@@ -354,3 +354,14 @@ fn root_identity() -> Option<(u32, u32)> {
         ),
     }
 }
+
+/// Keeps one dispatcher registered for the life of the test process, so that a tracing callsite's
+/// interest is never decided by the thread that happens to reach it first. With exactly one
+/// dispatcher in existence, tracing takes a new callsite's interest from the default dispatcher
+/// of the reaching thread; a thread with no subscriber then caches "never" for the callsite, and a
+/// test that captures the log on another thread sees nothing. A second, silent dispatcher makes
+/// tracing combine the interests of all of them. Call it before installing a capturing subscriber.
+pub(crate) fn pin_dispatchers() {
+    static PIN: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    PIN.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+}

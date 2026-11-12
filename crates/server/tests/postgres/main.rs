@@ -7,4 +7,5 @@ mod migrations;
 mod redeem;
 mod registration;
 mod serving;
+mod session;
 mod support;

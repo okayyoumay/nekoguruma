@@ -1,7 +1,7 @@
 # ADR-466: The Control Channel Is a WebSocket Opened With a Session Token From a Signed Challenge
 
 **Date:** 2026-11-12
-**Status:** Accepted
+**Status:** Accepted (Consequences on pushed-out challenges restated, and the issuing numbers set, by ADR-467)
 **Affects:** design 5.2, 5.3, 5.7, 6.4, 13.3, 14.1, 14.4; `api/asyncapi.yaml` (`agentControl`), `api/openapi.yaml` (`/v1/agent/challenge`, `/v1/agent/session`); `crates/shared-proto` (`control`), `crates/shared-crypto` (`proof::Audience`); the server's proof exchange, WebSocket and hub, and the agent's session library and `connect` command (later work); fixes the transport that ADR-459 item 3 left open; extends ADR-456 item 9 and ADR-461 items 9 and 10; relies on ADR-463 item 13
 
 ## Context
@@ -155,10 +155,11 @@ fixed points constrain it:
   exchange before every upgrade, so a restart costs one round trip.
 - A token is a bearer for its lifetime (300 seconds): a process that obtains one can open the
   channel as the agent, though it cannot issue jobs, which are signed (design 11.1).
-- Issuing challenges is limited per route, and the store holds at most 1024: a caller that
-  keeps requesting challenges pushes the oldest outstanding ones out, so an agent's pending
-  challenge can be dropped and its exchange answered 401. The agent fetches a new one at once,
-  so the cost is a retry; the cap on issuing bounds how fast it can happen.
+- Issuing challenges is limited per route, and the cap keeps the live challenges well below the
+  store's bound of 1024, so on one server none is pushed out (ADR-467 sets the numbers). The
+  bound stays as the store's own invariant. The residual risk is the cap itself: a caller that
+  uses all of it can deny challenges to honest agents for up to a minute, and an agent meets
+  that as a 429 and waits.
 - The proof exchange authenticates the agent, not the server. On the local profile a process
   that holds the port could answer both routes. Server authentication must prove the server on
   the WebSocket itself (the `hello` frame and the fresh exchange are its hooks), not only on the

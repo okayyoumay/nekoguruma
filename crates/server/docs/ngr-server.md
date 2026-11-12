@@ -282,6 +282,55 @@ value. The 307 carries `Cache-Control: no-store` and an absolute `Location`.
 - `POST /api/v1/agents/register` (`api/openapi.yaml`; `register.rs`; ADR-463, ADR-465): redeems a
   registration code. No login: the code and the agent key's proof authorize it. See
   "Registration" above.
+- `POST /api/v1/agent/challenge` and `POST /api/v1/agent/session` (`api/openapi.yaml`;
+  `session.rs`; ADR-466, ADR-467): the server's side of an agent's connection proof. See "The
+  agent's connection proof" below.
+
+## The agent's connection proof
+
+`session.rs` holds both routes, the challenge store, the token table and their tests (design 6.4,
+14.4, 16.3; ADR-466 items 1 to 4, ADR-467). No login: the proof authorizes the session.
+
+- **Challenge route.** The body must be empty (any byte is 400; `Content-Type` is not looked at),
+  read within 5 seconds (408) and at most 4 KiB (413). 200 `{"challenge": <44 characters>}`, with
+  `Cache-Control: no-store`. The store keeps 32 random bytes for 60 seconds, oldest first, with at
+  most 1024: a new one first drops the expired ones from the front, then the oldest while 1024
+  remain. Issuing is capped at **60 per sliding 60 seconds** per router (a `register::Limiter`
+  with its own numbers); past it the answer is 429 with `Retry-After` (1 to 60), a gated warning,
+  and nothing is recorded, drawn or stored. A request that passed the body rules counts even if
+  the random source then fails (500). With the cap, at most 60 challenges are live, so the bound
+  of 1024 is the store's own invariant, tested directly. A caller that uses the whole cap denies
+  challenges to honest agents for up to a minute.
+- **Session route, in this order, the first step that applies answers.** The guard; the method
+  (405); the body (413, 408); the shape (400): one `application/json` `Content-Type`, a strict
+  object of `agentId`, `challenge`, `nonce` and `proof` (each once, as a string), `agentId` in
+  lower-case hyphenated UUID form, `challenge` and `nonce` strict standard padded base64 of 32
+  bytes, `proof` of 64. A 400 consumes nothing. The challenge (401): taken from the store, which
+  removes it whatever the answer, so a missing, already presented or 60-second-old one is the
+  same 401 with `WWW-Authenticate: Bearer`, with no database access, not counted and never
+  turned into a 429. The agent's row (503, 500): one read of `public_key` and the revoked flag
+  in a transaction that is dropped, with a 5 second lock and statement timeout; nothing is
+  written (`last_seen_at` belongs to the control channel). The key and the proof (403, or 429):
+  an unknown agent, a revoked row (its signature is not checked) and a proof that does not verify
+  over the version, this server's audience, `agentId`, challenge and nonce are one 403 document;
+  the third includes a wrong key, audience, agent ID, challenge or nonce and a high-S signature.
+  A stored key that does not decode is a 500, not counted. The ten-refusals-in-a-minute limiter
+  is the route's own (`register::Limiter::default()`), counts only 403, and answers 429 with
+  `Retry-After` for the eleventh; a valid proof is never limited. Last the token: 200 `{"token",
+  "expiresInSecs": 300}`.
+- **The audience** is `local_guard::pinned_origin(port)` of the bound port, parsed once as a
+  canonical `shared_crypto::proof::Audience`; nothing from a request is used.
+- **Tokens.** `Sessions` (`Server::sessions()`, `AppState.sessions`) maps the SHA-256 of a
+  token's 32 bytes to its agent and an expiry. A token is a multi-use bearer for 300 seconds;
+  an agent may hold several, and nothing replaces an earlier one. Every token costs one
+  challenge, so at most 360 are live; expired ones are dropped at each issue.
+  `Sessions::authenticate(token)` and `revoke_agent(agent)` are for the control channel route.
+- **Clock.** The stores, limiters and log gates read tokio's clock and take the instant as a
+  parameter.
+- **Logging.** A refusal logs a warning with the word `unknown_agent`, `revoked` or `proof` and
+  the agent ID, once per word per minute; a wrong audience cannot be told from a bad signature
+  and is `proof`. A 503, a 500 and a limited challenge have a gate of their own; a 401 logs at
+  debug; a session issued logs at info. No token, challenge, nonce, proof or body is logged.
 
 Any other path answers 404 with a problem body, after the guard.
 
@@ -331,6 +380,21 @@ a new migration file rebuilds the crate. How migrations are written and applied 
   code limited while a valid registration is not. No log line holds a code, a name or an owner.
   `migrations.rs` also upgrades a database that holds duplicate agent rows (newest kept, ties by
   id, revoked rows untouched, cross-tenant duplicates).
+  `session.rs` (unit tests in `src/session.rs`) covers the stores at their boundaries (59.999 and
+  60 seconds, 299.999 and 300, 1024 and 1025 challenges, fifty threads taking one challenge), the
+  shape table, the judgement of a row and a proof with no database, the cap's numbers and the
+  log gates; `tests/postgres/session.rs` runs the two routes over TCP. Without a database: the
+  challenge route's body, method and size rules, both routes' 408, the cap (60 issued, the 61st
+  429, a challenge issued before it still live), each shape rule giving 400 with the challenge
+  still live afterwards, unknown challenges giving 401 and never 429 or 503, and the guard's
+  answers on both routes. With a database: a valid exchange (a token that authenticates twice,
+  `last_seen_at` untouched); a challenge used once whatever the outcome; every refusal (unknown
+  agent, revoked by SQL, revoked by registering the key again, another key, another audience,
+  another challenge, another agent ID, high-S) giving the same 403 bytes, one gated log line per
+  reason and no secret in the log; the eleventh refusal 429 while a 401, a 400 and a valid
+  exchange are answered as before; a 503 from a locked table that is not counted; a challenge
+  and a token expiring under a moved tokio clock (`pause`, `advance` and `resume` back to back
+  with no request in flight); and one valid request sent twice at once giving one 200 and one 401.
   `binary.rs` starts `ngr-server` as a process (on a port that was free a moment before, trying
   again when another process takes it): usage and start failures, a refused database and a
   changed migration (exit 1, nothing listens, no password in the log), health over TCP, and the

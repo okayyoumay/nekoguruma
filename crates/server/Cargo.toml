@@ -26,6 +26,7 @@ tracing-subscriber.workspace = true
 sqlx.workspace = true
 url.workspace = true
 base64.workspace = true
+sha2.workspace = true
 # Reads a request body frame by frame, so the registration route can bound its size and time.
 http-body-util = "0.1"
 # The server serves HTTP/1 only (ADR-456), so it drives hyper directly instead of `axum::serve`,
@@ -41,3 +42,5 @@ libc = "0.2"
 [dev-dependencies]
 tempfile = "3"
 getrandom.workspace = true
+# The session route's test moves tokio's clock (ADR-467); no other test needs it.
+tokio = { workspace = true, features = ["test-util"] }

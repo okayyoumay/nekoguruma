@@ -24,7 +24,7 @@ use tracing_subscriber::fmt::MakeWriter;
 use crate::serving::{Reply, Running, exchange};
 use crate::support::{TestPostgres, free_port};
 
-const LIMIT: Duration = Duration::from_secs(30);
+pub(crate) const LIMIT: Duration = Duration::from_secs(30);
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -48,7 +48,7 @@ async fn send(s: &Running, body: &str) -> Reply {
 }
 
 /// The reply without its `Date` header, for comparing two replies byte for byte.
-fn bytes_of(r: &Reply) -> String {
+pub(crate) fn bytes_of(r: &Reply) -> String {
     let head: Vec<&str> = r
         .head
         .lines()
@@ -57,19 +57,19 @@ fn bytes_of(r: &Reply) -> String {
     format!("{}\n\n{}", head.join("\n"), r.body)
 }
 
-struct Agent {
-    key: SigningKey,
-    public: PublicKey,
+pub(crate) struct Agent {
+    pub(crate) key: SigningKey,
+    pub(crate) public: PublicKey,
 }
 
 impl Agent {
-    fn new() -> Agent {
+    pub(crate) fn new() -> Agent {
         let key = SigningKey::generate().unwrap();
         let public = key.public_key();
         Agent { key, public }
     }
 
-    fn id(&self) -> String {
+    pub(crate) fn id(&self) -> String {
         self.public.fingerprint_hex()
     }
 
@@ -110,7 +110,7 @@ fn plain(code: &RegistrationCode) -> &str {
     code.as_str()
 }
 
-fn json(r: &Reply) -> serde_json::Value {
+pub(crate) fn json(r: &Reply) -> serde_json::Value {
     serde_json::from_str(&r.body).unwrap_or_else(|e| panic!("{e}: {}", r.body))
 }
 
@@ -118,7 +118,7 @@ fn json(r: &Reply) -> serde_json::Value {
 // Log capture
 
 #[derive(Clone, Default)]
-struct Captured(Arc<Mutex<Vec<u8>>>);
+pub(crate) struct Captured(Arc<Mutex<Vec<u8>>>);
 
 impl io::Write for Captured {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
@@ -138,7 +138,7 @@ impl<'a> MakeWriter<'a> for Captured {
 }
 
 impl Captured {
-    fn text(&self) -> String {
+    pub(crate) fn text(&self) -> String {
         String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
     }
 
@@ -155,7 +155,8 @@ impl Captured {
 
 /// Logs of the current thread from now on. The tests that read the log run on the current-thread
 /// runtime, so the server's tasks log on this thread too.
-fn capture() -> (Captured, tracing::subscriber::DefaultGuard) {
+pub(crate) fn capture() -> (Captured, tracing::subscriber::DefaultGuard) {
+    crate::support::pin_dispatchers();
     let captured = Captured::default();
     let subscriber = tracing_subscriber::fmt()
         .with_writer(captured.clone())
@@ -168,7 +169,7 @@ fn capture() -> (Captured, tracing::subscriber::DefaultGuard) {
 // ---------------------------------------------------------------------------------------------
 // Servers
 
-fn instruction_key() -> Arc<InstructionKey> {
+pub(crate) fn instruction_key() -> Arc<InstructionKey> {
     Arc::new(InstructionKey::from_signer(Arc::new(
         SigningKey::generate().unwrap(),
     )))
@@ -183,7 +184,7 @@ async fn bind(pool: PgPool, key: Arc<InstructionKey>) -> Running {
 }
 
 /// A server whose pool points at a port nothing listens on.
-async fn dead(key: Arc<InstructionKey>) -> Running {
+pub(crate) async fn dead(key: Arc<InstructionKey>) -> Running {
     let options = PgConnectOptions::new_without_pgpass()
         .host("127.0.0.1")
         .port(free_port())
@@ -192,15 +193,15 @@ async fn dead(key: Arc<InstructionKey>) -> Running {
 }
 
 /// A migrated database with the server key's row, and a server on it.
-struct World {
-    pg: TestPostgres,
-    pool: PgPool,
-    key: Arc<InstructionKey>,
-    server: Running,
+pub(crate) struct World {
+    pub(crate) pg: TestPostgres,
+    pub(crate) pool: PgPool,
+    pub(crate) key: Arc<InstructionKey>,
+    pub(crate) server: Running,
 }
 
 impl World {
-    async fn new() -> World {
+    pub(crate) async fn new() -> World {
         World::with_key(instruction_key()).await
     }
 
@@ -228,7 +229,7 @@ impl World {
     }
 
     /// A new tenant with an enabled operator of this subject; the tenant's and operator's IDs.
-    async fn add_operator(&self, subject: &str) -> (String, String) {
+    pub(crate) async fn add_operator(&self, subject: &str) -> (String, String) {
         sqlx::query_as(
             "WITH t AS (INSERT INTO tenants (id, name) VALUES (gen_random_uuid(), 'tenant') \
                         RETURNING id), \
@@ -251,18 +252,18 @@ impl World {
             .code
     }
 
-    async fn redeem(&self, owner: &str, agent: &Agent) -> (RegistrationCode, Reply) {
+    pub(crate) async fn redeem(&self, owner: &str, agent: &Agent) -> (RegistrationCode, Reply) {
         let code = self.issue(owner, agent).await;
         let body = agent.body(plain(&code), &code, Mode::User, &self.key.public_key());
         let reply = send(&self.server, &body).await;
         (code, reply)
     }
 
-    async fn sql(&self, sql: &str) -> String {
+    pub(crate) async fn sql(&self, sql: &str) -> String {
         self.pg.scalar(sql).await
     }
 
-    async fn finish(self) {
+    pub(crate) async fn finish(self) {
         self.server.finish().await;
     }
 }
@@ -1158,7 +1159,7 @@ async fn while_limited_an_unknown_code_is_429_and_a_valid_registration_is_201() 
 
 /// The same signature with `s` replaced by the group order minus `s`: the high-S twin, which the
 /// signer never produces and the verifier refuses.
-fn high_s(signature: &[u8]) -> Vec<u8> {
+pub(crate) fn high_s(signature: &[u8]) -> Vec<u8> {
     // The order of the P-256 group, big endian.
     const ORDER: [u8; 32] = [
         0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,

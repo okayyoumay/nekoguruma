@@ -281,18 +281,18 @@ async fn the_guard_answers_both_routes_before_they_run_and_the_cap_is_untouched(
 
 /// A migrated database with one registered agent, and a session server on a pool of its own
 /// (`Server::run` closes the pool it is given).
-struct Up {
-    w: World,
+pub(crate) struct Up {
+    pub(crate) w: World,
     agent: Agent,
     id: String,
-    s: Running,
+    pub(crate) s: Running,
     sessions: Sessions,
     /// The text of every challenge and nonce this test sent, for the log check.
     seen: std::sync::Mutex<Vec<String>>,
 }
 
 impl Up {
-    async fn new() -> Up {
+    pub(crate) async fn new() -> Up {
         let w = World::new().await;
         w.add_operator("alice").await;
         let agent = Agent::new();
@@ -335,7 +335,7 @@ impl Up {
         pair
     }
 
-    async fn valid(&self) -> Reply {
+    pub(crate) async fn valid(&self) -> Reply {
         self.exchange_as(&self.agent.key, &self.id).await
     }
 
@@ -345,7 +345,7 @@ impl Up {
             .await
     }
 
-    async fn finish(self) {
+    pub(crate) async fn finish(self) {
         self.s.finish().await;
         self.w.finish().await;
     }

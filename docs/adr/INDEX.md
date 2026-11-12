@@ -455,8 +455,9 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-463](ADR-463-an-agent-registers-with-a-single-use-code-bound-to-its-owner-and-key-and-checks-the-server-out-of-band.md) | An Agent Registers With a Single-Use Code Bound to Its Owner and Key, and Checks the Server Out of Band | Accepted (items 5 and 14 detailed by ADR-465; item 13's transport rule applied to the audience by ADR-466) | design 6.4, 6.6, 6.7, 11.1, 13.3, 14.4, `api/openapi.yaml`, `db/migrations`, `crates/shared-crypto`, `crates/shared-proto`; annotates ADR-459, ADR-461, ADR-462 |
 | [ADR-464](ADR-464-open-work-is-tied-to-a-milestone-by-its-exit-criteria.md) | Open Work Is Tied to a Milestone by Its Exit Criteria | Accepted | `.claude/skills/milestone-exit` (`coverage`), `work/README.md` (priorities), development plan, weekly plan re-evaluation |
 | [ADR-465](ADR-465-registration-is-issued-by-a-read-only-checked-command-and-redeemed-in-one-transaction-that-signs-before-commit.md) | Registration Is Issued by a Command That Checks Migrations Read-Only, and Redeemed in One Transaction That Signs Before It Commits | Accepted | design 6.4, 6.7, 14.4, `crates/server`, `db/migrations`, `db/README.md`; details ADR-463 items 5 and 14 |
-| [ADR-466](ADR-466-the-control-channel-is-a-websocket-opened-with-a-session-token-from-a-signed-challenge.md) | The Control Channel Is a WebSocket Opened With a Session Token From a Signed Challenge | Accepted (Consequences on pushed-out challenges restated, and the issuing numbers set, by ADR-467) | design 5.2, 5.3, 5.7, 6.4, 13.3, 14.1, 14.4, `api/`, `crates/shared-proto`, `crates/shared-crypto`; fixes ADR-459 item 3's transport; extends ADR-456 item 9, ADR-461 items 9 and 10; relies on ADR-463 item 13 |
+| [ADR-466](ADR-466-the-control-channel-is-a-websocket-opened-with-a-session-token-from-a-signed-challenge.md) | The Control Channel Is a WebSocket Opened With a Session Token From a Signed Challenge | Accepted (Consequences on pushed-out challenges restated, and the issuing numbers set, by ADR-467; item 5 extended, and item 6's stop detailed, by ADR-468) | design 5.2, 5.3, 5.7, 6.4, 13.3, 14.1, 14.4, `api/`, `crates/shared-proto`, `crates/shared-crypto`; fixes ADR-459 item 3's transport; extends ADR-456 item 9, ADR-461 items 9 and 10; relies on ADR-463 item 13 |
 | [ADR-467](ADR-467-the-session-route-takes-the-challenge-before-the-database-and-challenge-issuing-is-capped-at-sixty-a-minute.md) | The Session Route Takes the Challenge Before the Database, and Challenge Issuing Is Capped at Sixty a Minute | Accepted | design 6.4, 14.4, `crates/server`, `api/openapi.yaml`; sets the numbers of ADR-466 item 3 and restates one of its consequences |
+| [ADR-468](ADR-468-the-control-channel-judges-the-token-before-the-upgrade-and-runs-each-connection-as-a-task-the-hub-owns.md) | The Control Channel Judges the Token Before the Upgrade and Runs Each Connection as a Task the Hub Owns | Accepted | design 5.2, 13.3, 14.1, 15.1, `crates/server`, `crates/shared-proto`, `api/asyncapi.yaml`; extends ADR-466 item 5, details its item 6 and ADR-456 item 9 |
 
 ## Status Legend
 
@@ -1040,5 +1041,6 @@ the predecessor repository these ADRs came from.
 - ADR-461 (item 11's PEM is a field of the registration record, ADR-463; items 9 and 10 extended by ADR-466: the rejection settles the delivery)
 - ADR-463 (items 5 and 14 detailed by ADR-465; item 13's transport rule applied to the audience by ADR-466)
 - ADR-465
-- ADR-466 (Consequences on pushed-out challenges restated, and the issuing numbers set, by ADR-467)
+- ADR-466 (Consequences on pushed-out challenges restated, and the issuing numbers set, by ADR-467; item 5 extended, and item 6's stop detailed, by ADR-468)
 - ADR-467
+- ADR-468

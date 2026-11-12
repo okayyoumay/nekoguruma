@@ -76,7 +76,7 @@ fn request(method: &str, target: &str, headers: &[String]) -> String {
 pub(crate) struct Running {
     pub(crate) addr: std::net::SocketAddr,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
-    force: Option<tokio::sync::oneshot::Sender<()>>,
+    pub(crate) force: Option<tokio::sync::oneshot::Sender<()>>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -155,7 +155,7 @@ impl Running {
     }
 
     /// Begins the graceful stop and returns once the listener no longer accepts.
-    async fn begin_stop(&mut self) {
+    pub(crate) async fn begin_stop(&mut self) {
         let _ = self.stop.take().unwrap().send(());
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while TcpStream::connect(self.addr).await.is_ok() {
@@ -171,7 +171,7 @@ impl Running {
         self.joined().await;
     }
 
-    async fn joined(self) {
+    pub(crate) async fn joined(self) {
         tokio::time::timeout(Duration::from_secs(10), self.task)
             .await
             .expect("run returns after the shutdown")

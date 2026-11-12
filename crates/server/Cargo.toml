@@ -32,8 +32,11 @@ http-body-util = "0.1"
 # The server serves HTTP/1 only (ADR-456), so it drives hyper directly instead of `axum::serve`,
 # which also accepts HTTP/2 whenever another crate in the build turns that feature on.
 hyper = { version = "1", features = ["http1", "server"] }
-hyper-util = { version = "0.1", features = ["tokio", "service", "server-graceful"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
 tower = { version = "0.5", default-features = false }
+# Only its error types: the control channel tells a message over the limit from other read errors
+# by the stack's own error (ADR-468). It must stay the version axum's WebSocket uses.
+tungstenite = { version = "0.29", default-features = false }
 
 # Unix only: the open flags and the effective user ID that the key file's checks use.
 [target.'cfg(unix)'.dependencies]
@@ -44,3 +47,6 @@ tempfile = "3"
 getrandom.workspace = true
 # The session route's test moves tokio's clock (ADR-467); no other test needs it.
 tokio = { workspace = true, features = ["test-util"] }
+# The control channel's tests are its client (ADR-468): the handshake over a stream the test opens.
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }

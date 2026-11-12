@@ -8,8 +8,10 @@
 //! (ADR-462).
 
 pub mod config;
+pub mod control;
 pub mod db;
 pub mod health;
+pub mod hub;
 pub mod instruction_key;
 pub mod local_guard;
 pub mod problem;
@@ -28,14 +30,15 @@ use axum::middleware;
 use axum::routing::{get, post};
 use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
-use hyper_util::server::graceful::GracefulShutdown;
 use hyper_util::service::TowerToHyperService;
 use sqlx::PgPool;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tower::Layer;
 
 pub use config::{Config, ConfigError, Profile};
+pub use hub::Hub;
 pub use instruction_key::InstructionKey;
 pub use session::Sessions;
 
@@ -55,6 +58,8 @@ pub struct AppState {
     pub instruction_key: Arc<InstructionKey>,
     /// The session tokens the agent session route issues; the control channel route reads them.
     pub sessions: Sessions,
+    /// The connections of the control channel.
+    pub hub: Hub,
 }
 
 /// The server's routes behind the local profile's request guard (design 13, 13.3).
@@ -81,11 +86,16 @@ pub fn router(state: AppState) -> Router {
         .with_state(session::Exchange::new(
             state.pool,
             state.port,
-            state.sessions,
+            state.sessions.clone(),
         ));
+    // The control channel judges the token the exchange issues, and hands its sockets to the hub.
+    let control = Router::new()
+        .route(control::PATH, get(control::upgrade))
+        .with_state(control::Control::new(state.sessions, state.hub));
     let routes = health
         .merge(register)
         .merge(exchange)
+        .merge(control)
         .fallback(|| async { problem::Problem::new(StatusCode::NOT_FOUND, "Not found") });
     // The standard profile supplies its own ingress layer here (design 13).
     let guarded = middleware::from_fn_with_state(state.port, local_guard::guard).layer(routes);
@@ -116,6 +126,7 @@ pub struct Server {
     router: Router,
     pool: PgPool,
     sessions: Sessions,
+    hub: Hub,
     grace: Duration,
 }
 
@@ -164,6 +175,7 @@ impl Server {
             .map_err(|source| StartError::Bind { port, source })?
             .port();
         let sessions = Sessions::new();
+        let hub = Hub::new();
         Ok(Server {
             listener,
             router: router(AppState {
@@ -171,9 +183,11 @@ impl Server {
                 pool: pool.clone(),
                 instruction_key,
                 sessions: sessions.clone(),
+                hub: hub.clone(),
             }),
             pool,
             sessions,
+            hub,
             grace: Duration::from_secs(http.shutdown_grace_secs),
         })
     }
@@ -184,7 +198,7 @@ impl Server {
             .expect("a bound listener has an address")
     }
 
-    /// The session tokens this server issues, which the control channel route will accept.
+    /// The session tokens this server issues, which the control channel route accepts.
     pub fn sessions(&self) -> Sessions {
         self.sessions.clone()
     }
@@ -194,9 +208,10 @@ impl Server {
         local_guard::pinned_origin(self.local_addr().port())
     }
 
-    /// Serves HTTP/1 until `shutdown` resolves; then stops accepting and waits for requests in
-    /// flight, at most the grace period or until `immediate` resolves (a second stop signal),
-    /// and drops what is left.
+    /// Serves HTTP/1 until `shutdown` resolves; then stops accepting, closes every control
+    /// channel connection with 1001, and waits for requests in flight and for those closes, at
+    /// most the grace period or until `immediate` resolves (a second stop signal). What is left
+    /// is aborted, the connections before the sockets, and the database pool is closed last.
     ///
     /// Only HTTP/1 is served, whatever features other crates in the build enable: the
     /// connections are driven by hyper's HTTP/1 builder, not by `axum::serve`.
@@ -210,10 +225,13 @@ impl Server {
             router,
             pool,
             sessions: _,
+            hub,
             grace,
         } = self;
         let service = TowerToHyperService::new(router);
-        let graceful = GracefulShutdown::new();
+        // hyper-util's graceful watch has no implementation for a connection that allows
+        // upgrades, so each connection task watches this signal itself (ADR-468).
+        let (stop, _) = watch::channel(false);
         // Dropping the set aborts the connections that are still open.
         let mut connections: JoinSet<()> = JoinSet::new();
         let mut shutdown = std::pin::pin!(shutdown);
@@ -226,16 +244,10 @@ impl Server {
                         builder
                             .timer(TokioTimer::new())
                             .header_read_timeout(HEADER_READ_TIMEOUT);
-                        // The WebSocket route will need `with_upgrades()` and its own handling
-                        // of a graceful stop.
-                        let connection =
-                            builder.serve_connection(TokioIo::new(stream), service.clone());
-                        let connection = graceful.watch(connection);
-                        connections.spawn(async move {
-                            if let Err(error) = connection.await {
-                                tracing::debug!(%error, "connection ended with an error");
-                            }
-                        });
+                        let connection = builder
+                            .serve_connection(TokioIo::new(stream), service.clone())
+                            .with_upgrades();
+                        connections.spawn(serve_connection(connection, stop.subscribe()));
                     }
                     Err(error) => {
                         // Typically descriptor exhaustion; back off instead of spinning.
@@ -247,22 +259,57 @@ impl Server {
             }
         }
         drop(listener);
+        // Requests in flight finish and idle connections close; every control channel session
+        // is told to close with 1001. A connection that upgraded has left `connections`: its
+        // socket is the hub's.
+        stop.send_replace(true);
+        let mut sockets = hub.begin_stop();
         tokio::select! {
-            () = graceful.shutdown() => {}
+            () = async {
+                while connections.join_next().await.is_some() {}
+                while sockets.join_next().await.is_some() {}
+            } => {}
             () = tokio::time::sleep(grace) => {
                 tracing::warn!(
                     grace_secs = grace.as_secs(),
-                    "requests still in flight at the end of the grace period; stopping"
+                    "requests or control connections still open at the end of the grace \
+                     period; stopping"
                 );
             }
             () = immediate => {
                 tracing::warn!("second stop signal; stopping at once");
             }
         }
-        // Connections still open at the end of the grace period (or of a second signal) are
-        // aborted first, so that none holds a pooled connection that `close` would wait for.
+        // What is still open at the end of the grace period (or of a second signal) is aborted
+        // before the pool closes, so that none holds a pooled connection that `close` would wait
+        // for. The connections come first: one that is about to upgrade then fails to, instead
+        // of handing the hub a socket.
         connections.shutdown().await;
+        sockets.shutdown().await;
         db::close(&pool).await;
         Ok(())
+    }
+}
+
+/// A connection of the accept loop: HTTP/1 that may hand its socket over at an upgrade.
+type Upgradeable = http1::UpgradeableConnection<TokioIo<TcpStream>, TowerToHyperService<Router>>;
+
+/// Serves one connection until it ends, asking it to finish its request and close when `stop`
+/// turns true.
+async fn serve_connection(connection: Upgradeable, mut stop: watch::Receiver<bool>) {
+    let mut connection = std::pin::pin!(connection);
+    let mut stopped = false;
+    let result = loop {
+        tokio::select! {
+            result = connection.as_mut() => break result,
+            // `Err` means the sender is gone, which is a stop as well.
+            _ = async { let _ = stop.wait_for(|stop| *stop).await; }, if !stopped => {
+                stopped = true;
+                connection.as_mut().graceful_shutdown();
+            }
+        }
+    };
+    if let Err(error) = result {
+        tracing::debug!(%error, "connection ended with an error");
     }
 }

@@ -848,6 +848,9 @@ mod tests {
     }
 
     const NANO: Duration = Duration::from_nanos(1);
+    /// The smallest step taken on the wall clock: Windows keeps `SystemTime` in 100 ns units and
+    /// truncates a smaller `Duration`, so one nanosecond before a limit would be the limit itself.
+    const WALL_STEP: Duration = Duration::from_micros(1);
 
     // ----- expiry
 
@@ -896,7 +899,7 @@ mod tests {
         );
         let table = one(t0, w0);
         assert!(matches!(
-            table.look(&key(1), t0, w0 + IDLE_LIMIT - NANO),
+            table.look(&key(1), t0, w0 + IDLE_LIMIT - WALL_STEP),
             Lookup::Live(_)
         ));
         assert_eq!(
@@ -952,7 +955,7 @@ mod tests {
             table.look(
                 &key(1),
                 t0 + used + IDLE_LIMIT - NANO,
-                w0 + used + IDLE_LIMIT - NANO
+                w0 + used + IDLE_LIMIT - WALL_STEP
             ),
             Lookup::Live(_)
         ));

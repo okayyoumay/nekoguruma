@@ -15,6 +15,10 @@ pub static MIGRATOR: Migrator = sqlx::migrate!("../../db/migrations");
 /// The longest `ngr-server` waits for the migrations at start.
 pub const MIGRATION_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// The table in which sqlx records applied migrations. [`require_current`] reads it by this name;
+/// a test pins it against [`MIGRATOR`]'s own table name.
+const MIGRATIONS_TABLE: &str = "_sqlx_migrations";
+
 /// How long closing the pool may take before the server gives up waiting for it.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -36,6 +40,25 @@ pub enum DbError {
     Migrate(#[from] sqlx::migrate::MigrateError),
     #[error("the migrations did not finish within {0} s plus the client's margin")]
     MigrateTimeout(u64),
+    #[error("the database has not been migrated; start ngr-server once to apply the migrations")]
+    NotMigrated,
+    #[error("the database's migrations are not those of this ngr-server: {0}")]
+    MigrationsDiffer(MigrationsDiffer),
+    #[error("cannot read the database's migration state: {0}")]
+    MigrationState(sqlx::Error),
+}
+
+/// How the applied migrations differ from the embedded ones (see [`require_current`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum MigrationsDiffer {
+    #[error("an embedded migration is not applied yet (the database is behind)")]
+    Behind,
+    #[error("the database holds a migration this binary does not carry (the database is ahead)")]
+    Ahead,
+    #[error("an applied migration differs from the embedded file")]
+    Changed,
+    #[error("a migration was left half applied")]
+    Dirty,
 }
 
 /// Opens the pool, with the connect timeout as the pool's acquire timeout: sqlx retries a refused
@@ -53,6 +76,56 @@ pub async fn connect(config: &Database) -> Result<PgPool, DbError> {
             secs: config.connect_timeout_secs,
             source,
         })
+}
+
+/// Checks, read-only, that the database's applied migrations equal the embedded ones, both ways:
+/// every embedded migration is applied with its checksum, and the database holds nothing else.
+///
+/// The check never writes: `Migrator::run_direct` would create the migrations table, and a
+/// command that must not migrate (ADR-458, ADR-465) cannot use it. It reads committed state and
+/// takes no lock, so a server that is applying migrations at that moment makes it fail; a rerun
+/// after the start finishes passes.
+pub async fn require_current(pool: &PgPool) -> Result<(), DbError> {
+    let present: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
+        .bind(MIGRATIONS_TABLE)
+        .fetch_one(pool)
+        .await
+        .map_err(DbError::MigrationState)?;
+    if present.is_none() {
+        return Err(DbError::NotMigrated);
+    }
+    let sql = format!("SELECT version, checksum, success FROM {MIGRATIONS_TABLE} ORDER BY version");
+    let applied: Vec<(i64, Vec<u8>, bool)> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .fetch_all(pool)
+        .await
+        .map_err(DbError::MigrationState)?;
+    compare_migrations(&MIGRATOR, &applied).map_err(DbError::MigrationsDiffer)
+}
+
+/// The decision of [`require_current`] on rows of (version, checksum, success).
+fn compare_migrations(
+    migrator: &Migrator,
+    applied: &[(i64, Vec<u8>, bool)],
+) -> Result<(), MigrationsDiffer> {
+    for (version, checksum, success) in applied {
+        if !success {
+            return Err(MigrationsDiffer::Dirty);
+        }
+        match migrator.iter().find(|m| m.version == *version) {
+            None => return Err(MigrationsDiffer::Ahead),
+            Some(m) if m.checksum.as_ref() != checksum.as_slice() => {
+                return Err(MigrationsDiffer::Changed);
+            }
+            Some(_) => {}
+        }
+    }
+    if migrator
+        .iter()
+        .any(|m| !applied.iter().any(|(version, _, _)| *version == m.version))
+    {
+        return Err(MigrationsDiffer::Behind);
+    }
+    Ok(())
 }
 
 /// A pool that connects on first use. Tests only: they exercise the routes without a schema.
@@ -171,6 +244,52 @@ mod tests {
             assert_eq!(m.version, digits.parse::<i64>().unwrap(), "{f}");
             assert!(digits.len() == 4 && rest.ends_with(".sql"), "{f}");
         }
+    }
+
+    #[test]
+    fn the_read_only_check_reads_the_table_sqlx_writes() {
+        assert_eq!(MIGRATOR.table_name, MIGRATIONS_TABLE);
+    }
+
+    #[test]
+    fn the_comparison_refuses_every_difference_and_accepts_equality() {
+        let equal: Vec<_> = MIGRATOR
+            .iter()
+            .map(|m| (m.version, m.checksum.to_vec(), true))
+            .collect();
+        assert_eq!(compare_migrations(&MIGRATOR, &equal), Ok(()));
+
+        let mut behind = equal.clone();
+        behind.pop();
+        assert_eq!(
+            compare_migrations(&MIGRATOR, &behind),
+            Err(MigrationsDiffer::Behind)
+        );
+        assert_eq!(
+            compare_migrations(&MIGRATOR, &[]),
+            Err(MigrationsDiffer::Behind)
+        );
+
+        let mut ahead = equal.clone();
+        ahead.push((9999, vec![0], true));
+        assert_eq!(
+            compare_migrations(&MIGRATOR, &ahead),
+            Err(MigrationsDiffer::Ahead)
+        );
+
+        let mut changed = equal.clone();
+        changed[0].1 = vec![0];
+        assert_eq!(
+            compare_migrations(&MIGRATOR, &changed),
+            Err(MigrationsDiffer::Changed)
+        );
+
+        let mut dirty = equal;
+        dirty[1].2 = false;
+        assert_eq!(
+            compare_migrations(&MIGRATOR, &dirty),
+            Err(MigrationsDiffer::Dirty)
+        );
     }
 
     #[test]

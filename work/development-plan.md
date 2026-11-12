@@ -37,11 +37,12 @@ M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 20
 
 **Exit criteria.**
 
-1. In CI, a local-profile server and an agent with the simulators run an acquisition job and a configuration write job end to end, created through the Web API.
-2. A network fault test (disconnect, slow link; design 13.4) shows no duplicate execution, no automatic reissue of a write job, and complete event delivery after reconnection (5.3).
-3. An agent rejects a job instruction with a bad signature.
+1. In CI, a local-profile server and an agent with the simulators run an acquisition job and a configuration write job end to end, created through the Web API, on a server whose database holds its seed data (roles, the default confirmation level, presets) and gives each per-vehicle lock an expiry derived from the job kind's expected duration (the seed data and lock expiry added at the maintainer's request, 2026-11-12)
+2. A network fault test (disconnect, slow link; design 13.4) shows no duplicate execution, no automatic reissue of a write job, and complete event delivery after reconnection (5.3). A restart of an interrupted job runs only the program and documents its instruction names, and is refused before anything is sent when they differ (added at the maintainer's request, 2026-11-12).
+3. An agent rejects a job instruction with a bad signature, and one whose operator is not the owner the agent is registered to where the connection restriction requires it (design 6.6). It also refuses a listener on its server's port that is not its own server, and the unsigned commands such a listener sends (cancel, HMI response, seed-key response; design 14.4, 11.1) (the operator and listener checks added at the maintainer's request, 2026-11-12).
 4. The hardware checks listed below are implemented: the harness lists each one for a profile of its class, a check run without `NGR_HW_PROFILE` fails, and their parts that need no hardware are tested in CI (design 13.5). Running them on hardware is optional.
 5. The fictional test vehicle ("Mikeneko", a gateway and six ECUs) is the vehicle of the end to end: its ECU definitions and its vehicle definition convert, and a configuration write job created through the Web API changes the engine controller's coding on the simulators, saving the current value, writing, reading it back, and writing the saved value back when the read-back check fails (added at the maintainer's request, 2026-11-12).
+6. An operator's explicit upload sends a job's communication log over the data channel, showing its scope first; the server stores it with the job's result under its retention, and the agent deletes nothing locally before the server acknowledges the upload (design 8.11, 16.2, ADR-455) (added at the maintainer's request, 2026-11-12).
 
 **Hardware checks to implement (design 13.5; running them on hardware is optional).**
 
@@ -59,9 +60,11 @@ M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 20
 
 **Exit criteria.**
 
-1. A browser end-to-end test (Playwright) runs an acquisition against the simulators, edits a record-template field, and sees the change from a second session.
+1. A browser end-to-end test (Playwright) runs an acquisition against the simulators, edits a record-template field, and sees the change from a second session. The same test opens the job's communication log in the browser (8.11) (the log view added at the maintainer's request, 2026-11-12).
 2. With the server unreachable, a pre-fetched acquisition job starts from the cached UI over the local connection and syncs once the server is back.
 3. From the browser, an operator runs an actuator test on the fictional test vehicle's engine controller (an InputOutputControlByIdentifier item, ISO 14229-1 (2026) 12.2, and an actuator routine) at the confirmation level design 5.1 and 6.3 give actuator tests, and every IO control the job started is back under the ECU's control after the job ends, after it is cancelled, and after its agent is killed and restarted (added at the maintainer's request, 2026-11-12).
+4. Maintenance records carry a retention derived from an operator setting per tenant and record kind (4.3, 16.2), and deleting an expired maintenance record leaves the write-job audit records of the same vehicle in place (added at the maintainer's request, 2026-11-12).
+5. When several variants match an ECU, the operator chooses one in the browser by the attributes its definition gives each variant (ADR-327 item 7) (added at the maintainer's request, 2026-11-12).
 
 **Hardware checks to implement (design 13.5; running them on hardware is optional).**
 
@@ -76,10 +79,14 @@ M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 20
 **Exit criteria.**
 
 1. Unsigned or wrongly signed packages, artifacts and job instructions are each rejected, with a test per layer.
-2. An ECU reprogramming job runs the ISO 14229-1 clause 16 sequence against `sim-ecu`'s flash state machine, recovers from each of the four fault classes in clause 16.4 per design 5.6, and is refused when a precondition (8.9.1) is not met.
+2. An ECU reprogramming job runs the ISO 14229-1 clause 16 sequence against `sim-ecu`'s flash state machine, recovers from each of the four fault classes in clause 16.4 per design 5.6, and is refused when a precondition (8.9.1) is not met. The sequence includes a flash session with several memory regions and a memory check against a digest the host computes from the artifact (the regions and the digest added at the maintainer's request, 2026-11-12)).
 3. A two-person approval flow blocks reprogramming on an unattended device until the second approval.
 4. The hardware checks listed below are implemented: the harness lists each one for a profile of its class, a check run without `NGR_HW_PROFILE` fails, and their parts that need no hardware are tested in CI (design 13.5). Running them on hardware is optional.
 5. On the fictional test vehicle, a reprogramming job and a configuration change reach ECUs behind its gateway: the gateway is unlocked first, the engine controller is reprogrammed, and a body controller coding change is checked against the gateway's vehicle configuration record and written back on a mismatch (added at the maintainer's request, 2026-11-12).
+6. The write-job journal, the communication log beside it and the local cache are encrypted with a key in the OS credential store and are tamper-evident, so an edited resume count is detected; their bodies are erased after job and sync completion and on agent-key revocation (5.5). The agent key is kept in an OS key store on every supported OS, Linux hosts with systemd older than 250 included (16.3) (added at the maintainer's request, 2026-11-12).
+7. A signed VCI profile (9.3) changes what the agent judges: its timing margins and drift bound, and whether a D-PDU library forwards every pending, with a test per field (added at the maintainer's request, 2026-11-12).
+8. A configuration write unlocks `sim-ecu` both through seed/key and through an OEM authentication provider whose challenge the server shows to the operator in the browser while the job waits for the grant (8.10) (added at the maintainer's request, 2026-11-12).
+9. The server ingests a signed definition package (ECU definitions in CSV + Starlark, and vehicle definitions; 9.4), and refuses within bounded time and memory a package past its size limits or built to cost more than they allow (8.4) (added at the maintainer's request, 2026-11-12).
 
 **Hardware checks to implement (design 13.5; running them on hardware is optional).**
 
@@ -96,7 +103,7 @@ M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 20
 
 **Exit criteria.**
 
-1. A monitoring session against the simulators reports the measured achievable interval and the p99 arrival interval (10.3).
+1. A monitoring session against the simulators, built from the monitor sets of a CSV + Starlark definition (10.2; the definition source added at the maintainer's request, 2026-11-12)), reports the measured achievable interval and the p99 arrival interval (10.3).
 2. A captured interval is stored as acquired data with its metadata (4.6).
 3. A second browser subscribes through the server path while the first uses the direct path (10.4).
 4. The hardware checks listed below are implemented: the harness lists each one for a profile of its class, a check run without `NGR_HW_PROFILE` fails, and their parts that need no hardware are tested in CI (design 13.5). Running them on hardware is optional.
@@ -112,10 +119,11 @@ M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 20
 
 **Exit criteria.**
 
-1. A sample PDX converts to the same IR shape as the M2 proprietary-format definition for the same ECU, and runs against `sim-ecu`.
+1. A sample PDX converts to the same IR shape as the M2 proprietary-format definition for the same ECU, and runs against `sim-ecu`; a flash description in a PDX converts to a flash session with its restart declaration (the flash description added at the maintainer's request, 2026-11-12)).
 2. The SOVD resource mapping (L4) serves data reads for that ECU.
 3. The generic OBD package reads the supported data identifiers (PIDs for classic SAE J1979, DIDs for J1979-2 and ISO 27145), current data and stored DTCs against `sim-ecu`, for each generic OBD family whose standard is held.
 4. The hardware checks listed below are implemented: the harness lists each one for a profile of its class, a check run without `NGR_HW_PROFILE` fails, and their parts that need no hardware are tested in CI (design 13.5). Running them on hardware is optional.
+5. For each of OTX (ISO 13209) and ExVe (ISO 20077/20078) whose standard is held: an OTX procedure converts and runs against `sim-ecu`, and the ExVe compatible endpoints serve that ECU's data (added at the maintainer's request, 2026-11-12).
 
 **Hardware checks to implement (design 13.5; running them on hardware is optional).**
 
@@ -132,6 +140,9 @@ M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 20
 
 1. The server runs as a container with OIDC and S3-compatible storage, and an agent over the internet completes a job (14.4).
 2. At least one real J2534 VCI and one D-PDU API VCI complete acquisition and a configuration write on a real ECU or bench.
+3. The agent runs as a Windows service and as a systemd service, and writes its operational log to the Windows event log and to journald (6.2, 6.5, 12.2) (added at the maintainer's request, 2026-11-12).
+4. The communication log's invariants for late items are written down and checked by generated-sequence tests, with the refinement of the scope above done where the real-VCI runs call for it (8.11) (added at the maintainer's request, 2026-11-12).
+5. The design 17 P5 non-functional targets are decided, and the size-S measures (15.2) are measured against them (added at the maintainer's request, 2026-11-12).
 
 This is the one milestone whose exit criteria require real hardware. It runs the hardware checks implemented in earlier milestones (design 13.5) at T2, and answers the design 17 per-vendor items for each VCI.
 

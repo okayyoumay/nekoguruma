@@ -48,7 +48,8 @@ path = "/etc/nekoguruma/instruction.key"   # absolute; Windows: use a TOML liter
 - The `[instruction_key]` table is required: `path` is an absolute path to the PKCS#8 file of the
   key that signs job instructions (design 11.1, ADR-462). There is no default path, no search and
   no environment variable. The table holds a path, never key material. The directory must exist,
-  belong to the server's account and, on Unix, not be writable by group or others; the server
+  belong to the server's account (or, on Unix, to root) and, on Unix, not be writable by group or
+  others; the server
   creates only the file. Put it beside the configuration, not in the database's data directory,
   and not in a directory that a backup of the database covers.
 - There is no bind-address key. The listener is `127.0.0.1:<port>` in code, so no configuration
@@ -111,9 +112,13 @@ deployment, or a restart with another file, from signing under two identities.
 - Every start logs `instruction key ready` with the key ID (64 hex digits, the SHA-256 of the SPKI
   document, the value of `jobs.signing_key_id`). There is no endpoint and no command for the key
   yet; registration will return the public key as SPKI PEM.
-- On Unix the server refuses a path that is not a regular file (a symbolic link to one is
-  followed), has any group or other permission bit, or whose directory is writable by group or
-  others. The checks run on the opened file. Errors are fixed text plus the OS error kind, never
+- On Unix the server opens the file with `O_NOFOLLOW`, `O_NONBLOCK` and `O_NOCTTY` (as the agent
+  opens its lock files, ADR-262 item 6), so a symbolic link, dangling or not, is refused and a
+  FIFO never blocks the start. On the open handle it then refuses what is not a regular file,
+  what is not owned by the server's effective user, and any group or other permission bit. By
+  path it refuses a directory that is writable by group or others or owned by neither the
+  server's user nor root. On Windows the file is opened as a reparse point and refused if it is
+  one. Errors are fixed text plus the OS error kind, never
   the path's contents or key bytes. Only the server's account should read the file; a user-mode
   agent that runs under the same account can read it too, which design 6.6 accepts for a personal
   installation.
@@ -134,7 +139,8 @@ deployment, or a restart with another file, from signing under two identities.
 **Resetting the key** (a new key; every agent must then register again, and jobs signed under the
 old key are not delivered): stop the server; in the database, set `retired_at = now()` on the row
 of `instruction_keys` where it is null; remove the key file; start the server, which creates a new
-key and records it. A file restored over a retired row is refused ("only a retired record"). A
+key and records it. Also remove any `.instruction-key-*.tmp` beside the key file: a crash between
+the link and the removal of the temporary file leaves a second link to the key. A file restored over a retired row is refused ("only a retired record"). A
 command that does this is not written.
 
 ## The request guard

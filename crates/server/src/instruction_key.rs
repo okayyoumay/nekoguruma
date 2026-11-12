@@ -45,8 +45,15 @@ pub enum KeyError {
         op: &'static str,
         kind: io::ErrorKind,
     },
-    #[error("the instruction key path is not a regular file")]
+    #[error("the instruction key path is not a regular file (a symbolic link is refused)")]
     NotRegularFile,
+    #[error("the instruction key file is not owned by the account the server runs as")]
+    FileNotOwned,
+    #[error(
+        "the instruction key file's directory is owned by neither the account the server runs \
+         as nor root"
+    )]
+    DirectoryNotOwned,
     #[error(
         "the instruction key file is accessible to group or others; it must be readable and \
          writable by the server's account only (mode 0600)"
@@ -104,8 +111,10 @@ impl std::fmt::Debug for InstructionKey {
 impl InstructionKey {
     /// Wraps a signer. Tests, and the signing service later.
     ///
-    /// `shared_crypto::instruction::seal` asks the signer for its public key on every call, so a
-    /// signer that reaches a module or a network must cache it.
+    /// [`Signer`] is synchronous and `seal` calls it on the runtime's thread, so a signer that
+    /// reaches a network or a hardware module must not block there (wrap its call in
+    /// `spawn_blocking`). `shared_crypto::instruction::seal` also asks the signer for its public
+    /// key on every call, so such a signer must cache it.
     pub fn from_signer(signer: Arc<dyn Signer + Send + Sync>) -> InstructionKey {
         InstructionKey { signer }
     }
@@ -137,31 +146,57 @@ impl InstructionKey {
         pool: &PgPool,
     ) -> Result<InstructionKey, KeyError> {
         let path = config.path.as_path();
-        let key = match read_key(path)? {
-            Some(key) => key,
-            None => {
-                // Absent. A recorded key whose file is gone is never replaced silently. A
-                // creator links the file before it records the key, so a row that appeared
-                // since the first read means the file exists now: read it again before
-                // refusing.
-                if active(pool).await?.is_some() {
-                    match read_key(path)? {
-                        Some(key) => key,
-                        None => return Err(KeyError::FileMissing),
-                    }
-                } else {
+        let first = read_key(path)?;
+        let key = if first.is_some() {
+            first
+        } else {
+            // Absent. A recorded key whose file is gone is never replaced silently. A creator
+            // links the file before it records the key, so a row that appeared since the
+            // first read means the file exists now: read it again before refusing.
+            let row = active(pool).await?.is_some();
+            let second = if row { read_key(path)? } else { None };
+            match decide(false, row, second.is_some()) {
+                Decision::UseSecond => second,
+                Decision::Create => {
                     let (key, created) = create_or_load(path)?;
                     if created {
                         tracing::info!("instruction key file created");
                     }
-                    key
+                    Some(key)
                 }
+                Decision::FileMissing => return Err(KeyError::FileMissing),
+                Decision::UseFirst => unreachable!("the file was absent"),
             }
-        };
+        }
+        .expect("a branch above yields a key or returns");
+        // The file's directory entry is durable before the database records its key, on every
+        // path: a key found by a start that did not create it may still be in a creator's cache.
+        sync_directory(directory(path)?).map_err(io_error("sync the directory of"))?;
         pin(pool, &key.public_key()).await?;
         let key = InstructionKey::from_signer(Arc::new(key));
         tracing::info!(key_id = %key.key_id(), "instruction key ready");
         Ok(key)
+    }
+}
+
+/// What `open` does with what it read.
+#[derive(Debug, PartialEq, Eq)]
+enum Decision {
+    UseFirst,
+    UseSecond,
+    Create,
+    FileMissing,
+}
+
+/// The outcome of the two reads of the key file around the database's active-row query: `first`
+/// is whether the first read found the file, `row` whether the database has an active key, and
+/// `second` whether a second read (made only when the file was absent and a row exists) found it.
+fn decide(first: bool, row: bool, second: bool) -> Decision {
+    match (first, row, second) {
+        (true, _, _) => Decision::UseFirst,
+        (false, false, _) => Decision::Create,
+        (false, true, true) => Decision::UseSecond,
+        (false, true, false) => Decision::FileMissing,
     }
 }
 
@@ -209,14 +244,26 @@ fn io_error(op: &'static str) -> impl FnOnce(io::Error) -> KeyError {
     }
 }
 
-/// Refuses a directory that group or others can write to (Unix). On Windows the directory's ACL,
-/// set when the service is installed, is the protection.
+/// The effective user ID of the process.
+#[cfg(unix)]
+fn euid() -> u32 {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
+/// Refuses a directory that group or others can write to, or that belongs to neither the
+/// server's account nor root (Unix; judged by path, and the file inside is judged on its own
+/// handle). On Windows the directory's ACL, set when the service is installed, is the
+/// protection.
 #[cfg(unix)]
 fn check_directory(dir: &Path) -> Result<(), KeyError> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let meta = std::fs::metadata(dir).map_err(io_error("inspect the directory of"))?;
     if !meta.is_dir() {
         return Err(KeyError::Path);
+    }
+    if meta.uid() != euid() && meta.uid() != 0 {
+        return Err(KeyError::DirectoryNotOwned);
     }
     if meta.permissions().mode() & 0o022 != 0 {
         return Err(KeyError::DirectoryWritable);
@@ -233,13 +280,17 @@ fn check_directory(dir: &Path) -> Result<(), KeyError> {
     Ok(())
 }
 
-/// Refuses an opened file that is not a regular file or, on Unix, that has any group or other
-/// permission bit. Judged on the open handle, so the file cannot change between check and read.
+/// Refuses an opened file that is not a regular file or, on Unix, that is not the server
+/// account's own or has any group or other permission bit; on Windows, a reparse point. Judged on
+/// the open handle, so the file cannot change between check and read.
 #[cfg(unix)]
 fn check_file(meta: &std::fs::Metadata) -> Result<(), KeyError> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     if !meta.is_file() {
         return Err(KeyError::NotRegularFile);
+    }
+    if meta.uid() != euid() {
+        return Err(KeyError::FileNotOwned);
     }
     if meta.permissions().mode() & 0o077 != 0 {
         return Err(KeyError::FileTooOpen);
@@ -247,7 +298,17 @@ fn check_file(meta: &std::fs::Metadata) -> Result<(), KeyError> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn check_file(meta: &std::fs::Metadata) -> Result<(), KeyError> {
+    use std::os::windows::fs::MetadataExt;
+    // FILE_ATTRIBUTE_REPARSE_POINT
+    if !meta.is_file() || meta.file_attributes() & 0x400 != 0 {
+        return Err(KeyError::NotRegularFile);
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
 fn check_file(meta: &std::fs::Metadata) -> Result<(), KeyError> {
     if !meta.is_file() {
         return Err(KeyError::NotRegularFile);
@@ -255,14 +316,52 @@ fn check_file(meta: &std::fs::Metadata) -> Result<(), KeyError> {
     Ok(())
 }
 
+/// Opens the key file for reading without following a symbolic link and without blocking on a
+/// FIFO (the same open as the agent's lock files, ADR-262 item 6); [`check_file`] then requires
+/// a regular file. A link, dangling or not, is refused.
+fn open_key_file(path: &Path) -> Result<File, KeyError> {
+    #[cfg(unix)]
+    let options = {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY);
+        options
+    };
+    #[cfg(windows)]
+    let options = {
+        use std::os::windows::fs::OpenOptionsExt;
+        let mut options = OpenOptions::new();
+        // FILE_FLAG_OPEN_REPARSE_POINT: open a reparse point itself, not its target.
+        options.read(true).custom_flags(0x0020_0000);
+        options
+    };
+    #[cfg(not(any(unix, windows)))]
+    let options = {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        options
+    };
+    match options.open(path) {
+        Ok(file) => Ok(file),
+        #[cfg(unix)]
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => Err(KeyError::NotRegularFile),
+        Err(error) => Err(io_error("open")(error)),
+    }
+}
+
 /// Reads the key file: `None` when it is absent. Anything else that stops a read is an error;
 /// a file is never overwritten here.
 pub(crate) fn read_key(path: &Path) -> Result<Option<SigningKey>, KeyError> {
     check_directory(directory(path)?)?;
-    let file = match File::open(path) {
+    let file = match open_key_file(path) {
         Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(io_error("open")(error)),
+        Err(KeyError::Io {
+            kind: io::ErrorKind::NotFound,
+            ..
+        }) => return Ok(None),
+        Err(error) => return Err(error),
     };
     check_file(&file.metadata().map_err(io_error("inspect"))?)?;
     let mut bytes = Zeroizing::new(Vec::new());
@@ -564,19 +663,86 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_symlink_to_a_regular_private_file_is_followed_and_to_a_directory_refused() {
+    fn a_symbolic_link_is_refused_whatever_it_points_to() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("target.key");
-        let (key, _) = create_or_load(&target).unwrap();
+        create_or_load(&target).unwrap();
         let link = key_path(&dir);
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        assert_eq!(
-            read_key(&link).unwrap().unwrap().public_key(),
-            key.public_key()
-        );
+        assert!(matches!(read_key(&link), Err(KeyError::NotRegularFile)));
+        assert!(matches!(
+            create_or_load(&link),
+            Err(KeyError::NotRegularFile)
+        ));
         std::fs::remove_file(&link).unwrap();
         std::os::unix::fs::symlink(dir.path(), &link).unwrap();
         assert!(matches!(read_key(&link), Err(KeyError::NotRegularFile)));
+        std::fs::remove_file(&link).unwrap();
+        // A dangling link is refused too, not treated as absent.
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), &link).unwrap();
+        assert!(matches!(read_key(&link), Err(KeyError::NotRegularFile)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_is_refused_without_blocking() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = key_path(&dir);
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `name` is a valid NUL-terminated path for the duration of the call.
+        if unsafe { libc::mkfifo(name.as_ptr(), 0o600) } != 0 {
+            return; // no FIFOs on this file system
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(matches!(read_key(&path), Err(KeyError::NotRegularFile)));
+        });
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(10)),
+            Ok(true)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_or_directory_of_another_account_is_refused() {
+        if euid() != 0 {
+            return; // chown to another account needs root
+        }
+        let other = 4_242_424;
+        let dir = tempfile::tempdir().unwrap();
+        let path = key_path(&dir);
+        create_or_load(&path).unwrap();
+        std::os::unix::fs::chown(&path, Some(other), None).unwrap();
+        assert!(matches!(read_key(&path), Err(KeyError::FileNotOwned)));
+        assert!(matches!(create_or_load(&path), Err(KeyError::FileNotOwned)));
+        std::os::unix::fs::chown(&path, Some(0), None).unwrap();
+        assert!(read_key(&path).unwrap().is_some());
+
+        std::os::unix::fs::chown(dir.path(), Some(other), None).unwrap();
+        assert!(matches!(read_key(&path), Err(KeyError::DirectoryNotOwned)));
+        assert!(matches!(
+            create_or_load(&path),
+            Err(KeyError::DirectoryNotOwned)
+        ));
+    }
+
+    #[test]
+    fn every_combination_of_the_two_reads_and_the_row_has_one_outcome() {
+        use Decision::*;
+        for (first, row, second, want) in [
+            (true, false, false, UseFirst),
+            (true, false, true, UseFirst),
+            (true, true, false, UseFirst),
+            (true, true, true, UseFirst),
+            (false, false, false, Create),
+            (false, false, true, Create),
+            (false, true, false, FileMissing),
+            (false, true, true, UseSecond),
+        ] {
+            assert_eq!(decide(first, row, second), want, "{first} {row} {second}");
+        }
     }
 
     #[test]

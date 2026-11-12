@@ -36,7 +36,7 @@ It leads the composite primary keys, which also prepares for future sharding (th
 
 **One instruction key per deployment (the exception to the tenant rule)**
 `instruction_keys` has no tenant ID: the server's instruction key belongs to the deployment, not
-to a tenant (ADR-461 Decision item 7), so it is the first table without one. `key_id` (the SHA-256
+to a tenant (ADR-461 Decision item 7), so it is an exception to the rule above (`tenants` itself has none either). `key_id` (the SHA-256
 of the SPKI, 64 lowercase hex digits, the value of `jobs.signing_key_id`) is the primary key, and a
 partial unique index allows one row with `retired_at` null, so the database decides which key is
 active when two servers start together. Retired rows stay as history. The private key is not in

@@ -25,8 +25,12 @@ because every registered agent pins one key.
    exists yet, and a service has no session bus); a built-in state directory (it contradicts
    ADR-456 Decision item 7, and `/var/lib/nekoguruma` is the agent's device root, ADR-460).
 2. **Protection is permissions.** On Unix the server creates the file with mode 0600 and refuses
-   a path that is not a regular file, has any group or other permission bit, or whose directory
-   is writable by group or others; the checks run on the opened file. This is the level of the
+   a path that is not a regular file, is not owned by the server's effective user, or has any
+   group or other permission bit, and a directory that is writable by group or others or owned by
+   neither that user nor root. The file is opened with `O_NOFOLLOW`, `O_NONBLOCK` and `O_NOCTTY`
+   (ADR-262 item 6), so a symbolic link is refused and a FIFO cannot block the start, and its
+   type, owner and mode are judged on the open handle; the directory is judged by path. On
+   Windows the file is opened as a reparse point and refused if it is one. This is the level of the
    database password in the same configuration file (ADR-458 Decision item 2). The reader is the
    server's account alone. A personal installation where a user-mode agent runs under that same
    account is accepted (design 6.6). On Windows the file is a plain file protected by the ACL of
@@ -68,7 +72,9 @@ because every registered agent pins one key.
 7. **Signer.** `server::InstructionKey` wraps an `Arc<dyn shared_crypto::Signer + Send + Sync>`
    (ADR-459 Decision item 1) and is built from one with `InstructionKey::from_signer`, which tests
    and a later signing service use. `seal(&JobInstruction)` is `async` now, because a signing
-   service is network I/O and the job queue's call sites then never change.
+   service is network I/O and the job queue's call sites then never change. `Signer` itself is
+   synchronous, so a network or hardware signer must not block the runtime (it wraps its call in
+   `spawn_blocking`).
    `shared_crypto::instruction::seal` asks the signer for its public key on every call, so a
    signer that reaches a module or a network must cache it.
 8. **Interface.** `AppState.instruction_key` is an `Arc<InstructionKey>` with `public_key()`,

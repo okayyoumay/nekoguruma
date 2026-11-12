@@ -200,7 +200,11 @@ async fn the_database_allows_one_active_key() {
     )
     .execute(&pool)
     .await;
-    assert!(second.is_err(), "a second active row must be refused");
+    let error = second.expect_err("a second active row must be refused");
+    let unique_violation = error
+        .as_database_error()
+        .and_then(|e| e.code().map(|c| c.into_owned()));
+    assert_eq!(unique_violation.as_deref(), Some("23505"), "{error}");
     // A retired row is history, and any number of them may exist.
     for id in ["old-1", "old-2"] {
         sqlx::query(

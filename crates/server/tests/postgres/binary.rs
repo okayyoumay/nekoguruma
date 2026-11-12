@@ -301,6 +301,12 @@ fn a_refused_instruction_key_exits_1_and_never_listens() {
     std::fs::create_dir(&as_dir).unwrap();
     let as_file = dir.path().join("not-a-key");
     std::fs::write(&as_file, b"not a key").unwrap();
+    #[cfg(unix)]
+    {
+        // Owner-only, so that the refusal is about the content and not the mode.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&as_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
     for key in [as_dir, as_file.clone()] {
         let port = free_port();
         let path = write_config_with_key(dir.path(), port, &pg.url(), &key);

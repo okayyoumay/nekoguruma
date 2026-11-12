@@ -104,6 +104,17 @@ impl Limiter {
         self.admit(now)
     }
 
+    /// Gives back the slot of one event recorded at `at` (the `now` its [`Limiter::admit`] was
+    /// given): the latest recorded instant equal to `at` is removed. Nothing is removed when it
+    /// is no longer held, because the window had passed and a later event took its place. The
+    /// login route gives a slot back for a 200 only (ADR-469).
+    pub fn release(&self, at: Instant) {
+        let mut counted = self.counted.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(index) = counted.iter().rposition(|held| *held == at) {
+            counted.remove(index);
+        }
+    }
+
     /// Judges one event at `now`. With `limit` events recorded and the oldest younger than the
     /// window, it is limited, with the seconds until that oldest is a window old, rounded up
     /// (1 to the window's seconds); otherwise it is recorded and counted.
@@ -749,6 +760,32 @@ mod tests {
                 retry_after_secs: 60
             }
         );
+    }
+
+    #[test]
+    fn a_released_slot_is_free_again_and_a_stranger_instant_releases_nothing() {
+        let limiter = Limiter::default();
+        let t0 = Instant::now();
+        for i in 0..10 {
+            assert_eq!(limiter.admit(t0 + secs(i)), Admission::Counted);
+        }
+        assert!(matches!(
+            limiter.admit(t0 + secs(10)),
+            Admission::Limited { .. }
+        ));
+        // An instant that was never recorded, or one already released, gives nothing back.
+        limiter.release(t0 + secs(30));
+        assert!(matches!(
+            limiter.admit(t0 + secs(10)),
+            Admission::Limited { .. }
+        ));
+        limiter.release(t0 + secs(5));
+        limiter.release(t0 + secs(5));
+        assert_eq!(limiter.admit(t0 + secs(10)), Admission::Counted);
+        assert!(matches!(
+            limiter.admit(t0 + secs(10)),
+            Admission::Limited { .. }
+        ));
     }
 
     #[test]

@@ -10,6 +10,8 @@ instruction key (design 11.1, ADR-462).
 `migrations/0005_agent_registration.sql` adds `agent_registration_codes`, the nullable
 `agents.owner_id` and the unique index `agents_public_key_unrevoked` (design 6.4, 6.7, ADR-463,
 ADR-465).
+`migrations/0006_local_users.sql` adds `operator_credentials`, the Argon2id password hashes of the
+local users (design 13.3, ADR-469).
 
 ## How migrations are applied
 
@@ -64,6 +66,13 @@ newest by `(registered_at, id)`, sets `revoked_at` on the others and reports the
 warning before it creates the index. `agents.owner_id` (the operator the agent is registered to) is
 null only on rows that predate registration.
 
+**Passwords are in their own table, without a tenant ID**
+`operator_credentials` is keyed by `operator_id` alone and holds the Argon2id PHC string of a
+local user's password (ADR-469). Like the registration codes it is an exception to the tenant
+rule: the operator row it references already carries the tenant, and every read goes through the
+operator. A login session remembers the SHA-256 of the stored string, so a new password ends the
+sessions of the old one; `updated_at` is for the administrator and is compared with nothing.
+
 **Do not store raw data bodies in the DB**
 `dataset_chunks` holds only object storage keys and hashes.
 `chunk_format` carries a format version. The first version, `records/1`, stores the
@@ -92,7 +101,8 @@ and dropping old partitions (15.1).
   Moving to `LISTEN/NOTIFY` at the L stage needs no extra table either
 - **Monitoring frames**: display only, not recorded (4.6).
   Only captured windows go into `datasets`
-- **Session tokens**: OIDC access tokens are not stored
+- **Session tokens**: OIDC access tokens are not stored. Nor are the operators' login sessions
+  (ADR-469): the server keeps them in memory, so a restart signs everyone out
 
 ## Column values
 

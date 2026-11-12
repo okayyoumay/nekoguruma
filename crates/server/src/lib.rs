@@ -5,7 +5,7 @@
 //! request guard of design 13.3 (ADR-456). It connects to PostgreSQL and applies the embedded
 //! migrations before it binds, so a listening port means a migrated schema (ADR-458). It then
 //! reads or creates the job instruction key, so a listening port also means a usable key
-//! (ADR-462).
+//! (ADR-462). Local users sign in with a password and keep a cookie session (ADR-469).
 
 pub mod config;
 pub mod control;
@@ -14,6 +14,8 @@ pub mod health;
 pub mod hub;
 pub mod instruction_key;
 pub mod local_guard;
+pub mod local_user;
+pub mod operator_session;
 pub mod problem;
 pub mod register;
 pub mod registration;
@@ -40,6 +42,8 @@ use tower::Layer;
 pub use config::{Config, ConfigError, Profile};
 pub use hub::Hub;
 pub use instruction_key::InstructionKey;
+pub use local_user::Hasher;
+pub use operator_session::OperatorSessions;
 pub use session::Sessions;
 
 /// How long a connection may take to deliver a complete request head. A client that opens a
@@ -60,6 +64,10 @@ pub struct AppState {
     pub sessions: Sessions,
     /// The connections of the control channel.
     pub hub: Hub,
+    /// The operators' login sessions (design 13.3, ADR-469); its `Debug` shows the count only.
+    pub operator_sessions: OperatorSessions,
+    /// The password hashing, one at a time (ADR-469).
+    pub hasher: Hasher,
 }
 
 /// The server's routes behind the local profile's request guard (design 13, 13.3).
@@ -71,6 +79,31 @@ pub fn router(state: AppState) -> Router {
     let health = Router::new()
         .route("/api/v1/health", get(health::health))
         .with_state(state.pool.clone());
+    // Login, logout and the whoami route; the session layer is the one every operator route
+    // mounts with `route_layer`, so that an unknown path and a wrong method are answered first.
+    let auth = operator_session::OperatorAuth::new(
+        state.pool.clone(),
+        state.port,
+        state.operator_sessions,
+        state.hasher,
+    );
+    // The layer is mounted on the method router (`MethodRouter::route_layer`), not on the
+    // router: only the former leaves the 405 for a wrong method outside the layer.
+    let signed_in = Router::new().route(
+        operator_session::ME_PATH,
+        get(operator_session::me).route_layer(middleware::from_fn_with_state(
+            auth.clone(),
+            operator_session::require_session,
+        )),
+    );
+    let operator = Router::new()
+        .route(operator_session::LOGIN_PATH, post(operator_session::login))
+        .route(
+            operator_session::LOGOUT_PATH,
+            post(operator_session::logout),
+        )
+        .merge(signed_in)
+        .with_state(auth);
     // The redemption route keeps its own limiter and log gates: one set per router.
     let register = Router::new()
         .route(register::PATH, post(register::register))
@@ -94,6 +127,7 @@ pub fn router(state: AppState) -> Router {
         .route(control::PATH, any(control::upgrade))
         .with_state(control::Control::new(state.sessions, state.hub));
     let routes = health
+        .merge(operator)
         .merge(register)
         .merge(exchange)
         .merge(control)
@@ -127,6 +161,7 @@ pub struct Server {
     router: Router,
     pool: PgPool,
     sessions: Sessions,
+    hasher: Hasher,
     hub: Hub,
     grace: Duration,
 }
@@ -177,6 +212,7 @@ impl Server {
             .port();
         let sessions = Sessions::new();
         let hub = Hub::new();
+        let hasher = Hasher::new();
         Ok(Server {
             listener,
             router: router(AppState {
@@ -185,9 +221,12 @@ impl Server {
                 instruction_key,
                 sessions: sessions.clone(),
                 hub: hub.clone(),
+                operator_sessions: OperatorSessions::new(),
+                hasher: hasher.clone(),
             }),
             pool,
             sessions,
+            hasher,
             hub,
             grace: Duration::from_secs(http.shutdown_grace_secs),
         })
@@ -202,6 +241,13 @@ impl Server {
     /// The session tokens this server issues, which the control channel route accepts.
     pub fn sessions(&self) -> Sessions {
         self.sessions.clone()
+    }
+
+    /// The server's password hasher. Tests only: holding its permit pins a login between its row
+    /// read and its hash.
+    #[doc(hidden)]
+    pub fn hasher(&self) -> Hasher {
+        self.hasher.clone()
     }
 
     /// The pinned origin this server answers on.
@@ -226,6 +272,7 @@ impl Server {
             router,
             pool,
             sessions: _,
+            hasher: _,
             hub,
             grace,
         } = self;

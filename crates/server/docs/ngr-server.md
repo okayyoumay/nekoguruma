@@ -2,11 +2,11 @@
 
 The server (design 3.2, 12, 13). `crates/server` is a library plus the binary `ngr-server`. This
 build serves the local deployment profile (design 13) only: it listens on loopback, uses
-PostgreSQL through sqlx and has two routes, the health probe and the redemption of registration
-codes. The rules of the listener and the
+PostgreSQL through sqlx and serves the health probe, the redemption of registration codes, the
+agent's connection proof and control channel, and the local users' login. The rules of the listener and the
 request guard are in ADR-456; the database, the migrations and the test database are in ADR-458;
 the job instruction key is in ADR-462; registration codes and their command are in ADR-463 and
-ADR-465.
+ADR-465; local users, their command and the operator session are in ADR-469.
 
 ## Running
 
@@ -14,15 +14,20 @@ ADR-465.
 ngr-server --config <file>
 ngr-server registration-code --config <file> --owner <subject> --name <display name> \
     --agent-key <64 hex digits> [--ttl-minutes <1-60>]
+ngr-server user add --config <file> --username <name> --name <display name> [--role <role>]...
+ngr-server user set-password --config <file> --username <name>
+ngr-server user disable --config <file> --username <name>
 ```
 
 The first form serves; `--config` is required there. There is no default path, no search and no
 environment variable. The second issues a registration code ("Issuing a registration code"
 below); `registration-code` is a subcommand only as the first argument, so
 `ngr-server --config registration-code` still serves, with a configuration file of that name.
-Exit codes: 0 after a graceful stop or an issued code, 1 when the configuration is refused or the
+The `user` forms manage local users ("Local users" below), with the same rule for `user`.
+Exit codes: 0 after a graceful stop, an issued code or a user change, 1 when the configuration is refused or the
 server cannot start or run (including a database that cannot be reached or migrated and an
-instruction key that is refused), or when a code cannot be issued, 2 for a usage error.
+instruction key that is refused), or when a code cannot be issued or a user changed, 2 for a
+usage error (for `user add` and `set-password`, also a terminal on standard input).
 
 ## Configuration
 
@@ -272,6 +277,87 @@ value. The 307 carries `Cache-Control: no-store` and an absolute `Location`.
 - Loopback has no server authentication: another OS user that binds the port first answers as
   the server. The guard does not address this.
 
+## Local users
+
+`local_user.rs` and `main.rs`; the decisions are in ADR-469. On the local profile an operator logs
+in with a username and a password instead of OIDC (design 6.4, 13.3). The username is the
+operator's `subject` in the local tenant, whose ID is fixed in the server
+(`4e475200-0000-4000-8000-000000000001`, named `local`); `user add` creates that tenant if it is
+absent. The password is kept only as an Argon2id hash (19 MiB, two passes, one lane, a random
+salt; the parameters are in the stored string) in `operator_credentials`. Like
+`registration-code`, the command writes the database directly: whoever can read the server's
+configuration is the Administrator (design 6.8).
+
+```sh
+printf '%s\n' "$PASSWORD" | ngr-server user add --config <file> --username alice \
+    --name "Alice" --role worker --role admin
+ngr-server user set-password --config <file> --username alice < password.txt
+ngr-server user disable --config <file> --username alice
+```
+
+- The flags come in any order, each at most once except `--role`. The username is 1 to 64 of
+  `a-z`, `0-9`, `.`, `_`, `@` and `-`; the display name is 1 to 128 characters without control
+  characters; a role is one of `viewer`, `worker`, `reprogrammer`, `remote`, `approver` and
+  `admin`, each at most once, and no role is given implicitly. Anything else is exit 2 with the
+  usage text, before standard input or the database is touched.
+- `add` and `set-password` read the password from standard input, never from an argument. A
+  terminal on standard input is exit 2 with a hint to pipe or redirect it, since the password
+  would echo. One trailing line break (LF or CRLF) is removed and nothing else is trimmed. The
+  password must be valid UTF-8 without a byte order mark, one line, without control characters,
+  at least 12 characters and at most 1024 bytes; otherwise the command exits 1 and writes nothing.
+- The configuration, the database connection and the check that the applied migrations equal the
+  embedded ones are those of `registration-code`: the command never migrates. `add` refuses a
+  username that exists in the local tenant (exit 1, also when two run at once); it then writes
+  the tenant if absent, the operator, its roles and the credential in one transaction.
+  `set-password` refuses an unknown or a disabled operator and otherwise replaces (or creates)
+  the credential. `disable` refuses an unknown operator, sets `disabled_at` (an operator already
+  disabled is exit 0 and unchanged) and keeps the credential. A disable or a new password ends
+  the operator's open sessions at their next request.
+- Standard output is one JSON line after the commit: `add` prints
+  `{"operator_id":...,"username":...,"roles":[...]}`, `set-password` prints the ID and the
+  username, `disable` adds `disabled_at` and `already_disabled`. If writing the line fails, the
+  change stays and the exit is 1. The password and its hash are never printed or logged.
+
+## Logging in
+
+`operator_session.rs`; the decisions are in ADR-469.
+
+- **`POST /api/v1/login`, in this order, the first step that applies answers.** The guard; the
+  method (405 with `Allow: POST`); the Origin (403 "Origin required" unless it is the pinned
+  origin); the body (4096 bytes within 5 seconds: 413, 408, 400); the shape (an `application/json`
+  object with exactly a string `username` and a string `password`: 400); the lengths (a username
+  of 1 to 256 bytes without control characters, a password of 1 to 1024 bytes: 400); the limiter
+  (ten admitted attempts within a sliding minute; while ten are recorded every attempt is 429
+  with `Retry-After`, a right password included, and only a 200 gives its place back); one read
+  of the operator, its credential and its roles (503, 500); one Argon2 verification; then the
+  session. An unknown username, an operator without a credential, a disabled operator and a
+  wrong password get one 401 body with `WWW-Authenticate: Ngr-Session`, and each costs one
+  verification (against a fixed dummy hash when there is none to check). A stored hash that is
+  not an Argon2id string is 500. Verifications run one at a time on the blocking pool.
+- **The session.** A 200 answers `{"operatorId","username","displayName","roles"}` and sets
+  `ngr_session` (43 base64url characters; `HttpOnly; SameSite=Strict; Path=/`, no `Max-Age`). The
+  server keeps the token's SHA-256 with the operator, the tenant and the SHA-256 of the verified
+  stored hash. Sessions a login request presents are ended, never adopted. A session ends 8 hours
+  after login or 30 minutes after its last use, judged on both tokio's clock and the wall clock
+  (exactly at the limit counts as ended); an operator keeps at most 16, and the next login drops
+  the least recently used. A restart ends them all.
+- **The session layer** sits on each operator route's method router (`MethodRouter::route_layer`),
+  so 404 and 405 answer first. Then: a method other than GET or HEAD needs the pinned Origin
+  (403); exactly one well-formed `ngr_session` among the request's cookies (other pairs are
+  ignored; none is 401, a malformed or repeated one is 401 that clears it); the session, judged
+  at the request's arrival (401, cleared and removed when it expired); one read of the operator's
+  `disabled_at` and stored hash (503 keeps the session and does not refresh it); a disabled or
+  deleted operator, or a stored hash whose SHA-256 differs from the session's, is 401 and ends it;
+  a session removed meanwhile is 401. Only a request that passes refreshes the last use.
+- **`POST /api/v1/logout`** needs the pinned Origin and an empty body, ends every well-formed
+  token presented and clears the cookie: 204, with or without a session, and no database access.
+  **`GET /api/v1/me`** answers the session's operator with its name and roles read at that
+  request.
+- **Logging.** The reasons `unknown_user`, `no_credential`, `disabled`, `wrong_password` (with the
+  operator ID when there is one), `login limited`, and `login` and `logout` at info, each gated
+  once a minute where they are warnings. The password, the typed username of a failed login, the
+  cookie, the token and the hashes are never logged.
+
 ## Routes
 
 - `GET /api/v1/health` (`api/openapi.yaml`): runs `SELECT 1` on the pool. 200
@@ -286,6 +372,9 @@ value. The 307 carries `Cache-Control: no-store` and an absolute `Location`.
   agent's connection proof" below.
 - `GET /api/v1/agent/control` (`api/asyncapi.yaml`, `agentControl`; `control.rs`, `hub.rs`;
   ADR-466, ADR-468): the agent's WebSocket. See "The control channel" below.
+- `POST /api/v1/login`, `POST /api/v1/logout` and `GET /api/v1/me` (`api/openapi.yaml`;
+  `operator_session.rs`; ADR-469): the local users' login and the operator session. See "Logging
+  in" above.
 
 ## The agent's connection proof
 
@@ -502,5 +591,25 @@ a new migration file rebuilds the crate. How migrations are written and applied 
   the exact seconds, one slot freeing at 60 seconds, 50 threads at one instant), its shape table,
   its proof checks and its log gates. The tests may run as
   root, so a refusal is provoked by mode bits or by a directory at the path, never by mode 000.
+- `local_users.rs` (database) covers the local users: the login's order (the guard, 405, the
+  Origin, the body limits, the shape and the lengths before any database access), one
+  byte-identical 401 for an unknown user, no credential, a disabled operator and a wrong password,
+  each waiting for a hash, and an unknown user with the dummy's password; a hash that is not
+  Argon2id (500); the limiter (eleven concurrent wrong logins give ten 401s and one 429, a right
+  password refused while it is full, a failed database read keeping its place, a client that
+  disconnects during the hash keeping its place); the whoami body and cookie; a login replacing
+  presented sessions; sixteen sessions per operator; two logins at once; a disable or a new
+  password committed during a login; a disable, a deleted operator or credential and a new
+  password (also the same text) ending a session, and a changed `updated_at` alone not ending it;
+  a logout during the per-request read; logout without a database and its Origin, body and
+  method rules; the idle and the absolute limit across clock jumps; and that the role list in the
+  code is the migration's CHECK. Its `command` tests run `ngr-server user` as a process: 22 usage
+  errors (exit 2), a terminal on standard input (exit 2; Linux only, through util-linux
+  `script`), each refused password (exit 1, nothing written), the configuration, database and
+  migration checks, two `add`s of one username at once, the JSON lines, and a failed write to
+  standard output after the commit. The unit tests in `operator_session.rs` cover the cookie
+  parsing, the session table's limits at each boundary and one nanosecond before it, the clocks,
+  eviction, and the layer's order with a dead pool; those in `local_user.rs` the password rules
+  and the dummy hash's parameters.
 - The HTTP/1-only test must also pass in a workspace build, where hyper's HTTP/2 is enabled:
   build with `cargo test --workspace --no-run` and run the `postgres` test binary.

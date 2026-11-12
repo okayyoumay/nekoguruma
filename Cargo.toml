@@ -97,6 +97,14 @@ winreg = "0.56"
 [profile.dev.package.starlark_syntax]
 opt-level = 1
 
+# Argon2id at the local users' policy (19 MiB, two passes) takes seconds when built without
+# optimisation, which would make every login in a debug build of the server's tests crawl
+# (ADR-469).
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3
+
 [profile.release]
 lto = "thin"
 panic = "unwind" # Not abort, because catch_unwind is used at the FFI boundary

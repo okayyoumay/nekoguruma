@@ -69,8 +69,9 @@ the terminal rule and the accepted cookie risk below.
    extends nothing, one that steps forward ends sessions early. Only a request that passes the
    whole check refreshes the last use, to the later of its own arrival and the recorded one.
    Sixteen live sessions per operator at most; the next login drops the least recently used.
-8. **Every authenticated request reads the operator's state.** The session layer, in front of
-   every operator route, judges in this order: the route and the method (404, 405), the Origin
+8. **Every authenticated request reads the operator's state.** The session layer sits on each
+   operator route's method router (axum's `MethodRouter::route_layer`; the router-wide layer would
+   judge a wrong method first) and judges in this order: the route and the method (404, 405), the Origin
    (item 9), the cookie, the session at one instant (expiry), one read of the operator's
    `disabled_at` and stored hash, the session again, then the handler. A disabled or deleted
    operator, or a credential whose SHA-256 differs from the one recorded at login, ends that

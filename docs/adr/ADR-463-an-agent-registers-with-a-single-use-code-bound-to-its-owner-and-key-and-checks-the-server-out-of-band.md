@@ -2,7 +2,7 @@
 
 **Date:** 2026-11-12
 **Status:** Accepted (items 5 and 14 detailed by ADR-465; item 13's transport rule applied to the audience by ADR-466; item 5's limiter rule not applied to passwords, ADR-469; items 13, 16, 17 and 18 detailed by ADR-470, item 16's record gaining `allow_remote` and item 18's exit 6 covering a signature that does not verify)
-**Affects:** design 6.4, 6.6, 6.7, 11.1, 13.3, 14.4; `api/openapi.yaml` (`/v1/agents/register`, `AgentRegistration`, `Agent.mode`); `db/migrations/0004_agent_mode_device.sql`, `db/README.md`; `crates/shared-crypto` (`registration`); `crates/shared-proto` (`AgentMode`); `docs/glossary.md`; the server's registration code, `registration-code` subcommand (`main.rs` usage, `crates/server/docs/ngr-server.md` "Running"; ADR-456 item 7 stays, since `--config` stays) and route, and the agent's `register` command (later work); relies on ADR-458 (the command never migrates); annotates ADR-459 (Decision item 5), ADR-461 (item 11) and ADR-462 (item 8 and the first-use consequence)
+**Affects:** design 6.4, 6.6, 6.7, 11.1, 13.3, 14.4; `api/openapi.yaml` (`/v1/agents/register`, `AgentRegistration`, `Agent.mode`); `db/migrations/0004_agent_mode_device.sql`, `db/README.md`; `crates/shared-crypto` (`registration`); `crates/shared-proto` (`AgentMode`); `docs/glossary.md`; the server's registration code, `registration-code` subcommand (`main.rs` usage, `crates/server/docs/ngr-server.md` "Running"; ADR-456 item 7 stays, since `--config` stays) and route, and the agent's `register` command (detailed by ADR-470); relies on ADR-458 (the command never migrates); annotates ADR-459 (Decision item 5), ADR-461 (item 11) and ADR-462 (item 8 and the first-use consequence)
 
 ## Context
 

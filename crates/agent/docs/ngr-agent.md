@@ -1,9 +1,11 @@
 # `ngr-agent`
 
-`ngr-agent` is the binary of the `agent` crate (design 3.3). It has three commands. `run` runs the procedure of a variant's document on a VCI, and `identify` runs
+`ngr-agent` is the binary of the `agent` crate (design 3.3). It has four commands. `run` runs the procedure of a variant's document on a VCI, and `identify` runs
 an identification plan's functional presence requests, VIN reads and ECU reads; both are for local
 end-to-end runs and tests (below). `identity` creates the agent's key and prints its public key
-("`ngr-agent identity`" below). It does not connect to the server or take jobs from it. A procedure job is always a document: a bare program has no
+("`ngr-agent identity`" below), and `register` registers that key with the server and stores the
+registration record ("`ngr-agent register`" below). It runs no control channel session and takes
+no jobs from the server. A procedure job is always a document: a bare program has no
 declarations to decode with and no declared link, so `run` takes none.
 
 ## `ngr-agent run`
@@ -323,7 +325,7 @@ as the registration record. `registration.rs` holds the flow, the record and the
 | Exit status | Meaning |
 |---|---|
 | 0 | Registered and stored |
-| 1 | Cannot register as asked: no key store, a code that is not one, a key just created, a refusal (403, 429 and any other 4xx, a redirect, an unexpected status), or a 201 that is not a registration answer |
+| 1 | Cannot register as asked: no key store, a code that is not one, a key just created, a refusal (403, 429 and any other 4xx, a redirect, an unexpected status; a 421 adds that `--server` is not the server's own origin), or a 201 that is not a registration answer |
 | 2 | Invalid command line, including a terminal on standard input |
 | 3 | Unavailable or the outcome is unknown, with the local record unchanged. The text says which: nothing was sent (no connection, the lock held, the state directory unusable); the outcome is unknown (408, 5xx, no complete answer), in which case issue a new code if the same one is refused; or registered at the server but not stored, in which case a new code is needed |
 | 4 | The agent key is present and cannot be used |

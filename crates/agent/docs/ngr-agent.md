@@ -285,12 +285,14 @@ as the registration record. `registration.rs` holds the flow, the record and the
   - at most 256 bytes;
   - parsed with `RegistrationCode::parse`;
   - a terminal on standard input is exit 2, with a hint to pipe or redirect it.
+  - the `--code-file` path is taken as given, as `ngr-server` takes `--config`: a path need not
+    be UTF-8, while every other value must be.
 
   The code, argument values and anything the server sent other than the status and
   `Retry-After` are never printed or logged.
 - **The request** is one HTTP/1 request over a TCP stream to `127.0.0.1:<port>`: no pool, no name
   resolution, no retry and no Origin. It has these limits:
-  - 5 seconds to connect and 30 in all;
+  - 5 seconds to connect, and 30 seconds in all from the start of the connect;
   - a head of at most 16 KiB and 64 fields;
   - a body of at most 4096 bytes.
 - **A 201** is read strictly (`AgentRegistration`, no other field) and checked in order:
@@ -315,7 +317,8 @@ as the registration record. `registration.rs` holds the flow, the record and the
 - **Standard output** on success is one JSON line: `agent_id`, `owner_id`, `preset`,
   `allow_remote`, `server_origin`, `instruction_key_id`, `agent_key_fingerprint` and `replaced`.
 - **A release build** has no key store yet, so the command exits 1 there without a connection
-  and without touching the state directory.
+  and without creating any registration or identity state (the operational log's directory is
+  created at start, as for every command).
 
 | Exit status | Meaning |
 |---|---|

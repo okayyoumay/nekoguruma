@@ -26,7 +26,7 @@ exit 6 needs an answerer that returns a 201 with another key or a forged signatu
    the existing-record check; the temporary file; one request; the answer's checks; the write.
    The first step that fails decides the exit code, and every step that can fail without the
    server is done before the request. The key comes before the lock, so a build without a key
-   store exits 1 without touching the state directory; ADR-463 item 16's lock "for the whole
+   store exits 1 without creating any registration or identity state; ADR-463 item 16's lock "for the whole
    command" is read as from the record check to the rename. A key that this run had to create
    stops the command before anything is sent (exit 1), since no code can have been issued for
    it yet.
@@ -40,7 +40,7 @@ exit 6 needs an answerer that returns a 201 with another key or a forged signatu
 4. **One request over a stream the agent opens.** hyper's HTTP/1 client connection over a TCP
    stream to `127.0.0.1:<port>`, with no pool, no name resolution, no retry and no redirect
    followed; `Host` is the pinned authority and no Origin is sent. Limits: 5 seconds to connect,
-   30 seconds in all, a head of at most 16 KiB and 64 fields, a body of at most 4096 bytes. The
+   30 seconds in all from the start of the connect, a head of at most 16 KiB and 64 fields, a body of at most 4096 bytes. The
    origin rule is `Audience::canonicalise` followed by an exact comparison with `http://127.0.0.1`
    or `http://127.0.0.1:<port>`, so port 80 and the form without a port, which is how the server
    pins port 80 (ADR-456), are accepted.

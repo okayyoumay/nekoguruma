@@ -638,7 +638,9 @@ fn without_a_store_the_exit_is_1_with_no_connection_and_an_empty_state() {
     let env = Env::new();
     let stub = silent();
     let mut command = env.command();
-    command.env_remove(KEY_STORE_VAR).env_remove(STATE_DIR_VAR);
+    // A debug build keeps the state directory override and loses only the store selection, so
+    // that the binary would write into `env.state` if it touched the state at all.
+    command.env_remove(KEY_STORE_VAR);
     command.args(register_args(stub.port, KEY));
     // Standard input stays open and unread: the command must not wait for it.
     let mut child = command
@@ -656,6 +658,18 @@ fn without_a_store_the_exit_is_1_with_no_connection_and_an_empty_state() {
     assert!(stderr.contains("register: no key store"), "{stderr}");
     assert!(stub.finish().is_none());
     assert!(is_empty_dir(env.state.path()));
+    // The state root the build really uses: the override's directory in a debug build, the
+    // account's own location in a release build (the log directory may exist beside them).
+    let own_root = env
+        .home
+        .path()
+        .join(if cfg!(windows) { "local" } else { "xdg" })
+        .join("nekoguruma");
+    for root in [env.state.path().to_owned(), own_root] {
+        for sub in ["registration", "identity"] {
+            assert!(!root.join(sub).exists(), "{sub} under {}", root.display());
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -959,32 +973,47 @@ mod with_store {
         }
     }
 
-    /// C8: a standard input that never ends makes the command wait, and it holds no lock.
+    /// C8: a standard input that never ends makes the command wait, and it holds no lock: a
+    /// second registration with a code file takes the lock and reaches the server meanwhile, and
+    /// the first goes on only when its input ends.
     #[test]
-    fn a_standard_input_that_never_ends_makes_the_command_wait() {
+    fn a_standard_input_that_never_ends_makes_the_command_wait_without_a_lock() {
         let env = Env::new();
         env.fingerprint();
-        let stub = silent();
-        let mut child = env
+        let silent_stub = silent();
+        let mut first = env
             .command()
-            .args(register_args(stub.port, KEY))
+            .args(register_args(silent_stub.port, KEY))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let held = child.stdin.take().unwrap();
-        std::thread::sleep(Duration::from_millis(700));
+        let held = first.stdin.take().unwrap();
+
+        let outside = tempfile::tempdir().unwrap();
+        let file = outside.path().join("code.txt");
+        std::fs::write(&file, code().as_str()).unwrap();
+        let refusing = Stub::raw(http(403, &[], b""));
+        let mut command = env.command();
+        command
+            .args(register_args(refusing.port, KEY))
+            .arg("--code-file")
+            .arg(&file);
+        let second = run_with(command, b"");
+        // It took the lock (the first holds none) and reached the server.
+        assert_exit(&second, 1, "refused: the code is wrong");
+        assert!(refusing.finish().is_some());
         assert!(
-            child.try_wait().unwrap().is_none(),
-            "the command waits for its input"
+            first.try_wait().unwrap().is_none(),
+            "the first still waits for its input"
         );
-        // No lock is held and no directory made while it waits.
-        assert!(!env.registration_dir().exists());
-        child.kill().unwrap();
-        let _ = child.wait();
+
+        // Its input ends: it reads nothing and says so.
         drop(held);
-        assert!(stub.finish().is_none());
+        let first = finish(first);
+        assert_exit(&first, 1, "no registration code on standard input");
+        assert!(silent_stub.finish().is_none());
     }
 
     /// L2: a second registration finds the lock held, exits 3 and sends nothing. L3: when the
@@ -1390,6 +1419,63 @@ mod with_store {
         assert!(stderr.contains(&key_id(&impostor)), "{stderr}");
         assert!(stub.finish().is_some());
         assert_nothing_stored(&env);
+    }
+
+    /// V3 comes before V4, V5 and V6: an impostor's key is exit 6 whatever else is wrong with
+    /// the answer, including a key ID that is the operator's `--server-key`.
+    #[test]
+    fn another_servers_key_is_exit_6_before_the_other_field_checks() {
+        let env = Env::new();
+        env.fingerprint();
+        let operator_given = new_server();
+        let impostor = new_server();
+        let given = key_id(&operator_given);
+        type Change = Box<dyn FnOnce(&mut serde_json::Value) + Send>;
+        let cases: Vec<Change> = vec![
+            Box::new({
+                let given = given.clone();
+                move |v| v["instructionKeyId"] = given.into()
+            }),
+            Box::new(|v| v["agentId"] = "not-a-uuid".into()),
+            Box::new(|v| v["signature"] = "AAAA".into()),
+        ];
+        for change in cases {
+            let stub = honest(&impostor, change);
+            let output = register(&env, &stub, &given, code().as_str(), &[]);
+            assert_exit(&output, 6, "");
+            assert!(text(&output.stderr).contains(&key_id(&impostor)));
+            assert!(stub.finish().is_some());
+            assert_nothing_stored(&env);
+        }
+    }
+
+    /// A closed standard error keeps the documented exit status.
+    #[cfg(unix)]
+    #[test]
+    fn a_closed_standard_error_still_exits_0() {
+        let env = Env::new();
+        env.fingerprint();
+        let server = new_server();
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let stub = {
+            let server = server.clone();
+            Stub::start(move |seen, stream| {
+                reached_tx.send(()).unwrap();
+                go_rx.recv_timeout(LIMIT).unwrap();
+                let _ = stream.write_all(&created(&answer(seen, &server)));
+            })
+        };
+        let mut command = env.command();
+        command.args(register_args(stub.port, &key_id(&server)));
+        let mut child = spawn_with(command, code().as_str().as_bytes());
+        reached_rx.recv_timeout(LIMIT).unwrap();
+        drop(child.stderr.take());
+        go_tx.send(()).unwrap();
+        let output = finish(child);
+        stub.finish();
+        assert_eq!(output.status.code(), Some(0));
+        assert!(Record::read(&env.record_path()).is_ok());
     }
 
     /// V7: a signature that does not verify is exit 6; a K3 server key that is well-formed but

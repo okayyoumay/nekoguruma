@@ -254,7 +254,8 @@ fn register(args: RegisterArgs) -> ExitCode {
             // A terminal would show the code as it is typed and keep it in the shell's history
             // of the session; the code comes from a pipe, a redirect or a file.
             if std::io::stdin().is_terminal() {
-                eprintln!(
+                let _ = writeln!(
+                    std::io::stderr(),
                     "ngr-agent: register: standard input is a terminal; pipe or redirect the \
                      code to it, or use --code-file\n\n{USAGE}"
                 );
@@ -267,7 +268,8 @@ fn register(args: RegisterArgs) -> ExitCode {
         Ok(done) => {
             tracing::info!(agent_id = %done.record.agent_id, "agent registered");
             if done.durability == agent::registration::record::Durability::DirectoryNotSynced {
-                eprintln!(
+                let _ = writeln!(
+                    std::io::stderr(),
                     "ngr-agent: register: warning: the registration is stored, but syncing its \
                      directory failed"
                 );
@@ -277,7 +279,8 @@ fn register(args: RegisterArgs) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(error) => {
-            eprintln!("ngr-agent: register: {error}");
+            // A closed standard error keeps the documented exit status.
+            let _ = writeln!(std::io::stderr(), "ngr-agent: register: {error}");
             ExitCode::from(error.exit_code())
         }
     }
@@ -946,6 +949,35 @@ mod tests {
             ]),
             expected(true, Some("code.txt"))
         );
+    }
+
+    /// A path need not be UTF-8: `--code-file` takes one as it is.
+    #[cfg(unix)]
+    #[test]
+    fn a_register_code_file_may_be_a_path_that_is_not_utf8() {
+        use std::os::unix::ffi::OsStringExt;
+        let key = "ab".repeat(32);
+        let path = OsString::from_vec(vec![b'c', 0xff, b'd']);
+        let mut args: Vec<OsString> = [
+            "register",
+            "--mode",
+            "user",
+            "--server",
+            "http://127.0.0.1:1",
+            "--server-key",
+            key.as_str(),
+            "--code-file",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        args.push(path.clone());
+        match parse_args(args) {
+            Ok(Command::Register(parsed)) => {
+                assert_eq!(parsed.code_file, Some(PathBuf::from(path)));
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     /// A5: the message names a `--flag` only and never echoes another argument.

@@ -388,6 +388,32 @@ mod tests {
         );
     }
 
+    /// V3 comes before V4, V5 and V6: another key is exit 6 whatever else is wrong.
+    #[test]
+    fn the_key_check_comes_before_the_later_field_checks() {
+        let f = Fixture::new();
+        let impostor = SigningKey::generate().unwrap();
+        let key = impostor.public_key();
+        type Change = fn(&mut serde_json::Value, &str);
+        let changes: [Change; 5] = [
+            // The key ID is the one the operator gave.
+            |v, given| v["instructionKeyId"] = given.into(),
+            |v, _| v["agentId"] = "not-a-uuid".into(),
+            |v, _| v["ownerId"] = "".into(),
+            |v, _| v["preset"] = "other".into(),
+            |v, _| v["signature"] = "AAAA".into(),
+        ];
+        for change in changes {
+            let mut answer = f.answer();
+            answer["instructionKey"] = key.to_spki_pem().into();
+            answer["instructionKeyId"] = key.fingerprint_hex().into();
+            change(&mut answer, &f.server.public_key().fingerprint_hex());
+            let error = f.check(&answer).unwrap_err();
+            assert_eq!(error.exit_code(), 6, "{answer}");
+            assert!(matches!(error, AnswerError::KeyMismatch { .. }));
+        }
+    }
+
     /// V4 and V5.
     #[test]
     fn the_key_id_and_the_assigned_values_are_checked() {

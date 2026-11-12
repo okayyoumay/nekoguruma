@@ -23,6 +23,7 @@ use hyper::{HeaderMap, Method};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 /// How long the connect may take.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -53,7 +54,6 @@ impl Default for Timeouts {
 }
 
 /// A POST to `127.0.0.1:<port>`.
-#[derive(Debug)]
 pub struct PostRequest<'a> {
     pub port: u16,
     /// The `Host` header's value.
@@ -61,6 +61,18 @@ pub struct PostRequest<'a> {
     pub path: &'a str,
     /// The JSON body.
     pub body: Vec<u8>,
+}
+
+/// The body holds the registration code, so only its length is shown.
+impl std::fmt::Debug for PostRequest<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PostRequest")
+            .field("port", &self.port)
+            .field("host", &self.host)
+            .field("path", &self.path)
+            .field("body_len", &self.body.len())
+            .finish()
+    }
 }
 
 /// What came back.
@@ -111,16 +123,26 @@ pub async fn post(
     body_status: u16,
     timeouts: Timeouts,
 ) -> Result<Reply, PostError> {
+    // One deadline from before the connect: the connect within its limit, everything within the
+    // total.
+    let (connect_by, deadline) = deadlines(Instant::now(), timeouts);
     // The address is a literal: no name is resolved.
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, request.port));
-    let stream = match tokio::time::timeout(timeouts.connect, TcpStream::connect(addr)).await {
+    let stream = match tokio::time::timeout_at(connect_by, TcpStream::connect(addr)).await {
         Err(_) => return Err(PostError::ConnectTimeout),
         Ok(Err(error)) => return Err(PostError::NotSent(error.kind())),
         Ok(Ok(stream)) => stream,
     };
-    tokio::time::timeout(timeouts.total, exchange(stream, request, body_status))
+    tokio::time::timeout_at(deadline, exchange(stream, request, body_status))
         .await
         .unwrap_or(Err(PostError::Unknown))
+}
+
+/// When the connect must be done and when the whole call must be, from `start`. The connect limit
+/// never passes the total.
+fn deadlines(start: Instant, timeouts: Timeouts) -> (Instant, Instant) {
+    let deadline = start + timeouts.total;
+    ((start + timeouts.connect).min(deadline), deadline)
 }
 
 async fn exchange(
@@ -312,13 +334,81 @@ mod tests {
         });
         let reply = run(declared, 201, Timeouts::default()).unwrap();
         assert_eq!(reply.body, Some(ReplyBody::TooLarge));
+        // Streamed, and the connection stays open: the limit is applied as the bytes arrive, so
+        // a client that read to the end first would run into the total limit instead.
         let streamed = stub(|mut s| {
             s.write_all(b"HTTP/1.1 201 Created\r\nConnection: close\r\n\r\n")
                 .unwrap();
             let _ = s.write_all(&vec![b'a'; MAX_BODY + 1]);
+            std::thread::sleep(Duration::from_secs(3));
         });
+        let started = std::time::Instant::now();
         let reply = run(streamed, 201, Timeouts::default()).unwrap();
         assert_eq!(reply.body, Some(ReplyBody::TooLarge));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// H4: a body that comes too slowly, and one that never ends but stays under the limit, are
+    /// unknown outcomes within the total limit.
+    #[test]
+    fn a_body_that_is_late_or_never_ends_is_unknown_within_the_limit() {
+        let timeouts = Timeouts {
+            connect: Duration::from_secs(5),
+            total: Duration::from_millis(400),
+        };
+        let slow = stub(|mut s| {
+            s.write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 10\r\n\r\nabc")
+                .unwrap();
+            std::thread::sleep(Duration::from_secs(3));
+        });
+        let endless = stub(|mut s| {
+            s.write_all(b"HTTP/1.1 201 Created\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            for _ in 0..30 {
+                if s.write_all(&[b'a'; 10]).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+        for port in [slow, endless] {
+            let started = std::time::Instant::now();
+            assert_eq!(run(port, 201, timeouts).unwrap_err(), PostError::Unknown);
+            assert!(started.elapsed() < Duration::from_secs(2));
+        }
+    }
+
+    #[test]
+    fn the_total_limit_counts_from_before_the_connect() {
+        let start = Instant::now();
+        let both = |connect, total| Timeouts {
+            connect: Duration::from_secs(connect),
+            total: Duration::from_secs(total),
+        };
+        assert_eq!(
+            deadlines(start, both(5, 30)),
+            (
+                start + Duration::from_secs(5),
+                start + Duration::from_secs(30)
+            )
+        );
+        // A connect limit past the total ends with the total.
+        assert_eq!(
+            deadlines(start, both(40, 30)),
+            (
+                start + Duration::from_secs(30),
+                start + Duration::from_secs(30)
+            )
+        );
+    }
+
+    #[test]
+    fn a_debug_of_a_request_shows_the_body_length_only() {
+        let mut request = request(1);
+        request.body = b"secret-code-text".to_vec();
+        let shown = format!("{request:?}");
+        assert!(!shown.contains("secret"), "{shown}");
+        assert!(shown.contains("body_len: 16"), "{shown}");
     }
 
     #[test]

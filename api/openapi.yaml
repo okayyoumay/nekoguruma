@@ -330,7 +330,13 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Operator' }
         '400': { $ref: '#/components/responses/Problem' }
-        '401': { $ref: '#/components/responses/Problem' }
+        '401':
+          description: One body for an unknown username, an operator without a password, a disabled operator and a wrong password
+          headers:
+            WWW-Authenticate: { schema: { type: string }, description: '`Ngr-Session`' }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '403': { $ref: '#/components/responses/Problem' }
         '405':
           description: A method other than POST
@@ -382,7 +388,8 @@ paths:
         request. Like every operator route on the local deployment it needs a live session:
         without one, with a malformed or repeated `ngr_session`, after the session expired, or
         once the operator was disabled or its password set again, the answer is **401**, which
-        clears a presented cookie. A database failure during the session check is **503**.
+        clears a presented cookie. A database failure during the session check or the read is **503**
+        (**500** for a fault of the query itself).
       security:
         - operatorSession: []
       responses:
@@ -391,7 +398,18 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Operator' }
-        '401': { $ref: '#/components/responses/Problem' }
+        '401':
+          description: No live session; a presented `ngr_session` is cleared
+          headers:
+            WWW-Authenticate: { schema: { type: string }, description: '`Ngr-Session`' }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '405':
+          description: A method other than GET or HEAD
+          headers:
+            Allow: { schema: { type: string }, description: '`GET,HEAD`' }
+        '500': { $ref: '#/components/responses/Problem' }
         '503': { $ref: '#/components/responses/Problem' }
 
   /v1/agent/challenge:

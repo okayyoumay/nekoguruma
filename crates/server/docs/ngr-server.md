@@ -299,7 +299,8 @@ ngr-server user disable --config <file> --username alice
   `a-z`, `0-9`, `.`, `_`, `@` and `-`; the display name is 1 to 128 characters without control
   characters; a role is one of `viewer`, `worker`, `reprogrammer`, `remote`, `approver` and
   `admin`, each at most once, and no role is given implicitly. Anything else is exit 2 with the
-  usage text, before standard input or the database is touched.
+  usage text, before standard input or the database is touched. The configuration path is taken
+  as given, as for `registration-code`: a path need not be UTF-8.
 - `add` and `set-password` read the password from standard input, never from an argument. A
   terminal on standard input is exit 2 with a hint to pipe or redirect it, since the password
   would echo. One trailing line break (LF or CRLF) is removed and nothing else is trimmed. The

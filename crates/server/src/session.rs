@@ -1053,9 +1053,13 @@ mod tests {
         // Another agent ID, challenge and nonce in the request than in the proof.
         let id2 = "ffffffff-4e5f-4a6b-8c7d-0123456789ab";
         let with = |f: &dyn Fn(&mut Shaped)| {
+            // Each field named: Rust 1.94 (the MSRV) hits an internal compiler error on the
+            // struct-update form here.
             let mut s = Shaped {
                 agent_id: c.shaped.agent_id.clone(),
-                ..c.shaped
+                challenge: c.shaped.challenge,
+                nonce: c.shaped.nonce,
+                proof: c.shaped.proof,
             };
             f(&mut s);
             judge(row(&c.key, false), &s, &c.audience)

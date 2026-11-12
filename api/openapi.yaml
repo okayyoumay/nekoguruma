@@ -9,7 +9,10 @@ info:
     - `/v1/sovd/**` : Compliant with the SOVD resource model
     - `/v1/**`      : Specific to this system (jobs, agents, artifacts, extensions)
 
-    Authentication is OIDC (Bearer). This is consistent with SOVD assuming OAuth2.
+    Authentication is OIDC (Bearer) on the standard deployment, which is consistent with SOVD
+    assuming OAuth2. The local deployment authenticates local users instead (13, 13.3,
+    ADR-469): `POST /v1/login` sets the `ngr_session` cookie, and every operator route takes
+    that cookie in place of a bearer token.
 
 servers:
   - url: https://example.com/api
@@ -19,6 +22,7 @@ servers:
 
 security:
   - bearerAuth: []
+  - operatorSession: []
 
 tags:
   - name: jobs
@@ -280,6 +284,114 @@ paths:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
         '500': { $ref: '#/components/responses/Problem' }
+        '503': { $ref: '#/components/responses/Problem' }
+
+  /v1/login:
+    post:
+      tags: [system]
+      summary: Log a local user in (13.3, ADR-469)
+      description: |
+        Local deployment only. Checks a username and a password and, when they hold, starts an
+        operator session: the answer sets the cookie `ngr_session` (`HttpOnly`,
+        `SameSite=Strict`, `Path=/`, no `Max-Age`), which every operator route then takes. The
+        session ends 8 hours after login or 30 minutes after its last use, whichever comes
+        first, at a logout, when the operator is disabled or its password is set again, and when
+        the server restarts. A token the request presents is never adopted, and a live session
+        it presents is ended.
+
+        The checks run in this order: the request guard (13.3), the method (**405**, with
+        `Allow`), the Origin (**403** without one: the request must carry the pinned origin),
+        the body (read within 5 seconds, **408**; at most 4 KiB, **413**), the shape (**400**:
+        `Content-Type: application/json` and exactly the two string properties below), the
+        lengths (**400**: a username of 1 to 256 bytes without control characters, a password
+        of 1 to 1024 bytes), the limit (**429**), one database read (**503**, **500**), then the
+        password (**401**).
+
+        **429**: at most 10 attempts are admitted within a sliding minute; while 10 are recorded,
+        every attempt is refused before any lookup, a right password included, and only a
+        successful login gives its place back. A caller that keeps the limit full can deny
+        logins for up to a minute at a time (ADR-469).
+
+        **401** has one body, byte for byte, for an unknown username, an operator without a
+        password, a disabled operator and a wrong password, and each costs the same password
+        check. **500** also answers a stored password hash that cannot be read.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginRequest' }
+      responses:
+        '200':
+          description: Logged in; the answer sets `ngr_session` and is not cached
+          headers:
+            Set-Cookie: { schema: { type: string }, description: '`ngr_session=<43 base64url characters>; HttpOnly; SameSite=Strict; Path=/`' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Operator' }
+        '400': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/Problem' }
+        '403': { $ref: '#/components/responses/Problem' }
+        '405':
+          description: A method other than POST
+          headers:
+            Allow: { schema: { type: string }, description: '`POST`' }
+        '408': { $ref: '#/components/responses/Problem' }
+        '413': { $ref: '#/components/responses/Problem' }
+        '429':
+          description: 10 attempts are recorded in the last minute; `Retry-After` is the time until the oldest is a minute old
+          headers:
+            Retry-After: { schema: { type: integer, minimum: 1, maximum: 60 }, description: Seconds to wait }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '500': { $ref: '#/components/responses/Problem' }
+        '503': { $ref: '#/components/responses/Problem' }
+
+  /v1/logout:
+    post:
+      tags: [system]
+      summary: End the operator session (13.3, ADR-469)
+      description: |
+        Ends every session whose well-formed `ngr_session` the request carries and clears the
+        cookie. It answers **204** with or without a live session and reads no database, so it
+        works for a disabled operator and while the database is down. The request must carry
+        the pinned Origin (**403** without one) and an empty body (**400**; **413**, **408** as
+        for login).
+      security: []
+      responses:
+        '204':
+          description: Logged out; the cookie is cleared
+          headers:
+            Set-Cookie: { schema: { type: string }, description: '`ngr_session=; Max-Age=0; Path=/; HttpOnly; SameSite=Strict`' }
+        '400': { $ref: '#/components/responses/Problem' }
+        '403': { $ref: '#/components/responses/Problem' }
+        '405':
+          description: A method other than POST
+          headers:
+            Allow: { schema: { type: string }, description: '`POST`' }
+        '408': { $ref: '#/components/responses/Problem' }
+        '413': { $ref: '#/components/responses/Problem' }
+
+  /v1/me:
+    get:
+      tags: [system]
+      summary: The operator of this session (13.3, ADR-469)
+      description: |
+        Answers the operator the session belongs to, with its name and roles read at this
+        request. Like every operator route on the local deployment it needs a live session:
+        without one, with a malformed or repeated `ngr_session`, after the session expired, or
+        once the operator was disabled or its password set again, the answer is **401**, which
+        clears a presented cookie. A database failure during the session check is **503**.
+      security:
+        - operatorSession: []
+      responses:
+        '200':
+          description: The operator; not cached
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Operator' }
+        '401': { $ref: '#/components/responses/Problem' }
         '503': { $ref: '#/components/responses/Problem' }
 
   /v1/agent/challenge:
@@ -666,6 +778,14 @@ components:
       type: http
       scheme: bearer
       bearerFormat: JWT
+    operatorSession:
+      type: apiKey
+      in: cookie
+      name: ngr_session
+      description: |
+        The local deployment's operator session (13.3, ADR-469), set by `POST /v1/login`. A
+        request whose method is not GET or HEAD must also carry the pinned Origin, or it is
+        **403** before the cookie is read.
 
   parameters:
     JobId:
@@ -692,6 +812,24 @@ components:
           schema: { $ref: '#/components/schemas/Problem' }
 
   schemas:
+    LoginRequest:
+      type: object
+      additionalProperties: false
+      required: [username, password]
+      properties:
+        username: { type: string, minLength: 1, description: 'The operator''s username; 1 to 256 bytes, no control characters, compared exactly' }
+        password: { type: string, minLength: 1, description: 'At most 1024 bytes' }
+    Operator:
+      type: object
+      additionalProperties: false
+      required: [operatorId, username, displayName, roles]
+      properties:
+        operatorId: { type: string, format: uuid }
+        username: { type: string }
+        displayName: { type: string }
+        roles:
+          type: array
+          items: { type: string, enum: [viewer, worker, reprogrammer, remote, approver, admin] }
     Health:
       type: object
       required: [status]

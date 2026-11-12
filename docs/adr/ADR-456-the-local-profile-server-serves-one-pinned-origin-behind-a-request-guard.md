@@ -1,7 +1,7 @@
 # ADR-456: The Local-Profile Server Serves One Pinned Origin Behind a Request Guard
 
 **Date:** 2026-11-11
-**Status:** Accepted (items 7 and 8 extended by ADR-458: the database, the migrations and the health check; item 7 extended by ADR-462: the instruction key's path; item 9's graceful stop extended by ADR-466 to upgraded connections)
+**Status:** Accepted (items 7 and 8 extended by ADR-458: the database, the migrations and the health check; item 7 extended by ADR-462: the instruction key's path; item 9's graceful stop extended by ADR-466 to upgraded connections; the CSRF and passkey Consequences answered by ADR-469)
 **Affects:** `crates/server`, design 13.3, `api/openapi.yaml`, `crates/server/docs/ngr-server.md`
 
 ## Context

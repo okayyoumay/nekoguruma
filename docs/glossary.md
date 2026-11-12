@@ -260,6 +260,12 @@ SAE J2534 ("PassThru") standard for vehicle interface adapters. The worker suppo
 **K-Line**  
 Single-wire serial automotive bus (ISO 9141-2, ISO 14230). Older protocol used in pre-CAN vehicles.
 
+**Local tenant** (design 13.3, ADR-469)  
+The one tenant of the local deployment, with an ID fixed in the server. `ngr-server user add` creates it if it is absent, and login and the other user commands look an operator up by this tenant and the username, so one username names one operator. See **Local user**.
+
+**Local user** (design 6.4, 13.3, ADR-469)  
+An operator of the local deployment who logs in with a username (the operator's subject in the **Local tenant**) and a password, stored as an Argon2id hash in `operator_credentials`, instead of through OIDC. Created, given a new password and disabled only by the `ngr-server user` command; a login starts an **Operator session**.
+
 ---
 
 ## M–O
@@ -306,6 +312,9 @@ The `tracing` log each NGR process keeps for the developers and maintainers of N
 ---
 
 ## P–R
+
+**Operator session** (design 6.4, 13.3, ADR-469)  
+The browser session of a **Local user**: the cookie `ngr_session` that `POST /api/v1/login` sets, whose 32 random bytes the server keeps only as a SHA-256 in memory. It ends 8 hours after login or 30 minutes after its last use, measured on both the monotonic and the wall clock, at a logout or a restart, and at the next request after the operator is disabled or its password set again. It is not the agents' **Session token**, which is a bearer header.
 
 **Owner** (design 6.6, 6.8, ADR-463)  
 The operator who may use an agent by default and whose ID the agent matches against the operator ID of each job instruction (operator ID matching). The registration code names the owner at issuance; the server stores it as `agents.owner_id` and as the first row of the agent's allowed-operator list, and the agent keeps it in its **Registration record**. The agent's tenant is the owner's. See **Registration code**.

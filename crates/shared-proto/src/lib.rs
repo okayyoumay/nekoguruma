@@ -1,13 +1,20 @@
 //! Protocol types shared by the server, agent, and worker.
 //!
 //! Design document sections: 5.1 job kinds / 5.3 handling disconnects / 9.5 capabilities /
-//! 11.1 job instructions
+//! 11.1 job instructions / 5.2 control channel messages (ADR-466)
 //!
 //! These types are also used for worker IPC, so only fixed-width types are used.
 //! `usize` / `isize` / `c_long` must not appear in public types (7.4).
 
 use serde::{Deserialize, Serialize};
 
+mod control;
+pub use control::{
+    AgentEventKind, AgentEventMessage, AgentMessage, CLOSE_CODE_REPLACED, CONTROL_SUBPROTOCOL,
+    Checkpoint, ControlError, DEFAULT_HEARTBEAT_SECS, Delivery, HEARTBEAT_MISSED_LIMIT,
+    HmiRequestBody, MAX_CONTROL_MESSAGE_LEN, MAX_HEARTBEAT_SECS, MAX_PROGRESS_PERMILLE,
+    MIN_HEARTBEAT_SECS, OpenJob, ServerMessage,
+};
 mod instruction;
 pub use instruction::{
     INSTRUCTION_VERSION, InstructionError, InstructionRejectReason, JOB_ID_LEN, JobInstruction,

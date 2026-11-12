@@ -24,6 +24,9 @@ The frontend's data for one diagnostic application layer (UDS first, others such
 **Artifact block** (`Op::FlashBlock`, ADR-336)  
 One TransferData payload of a flash segment, read from the artifact the job names by content hash: `FlashBlock` takes a block index and pushes the bytes that the host's `artifact_bytes(offset, len)` returns for that block, and `FlashTransfer` sends them. The artifact is the flash file the job names by SHA-256 (`ngr-agent run --artifact`); the agent reads it once, holds it in memory and hashes it at job check, and the host refuses a block longer than the ECU's maxNumberOfBlockLength allows.
 
+**Audience** (design 14.4, ADR-466)  
+The server origin that a **Connection proof** names: `scheme://host[:port]` in one canonical text (lower case, the scheme's default port left out, no path or trailing slash), built by `shared_crypto::proof::Audience`. The agent signs the text its registration record holds, and the server builds the same text from its own pinned origin.
+
 **Bearer Token** (`vci1.` prefix)  
 A short-lived HMAC-SHA256-signed token, presented by the gRPC client as the `authorization: Bearer <token>` metadata header on every RPC against a running worker's **`grpc_endpoint`**. It is signed with the per-instance key the agent (`worker-host`) hands the worker over its stdio control channel, and verified by the worker's own listener (a shared interceptor in `vci-service-launcher`). The key is held only by the agent and that worker: it never travels over the gRPC socket and is never handed to a separate client process. The agent mints its own tokens per call (ADR-221, ADR-231). Format: `vci-service-interface/src/token.rs`.
 
@@ -74,8 +77,14 @@ A named parameter that controls protocol timing, addressing, and behavior. Ident
 **Connect flags**  
 The `Flags` argument of J2534 `PassThruConnect`, fixed for the channel's lifetime (bit 8 `CAN_29BIT_ID`, bit 9 `ISO9141_NO_CHECKSUM`, bit 11 `CAN_ID_BOTH`, bit 12 `ISO9141_K_LINE_ONLY`). Set by `j2534-0404-service` per protocol: raw `CAN` channels always get `CAN_ID_BOTH`; `ISO15765` and `ISO9141`/`ISO14230` flags are derived from the creator CLL's Working ComParams and UniqueRespIdTable (ADR-065). Bit 9 (`ISO9141_NO_CHECKSUM`) is the one exception to the "ComParams/UniqueRespIdTable" derivation: it comes from the creator CLL's `CllCreateFlag` RawMode/ChecksumMode combination instead (`raw_mode && !checksum_mode`, ADR-198 Phase 2) — see `docs/rpc-api-guide.md`'s `CllCreateFlag` section.
 
+**Connection challenge** (design 6.4, 14.4, ADR-466)  
+The 32 random bytes that the server gives an agent from `POST /api/v1/agent/challenge`, which the agent's **Connection proof** covers. It lives 60 seconds in the server's memory and is removed at its first presentation whatever the outcome, so a proof cannot be replayed. The server keeps at most 1024 of them.
+
 **Connection proof** (design 6.4, 14.4, ADR-459)  
 What an agent signs with its **Agent key** to authenticate a connection: a transcript of a purpose tag, a protocol version, the server's origin (audience), the agent ID, a 32-byte server challenge and a 32-byte agent nonce, length-prefixed and without a timestamp, because the device clock is untrusted. The server issues each challenge once. It works without TLS, so it serves the local profile too. `shared-crypto::proof` builds, signs and verifies the transcript. The purpose tag keeps a proof signature from verifying as any other signed message, such as a job instruction.
+
+**Control channel** (design 5.2, 5.3, ADR-466)  
+The WebSocket that an agent opens to the server at `/api/v1/agent/control` with the subprotocol `ngr-control.v1`, authenticated by a **Session token**. It carries job commands to the agent and its events back, as JSON text messages of at most 128 KiB each whose `type` names them (`api/asyncapi.yaml`). There is one connection per agent: a new one replaces the old. It is not the stdio control channel between the agent and a worker.
 
 **COP** — ComPrimitive  
 A single communication operation on a CLL (send a message, wait for a response, start/stop communication, etc.). Maps to a `PassThruWriteMsgs` / `PassThruReadMsgs` sequence in J2534.
@@ -388,6 +397,9 @@ A heavy-duty-vehicle CAN-based protocol with a 250kbps default rate (client-conf
 
 **SERMI** — Security-Related Vehicle Repair and Maintenance Information  
 The EU scheme (under Regulation (EU) 2018/858 as amended by 2021/1244) that controls access to theft-protection functions such as key programming: accredited conformity assessment bodies approve repair businesses and authorise their employees. The authorised employee presents their credential to the maker's portal. The system handles the step through the OEM authentication provider and never holds the credential (ADR-237).
+
+**Session token** (design 6.4, 14.4, ADR-466)  
+The bearer token that `POST /api/v1/agent/session` gives an agent in exchange for a valid **Connection proof**: 32 random bytes, kept by the server only as a SHA-256 and in its memory, valid 300 seconds and reported as a relative time because the device clock is untrusted. The agent sends it as `Authorization: Bearer` on the upgrade of the **Control channel**. It is not the worker's **Bearer Token** (a different mechanism on a different link).
 
 **Signal** (time series)  
 One decoded value recorded over time during monitoring or acquisition, such as engine speed or coolant temperature. Signals are not stored directly: the stored original is the *record*, one response received from the vehicle with its monotonic timestamp and source, and signals are decoded from records with the IR's decode plans (design 4.3, 8.2.2; ADR-236). Not to be confused with a J2534 channel (a communication path opened with `PassThruConnect`).

@@ -5,7 +5,8 @@ info:
   description: |
     Defines two kinds of paths (5.2).
 
-    1. Agent ⇄ server: WSS (outbound 443). Commands and events.
+    1. Agent ⇄ server: WSS (outbound 443; WS to the pinned origin on the local profile, 13.3).
+       Commands and events (ADR-466).
     2. Browser ⇄ server: WebSocket. Job state and monitoring relay.
 
     The direct monitoring link (WebRTC DataChannel) uses binary frames
@@ -15,9 +16,17 @@ info:
 servers:
   agentGateway:
     host: example.com
-    pathname: /agent/v1
     protocol: wss
-    description: Agent connection. Mutual authentication uses the key issued at registration
+    description: |
+      Agent connection on the standard profile. The agent proves its registered key in an HTTP
+      exchange first (`POST /api/v1/agent/challenge`, `POST /api/v1/agent/session`, 6.4,
+      ADR-466) and sends the session token it gets as `Authorization: Bearer` on the upgrade.
+  agentGatewayLocal:
+    host: 127.0.0.1:8080
+    protocol: ws
+    description: |
+      The same channel on the local profile (13.3): plain WebSocket to the pinned origin
+      `http://127.0.0.1:<port>`. A redirect is an error to the agent.
   browser:
     host: example.com
     pathname: /ws/v1
@@ -32,9 +41,62 @@ servers:
 
 channels:
   agentControl:
-    address: /agent/v1
-    servers: [{ $ref: '#/servers/agentGateway' }]
+    address: /api/v1/agent/control
+    servers:
+      - { $ref: '#/servers/agentGateway' }
+      - { $ref: '#/servers/agentGatewayLocal' }
+    description: |
+      One WebSocket per agent, opened by the agent (5.2, ADR-466).
+
+      **Upgrade.** `GET` with `Authorization: Bearer <session token>` and the subprotocol
+      `ngr-control.v1`. A missing, unknown or expired token is answered 401 (with
+      `WWW-Authenticate: Bearer`) before any upgrade, and an upgrade that does not offer the
+      subprotocol is answered 400. The agent sends no
+      `Origin` header. The identity of the agent is the session's: no payload carries an
+      agent ID, and the server takes it from the session only.
+
+      **Framing.** Text frames only, one JSON message per frame, at most 128 KiB per message in
+      both directions. A binary frame closes the connection. Every message is an object whose
+      `type` is the message name below, and the other properties are camelCase. A message with
+      an unknown `type` closes the connection (16.3). So does a message with a property its
+      `type` does not have (every payload below is closed: `additionalProperties: false`), a
+      missing required property and a value out of range: versioning is by the subprotocol, so
+      nothing is ignored for forward compatibility. One exception settles instead of closing:
+      a `jobCommand` that has a `commandId` but no usable `signedJob` (missing, or not a string)
+      reaches the agent's gate as malformed and is answered `commandRejected`; without a
+      `commandId` there is nothing to settle and the connection closes. Compression is not
+      negotiated.
+
+      **Opening.** The server's first frame is `hello`. The agent handles nothing before it,
+      and closes the connection if it has not arrived within 10 seconds of the upgrade.
+
+      **Keepalive.** The agent sends `heartbeat` every `heartbeatSecs` seconds and the server
+      answers each with a `heartbeat`. A side that has seen no frame of any kind for three
+      intervals closes the connection (14.1).
+
+      **One connection per agent.** A new connection from the same agent replaces the old one,
+      which the server closes with an application close code (4001, replaced). An agent that
+      receives it backs off to its longest delay before it reconnects.
+
+      **Close codes.**
+
+      | Code | Sent by | Meaning |
+      |---|---|---|
+      | 1001 | server | Going away: the server is stopping (13.3) |
+      | 1002 | either | Protocol error: malformed text, unknown `type`, unknown or missing property, value out of range, `hello` not first or not received in time |
+      | 1003 | either | A binary frame |
+      | 1009 | either | A message over 128 KiB |
+      | 4001 | server | Replaced by a newer connection of the same agent |
+      | 4002 | server | The agent's key was revoked, or its session ended |
+      | 4003 | either | No frame of any kind for three heartbeat intervals |
+
+      **Settlement.** `commandAck` settles the delivery of a `jobCommand`, `commandRejected`
+      settles it as a refusal (5.3, ADR-466). `commandId` is unique per delivery and scoped to
+      the connection; it is never the job ID. `eventAck` is reserved for the outbox work.
     messages:
+      hello: { $ref: '#/components/messages/Hello' }
+      commandAck: { $ref: '#/components/messages/CommandAck' }
+      eventAck: { $ref: '#/components/messages/EventAck' }
       jobCommand: { $ref: '#/components/messages/JobCommand' }
       cancelCommand: { $ref: '#/components/messages/CancelCommand' }
       hmiResponse: { $ref: '#/components/messages/HmiResponse' }
@@ -53,6 +115,16 @@ channels:
       changeFeed: { $ref: '#/components/messages/ChangeFeedEvent' }
 
 operations:
+  openChannel:
+    action: receive
+    channel: { $ref: '#/channels/agentControl' }
+    summary: Server → agent. First frame of every connection
+    description: |
+      Names the heartbeat interval the agent keeps. The agent sends and handles nothing before
+      it (ADR-466).
+    messages:
+      - { $ref: '#/channels/agentControl/messages/hello' }
+
   receiveJob:
     action: receive
     channel: { $ref: '#/channels/agentControl' }
@@ -62,8 +134,19 @@ operations:
       duplicate and records the job ID in its journal, then ACKs receipt, and ignores
       duplicates (5.3, ADR-461). A command whose
       instruction fails verification is answered with commandRejected (ADR-461) and creates no job. Jobs past their start deadline are not run; Expired is reported instead.
+      The agent settles each delivery with commandAck or commandRejected (ADR-466).
     messages:
       - { $ref: '#/channels/agentControl/messages/jobCommand' }
+
+  ackCommand:
+    action: send
+    channel: { $ref: '#/channels/agentControl' }
+    summary: Agent → server. A job command was accepted
+    description: |
+      Sent once the instruction verified and, when the journal exists, was recorded (5.3). The
+      server stops redelivering that command.
+    messages:
+      - { $ref: '#/channels/agentControl/messages/commandAck' }
 
   rejectCommand:
     action: send
@@ -72,7 +155,11 @@ operations:
     description: |
       Sent for a job command whose instruction does not verify or is not for this agent (5.3,
       ADR-461). It is keyed by the command, not by a job: no job state exists for the command.
-      The agent also writes an operational-log entry.
+      The agent also writes an operational-log entry. The rejection settles the delivery: the
+      server stops redelivering and ends the job as failed by its own decision, never with
+      `SignatureInvalid` (ADR-461, ADR-466). It is sent on the connection the command arrived
+      on and never goes through the outbox. A reason may be added only if the envelope bytes and
+      the registration record alone decide it; expiry and the operator match are job states (5.6).
     messages:
       - { $ref: '#/channels/agentControl/messages/commandRejected' }
 
@@ -83,9 +170,35 @@ operations:
     description: |
       Must-deliver events (completed, failed) are retained until ACKed.
       Progress may be thinned; only the latest value is sent (5.4).
-      The server deduplicates by "agent ID + sequence number".
+      The server deduplicates by "agent ID + sequence number", the agent ID being the
+      session's.
     messages:
       - { $ref: '#/channels/agentControl/messages/agentEvent' }
+
+  ackEvents:
+    action: receive
+    channel: { $ref: '#/channels/agentControl' }
+    summary: Server → agent. Events stored up to a sequence number (reserved)
+    description: |
+      Cumulative: every event with a sequence number up to `seq` is stored and may leave the
+      outbox. Reserved for the outbox work; this version of the channel does not send it and an
+      agent does not need to handle it (ADR-466).
+    messages:
+      - { $ref: '#/channels/agentControl/messages/eventAck' }
+
+  keepAlive:
+    action: send
+    channel: { $ref: '#/channels/agentControl' }
+    summary: Agent → server. Application heartbeat (14.1)
+    messages:
+      - { $ref: '#/channels/agentControl/messages/heartbeat' }
+
+  echoHeartbeat:
+    action: receive
+    channel: { $ref: '#/channels/agentControl' }
+    summary: Server → agent. The echo of each heartbeat (14.1)
+    messages:
+      - { $ref: '#/channels/agentControl/messages/heartbeat' }
 
   reconcileOnReconnect:
     action: send
@@ -106,16 +219,40 @@ operations:
 
 components:
   messages:
+    Hello:
+      name: hello
+      summary: Server → agent. First frame
+      description: |
+        Names the interval at which the agent sends `heartbeat` (14.1, ADR-466). The server
+        sends it once, before anything else, and the agent handles nothing before it.
+      payload:
+        type: object
+        additionalProperties: false
+        required: [type, heartbeatSecs]
+        properties:
+          type: { const: hello }
+          heartbeatSecs: { type: integer, minimum: 1, maximum: 60, description: Seconds between heartbeats; 20 by default. 60 is the idle timeout commonly met at a load balancer }
+      examples:
+        - payload: {"type": "hello", "heartbeatSecs": 20}
+
     JobCommand:
       name: jobCommand
       payload:
         type: object
-        required: [commandId, signedJob]
+        additionalProperties: false
+        required: [type, commandId]
         properties:
-          commandId: { type: string }
+          type: { const: jobCommand }
+          commandId:
+            type: string
+            description: |
+              Unique per delivery and scoped to the connection it is sent on; never the job ID
+              (5.3, ADR-466)
           signedJob:
             type: string
             description: |
+              A missing or non-string value is answered `commandRejected` with the reason
+              `malformed` (the command has its `commandId`, so it can be settled). When present,
               base64 of one envelope (11.1, ADR-461): a format byte (1), the SHA-256
               fingerprint of the signing key's SPKI (32 bytes), the signature (64 bytes, r then
               s, low-S) and the payload, a postcard `JobInstruction` of at most 64 KiB. The
@@ -123,13 +260,34 @@ components:
               The agent verifies it with the key pinned at registration before it parses the
               payload. The job's documents, artifact and plan are named by hash inside the
               payload; nothing the agent acts on is carried beside it.
+      examples:
+        - payload: {"type": "jobCommand", "commandId": "c-1", "signedJob": "AQIDBAUGBwgJCg=="}
+
+    CommandAck:
+      name: commandAck
+      summary: Agent → server. A job command was accepted
+      description: Settles the delivery of the command (5.3, ADR-466)
+      payload:
+        type: object
+        additionalProperties: false
+        required: [type, commandId]
+        properties:
+          type: { const: commandAck }
+          commandId: { type: string, description: The commandId of the accepted job command }
+      examples:
+        - payload: {"type": "commandAck", "commandId": "c-1"}
 
     CommandRejected:
       name: commandRejected
+      description: |
+        Settles the delivery of the command as a refusal; the server stops redelivering it and
+        ends the job as failed by its own decision (5.3, ADR-461, ADR-466).
       payload:
         type: object
-        required: [commandId, reason]
+        additionalProperties: false
+        required: [type, commandId, reason]
         properties:
+          type: { const: commandRejected }
           commandId: { type: string, description: The commandId of the refused job command }
           reason:
             type: string
@@ -138,22 +296,34 @@ components:
               pinned one (the server asks the agent to register again after it rotated its
               key). notForThisAgent: the instruction verified but names another agent.
             enum: [malformed, unknownKey, badSignature, unsupportedVersion, notForThisAgent]
+      examples:
+        - payload: {"type": "commandRejected", "commandId": "c-1", "reason": "badSignature"}
 
     CancelCommand:
       name: cancelCommand
       payload:
         type: object
+        additionalProperties: false
+        required: [type, jobId]
         properties:
+          type: { const: cancelCommand }
           jobId: { type: string }
+      examples:
+        - payload: {"type": "cancelCommand", "jobId": "0193c8a0-7b1e-7c2d-9a4f-3e5d6c7b8a90"}
 
     HmiResponse:
       name: hmiResponse
       payload:
         type: object
+        additionalProperties: false
+        required: [type, jobId, requestId]
         properties:
+          type: { const: hmiResponse }
           jobId: { type: string }
           requestId: { type: string }
           values: { type: object, additionalProperties: true }
+      examples:
+        - payload: {"type": "hmiResponse", "jobId": "j-1", "requestId": "r-1", "values": {"answer": 1}}
 
     SeedKeyResponse:
       name: seedKeyResponse
@@ -162,73 +332,147 @@ components:
         S3 keep-alive continues while waiting. Not possible offline.
       payload:
         type: object
+        additionalProperties: false
+        required: [type, jobId, requestId, key]
         properties:
+          type: { const: seedKeyResponse }
           jobId: { type: string }
           requestId: { type: string }
           key: { type: string, description: base64 }
+      examples:
+        - payload: {"type": "seedKeyResponse", "jobId": "j-1", "requestId": "r-1", "key": "AQID"}
 
     AgentEvent:
       name: agentEvent
+      description: |
+        The agent is the session's: the message carries no agent ID (ADR-466). `kind` selects
+        which of the other properties are present, as the `oneOf` below states. A property
+        that belongs to another kind is refused like any unknown one. Communication logs and
+        captured data travel over the data channel, not as events; reporting the agent's
+        capabilities is later work and will add its own kind.
       payload:
         type: object
-        required: [agentId, seq, kind]
+        required: [type, seq, kind]
         properties:
-          agentId: { type: string }
-          seq: { type: integer, description: Monotonically increasing per agent }
+          type: { const: agentEvent }
+          seq: { type: integer, minimum: 0, description: Monotonically increasing per agent }
           delivery: { type: string, enum: [guaranteed, lossy] }
-          kind:
-            type: string
-            enum: [jobState, progress, hmiRequest, capabilities, capture, log]
-          jobId: { type: string }
-          state: { type: string }
-          failureCode: { type: string }
-          progressPermille: { type: integer }
-          phase: { type: string }
-          hmiRequest:
-            type: object
-            properties:
-              requestId: { type: string }
-              templateId: { type: string, description: Record template or HMI form }
-          capabilities: { type: object }
+          kind: { type: string, enum: [jobState, progress, hmiRequest] }
           occurredAtAgent:
             type: string
             format: date-time
             description: |
               Device time is for reference only. Audit logs treat the server receive time as authoritative (16.3).
+        oneOf:
+          - type: object
+            required: [kind, jobId, state]
+            additionalProperties: false
+            properties:
+              type: true
+              seq: true
+              delivery: true
+              occurredAtAgent: true
+              kind: { const: jobState }
+              jobId: { type: string }
+              state: { type: string, description: The job state's name (5.6) in camelCase }
+              failureCode: { type: string, description: The failure code's name in camelCase, for the states that carry one }
+              detail: { type: string, description: For the states that carry a detail }
+          - type: object
+            required: [kind, jobId, progressPermille, phase]
+            additionalProperties: false
+            properties:
+              type: true
+              seq: true
+              delivery: true
+              occurredAtAgent: true
+              kind: { const: progress }
+              jobId: { type: string }
+              progressPermille: { type: integer, minimum: 0, maximum: 1000 }
+              phase: { type: string }
+          - type: object
+            required: [kind, jobId, hmiRequest]
+            additionalProperties: false
+            properties:
+              type: true
+              seq: true
+              delivery: true
+              occurredAtAgent: true
+              kind: { const: hmiRequest }
+              jobId: { type: string }
+              hmiRequest:
+                type: object
+                required: [requestId, templateId]
+                additionalProperties: false
+                properties:
+                  requestId: { type: string }
+                  templateId: { type: string, description: Record template or HMI form }
+      examples:
+        - payload: {"type": "agentEvent", "seq": 7, "delivery": "guaranteed", "kind": "jobState", "jobId": "j-1", "state": "running"}
+        - payload: {"type": "agentEvent", "seq": 8, "delivery": "lossy", "kind": "progress", "jobId": "j-1", "progressPermille": 250, "phase": "download"}
+        - payload: {"type": "agentEvent", "seq": 9, "delivery": "guaranteed", "kind": "hmiRequest", "jobId": "j-1", "hmiRequest": {"requestId": "r-1", "templateId": "confirm"}}
+
+    EventAck:
+      name: eventAck
+      summary: Server → agent. Events stored up to a sequence number (reserved)
+      description: |
+        Cumulative. Reserved for the outbox work (5.3, ADR-466); the first version of the
+        channel does not send it.
+      payload:
+        type: object
+        additionalProperties: false
+        required: [type, seq]
+        properties:
+          type: { const: eventAck }
+          seq: { type: integer, description: Every event up to and including this one is stored }
+      examples:
+        - payload: {"type": "eventAck", "seq": 8}
 
     Heartbeat:
       name: heartbeat
       description: |
-        Application-level heartbeat. Detects half-open connections and
-        counters load balancer idle timeouts (14.1).
-        Does not update the DB; kept in memory and periodically batch-written (15.1).
+        Application-level heartbeat, with no other property (the device clock is untrusted,
+        16.3). The agent sends it every `heartbeatSecs` and the server echoes it. Detects
+        half-open connections and counters load balancer idle timeouts (14.1, ADR-466).
+        Does not update the DB; the server writes `agents.last_seen_at` at connect and
+        disconnect only (15.1).
       payload:
         type: object
+        additionalProperties: false
+        required: [type]
         properties:
-          agentId: { type: string }
-          sentAt: { type: string, format: date-time }
+          type: { const: heartbeat }
+      examples:
+        - payload: {"type": "heartbeat"}
 
     Reconcile:
       name: reconcile
+      description: The agent is the session's; the message carries no agent ID (ADR-466)
       payload:
         type: object
+        additionalProperties: false
+        required: [type, openJobs]
         properties:
-          agentId: { type: string }
+          type: { const: reconcile }
           openJobs:
             type: array
             description: Open jobs only. Never sends the full set
             items:
               type: object
+              additionalProperties: false
+              required: [jobId, state]
               properties:
                 jobId: { type: string }
                 state: { type: string }
                 checkpoint:
                   type: object
+                  additionalProperties: false
                   description: Summary for handover to another device (8.2.5)
                   properties:
                     section: { type: integer }
                     vin: { type: string }
                     artifactDigest: { type: string }
+      examples:
+        - payload: {"type": "reconcile", "openJobs": [{"jobId": "j-1", "state": "running", "checkpoint": {"section": 2, "vin": "WVWZZZ1KZAW000001", "artifactDigest": "ab12"}}]}
 
     JobStateEvent:
       name: jobState

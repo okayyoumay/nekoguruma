@@ -41,6 +41,7 @@ M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 20
 2. A network fault test (disconnect, slow link; design 13.4) shows no duplicate execution, no automatic reissue of a write job, and complete event delivery after reconnection (5.3).
 3. An agent rejects a job instruction with a bad signature.
 4. The hardware checks listed below are implemented: the harness lists each one for a profile of its class, a check run without `NGR_HW_PROFILE` fails, and their parts that need no hardware are tested in CI (design 13.5). Running them on hardware is optional.
+5. The fictional test vehicle ("Mikeneko", a gateway and six ECUs) is the vehicle of the end to end: its ECU definitions and its vehicle definition convert, and a configuration write job created through the Web API changes the engine controller's coding on the simulators, saving the current value, writing, reading it back, and writing the saved value back when the read-back check fails (added at the maintainer's request, 2026-11-12).
 
 **Hardware checks to implement (design 13.5; running them on hardware is optional).**
 
@@ -60,6 +61,7 @@ M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 20
 
 1. A browser end-to-end test (Playwright) runs an acquisition against the simulators, edits a record-template field, and sees the change from a second session.
 2. With the server unreachable, a pre-fetched acquisition job starts from the cached UI over the local connection and syncs once the server is back.
+3. From the browser, an operator runs an actuator test on the fictional test vehicle's engine controller (an InputOutputControlByIdentifier item, ISO 14229-1 (2026) 12.2, and an actuator routine) at the confirmation level design 5.1 and 6.3 give actuator tests, and every IO control the job started is back under the ECU's control after the job ends, after it is cancelled, and after its agent is killed and restarted (added at the maintainer's request, 2026-11-12).
 
 **Hardware checks to implement (design 13.5; running them on hardware is optional).**
 
@@ -77,10 +79,12 @@ M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 20
 2. An ECU reprogramming job runs the ISO 14229-1 clause 16 sequence against `sim-ecu`'s flash state machine, recovers from each of the four fault classes in clause 16.4 per design 5.6, and is refused when a precondition (8.9.1) is not met.
 3. A two-person approval flow blocks reprogramming on an unattended device until the second approval.
 4. The hardware checks listed below are implemented: the harness lists each one for a profile of its class, a check run without `NGR_HW_PROFILE` fails, and their parts that need no hardware are tested in CI (design 13.5). Running them on hardware is optional.
+5. On the fictional test vehicle, a reprogramming job and a configuration change reach ECUs behind its gateway: the gateway is unlocked first, the engine controller is reprogrammed, and a body controller coding change is checked against the gateway's vehicle configuration record and written back on a mismatch (added at the maintainer's request, 2026-11-12).
 
 **Hardware checks to implement (design 13.5; running them on hardware is optional).**
 
 - T1: the clause 16 reprogramming sequence with a real VCI against the stand-in ECU, with power cut through the host-controlled switch during the transfer.
+- T1: on the stand-in ECU serving the fictional test vehicle, an IO control a job holds is returned to the ECU when the VCI is unplugged and when supply power is cut through the host-controlled switch, and a configuration change interrupted by a power cut is detected and written back after the restart.
 - T1 (carried over from M1 and M3): the interrupted write of M1 and a configuration write created through the Web API, with a real J2534 VCI against the stand-in ECU, and the VCI-disconnect fault produced by unplugging the VCI when the check asks for it, instead of by `sim-vci`.
 - The rest of the guard (design 13.5): on T1, a hardware control passes when the profile lists it with its complete parameters and the request matches them; on T2, state-changing requests and listed hardware controls pass only from an authorized job, checked against what the job declares.
 - T2: a configuration write and reprogramming of an ECU the profile declares expendable, once this milestone's approval levels exist, and only after the 8.9.1 checks pass.

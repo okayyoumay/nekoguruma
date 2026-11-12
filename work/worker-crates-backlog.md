@@ -73,7 +73,7 @@ margin theory — stop widening and instrument instead (see
 in the "Test-suite reliability: past flaky-test root causes" section of
 `crates/j2534-0404-service/docs/implementation-notes.md` for a worked example).
 
-No entries at present.
+- `agent_restart_end_to_end::a_vci_disconnect_mid_transfer_is_restarted_once_the_vci_is_back` (`crates/j2534-0404-service/tests/agent_restart_end_to_end.rs`). Symptom: on the `core-windows` job, the assertion at line 1007 that the ended job releases its guards failed after the worker disconnected cleanly; the other 20 restart tests passed in the same run, and a re-run of the job passed (2026-11-12, pull request #336's head cf16cba, whose j2534-0404-service, agent and sim-vci code is main 7de9261's). Confirm in isolation on Windows: `cargo nextest run -p j2534-0404-service --test agent_restart_end_to_end a_vci_disconnect_mid_transfer_is_restarted_once_the_vci_is_back` in a loop. Known cause: none yet; the guard release is observed right after the job ends, so a release that completes slightly later on a loaded Windows runner is the first suspect.
 
 Past root causes and their fixes: `crates/j2534-0404-service/docs/implementation-notes.md`, section
 "Test-suite reliability: past flaky-test root causes".

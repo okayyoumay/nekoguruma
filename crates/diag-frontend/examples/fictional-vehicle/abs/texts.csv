@@ -1,0 +1,28 @@
+key,id,text
+session.default,1001,Default session
+session.programming,1002,Programming session
+session.extended,1003,Extended diagnostic session
+value.unknown,1004,Unknown value
+value.no,1005,No
+value.yes,1006,Yes
+routine.completed,1009,Completed
+routine.notStarted,1011,Not started
+routine.running,1012,Running
+routine.aborted,1013,Aborted
+nrc.subFunctionNotSupported,1021,Sub-function not supported
+nrc.incorrectMessageLength,1022,Incorrect message length or format
+nrc.conditionsNotCorrect,1023,Conditions not correct
+nrc.requestSequenceError,1024,Request sequence error
+nrc.requestOutOfRange,1025,Request out of range
+nrc.securityAccessDenied,1026,Security access denied
+nrc.authenticationRequired,1027,Gateway not unlocked
+nrc.invalidKey,1028,Invalid key
+nrc.exceededAttempts,1029,Too many false keys
+nrc.delayNotExpired,1030,Security delay still running
+nrc.serviceNotSupportedInSession,1033,Service not supported in the active session
+nrc.vehicleSpeedTooHigh,1035,Vehicle is moving
+dtc.abs.wheelSensorFrontLeft,1400,Front left wheel speed sensor signal missing
+dtc.abs.wheelSensorFrontRight,1401,Front right wheel speed sensor signal missing
+dtc.abs.wheelSensorRearLeft,1402,Rear left wheel speed sensor signal missing
+dtc.abs.wheelSensorRearRight,1403,Rear right wheel speed sensor signal missing
+dtc.abs.pumpMotor,1404,Hydraulic pump motor circuit fault

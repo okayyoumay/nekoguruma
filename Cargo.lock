@@ -649,6 +649,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.1",
+ "sim-ecu",
  "starlark_syntax",
  "thiserror",
 ]

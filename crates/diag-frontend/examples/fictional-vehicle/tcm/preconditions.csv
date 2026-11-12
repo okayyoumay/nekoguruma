@@ -1,0 +1,6 @@
+kind,lower,upper,default_source,programming_source,note
+voltage,12000,15000,input:supply_voltage_mv,,Millivolts
+external_supply,1,1,input:external_supply,,
+ignition,1,1,input:ignition_on,,
+engine,0,0,input:engine_running,,
+vehicle_speed,0,0,input:vehicle_speed_kmh,,

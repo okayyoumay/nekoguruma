@@ -1,0 +1,2 @@
+variant,service,field,expected,note
+tcmAt6V1,sparePartNumber.read,sparePartNumber,4D 4B 2D 54 43 4D 2D 30 30 30 31,"ASCII ""MK-TCM-0001"""

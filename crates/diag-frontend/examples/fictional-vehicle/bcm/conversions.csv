@@ -1,0 +1,5 @@
+name,kind,numerator,denominator,offset,default_text
+sessionName,text-table,,,,value.unknown
+tenMilliseconds,linear,10,1,0,
+ignition,text-table,,,,value.unknown
+yesNo,text-table,,,,value.unknown

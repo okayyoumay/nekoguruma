@@ -1,0 +1,16 @@
+variants,name,did,read,write,write_session,write_security
+,activeSession,0xF186,yes,no,,
+,sparePartNumber,0xF187,yes,no,,
+,softwareVersion,0xF189,yes,no,,
+,ecuSerialNumber,0xF18C,yes,no,,
+,vin,0xF190,yes,yes,0x03,0x01
+,systemName,0xF197,yes,no,,
+,flashState,0xFD00,yes,no,,
+,engineSpeed,0x1000,yes,no,,
+,coolantTemperature,0x1001,yes,no,,
+,intakeAirTemperature,0x1002,yes,no,,
+,vehicleSpeed,0x1003,yes,no,,
+,throttlePosition,0x1004,yes,no,,
+,batteryVoltage,0x1005,yes,no,,
+,engineRunning,0x1006,yes,no,,
+ecmV2,fuelRailPressure,0x1010,yes,no,,

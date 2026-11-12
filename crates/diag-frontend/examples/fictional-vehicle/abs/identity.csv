@@ -1,0 +1,4 @@
+kind,service,field
+vin,vin.read,vin
+hardware_part_number,sparePartNumber.read,sparePartNumber
+software_version,softwareVersion.read,softwareVersion

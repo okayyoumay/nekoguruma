@@ -1,0 +1,9 @@
+name,sid
+defaultSession,0x10
+extendedSession,0x10
+ecuReset,0x11
+clearDtcs,0x14
+readDtcByStatusMask,0x19
+readSupportedDtcs,0x19
+securityAccess,0x27
+testerPresent,0x3E

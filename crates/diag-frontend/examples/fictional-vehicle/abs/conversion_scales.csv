@@ -1,0 +1,10 @@
+conversion,lower,upper,text
+sessionName,0x01,,session.default
+sessionName,0x02,,session.programming
+sessionName,0x03,,session.extended
+yesNo,0x00,,value.no
+yesNo,0x01,,value.yes
+testState,0x00,,routine.notStarted
+testState,0x01,,routine.running
+testState,0x02,,routine.completed
+testState,0x03,,routine.aborted

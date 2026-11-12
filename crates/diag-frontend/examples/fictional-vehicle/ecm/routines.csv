@@ -1,0 +1,5 @@
+name,rid,start,stop,results,session,security,p2_star_ms
+throttleAdaptationReset,0x0201,yes,no,no,0x03,0x01,
+idleSpeedLearn,0x0202,yes,no,yes,0x03,,
+eraseMemory,0xFF00,yes,no,no,0x02,0x01,10000
+checkProgrammingDependencies,0xFF01,yes,no,no,0x02,,10000

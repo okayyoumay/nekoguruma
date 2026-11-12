@@ -1,0 +1,7 @@
+variants,code,display,text,status
+,0x011700,P0117-00,dtc.ecm.coolantSensorLow,dtcStatus
+,0x012200,P0122-00,dtc.ecm.throttleSensorLow,dtcStatus
+,0x030000,P0300-00,dtc.ecm.misfireSeveral,dtcStatus
+,0x030100,P0301-00,dtc.ecm.misfireCylinder1,dtcStatus
+,0x056200,P0562-00,dtc.ecm.supplyLow,dtcStatus
+,0xC10100,U0101-00,dtc.ecm.noTransmission,dtcStatus

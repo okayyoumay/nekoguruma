@@ -1,0 +1,33 @@
+key,id,text
+session.default,1001,Default session
+session.programming,1002,Programming session
+session.extended,1003,Extended diagnostic session
+value.unknown,1004,Unknown value
+value.no,1005,No
+value.yes,1006,Yes
+check.correct,1007,Image correct
+check.incorrect,1008,Image incorrect
+routine.completed,1009,Completed
+routine.failed,1010,Failed
+routine.notStarted,1011,Not started
+routine.running,1012,Running
+routine.aborted,1013,Aborted
+nrc.subFunctionNotSupported,1021,Sub-function not supported
+nrc.incorrectMessageLength,1022,Incorrect message length or format
+nrc.conditionsNotCorrect,1023,Conditions not correct
+nrc.requestSequenceError,1024,Request sequence error
+nrc.requestOutOfRange,1025,Request out of range
+nrc.securityAccessDenied,1026,Security access denied
+nrc.authenticationRequired,1027,Gateway not unlocked
+nrc.invalidKey,1028,Invalid key
+nrc.exceededAttempts,1029,Too many false keys
+nrc.delayNotExpired,1030,Security delay still running
+nrc.serviceNotSupportedInSession,1033,Service not supported in the active session
+nrc.engineIsRunning,1034,Engine is running
+nrc.vehicleSpeedTooHigh,1035,Vehicle is moving
+dtc.ecm.coolantSensorLow,1200,Coolant temperature sensor signal below its range
+dtc.ecm.throttleSensorLow,1201,Throttle position sensor signal below its range
+dtc.ecm.misfireSeveral,1202,Misfire detected on several cylinders
+dtc.ecm.misfireCylinder1,1203,Misfire detected on cylinder 1
+dtc.ecm.supplyLow,1204,Supply voltage low
+dtc.ecm.noTransmission,1205,No messages received from the transmission controller

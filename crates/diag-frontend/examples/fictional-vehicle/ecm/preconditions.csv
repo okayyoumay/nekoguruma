@@ -1,0 +1,6 @@
+kind,lower,upper,default_source,programming_source,note
+voltage,1200,1500,batteryVoltage.read.batteryVoltage,,Raw value in 0.01 V: 12.00 V to 15.00 V
+external_supply,1,1,input:external_supply,,
+ignition,1,1,input:ignition_on,,
+engine,0,0,engineRunning.read.engineRunning,,Read from the ECU
+vehicle_speed,0,0,vehicleSpeed.read.vehicleSpeed,,"Read from the ECU, km/h"

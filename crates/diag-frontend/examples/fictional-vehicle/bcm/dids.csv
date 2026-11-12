@@ -1,0 +1,12 @@
+variants,name,did,read,write,write_session,write_security,note
+,activeSession,0xF186,yes,no,,,
+,sparePartNumber,0xF187,yes,no,,,
+,softwareVersion,0xF189,yes,no,,,
+,ecuSerialNumber,0xF18C,yes,no,,,
+,vin,0xF190,yes,yes,0x03,0x01,
+,systemName,0xF197,yes,no,,,
+,doorStatus,0x5000,yes,no,,,
+,exteriorLamps,0x5001,yes,no,,,
+,ignitionState,0x5002,yes,no,,,
+bcmPremium,registeredKeys,0x5010,yes,no,,,
+,bodyConfiguration,0x5100,yes,yes,0x03,0x01,Vehicle coding

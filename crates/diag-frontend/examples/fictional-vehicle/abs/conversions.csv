@@ -1,0 +1,8 @@
+name,kind,numerator,denominator,offset,default_text
+sessionName,text-table,,,,value.unknown
+tenMilliseconds,linear,10,1,0,
+centiKmh,linear,1,100,0,
+deciBar,linear,1,10,0,
+hundredth,linear,1,100,0,
+yesNo,text-table,,,,value.unknown
+testState,text-table,,,,value.unknown

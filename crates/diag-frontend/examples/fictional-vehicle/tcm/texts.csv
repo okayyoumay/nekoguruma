@@ -1,0 +1,30 @@
+key,id,text
+session.default,1001,Default session
+session.programming,1002,Programming session
+session.extended,1003,Extended diagnostic session
+value.unknown,1004,Unknown value
+check.correct,1007,Image correct
+check.incorrect,1008,Image incorrect
+routine.completed,1009,Completed
+routine.failed,1010,Failed
+nrc.subFunctionNotSupported,1021,Sub-function not supported
+nrc.incorrectMessageLength,1022,Incorrect message length or format
+nrc.conditionsNotCorrect,1023,Conditions not correct
+nrc.requestSequenceError,1024,Request sequence error
+nrc.requestOutOfRange,1025,Request out of range
+nrc.securityAccessDenied,1026,Security access denied
+nrc.authenticationRequired,1027,Gateway not unlocked
+nrc.invalidKey,1028,Invalid key
+nrc.exceededAttempts,1029,Too many false keys
+nrc.delayNotExpired,1030,Security delay still running
+nrc.serviceNotSupportedInSession,1033,Service not supported in the active session
+nrc.engineIsRunning,1034,Engine is running
+selector.park,1300,P
+selector.reverse,1301,R
+selector.neutral,1302,N
+selector.drive,1303,D
+selector.manual,1304,M
+dtc.tcm.fluidSensorImplausible,1305,Transmission fluid temperature signal implausible
+dtc.tcm.inputSpeedMissing,1306,Input shaft speed signal missing
+dtc.tcm.outputSpeedMissing,1307,Output shaft speed signal missing
+dtc.tcm.noEngine,1308,No messages received from the engine controller

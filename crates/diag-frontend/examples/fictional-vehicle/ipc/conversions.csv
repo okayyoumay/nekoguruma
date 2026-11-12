@@ -1,0 +1,7 @@
+name,kind,numerator,denominator,offset,default_text
+sessionName,text-table,,,,value.unknown
+tenMilliseconds,linear,10,1,0,
+tenth,linear,1,10,0,
+half,linear,1,2,0,
+times10,linear,10,1,0,
+language,text-table,,,,value.unknown

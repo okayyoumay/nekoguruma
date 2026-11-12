@@ -1,0 +1,5 @@
+variants,code,display,text,status
+,0x920100,B1201-00,dtc.bcm.driverDoorSwitch,dtcStatus
+,0x931000,B1310-00,dtc.bcm.lowBeamLeft,dtcStatus
+,0x931100,B1311-00,dtc.bcm.lowBeamRight,dtcStatus
+bcmPremium,0x940200,B1402-00,dtc.bcm.keylessAntenna,dtcStatus

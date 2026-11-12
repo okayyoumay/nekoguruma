@@ -1,0 +1,10 @@
+conversion,lower,upper,text
+sessionName,0x01,,session.default
+sessionName,0x02,,session.programming
+sessionName,0x03,,session.extended
+ignition,0x00,,ignition.off
+ignition,0x01,,ignition.accessory
+ignition,0x02,,ignition.on
+ignition,0x03,,ignition.cranking
+yesNo,0x00,,value.no
+yesNo,0x01,,value.yes

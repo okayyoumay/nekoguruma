@@ -1,0 +1,2 @@
+session,name,start_address,length,artifact_offset,block_size,data_format,address_and_length_format
+application,app,0x00000000,0x00020000,0,0x0100,0x00,0x44

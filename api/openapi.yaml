@@ -282,6 +282,143 @@ paths:
         '500': { $ref: '#/components/responses/Problem' }
         '503': { $ref: '#/components/responses/Problem' }
 
+  /v1/agent/challenge:
+    post:
+      tags: [agents]
+      summary: Get a connection challenge (6.4, 14.4, ADR-466)
+      description: |
+        The first step of an agent's proof that it holds its registered key. Needs no login: the
+        agent has no session, and the request has no body to trust. The body must be empty
+        (a non-empty body is **400**). The server answers with 32 random bytes that it keeps in
+        memory for 60 seconds and removes at the first presentation, whatever the outcome. At
+        most 1024 challenges are outstanding; the oldest is dropped beyond that.
+
+        Like registration the route has a 5 second body-read bound (**408**) and answers **405**
+        with `Allow` to another method. It is subject to the Host and Origin rules of 13.3. A
+        challenge says nothing about any agent, so the route has no refusal of its own and the
+        limit on refusals does not apply to it.
+      security: []
+      responses:
+        '200':
+          description: A fresh challenge
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConnectionChallenge' }
+        '400': { $ref: '#/components/responses/Problem' }
+        '405':
+          description: A method other than POST
+          headers:
+            Allow: { schema: { type: string }, description: '`POST`' }
+        '408': { $ref: '#/components/responses/Problem' }
+        '413': { $ref: '#/components/responses/Problem' }
+        '500': { $ref: '#/components/responses/Problem' }
+
+  /v1/agent/session:
+    post:
+      tags: [agents]
+      summary: Exchange a signed challenge for a session token (6.4, 14.4, ADR-459, ADR-466)
+      description: |
+        The second step: the agent presents the challenge it got, a nonce it chose and its
+        signature over the connection transcript (`shared-crypto`'s `proof` module: the
+        protocol version, the audience, the agent ID, the challenge and the nonce, under the
+        proof's domain tag). Needs no login. The audience is the server's own pinned origin
+        (13.3): the server builds it itself and never reads one from the request.
+
+        The checks run in this order: the request guard (13.3), the method (**405**, with
+        `Allow`), the body (read within 5 seconds, **408**; at most 4 KiB, **413**), the shape
+        (**400**), the challenge, then the key and the proof.
+
+        **400** is decided on the shape of the request alone, before and without any lookup: a
+        `Content-Type` other than `application/json` (parameters allowed), an `agentId` that is
+        not a canonical lowercase UUID, a `challenge`, `nonce` or `proof` that is not standard
+        padded base64 or does not decode to exactly 32, 32 and 64 bytes, a missing, unknown or
+        duplicate field, a field that is not a string, bytes after the JSON value, or a body
+        that is not a JSON object.
+
+        **401** is for a challenge that is unknown, expired or already presented: the agent
+        fetches a new one at once. The challenge is removed at this presentation whatever the
+        outcome, so a refusal below uses it up too.
+
+        **403** is the one uniform refusal for an unknown agent, a revoked row, a bad signature
+        and a wrong audience. The caller cannot tell these apart; the reason goes to the
+        server's log only, and the log is rate-bounded. Refusals are limited for the whole
+        route as registration's are (ten 403 responses within the last minute, then **429**
+        until the oldest is a minute old); only 403 counts, and a valid proof is never limited.
+        A distinct answer for a revoked key waits for the work that authenticates the server to
+        the agent, since the answer would be unauthenticated on the local profile.
+
+        On success the server returns a token: 32 random bytes, of which it keeps only the
+        SHA-256, valid for 300 seconds and reported as a relative time, since the device clock
+        is untrusted (16.3). It is a bearer token that may be presented any number of times
+        within that time. The agent sends it as `Authorization: Bearer <token>` on the upgrade of
+        the control channel (`agentControl` in `api/asyncapi.yaml`), at `GET /api/v1/agent/control`
+        with the subprotocol `ngr-control.v1`; a missing or expired token is answered 401 before
+        any upgrade. The agent takes a fresh exchange before every upgrade.
+
+        **503** is returned when the database cannot be reached or a statement fails or times out
+        (5 seconds); **500** for any other failure of the server. Neither counts toward the
+        limit.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [agentId, challenge, nonce, proof]
+              properties:
+                agentId:
+                  type: string
+                  maxLength: 36
+                  description: The ID registration assigned; a canonical lowercase UUID
+                challenge:
+                  type: string
+                  maxLength: 64
+                  description: Standard padded base64 of the 32 bytes that `/v1/agent/challenge` returned
+                nonce:
+                  type: string
+                  maxLength: 64
+                  description: Standard padded base64 of 32 random bytes the agent chose for this exchange
+                proof:
+                  type: string
+                  maxLength: 128
+                  description: |
+                    Standard padded base64 of the 64-byte signature the agent key makes over the
+                    transcript
+      responses:
+        '200':
+          description: A session token
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AgentSession' }
+        '400': { $ref: '#/components/responses/Problem' }
+        '401':
+          description: The challenge is unknown, expired or was presented before. Fetch a new one
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '403':
+          description: Refused. The same document for every reason
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '405':
+          description: A method other than POST
+          headers:
+            Allow: { schema: { type: string }, description: '`POST`' }
+        '408': { $ref: '#/components/responses/Problem' }
+        '413': { $ref: '#/components/responses/Problem' }
+        '429':
+          description: Ten refusals were given in the last minute on this route; `Retry-After` is the time until the oldest is a minute old
+          headers:
+            Retry-After: { schema: { type: integer, minimum: 1, maximum: 60 }, description: Seconds to wait }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '500': { $ref: '#/components/responses/Problem' }
+        '503': { $ref: '#/components/responses/Problem' }
+
   # ------------------------------------------------------------ Artifacts and extensions
   /v1/artifacts:
     post:
@@ -637,6 +774,23 @@ components:
         allowRemote: { type: boolean }
         preset: { type: string, enum: [personal, personalRemote, shared] }
         capabilities: { $ref: '#/components/schemas/Capabilities' }
+
+    ConnectionChallenge:
+      type: object
+      description: A single-use challenge for one proof exchange (ADR-466)
+      required: [challenge]
+      properties:
+        challenge: { type: string, description: Standard padded base64 of 32 random bytes; valid for 60 seconds and for one presentation }
+
+    AgentSession:
+      type: object
+      description: |
+        A session token for the control channel (ADR-466). It is a bearer token: whoever holds
+        it can open the channel as the agent until it expires.
+      required: [token, expiresInSecs]
+      properties:
+        token: { type: string, description: Standard padded base64 of 32 random bytes }
+        expiresInSecs: { type: integer, minimum: 1, description: Seconds the token stays valid, counted from the answer (300) }
 
     AgentRegistration:
       type: object

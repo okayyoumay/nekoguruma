@@ -267,3 +267,59 @@ async fn a_migration_whose_sql_fails_is_rolled_back_and_a_fixed_one_applies() {
     );
     db::close(&pool).await;
 }
+
+/// A migrator holding the embedded migrations up to and including `version`.
+fn migrator_up_to(version: i64) -> Migrator {
+    Migrator::with_migrations(
+        db::MIGRATOR
+            .iter()
+            .filter(|m| m.version <= version)
+            .cloned()
+            .collect::<Vec<_>>(),
+    )
+}
+
+#[tokio::test]
+async fn the_agent_mode_machine_becomes_device_and_the_check_follows() {
+    let pg = TestPostgres::start();
+    let pool = pg.pool();
+    db::migrate_with(&pool, &migrator_up_to(3), Duration::from_secs(30))
+        .await
+        .expect("migrations 1 to 3 apply");
+    pg.execute("INSERT INTO tenants (id, name) VALUES (gen_random_uuid(), 'rename test')")
+        .await;
+    pg.execute(
+        "INSERT INTO agents (id, tenant_id, display_name, mode, public_key) \
+         SELECT gen_random_uuid(), id, 'old machine agent', 'machine', '\\x01' FROM tenants",
+    )
+    .await;
+    pg.execute(
+        "INSERT INTO agents (id, tenant_id, display_name, mode, public_key) \
+         SELECT gen_random_uuid(), id, 'user agent', 'user', '\\x02' FROM tenants",
+    )
+    .await;
+
+    db::migrate_with(&pool, &db::MIGRATOR, Duration::from_secs(30))
+        .await
+        .expect("the rest apply over existing rows");
+    db::close(&pool).await;
+
+    let modes = "SELECT string_agg(display_name || '=' || mode, ',' ORDER BY display_name) \
+                 FROM agents";
+    assert_eq!(
+        pg.scalar(modes).await,
+        "old machine agent=device,user agent=user"
+    );
+
+    // The check now allows device and user and refuses machine.
+    for (mode, ok) in [("device", true), ("user", true), ("machine", false)] {
+        let sql = format!(
+            "INSERT INTO agents (id, tenant_id, display_name, mode, public_key) \
+             SELECT gen_random_uuid(), id, 'probe', '{mode}', '\\x03' FROM tenants"
+        );
+        let probe = pg.pool();
+        let outcome = sqlx::query(sqlx::AssertSqlSafe(sql)).execute(&probe).await;
+        db::close(&probe).await;
+        assert_eq!(outcome.is_ok(), ok, "mode {mode}: {outcome:?}");
+    }
+}

@@ -952,7 +952,8 @@ components:
 
     ConnectionChallenge:
       type: object
-      description: A single-use challenge for one proof exchange (ADR-466)
+      description: A single-use challenge for one proof exchange (ADR-466). The agent reads it strictly (ADR-471).
+      additionalProperties: false
       required: [challenge]
       properties:
         challenge: { type: string, description: Standard padded base64 of 32 random bytes; valid for 60 seconds and for one presentation }
@@ -962,6 +963,7 @@ components:
       description: |
         A session token for the control channel (ADR-466). It is a bearer token: whoever holds
         it can open the channel as the agent until it expires.
+      additionalProperties: false
       required: [token, expiresInSecs]
       properties:
         token: { type: string, description: Standard padded base64 of 32 random bytes }

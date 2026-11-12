@@ -1,7 +1,7 @@
 ---
 name: milestone-exit
-description: Track the current nekoguruma milestone to its exit and close it. Count the open P1 items per exit criterion with the change since the last count (status), sweep the P2/P3 items for work the milestone should still take and its blocked P1 items for work it cannot unblock (sweep), or close it (close), which sweeps what changed since the last sweep, then verifies the exit criteria and moves the plan and backlog to the next milestone. Use when the maintainer asks how far the milestone is, what is left, whether anything else belongs in it, or to finish it.
-argument-hint: "status | sweep | close"
+description: Track the current nekoguruma milestone to its exit and close it. Count the open P1 items per exit criterion with the change since the last count (status), sweep the P2/P3 items for work the milestone should still take and its blocked P1 items for work it cannot unblock (sweep), check that the exit criteria of the current and later milestones cover the planned work and the open P2 items (coverage), or close it (close), which sweeps what changed since the last sweep, then verifies the exit criteria and moves the plan and backlog to the next milestone. Use when the maintainer asks how far the milestone is, what is left, whether anything else belongs in it or in a later milestone, or to finish it, and in the weekly re-evaluation of the development plan.
+argument-hint: "status | sweep | coverage | close"
 ---
 
 # Milestone exit
@@ -12,8 +12,8 @@ project-wide backlog's Status section names the current milestone. Arguments: $A
 (default `status`).
 
 Work from the latest `main` (`git fetch origin main`) and the open pull requests, and give the
-commit you read in every report. Each mode reports; only `close`, and a `sweep` the maintainer
-answered, change files.
+commit you read in every report. Each mode reports; only `close`, and a `sweep` or `coverage`
+the maintainer answered, change files.
 
 ## Counting rules (every mode)
 
@@ -107,6 +107,57 @@ platform or release-only path that CI does not run). Such a **sweep of the chang
 judges every blocked milestone P1 item, since a clause can change without the item moving.
 When no earlier sweep report and its commit can be found, the sweep covers every item. The
 milestone is ready to close when a sweep on the commit `close` reports finds nothing.
+
+## coverage
+
+Open work belongs to a milestone through that milestone's exit criteria. These are written as
+goals that cover a group of items, never as a tag on each item (ADR-464). This mode checks
+whether the exit criteria of the current milestone and of every later one cover the work. It
+also runs in the weekly re-evaluation of the development plan, after `status`.
+
+**What it reads.** The first run, and any run with no earlier coverage report to start from,
+reads every P2 item in both backlog files and the whole plan. A later run starts from the
+commit the last coverage report names. Look for that report where `status` looks for an
+earlier count, and in the coverage pull request. It then reads:
+
+- the items added or changed since that commit (`git log -p` on the backlog files);
+- the plan changes since that commit;
+- the items those plan changes bear on.
+
+P3 items (nice to have) are not judged. Development-process items are P1 whatever the
+milestone and are outside every exit, so leave them out. Say that once when they come up.
+
+**What it finds.**
+
+1. **A goal without a criterion.** A milestone's goal or scope states something that none of
+   its exit criteria checks. Propose a criterion that checks it, or an extension of an existing
+   one.
+2. **Work no milestone covers.** A P2 item, or a group of them, that no milestone's goal, scope
+   or exit criteria covers. Group items by the goal they would serve, not one by one. Then
+   either propose a criterion for the milestone whose goal fits, saying why that milestone, or
+   say the group stays milestone-independent and why. An example of the latter is quality work
+   that no goal needs. Name a group the maintainer already left milestone-independent in an
+   earlier coverage run once, and do not propose it again.
+3. **Covered but not raised.** In the current milestone, an item that an exit criterion covers
+   but that is still below P1. This is rule 1 of the sweep. Report it as a raise candidate.
+
+Write each proposed criterion as a goal a reviewer can check, in the plan's style. Mark it
+"added at the maintainer's request" with the date only once the maintainer chooses it. Cite
+the items it covers by file and line, at the commit the report names.
+
+**Reporting and applying.** Report the proposals as two lists, **recommended** and
+**optional**, and the milestone-independent groups as a third. Each entry names its milestone,
+the criterion's wording or the extension, and the items it covers. Ask the maintainer which to
+adopt: the recommended ones, the recommended and optional ones, or a choice of their own.
+Change nothing before the answer.
+
+Put the chosen criteria in the development plan. In the same pull request, raise to P1 the
+items that the current milestone's new or extended criteria cover, with the `backlog` skill.
+Give each raised item a `Milestone:` clause naming its criterion. Items for later milestones
+stay P2: the P1/P2 re-check at that milestone's change raises them (`work/README.md`). Run
+`scripts/check-backlog.sh` and `scripts/check-work-refs.sh`, open one draft PR, and run
+`pr-review-loop`. The plan is not a backlog file, so the PR gets the automated review. The PR
+description names the commit the coverage read and the groups left milestone-independent.
 
 ## close
 

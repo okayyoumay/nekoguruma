@@ -260,6 +260,12 @@ SAE J2534 ("PassThru") standard for vehicle interface adapters. The worker suppo
 **K-Line**  
 Single-wire serial automotive bus (ISO 9141-2, ISO 14230). Older protocol used in pre-CAN vehicles.
 
+**Local tenant** (design 13.3, ADR-469)  
+The one tenant of the local deployment, with an ID fixed in the server. `ngr-server user add` creates it if it is absent, and login and the other user commands look an operator up by this tenant and the username, so one username names one operator. See **Local user**.
+
+**Local user** (design 6.4, 13.3, ADR-469)  
+An operator of the local deployment who logs in with a username (the operator's subject in the **Local tenant**) and a password, stored as an Argon2id hash in `operator_credentials`, instead of through OIDC. Created, given a new password and disabled only by the `ngr-server user` command; a login starts an **Operator session**.
+
 ---
 
 ## M–O
@@ -302,6 +308,9 @@ Governs a COP's receive phase: `0` = no response required at all — the cycle c
 
 **Operational log** (agent, workers, server; design 12.2, ADR-348)  
 The `tracing` log each NGR process keeps for the developers and maintainers of NGR, to find out why NGR itself misbehaved. JSON Lines when written to a file, rotated by size with a cap, fetched by the server on request or with a failed job's result, never streamed. Its own text holds no VIN, secrets, personal data or diagnostic payloads; text taken from vendor libraries, workers or file paths, and names that may identify a person or a device, sit in a separate `external` field that leaves the device only on the device user's explicit action; and it is never evidence: not the audit log (design 8.2.3) and not the **Communication log** (design 8.11).
+
+**Operator session** (design 6.4, 13.3, ADR-469)  
+The browser session of a **Local user**: the cookie `ngr_session` that `POST /api/v1/login` sets, whose 32 random bytes the server keeps only as a SHA-256 in memory. It ends 8 hours after login or 30 minutes after its last use, measured on both the monotonic and the wall clock, at a logout or a restart, and at the next request after the operator is disabled or its password set again. It is not the agents' **Session token**, which is a bearer header.
 
 ---
 

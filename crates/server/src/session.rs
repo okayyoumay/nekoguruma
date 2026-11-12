@@ -446,7 +446,7 @@ fn ok(body: serde_json::Value) -> Response {
     response
 }
 
-fn too_many(retry_after_secs: u64, title: &'static str) -> Response {
+pub(crate) fn too_many(retry_after_secs: u64, title: &'static str) -> Response {
     let mut response = Problem::new(StatusCode::TOO_MANY_REQUESTS, title).into_response();
     response
         .headers_mut()

@@ -27,6 +27,9 @@ sqlx.workspace = true
 url.workspace = true
 base64.workspace = true
 sha2.workspace = true
+# Argon2id for the local users' passwords (ADR-469). The PHC string format and the random salt
+# come with `password-hash`; `alloc` is for the string output.
+argon2 = { version = "0.5", default-features = false, features = ["alloc", "password-hash", "std"] }
 # Reads a request body frame by frame, so the registration route can bound its size and time.
 http-body-util = "0.1"
 # The server serves HTTP/1 only (ADR-456), so it drives hyper directly instead of `axum::serve`,

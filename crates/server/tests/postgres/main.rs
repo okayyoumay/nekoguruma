@@ -4,6 +4,7 @@
 mod binary;
 mod control;
 mod instruction_key;
+mod local_users;
 mod migrations;
 mod redeem;
 mod registration;

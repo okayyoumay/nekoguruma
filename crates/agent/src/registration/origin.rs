@@ -96,7 +96,8 @@ mod tests {
     }
 
     fn refused(text: &str) -> OriginError {
-        ServerOrigin::parse(text).expect_err(text)
+        // The callers name the case in their own assertion; the refusal must not need the input.
+        ServerOrigin::parse(text).expect_err("an origin that must be refused was accepted")
     }
 
     /// S1 to S3.
@@ -240,9 +241,9 @@ mod tests {
 
     #[test]
     fn a_refusal_never_repeats_the_value() {
-        let secret = "http://secret-host.example:1234/secret";
-        let text = refused(secret).to_string();
-        assert!(!text.contains("secret"), "{text}");
+        let value = "http://unechoed-host.example:1234/unechoed";
+        let text = refused(value).to_string();
+        assert!(!text.contains("unechoed"), "{text}");
     }
 
     /// K1 and K2.

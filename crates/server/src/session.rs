@@ -498,7 +498,7 @@ pub async fn session(State(exchange): State<Exchange>, request: Request) -> Resp
         Err(error) => return Problem::new(StatusCode::BAD_REQUEST, error.title()).into_response(),
     };
 
-    // One instant for the challenge, the limiter, the gates and the token.
+    // One instant for the challenge take and the answers before the row read.
     let now = now();
     // The challenge is presented here: it is gone afterwards, whatever follows. A stale or
     // unknown one answers before any database access and is neither counted nor limited.
@@ -526,7 +526,10 @@ pub async fn session(State(exchange): State<Exchange>, request: Request) -> Resp
         Err(Judged::Internal(what)) => return inner.internal(Some(&shaped.agent_id), what, now),
     }
 
+    // The token's lifetime starts when it is minted: the clock is read again after the row read,
+    // so a wait for a connection or a lock does not shorten the advertised `expiresInSecs`.
     let agent = AgentId(shaped.agent_id.clone());
+    let now = self::now();
     match inner.sessions.mint(&agent, now) {
         Ok(token) => {
             tracing::info!(agent_id = %shaped.agent_id, "session issued");

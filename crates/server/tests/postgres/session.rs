@@ -624,6 +624,34 @@ async fn a_challenge_and_a_token_expire_when_the_clock_moves() {
     u.finish().await;
 }
 
+#[tokio::test]
+async fn a_token_lives_its_whole_lifetime_from_the_mint_after_a_slow_row_read() {
+    let u = Up::new().await;
+    // A lock on the table, held for 3 s (inside the 5 s lock timeout), delays the row read.
+    let mut tx = u.w.pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE agents IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let release = async move {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        drop(tx);
+    };
+    let (r, ()) = tokio::join!(u.valid(), release);
+    assert_eq!(r.status, 200, "the delayed exchange: {}", r.head);
+    let token = json(&r)["token"].as_str().unwrap().to_owned();
+
+    // Had the lifetime started before the wait, the token would be over 300 s old here.
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(298)).await;
+    tokio::time::resume();
+    assert!(
+        u.sessions.authenticate(&token).is_some(),
+        "a token about 298 s past its mint"
+    );
+    u.finish().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn one_valid_request_sent_twice_at_once_gets_one_token() {
     let u = Up::new().await;

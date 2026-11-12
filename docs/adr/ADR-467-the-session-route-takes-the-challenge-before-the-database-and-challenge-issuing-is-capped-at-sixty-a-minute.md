@@ -40,8 +40,9 @@ before the store could be full, so a caller cannot push one out on one server.
    numbers. The cap is global to the route: there is no caller identity on the local profile.
    *Rejected:* 10, registration's number, which two agents in a retry loop would exceed; a cap
    above 1024 to keep the pushed-out wording true, which buys nothing.
-3. **Tokens: many per agent, no bound of their own.** Each token lives its own 300 seconds and
-   nothing replaces an earlier one, since ADR-466 item 2 makes it a multi-use bearer and a later
+3. **Tokens: many per agent, no bound of their own.** Each token lives its own 300 seconds,
+   counted from when it is minted after the row read (a wait for the database does not shorten
+   the advertised `expiresInSecs`), and nothing replaces an earlier one, since ADR-466 item 2 makes it a multi-use bearer and a later
    data channel or long poll would otherwise lose its token to a reconnect. Every token costs one
    challenge, so at most 360 are live (60 a minute over the 300 seconds, plus the 60 seconds a
    challenge may wait). The table is keyed by the SHA-256 of the token's bytes, drops expired

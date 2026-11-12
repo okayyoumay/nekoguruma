@@ -150,6 +150,28 @@ fn normalized(r: &Reply) -> String {
     format!("{}\n\n{}", head.join("\n"), r.body)
 }
 
+/// Polls `condition` every 10 ms until it holds, and fails with `what` after 10 s.
+async fn wait_until<F, Fut>(what: &str, mut condition: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !condition().await {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Waits until `count` requests wait for the hasher's permit: each has then passed its
+/// admission and read its row.
+async fn wait_for_hash_waiters(hasher: &Hasher, count: usize) {
+    wait_until("a request to wait for the hasher", || async {
+        hasher.waiting() == count
+    })
+    .await;
+}
+
 /// A jump of the clock: the clock is paused only for it, with no request in flight.
 async fn jump(secs: u64) {
     tokio::time::pause();
@@ -368,7 +390,11 @@ async fn every_refusal_is_one_401_and_costs_a_verification_and_logs_its_reason()
             let (user, password) = ((*user).to_owned(), (*password).to_owned());
             async move { login(addr, &user, &password).await }
         });
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        // A refusal that skipped the verification would answer without ever waiting here.
+        wait_until(reason, || async {
+            pending.is_finished() || lab.hasher.waiting() == 1
+        })
+        .await;
         assert!(!pending.is_finished(), "{reason}: answered without a hash");
         drop(permit);
         let r = pending.await.unwrap();
@@ -418,6 +444,28 @@ async fn every_refusal_is_one_401_and_costs_a_verification_and_logs_its_reason()
     }
     // A reason is logged once per 60 s: the two unknown users made one line.
     assert_eq!(text.matches("reason=\"unknown_user\"").count(), 1, "{text}");
+    lab.finish().await;
+}
+
+#[tokio::test]
+async fn a_disabled_operator_without_a_credential_is_logged_as_disabled() {
+    let (log, _guard) = capture();
+    let lab = Lab::new().await;
+    let id = lab.user("both", "Both", &[], PASSWORD).await;
+    lab.sql(
+        "DELETE FROM operator_credentials WHERE operator_id = $1::uuid",
+        &id,
+    )
+    .await;
+    lab.sql(
+        "UPDATE operators SET disabled_at = now() WHERE id = $1::uuid",
+        &id,
+    )
+    .await;
+    assert_problem(&login(lab.addr(), "both", PASSWORD).await, 401, "both");
+    let text = log.text();
+    assert!(text.contains("reason=\"disabled\""), "{text}");
+    assert!(!text.contains("reason=\"no_credential\""), "{text}");
     lab.finish().await;
 }
 
@@ -557,12 +605,13 @@ async fn a_client_that_disconnects_during_the_hash_keeps_its_slot() {
         );
         let mut stream = TcpStream::connect(addr).await.unwrap();
         stream.write_all(raw.as_bytes()).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        // The request is waiting for the hasher; the client goes away.
+        // The request is admitted and its row is read: it waits for the hasher. Then the client
+        // goes away.
+        wait_for_hash_waiters(&lab.hasher, 1).await;
     }
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The server drops the request: nothing waits for the hasher any more.
+    wait_for_hash_waiters(&lab.hasher, 0).await;
     drop(permit);
-    tokio::time::sleep(Duration::from_millis(500)).await;
     assert_problem(
         &login(addr, "alice", "wrong password!").await,
         429,
@@ -942,7 +991,14 @@ async fn a_logout_during_the_row_read_makes_the_request_a_401_and_the_session_is
         let cookie = cookie.clone();
         async move { get_me(addr, &[&cookie]).await }
     });
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    // The row read is waiting on the table lock.
+    wait_until("the row read to wait for the lock", || async {
+        lab.pg
+            .scalar("SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock'")
+            .await
+            != "0"
+    })
+    .await;
     assert!(!pending.is_finished(), "the row read did not wait");
     let r = post_logout(addr, std::slice::from_ref(&cookie)).await;
     assert_eq!(r.status, 204);
@@ -965,7 +1021,7 @@ async fn a_disable_or_a_new_password_during_a_login_still_gets_its_200_and_the_f
         let permit = lab.hasher.hold().await;
         let pending = tokio::spawn(async move { login(addr, name, PASSWORD).await });
         // The row is read; the hash waits for the permit.
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        wait_for_hash_waiters(&lab.hasher, 1).await;
         assert!(!pending.is_finished());
         if change == "disable" {
             local_user::disable(&lab.pool, name).await.unwrap();
@@ -1050,6 +1106,24 @@ async fn a_logout_removes_every_session_presented_and_logs_the_id() {
     assert_eq!(post_logout(addr, &[a]).await.status, 204);
     assert!(!log.text().contains(&c));
     lab.finish().await;
+}
+
+#[tokio::test]
+async fn a_logout_with_a_live_session_needs_no_database() {
+    // O1
+    let mut lab = Lab::new().await;
+    let addr = lab.addr();
+    lab.user("alice", "Alice", &[], PASSWORD).await;
+    let cookie = cookie_of(&login(addr, "alice", PASSWORD).await);
+    lab.pg.stop();
+    let r = post_logout(addr, std::slice::from_ref(&cookie)).await;
+    assert_eq!(r.status, 204, "{}", r.head);
+    assert_eq!(r.header("cache-control"), Some("no-store"));
+    assert_eq!(r.header("set-cookie"), Some(CLEARED));
+    // The session is gone: the layer answers 401 from its table, before any database read
+    // (with the database up it would have been a 200 or a 503).
+    assert_signed_out(&get_me(addr, &[&cookie]).await, "after logout");
+    lab.server.finish().await;
 }
 
 #[tokio::test]
@@ -1366,6 +1440,7 @@ async fn disable_sets_the_time_once_keeps_the_credential_and_is_idempotent() {
         .pg
         .scalar("SELECT disabled_at FROM operators WHERE subject = 'alice'")
         .await;
+    // The database's clock moves on, so that a rewritten `disabled_at` would show.
     tokio::time::sleep(Duration::from_millis(1100)).await;
     let second = local_user::disable(&lab.pool, "alice").await.unwrap();
     assert!(second.already);

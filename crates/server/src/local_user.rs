@@ -11,6 +11,7 @@
 
 use std::io::Read;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use argon2::password_hash::{self, PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -264,12 +265,31 @@ pub fn verify_password(stored: &str, password: &str) -> Verdict {
     }
 }
 
+/// Counts a task as waiting while it lives, also when its future is dropped.
+struct Waiting<'a>(&'a AtomicUsize);
+
+impl<'a> Waiting<'a> {
+    fn enter(count: &'a AtomicUsize) -> Waiting<'a> {
+        count.fetch_add(1, Ordering::SeqCst);
+        Waiting(count)
+    }
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// The hashing of one server: one at a time, on a blocking thread, so that a flood of logins
 /// cannot hold more than one hash's memory and cannot starve the runtime's threads. The permit
 /// moves into the blocking task, so a request that is dropped mid-hash still holds it until the
 /// hash ends.
 #[derive(Debug, Clone)]
-pub struct Hasher(Arc<Semaphore>);
+pub struct Hasher {
+    permit: Arc<Semaphore>,
+    waiting: Arc<AtomicUsize>,
+}
 
 impl Default for Hasher {
     fn default() -> Hasher {
@@ -279,30 +299,40 @@ impl Default for Hasher {
 
 impl Hasher {
     pub fn new() -> Hasher {
-        Hasher(Arc::new(Semaphore::new(1)))
+        Hasher {
+            permit: Arc::new(Semaphore::new(1)),
+            waiting: Arc::new(AtomicUsize::new(0)),
+        }
     }
 
     /// Takes the only permit, so that every hash waits until it is dropped. Tests only: it pins
     /// a login between its row read and its hash.
     #[doc(hidden)]
     pub async fn hold(&self) -> OwnedSemaphorePermit {
-        self.0
+        self.permit
             .clone()
             .acquire_owned()
             .await
             .expect("the semaphore is never closed")
     }
 
+    /// How many hash tasks are waiting for the permit right now. Tests only: a request counts
+    /// from before it asks for the permit, so a count above zero shows that it has passed its
+    /// admission and its row read.
+    #[doc(hidden)]
+    pub fn waiting(&self) -> usize {
+        self.waiting.load(Ordering::SeqCst)
+    }
+
     async fn run<T: Send + 'static>(
         &self,
         work: impl FnOnce() -> T + Send + 'static,
     ) -> Result<T, HashError> {
-        let permit = self
-            .0
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| HashError::Task)?;
+        let permit = {
+            let _counted = Waiting::enter(&self.waiting);
+            self.permit.clone().acquire_owned().await
+        }
+        .map_err(|_| HashError::Task)?;
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             work()

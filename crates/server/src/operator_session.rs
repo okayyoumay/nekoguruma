@@ -78,7 +78,7 @@ const TOKEN_TEXT: usize = 43;
 /// The scheme the 401 answers name. Our own, never Basic: a browser would prompt for Basic.
 const CHALLENGE_SCHEME: &str = "Ngr-Session";
 
-/// The clock of the routes: tokio's, as in [`session::now`].
+/// The wall clock, read beside [`session::now`] (tokio's clock) for every instant the table keeps.
 fn wall() -> SystemTime {
     SystemTime::now()
 }
@@ -355,11 +355,20 @@ const SLOT_UNKNOWN_USER: usize = 1;
 const SLOT_NO_CREDENTIAL: usize = 2;
 const SLOT_DISABLED: usize = 3;
 const SLOT_WRONG_PASSWORD: usize = 4;
-const SLOT_UNAVAILABLE: usize = 5;
-const SLOT_INTERNAL: usize = 6;
-const SLOT_OPERATOR_GONE: usize = 7;
-const SLOT_CREDENTIAL_CHANGED: usize = 8;
-const SLOTS: usize = 9;
+const SLOT_HASH_TASK: usize = 5;
+const SLOT_MALFORMED_HASH: usize = 6;
+const SLOT_RANDOM: usize = 7;
+const SLOT_SESSION_CREDENTIAL_CHANGED: usize = 8;
+const SLOT_SESSION_NO_CREDENTIAL: usize = 9;
+const SLOT_SESSION_OPERATOR_GONE: usize = 10;
+const SLOT_SESSION_OPERATOR_DISABLED: usize = 11;
+const SLOT_WHOAMI_OPERATOR_GONE: usize = 12;
+/// The two gates of a route's database failures: unavailable (the first) and internal (the
+/// second), one pair per route.
+const SLOTS_LOGIN_DB: [usize; 2] = [13, 14];
+const SLOTS_SESSION_DB: [usize; 2] = [15, 16];
+const SLOTS_WHOAMI_DB: [usize; 2] = [17, 18];
+const SLOTS: usize = 19;
 
 /// One log gate per reason, so that a flood of one cannot silence another.
 struct Gates {
@@ -439,16 +448,22 @@ impl Inner {
         }
     }
 
-    fn failure(&self, error: &sqlx::Error, what: &str, now: Instant) -> Response {
+    fn failure(
+        &self,
+        error: &sqlx::Error,
+        what: &str,
+        slots: [usize; 2],
+        now: Instant,
+    ) -> Response {
         match db::failure(error) {
             db::Failure::Unavailable(cause) => {
-                if self.gates.allow(SLOT_UNAVAILABLE, now) {
+                if self.gates.allow(slots[0], now) {
                     tracing::warn!(error = %cause, "{what} unavailable");
                 }
                 Problem::new(StatusCode::SERVICE_UNAVAILABLE, "Sign-in unavailable").into_response()
             }
             db::Failure::Internal(cause) => {
-                if self.gates.allow(SLOT_INTERNAL, now) {
+                if self.gates.allow(slots[1], now) {
                     tracing::error!(error = %cause, "{what} failed");
                 }
                 Problem::new(StatusCode::INTERNAL_SERVER_ERROR, "Sign-in failed").into_response()
@@ -456,8 +471,14 @@ impl Inner {
         }
     }
 
-    fn internal(&self, operator_id: Option<&str>, what: &str, now: Instant) -> Response {
-        if self.gates.allow(SLOT_INTERNAL, now) {
+    fn internal(
+        &self,
+        operator_id: Option<&str>,
+        what: &str,
+        slot: usize,
+        now: Instant,
+    ) -> Response {
+        if self.gates.allow(slot, now) {
             tracing::error!(operator_id = operator_id.unwrap_or(""), error = %what, "login failed");
         }
         Problem::new(StatusCode::INTERNAL_SERVER_ERROR, "Sign-in failed").into_response()
@@ -472,11 +493,11 @@ impl Inner {
 // ---------------------------------------------------------------------------------------------
 // Login
 
-/// The user's row as login reads it: the operator, whether it is disabled, the stored password
-/// hash when there is one, and the roles.
 /// The columns of the login read, in the order of its `SELECT`.
 type AccountRow = (String, String, String, bool, Option<String>, Vec<String>);
 
+/// The user's row as login reads it: the operator, whether it is disabled, the stored password
+/// hash when there is one, and the roles.
 struct Account {
     operator_id: String,
     tenant_id: String,
@@ -564,7 +585,7 @@ pub async fn login(State(auth): State<OperatorAuth>, request: Request) -> Respon
 
     let account = match inner.read_account(&username).await {
         Ok(account) => account,
-        Err(error) => return inner.failure(&error, "login", session::now()),
+        Err(error) => return inner.failure(&error, "login", SLOTS_LOGIN_DB, session::now()),
     };
     // A refusal costs one verification whatever its reason: a real one for a wrong password,
     // the dummy for an account with nothing to check.
@@ -575,13 +596,6 @@ pub async fn login(State(auth): State<OperatorAuth>, request: Request) -> Respon
         }
         return Inner::refused();
     };
-    let Some(stored) = account.password_hash.clone() else {
-        inner.hasher.verify_dummy(password).await;
-        if inner.gates.allow(SLOT_NO_CREDENTIAL, session::now()) {
-            tracing::warn!(reason = "no_credential", operator_id = %account.operator_id, "login refused");
-        }
-        return Inner::refused();
-    };
     if account.disabled {
         inner.hasher.verify_dummy(password).await;
         if inner.gates.allow(SLOT_DISABLED, session::now()) {
@@ -589,6 +603,13 @@ pub async fn login(State(auth): State<OperatorAuth>, request: Request) -> Respon
         }
         return Inner::refused();
     }
+    let Some(stored) = account.password_hash.clone() else {
+        inner.hasher.verify_dummy(password).await;
+        if inner.gates.allow(SLOT_NO_CREDENTIAL, session::now()) {
+            tracing::warn!(reason = "no_credential", operator_id = %account.operator_id, "login refused");
+        }
+        return Inner::refused();
+    };
     // The fingerprint is taken from the row this verification judges and is never read again.
     let fingerprint = fingerprint(&stored);
     let verdict = match inner.hasher.verify(stored, password).await {
@@ -597,6 +618,7 @@ pub async fn login(State(auth): State<OperatorAuth>, request: Request) -> Respon
             return inner.internal(
                 Some(&account.operator_id),
                 "the hashing task failed",
+                SLOT_HASH_TASK,
                 session::now(),
             );
         }
@@ -613,6 +635,7 @@ pub async fn login(State(auth): State<OperatorAuth>, request: Request) -> Respon
             return inner.internal(
                 Some(&account.operator_id),
                 "the stored password hash is not an Argon2id PHC string",
+                SLOT_MALFORMED_HASH,
                 session::now(),
             );
         }
@@ -622,6 +645,7 @@ pub async fn login(State(auth): State<OperatorAuth>, request: Request) -> Respon
         return inner.internal(
             Some(&account.operator_id),
             "the random source failed",
+            SLOT_RANDOM,
             session::now(),
         );
     };
@@ -750,28 +774,37 @@ pub async fn require_session(
     let standing = match inner.read_standing(&holder.operator).await {
         Ok(standing) => standing,
         // The session is kept and not refreshed.
-        Err(error) => return inner.failure(&error, "session check", session::now()),
+        Err(error) => {
+            return inner.failure(&error, "session check", SLOTS_SESSION_DB, session::now());
+        }
     };
     match standing {
         Some((false, Some(stored))) if fingerprint(&stored) == holder.fingerprint => {}
         Some((false, Some(_))) => {
             inner.sessions.remove(&key);
-            if inner.gates.allow(SLOT_CREDENTIAL_CHANGED, now) {
+            if inner.gates.allow(SLOT_SESSION_CREDENTIAL_CHANGED, now) {
                 tracing::warn!(reason = "credential_changed", operator_id = %holder.operator, "session ended");
             }
             return unauthorized_cleared();
         }
         Some((false, None)) => {
             inner.sessions.remove(&key);
-            if inner.gates.allow(SLOT_CREDENTIAL_CHANGED, now) {
+            if inner.gates.allow(SLOT_SESSION_NO_CREDENTIAL, now) {
                 tracing::warn!(reason = "no_credential", operator_id = %holder.operator, "session ended");
             }
             return unauthorized_cleared();
         }
-        Some((true, _)) | None => {
+        Some((true, _)) => {
             inner.sessions.remove(&key);
-            if inner.gates.allow(SLOT_OPERATOR_GONE, now) {
-                tracing::warn!(reason = "operator_unusable", operator_id = %holder.operator, "session ended");
+            if inner.gates.allow(SLOT_SESSION_OPERATOR_DISABLED, now) {
+                tracing::warn!(reason = "operator_disabled", operator_id = %holder.operator, "session ended");
+            }
+            return unauthorized_cleared();
+        }
+        None => {
+            inner.sessions.remove(&key);
+            if inner.gates.allow(SLOT_SESSION_OPERATOR_GONE, now) {
+                tracing::warn!(reason = "operator_gone", operator_id = %holder.operator, "session ended");
             }
             return unauthorized_cleared();
         }
@@ -791,6 +824,7 @@ pub async fn require_session(
 pub async fn me(
     State(auth): State<OperatorAuth>,
     Extension(operator): Extension<SessionOperator>,
+    headers: HeaderMap,
 ) -> Response {
     let inner = &*auth.0;
     let row: Result<Option<(String, String, Vec<String>)>, sqlx::Error> = async {
@@ -815,8 +849,19 @@ pub async fn me(
             &display_name,
             &roles,
         )),
-        Ok(None) => unauthorized_cleared(),
-        Err(error) => inner.failure(&error, "whoami", session::now()),
+        Ok(None) => {
+            // The operator row is gone: the session ends, as in the layer.
+            for value in cookie_values(&headers) {
+                if let Some(token) = decode_token(value) {
+                    inner.sessions.remove(&table_key(&token));
+                }
+            }
+            if inner.gates.allow(SLOT_WHOAMI_OPERATOR_GONE, session::now()) {
+                tracing::warn!(reason = "operator_gone", operator_id = %operator.operator_id, "session ended");
+            }
+            unauthorized_cleared()
+        }
+        Err(error) => inner.failure(&error, "whoami", SLOTS_WHOAMI_DB, session::now()),
     }
 }
 

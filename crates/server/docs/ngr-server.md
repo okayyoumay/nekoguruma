@@ -354,9 +354,11 @@ ngr-server user disable --config <file> --username alice
   token presented and clears the cookie: 204, with or without a session, and no database access.
   **`GET /api/v1/me`** answers the session's operator with its name and roles read at that
   request.
-- **Logging.** The reasons `unknown_user`, `no_credential`, `disabled`, `wrong_password` (with the
-  operator ID when there is one), `login limited`, and `login` and `logout` at info, each gated
-  once a minute where they are warnings. The password, the typed username of a failed login, the
+- **Logging.** At login the reasons `unknown_user`, `no_credential`, `disabled` and
+  `wrong_password` (with the operator ID when there is one) and `login limited`; in the session
+  layer `operator_gone`, `operator_disabled`, `no_credential` and `credential_changed`; `login`
+  and `logout` at info. Every reason has its own gate, once a minute, so one never silences
+  another. The password, the typed username of a failed login, the
   cookie, the token and the hashes are never logged.
 
 ## Routes
@@ -602,9 +604,10 @@ a new migration file rebuilds the crate. How migrations are written and applied 
   presented sessions; sixteen sessions per operator; two logins at once; a disable or a new
   password committed during a login; a disable, a deleted operator or credential and a new
   password (also the same text) ending a session, and a changed `updated_at` alone not ending it;
-  a logout during the per-request read; logout without a database and its Origin, body and
-  method rules; the idle and the absolute limit across clock jumps; and that the role list in the
-  code is the migration's CHECK. Its `command` tests run `ngr-server user` as a process: 22 usage
+  a logout during the per-request read; logout with a live session and the database stopped,
+  and its Origin, body and method rules; a disabled operator without a credential logged as
+  disabled; the idle and the absolute limit across clock jumps; and that the role list in the
+  code is the migration's CHECK. Its `command` tests run `ngr-server user` as a process: 24 usage
   errors (exit 2), a terminal on standard input (exit 2; Linux only, through util-linux
   `script`), each refused password (exit 1, nothing written), the configuration, database and
   migration checks, two `add`s of one username at once, the JSON lines, and a failed write to

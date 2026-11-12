@@ -453,6 +453,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-461](ADR-461-the-job-instruction-is-signed-bytes-with-a-versioned-body-and-an-agent-side-gate.md) | The Job Instruction Is Signed Bytes With a Versioned Body and an Agent-Side Gate | Accepted (item 11's PEM is a field of the registration record, ADR-463) | design 5.3, 5.6, 5.7, 11.1, 12, `crates/shared-crypto`, `crates/shared-proto`, `api/`; annotates ADR-454, ADR-395 |
 | [ADR-462](ADR-462-the-server-s-instruction-key-is-an-owner-only-file-pinned-by-one-database-row.md) | The Server's Instruction Key Is an Owner-Only File Pinned by One Database Row | Accepted (item 8's Web API change specified by ADR-463, and the first-use consequence answered by it) | design 11.1, 13.3, 16.3, `crates/server`, `db/migrations`; extends ADR-456, ADR-458; fulfils ADR-461 item 14; scopes ADR-459 item 4 |
 | [ADR-463](ADR-463-an-agent-registers-with-a-single-use-code-bound-to-its-owner-and-key-and-checks-the-server-out-of-band.md) | An Agent Registers With a Single-Use Code Bound to Its Owner and Key, and Checks the Server Out of Band | Accepted | design 6.4, 6.6, 6.7, 11.1, 13.3, 14.4, `api/openapi.yaml`, `db/migrations`, `crates/shared-crypto`, `crates/shared-proto`; annotates ADR-459, ADR-461, ADR-462 |
+| [ADR-464](ADR-464-open-work-is-tied-to-a-milestone-by-its-exit-criteria.md) | Open Work Is Tied to a Milestone by Its Exit Criteria | Accepted | `.claude/skills/milestone-exit` (`coverage`), `work/README.md` (priorities), development plan, weekly plan re-evaluation |
 
 ## Status Legend
 
@@ -834,6 +835,7 @@ the predecessor repository these ADRs came from.
 - ADR-430
 - ADR-457
 - ADR-458
+- ADR-464
 
 ### Timestamps / Clock
 - ADR-057 (amended by ADR-102)

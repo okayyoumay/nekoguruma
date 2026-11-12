@@ -191,9 +191,12 @@ ngr-server registration-code --config <file> --owner alice --name "Bench PC" \
 "Redemption design", which tables every case). The steps, in order, and the first that applies
 answers:
 
-1. The request guard (above).
+1. The request guard ("The request guard" below).
 2. A method other than POST: 405 with `Allow: POST`.
 3. The body, read within 5 seconds (408), at most 4096 bytes (413; exactly 4096 passes).
+   A declared `Content-Length` over 4096 is answered 413 before any byte is read. A streamed
+   (chunked) body has no declared length and is cut when it grows past 4096, so a client that
+   keeps sending may see the connection reset instead of the 413.
 4. `Content-Type` and shape, with no database lookup: 400 unless there is one `Content-Type` of
    `application/json` (parameters allowed), a JSON object with `code`, `publicKey`, `mode` and
    `proof` exactly once each as strings and no other field, a code of at most 64 characters that
@@ -204,7 +207,7 @@ answers:
 5. The proof, with no database access: the signature must verify over the code's hash, the key's
    fingerprint, the mode and this server's in-memory key ID. A 64-byte value that is no signature,
    or one made for another mode, code or server key, is a refusal.
-6. One read committed transaction: `lock_timeout` and `statement_timeout` of 5 seconds; one
+6. One transaction, begun explicitly at read committed whatever the database default: `lock_timeout` and `statement_timeout` of 5 seconds; one
    conditional `UPDATE` consumes the code (unused, not revoked, not expired by the database's
    clock, bound to this agent key and to the in-memory key ID, that key still active, the owner in
    the code's tenant and enabled); on zero rows one `SELECT` classifies why, for the log only, and
@@ -278,7 +281,7 @@ value. The 307 carries `Cache-Control: no-store` and an absolute `Location`.
   `Cache-Control: no-store`; no login.
 - `POST /api/v1/agents/register` (`api/openapi.yaml`; `register.rs`; ADR-463, ADR-465): redeems a
   registration code. No login: the code and the agent key's proof authorize it. See
-  "Registration" below.
+  "Registration" above.
 
 Any other path answers 404 with a problem body, after the guard.
 

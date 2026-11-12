@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::Json;
+use axum::body::HttpBody;
 use axum::extract::{Request, State};
 use axum::http::header::{self, HeaderMap};
 use axum::http::{HeaderValue, StatusCode};
@@ -259,10 +260,11 @@ enum Reason {
     InstructionKey,
     Owner,
     StateChanged,
+    Unclassified,
 }
 
 impl Reason {
-    const COUNT: usize = 9;
+    const COUNT: usize = 10;
 
     fn word(self) -> &'static str {
         match self {
@@ -275,6 +277,7 @@ impl Reason {
             Reason::InstructionKey => "instruction_key",
             Reason::Owner => "owner",
             Reason::StateChanged => "state_changed",
+            Reason::Unclassified => "unclassified",
         }
     }
 }
@@ -335,18 +338,28 @@ enum RedeemError {
 }
 
 impl From<sqlx::Error> for RedeemError {
+    /// A pool, connection or database-execution failure (including a lock or statement timeout
+    /// and a serialization failure) is unavailability, 503. A fault in this code (a decode,
+    /// encode, column or type mismatch, a missing row) or any other kind is internal, 500.
+    ///
+    /// Never the error's own text: a constraint failure's detail can name a value.
     fn from(error: sqlx::Error) -> Self {
-        // Never the error's own text: a constraint failure's detail can name a value.
-        RedeemError::Unavailable(match &error {
-            sqlx::Error::Database(db) => match db.code() {
+        match &error {
+            sqlx::Error::Database(db) => RedeemError::Unavailable(match db.code() {
                 Some(code) => format!("database error, SQLSTATE {code}"),
                 None => "database error".to_owned(),
-            },
-            sqlx::Error::PoolTimedOut => "no connection available in time".to_owned(),
-            sqlx::Error::PoolClosed => "the pool is closed".to_owned(),
-            sqlx::Error::Io(_) => "connection failed".to_owned(),
-            _ => "database failure".to_owned(),
-        })
+            }),
+            sqlx::Error::PoolTimedOut => {
+                RedeemError::Unavailable("no connection available in time".to_owned())
+            }
+            sqlx::Error::PoolClosed => RedeemError::Unavailable("the pool is closed".to_owned()),
+            sqlx::Error::Io(_)
+            | sqlx::Error::Tls(_)
+            | sqlx::Error::Protocol(_)
+            | sqlx::Error::WorkerCrashed
+            | sqlx::Error::BeginFailed => RedeemError::Unavailable("connection failed".to_owned()),
+            _ => RedeemError::Internal("unexpected database client error".to_owned()),
+        }
     }
 }
 
@@ -405,6 +418,14 @@ fn closing(status: StatusCode, title: &'static str) -> Response {
 pub async fn register(State(registrar): State<Registrar>, request: Request) -> Response {
     let inner = &*registrar.0;
     let (parts, body) = request.into_parts();
+    // A declared length over the limit is answered before any byte is read, so the client gets
+    // its 413. A streamed body has no declared length and is cut when it grows past the limit.
+    if body.size_hint().lower() > MAX_BODY as u64 {
+        return closing(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "The request body is too large",
+        );
+    }
     let bytes = match read_body(body).await {
         Ok(bytes) => bytes,
         Err(BodyError::Timeout) => {
@@ -512,7 +533,12 @@ impl Inner {
     ) -> Result<Registered, RedeemError> {
         let hash = shaped.code.sha256();
         let agent_key_id = shaped.key.fingerprint_hex();
-        let mut tx = self.pool.begin().await?;
+        // Read committed is stated, not assumed: a database or role default of repeatable read
+        // would make a waiter on the code row fail with a serialization error (C1, C6).
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN ISOLATION LEVEL READ COMMITTED")
+            .await?;
 
         sqlx::query(
             "SELECT set_config('lock_timeout', '5s', true), \
@@ -538,9 +564,15 @@ impl Inner {
         .fetch_optional(&mut *tx)
         .await?;
         let Some((tenant_id, owner_id, display_name)) = consumed else {
-            let reason = self
+            // The refusal stands whatever the classification does: a failed read only loses the
+            // reason, which the log then names as unclassified.
+            let reason = match self
                 .classify(&mut tx, &hash, &agent_key_id, server_key_id)
-                .await?;
+                .await
+            {
+                Ok(reason) => reason,
+                Err(_) => Reason::Unclassified,
+            };
             return Err(RedeemError::Refused(reason));
         };
 
@@ -1030,6 +1062,31 @@ mod tests {
     }
 
     #[test]
+    fn the_length_caps_apply_to_values_that_would_otherwise_parse() {
+        let p = parts();
+        let h = json_headers();
+        // A code the parser accepts, padded with the whitespace it trims: 64 pass, 65 do not.
+        let pad = |n: usize| format!("{}{}", " ".repeat(n - p.code.len()), p.code);
+        assert_eq!(pad(64).len(), 64);
+        assert_eq!(
+            shape_of(&h, &body(&pad(64), &p.public_key, "user", &p.proof)),
+            Ok(())
+        );
+        assert_eq!(
+            shape_of(&h, &body(&pad(65), &p.public_key, "user", &p.proof)),
+            Err(ShapeError::Code)
+        );
+        // The PEM cap cannot be shown with a PEM that parses: the parser takes no padding but
+        // CRLF line ends, and a P-256 key's document is under 200 characters, so 512 is only a
+        // ceiling on what is handed to the parser.
+        let long = body(&p.code, &"A".repeat(513), "user", &p.proof);
+        assert_eq!(shape_of(&h, &long), Err(ShapeError::PublicKey));
+        // A 64-byte proof is 88 characters, and strict base64 admits no padding with other
+        // characters, so the 128-character cap is reached only by input that is invalid anyway.
+        assert_eq!(p.proof.len(), 88);
+    }
+
+    #[test]
     fn a_64_byte_value_that_is_no_signature_is_not_a_shape_error() {
         let p = parts();
         // All-zero r and s is no valid signature; the shape rules accept 64 bytes.
@@ -1089,6 +1146,39 @@ mod tests {
         assert!(!proof_holds(&shaped(code, Mode::User, theirs), server));
     }
 
+    // ----- the sqlx error mapping
+
+    #[test]
+    fn client_faults_are_internal_and_availability_failures_are_unavailable() {
+        let unavailable =
+            |e: sqlx::Error| matches!(RedeemError::from(e), RedeemError::Unavailable(_));
+        assert!(unavailable(sqlx::Error::PoolTimedOut));
+        assert!(unavailable(sqlx::Error::PoolClosed));
+        assert!(unavailable(sqlx::Error::WorkerCrashed));
+        assert!(unavailable(sqlx::Error::Io(std::io::Error::other("x"))));
+        assert!(unavailable(sqlx::Error::Protocol("x".into())));
+        for fault in [
+            sqlx::Error::RowNotFound,
+            sqlx::Error::ColumnNotFound("c".into()),
+            sqlx::Error::TypeNotFound {
+                type_name: "t".into(),
+            },
+            sqlx::Error::ColumnIndexOutOfBounds { index: 1, len: 0 },
+            sqlx::Error::Decode("x".into()),
+            sqlx::Error::Encode("x".into()),
+            sqlx::Error::ColumnDecode {
+                index: "0".into(),
+                source: "x".into(),
+            },
+            sqlx::Error::InvalidArgument("x".into()),
+        ] {
+            assert!(
+                matches!(RedeemError::from(fault), RedeemError::Internal(_)),
+                "a code fault is 500"
+            );
+        }
+    }
+
     // ----- the log gates
 
     #[test]
@@ -1105,6 +1195,7 @@ mod tests {
             Reason::InstructionKey,
             Reason::Owner,
             Reason::StateChanged,
+            Reason::Unclassified,
         ];
         assert_eq!(all.len(), Reason::COUNT);
         let words: std::collections::HashSet<_> = all.iter().map(|r| r.word()).collect();

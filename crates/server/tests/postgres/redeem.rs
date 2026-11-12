@@ -724,15 +724,17 @@ async fn every_refusal_is_the_same_403_and_its_reason_is_logged() {
     .execute(&w.pool)
     .await
     .unwrap();
+    // The first server's gate for this reason stays shut for a minute, so a second server (its own
+    // gates) answers this one and logs it.
+    let second = bind(w.pool.clone(), w.key.clone()).await;
     replies.push(
         send(
-            &w.server,
+            &second,
             &b.body(plain(&moved), &moved, Mode::User, &server_key),
         )
         .await,
     );
-    // The reason's gate stays shut for a minute, so this refusal is not logged again.
-    assert_eq!(logs.reasons("owner"), 1);
+    assert_eq!(logs.reasons("owner"), 2);
     codes.push(disabled);
     codes.push(moved);
 
@@ -768,6 +770,7 @@ async fn every_refusal_is_the_same_403_and_its_reason_is_logged() {
     {
         assert!(!text.contains(secret), "the log holds forbidden value #{i}");
     }
+    second.finish().await;
     w.finish().await;
 }
 
@@ -870,6 +873,16 @@ async fn a_new_code_for_the_same_key_revokes_the_old_rows_in_every_tenant_and_ot
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn one_code_sent_twice_at_once_redeems_exactly_once() {
+    // The server's tasks run on other threads, so the log is captured process-wide; only this
+    // test's own code is looked for in it.
+    let logs = Captured::default();
+    let _ = tracing::subscriber::set_global_default(
+        tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish(),
+    );
     let w = World::new().await;
     w.add_operator("alice").await;
     for round in 0..20 {
@@ -905,6 +918,29 @@ async fn one_code_sent_twice_at_once_redeems_exactly_once() {
             "1",
             "{round}"
         );
+        // The code row names the winner's agent.
+        let winner = if one.status == 201 { &one } else { &two };
+        let loser = if one.status == 201 { &two } else { &one };
+        assert_eq!(
+            w.sql(&format!(
+                "SELECT agent_id::text FROM agent_registration_codes WHERE {}",
+                code_where(&code)
+            ))
+            .await,
+            json(winner)["agentId"].as_str().unwrap(),
+            "{round}"
+        );
+        if round == 0 {
+            // The first refusal of the router is logged: as used, with this code's redacted form.
+            assert_eq!(loser.status, 403, "{}", loser.head);
+            let line = logs
+                .text()
+                .lines()
+                .find(|l| l.contains(&format!("{code:?}")))
+                .map(str::to_owned);
+            let line = line.expect("the refusal is logged with the code's redacted form");
+            assert!(line.contains("reason=\"used\""), "{line}");
+        }
     }
     w.finish().await;
 }
@@ -1114,5 +1150,264 @@ async fn while_limited_an_unknown_code_is_429_and_a_valid_registration_is_201() 
     )
     .await;
     assert_eq!(replay.status, 429);
+    w.finish().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Proof encodings, the declared size, the guard
+
+/// The same signature with `s` replaced by the group order minus `s`: the high-S twin, which the
+/// signer never produces and the verifier refuses.
+fn high_s(signature: &[u8]) -> Vec<u8> {
+    // The order of the P-256 group, big endian.
+    const ORDER: [u8; 32] = [
+        0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84, 0xf3, 0xb9, 0xca, 0xc2, 0xfc, 0x63,
+        0x25, 0x51,
+    ];
+    let mut out = signature.to_vec();
+    let mut borrow = 0i16;
+    for i in (0..32).rev() {
+        let d = i16::from(ORDER[i]) - i16::from(signature[32 + i]) - borrow;
+        borrow = i16::from(d < 0);
+        out[32 + i] = u8::try_from(d.rem_euclid(256)).unwrap();
+    }
+    out
+}
+
+#[tokio::test]
+async fn a_high_s_proof_is_refused_and_a_non_canonical_base64_proof_is_400() {
+    let key = instruction_key();
+    let s = dead(key.clone()).await;
+    let agent = Agent::new();
+    let code = RegistrationCode::generate().unwrap();
+    let proof = agent.proof(&code, Mode::User, &key.public_key());
+    // Control: the proof as made reaches the (dead) database.
+    let ok = send(&s, &agent.body_with(plain(&code), "user", &proof)).await;
+    assert_eq!(ok.status, 503, "{}", ok.head);
+
+    let raw = STANDARD.decode(&proof).unwrap();
+    let twin = high_s(&raw);
+    assert_ne!(twin, raw);
+    let r = send(
+        &s,
+        &agent.body_with(plain(&code), "user", &STANDARD.encode(&twin)),
+    )
+    .await;
+    assert_eq!(r.status, 403, "V1: a high-S proof is a refusal: {}", r.head);
+
+    // The last data character carries four bits that must be zero; set one of them.
+    let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let body = proof.trim_end_matches('=');
+    let (head, last) = body.split_at(body.len() - 1);
+    let index = alphabet.find(last).unwrap();
+    assert_eq!(index & 0x0f, 0, "canonical trailing bits are zero");
+    let bent = format!(
+        "{head}{}{}",
+        &alphabet[index | 1..=index | 1],
+        &proof[body.len()..]
+    );
+    assert!(
+        STANDARD.decode(&bent).is_err(),
+        "the standard decoder is strict too"
+    );
+    let r = send(&s, &agent.body_with(plain(&code), "user", &bent)).await;
+    assert_eq!(r.status, 400, "H10: {}", r.head);
+    s.finish().await;
+}
+
+#[tokio::test]
+async fn a_declared_length_over_the_limit_is_answered_413_before_the_body_is_read() {
+    let s = dead(instruction_key()).await;
+    let raw = post(&s.host(), Some("application/json"), &"x".repeat(65536));
+    let r = exchange(s.addr, &raw).await;
+    assert_eq!(r.status, 413, "{}", r.head);
+    s.finish().await;
+}
+
+#[tokio::test]
+async fn a_request_the_guard_redirects_never_reaches_the_code() {
+    let w = World::new().await;
+    w.add_operator("alice").await;
+    let agent = Agent::new();
+    let code = w.issue("alice", &agent).await;
+    let body = agent.body(plain(&code), &code, Mode::User, &w.key.public_key());
+    let host = format!("Host: localhost:{}", w.server.addr.port());
+    let r = exchange(w.server.addr, &post(&host, Some("application/json"), &body)).await;
+    assert_eq!(r.status, 307, "{}", r.head);
+    assert_eq!(
+        w.sql(&format!(
+            "SELECT used_at IS NULL FROM agent_registration_codes WHERE {}",
+            code_where(&code)
+        ))
+        .await,
+        "true"
+    );
+    let ok = send(&w.server, &body).await;
+    assert_eq!(ok.status, 201, "{}", ok.body);
+    w.finish().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Waiting on the code row
+
+/// Waits until some session waits on a lock.
+async fn wait_for_lock_wait(w: &World) {
+    for _ in 0..200 {
+        if w.sql("SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock'")
+            .await
+            != "0"
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("no session waits on a lock");
+}
+
+/// A transaction that has consumed the code and not ended: the state the first of two requests
+/// for one code is in.
+async fn hold_consumed(
+    w: &World,
+    code: &RegistrationCode,
+) -> sqlx::Transaction<'static, sqlx::Postgres> {
+    let mut tx = w.pool.begin().await.unwrap();
+    let rows =
+        sqlx::query("UPDATE agent_registration_codes SET used_at = now() WHERE code_sha256 = $1")
+            .bind(&code.sha256()[..])
+            .execute(&mut *tx)
+            .await
+            .unwrap()
+            .rows_affected();
+    assert_eq!(rows, 1);
+    tx
+}
+
+#[tokio::test]
+async fn a_request_that_waits_on_the_code_is_refused_as_used_when_the_first_commits() {
+    let (logs, _guard) = capture();
+    let w = World::new().await;
+    w.add_operator("alice").await;
+    let agent = Agent::new();
+    let code = w.issue("alice", &agent).await;
+    let body = agent.body(plain(&code), &code, Mode::User, &w.key.public_key());
+    let holder = hold_consumed(&w, &code).await;
+
+    let (addr, host) = (w.server.addr, w.server.host());
+    let waiter =
+        tokio::spawn(
+            async move { exchange(addr, &post(&host, Some("application/json"), &body)).await },
+        );
+    wait_for_lock_wait(&w).await;
+    holder.commit().await.unwrap();
+    let r = waiter.await.unwrap();
+    assert_eq!(r.status, 403, "{}", r.head);
+    assert_eq!(logs.reasons("used"), 1);
+    assert_eq!(w.sql("SELECT count(*) FROM agents").await, "0");
+    w.finish().await;
+}
+
+#[tokio::test]
+async fn a_request_that_waits_on_the_code_redeems_when_the_first_rolls_back() {
+    let w = World::new().await;
+    w.add_operator("alice").await;
+    let agent = Agent::new();
+    let code = w.issue("alice", &agent).await;
+    let body = agent.body(plain(&code), &code, Mode::User, &w.key.public_key());
+    let holder = hold_consumed(&w, &code).await;
+
+    let (addr, host) = (w.server.addr, w.server.host());
+    let waiter =
+        tokio::spawn(
+            async move { exchange(addr, &post(&host, Some("application/json"), &body)).await },
+        );
+    wait_for_lock_wait(&w).await;
+    holder.rollback().await.unwrap();
+    let r = waiter.await.unwrap();
+    assert_eq!(r.status, 201, "{}", r.body);
+    assert_eq!(w.sql("SELECT count(*) FROM agents").await, "1");
+    w.finish().await;
+}
+
+#[tokio::test]
+async fn a_lock_wait_past_five_seconds_is_503_and_the_code_redeems_after() {
+    let (logs, _guard) = capture();
+    let w = World::new().await;
+    w.add_operator("alice").await;
+    let agent = Agent::new();
+    let code = w.issue("alice", &agent).await;
+    let body = agent.body(plain(&code), &code, Mode::User, &w.key.public_key());
+    let holder = hold_consumed(&w, &code).await;
+
+    let started = std::time::Instant::now();
+    let r = send(&w.server, &body).await;
+    assert_eq!(r.status, 503, "{}", r.head);
+    assert!(
+        started.elapsed() >= Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    // The lock and statement limits are both 5 s, so either one ends the wait.
+    let text = logs.text();
+    assert!(
+        text.contains("SQLSTATE 55P03") || text.contains("SQLSTATE 57014"),
+        "{text}"
+    );
+    holder.rollback().await.unwrap();
+
+    let ok = send(&w.server, &body).await;
+    assert_eq!(ok.status, 201, "{}", ok.body);
+    w.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_transaction_is_read_committed_whatever_the_database_default() {
+    let w = World::new().await;
+    w.add_operator("alice").await;
+    w.add_operator("bob").await;
+    w.pg.execute("ALTER DATABASE postgres SET default_transaction_isolation = 'repeatable read'")
+        .await;
+    // New sessions take the setting; a pool of its own has no older ones.
+    assert_eq!(
+        w.sql("SELECT current_setting('default_transaction_isolation')")
+            .await,
+        "repeatable read"
+    );
+    let server = bind(w.pg.pool(), w.key.clone()).await;
+    for round in 0..5 {
+        let agent = Agent::new();
+        let first = w.issue("alice", &agent).await;
+        let second = w.issue("bob", &agent).await;
+        let (addr, host) = (server.addr, server.host());
+        let server_key = w.key.public_key();
+        let go = |code: RegistrationCode| {
+            let raw = post(
+                &host,
+                Some("application/json"),
+                &agent.body(plain(&code), &code, Mode::User, &server_key),
+            );
+            tokio::spawn(async move { exchange(addr, &raw).await })
+        };
+        let (a, b) = (go(first), go(second));
+        let (a, b) = (a.await.unwrap(), b.await.unwrap());
+        assert_eq!(
+            (a.status, b.status),
+            (201, 201),
+            "{round}: {} {}",
+            a.body,
+            b.body
+        );
+        assert_eq!(
+            w.sql(&format!(
+                "SELECT count(*) FROM agents WHERE public_key = decode('{}', 'hex') \
+                 AND revoked_at IS NULL",
+                hex(&agent.public.to_spki_der())
+            ))
+            .await,
+            "1",
+            "{round}"
+        );
+    }
+    server.finish().await;
     w.finish().await;
 }

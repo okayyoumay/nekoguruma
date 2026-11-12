@@ -210,7 +210,9 @@ mod tests {
     use std::net::TcpListener;
 
     /// A listener that answers its first connection with `behaviour`, given the stream after the
-    /// request head was read.
+    /// whole request (head and body) was read. The body is read too: closing a socket with
+    /// unread input makes Windows reset the connection, and the client would see the reset
+    /// instead of the answer.
     fn stub(behaviour: impl FnOnce(std::net::TcpStream) + Send + 'static) -> u16 {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -223,6 +225,16 @@ mod tests {
                     return;
                 }
                 seen.push(byte[0]);
+            }
+            let head = String::from_utf8_lossy(&seen).to_ascii_lowercase();
+            let length = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            let mut body = vec![0u8; length];
+            if stream.read_exact(&mut body).is_err() {
+                return;
             }
             behaviour(stream);
         });

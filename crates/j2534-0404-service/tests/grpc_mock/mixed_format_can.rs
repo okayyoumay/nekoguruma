@@ -1353,8 +1353,10 @@ async fn non_native_mixed_mode_accepts_a_colliding_uudt_usdt_table() {
     // Confirm this is still exercising a collision-shaped table (both a
     // FLOW_CONTROL_FILTER-eligible USDT id and a UUDT id at the same
     // numeric address), not an accidentally-empty one: the pre-existing
-    // ADR-041 workaround installs a FLOW_CONTROL_FILTER for each.
-    assert_eq!(server.backdoor.filter_count(MOCK_CHANNEL_ID), 2);
+    // ADR-041 workaround wants a FLOW_CONTROL_FILTER for each, and both are
+    // the same pattern/flow-control pair, so the channel holds the one filter
+    // they share (ADR-398: an adapter refuses a repeated pair).
+    assert_eq!(server.backdoor.filter_count(MOCK_CHANNEL_ID), 1);
 
     // The promote-time path must likewise accept a (different) colliding
     // table outside native-mixed mode.
@@ -1371,7 +1373,7 @@ async fn non_native_mixed_mode_accepts_a_colliding_uudt_usdt_table() {
         )],
     )
     .await;
-    assert_eq!(server.backdoor.filter_count(MOCK_CHANNEL_ID), 2);
+    assert_eq!(server.backdoor.filter_count(MOCK_CHANNEL_ID), 1);
 
     server.shutdown().await;
 }
@@ -1900,5 +1902,115 @@ async fn native_mixed_all_frames_mode_usdt_delivery_keeps_its_own_normal_address
     assert_result_data(&result, &0x5E8_u32.to_be_bytes(), &[], &payload);
     assert_eq!(result.unique_resp_identifier, 3);
 
+    server.shutdown().await;
+}
+
+/// A started ISO 15765 message is ended only by an ISO 15765 content message
+/// from that response ID. Under native-mixed a raw UUDT frame routed to the
+/// same table entry carries the same unique response identifier but completes
+/// no segmented message, so the stalled response's timeout is still named
+/// `ISO15765_CF_TIMEOUT`.
+#[tokio::test]
+#[serial]
+async fn native_mixed_uudt_frame_does_not_end_a_started_usdt_message() {
+    let server = TestServer::start_with_can_mode(Some("native-mixed")).await;
+    let mut client = server.client().await;
+    let cll_handle = create_and_connect_cll(
+        &mut client,
+        j2534_0404::ISO15765,
+        &[
+            (j2534_0404::DATA_RATE, 500_000),
+            (j2534_0404::P2_MAX, 800_000),
+        ],
+    )
+    .await;
+    set_unique_resp_table_and_promote(
+        &mut client,
+        cll_handle,
+        vec![ecu_entry(
+            3,
+            vec![
+                unum32_param(CP_CAN_RESP_USDT_ID, 0x7E8),
+                unum32_param(CP_CAN_RESP_UUDT_ID, 0x5E8),
+                unum32_param(CP_CAN_PHYS_REQ_ID, 0x7E0),
+            ],
+        )],
+    )
+    .await;
+    let mut events = client
+        .subscribe_event(SubscribeEventRequest {
+            handle: Some(subscribe_event_request::Handle::CllHandle(cll_handle)),
+        })
+        .await
+        .expect("subscribe_event should succeed")
+        .into_inner();
+
+    let cop_handle = client
+        .start_com_primitive(StartComPrimitiveRequest {
+            cop_tag: None,
+            cll_handle: Some(cll_handle),
+            cop_type: ComOperationType::CoptSendrecv as i32,
+            cop_data: vec![0x22, 0xF1, 0x90],
+            cop_ctrl_data: Some(vci_service_interface::ComPrimitiveCtrlData {
+                time: 0,
+                num_send_cycles: 1,
+                num_receive_cycles: 1,
+                temp_param_update: 0,
+                expected_response_array: vec![vci_service_interface::ExpectedResponseData {
+                    response_type: 0,
+                    acceptance_id: 7,
+                    mask_data: vec![0xFF],
+                    pattern_data: vec![0x62],
+                    unique_resp_ids: vec![],
+                }],
+                tx_flag: None,
+            }),
+        })
+        .await
+        .expect("start_com_primitive(CoptSendrecv) should succeed")
+        .into_inner()
+        .cop_handle
+        .expect("cop_handle should be present");
+    wait_for_written_count(&server, MOCK_CHANNEL_ID, 1).await;
+
+    // The USDT response starts, then an unrelated UUDT frame (not matching
+    // the expected response) arrives for the same entry; the USDT message
+    // never completes.
+    server.backdoor.inject_rx_with_status(
+        MOCK_CHANNEL_ID,
+        &can_frame(0x7E8, &[]),
+        j2534_0404::ISO15765,
+        0x0000_0002, // START_OF_MESSAGE
+    );
+    server.backdoor.inject_rx(
+        MOCK_CHANNEL_ID,
+        &can_frame(0x5E8, &[0x11, 0x22]),
+        j2534_0404::CAN,
+    );
+
+    let mut error = None;
+    assert!(
+        wait_for_event(&mut events, 4000, |item| {
+            if let Some(event_item::Data::ErrorData(data)) = &item.data {
+                error = Some((data.clone(), item.cop_handle));
+                return true;
+            }
+            false
+        })
+        .await,
+        "the deadline should raise a receive timeout"
+    );
+    let (data, error_cop) = error.expect("error captured");
+    assert_eq!(
+        data.error_event,
+        vci_service_interface::PduErrorEvent::PduErrEvtRxTimeout as i32
+    );
+    assert_eq!(
+        data.extra_error_info_name.as_deref(),
+        Some("ISO15765_CF_TIMEOUT")
+    );
+    assert_eq!(error_cop, Some(cop_handle));
+
+    drop(events);
     server.shutdown().await;
 }

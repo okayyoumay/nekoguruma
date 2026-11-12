@@ -63,7 +63,19 @@ recur:
   several differently worded findings in one function or tightly coupled group): ask for an
   enumeration audit, every variant × handler × side-effecting `.await`, success and failure arms,
   with pass/fail for each. Treat "the surface is closed" as a hypothesis: run `edge-case-hunter`
-  on the audit's diff.
+  on the audit's diff. A judgement found false in one more case is the next shape, not
+  this one.
+- **A judgement found false in one more case** (a classification, a lateness, an owner, a kept
+  power: an outcome the code infers from evidence rather than reads): the second finding, from
+  any source, that the outcome comes out false in a case consistent with the evidence the code
+  had, whichever case each finding names. No evidence bounds that error, so more cases will
+  follow; neither an enumeration audit nor a further estimate that closes the case found (a
+  bound, a tolerance, an assumed value) ends it. Ask instead for the fix that makes the evidence
+  decide: read what was missing, or narrow the judgement to the cases its evidence decides and
+  leave the rest open with its reason and inputs (ADR-375 item 4, which requires this of the
+  communication log). When neither fits the PR (the missing input is new work, or narrowing
+  drops what the item asked for), stop fixing and ask the maintainer to cut the scope, and
+  record the part cut with the `backlog` skill.
 - **"State X is wrong during window W"** (a wait loop, a sleep, a non-cancellable phase): fix
   the whole window at once, every `.await` and sleep inside it, including nested branches.
 - **"A check acted on state not yet updated"**: ask for every source of staleness for that

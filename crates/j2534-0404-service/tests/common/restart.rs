@@ -219,7 +219,8 @@ impl Env {
             .duration_since(UNIX_EPOCH)
             .expect("system clock should be after unix epoch")
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("ngr-restart-{tag}-{nanos}"));
+        let pid = std::process::id();
+        let root = std::env::temp_dir().join(format!("ngr-restart-{tag}-{pid}-{nanos}"));
         std::fs::create_dir_all(root.join("journal")).expect("journal directory");
         std::fs::create_dir_all(root.join("control")).expect("control directory");
         let env = Self {
@@ -1104,6 +1105,12 @@ fn probe_main() {
         data.extend_from_slice(&did.to_be_bytes());
         api.write_messages(channel, &mut [message(&data)], 1_000)
             .expect("the request should be sent");
+        // The request's TxDone indication (`TX_MSG_TYPE` and `TX_INDICATION`) comes first
+        // (SAE J2534-1 v04.04 clause 8.6).
+        let indication = api
+            .read_messages(channel, 1, 2_000)
+            .expect("the request's TxDone indication");
+        assert_eq!(indication[0].rx_status(), 0x09);
         let responses = api
             .read_messages(channel, 1, 2_000)
             .expect("the ECU should answer");

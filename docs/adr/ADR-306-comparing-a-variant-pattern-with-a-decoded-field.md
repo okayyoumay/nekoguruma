@@ -1,7 +1,7 @@
 # ADR-306: Comparing a Variant Pattern with a Decoded Field
 
 **Date:** 2026-10-16
-**Status:** Accepted (how entries combine and which variant wins decided by ADR-315)
+**Status:** Accepted (how entries combine and which variant wins decided by ADR-315; the comparison also judges a field rule, through `expected_matches`, by ADR-403)
 **Affects:** `diag-ir` (`src/decode.rs`), `diag-frontend` (`src/tables/resolve.rs`,
 `src/convert/services.rs`), `crates/diag-frontend/docs/csv-tables.md` 4.2, design 8.9.1
 

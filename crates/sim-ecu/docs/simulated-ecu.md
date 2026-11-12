@@ -16,7 +16,10 @@ message)` takes the addressing mode. `message` is the A_Data starting with the S
 via `to_bytes()`), or no response. `exchange(addressing, message)` returns the same response
 together with the delay before it is sent (`EcuConfig::response_delay_ms` plus any injected
 delay); the VCI side (`sim-vci` for the J2534 worker, `iso22900-mock` for the D-PDU worker,
-ADR-299) applies it.
+ADR-299) applies it. Its `reached` says whether the request reached the ECU at all: not while
+the ECU is off or starting up after a reset, nor when a bus error or `drop_at_block` loses it.
+`sim-vci` gives such a request no TxDone when it is segmented, since no flow control would come
+(ADR-352).
 
 The ECU's own timers (the session timeout and the security delay, below) run on a `Clock`.
 `SimEcu::new` uses real time (`SystemClock`); `SimEcu::with_clock(config, clock)` takes another,
@@ -184,12 +187,19 @@ numbers contradict each other or exceed the flash window, which the ECU itself n
 | `PowerLoss` | Immediate: session, security and a running transfer are lost as in a power cycle (flash progress is kept), and the ECU answers nothing until `reconnect()` |
 | `CorruptBlock { block }` | Writing TransferData block `block` (numbered as for `drop_at_block`) fails: NRC 72 (clause 14.4), nothing is stored and the blockSequenceCounter does not advance, so the client may send the block again |
 | `NegativeResponse { nrc }` | The next request that reaches the ECU is refused with `nrc` and has no effect: it is not dispatched, so no state changes (an ECU reset does not happen, a session does not switch). Sent whatever the addressing and the suppress bit; tS3_Server restarts as for any request that reaches the ECU |
-| `ResponsePending { count, interval_ms }` | The next request the ECU answers gets `count` response pending messages (`7F SID 78`, Annex A.1) before its response: the first when the response was due, the others `interval_ms` apart, and the response `interval_ms` after the last. `exchange()` lists them in `Exchange::pending` with their delays; tS3_Server restarts when the final response goes out. A request without a response leaves the fault armed; with `DropResponse` the messages still go out and only the final response is lost. `count` is capped at `MAX_RESPONSE_PENDING` (1000); zero uses the fault up without sending any |
+| `TruncateResponse { len }` | The next positive response is cut to its first `len` bytes (at least its service identifier): the request is handled as usual, and the response no longer answers it (ADR-359). A request with no positive response leaves the fault armed; a `len` at or above the response's length uses the fault up without cutting; with `DropResponse` armed too, the cut response is lost |
+| `RepeatResponse { interval_ms }` | The next final response goes out twice, the second copy `interval_ms` after the first (ADR-400). A request with no response leaves the fault armed; with `DropResponse` armed too, both copies are lost and the fault stays armed |
+| `ResponsePending { count, interval_ms }` | The next request the ECU answers gets `count` response pending messages (`7F SID 78`, Annex A.1) before its response: the first when the response was due, the others `interval_ms` apart, and the response `interval_ms` after the last. `exchange()` lists them in `Exchange::pending` with their delays; tS3_Server restarts when the final response goes out. A request without a response leaves the fault armed (a request with the suppress bit is not one, see below); with `DropResponse` the messages still go out and only the final response is lost. `count` is capped at `MAX_RESPONSE_PENDING` (1000); zero uses the fault up without sending any |
 
 `ResponsePending` simplifies what a server does around NRC 78 (Annex A.1, clause 7.7.3):
 
-- A request with the suppress bit set gets no chain: a server that sends NRC 78 must then send a
-  final response even for such a request, a sequence the simulator cannot produce.
+- A request with the suppress bit set that a `ResponsePending` with a count above zero fires on is
+  handled as if the bit were clear: after a response pending message a final response is owed
+  whatever the bit says (clause 7.7.3.2), so the positive response follows the last message
+  (the bit is cleared in the sub-function it echoes). Only the services the simulator gives a
+  sub-function read the bit (DiagnosticSessionControl, ECUReset, SecurityAccess,
+  TesterPresent, ReadDTCInformation, RoutineControl). A request that has no response for another
+  reason leaves the fault armed.
 - The chain can precede any final response, also a negative one a server would have given at
   once (NRC 11, 12 or 13), although NRC 78 says the request was accepted.
 - During the chain the ECU answers other requests at once, and the request's own effect (an ECU

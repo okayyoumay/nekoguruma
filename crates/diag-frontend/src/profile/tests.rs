@@ -274,7 +274,13 @@ fn leak<T>(items: Vec<T>) -> &'static [T] {
 
 /// `intent`'s call made of `steps`, validated in a profile of its own.
 fn check(intent: Intent, steps: Vec<Step>) -> Result<(), ProfileError> {
+    check_in(UDS, intent, steps)
+}
+
+/// As [`check`], in the profile of application layer `layer`.
+fn check_in(layer: &'static str, intent: Intent, steps: Vec<Step>) -> Result<(), ProfileError> {
     Profile {
+        layer,
         calls: leak(vec![Call {
             intent,
             steps: leak(steps),
@@ -322,6 +328,10 @@ fn security(steps: Vec<Step>) -> Result<(), ProfileError> {
 }
 
 fn seed_step() -> Step {
+    seed_step_with(ZeroSeed::Unlocked)
+}
+
+fn seed_step_with(zero: ZeroSeed) -> Step {
     step(
         StepKind::SendReceive,
         0x27,
@@ -330,7 +340,10 @@ fn seed_step() -> Step {
             arg: Source::Level,
         }],
         false,
-        ResultMap::Seed { after_bytes: 2 },
+        ResultMap::Seed {
+            after_bytes: 2,
+            zero,
+        },
     )
 }
 
@@ -503,6 +516,20 @@ fn each_call_has_the_results_adr_314_gives_it() {
     assert_eq!(
         security(vec![seed_step(), key_step(0), declared_key]),
         Err(ProfileError::ResultMap(Intent::SecurityAccess))
+    );
+}
+
+#[test]
+fn on_uds_a_zero_seed_means_unlocked_and_another_layer_may_say_otherwise() {
+    let with = |zero| vec![seed_step_with(zero), key_step(0), send_key_step()];
+    assert_eq!(security(with(ZeroSeed::Unlocked)), Ok(()));
+    assert_eq!(
+        security(with(ZeroSeed::Key)),
+        Err(ProfileError::ZeroSeed(Intent::SecurityAccess))
+    );
+    assert_eq!(
+        check_in("other", Intent::SecurityAccess, with(ZeroSeed::Key)),
+        Ok(())
     );
 }
 

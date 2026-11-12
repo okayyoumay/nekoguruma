@@ -91,6 +91,10 @@ async fn iso15765_standard_grpc_call_sequence_round_trips_through_mock() {
         .expect("get_timestamp should succeed")
         .into_inner();
     assert!(timestamp.timestamp > 0);
+    assert_eq!(
+        timestamp.timestamp_clock(),
+        vci_service_interface::TimestampClock::Worker
+    );
 
     // ── GetResourceIds("ISO15765") ───────────────────────────────────────
     let resource_ids = client

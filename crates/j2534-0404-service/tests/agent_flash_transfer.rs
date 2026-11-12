@@ -158,6 +158,7 @@ fn download_program(segments: &[Segment]) -> Program {
     // The validator wants download instructions inside a flash session's plan. The plan never
     // allows a restart (a recovery point at the erase), so it declares nothing else.
     let flash = vec![FlashRecovery {
+        target: 0,
         flash_session: FLASH_SESSION,
         stage: 1,
         max_resumes: 1,
@@ -186,16 +187,19 @@ fn download_program(segments: &[Segment]) -> Program {
         identity: IdentitySources {
             vin: None,
             hardware_part_number: Some(Source::EcuService {
+                target: 0,
                 service_id: 1,
                 field_id: 1,
             }),
             software_version: Some(Source::EcuService {
+                target: 0,
                 service_id: 2,
                 field_id: 1,
             }),
         },
         preconditions: Default::default(),
         flash,
+        targets: Vec::new(),
     }
 }
 
@@ -339,20 +343,21 @@ fn agent_job_downloads_more_blocks_than_the_counter_holds() {
         .duration_since(UNIX_EPOCH)
         .expect("system clock should be after unix epoch")
         .as_nanos();
-    let config_path = std::env::temp_dir().join(format!("agent-flash-{nanos}-sim-vci.toml"));
-    let ecu_path = std::env::temp_dir().join(format!("agent-flash-{nanos}-ecu.json"));
+    let pid = std::process::id();
+    let config_path = std::env::temp_dir().join(format!("agent-flash-{pid}-{nanos}-sim-vci.toml"));
+    let ecu_path = std::env::temp_dir().join(format!("agent-flash-{pid}-{nanos}-ecu.json"));
     let _config = TempFile(config_path.clone());
     let _ecu = TempFile(ecu_path.clone());
-    let journal_dir = std::env::temp_dir().join(format!("agent-flash-{nanos}-journal"));
+    let journal_dir = std::env::temp_dir().join(format!("agent-flash-{pid}-{nanos}-journal"));
     std::fs::create_dir_all(&journal_dir).expect("journal directory");
     let _journal = TempDir(journal_dir.clone());
     let long_block_journal_dir =
-        std::env::temp_dir().join(format!("agent-flash-{nanos}-long-block-journal"));
+        std::env::temp_dir().join(format!("agent-flash-{pid}-{nanos}-long-block-journal"));
     std::fs::create_dir_all(&long_block_journal_dir).expect("journal directory");
     let _long_block_journal = TempDir(long_block_journal_dir.clone());
     // The artifact files: the first job's segments end at the end of the file, the second
     // job's single block is the whole file.
-    let artifact_dir = std::env::temp_dir().join(format!("agent-flash-{nanos}-artifacts"));
+    let artifact_dir = std::env::temp_dir().join(format!("agent-flash-{pid}-{nanos}-artifacts"));
     std::fs::create_dir_all(&artifact_dir).expect("artifact directory");
     let _artifacts = TempDir(artifact_dir.clone());
     let accepted_len = (u64::from(BLOCKS) + LONGEST_BLOCK as u64) as usize;
@@ -369,7 +374,8 @@ fn agent_job_downloads_more_blocks_than_the_counter_holds() {
     std::fs::write(&config_path, "").expect("test config file should be writable");
     // The registration definition names the library, through the debug-only
     // `NGR_J2534_DEFINITION_DIR` override (ADR-282).
-    let definition_dir = std::env::temp_dir().join(format!("agent-flash-{nanos}-definitions"));
+    let definition_dir =
+        std::env::temp_dir().join(format!("agent-flash-{pid}-{nanos}-definitions"));
     std::fs::create_dir_all(&definition_dir).expect("definition directory");
     let _definitions = TempDir(definition_dir.clone());
     j2534_0404_mock::write_definition(&definition_dir, LIBRARY_NAME, &sim_vci_path())
@@ -478,7 +484,7 @@ fn assert_comm_log(journal_dir: &std::path::Path) {
     );
     assert!(version["api_version"].is_u64(), "{connected}");
     assert!(version.get("vendor").is_none(), "{connected}");
-    assert_eq!(connected["drift_bound"]["source"], "none", "{connected}");
+    assert_eq!(connected["drift_bound"]["source"], "default", "{connected}");
     let identities: Vec<(&str, &str)> = lines
         .iter()
         .filter(|line| line["event"] == "identity")

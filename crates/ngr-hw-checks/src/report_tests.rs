@@ -172,6 +172,19 @@ fn the_report_has_every_field_and_no_identifier() {
     );
 }
 
+/// The report states the ABI of the worker that ran, whichever ABI that is.
+#[test]
+fn the_report_states_the_worker_abi_that_ran() {
+    for abi in Abi::ALL {
+        let profile = profile("j2534-0404", "");
+        let mut report = Report::new(&profile);
+        report.add_device(vci(&profile), abi, &module("VCI-1"), &version());
+        let table: toml::Table = report.to_toml().unwrap().parse().unwrap();
+        let device = table["device"].as_array().unwrap()[0].as_table().unwrap();
+        assert_eq!(device["abi"].as_str(), Some(abi.name()));
+    }
+}
+
 #[test]
 fn j2534_versions_are_the_reported_strings_and_no_device_leaves_them_out() {
     let profile = profile("j2534-0404", "");

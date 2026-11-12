@@ -9,6 +9,8 @@ Native-library test double used by wrapper and service tests, with deterministic
 - Global mock state is shared for process lifetime and requires deliberate reset discipline.
 - Deterministic constants are preferred for reproducible tests.
 - Exported ABI must mirror target-specific calling-convention constraints from real bindings.
+- The response pending handling (`receive_events`, ADR-299 extended) is a pure function of the ECU's messages and the active ComParams a ComPrimitive took when it was started (`WaitingCop::rc78`; `PDUConnect` and UPDATEPARAM copy working to active, 8.4.15.6), so it is unit-tested without the delivery thread. Handling is off at the start (the standard's default for UDS is on) so existing tests that count result items keep seeing the pendings.
+- The link's state and tester-present (ADR-423) live in `MockState` and are scheduled by the delivery thread that already orders ComPrimitive events (ADR-299): the start of a ComPrimitive on an idle link also sends a tester-present that is already due, before the ComPrimitive and before an UPDATEPARAM's copy of the working buffers (ADR-423 item 6); a tester-present is a marker in the same schedule, so it is serialized with ComPrimitives by construction. State changes of STARTCOMM, UPDATEPARAM and STOPCOMM take effect when their last event is delivered, not when they start; `MockState::go_online` strips them from the ComPrimitives still waiting or scheduled, so none outlives the link it was started on.
 
 ## Implementation Policy
 

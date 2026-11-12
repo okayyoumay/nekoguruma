@@ -289,6 +289,8 @@ impl<'a> Index<'a> {
                 // Resolving checked that the service is a DID read of one field with this name.
                 let did = rows::Container::Did(service.name.clone());
                 Source::EcuService {
+                    // The format declares no targets yet (ADR-336 item 7, ADR-410).
+                    target: 0,
                     service_id: self.service_ids[service],
                     field_id: self.field_ids[self.fields_by_name[&(&did, field.as_str())]]
                         .expect("a source field is not a constant"),

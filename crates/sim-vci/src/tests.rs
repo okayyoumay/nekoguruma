@@ -106,8 +106,13 @@ fn write(channel: PassThruUlong, can_id: u32, payload: &[u8]) {
     assert_eq!(n, 1);
 }
 
-/// Reads up to `wanted` messages; returns the status and the data of each message read.
-fn read(channel: PassThruUlong, wanted: usize, timeout: u32) -> (PassThruUlong, Vec<Vec<u8>>) {
+/// Reads up to `wanted` messages as one `PassThruReadMsgs` call does: the status, and the
+/// `RxStatus` and data of each message read.
+fn read_raw(
+    channel: PassThruUlong,
+    wanted: usize,
+    timeout: u32,
+) -> (PassThruUlong, Vec<(PassThruUlong, Vec<u8>)>) {
     let mut buf: Vec<PassThruMsg> = (0..wanted).map(|_| empty_msg()).collect();
     let mut n = wanted as PassThruUlong;
     let status = unsafe {
@@ -122,10 +127,47 @@ fn read(channel: PassThruUlong, wanted: usize, timeout: u32) -> (PassThruUlong, 
         .iter()
         .map(|m| {
             assert_eq!(m.protocol_id, ISO15765);
-            m.data[..m.data_size as usize].to_vec()
+            (m.rx_status, m.data[..m.data_size as usize].to_vec())
         })
         .collect();
     (status, msgs)
+}
+
+/// Reads up to `wanted` responses within `timeout` ms, as `PassThruReadMsgs` would if the
+/// channel gave no TxDone indications: an indication read on the way is checked to carry a
+/// CAN ID and left out, and the read goes on for the rest. Returns the status and the data of
+/// each response read.
+fn read(channel: PassThruUlong, wanted: usize, timeout: u32) -> (PassThruUlong, Vec<Vec<u8>>) {
+    let deadline = Instant::now() + Duration::from_millis(timeout.into());
+    let mut responses = Vec::new();
+    loop {
+        let left = deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis() as u32;
+        let (status, msgs) = read_raw(channel, wanted - responses.len(), left);
+        let mut indications = 0;
+        for (rx_status, data) in msgs {
+            if rx_status == TX_DONE {
+                assert_eq!(data.len(), CAN_ID_LEN, "{data:02X?}");
+                indications += 1;
+            } else {
+                assert_eq!(rx_status, 0);
+                responses.push(data);
+            }
+        }
+        if responses.len() == wanted {
+            return (STATUS_NOERROR, responses);
+        }
+        if indications == 0 {
+            // A later call that read nothing says so, though responses were read before it.
+            let status = match (status, responses.is_empty(), timeout) {
+                (ERR_BUFFER_EMPTY, false, 0) => STATUS_NOERROR,
+                (ERR_BUFFER_EMPTY, false, _) => ERR_TIMEOUT,
+                _ => status,
+            };
+            return (status, responses);
+        }
+    }
 }
 
 fn response(payload: &[u8]) -> Vec<u8> {
@@ -248,6 +290,26 @@ fn response_pending_messages_arrive_before_the_response() {
     // The last response pending goes out 100 ms after the first, and the response 100 ms later.
     assert!(
         start.elapsed() >= Duration::from_millis(190),
+        "{:?}",
+        start.elapsed()
+    );
+}
+
+#[test]
+fn a_repeated_response_arrives_a_second_time_after_the_interval() {
+    let f = fixture();
+    with_ecu(|ecu| ecu.inject(Fault::RepeatResponse { interval_ms: 100 }));
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &[0x3E, 0x00]);
+    let start = Instant::now();
+    assert_eq!(
+        read(f.channel, 2, 1000),
+        (
+            STATUS_NOERROR,
+            vec![response(&[0x7E, 0x00]), response(&[0x7E, 0x00])]
+        )
+    );
+    assert!(
+        start.elapsed() >= Duration::from_millis(90),
         "{:?}",
         start.elapsed()
     );
@@ -517,15 +579,83 @@ fn timestamps_mark_when_each_response_appeared() {
     write(f.channel, ECU_PHYSICAL_REQUEST_ID, &[0x3E, 0x00]);
     write(f.channel, ECU_PHYSICAL_REQUEST_ID, &[0x3E, 0x00]);
     std::thread::sleep(Duration::from_millis(300));
-    let mut buf = [empty_msg(), empty_msg()];
-    let mut n = 2;
+    // Two TxDone indications, then the two responses.
+    let mut buf = [empty_msg(), empty_msg(), empty_msg(), empty_msg()];
+    let mut n = 4;
     assert_eq!(
         unsafe { PassThruReadMsgs(f.channel, buf.as_mut_ptr(), &mut n, 0) },
         STATUS_NOERROR
     );
+    let responses: Vec<_> = buf.iter().filter(|m| m.rx_status == 0).collect();
+    assert_eq!(responses.len(), 2);
     // Read together, but the delayed response appeared about 200 ms after the other.
-    let gap = buf[1].timestamp.wrapping_sub(buf[0].timestamp);
+    let gap = responses[1].timestamp.wrapping_sub(responses[0].timestamp);
     assert!((100_000..=200_000).contains(&gap), "gap {gap} us");
+}
+
+/// SAE J2534-1 v04.04 clause 8.6: each message sent on ISO 15765 gives a TxDone indication,
+/// ahead of any response to it, with the CAN ID it was sent to as its data and no filter in its
+/// way; a failed send gives none.
+#[test]
+fn each_message_sent_gives_a_tx_done_indication_before_its_response() {
+    let f = fixture();
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &[0x3E, 0x00]);
+    // No filter receives from 0x7E9, but the indication of a send to it is not filtered.
+    write(f.channel, 0x7E1, &[0x3E, 0x00]);
+    let (status, msgs) = read_raw(f.channel, 3, 100);
+    assert_eq!(status, STATUS_NOERROR);
+    assert_eq!(
+        msgs,
+        vec![
+            (TX_DONE, ECU_PHYSICAL_REQUEST_ID.to_be_bytes().to_vec()),
+            // The ECU answers at once, before the second send.
+            (0, response(&[0x7E, 0x00])),
+            (TX_DONE, 0x7E1_u32.to_be_bytes().to_vec()),
+        ]
+    );
+    // A segmented send without flow control fails and gives no indication.
+    let m = msg(0x7E1, &[0x2E; 20]);
+    let mut n = 1;
+    assert_eq!(
+        unsafe { PassThruWriteMsgs(f.channel, &m, &mut n, 100) },
+        ERR_NO_FLOW_CONTROL
+    );
+    assert_eq!(read_raw(f.channel, 1, 0).0, ERR_BUFFER_EMPTY);
+    // A segmented send to an ID no ECU answers gets no flow control and gives none either.
+    assert_eq!(start_filter(f.channel, 0x7E9, 0x7E1).0, STATUS_NOERROR);
+    write(f.channel, 0x7E1, &[0x2E; 20]);
+    assert_eq!(read_raw(f.channel, 1, 0).0, ERR_BUFFER_EMPTY);
+}
+
+/// A segmented message the ECU does not take (it is off, or there is none) gets no flow
+/// control and gives no TxDone; a single frame still goes out and gives one.
+#[test]
+fn a_segmented_send_no_ecu_takes_gives_no_tx_done() {
+    // The fixture's filter lets segmented messages go to the ECU.
+    let f = fixture();
+    let tx_done = || (TX_DONE, ECU_PHYSICAL_REQUEST_ID.to_be_bytes().to_vec());
+    let segmented = [0x2E; 20];
+    // A segmented message the ECU takes gets its TxDone, ahead of the ECU's answer.
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &segmented);
+    let (status, msgs) = read_raw(f.channel, 2, 100);
+    assert_eq!(status, STATUS_NOERROR);
+    assert_eq!(msgs[0], tx_done());
+    // A bus error loses it before the ECU.
+    with_ecu(|ecu| ecu.inject(Fault::BusError));
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &segmented);
+    assert_eq!(read_raw(f.channel, 1, 0).0, ERR_BUFFER_EMPTY);
+    // The ECU loses power: it takes nothing until it is reconnected.
+    with_ecu(|ecu| ecu.inject(Fault::PowerLoss));
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &segmented);
+    assert_eq!(read_raw(f.channel, 1, 0).0, ERR_BUFFER_EMPTY);
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &[0x3E, 0x00]);
+    assert_eq!(read_raw(f.channel, 2, 0), (STATUS_NOERROR, vec![tx_done()]));
+    // With no ECU at all, the same.
+    lock().ecu = None;
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &segmented);
+    assert_eq!(read_raw(f.channel, 1, 0).0, ERR_BUFFER_EMPTY);
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &[0x3E, 0x00]);
+    assert_eq!(read_raw(f.channel, 2, 0), (STATUS_NOERROR, vec![tx_done()]));
 }
 
 /// J2534-1 7.2.9: an ISO 15765 channel receives only what a flow-control filter lets in, and a
@@ -1051,6 +1181,8 @@ fn the_control_export_rejects_what_it_cannot_parse() {
         r#"{"command": "fail_writes", "times": 0}"#,
         r#"{"command": "fail_writes", "times": -1}"#,
         r#"{"command": "clear_write_failures", "times": 1}"#,
+        r#"{"command": "fail_closes", "times": 0}"#,
+        r#"{"command": "clear_close_failures", "times": 1}"#,
     ] {
         assert_eq!(control(command), ERR_FAILED, "{command}");
     }
@@ -1534,7 +1666,8 @@ impl StateDir {
             .duration_since(UNIX_EPOCH)
             .expect("system clock should be after unix epoch")
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("sim-vci-state-{name}-{nanos}"));
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("sim-vci-state-{name}-{pid}-{nanos}"));
         std::fs::create_dir_all(&dir).expect("temporary directory should be writable");
         Self(dir)
     }
@@ -1553,6 +1686,10 @@ impl Drop for StateDir {
 #[test]
 fn a_config_file_with_an_over_long_value_is_refused() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    // Start from a connected, closed device: an earlier test may have left the VCI unplugged,
+    // lost or crashed, and `PassThruOpen` would then refuse with that state's status
+    // (`ERR_DEVICE_NOT_CONNECTED`) before it reaches the ECU this test removes.
+    reset(default_ecu_config());
     let dir = StateDir::new("config");
     let file = dir.0.join("ecu.json");
     let write = |config: &EcuConfig| {
@@ -1739,8 +1876,90 @@ fn armed_write_failures_send_nothing() {
     assert_eq!(read(f.channel, 1, 1000).1, vec![response(&[0x7E, 0x00])]);
 }
 
+/// A write failure armed for one service fails and counts only writes that start with that
+/// service; other writes, such as a tester present beside it, go through and keep the count.
+#[test]
+fn a_write_failure_for_a_service_fails_only_that_service() {
+    let f = fixture();
+    let read_did = msg(ECU_PHYSICAL_REQUEST_ID, &[0x22, 0xF1, 0x90]);
+    let failed = |m: &PassThruMsg| {
+        let mut n = 1;
+        let status = unsafe { PassThruWriteMsgs(f.channel, m, &mut n, 100) };
+        assert_eq!(n, 0, "no message taken");
+        status == ERR_FAILED
+    };
+    assert_eq!(
+        control(r#"{"command": "fail_writes", "times": 1, "service": 34}"#),
+        STATUS_NOERROR
+    );
+    // Another service goes through and leaves the count.
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &[0x3E, 0x00]);
+    assert_eq!(read(f.channel, 1, 1000).1, vec![response(&[0x7E, 0x00])]);
+    // The named service fails once, and then goes through.
+    assert!(failed(&read_did));
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &[0x3E, 0x00]);
+    assert_eq!(read(f.channel, 1, 1000).1, vec![response(&[0x7E, 0x00])]);
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &[0x22, 0xF1, 0x90]);
+    assert_eq!(read(f.channel, 1, 1000).1.len(), 1);
+    // `clear_write_failures` drops the service too: a later unfiltered failure hits any write.
+    assert_eq!(
+        control(r#"{"command": "fail_writes", "service": 34}"#),
+        STATUS_NOERROR
+    );
+    assert_eq!(
+        control(r#"{"command": "clear_write_failures"}"#),
+        STATUS_NOERROR
+    );
+    assert_eq!(
+        control(r#"{"command": "fail_writes", "times": 1}"#),
+        STATUS_NOERROR
+    );
+    assert!(failed(&msg(ECU_PHYSICAL_REQUEST_ID, &[0x3E, 0x00])));
+}
+
+/// An armed close failure fails the close of the open device with `ERR_FAILED` and releases
+/// nothing; an unknown device ID keeps the count; a lost device is released only by the first
+/// close that is not armed to fail.
+#[test]
+fn armed_close_failures_release_nothing() {
+    let f = fixture();
+    assert_eq!(
+        control(r#"{"command": "fail_closes", "times": 2}"#),
+        STATUS_NOERROR
+    );
+    // An unknown ID is refused without using a count.
+    assert_eq!(PassThruClose(DEVICE_ID + 1), ERR_INVALID_DEVICE_ID);
+    assert_eq!(PassThruClose(DEVICE_ID), ERR_FAILED);
+    // The device is still open: the channel works.
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &[0x3E, 0x00]);
+    assert_eq!(read(f.channel, 1, 1000).1, vec![response(&[0x7E, 0x00])]);
+    assert_eq!(PassThruClose(DEVICE_ID), ERR_FAILED);
+    assert_eq!(PassThruClose(DEVICE_ID), STATUS_NOERROR);
+    assert_eq!(PassThruClose(DEVICE_ID), ERR_INVALID_DEVICE_ID);
+
+    // Lost device: the armed close fails and leaves it lost; the next one releases it.
+    reset(default_ecu_config());
+    let mut device = 0;
+    assert_eq!(
+        unsafe { PassThruOpen(ptr::null(), &mut device) },
+        STATUS_NOERROR
+    );
+    assert_eq!(control(r#"{"command": "disconnect_vci"}"#), STATUS_NOERROR);
+    assert_eq!(control(r#"{"command": "connect_vci"}"#), STATUS_NOERROR);
+    assert_eq!(control(r#"{"command": "fail_closes"}"#), STATUS_NOERROR);
+    assert_eq!(PassThruClose(device), ERR_FAILED);
+    assert_eq!(PassThruClose(device), ERR_FAILED);
+    assert_eq!(
+        control(r#"{"command": "clear_close_failures"}"#),
+        STATUS_NOERROR
+    );
+    assert_eq!(PassThruClose(device), ERR_DEVICE_NOT_CONNECTED);
+    assert_eq!(PassThruClose(device), ERR_INVALID_DEVICE_ID);
+}
+
 /// A crashed VCI fails every call but `PassThruGetLastError` with `ERR_FAILED`, a close included,
-/// which still releases the device. The open fails until the VCI restarts; the next one gets a
+/// which still releases the device; a close of an ID the library does not hold is refused with
+/// `ERR_INVALID_DEVICE_ID`. The open fails until the VCI restarts; the next one gets a
 /// new device ID, and the ECU kept its state (ADR-292).
 #[test]
 fn a_crashed_vci_fails_every_call_until_it_restarts() {
@@ -1771,6 +1990,8 @@ fn a_crashed_vci_fails_every_call_until_it_restarts() {
         STATUS_NOERROR
     );
     assert_eq!(PassThruClose(DEVICE_ID), ERR_FAILED);
+    // The released device is unknown to the library even while the VCI does not answer.
+    assert_eq!(PassThruClose(DEVICE_ID), ERR_INVALID_DEVICE_ID);
     let mut device = 0;
     assert_eq!(
         unsafe { PassThruOpen(ptr::null(), &mut device) },

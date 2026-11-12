@@ -20,16 +20,17 @@ mod services;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
-use diag_ir::IR_SCHEMA_VERSION;
 use diag_ir::declaration::{
     ComParamT, EcuDocumentT, EcuVariant, EcuVariantT, NegativeShapeT, ProtocolT,
     encode_ecu_document, load_ecu_document,
 };
+use diag_ir::dry_run::{DryRunEnd, DryRunEvent, DryRunReport, Script, dry_run};
+use diag_ir::{DEFAULT_MAX_STEPS, IR_SCHEMA_VERSION, Program, VmError};
 use sha2::{Digest, Sha256};
 
 use crate::star::{self, RequestIndex, StarError};
 use crate::tables::Definition;
-use crate::tables::rows::CatalogRow;
+use crate::tables::rows::{CatalogRow, declared_protocol};
 
 /// The `source_format` of a document converted from CSV tables and Starlark (ADR-254).
 pub const SOURCE_FORMAT: &str = "csv-starlark";
@@ -85,7 +86,7 @@ pub struct Procedure {
 }
 
 /// Why [`lower_procedures`] failed: the errors of every file that failed, and the warnings of
-/// every file that lowered, which a rejected report carries too (`starlark-subset.md` section 5).
+/// every file that lowered, refused by the dry run or not, which a rejected report carries too (`starlark-subset.md` section 5).
 #[derive(Debug, Clone)]
 pub struct ProceduresRejected {
     pub errors: Vec<StarError>,
@@ -118,6 +119,7 @@ pub fn lower_procedures(definition: &Definition) -> Result<Vec<Procedure>, Proce
         .collect();
     let mut procedures = Vec::new();
     let mut errors = Vec::new();
+    let mut refused_warnings = Vec::new();
     for (file, source) in &definition.tables.procedures {
         let checked = match star::check_file(file, source) {
             Ok(checked) => checked,
@@ -126,6 +128,8 @@ pub fn lower_procedures(definition: &Definition) -> Result<Vec<Procedure>, Proce
                 continue;
             }
         };
+        // Lowering needs the source to be UTF-8, so nothing is replaced here.
+        let text = String::from_utf8_lossy(source);
         let mut programs = Vec::with_capacity(variants.len());
         let mut file_errors = Vec::new();
         let mut file_warnings = Vec::new();
@@ -133,11 +137,20 @@ pub fn lower_procedures(definition: &Definition) -> Result<Vec<Procedure>, Proce
             let name = *name;
             match star::lower(file, &checked, *variant, requests) {
                 Ok(lowered) => {
+                    let script = Script::built_defaults();
+                    let report = dry_run(&lowered.program, variant, &script, DEFAULT_MAX_STEPS);
+                    // The warnings stay when the dry run refuses the variant: they can explain
+                    // the refusal, such as a step limit.
+                    let verdict = dry_run_verdict(file, &text, &lowered.program, variant, &report);
+                    file_warnings.push((name, lowered.warnings));
+                    if let Err(error) = verdict {
+                        file_errors.push((name, vec![error]));
+                        continue;
+                    }
                     programs.push(
                         postcard::to_allocvec(&lowered.program)
                             .expect("a program serializes into memory"),
                     );
-                    file_warnings.push((name, lowered.warnings));
                 }
                 Err(more) => file_errors.push((name, more)),
             }
@@ -152,6 +165,7 @@ pub fn lower_procedures(definition: &Definition) -> Result<Vec<Procedure>, Proce
             });
         } else {
             errors.extend(merge(file_errors, variants.len()));
+            refused_warnings.extend(warnings);
         }
     }
     if errors.is_empty() {
@@ -159,9 +173,88 @@ pub fn lower_procedures(definition: &Definition) -> Result<Vec<Procedure>, Proce
     } else {
         Err(ProceduresRejected {
             errors,
-            warnings: procedures.into_iter().flat_map(|p| p.warnings).collect(),
+            warnings: procedures
+                .into_iter()
+                .flat_map(|p| p.warnings)
+                .chain(refused_warnings)
+                .collect(),
         })
     }
+}
+
+/// Whether the dry run of a lowered procedure on built answers (`report`) ended in a way the
+/// conversion accepts (ADR-391); the one place that decides. It accepts the procedure's own end
+/// (`Finished`), every `Failed` (the author's `diag.fail` and the lowering's own failures, such
+/// as a loop past its limit), and an `Undecodable` response that was built from the declaration
+/// of the service named, since the answer built from a declaration need not decode into the
+/// shape a procedure's later reads expect. Everything else is refused as `STAR_DRY_RUN_STOPPED`
+/// at the source of the instruction the run stopped on (`report.pc`); a new `VmError` or
+/// `DryRunError` variant is refused until this function is told otherwise.
+fn dry_run_verdict(
+    file: &str,
+    source: &str,
+    program: &Program,
+    variant: &EcuVariant<'_>,
+    report: &DryRunReport,
+) -> Result<(), StarError> {
+    let reason = match &report.end {
+        DryRunEnd::Finished | DryRunEnd::Failed(_) => return Ok(()),
+        DryRunEnd::Vm(VmError::Undecodable { service })
+            if built_answer_undecodable(variant, report, *service) =>
+        {
+            return Ok(());
+        }
+        DryRunEnd::Vm(VmError::Undecodable { service }) => {
+            let name = variant
+                .services()
+                .and_then(|services| services.iter().find(|s| s.id() == *service))
+                .and_then(|s| s.short_name().map(str::to_owned))
+                .unwrap_or_else(|| service.to_string());
+            format!("the response does not decode as service {name}'s positive response")
+        }
+        DryRunEnd::Vm(error) => error.to_string(),
+        DryRunEnd::Host(error) => error.to_string(),
+        DryRunEnd::Invalid(error) => error.to_string(),
+        DryRunEnd::Waiting(on) => {
+            format!("the procedure waits on {on:?} although the host answers")
+        }
+        DryRunEnd::StepLimit => {
+            format!("did not end within {DEFAULT_MAX_STEPS} instructions")
+        }
+    };
+    // The entry covering `pc` is the last one at or before it.
+    let at = program
+        .source_map
+        .iter()
+        .take_while(|span| span.pc <= report.pc)
+        .last();
+    let (line, column) = at.map_or((1, 1), |span| (span.line, span.column));
+    Err(star::at_position(
+        star::StarCode::DryRunStopped,
+        file,
+        source,
+        line,
+        column,
+        format!("the dry run on answers built from the declarations stopped: {reason}"),
+    ))
+}
+
+/// Whether the report holds a built answer to service `service` (by id) that did not decode.
+fn built_answer_undecodable(variant: &EcuVariant<'_>, report: &DryRunReport, service: u32) -> bool {
+    let Some(name) = variant
+        .services()
+        .and_then(|services| services.iter().find(|s| s.id() == service))
+        .and_then(|s| s.short_name())
+    else {
+        return false;
+    };
+    report.events.iter().any(|event| {
+        matches!(
+            event,
+            DryRunEvent::Request { service: s, built: true, decoded: Some(Err(_)), .. }
+                if s == name
+        )
+    })
 }
 
 /// The errors or warnings that lowering one file for each of `variants` variants gave, by the
@@ -209,33 +302,45 @@ fn merge(per_variant: Vec<(&str, Vec<StarError>)>, variants: usize) -> Vec<StarE
 /// and its digest to each.
 fn declarations(definition: &Definition) -> Vec<EcuDocumentT> {
     let tables = &definition.tables;
-    let unit_ids: HashMap<&str, u32> = tables
-        .units
-        .iter()
-        .map(|row| (row.key.as_str(), row.id))
-        .collect();
     let index = services::Index::new(definition);
     let dtcs_and_flash = dtcs_and_flash::DtcsAndFlash::new(definition, &index);
     let mut documents = Vec::new();
     for (at, (variant, rows)) in tables.variants.iter().zip(&definition.variants).enumerate() {
-        let mut protocols: Vec<ProtocolT> = rows
+        let protocols: Vec<ProtocolT> = rows
             .protocols
             .iter()
             .map(|&i| {
                 let row = &tables.protocols[i];
+                // The values the agent's link rules judged at resolving (ADR-406). A variant's
+                // protocol names are unique (section 3), and every ComParam names one of them
+                // (4.3), so each ComParam goes to exactly one protocol, in row order.
+                let (declared, _) =
+                    declared_protocol(row, rows.comparams.iter().map(|&c| &tables.comparams[c]));
                 let mut protocol = ProtocolT::default();
-                protocol.short_name = Some(row.name.clone());
-                protocol.baud_rate = row.baud_rate;
-                protocol.tx_id = row.tx_id.into();
-                protocol.rx_id = row.rx_id.into();
-                protocol.functional_id = row.functional_id.into();
-                protocol.extended_addressing = row.extended_addressing;
-                protocol.params = Some(Vec::new());
+                protocol.short_name = declared.short_name.map(str::to_owned);
+                protocol.baud_rate = declared.baud_rate;
+                protocol.tx_id = declared.tx_id;
+                protocol.rx_id = declared.rx_id;
+                protocol.functional_id = declared.functional_id;
+                protocol.extended_addressing = declared.extended_addressing;
+                protocol.params = Some(
+                    declared
+                        .params
+                        .iter()
+                        .map(|declared| {
+                            let mut param = ComParamT::default();
+                            param.short_name = declared.short_name.map(str::to_owned);
+                            param.value = declared.value;
+                            param.unit_id = declared.unit_id;
+                            param
+                        })
+                        .collect(),
+                );
                 // The layer names a shipped profile (4.3), whose shape and pending codes the
                 // agent reads answers with (ADR-309 item 4).
                 let profile = crate::profile::get(&row.application_layer)
                     .expect("resolving checks that a profile ships for every protocol's layer");
-                protocol.application_layer = Some(row.application_layer.clone());
+                protocol.application_layer = declared.application_layer.map(str::to_owned);
                 let mut shape = NegativeShapeT::default();
                 shape.marker = profile.negative.marker;
                 shape.echoes_sid = profile.negative.echoes_sid;
@@ -245,25 +350,6 @@ fn declarations(definition: &Definition) -> Vec<EcuDocumentT> {
                 protocol
             })
             .collect();
-        // A variant's protocol names are unique (section 3), and every ComParam names one of
-        // them (4.3), so each is appended to exactly one protocol, in row order.
-        let by_name: HashMap<&str, usize> = rows
-            .protocols
-            .iter()
-            .enumerate()
-            .map(|(at, &i)| (tables.protocols[i].name.as_str(), at))
-            .collect();
-        for &i in &rows.comparams {
-            let row = &tables.comparams[i];
-            let mut param = ComParamT::default();
-            param.short_name = Some(row.name.clone());
-            param.value = row.value;
-            param.unit_id = row.unit.as_deref().map_or(0, |key| unit_ids[key]);
-            protocols[by_name[row.protocol.as_str()]]
-                .params
-                .get_or_insert_with(Vec::new)
-                .push(param);
-        }
         let mut ecu = EcuVariantT::default();
         ecu.id = variant.id;
         ecu.short_name = Some(variant.name.clone());
@@ -281,6 +367,7 @@ fn declarations(definition: &Definition) -> Vec<EcuDocumentT> {
         document.schema_version = IR_SCHEMA_VERSION;
         document.source_format = Some(SOURCE_FORMAT.to_owned());
         document.source_digest = Some(String::new());
+        document.definition_id = tables.definition.first().map(|row| row.id.clone());
         document.variant = Some(Box::new(ecu));
         documents.push(document);
     }

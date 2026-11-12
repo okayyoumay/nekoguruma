@@ -4,7 +4,7 @@
 
 Milestones from the current skeleton to a deployable product. Each milestone has a goal, its scope (by design-document section) and exit criteria a reviewer can check. The individual work items live in `backlog.md` and `worker-crates-backlog.md`; this file only says which milestone they belong to. When a milestone finishes, delete its section, move any lasting decision into `docs/system-architecture.md` or an ADR, and name the next milestone in `backlog.md`'s Status section (that is what P1 means).
 
-Order of work: the device side first (M1, finished 2026-10-14, then M2), because interruption safety (R5) and the IR runtime are the riskiest parts and can be verified without a server. The server and UI follow on the local deployment profile (M3, M4), which needs no cloud. Trust, approval and reprogramming (M6) come before real-time monitoring (M5), so the highest-risk job type continues directly from the M1/M2 interrupted-write work and signing is in place before M7 ingests extension packages. The ODX converter and the SOVD endpoints of M7 can be developed alongside M5/M6, since those standards are held, but the server does not ingest ODX-derived IR as extension packages (9.4) until M6's package signing (11.1) exists; the OTX and ExVe parts come last, once ISO 13209 and ISO 20077/20078 are obtained.
+Order of work: the device side first (M1, finished 2026-10-14, then M2, finished 2026-11-11), because interruption safety (R5) and the IR runtime are the riskiest parts and can be verified without a server. The server and UI follow on the local deployment profile (M3, M4), which needs no cloud. Trust, approval and reprogramming (M6) come before real-time monitoring (M5), so the highest-risk job type continues directly from the M1/M2 interrupted-write work and signing is in place before M7 ingests extension packages. The ODX converter and the SOVD endpoints of M7 can be developed alongside M5/M6, since those standards are held, but the server does not ingest ODX-derived IR as extension packages (9.4) until M6's package signing (11.1) exists; the OTX and ExVe parts come last, once ISO 13209 and ISO 20077/20078 are obtained.
 
 Standards: `vehicle-comm-specs` holds SAE J2534-1 (v04.04), SAE J2534-2 (DEC2020), ISO 22900-2 (2009 and 2022), ISO 14229-1 (2026 edition), ISO 14229-2 (2021 edition), ISO 15765-2 (2024 edition), ISO 22901-1 (2008 edition) and ISO 17978-1/-2/-3 (2026 edition). Clause numbers below for ISO 14229-1 refer to the 2026 edition. Standards marked "not held" still have to be obtained.
 
@@ -12,7 +12,6 @@ Standards: `vehicle-comm-specs` holds SAE J2534-1 (v04.04), SAE J2534-2 (DEC2020
 
 | Milestone | Goal | Main crates | Standards needed |
 |---|---|---|---|
-| M2 Diagnostic runtime | Diagnostic procedures defined as data (proprietary CSV + Starlark format) run end to end | `diag-ir`, `diag-frontend`, worker L1 (ISO-TP, UDS), `agent` L2 | ISO 14229-1, ISO 14229-2, ISO 15765-2 (all held) |
 | M3 Server and job control (local profile) | A job created through the Web API is executed by the agent over the control channel and its result is stored | `server`, `agent`, `shared-proto`, `shared-crypto`, `db/` | none (RFC/IT specs only) |
 | M4 Web UI and acquired data | Operators run jobs and view/edit acquired data in the browser; offline start works | UI framework, reference UI, `server` | none |
 | M6 Trust, approval and reprogramming | Signed packages and artifacts, approval levels, ECU reprogramming with preconditions | `shared-crypto`, `vendor-manifest`, `agent`, `server` | ISO 14229-1 clause 16 (held); SAE J3138 (not held) |
@@ -24,33 +23,7 @@ Each milestone also implements real-hardware checks (design 13.5, ADR-275) by ta
 
 M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 2026-10-06). M7's ODX converter and SOVD endpoints can be developed in parallel with M5/M6; ingesting ODX-derived IR as extension packages waits on M6's package signing, and the OTX and ExVe parts wait on those standards.
 
-## M2 Diagnostic runtime (current milestone)
-
-**Goal.** Vehicle knowledge supplied as data is turned into IR on the server side and executed by the agent, with format differences not leaking below L3 (design 8.1, 8.2).
-
-**Scope.**
-
-- Worker L1: ISO-TP (ISO 15765-2) and UDS client behaviour on both the J2534 and D-PDU workers (design 8.1): session-layer timing and response pending from ISO 14229-2 (2021) clause 9.2, request/response handling per ISO 14229-1 clause 7. `sim-ecu`'s P2 and P2* are still fixed constants from M1; here they become configurable and are checked against ISO 14229-2.
-- Agent L2 primitives (design 8.1) built on ISO 14229-1: read/write DID (10.2, 10.7) with the DID ranges in Annex C.1, read DTC with the status-mask bits and DTC formats in Annex D.2 / D.4, routine control (13.2, Annex F), security access (9.4). The 2026 edition also defines the Authentication service (9.6, certificate exchange and challenge-response) as an alternative to seed/key; L2 keeps the security step replaceable so it can be added in M6.
-- `diag-ir`: declaration part in FlatBuffers with pre-expanded decode plans and COMPU-METHOD conversions (8.2.2); the full procedure-part instruction set (8.2.4); resume model (8.2.5); interruptibility attributes (8.10.1).
-- `diag-frontend`: the proprietary format first, CSV tables + Starlark subset -> IR (8.4), because it needs no purchased standard. Dry-run validation with vehicle access mocked (12.1).
-- COMPARAM mapping on the J2534 side for the base protocols (8.5).
-
-**Exit criteria.**
-
-1. A CSV + Starlark definition of one ECU (variant identification, a few DIDs with conversions, DTC read, one routine) is converted to IR and runs against `sim-ecu` through both worker kinds (J2534 and D-PDU mock).
-2. IR golden tests (definition -> IR -> request bytes and decoded values) and a fuzz target for malformed IR run in CI (12.1).
-3. A procedure interrupted mid-run resumes at the IR level according to its section attributes (8.2.5, 8.10.1).
-4. The hardware checks listed below are implemented: the harness lists each one for a profile of its class, a check run without `NGR_HW_PROFILE` fails, and their parts that need no hardware are tested in CI (design 13.5). Running them on hardware is optional.
-
-**Hardware checks to implement (design 13.5; running them on hardware is optional).**
-
-- The harness the checks run in: the hardware profile named by `NGR_HW_PROFILE` and its parser, the static check declarations and the listing of the checks a profile permits, the `hardware` nextest profile, the guarded VCI handle with its cleanup (including the seam in the agent's job runner that hands it a guarded worker client) for read-only checks, refusing state-changing requests on T2 and T3 and every hardware control, and the report writer.
-- T0: for each OS and worker ABI the vendor ships a J2534 library for (Windows x86_64 and i686, Linux x86_64 and i686, and Linux ARM where offered), the library is found the way that OS finds it (the Windows registry; the registration definition in `/etc/nekoguruma/j2534/` on Linux, design 7.1, 7.1.1), opens, connects two CAN endpoints and passes loopback frames. On Linux this also checks the ABI and `unsigned long` width of design 7.1.2.
-- T2/T3: the read parts of exit criterion 1's CSV + Starlark definition (variant identification, DIDs, DTC read), with the definition for the bench ECU or vehicle named by the profile, run through a J2534 VCI and through a D-PDU API VCI (the first real use of the D-PDU worker). The routine waits for M6, when section 6's controls for it exist (design 13.5).
-- T2: the session timing (P2 / P2*) the bench ECU reports and the response times measured through a real VCI, compared with the values `sim-ecu` uses (ISO 14229-2 (2021) 9.2).
-
-## M3 Server and job control (local deployment profile)
+## M3 Server and job control (local deployment profile, current milestone)
 
 **Goal.** The server and agent work together on the local deployment profile (design 13): a job created through the Web API reaches the agent, runs, and its result and events are stored.
 
@@ -60,6 +33,7 @@ M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 20
 - Control channel WSS and data channel HTTPS with resumable chunks (5.2); idempotent commands, start deadlines, sequence-numbered outbox and reconnection reconciliation (5.3).
 - Agent identity, installation and initial registration (6.1, 6.4, 6.7); job instruction signing and verification in `shared-crypto` (11.1).
 - `api/openapi.yaml` and `api/asyncapi.yaml` kept in sync with the implementation.
+- The agent's communication log (8.11) uploaded only by explicit operator action, with the scope shown, over the data channel, and kept on the server with the job's result under its retention (8.11, 16.2, ADR-455; the agent deletes nothing locally before the server acknowledges the upload).
 
 **Exit criteria.**
 
@@ -80,7 +54,7 @@ M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 20
 
 **Goal.** Operators use the system from an ordinary browser (R4): run jobs, view and edit acquired data, and start pre-fetched jobs offline.
 
-**Scope.** UI framework and reference implementation (9.6); acquired data, record templates and annotations (4.3, 4.3.1, R21); concurrent editing and merge (R7); local-first sync (4.4, R6); PWA caching and the offline local connection (5.7, 5.7.1); confirmation levels for the job types (5.1, 6.3).
+**Scope.** Viewing a job's communication log (8.11) in the browser (decided by the maintainer, 2026-11-11). UI framework and reference implementation (9.6); acquired data, record templates and annotations (4.3, 4.3.1, R21); concurrent editing and merge (R7); local-first sync (4.4, R6); PWA caching and the offline local connection (5.7, 5.7.1); confirmation levels for the job types (5.1, 6.3).
 
 **Exit criteria.**
 
@@ -148,6 +122,8 @@ M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 20
 
 **Goal.** The standard deployment (design 14) with OIDC, S3-compatible storage and containers; the size-S measures that apply regardless of scale (15.2); validation with real VCIs against the per-vendor checklist (design 17, "Items to Confirm Early").
 
+**Scope.** Besides the deployment and the validation above: the communication log's attribution of late items across exchanges (8.11 `late_item`, `late_response`, Settlement) is refined against what real VCIs deliver (decided by the maintainer, 2026-11-11). Its invariants are written down and checked by generated-sequence tests, its placement paths are unified under those tests, and the coarse cases are refined only where the real-VCI runs show they leave exchanges `undetermined` often enough to matter.
+
 **Exit criteria.**
 
 1. The server runs as a container with OIDC and S3-compatible storage, and an agent over the internet completes a job (14.4).
@@ -162,6 +138,7 @@ This is the one milestone whose exit criteria require real hardware. It runs the
 ## Decisions needed
 
 These change the plan's scope or order; each is a design-17 item or a purchase.
+
 
 - Standards purchase: SAE J3138 before M6; ISO 13209 (OTX) and ISO 20077/20078 (ExVe) before M7's OTX and ExVe parts start; SAE J1979, J1979-2, ISO 15031-5, ISO 15765-4 and ISO 27145 before M7's generic OBD package. The M2 standards, ISO 22901-1 (ODX) and ISO 17978 (SOVD) are held.
 - Design 17 P5 (non-functional targets) before M8.

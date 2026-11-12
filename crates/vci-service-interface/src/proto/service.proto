@@ -522,6 +522,23 @@ message EventItem {
     // cop_handle is set above and a tag was supplied at StartComPrimitive
     // for that COP. Absent otherwise -- never a zero-length sentinel.
     optional bytes cop_tag = 9;
+    // ADR-353: the clock `timestamp` is on (design 8.11 "On one clock"),
+    // and with it the times `result_data` carries (`tx_msg_done_timestamp`,
+    // `start_msg_timestamp`). Each worker sets it per item; UNSPECIFIED means
+    // the worker does not say, and a client then compares those times with
+    // no other.
+    TimestampClock timestamp_clock = 11;
+}
+
+// ADR-353: the clock an item's timestamp is on.
+enum TimestampClock {
+    TIMESTAMP_CLOCK_UNSPECIFIED = 0;
+    // The VCI's own clock, as the vendor library reports it: the time base
+    // of the item's module.
+    TIMESTAMP_CLOCK_DEVICE = 1;
+    // The worker's synthetic clock (ADR-120), for an item the library gives
+    // no time for.
+    TIMESTAMP_CLOCK_WORKER = 2;
 }
 
 // ADR-350: an error event item's data (ISO 22900-2:2022 PDU_ERROR_DATA).
@@ -653,6 +670,21 @@ message ResourceStatusResponse {
 
 message ComLogicalLinkResponse {
     ComLogicalLinkHandle cll_handle = 1;
+    // ADR-355: whether the worker passes on every response pending (0x78)
+    // the link sees, bound to its primitive (design 8.11 "Link settings for
+    // the log"). UNSPECIFIED means the worker does not say, as a worker
+    // built before the field does; a client then treats a pending as
+    // possibly absorbed.
+    PendingForwarding pending_forwarding = 2;
+}
+
+// ADR-355: whether a link shows a client every response pending.
+enum PendingForwarding {
+    PENDING_FORWARDING_UNSPECIFIED = 0;
+    // The worker passes on every pending the ECU sends on the link.
+    PENDING_FORWARDING_ALL = 1;
+    // The library may handle a pending itself without delivering it.
+    PENDING_FORWARDING_NOT_ALL = 2;
 }
 
 message ComParamResponse {
@@ -689,6 +721,12 @@ message UniqueRespIdTableResponse {
 
 message TimestampResponse {
     uint32 timestamp = 1;
+    // ADR-353: the clock `timestamp` is on, as `EventItem.timestamp_clock`
+    // names an item's (design 8.11 "On one clock"): DEVICE when the library
+    // reads the VCI's own clock, WORKER for the worker's synthetic one.
+    // UNSPECIFIED means the worker does not say, and a client then compares
+    // the reading with no other time.
+    TimestampClock timestamp_clock = 2;
 }
 
 // ============================================================================

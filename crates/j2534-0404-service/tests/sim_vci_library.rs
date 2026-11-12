@@ -64,7 +64,8 @@ fn a_lost_device_stays_lost_until_closed_and_reopens_with_a_new_id() {
         .duration_since(UNIX_EPOCH)
         .expect("system clock should be after unix epoch")
         .as_nanos();
-    let control_dir = TempDir(std::env::temp_dir().join(format!("sim-vci-library-{nanos}")));
+    let pid = std::process::id();
+    let control_dir = TempDir(std::env::temp_dir().join(format!("sim-vci-library-{pid}-{nanos}")));
     std::fs::create_dir(&control_dir.0).expect("control directory should be created");
     // SAFETY: this test binary runs only this test and starts no other thread, so nothing
     // reads the environment concurrently.

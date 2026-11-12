@@ -18,11 +18,11 @@ capability unless the user asks for one.
 | Agent | Model (effort) | Tools | Use for |
 |---|---|---|---|
 | `code-scout` | haiku | read-only | Fan-out searches across many crates or docs; returns conclusions and `path:line`, never file dumps |
-| `cargo-runner` | haiku | Bash + read-only | Builds, tests, clippy and fmt with long output; returns a compact pass/fail summary. Never edits files |
+| `cargo-runner` | haiku (low) | Bash + read-only | Builds, tests, clippy and fmt with long output; returns a compact pass/fail summary. Never edits files; runs `cargo clean` before a workspace-wide run when less than 10 GB is free |
 | `doc-sync-checker` | sonnet (medium) | Bash (git read) + read-only | Pre-commit audit of the diff against CLAUDE.md's documentation-sync table, the `work/` rule and the spec copyright rule |
 | `scope-shaper` | sonnet (high) | read-only | Turns a fuzzy or oversized request into a minimal scope with acceptance criteria |
 | `implementer` | sonnet (medium) | Bash + edit | Code, tests and doc edits from a distilled brief |
-| `edge-case-hunter` | opus (high) | Bash + read-only | Verification pass before commit: boundaries, error paths, concurrency, protocol corner cases, interruption/resume, missing tests |
+| `edge-case-hunter` | opus (high) | Bash + read-only | Verification pass before commit: boundaries, error paths, concurrency, protocol corner cases, interruption/resume, parity with a path the change rebuilds, missing tests |
 | `design-advisor` | fable (xhigh) | Bash (git read) + read-only | Escalation for decisions that are expensive to get wrong |
 
 Each tier is used for what it does best, following the official model descriptions
@@ -31,8 +31,11 @@ Each tier is used for what it does best, following the official model descriptio
 when a new model generation ships, since the price ratios between tiers move:
 
 - **Haiku** (`code-scout`, `cargo-runner`): mechanical work with a short report (locating code,
-  running commands). It is the cheapest tier, has a 200K context window and carries no
-  `effort` key (unsupported there), so it gets the agents whose output needs no judgment.
+  running commands). It is the cheapest tier, so it gets the agents whose output needs no
+  judgment. `code-scout` runs at Haiku's default effort (`medium`), since judging which match
+  answers the question still takes some reasoning; `cargo-runner` runs at `low`, which the
+  official effort guidance suggests for simple subagent work, since it only runs commands and
+  summarizes their output.
 - **Sonnet** (`scope-shaper`, `implementer`, `doc-sync-checker`): everyday reasoning at a
   fifth of the top tier's price. `implementer` runs at `medium`, which fits implementation
   from a distilled brief; `scope-shaper` at `high` for the scoping judgment. `doc-sync-checker`
@@ -82,11 +85,30 @@ delegated (the final commit and push) or a single targeted read to check an agen
   (job state transitions, VM resume, worker lifecycle), FFI and `*-sys` crates, ABI handling,
   signatures and trust boundaries (`shared-crypto`, token handling), or more than one crate.
   Mechanical single-crate changes skip it.
+  When the diff adds a path that builds what an existing path already builds (a second
+  settlement, encoder or conversion producing the same entry or output), name the existing path
+  in the brief and ask for the agent's parity check. A step the check (or a later review) finds
+  missing from the new path is fixed by having the new path call the existing path's code,
+  extracted into a function both call, not by copying the step or reproducing part of it; a copy
+  stays only when the existing code cannot be called from the new path, and the PR says why
+  (ADR-397). The fix brief asks for that extraction, without a smaller fallback.
 - **`design-advisor`** when a wrong decision is expensive to reverse: interpreting ISO 22900 /
   J2534 / UDS requirements, concurrency or state-machine design across crates, trust-boundary
   and signature design, a choice that needs an ADR, or a bug that survived a `code-scout` +
   `cargo-runner` investigation. Hand it a distilled brief with the facts already collected, not
   an exploration task.
+- **`design-advisor` case table** before implementation (ADR-381), when the change's outcome
+  depends on combinations of states and events (settlement or attribution of results, clocks and
+  time placement, concurrency, state machines, protocol timing), when its estimated change, tests
+  aside, exceeds 300 lines, or when the latest merged PR that changed the same source files
+  needed five or more review rounds with findings. The gate is the nature of the change, not a
+  module. Ask for every combination with its expected outcome, or out of scope with the reason.
+  When the rule decides a value that more than one path writes or changes (a count, a flag, a
+  classification, a stored time, a record), the table also has one row per writing path, found
+  by searching the code for every write of the value (ADR-387).
+  The implementation and its tests cover every in-scope row, the table goes into the PR
+  description under "Cases", and the `edge-case-hunter` brief carries it and asks for
+  combinations missing from it; a missing row it finds is added to the table as well as fixed.
 
 ## Working rules
 
@@ -108,10 +130,11 @@ delegated (the final commit and push) or a single targeted read to check an agen
 Claude Code also offers built-in agents. They are not pinned by this configuration, so route
 around the expensive ones:
 
-- **`Explore`** runs on the session model (Opus by default). For read-only searches, use
-  `code-scout` (Haiku) instead; use `Explore` only when the user asks for it.
-- **`Plan`, `general-purpose` and `claude`** use `CLAUDE_CODE_SUBAGENT_MODEL`, which
-  `settings.json` sets to `sonnet`. Prefer a project agent when one fits the task.
+- **`Explore`** and **`Plan`** run on the session model (Opus by default);
+  `CLAUDE_CODE_SUBAGENT_MODEL` does not change them. For read-only searches, use `code-scout`
+  (Haiku) instead; use `Explore` or `Plan` only when the user asks for it.
+- **`general-purpose` and `claude`** use `CLAUDE_CODE_SUBAGENT_MODEL`, which `settings.json`
+  sets to `sonnet`. Prefer a project agent when one fits the task.
 - Forks (`/subtask`) inherit the session model and history. They reuse the parent's prompt
   cache, so they suit a short side task that needs the conversation's context; for anything
   that a brief can describe, a pinned agent is cheaper.
@@ -130,7 +153,7 @@ Project skills live in `.claude/skills/`:
 | `backlog` | Adding, updating and closing backlog items in `work/` |
 | `next-task` | Recommending the next item to work on (one pick plus one alternative) |
 | `backlog-triage` | Cleaning up the backlog; manual only (`/backlog-triage`) |
-| `milestone-exit` | The current milestone's open P1 items per exit criterion, the sweep of P2/P3 items it should still take, and closing it (exit evidence, plan and Status update, P1/P2 re-check for the next milestone) |
+| `milestone-exit` | The current milestone's open P1 items per exit criterion, the sweep of P2/P3 items it should still take and of blocked P1 items it cannot unblock (ADR-407), and closing it (a sweep of what changed since the last one, ADR-413, then exit evidence, plan and Status update, P1/P2 re-check for the next milestone) |
 | `pr-review-loop` | Driving the Codex review cycle (Copilot when Codex cannot review) on a PR Claude opened, up to handing it to the maintainer |
 | `backlog-loop` | Working through the backlog one item and one PR at a time, failing Dependabot PRs first, waiting for the maintainer's merge between items, ending with a retrospective that proposes improvements to the loop; manual only |
 | `codeql-alerts` | Fixing open CodeQL code scanning alerts one alert and one PR at a time, from the alert list the CodeQL alert hand-off workflow sends to its routine |

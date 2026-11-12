@@ -345,9 +345,12 @@ they are set only via `SetUniqueRespIdTable`.
 > hardware CONFIG write.
 >
 > **RawMode bypass (ADR-196 Phase 1, extended to hardware K-line by ADR-198
-> Phase 2, then to SAE J1850/J1939 by ADR-200 Phase 3):** on a CLL created
-> with `CLL_CREATE_FLAG_RAW_MODE` set (base CAN, hardware ISO15765,
-> hardware K-line/ISO9141/ISO14230, SAE J1850 (VPW/PWM), or SAE J1939 — the
+> Phase 2, then to SAE J1850/J1939 by ADR-200 Phase 3, then to their `_PS` and
+> `_CHx` links by ADR-414):** on a CLL created
+> with `CLL_CREATE_FLAG_RAW_MODE` set (CAN, hardware ISO15765,
+> hardware K-line/ISO9141/ISO14230, SAE J1850 (VPW/PWM), or SAE J1939, and a
+> pin-selected or additional-channel link that resolves to one of them, the
+> Single Wire, Fault-Tolerant and CAN FD families included — the
 > protocol allowlist), `tx_header::build_tx_message` skips this whole
 > addressing-consumption/header-construction step entirely — none of the
 > ComParams this note describes are read for that CLL's `CoptSendrecv`/

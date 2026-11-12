@@ -444,6 +444,9 @@ table EcuDocument {
   variant: EcuVariant;
   // Procedure part program (postcard-serialized bytes). Corresponds to Program
   procedure: [uint8];
+  // The identifier of the ECU definition the document was converted from, which a vehicle
+  // definition names (8.8.2, ADR-363); absent when the definition declares none
+  definition_id: string;
 }
 
 root_type EcuDocument;

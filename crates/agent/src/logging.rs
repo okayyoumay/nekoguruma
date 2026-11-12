@@ -376,25 +376,12 @@ fn io_kind(error: &std::io::Error) -> String {
 /// directory, `$XDG_STATE_HOME/nekoguruma/logs` (an absolute `XDG_STATE_HOME`, else
 /// `~/.local/state`) on Unix, `%LOCALAPPDATA%\nekoguruma\logs` on Windows.
 pub fn default_dir() -> Result<PathBuf, NoFile> {
-    state_dir(|name| std::env::var_os(name))
+    crate::state::user_base_dir(|name| std::env::var_os(name))
         .map(|dir| dir.join("nekoguruma").join("logs"))
-        .map_err(|why| NoFile { why, path: None })
-}
-
-/// The user's state directory from the environment `var` reads.
-fn state_dir(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> Result<PathBuf, String> {
-    let absolute = |name: &str| {
-        var(name)
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute())
-    };
-    if cfg!(windows) {
-        absolute("LOCALAPPDATA").ok_or_else(|| "LOCALAPPDATA is not set".to_owned())
-    } else {
-        absolute("XDG_STATE_HOME")
-            .or_else(|| absolute("HOME").map(|home| home.join(".local").join("state")))
-            .ok_or_else(|| "neither XDG_STATE_HOME nor HOME is set".to_owned())
-    }
+        .map_err(|why| NoFile {
+            why: why.to_string(),
+            path: None,
+        })
 }
 
 #[cfg(test)]
@@ -731,36 +718,5 @@ mod tests {
             ),
             "{notices:?}"
         );
-    }
-
-    /// The state directory comes from an absolute `XDG_STATE_HOME`, else `HOME` (Unix), or
-    /// `LOCALAPPDATA` (Windows).
-    #[test]
-    fn the_state_directory_comes_from_the_environment() {
-        let env = |pairs: &'static [(&'static str, &'static str)]| {
-            move |name: &str| {
-                pairs
-                    .iter()
-                    .find(|(key, _)| *key == name)
-                    .map(|(_, value)| std::ffi::OsString::from(value))
-            }
-        };
-        if cfg!(windows) {
-            assert_eq!(
-                state_dir(env(&[("LOCALAPPDATA", r"C:\Users\a\AppData\Local")])).unwrap(),
-                PathBuf::from(r"C:\Users\a\AppData\Local")
-            );
-            assert!(state_dir(env(&[])).is_err());
-        } else {
-            assert_eq!(
-                state_dir(env(&[("XDG_STATE_HOME", "/x/state"), ("HOME", "/home/a")])).unwrap(),
-                PathBuf::from("/x/state")
-            );
-            assert_eq!(
-                state_dir(env(&[("XDG_STATE_HOME", "relative"), ("HOME", "/home/a")])).unwrap(),
-                PathBuf::from("/home/a/.local/state")
-            );
-            assert!(state_dir(env(&[])).is_err());
-        }
     }
 }

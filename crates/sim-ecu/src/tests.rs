@@ -1482,6 +1482,8 @@ fn exchange_reports_the_configured_response_delay() {
             response: pos(&[0x7E, 0x00]),
             delay_ms: 20,
             pending: Vec::new(),
+            after: Vec::new(),
+            reached: true,
         }
     );
     // A suppressed response has no delay.
@@ -1491,6 +1493,8 @@ fn exchange_reports_the_configured_response_delay() {
             response: SimResponse::NoResponse,
             delay_ms: 0,
             pending: Vec::new(),
+            after: Vec::new(),
+            reached: true,
         }
     );
 }
@@ -1521,6 +1525,27 @@ fn drop_response_fault_keeps_the_state_change() {
     assert_eq!(ecu.request(&[0x10, 0x03]), SimResponse::NoResponse);
     assert_eq!(ecu.session, Session::Extended);
     // Only one response is lost.
+    assert_eq!(
+        ecu.request(&[0x22, 0xF1, 0x86]),
+        pos(&[0x62, 0xF1, 0x86, 0x03])
+    );
+}
+
+#[test]
+fn truncate_response_fault_cuts_the_next_positive_response() {
+    let mut ecu = ecu();
+    ecu.inject(Fault::TruncateResponse { len: 2 });
+    // A refusal is no positive response, so the fault stays armed.
+    assert!(matches!(
+        ecu.request(&[0x22, 0x00, 0x00]),
+        SimResponse::Negative { .. }
+    ));
+    assert_eq!(ecu.request(&[0x22, 0xF1, 0x86]), pos(&[0x62, 0xF1]));
+    // The request is handled as usual: a session change takes effect, only its response cut.
+    ecu.inject(Fault::TruncateResponse { len: 1 });
+    assert_eq!(ecu.request(&[0x10, 0x03]), pos(&[0x50]));
+    assert_eq!(ecu.session, Session::Extended);
+    assert!(ecu.armed_faults().is_empty());
     assert_eq!(
         ecu.request(&[0x22, 0xF1, 0x86]),
         pos(&[0x62, 0xF1, 0x86, 0x03])
@@ -1573,9 +1598,13 @@ fn negative_response_fault_refuses_the_next_request_without_effect() {
 fn bus_error_fault_loses_the_request() {
     let mut ecu = ecu();
     ecu.inject(Fault::BusError);
-    assert_eq!(ecu.request(&[0x10, 0x03]), SimResponse::NoResponse);
+    let lost = ecu.exchange(Addressing::Physical, &[0x10, 0x03]);
+    assert_eq!(lost.response, SimResponse::NoResponse);
+    assert!(!lost.reached);
     // The request never reached the ECU.
     assert_eq!(ecu.session, Session::Default);
+    // A suppressed request reaches it, though it sends nothing back.
+    assert!(ecu.exchange(Addressing::Physical, &[0x3E, 0x80]).reached);
     assert_eq!(
         ecu.request(&[0x10, 0x03]),
         pos(&[0x50, 0x03, 0x00, 0x32, 0x01, 0xF4])
@@ -2445,10 +2474,13 @@ fn response_pending_fault_precedes_the_response_with_nrc_78() {
         count: 3,
         interval_ms: 100,
     });
-    // Suppressed: nothing goes out, and the fault waits for a request that is answered.
+    // A functional request the ECU does not answer leaves the fault armed.
     assert_eq!(
-        ecu.exchange(Addressing::Physical, &[0x3E, 0x80]),
-        Exchange::none()
+        ecu.exchange(Addressing::Functional, &[0x22, 0xF1, 0xFF]),
+        Exchange {
+            reached: true,
+            ..Exchange::none()
+        }
     );
     let pending = |at| (at, vec![0x7F, 0x22, 0x78]);
     assert_eq!(
@@ -2464,8 +2496,70 @@ fn response_pending_fault_precedes_the_response_with_nrc_78() {
             response: pos(&[0x7E, 0x00]),
             delay_ms: 20,
             pending: Vec::new(),
+            after: Vec::new(),
+            reached: true,
         }
     );
+}
+
+#[test]
+fn repeat_response_sends_the_next_final_response_a_second_time() {
+    let mut ecu = SimEcu::new(EcuConfig {
+        response_delay_ms: 20,
+        ..config()
+    });
+    ecu.inject(Fault::RepeatResponse { interval_ms: 30 });
+    // A request with no response leaves the fault armed.
+    assert!(
+        ecu.exchange(Addressing::Physical, &[0x3E, 0x80])
+            .after
+            .is_empty()
+    );
+    assert_eq!(
+        ecu.armed_faults(),
+        [Fault::RepeatResponse { interval_ms: 30 }]
+    );
+    let repeated = ecu.exchange(Addressing::Physical, &[0x3E, 0x00]);
+    assert_eq!(repeated.response, pos(&[0x7E, 0x00]));
+    assert_eq!(repeated.delay_ms, 20);
+    assert_eq!(repeated.after, [(50, vec![0x7E, 0x00])]);
+    // Once only.
+    assert!(ecu.armed_faults().is_empty());
+    assert!(
+        ecu.exchange(Addressing::Physical, &[0x3E, 0x00])
+            .after
+            .is_empty()
+    );
+}
+
+#[test]
+fn repeat_response_follows_the_pendings_and_a_lost_response_keeps_it_armed() {
+    let mut ecu = SimEcu::new(config());
+    ecu.inject(Fault::ResponsePending {
+        count: 1,
+        interval_ms: 100,
+    });
+    ecu.inject(Fault::RepeatResponse { interval_ms: 10 });
+    let exchange = ecu.exchange(Addressing::Physical, &[0x22, 0xF1, 0x90]);
+    // The pending at the original delay, the response one interval later, the copy after it.
+    assert_eq!(exchange.pending.len(), 1);
+    assert_eq!(exchange.delay_ms, 100);
+    assert_eq!(exchange.after.len(), 1);
+    assert_eq!(exchange.after[0].0, 110);
+    ecu.inject(Fault::RepeatResponse { interval_ms: 10 });
+    ecu.inject(Fault::DropResponse);
+    let dropped = ecu.exchange(Addressing::Physical, &[0x3E, 0x00]);
+    assert!(dropped.after.is_empty());
+    assert_eq!(
+        ecu.armed_faults(),
+        [Fault::RepeatResponse { interval_ms: 10 }]
+    );
+}
+
+#[test]
+fn repeat_response_is_serialized_in_snake_case() {
+    let fault: Fault = serde_json::from_str(r#"{"repeat_response": {"interval_ms": 40}}"#).unwrap();
+    assert_eq!(fault, Fault::RepeatResponse { interval_ms: 40 });
 }
 
 #[test]
@@ -2499,6 +2593,108 @@ fn a_dropped_response_still_follows_its_response_pending_messages() {
     let exchange = ecu.exchange(Addressing::Physical, &[0x3E, 0x00]);
     assert_eq!(exchange.response, SimResponse::NoResponse);
     assert_eq!(exchange.pending, [(0, vec![0x7F, 0x3E, 0x78])]);
+}
+
+#[test]
+fn a_suppressed_request_with_a_pending_fault_gets_its_final_response() {
+    // After a response pending message the final response is owed whatever the suppress bit says
+    // (clause 7.7.3.2); the positive response goes out last, with the bit cleared in its echo.
+    let mut ecu = SimEcu::new(EcuConfig {
+        response_delay_ms: 20,
+        ..config()
+    });
+    ecu.inject(Fault::ResponsePending {
+        count: 2,
+        interval_ms: 100,
+    });
+    let exchange = ecu.exchange(Addressing::Physical, &[0x10, 0x83]);
+    assert_eq!(
+        exchange.response,
+        pos(&[0x50, 0x03, 0x00, 0x32, 0x01, 0xF4])
+    );
+    assert_eq!(exchange.delay_ms, 220);
+    assert_eq!(
+        exchange.pending,
+        [(20, vec![0x7F, 0x10, 0x78]), (120, vec![0x7F, 0x10, 0x78])]
+    );
+    assert_eq!(ecu.session, Session::Extended);
+    assert!(ecu.armed_faults().is_empty());
+    // A negative response is sent whatever the bit says, after the pending as well.
+    ecu.inject(Fault::ResponsePending {
+        count: 1,
+        interval_ms: 100,
+    });
+    let exchange = ecu.exchange(Addressing::Physical, &[0x10, 0xFF]);
+    assert_eq!(
+        exchange.response,
+        SimResponse::Negative {
+            sid: 0x10,
+            nrc: Nrc::SubFunctionNotSupported
+        }
+    );
+    assert_eq!(exchange.pending.len(), 1);
+    // Without the fault the bit suppresses as before, and a count of zero does not owe one.
+    assert_eq!(
+        ecu.exchange(Addressing::Physical, &[0x10, 0x81]).response,
+        SimResponse::NoResponse
+    );
+    ecu.inject(Fault::ResponsePending {
+        count: 0,
+        interval_ms: 100,
+    });
+    assert_eq!(
+        ecu.exchange(Addressing::Physical, &[0x10, 0x81]).response,
+        SimResponse::NoResponse
+    );
+    // The zero-count fault waits for a request that is answered, and uses itself up there.
+    assert!(
+        ecu.exchange(Addressing::Physical, &[0x22, 0xF1, 0x90])
+            .pending
+            .is_empty()
+    );
+    // A service without a sub-function reads bit 7 as data, not as the suppress bit.
+    ecu.inject(Fault::ResponsePending {
+        count: 1,
+        interval_ms: 100,
+    });
+    let exchange = ecu.exchange(Addressing::Physical, &[0x22, 0xF1, 0x90]);
+    assert_eq!(exchange.pending.len(), 1);
+}
+
+#[test]
+fn a_suppressed_request_owes_its_final_response_only_for_the_pending_fault_that_fires() {
+    // The fault that fires is the first armed pending fault. A zero count first sends no
+    // pending, so the request is not owed an answer and the bit suppresses it; the second
+    // fault, which would owe one, does not fire on it.
+    let mut ecu = SimEcu::new(config());
+    ecu.inject(Fault::ResponsePending {
+        count: 0,
+        interval_ms: 100,
+    });
+    ecu.inject(Fault::ResponsePending {
+        count: 2,
+        interval_ms: 100,
+    });
+    let exchange = ecu.exchange(Addressing::Physical, &[0x10, 0x81]);
+    assert_eq!(exchange.response, SimResponse::NoResponse);
+    assert!(
+        exchange.pending.is_empty(),
+        "no positive response without a pending, and no pending without one"
+    );
+    assert_eq!(ecu.armed_faults().len(), 2, "neither fault fired");
+    // The same request when the owing fault is first: pendings, then the positive response.
+    let mut ecu = SimEcu::new(config());
+    ecu.inject(Fault::ResponsePending {
+        count: 2,
+        interval_ms: 100,
+    });
+    ecu.inject(Fault::ResponsePending {
+        count: 0,
+        interval_ms: 100,
+    });
+    let exchange = ecu.exchange(Addressing::Physical, &[0x10, 0x81]);
+    assert_eq!(exchange.pending.len(), 2);
+    assert!(matches!(exchange.response, SimResponse::Positive(_)));
 }
 
 #[test]

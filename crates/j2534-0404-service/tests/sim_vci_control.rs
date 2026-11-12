@@ -87,6 +87,7 @@ fn read_vin() -> Program {
         identity: Default::default(),
         preconditions: Default::default(),
         flash: Vec::new(),
+        targets: Vec::new(),
     }
 }
 
@@ -198,11 +199,12 @@ fn control_commands_reach_sim_vci_in_the_worker() {
         .duration_since(UNIX_EPOCH)
         .expect("system clock should be after unix epoch")
         .as_nanos();
+    let pid = std::process::id();
     let temp = std::env::temp_dir();
     let paths = TempPaths {
-        config: temp.join(format!("sim-vci-control-{nanos}.toml")),
-        control_dir: temp.join(format!("sim-vci-control-{nanos}")),
-        definitions: temp.join(format!("sim-vci-control-definitions-{nanos}")),
+        config: temp.join(format!("sim-vci-control-{pid}-{nanos}.toml")),
+        control_dir: temp.join(format!("sim-vci-control-{pid}-{nanos}")),
+        definitions: temp.join(format!("sim-vci-control-definitions-{pid}-{nanos}")),
     };
     std::fs::write(&paths.config, "").expect("test config file should be writable");
     // The registration definition names the library, through the debug-only
@@ -271,7 +273,14 @@ async fn inject(control_dir: &Path) {
     );
     let silent = run(&client).await;
     assert!(
-        matches!(silent, Err(JobError::Host { pc: 1, .. })),
+        matches!(
+            silent,
+            Err(JobError::OnSiteInterventionRequired(
+                agent::restart::OnSiteReason::UnconfirmedRequest {
+                    at: agent::journal::StepRef { pc: 1, steps: 1 }
+                }
+            ))
+        ),
         "{silent:?}"
     );
     send(control_dir, "002", r#"{"command": "reconnect_ecu"}"#);

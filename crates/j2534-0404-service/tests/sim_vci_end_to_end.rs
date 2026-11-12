@@ -193,6 +193,7 @@ async fn read_the_vin() {
         .duration_since(UNIX_EPOCH)
         .expect("system clock should be after unix epoch")
         .as_nanos();
+    let pid = std::process::id();
     let (service, library) = target_build();
     let abi = library_abi(&library);
     check_service_abi(&service, abi);
@@ -209,13 +210,15 @@ async fn read_the_vin() {
         library.display(),
         abi.name()
     );
-    let config_path = std::env::temp_dir().join(format!("j2534-0404-service-{nanos}-sim-vci.toml"));
+    let config_path =
+        std::env::temp_dir().join(format!("j2534-0404-service-{pid}-{nanos}-sim-vci.toml"));
     let config = TempFile(config_path.clone());
     std::fs::write(&config_path, "").expect("test config file should be writable");
     // The registration definition names the library, through the debug-only
     // `NGR_J2534_DEFINITION_DIR` override (ADR-282).
-    let definition_dir =
-        std::env::temp_dir().join(format!("j2534-0404-service-{nanos}-sim-vci-definitions"));
+    let definition_dir = std::env::temp_dir().join(format!(
+        "j2534-0404-service-{pid}-{nanos}-sim-vci-definitions"
+    ));
     let _ = std::fs::remove_dir_all(&definition_dir);
     std::fs::create_dir_all(&definition_dir).expect("definition directory");
     j2534_0404_mock::write_definition(&definition_dir, LIBRARY_NAME, &library)

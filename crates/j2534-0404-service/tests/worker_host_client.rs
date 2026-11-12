@@ -27,13 +27,14 @@ async fn worker_host_client_authenticates_with_minted_tokens() {
         .duration_since(UNIX_EPOCH)
         .expect("system clock should be after unix epoch")
         .as_nanos();
+    let pid = std::process::id();
     let config_path =
-        std::env::temp_dir().join(format!("j2534-0404-service-{nanos}-worker-host.toml"));
+        std::env::temp_dir().join(format!("j2534-0404-service-{pid}-{nanos}-worker-host.toml"));
     std::fs::write(&config_path, "").expect("test config file should be writable");
     // The registration definition names the library, through the debug-only
     // `NGR_J2534_DEFINITION_DIR` override (ADR-282).
     let definition_dir = std::env::temp_dir().join(format!(
-        "j2534-0404-service-{nanos}-worker-host-definitions"
+        "j2534-0404-service-{pid}-{nanos}-worker-host-definitions"
     ));
     let _ = std::fs::remove_dir_all(&definition_dir);
     std::fs::create_dir_all(&definition_dir).expect("definition directory");

@@ -33,13 +33,15 @@ use agent::client::{Reply, WorkerApi};
 use tokio::sync::Mutex as AsyncMutex;
 use tonic::Streaming;
 use vci_service_interface::{
-    ComLogicalLinkResponse, ComPrimitiveResponse, ConnectComLogicalLinkRequest,
-    CreateComLogicalLinkRequest, DestroyComLogicalLinkRequest, DisconnectComLogicalLinkRequest,
-    ErrorDetail, ErrorEventData, EventNotification, GetModuleIdsRequest, GetObjectIdRequest,
-    GetResourceIdsRequest, GetVersionRequest, IoCtlRequest, IoCtlResponse, ModuleConnectRequest,
+    CancelComPrimitiveRequest, ComLogicalLinkResponse, ComPrimitiveResponse,
+    ConnectComLogicalLinkRequest, CreateComLogicalLinkRequest, DestroyComLogicalLinkRequest,
+    DisconnectComLogicalLinkRequest, ErrorDetail, ErrorEventData, EventNotification,
+    GetModuleIdsRequest, GetObjectIdRequest, GetResourceIdsRequest, GetStatusRequest,
+    GetTimestampRequest, GetVersionRequest, IoCtlRequest, IoCtlResponse, ModuleConnectRequest,
     ModuleDisconnectRequest, ModuleHandle, ModuleIdsResponse, ObjectIdResponse, PduError,
     PduErrorEvent, ResourceIdsResponse, Response, SetComParamRequest, SetUniqueRespIdTableRequest,
-    StartComPrimitiveRequest, SubscribeEventRequest, VersionResponse, status_with_error_detail,
+    StartComPrimitiveRequest, StatusResponse, SubscribeEventRequest, TimestampResponse,
+    VersionResponse, status_with_error_detail,
 };
 
 use super::{GuardedHandle, HandleError, HandleOptions, Request, Trace};
@@ -57,6 +59,7 @@ pub struct GuardedClient {
     handle: Arc<AsyncMutex<GuardedHandle>>,
     module: ModuleHandle,
     trace: Trace,
+    margins: agent::VciMargins,
 }
 
 impl GuardedClient {
@@ -93,11 +96,19 @@ impl GuardedClient {
     fn from_handle(handle: GuardedHandle) -> Self {
         let trace = handle.enable_trace();
         let module = handle.module_handle();
+        let margins = handle.vci_margins();
         Self {
             handle: Arc::new(AsyncMutex::new(handle)),
             module,
             trace,
+            margins,
         }
+    }
+
+    /// The margins the profile gives the client's VCI, which a job run on it takes
+    /// (`agent::Job::with_vci_margins`, ADR-357).
+    pub fn vci_margins(&self) -> agent::VciMargins {
+        self.margins
     }
 
     /// Every decision of the guard so far, in order: the job's calls, what the client added to
@@ -167,6 +178,7 @@ impl WorkerApi for GuardedClient {
     through! {
         get_module_ids(GetModuleIdsRequest) -> ModuleIdsResponse = |h, r| h.get_module_ids(r);
         get_version(GetVersionRequest) -> VersionResponse = |h, r| h.get_version(r);
+        get_timestamp(GetTimestampRequest) -> TimestampResponse = |h, r| h.get_timestamp(r);
         get_resource_ids(GetResourceIdsRequest) -> ResourceIdsResponse = |h, r| h.get_resource_ids(r);
         get_object_id(GetObjectIdRequest) -> ObjectIdResponse = |h, r| h.get_object_id(r);
         create_com_logical_link(CreateComLogicalLinkRequest) -> ComLogicalLinkResponse = |h, r| h.create_com_logical_link(r);
@@ -176,6 +188,8 @@ impl WorkerApi for GuardedClient {
         set_com_param(SetComParamRequest) -> Response = |h, r| h.set_com_param(r);
         set_unique_resp_id_table(SetUniqueRespIdTableRequest) -> Response = |h, r| h.set_table_completed(r);
         start_com_primitive(StartComPrimitiveRequest) -> ComPrimitiveResponse = |h, r| h.start_com_primitive(r);
+        cancel_com_primitive(CancelComPrimitiveRequest) -> Response = |h, r| h.cancel_com_primitive_settling(r);
+        get_status(GetStatusRequest) -> StatusResponse = |h, r| h.get_status(r);
         subscribe_event(SubscribeEventRequest) -> Streaming<EventNotification> = |h, r| h.subscribe_event(r);
         io_ctl(IoCtlRequest) -> IoCtlResponse = |h, r| h.io_ctl(r);
     }

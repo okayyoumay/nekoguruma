@@ -89,6 +89,77 @@ fn a_profile_names_its_vci_and_complete_link() {
     assert!(profile.operations.is_empty());
 }
 
+/// ADR-357: the `[vci]` margins a profile gives are the job's, and each key it leaves out takes
+/// the agent's default.
+#[test]
+fn a_profile_s_vci_margins_are_the_keys_it_gives() {
+    let profile = parse(&t1("")).unwrap();
+    let Setup::Link { vci, .. } = &profile.setup else {
+        panic!("{profile:?}");
+    };
+    assert_eq!(vci.margins(), agent::VciMargins::default());
+
+    let text = t1("").replace(
+        "library_version = \"4.5\"\n",
+        "library_version = \"4.5\"\ntiming_margin_us = 500\ndrift_bound_ppm = 30\n",
+    );
+    let profile = parse(&text).unwrap();
+    let Setup::Link { vci, .. } = &profile.setup else {
+        panic!("{profile:?}");
+    };
+    assert_eq!(
+        vci.margins(),
+        agent::VciMargins {
+            timing_margin_us: Some(500),
+            drift_bound_ppm: Some(30),
+            clock_margin_us: None,
+        }
+    );
+}
+
+/// The worker ABI to test is optional, named as the ABI table names it, and refused when the name
+/// is unknown or the host cannot run it.
+#[test]
+fn a_profile_names_the_worker_abi_by_its_table_name() {
+    let worker_abi = |name: Option<&str>| {
+        let text = match name {
+            Some(name) => t1("").replace(
+                "library_version = \"4.5\"\n",
+                &format!("library_version = \"4.5\"\nworker_abi = \"{name}\"\n"),
+            ),
+            None => t1(""),
+        };
+        parse(&text).map(|profile| match profile.setup {
+            Setup::Link { vci, .. } => vci.worker_abi,
+            other => panic!("{other:?}"),
+        })
+    };
+    assert_eq!(worker_abi(None), Ok(None));
+    // Every name of the table parses where the host can run it, and is refused where it cannot.
+    for abi in worker_host::abi::Abi::ALL {
+        let parsed = worker_abi(Some(abi.name()));
+        if agent::launch::host_runs(abi) {
+            assert_eq!(parsed, Ok(Some(abi)), "{abi:?}");
+        } else {
+            let ProfileError::Invalid(message) = parsed.unwrap_err() else {
+                panic!("{abi:?}");
+            };
+            assert!(
+                message.contains("worker_abi") && message.contains(abi.name()),
+                "{message}"
+            );
+        }
+    }
+    // An unknown name is a syntax error that lists the known ones.
+    let ProfileError::Syntax(message) = worker_abi(Some("win-arm64")).unwrap_err() else {
+        panic!("expected a syntax error");
+    };
+    assert!(
+        message.contains("win-arm64") && message.contains("win-x86"),
+        "{message}"
+    );
+}
+
 #[test]
 fn a_profile_can_only_narrow_its_class() {
     // T1 narrowed to reads and routines.
@@ -350,39 +421,100 @@ fn a_loopback_runs_between_two_ends_of_one_bus() {
         .replacen("response_id = 0x124", "response_id = 0x123", 1)
         .replacen("request_id = 0x999", "request_id = 0x124", 1);
     refused_for(&loopback(can_end, &can_partner), "VCI channel at one end");
+    // A channel names an additional channel of a J2534 module (SAE J2534-2 clause 7); a D-PDU
+    // API `vci` has none.
+    let jvci = &vci_end
+        .replacen("api = \"iso22900\"", "api = \"j2534-0404\"", 1)
+        .replacen(
+            "module = \"SN-0001\"",
+            "module = \"SN-0001\"\nlabel = \"bench-a\"\npname = \"J2534-2:a\"",
+            1,
+        );
+    refused_for(
+        &loopback(can_end, &with_channel(vci_end, "CAN_CH1")),
+        "`channel`",
+    );
     // One VCI end with a channel, opposite a SocketCAN end, is a valid loopback.
-    parse(&loopback(can_end, &with_channel(vci_end, "CAN_CH1"))).unwrap();
+    parse(&loopback(can_end, &with_channel(jvci, "CAN_CH1"))).unwrap();
 
     // Two channels of one VCI, the preferred loopback, differ by their channel.
-    let ch1 = with_channel(vci_end, "CAN_CH1");
-    parse(&loopback(&ch1, &partner(&with_channel(vci_end, "CAN_CH2")))).unwrap();
+    let ch1 = with_channel(jvci, "CAN_CH1");
+    parse(&loopback(&ch1, &partner(&with_channel(jvci, "CAN_CH2")))).unwrap();
     // The same channel, however it is spelled, or a channel at one end only, in either order.
-    for other in ["CAN_CH1", "can_ch1", " CAN_CH01 "] {
+    for other in ["CAN_CH1", "can_ch1", "CAN_CH01"] {
         refused_for(
-            &loopback(&ch1, &partner(&with_channel(vci_end, other))),
+            &loopback(&ch1, &partner(&with_channel(jvci, other))),
             "must be different channels",
         );
     }
     refused_for(
-        &loopback(vci_end, &partner(vci_end)),
+        &loopback(jvci, &partner(jvci)),
         "must be different channels",
     );
     refused_for(
-        &loopback(&ch1, &partner(vci_end)),
+        &loopback(&ch1, &partner(jvci)),
         "must be different channels",
     );
     refused_for(
-        &loopback(vci_end, &partner(&ch1)),
+        &loopback(jvci, &partner(&ch1)),
         "must be different channels",
     );
-    assert!(parse(&loopback(&with_channel(vci_end, " "), &partner(&ch1))).is_err());
+    assert!(parse(&loopback(&with_channel(jvci, " "), &partner(&ch1))).is_err());
+    // A channel has no surrounding whitespace: the worker does not trim it.
+    for padded in [" CAN_CH2", "CAN_CH2 "] {
+        refused_for(
+            &loopback(&ch1, &partner(&with_channel(jvci, padded))),
+            "no surrounding whitespace",
+        );
+    }
+    // A channel is of the link's protocol family: ISO 15765 or K-line channels do not fit a CAN
+    // link, and a CAN channel does not fit an ISO 15765 link.
+    for wrong in ["ISO15765_CH1", "ISO9141_CH1", "J1850VPW_CH1"] {
+        refused_for(
+            &loopback(
+                &with_channel(jvci, wrong),
+                &partner(&with_channel(jvci, "CAN_CH2")),
+            ),
+            "channel of the `link`'s protocol family",
+        );
+    }
+    let iso_link = |end: &str, channel: &str| {
+        with_channel(
+            &end.replacen(
+                "protocol = \"CAN\"",
+                "protocol = \"ISO_14229_3_on_ISO_15765_2\"",
+                1,
+            ),
+            channel,
+        )
+    };
+    refused_for(
+        &loopback(
+            &iso_link(jvci, "CAN_CH1"),
+            &partner(&iso_link(jvci, "ISO15765_CH2")),
+        ),
+        "channel of the `link`'s protocol family",
+    );
+    parse(&loopback(
+        &iso_link(jvci, "ISO15765_CH1"),
+        &partner(&iso_link(jvci, "ISO15765_CH2")),
+    ))
+    .unwrap();
+    // Two names of one family are one channel when the number agrees.
+    refused_for(
+        &loopback(
+            &iso_link(jvci, "ISO15765_CH1"),
+            &partner(&iso_link(jvci, "ISO_14229_3_on_ISO_15765_2_CH1")),
+        ),
+        "must be different channels",
+    );
 
     // Names are matched exactly, as the library resolvers match them: a library in another
     // case is another library.
     let shouted = vci_end.replacen("library = \"Vendor PDU\"", "library = \"VENDOR PDU\"", 1);
     parse(&loopback(vci_end, &partner(&shouted))).unwrap();
     // One module described with two versions.
-    let other_version = vci_end.replacen(
+    let other_version = jvci.replacen(
         "firmware_version = \"2.0.0\"",
         "firmware_version = \"2.1.0\"",
         1,
@@ -406,11 +538,14 @@ fn a_loopback_runs_between_two_ends_of_one_bus() {
         ),
         "both raw CAN or both ISO 15765",
     );
-    parse(&loopback(
-        &with_protocol(vci_end, "CAN"),
-        &partner(&with_protocol(&second_module, "can_ch1")),
-    ))
-    .unwrap();
+    // A channel is given in `channel`, never as a `_CHn` suffix of the protocol.
+    refused_for(
+        &loopback(
+            &with_protocol(vci_end, "CAN"),
+            &partner(&with_protocol(&second_module, "can_ch1")),
+        ),
+        "names no `_CHn` channel",
+    );
     // Names are matched ignoring case, aliases of one family agree, and a protocol outside the
     // two families is refused.
     refused_for(
@@ -929,4 +1064,18 @@ fn comparams_the_worker_cannot_set_are_not_pinnable() {
     }
     assert!(!crate::comparam::profile_may_pin("cp_testerpresentimmed"));
     assert!(!crate::comparam::ALLOWED.contains(&"cp_testerpresentimmed"));
+}
+
+#[test]
+fn can_and_iso15765_channels_with_one_number_are_one_physical_channel() {
+    use crate::profile::physical_channel;
+    // A raw CAN and an ISO 15765 channel can share hardware, so the profile conservatively takes
+    // the two for one when the number agrees; the worker's synonyms agree, and the base is 0.
+    let one = |name| physical_channel(name).expect(name);
+    assert_eq!(one("CAN_CH1"), one("ISO15765_CH01"));
+    assert_eq!(one("ISO_11898_RAW_CH2"), one("iso-tp_ch2"));
+    assert_eq!(one("CAN"), one("ISO_14229_3_on_ISO_15765_2"));
+    assert_ne!(one("CAN_CH1"), one("CAN_CH2"));
+    assert_ne!(one("CAN"), one("CAN_CH1"));
+    assert_eq!(physical_channel("ISO9141_CH1"), None);
 }

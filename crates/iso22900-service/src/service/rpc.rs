@@ -50,7 +50,102 @@ pub(super) const API_NOT_INITIALIZED: &str = "API not initialized";
 /// `StartComPrimitive` (ADR-204) and evicted the moment a terminal
 /// `PDU_COPST_FINISHED`/`PDU_COPST_CANCELLED` status event is observed for
 /// that COP -- see `events.rs::to_proto_event_item`.
-pub(super) type CopTagMap = HashMap<(u32, u32, u32), Vec<u8>>;
+///
+/// The same map, under the same lock, counts the items that break the rule of ISO 22900-2 (2022)
+/// 10.1.4.11 and 10.1.4.11.4 (an item of no ComPrimitive carries no extra info header), per link
+/// and kind of item, for the warning of `events.rs::note_unbound_header` (ADR-430). The tag
+/// entries are reached through the map it dereferences to.
+#[derive(Debug, Default)]
+pub(super) struct CopTagMap {
+    tags: HashMap<(u32, u32, u32), Vec<u8>>,
+    /// Items counted per `(module, cll, kind)`; the first of a key is warned about at once.
+    unbound_headers: HashMap<(u32, u32, UnboundItemKind), u64>,
+}
+
+/// The kind of an item of no ComPrimitive that carries a header, from its RxFlag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(super) enum UnboundItemKind {
+    TransmitIndication,
+    StartOfMessage,
+    Other,
+}
+
+impl UnboundItemKind {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::TransmitIndication => "transmit indication",
+            Self::StartOfMessage => "start of message",
+            Self::Other => "other",
+        }
+    }
+}
+
+impl CopTagMap {
+    /// Counts one such item; true for the first of its link and kind, which is the one to warn
+    /// about.
+    pub(super) fn count_unbound_header(
+        &mut self,
+        h_mod: u32,
+        h_cll: u32,
+        kind: UnboundItemKind,
+    ) -> bool {
+        let count = self
+            .unbound_headers
+            .entry((h_mod, h_cll, kind))
+            .or_insert(0);
+        *count += 1;
+        *count == 1
+    }
+
+    /// Removes the counts of the links `matches` selects and returns those of more than one item,
+    /// for the summary line.
+    pub(super) fn take_unbound_header_counts(
+        &mut self,
+        matches: impl Fn(u32, u32) -> bool,
+    ) -> Vec<(u32, u32, UnboundItemKind, u64)> {
+        let mut taken = Vec::new();
+        self.unbound_headers.retain(|&(module, cll, kind), count| {
+            if matches(module, cll) {
+                if *count > 1 {
+                    taken.push((module, cll, kind, *count));
+                }
+                false
+            } else {
+                true
+            }
+        });
+        taken.sort();
+        taken
+    }
+}
+
+impl std::ops::Deref for CopTagMap {
+    type Target = HashMap<(u32, u32, u32), Vec<u8>>;
+    fn deref(&self) -> &Self::Target {
+        &self.tags
+    }
+}
+
+impl std::ops::DerefMut for CopTagMap {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.tags
+    }
+}
+
+/// The summary line for items counted after the first warning (ADR-430).
+fn log_unbound_header_summary(counts: Vec<(u32, u32, UnboundItemKind, u64)>) {
+    for (module, cll, kind, count) in counts {
+        tracing::warn!(
+            module,
+            cll,
+            kind = kind.label(),
+            count,
+            "the D-PDU library gave {count} items of no ComPrimitive with an extra info header on \
+             this link ({}); a conforming library gives such an item no header (ADR-430)",
+            kind.label()
+        );
+    }
+}
 
 #[derive(Clone)]
 pub struct Iso22900Service {
@@ -104,6 +199,9 @@ impl Iso22900Service {
     ) {
         let mut cop_tags = self.cop_tags.lock().await;
         cop_tags.retain(|(module, cll, _), _| !(*module == h_mod.0 && *cll == h_cll.0));
+        let counts =
+            cop_tags.take_unbound_header_counts(|module, cll| module == h_mod.0 && cll == h_cll.0);
+        log_unbound_header_summary(counts);
     }
 
     /// Like [`Self::terminate_cop_tags_for_link`], but for a whole module
@@ -113,6 +211,8 @@ impl Iso22900Service {
     pub(super) async fn terminate_cop_tags_for_module(&self, h_mod: ModuleHandle) {
         let mut cop_tags = self.cop_tags.lock().await;
         cop_tags.retain(|(module, _, _), _| *module != h_mod.0);
+        let counts = cop_tags.take_unbound_header_counts(|module, _| module == h_mod.0);
+        log_unbound_header_summary(counts);
     }
 
     // Only exercised by a test that relies on the debug-only runtime
@@ -471,7 +571,7 @@ impl VciServer for Iso22900Service {
         drop(checked);
         let api = Arc::new(Mutex::new(Some(api)));
         let subscriptions = Arc::new(Mutex::new(HashMap::new()));
-        let cop_tags = Arc::new(Mutex::new(HashMap::new()));
+        let cop_tags = Arc::new(Mutex::new(CopTagMap::default()));
         let (event_notifications_tx, event_notifications_rx) =
             mpsc::unbounded_channel::<EventNotification>();
 

@@ -29,6 +29,10 @@ struct MockHost {
     inputs: Vec<(RuntimeInput, i64)>,
     /// The bytes of every HMI form and record template sent.
     forms: Vec<Vec<u8>>,
+    /// The targets `select_target` was told, kept apart from `calls`.
+    targets: Vec<u8>,
+    /// How many calls had been made when each of `targets` was told.
+    told_after_calls: Vec<usize>,
 }
 
 impl MockHost {
@@ -145,6 +149,12 @@ impl DiagHost for MockHost {
         assert!(!self.forbidden, "the host must not be called");
         self.logs.push((level, message.to_owned()));
     }
+    // Not `forbidden`: the notification precedes a valid step, which may itself be a
+    // non-primitive instruction a `forbidden` host runs.
+    fn select_target(&mut self, target: u8) {
+        self.targets.push(target);
+        self.told_after_calls.push(self.calls.len());
+    }
 }
 
 fn prog(code: Vec<Op>, constants: Vec<Vec<u8>>) -> Program {
@@ -157,6 +167,7 @@ fn prog(code: Vec<Op>, constants: Vec<Vec<u8>>) -> Program {
         identity: Default::default(),
         preconditions: Default::default(),
         flash: Vec::new(),
+        targets: Vec::new(),
     }
 }
 
@@ -1289,6 +1300,7 @@ fn primitive_classification_covers_every_instruction() {
             input: RuntimeInput::SupplyVoltageMillivolts,
         },
         Op::HmiRequestFromStack { form: 0 },
+        Op::SelectTarget { target: 0 },
     ];
     for (index, op) in all.iter().enumerate() {
         // The postcard encoding starts with the variant index, so this also pins the variant
@@ -1551,12 +1563,18 @@ fn resumed_state_is_checked() {
         pc: 2,
         ..base.clone()
     };
+    // A target outside the program's list: none listed, so only 0 is in range, and two listed.
+    let one_target_state = VmState {
+        target: 1,
+        ..base.clone()
+    };
     for (state, expected) in [
         (oversized_stack, VmError::StackOverflow),
         (deep_calls, VmError::CallDepthExceeded),
         (bad_return, VmError::BadReturnPc(3)),
         (bad_lower_return, VmError::BadReturnPc(3)),
         (finished_oversized, VmError::StackOverflow),
+        (one_target_state, VmError::BadTarget(1)),
     ] {
         let before = postcard::to_allocvec(&state).unwrap();
         let mut vm = Vm::resume(state);
@@ -1694,6 +1712,7 @@ fn unusual_values_round_trip() {
             locals: vec![Some(Value::F64(f64::INFINITY)), None],
         }],
         steps: u64::MAX - 1,
+        target: 0,
     };
     let bytes = postcard::to_allocvec(&state).unwrap();
     let restored: VmState = postcard::from_bytes(&bytes).unwrap();
@@ -2054,6 +2073,7 @@ fn schema_version_one_is_refused() {
 }
 
 const SVC: Source = Source::EcuService {
+    target: 0,
     service_id: 1,
     field_id: 1,
 };
@@ -2068,6 +2088,7 @@ fn precondition(default: Option<Source>, programming: Option<Source>) -> Precond
 
 fn plan(flash_session: u32, stage: u32, entry: u32) -> FlashRecovery {
     FlashRecovery {
+        target: 0,
         flash_session,
         stage,
         max_resumes: 3,
@@ -3097,6 +3118,7 @@ fn sources_are_checked() {
 
     for (service_id, field_id) in [(0, 1), (1, 0)] {
         let zero = Source::EcuService {
+            target: 0,
             service_id,
             field_id,
         };
@@ -3563,6 +3585,7 @@ mod decode_field {
         };
         encode_ecu_document(&EcuDocumentT {
             schema_version: IR_SCHEMA_VERSION,
+            definition_id: None,
             source_format: Some("csv-starlark".into()),
             source_digest: Some("00".into()),
             variant: Some(Box::new(EcuVariantT {
@@ -3890,6 +3913,7 @@ mod flash_block {
     fn document() -> Vec<u8> {
         encode_ecu_document(&EcuDocumentT {
             schema_version: IR_SCHEMA_VERSION,
+            definition_id: None,
             source_format: Some("csv-starlark".into()),
             source_digest: Some("00".into()),
             variant: Some(Box::new(EcuVariantT {
@@ -4230,6 +4254,116 @@ mod flash_block {
         assert_eq!(
             check_declarations(&program(8, 0), &variant),
             Err((1, VmError::UnknownFlashSession { session: 8 }))
+        );
+    }
+
+    #[test]
+    fn check_declarations_refuses_a_plan_when_the_variant_declares_no_flash_sessions() {
+        use crate::declaration::{EcuDocumentT, EcuVariantT, encode_ecu_document};
+        let document = EcuDocumentT {
+            schema_version: IR_SCHEMA_VERSION,
+            source_format: Some("test".to_owned()),
+            source_digest: Some(String::new()),
+            variant: Some(Box::new(EcuVariantT::default())),
+            ..Default::default()
+        };
+        let bytes = encode_ecu_document(&document);
+        let document = load_ecu_document(&bytes).expect("the document loads");
+        let variant = document.variant().expect("a variant");
+        let mut program = prog(vec![Op::Pop], vec![]);
+        assert_eq!(check_declarations(&program, &variant), Ok(()));
+        program.flash = vec![super::plan(1, 0, 4)];
+        assert_eq!(
+            check_declarations(&program, &variant),
+            Err((4, VmError::UnknownFlashSession { session: 1 }))
+        );
+    }
+
+    /// Every segment of a plan's session is checked, at the plan's entry, in a job with no
+    /// artifact as with one: a zero block size (session 4), an end past the offset range
+    /// (session 6) and a block longer than a byte string may be (session 7).
+    #[test]
+    fn check_declarations_checks_every_segment_of_a_plans_session() {
+        let bytes = document();
+        let document = load_ecu_document(&bytes).expect("the document loads");
+        let variant = document.variant().expect("a variant");
+        let with_plan = |session| {
+            let mut program = prog(vec![Op::Pop], vec![]);
+            program.flash = vec![super::plan(session, 0, 6)];
+            program
+        };
+        assert_eq!(
+            check_declarations(&with_plan(4), &variant),
+            Err((
+                6,
+                VmError::ZeroBlockSize {
+                    session: 4,
+                    segment: 1
+                }
+            ))
+        );
+        assert_eq!(
+            check_declarations(&with_plan(6), &variant),
+            Err((6, VmError::Overflow))
+        );
+        assert_eq!(
+            check_declarations(&with_plan(7), &variant),
+            Err((6, VmError::BytesTooLong(MAX_BYTES_LEN as u64 + 1)))
+        );
+        // The same errors as the job's artifact check reads.
+        assert_eq!(
+            flash_session_extents(&variant, 4),
+            Err(VmError::ZeroBlockSize {
+                session: 4,
+                segment: 1
+            })
+        );
+    }
+
+    #[test]
+    fn check_declarations_checks_a_recovery_plans_flash_session() {
+        let bytes = document();
+        let document = load_ecu_document(&bytes).expect("the document loads");
+        let variant = document.variant().expect("a variant");
+        let with_plan = |code, session| {
+            let mut program = prog(code, vec![]);
+            program.flash = vec![super::plan(session, 0, 6)];
+            program
+        };
+        // Declared session with well-formed segments: accepted.
+        assert_eq!(
+            check_declarations(&with_plan(vec![Op::Pop], 5), &variant),
+            Ok(())
+        );
+        // Undeclared session: reported at the plan's entry.
+        assert_eq!(
+            check_declarations(&with_plan(vec![Op::Pop], 8), &variant),
+            Err((6, VmError::UnknownFlashSession { session: 8 }))
+        );
+        // Two undeclared plans: the first in plan order is reported.
+        let mut two = with_plan(vec![Op::Pop], 8);
+        two.flash = vec![super::plan(9, 0, 3), super::plan(8, 0, 6)];
+        assert_eq!(
+            check_declarations(&two, &variant),
+            Err((3, VmError::UnknownFlashSession { session: 9 }))
+        );
+        // Instructions are checked first.
+        let code = vec![
+            Op::PushI64(0),
+            Op::FlashBlock {
+                session: 4,
+                segment: 7,
+            },
+        ];
+        assert_eq!(
+            check_declarations(&with_plan(code, 8), &variant),
+            Err((
+                1,
+                VmError::UnknownFlashSegment {
+                    session: 4,
+                    segment: 7
+                }
+            ))
         );
     }
 }
@@ -4703,4 +4837,905 @@ fn a_resumed_hmi_wait_sends_the_same_form_under_the_same_inquiry() {
         "{inquiries:?}"
     );
     assert_eq!(resumed.state.stack, [Value::Bytes(b"\x01done".to_vec())]);
+}
+
+#[test]
+fn only_odd_levels_up_to_0x41_and_0x5f_are_standard_seed_levels() {
+    let found: Vec<u8> = (0..=0xFF).filter(|&l| is_standard_seed_level(l)).collect();
+    let expected: Vec<u8> = (0x01..=0x41).step_by(2).chain([0x5F]).collect();
+    assert_eq!(found, expected);
+    // Just below the supplier-specific range, and its first odd level.
+    assert!(is_standard_seed_level(0x5F));
+    assert!(!is_standard_seed_level(0x61));
+    assert!(!is_standard_seed_level(0x7D));
+}
+
+// ---------------------------------------------------------------- Targets (ADR-325 item 3, ADR-409)
+
+/// A program that lists `n` targets, with distinct declaration hashes.
+fn prog_with_targets(n: u8, code: Vec<Op>, constants: Vec<Vec<u8>>) -> Program {
+    Program {
+        targets: (0..n)
+            .map(|index| Target {
+                access: index == 0,
+                declarations: [index; 32],
+            })
+            .collect(),
+        // Several targets or an access target need a VIN source (ADR-325 item 5, ADR-410).
+        identity: IdentitySources {
+            vin: Some(SVC),
+            ..IdentitySources::default()
+        },
+        ..prog(code, constants)
+    }
+}
+
+#[test]
+fn a_program_without_targets_addresses_the_primary() {
+    let program = prog(
+        vec![i(1), Op::SelectTarget { target: 0 }, Op::Pop],
+        Vec::new(),
+    );
+    assert_eq!(program.validate(), Ok(()));
+    assert_eq!(program.target_count(), 1);
+    let mut vm = Vm::new(&program);
+    let mut host = MockHost::default();
+    run(&mut vm, &program, &mut host);
+    // Told once at the first step; the selection of the current target adds no call.
+    assert_eq!(host.targets, [0]);
+    assert_eq!(vm.state.target, 0);
+}
+
+#[test]
+fn select_target_out_of_range_is_refused_statically_and_at_run_time() {
+    let code = vec![i(1), Op::SelectTarget { target: 1 }];
+    let program = prog(code.clone(), Vec::new());
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::TargetOutOfRange { pc: 1, target: 1 })
+    );
+    assert_eq!(
+        ProgramError::TargetOutOfRange { pc: 1, target: 1 }.pc(),
+        Some(1)
+    );
+    // Not validated: the VM refuses it before any host call, with the state unchanged. The
+    // first step (`i(1)`) is told to the host; the refused one is not.
+    assert_eq!(
+        expect_vm_error(code.clone(), Vec::new(), 1),
+        VmError::BadTarget(1)
+    );
+    let program = prog(code, Vec::new());
+    let mut vm = Vm::resume(Vm::new(&program).state);
+    vm.step(&program, &mut MockHost::default()).unwrap();
+    let mut host = MockHost::default();
+    assert!(matches!(
+        vm.step(&program, &mut host),
+        Err(StepError::Vm(VmError::BadTarget(1)))
+    ));
+    assert!(host.targets.is_empty());
+    // Two listed targets: 1 is in range, 2 is not.
+    let listed =
+        |target| prog_with_targets(2, vec![Op::SelectTarget { target }], Vec::new()).validate();
+    assert_eq!(listed(1), Ok(()));
+    assert_eq!(
+        listed(2),
+        Err(ProgramError::TargetOutOfRange { pc: 0, target: 2 })
+    );
+}
+
+/// A first instruction that `check_primitive` refuses never reaches the host, the first-step
+/// notification included.
+#[test]
+fn a_refused_first_instruction_tells_the_host_nothing() {
+    for code in [
+        vec![Op::ServiceRequest { service: 0x22 }],
+        vec![Op::SelectTarget { target: 1 }],
+    ] {
+        let program = prog(code, Vec::new());
+        let mut vm = Vm::new(&program);
+        let mut host = MockHost::default();
+        let result = vm.step(&program, &mut host);
+        assert!(matches!(result, Err(StepError::Vm(_))), "{result:?}");
+        assert!(host.targets.is_empty());
+        assert!(host.calls.is_empty());
+    }
+}
+
+#[test]
+fn select_target_switches_across_a_jump_and_a_call() {
+    let code = vec![
+        Op::SelectTarget { target: 1 }, // 0
+        Op::Jump(2),
+        Op::SelectTarget { target: 0 }, // 2
+        Op::Call(6),
+        Op::Pop,
+        Op::Jump(9),
+        Op::PushBytes(0), // 6: sub
+        Op::ServiceRequest { service: 0x22 },
+        Op::Ret,
+    ];
+    let program = prog_with_targets(2, code, vec![vec![0xF1, 0x90]]);
+    assert_eq!(program.validate(), Ok(()));
+    let mut vm = Vm::new(&program);
+    let mut host = MockHost {
+        responses: [Ok(vec![0x62])].into(),
+        ..MockHost::default()
+    };
+    let mut seen = Vec::new();
+    loop {
+        let outcome = vm.step(&program, &mut host).unwrap();
+        seen.push(vm.state.target);
+        if outcome == StepOutcome::Finished {
+            break;
+        }
+    }
+    assert_eq!(host.targets, [0, 1, 0]);
+    // The request went out after the host was told target 0 again.
+    assert_eq!(host.calls.len(), 1);
+    assert_eq!(host.told_after_calls, [0, 0, 0]);
+    assert_eq!(seen[0], 1);
+    assert_eq!(vm.state.target, 0);
+}
+
+#[test]
+fn selecting_the_current_target_tells_the_host_nothing() {
+    let program = prog_with_targets(
+        2,
+        vec![
+            Op::SelectTarget { target: 1 },
+            Op::SelectTarget { target: 1 },
+        ],
+        Vec::new(),
+    );
+    let mut vm = Vm::new(&program);
+    let mut host = MockHost::default();
+    run(&mut vm, &program, &mut host);
+    assert_eq!(host.targets, [0, 1]);
+    assert_eq!(vm.state.target, 1);
+    assert_eq!(vm.state.steps, 2);
+}
+
+#[test]
+fn a_restored_state_resumes_on_its_target() {
+    let program = prog_with_targets(
+        2,
+        vec![Op::PushBytes(0), Op::ServiceRequest { service: 0x22 }],
+        vec![vec![0xF1, 0x90]],
+    );
+    let mut state = Vm::new(&program).state;
+    state.target = 1;
+    let bytes = postcard::to_allocvec(&state).unwrap();
+    let restored: VmState = postcard::from_bytes(&bytes).unwrap();
+    assert_eq!(restored.target, 1);
+    let mut vm = Vm::resume(restored);
+    let mut host = MockHost {
+        responses: [Ok(vec![0x62])].into(),
+        ..MockHost::default()
+    };
+    vm.step(&program, &mut host).unwrap();
+    vm.step(&program, &mut host).unwrap();
+    // Told once, before the request, and not again.
+    assert_eq!(host.targets, [1]);
+    assert_eq!(host.told_after_calls, [0]);
+    assert_eq!(host.calls.len(), 1);
+}
+
+#[test]
+fn a_state_with_a_target_round_trips_at_every_boundary() {
+    let program = prog_with_targets(
+        2,
+        vec![
+            Op::SelectTarget { target: 1 },
+            i(1),
+            Op::Pop,
+            Op::SelectTarget { target: 0 },
+        ],
+        Vec::new(),
+    );
+    let mut vm = Vm::new(&program);
+    let mut host = MockHost::default();
+    loop {
+        let bytes = postcard::to_allocvec(&vm.state).unwrap();
+        let restored: VmState = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(restored, vm.state);
+        vm = Vm::resume(restored);
+        if vm.step(&program, &mut host).unwrap() == StepOutcome::Finished {
+            break;
+        }
+    }
+    assert_eq!(vm.state.target, 0);
+    // Every resume tells the host once (four steps), and the two changes add theirs.
+    assert_eq!(host.targets, [0, 1, 1, 1, 1, 0]);
+}
+
+#[test]
+fn restored_target_out_of_range_is_refused() {
+    let two = prog_with_targets(2, vec![i(1)], Vec::new());
+    let none = prog(vec![i(1)], Vec::new());
+    for (program, target) in [(&two, 2u8), (&none, 1u8)] {
+        let state = VmState {
+            target,
+            ..Vm::new(program).state
+        };
+        let before = postcard::to_allocvec(&state).unwrap();
+        let mut vm = Vm::resume(state);
+        let expected = VmError::BadTarget(target);
+        assert_eq!(vm.check_state(program), Err(expected.clone()));
+        assert_eq!(vm.current_op(program), Err(expected.clone()));
+        let mut host = MockHost {
+            forbidden: true,
+            ..MockHost::default()
+        };
+        assert!(matches!(vm.step(program, &mut host), Err(StepError::Vm(ref e)) if *e == expected));
+        assert!(host.targets.is_empty());
+        assert_eq!(postcard::to_allocvec(&vm.state).unwrap(), before);
+    }
+}
+
+#[test]
+fn a_finished_state_tells_the_host_nothing() {
+    let program = prog_with_targets(2, vec![i(1)], Vec::new());
+    let state = VmState {
+        pc: 1,
+        target: 1,
+        ..Vm::new(&program).state
+    };
+    let mut vm = Vm::resume(state);
+    let mut host = MockHost::default();
+    assert_eq!(vm.step(&program, &mut host).unwrap(), StepOutcome::Finished);
+    assert!(host.targets.is_empty());
+}
+
+#[test]
+fn too_many_targets_are_refused() {
+    let at_limit = prog_with_targets(MAX_TARGETS as u8, Vec::new(), Vec::new());
+    assert_eq!(at_limit.validate(), Ok(()));
+    let program = prog_with_targets(MAX_TARGETS as u8 + 1, Vec::new(), Vec::new());
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::TooManyTargets {
+            count: MAX_TARGETS + 1
+        })
+    );
+}
+
+#[test]
+fn duplicate_target_declarations_are_refused() {
+    let mut program = prog_with_targets(3, Vec::new(), Vec::new());
+    program.targets[2].declarations = program.targets[0].declarations;
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::DuplicateTargetDeclarations { a: 0, b: 2 })
+    );
+}
+
+// ---------------------------------------------------------------- Restart declaration targets
+// (ADR-325 items 3, 4, 5, 9 and 13, ADR-410)
+
+fn svc_on(target: u8) -> Source {
+    Source::EcuService {
+        target,
+        service_id: 1,
+        field_id: 1,
+    }
+}
+
+/// `recovery_program()` with a target list whose entries have the given access flags, every
+/// source and the plan on target 0.
+fn declared_targets(access: &[bool]) -> Program {
+    let mut program = recovery_program();
+    program.targets = access
+        .iter()
+        .enumerate()
+        .map(|(index, &access)| Target {
+            access,
+            declarations: [index as u8 + 1; 32],
+        })
+        .collect();
+    // The plan (entry 0) selects its target first (ADR-412).
+    program.code[0] = Op::SelectTarget { target: 0 };
+    program
+}
+
+/// `declared_targets` without a plan (and so without download instructions).
+fn declared_targets_without_a_plan(access: &[bool]) -> Program {
+    let mut program = declared_targets(access);
+    program.flash.clear();
+    program.code = vec![Op::Pop; 10];
+    program
+}
+
+fn with_plan_on(mut program: Program, target: u8) -> Program {
+    program.flash[0].target = target;
+    if usize::from(target) < program.targets.len() {
+        program.code[0] = Op::SelectTarget { target };
+    }
+    program
+}
+
+#[test]
+fn a_program_without_target_fields_decodes_on_the_primary() {
+    let source: Source = serde_json::from_str(r#"{"EcuService":{"service_id":1,"field_id":1}}"#)
+        .expect("a source without a target decodes");
+    assert_eq!(source, SVC);
+    let mut plan_json = serde_json::to_value(plan(1, 1, 0)).unwrap();
+    assert!(
+        plan_json
+            .as_object_mut()
+            .unwrap()
+            .remove("target")
+            .is_some()
+    );
+    let decoded: FlashRecovery = serde_json::from_value(plan_json).unwrap();
+    assert_eq!(decoded, plan(1, 1, 0));
+    assert_eq!(recovery_program().reprogramming_target(), Some(0));
+    assert_eq!(prog(Vec::new(), Vec::new()).reprogramming_target(), None);
+}
+
+#[test]
+fn a_source_target_outside_the_list_is_refused() {
+    let mut program = recovery_program();
+    program.identity.vin = Some(svc_on(1));
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::SourceTargetOutOfRange {
+            owner: SourceOwner::Identity(IdentityKind::Vin),
+            target: 1
+        })
+    );
+    let mut program = declared_targets(&[false, false]);
+    program.preconditions.engine = Some(precondition(Some(SVC), Some(svc_on(2))));
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::SourceTargetOutOfRange {
+            owner: SourceOwner::Precondition {
+                kind: PreconditionKind::Engine,
+                session: SessionKind::Programming
+            },
+            target: 2
+        })
+    );
+}
+
+#[test]
+fn a_plan_target_outside_the_list_is_refused() {
+    let program = with_plan_on(recovery_program(), 1);
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::PlanTargetOutOfRange {
+            flash_session: 1,
+            target: 1
+        })
+    );
+    // The plan loop runs before the identity loop.
+    let mut program = with_plan_on(declared_targets(&[false, false]), 5);
+    program.identity.vin = Some(svc_on(1));
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::PlanTargetOutOfRange {
+            flash_session: 1,
+            target: 5
+        })
+    );
+}
+
+#[test]
+fn two_plans_on_two_targets_are_refused() {
+    let mut program = declared_targets(&[false, false]);
+    second_plan_ops(&mut program);
+    program.code[5] = Op::SelectTarget { target: 0 };
+    program.flash.push(plan(2, 2, 5));
+    assert_eq!(program.validate(), Ok(()));
+    program.flash[1].target = 1;
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::FlashPlansOnSeveralTargets { a: 1, b: 2 })
+    );
+}
+
+#[test]
+fn a_software_version_source_off_the_reprogramming_target_is_refused() {
+    let mut program = declared_targets(&[false, false]);
+    program.identity.software_version = Some(svc_on(1));
+    let software = ProgramError::SourceOffReprogrammingTarget {
+        kind: IdentityKind::SoftwareVersion,
+        target: 1,
+        reprogramming_target: 0,
+    };
+    assert_eq!(program.validate(), Err(software.clone()));
+    // The plan's entry record reads it whether or not the plan allows a restart.
+    program.flash[0].recovery_required = RecoveryRequired::FromPc(1);
+    assert!(!program.flash[0].allows_restart());
+    assert_eq!(program.validate(), Err(software));
+
+    let mut program = with_plan_on(declared_targets(&[false, false]), 1);
+    program.identity.hardware_part_number = Some(svc_on(0));
+    program.identity.software_version = Some(svc_on(1));
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::SourceOffReprogrammingTarget {
+            kind: IdentityKind::HardwarePartNumber,
+            target: 0,
+            reprogramming_target: 1,
+        })
+    );
+    program.identity.hardware_part_number = Some(svc_on(1));
+    assert_eq!(program.validate(), Ok(()));
+}
+
+#[test]
+fn identity_sources_may_name_any_target_without_a_plan() {
+    let mut program = declared_targets_without_a_plan(&[false, false]);
+    program.identity = IdentitySources {
+        vin: Some(svc_on(0)),
+        hardware_part_number: Some(svc_on(1)),
+        software_version: Some(svc_on(0)),
+    };
+    assert_eq!(program.reprogramming_target(), None);
+    assert_eq!(program.validate(), Ok(()));
+}
+
+#[test]
+fn a_flash_plan_on_an_access_target_is_refused() {
+    let on_access = |session, target| {
+        Err(ProgramError::FlashPlanOnAccessTarget {
+            flash_session: session,
+            target,
+        })
+    };
+    assert_eq!(declared_targets(&[true]).validate(), on_access(1, 0));
+    assert_eq!(
+        with_plan_on(declared_targets(&[false, true]), 1).validate(),
+        on_access(1, 1)
+    );
+    let mut program = with_plan_on(declared_targets(&[true, false]), 1);
+    program.identity.hardware_part_number = Some(svc_on(1));
+    program.identity.software_version = Some(svc_on(1));
+    assert_eq!(program.validate(), Ok(()));
+    // The per-plan check precedes the pairwise ones: the first plan is the offending one.
+    let mut program = with_plan_on(declared_targets(&[false, true]), 1);
+    second_plan_ops(&mut program);
+    program.flash.push(plan(2, 2, 5));
+    assert_eq!(program.validate(), on_access(1, 1));
+}
+
+#[test]
+fn a_vin_source_is_required_with_several_targets_or_an_access_target() {
+    let missing = Err(ProgramError::MissingIdentitySource(IdentityKind::Vin));
+    for access in [&[false, false][..], &[true][..]] {
+        let mut program = declared_targets_without_a_plan(access);
+        program.identity = IdentitySources::default();
+        assert_eq!(program.validate(), missing, "{access:?}");
+        program.identity.vin = Some(svc_on(0));
+        assert_eq!(program.validate(), Ok(()), "{access:?}");
+    }
+    for access in [&[][..], &[false][..]] {
+        let mut program = declared_targets_without_a_plan(access);
+        program.identity = IdentitySources::default();
+        assert_eq!(program.validate(), Ok(()), "{access:?}");
+    }
+}
+
+#[test]
+fn a_vin_source_off_the_first_access_target_is_refused() {
+    let set_vin = |mut program: Program, target| {
+        program.identity.vin = Some(svc_on(target));
+        program
+    };
+    assert_eq!(
+        set_vin(declared_targets_without_a_plan(&[false, true]), 0).validate(),
+        Err(ProgramError::VinOffFirstAccessTarget {
+            target: 0,
+            first_access_target: 1
+        })
+    );
+    assert_eq!(
+        set_vin(declared_targets_without_a_plan(&[true, false]), 1).validate(),
+        Err(ProgramError::VinOffFirstAccessTarget {
+            target: 1,
+            first_access_target: 0
+        })
+    );
+    assert_eq!(
+        set_vin(declared_targets_without_a_plan(&[true, false]), 0).validate(),
+        Ok(())
+    );
+    // With no access target the VIN may be on any target, the reprogramming target included.
+    for target in [0, 1] {
+        assert_eq!(
+            set_vin(declared_targets_without_a_plan(&[false, false]), target).validate(),
+            Ok(())
+        );
+        let mut program = declared_targets(&[false, false]);
+        program.identity.vin = Some(svc_on(target));
+        assert_eq!(program.validate(), Ok(()));
+    }
+}
+
+#[test]
+fn a_precondition_source_may_name_another_target() {
+    let mut program = declared_targets(&[false, false]);
+    program.preconditions.engine = Some(precondition(Some(svc_on(1)), Some(svc_on(1))));
+    assert_eq!(program.validate(), Ok(()));
+    // An access target too: a read.
+    let mut program = with_plan_on(declared_targets(&[true, false]), 1);
+    program.identity.hardware_part_number = Some(svc_on(1));
+    program.identity.software_version = Some(svc_on(1));
+    program.preconditions.engine = Some(precondition(Some(svc_on(0)), Some(svc_on(0))));
+    assert_eq!(program.validate(), Ok(()));
+}
+
+#[test]
+fn the_first_access_target_is_the_one_with_the_lowest_index() {
+    let vin_on = |access: &[bool], target| {
+        let mut program = declared_targets_without_a_plan(access);
+        program.identity.vin = Some(svc_on(target));
+        program.validate()
+    };
+    assert_eq!(
+        vin_on(&[true, true], 1),
+        Err(ProgramError::VinOffFirstAccessTarget {
+            target: 1,
+            first_access_target: 0
+        })
+    );
+    assert_eq!(vin_on(&[true, true], 0), Ok(()));
+    assert_eq!(
+        vin_on(&[false, true, true], 2),
+        Err(ProgramError::VinOffFirstAccessTarget {
+            target: 2,
+            first_access_target: 1
+        })
+    );
+    assert_eq!(vin_on(&[false, true, true], 1), Ok(()));
+}
+
+#[test]
+fn source_and_plan_targets_survive_postcard() {
+    let mut program = declared_targets(&[false; 4]);
+    program.identity.vin = Some(svc_on(3));
+    program.flash[0].target = 2;
+    let bytes = postcard::to_allocvec(&program).unwrap();
+    let back: Program = postcard::from_bytes(&bytes).unwrap();
+    assert_eq!(postcard::to_allocvec(&back).unwrap(), bytes);
+    assert_eq!(back.identity.vin, Some(svc_on(3)));
+    assert_eq!(back.reprogramming_target(), Some(2));
+}
+
+// ADR-412: a plan selects its target before the erase and keeps it to the post-transfer end.
+
+fn sel(target: u8) -> Op {
+    Op::SelectTarget { target }
+}
+
+/// A two-target program (plan on `plan_target`) whose code is `pre`, the erase, RequestDownload,
+/// RequestTransferExit and `post`, with the plan spanning all of it from instruction 0.
+fn plan_with_target_ops(pre: Vec<Op>, post: Vec<Op>, plan_target: u8) -> Program {
+    let erase = pre.len() as u32;
+    let mut code = pre;
+    code.push(Op::RoutineControl { routine: 1, sub: 1 });
+    code.push(Op::ServiceRequest { service: 0x34 });
+    code.push(Op::ServiceRequest { service: 0x37 });
+    let exit = code.len() as u32 - 1;
+    code.extend(post);
+    let end = code.len() as u32;
+    code.push(Op::Pop);
+    let mut program = declared_targets(&[false, false]);
+    program.code = code;
+    program.flash[0].target = plan_target;
+    program.flash[0].boundaries = RecoveryBoundaries {
+        entry_pc: 0,
+        erase_pc: erase,
+        transfer_exit_pc: exit,
+        post_transfer_end_pc: end,
+    };
+    program
+}
+
+fn not_selected(erase_pc: u32, target: u8) -> ProgramError {
+    ProgramError::PlanTargetNotSelected {
+        flash_session: 1,
+        pc: erase_pc,
+        target,
+    }
+}
+
+#[test]
+fn a_plan_that_selects_its_target_before_the_erase_is_valid() {
+    // C2
+    let program = plan_with_target_ops(vec![sel(0)], vec![Op::Pop], 0);
+    assert_eq!(program.validate(), Ok(()));
+}
+
+#[test]
+fn a_plan_reached_from_outside_selects_its_target_itself() {
+    // C3: the target before the entry is not trusted, even with no SelectTarget anywhere.
+    let program = plan_with_target_ops(vec![Op::Pop], vec![Op::Pop], 0);
+    assert_eq!(program.validate(), Err(not_selected(1, 0)));
+}
+
+#[test]
+fn a_plan_that_selects_another_target_before_the_erase_is_refused() {
+    // C4
+    let program = plan_with_target_ops(vec![sel(1)], vec![Op::Pop], 0);
+    assert_eq!(program.validate(), Err(not_selected(1, 0)));
+}
+
+#[test]
+fn another_targets_step_before_the_erase_is_allowed_when_the_plan_target_follows() {
+    // C5
+    let pre = vec![sel(1), Op::ServiceRequest { service: 0x28 }, sel(0)];
+    let program = plan_with_target_ops(pre, vec![Op::Pop], 0);
+    assert_eq!(program.validate(), Ok(()));
+}
+
+#[test]
+fn a_pre_erase_branch_that_skips_the_select_is_refused() {
+    // C6: one path jumps over the select to the erase.
+    let pre = vec![Op::PushI64(1), Op::JumpIfFalse(3), sel(0)];
+    let program = plan_with_target_ops(pre, vec![Op::Pop], 0);
+    assert_eq!(program.validate(), Err(not_selected(3, 0)));
+    // Both paths select it.
+    let pre = vec![
+        Op::PushI64(1),
+        Op::JumpIfFalse(4),
+        sel(0),
+        Op::Jump(5),
+        sel(0),
+    ];
+    let program = plan_with_target_ops(pre, vec![Op::Pop], 0);
+    assert_eq!(program.validate(), Ok(()));
+}
+
+#[test]
+fn a_pre_erase_loop_is_checked_to_a_fixed_point() {
+    // Loop body selects the plan's target: valid.
+    let pre = vec![sel(1), sel(0), Op::PushI64(1), Op::JumpIfFalse(1)];
+    let program = plan_with_target_ops(pre, vec![Op::Pop], 0);
+    assert_eq!(program.validate(), Ok(()));
+    // The back edge carries target 1 around to the erase: refused.
+    let pre = vec![sel(0), Op::Pop, sel(1), Op::PushI64(1), Op::JumpIfFalse(1)];
+    let program = plan_with_target_ops(pre, vec![Op::Pop], 0);
+    assert_eq!(program.validate(), Err(not_selected(5, 0)));
+}
+
+#[test]
+fn another_target_between_the_erase_and_the_post_transfer_end_is_refused() {
+    // C7
+    let program = plan_with_target_ops(vec![sel(0)], vec![sel(1), Op::Pop], 0);
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::OtherTargetInPlan {
+            flash_session: 1,
+            pc: 4,
+            target: 1
+        })
+    );
+    // Also between the erase and the download.
+    let mut program = plan_with_target_ops(vec![sel(0)], vec![Op::Pop], 0);
+    program.code.insert(2, sel(1));
+    program.flash[0].boundaries.transfer_exit_pc += 1;
+    program.flash[0].boundaries.post_transfer_end_pc += 1;
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::OtherTargetInPlan {
+            flash_session: 1,
+            pc: 2,
+            target: 1
+        })
+    );
+}
+
+#[test]
+fn the_plans_own_target_inside_the_window_is_allowed() {
+    // C8
+    let program = plan_with_target_ops(vec![sel(0)], vec![sel(0), Op::Pop], 0);
+    assert_eq!(program.validate(), Ok(()));
+}
+
+#[test]
+fn a_download_addressed_to_another_target_is_refused() {
+    // C9 (ADR-325 item 4, the download service): the erase is the RequestDownload itself.
+    let mut program = declared_targets(&[false, false]);
+    program.code = vec![
+        sel(1),
+        Op::ServiceRequest { service: 0x34 },
+        Op::ServiceRequest { service: 0x37 },
+        Op::Pop,
+        Op::Pop,
+    ];
+    program.flash[0].boundaries = RecoveryBoundaries {
+        entry_pc: 0,
+        erase_pc: 1,
+        transfer_exit_pc: 2,
+        post_transfer_end_pc: 4,
+    };
+    assert_eq!(program.validate(), Err(not_selected(1, 0)));
+    // The same download after a select of the plan's target.
+    program.code[0] = sel(0);
+    assert_eq!(program.validate(), Ok(()));
+}
+
+#[test]
+fn a_redo_jump_back_to_the_erase_keeps_the_window_clean() {
+    // C10
+    let post = vec![Op::PushI64(1), Op::JumpIfFalse(1), Op::Pop];
+    let program = plan_with_target_ops(vec![sel(0)], post, 0);
+    assert_eq!(program.validate(), Ok(()));
+}
+
+#[test]
+fn the_rules_follow_a_plan_on_the_second_target() {
+    // C11
+    let on_second = |mut program: Program| {
+        program.identity = IdentitySources {
+            vin: Some(svc_on(1)),
+            hardware_part_number: Some(svc_on(1)),
+            software_version: Some(svc_on(1)),
+        };
+        program
+    };
+    let program = on_second(plan_with_target_ops(vec![sel(1)], vec![Op::Pop], 1));
+    assert_eq!(program.validate(), Ok(()));
+    let program = on_second(plan_with_target_ops(vec![sel(0)], vec![Op::Pop], 1));
+    assert_eq!(program.validate(), Err(not_selected(1, 1)));
+    let program = on_second(plan_with_target_ops(vec![sel(1)], vec![sel(0), Op::Pop], 1));
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::OtherTargetInPlan {
+            flash_session: 1,
+            pc: 4,
+            target: 0
+        })
+    );
+}
+
+#[test]
+fn the_target_errors_name_the_instruction() {
+    assert_eq!(not_selected(7, 0).pc(), Some(7));
+    assert_eq!(
+        ProgramError::OtherTargetInPlan {
+            flash_session: 1,
+            pc: 9,
+            target: 1
+        }
+        .pc(),
+        Some(9)
+    );
+}
+
+fn with_failure_code(mut program: Program) -> Program {
+    program.constants = vec![b"E1".to_vec()];
+    program
+}
+
+#[test]
+fn an_erase_no_path_reaches_enters_nothing_and_is_accepted() {
+    // The entry fails or loops, so the erase is dead: accepted with or without targets.
+    for first in [Op::Fail { code: 0 }, Op::Jump(0)] {
+        let mut one = with_failure_code(recovery_program());
+        one.code[0] = first.clone();
+        assert_eq!(one.validate(), Ok(()), "{first:?}");
+        let mut two = with_failure_code(declared_targets(&[false, false]));
+        two.code[0] = first.clone();
+        assert_eq!(two.validate(), Ok(()), "{first:?}");
+    }
+}
+
+#[test]
+fn a_plan_whose_entry_is_its_erase_passes_only_with_one_target() {
+    // Entered from outside (here by falling through), so the target before it is unknown.
+    let mut one = recovery_program();
+    one.code[0] = Op::RoutineControl { routine: 1, sub: 1 };
+    one.flash[0].boundaries.entry_pc = 0;
+    one.flash[0].boundaries.erase_pc = 0;
+    one.code[1] = Op::ServiceRequest { service: 0x34 };
+    one.code[2] = Op::ServiceRequest { service: 0x37 };
+    one.code[3] = Op::Pop;
+    one.flash[0].boundaries.transfer_exit_pc = 2;
+    one.flash[0].boundaries.post_transfer_end_pc = 4;
+    assert_eq!(one.validate(), Ok(()));
+    let mut two = declared_targets(&[false, false]);
+    two.code = one.code.clone();
+    two.flash[0].boundaries = one.flash[0].boundaries;
+    assert_eq!(two.validate(), Err(not_selected(0, 0)));
+}
+
+#[test]
+fn plans_on_two_targets_are_reported_before_a_missing_select() {
+    // The second plan also lacks its select; the cross-plan error comes first.
+    let mut program = declared_targets(&[false, false]);
+    second_plan_ops(&mut program);
+    program.flash.push(plan(2, 2, 5));
+    program.flash[1].target = 1;
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::FlashPlansOnSeveralTargets { a: 1, b: 2 })
+    );
+}
+
+#[test]
+fn a_control_flow_fault_is_reported_before_a_missing_select() {
+    // No select before the erase, and a return inside the plan.
+    let program = plan_with_target_ops(vec![Op::Pop], vec![Op::Ret], 0);
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::CallOrReturnInPlan {
+            flash_session: 1,
+            pc: 4
+        })
+    );
+}
+
+#[test]
+fn eight_targets_fit_the_state_mask() {
+    let eight = |pre: Vec<Op>, post: Vec<Op>| {
+        let mut program = plan_with_target_ops(pre, post, 7);
+        program.targets = (0..8)
+            .map(|index| Target {
+                access: false,
+                declarations: [index + 1; 32],
+            })
+            .collect();
+        program.identity = IdentitySources {
+            vin: Some(svc_on(7)),
+            hardware_part_number: Some(svc_on(7)),
+            software_version: Some(svc_on(7)),
+        };
+        program
+    };
+    assert_eq!(eight(vec![sel(7)], vec![Op::Pop]).validate(), Ok(()));
+    assert_eq!(
+        eight(vec![sel(6)], vec![Op::Pop]).validate(),
+        Err(not_selected(1, 7))
+    );
+    assert_eq!(
+        eight(vec![sel(7)], vec![sel(6), Op::Pop]).validate(),
+        Err(ProgramError::OtherTargetInPlan {
+            flash_session: 1,
+            pc: 4,
+            target: 6
+        })
+    );
+}
+
+#[test]
+fn branches_and_loops_are_checked_in_a_plan_that_does_not_start_at_zero() {
+    let mut skipped = plan_with_target_ops(
+        vec![Op::Pop, Op::Pop, Op::PushI64(1), Op::JumpIfFalse(5), sel(0)],
+        vec![Op::Pop],
+        0,
+    );
+    skipped.flash[0].boundaries.entry_pc = 2;
+    assert_eq!(skipped.validate(), Err(not_selected(5, 0)));
+    let mut looped = plan_with_target_ops(
+        vec![Op::Pop, sel(1), sel(0), Op::PushI64(1), Op::JumpIfFalse(2)],
+        vec![Op::Pop],
+        0,
+    );
+    looped.flash[0].boundaries.entry_pc = 1;
+    assert_eq!(looped.validate(), Ok(()));
+    // The loop's back edge reaches the entry, which selects the other target.
+    let mut back = plan_with_target_ops(
+        vec![Op::Pop, sel(1), Op::PushI64(1), Op::JumpIfFalse(1), sel(0)],
+        vec![Op::Pop],
+        0,
+    );
+    back.flash[0].boundaries.entry_pc = 1;
+    assert_eq!(back.validate(), Ok(()));
+    back.code[4] = Op::Pop;
+    assert_eq!(back.validate(), Err(not_selected(5, 0)));
+}
+
+#[test]
+fn a_pre_erase_failure_on_one_branch_leaves_the_other_to_select() {
+    let pre = vec![
+        Op::PushI64(1),
+        Op::JumpIfFalse(4),
+        sel(0),
+        Op::Jump(5),
+        Op::Fail { code: 0 },
+    ];
+    let program = with_failure_code(plan_with_target_ops(pre, vec![Op::Pop], 0));
+    assert_eq!(program.validate(), Ok(()));
 }

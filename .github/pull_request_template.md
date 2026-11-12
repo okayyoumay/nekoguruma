@@ -42,6 +42,7 @@ After:
 
 - [ ] `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --locked` clean locally
 - [ ] `scripts/check-work-refs.sh`, `scripts/check-adr-index.sh`, `scripts/check-backlog.sh` pass
+- [ ] Tests pull requests skip or run alone on Windows (`j2534-0404-service`'s tests other than `agent_restart_end_to_end`, the agent's `runner::` tests, the `ci-windows` overrides in `.config/nextest.toml`), or code only they exercise: run locally under `ci-windows-parallel` (the agent's tests) and `ci-windows` (the rest), with the results here; Windows runs them only on `main`. (N/A if none changed.)
 - [ ] CI green
 - [ ] Other (describe):
 

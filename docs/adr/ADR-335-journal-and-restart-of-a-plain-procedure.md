@@ -1,7 +1,7 @@
 # ADR-335: Journal and Restart of a Plain Procedure
 
 **Date:** 2026-10-20
-**Status:** Accepted (the Consequences' remedy realized by ADR-336: session control and TesterPresent default to `Safe`)
+**Status:** Accepted (the Consequences' remedy realized by ADR-336: session control and TesterPresent default to `Safe`; item 3's `CheckState` read as `Unsafe` within a run too, and a request marker withdrawn when its request was not sent, by ADR-392)
 **Affects:** `agent` (`src/journaling.rs`, `src/journal.rs`, `src/restart.rs`, `src/runner.rs`,
 `docs/ngr-agent.md`), `diag-ir` (`Program::validate`, a reachability check), design 5.6, 8.2.5,
 8.10.1, `crates/diag-frontend/docs/starlark-subset.md` 4.6; ADR-244, ADR-252 item 7, ADR-253

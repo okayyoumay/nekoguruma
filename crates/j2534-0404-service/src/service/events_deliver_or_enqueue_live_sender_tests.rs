@@ -3,6 +3,7 @@ use super::*;
 fn frame(timestamp: u32) -> CllQueueItem {
     CllQueueItem::Frame(ReceivedFrame {
         timestamp,
+        clock: vci_service_interface::TimestampClock::Device,
         data: Vec::new(),
         header_bytes: Vec::new(),
         footer_bytes: Vec::new(),
@@ -150,6 +151,7 @@ async fn dead_sender_send_failure_clears_live_sender_and_preserves_item() {
 fn received_frame(timestamp: u32) -> ReceivedFrame {
     ReceivedFrame {
         timestamp,
+        clock: vci_service_interface::TimestampClock::Device,
         data: Vec::new(),
         header_bytes: Vec::new(),
         footer_bytes: Vec::new(),

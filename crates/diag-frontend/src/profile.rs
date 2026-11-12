@@ -177,10 +177,22 @@ pub enum ResultMap {
     },
     /// The declared response's own field names, as for `diag.request`.
     Declared,
-    /// The seed: the response bytes after the first `after_bytes`.
-    Seed { after_bytes: u8 },
+    /// The seed: the response bytes after the first `after_bytes`, and what an all-zero seed
+    /// means.
+    Seed { after_bytes: u8, zero: ZeroSeed },
     /// Nothing; the call's `raw` is the response.
     None,
+}
+
+/// What an all-zero seed means (ISO 14229-1 (2026) 9.4.1; ADR-405).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZeroSeed {
+    /// The level is already unlocked: the key step and the send-key request are skipped and the
+    /// call's value is the seed response. A seed with no bytes is not a zero seed; lowering
+    /// refuses it.
+    Unlocked,
+    /// A zero seed is a seed like any other: the key is computed and sent.
+    Key,
 }
 
 /// A rule of ADR-314 a profile breaks.
@@ -220,6 +232,8 @@ pub enum ProfileError {
     StepKind(Intent),
     #[error("{}: a step's result map does not fit the call", .0.name())]
     ResultMap(Intent),
+    #[error("{}: on UDS a zero seed means the level is unlocked (ISO 14229-1 9.4.1)", .0.name())]
+    ZeroSeed(Intent),
 }
 
 impl Profile {
@@ -423,6 +437,21 @@ impl Call {
         {
             return Err(ProfileError::StepKind(intent));
         }
+        // A server answers a seed request for an unlocked level with a seed of zero, so on UDS
+        // the profile must read it that way (ADR-405).
+        if layer == UDS
+            && self.steps.iter().any(|step| {
+                matches!(
+                    step.result,
+                    ResultMap::Seed {
+                        zero: ZeroSeed::Key,
+                        ..
+                    }
+                )
+            })
+        {
+            return Err(ProfileError::ZeroSeed(intent));
+        }
         let result_fits = match intent {
             Intent::ReadDtc => dtc_maps == 1,
             Intent::Routine => last.result == ResultMap::Declared,
@@ -516,7 +545,10 @@ const SECURITY_ACCESS: Call = Call {
                 }],
             },
             declared: false,
-            result: ResultMap::Seed { after_bytes: 2 },
+            result: ResultMap::Seed {
+                after_bytes: 2,
+                zero: ZeroSeed::Unlocked,
+            },
         },
         Step {
             kind: StepKind::SecurityKey,

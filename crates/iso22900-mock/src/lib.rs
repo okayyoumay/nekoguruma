@@ -21,8 +21,10 @@ const MOCK_RESOURCE_ID: UNUM32 = 2001;
 /// separation time of ISO 15765-2 (2024) 9.6.5.3 and 9.6.5.4 the example ECU declares (ADR-324),
 /// and those the hardware-check guard adds when it completes a job's link from its profile
 /// (addressing modes, the functional identifier, formats, address bytes, filler and the
-/// tester-present message; ADR-334). The mock keeps no ComParam values.
-pub const STANDARD_COMPARAMS: [(&str, UNUM32); 26] = [
+/// tester-present message; ADR-334), and the other tester-present ComParams of Annex B.5.1 the
+/// agent sets with the keep-alive (ADR-418, ADR-423). The mock keeps the values of the
+/// tester-present ComParams only (ADR-423).
+pub const STANDARD_COMPARAMS: [(&str, UNUM32); 32] = [
     ("CP_Baudrate", 3210),
     ("CP_P2Max", 3211),
     ("CP_P2Star", 3212),
@@ -49,6 +51,12 @@ pub const STANDARD_COMPARAMS: [(&str, UNUM32); 26] = [
     ("CP_CanFillerByteHandling", 3233),
     ("CP_CanFillerByte", 3234),
     ("CP_TesterPresentMessage", 3235),
+    ("CP_TesterPresentHandling", 3236),
+    ("CP_TesterPresentReqRsp", 3237),
+    ("CP_TesterPresentExpPosResp", 3238),
+    ("CP_TesterPresentExpNegResp", 3239),
+    ("CP_TesterPresentSendType", 3240),
+    ("CP_TesterPresentTime", 3241),
 ];
 
 fn standard_comparam_id(name: &str) -> Option<UNUM32> {
@@ -65,7 +73,39 @@ pub const STANDARD_PIN_TYPE_HI: UNUM32 = 3311;
 pub const STANDARD_PIN_TYPE_LOW: UNUM32 = 3312;
 const MOCK_LOGICAL_LINK_HANDLE: UNUM32 = 3001;
 const MOCK_COM_PRIMITIVE_HANDLE: UNUM32 = 4001;
-const MOCK_TIMESTAMP: UNUM32 = 4242;
+
+/// The module clock: microseconds since the mock state was created, from a monotonic clock,
+/// truncated to `UNUM32` (ISO 22900-2 (2022) 10.1.4.11.4 times, `PDUGetTimestamp`). Every event
+/// item's `Timestamp` and the transmit-done and start-of-message times come from it.
+///
+/// The epoch is the first call to `state()` or to the clock; `__mock_reset` does not restart it.
+fn clock_now() -> UNUM32 {
+    clock_at(Instant::now())
+}
+
+/// The module clock at `instant`; an instant before the epoch reads 0.
+fn clock_at(instant: Instant) -> UNUM32 {
+    clock_us(instant) as UNUM32
+}
+
+/// The module clock at `instant` in microseconds since the mock's epoch, not truncated to
+/// `UNUM32`.
+fn clock_us(instant: Instant) -> u64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    let epoch = *EPOCH.get_or_init(Instant::now);
+    instant.saturating_duration_since(epoch).as_micros() as u64
+}
+
+/// ComParam id of `CP_CanRespUSDTId` (the table above).
+const CP_CAN_RESP_USDT_ID: UNUM32 = 3217;
+
+/// ENABLE_EXTRA_INFO in a ComPrimitive TxFlag: byte 0, bit 5 (ISO 22900-2 (2022) D.2.1 Table D.4).
+const TX_FLAG_ENABLE_EXTRA_INFO: UNUM8 = 0x20;
+
+/// `TimestampFlags` bits of a result item: the transmit-done time and the start-of-message time
+/// are valid (ISO 22900-2 (2022) D.2.4: byte 0, bits 7 and 6; the default flag width is 4 bytes).
+const TIMESTAMP_FLAG_TX_DONE: UNUM8 = 0x80;
+const TIMESTAMP_FLAG_START_MSG: UNUM8 = 0x40;
 const MOCK_VERSION_TAG: &[u8] = b"iso22900-mock\0";
 const MOCK_VEHICLE_NAME: &[u8] = b"mock-vehicle\0";
 
@@ -73,6 +113,15 @@ const MOCK_VEHICLE_NAME: &[u8] = b"mock-vehicle\0";
 /// timeout of a ComPrimitive the attached ECU did not answer. D.4.2 leaves these codes to the
 /// vendor's MDF, so the value is the mock's own.
 pub const MOCK_XTRA_ERR_RX_TIMEOUT_NO_RSP: UNUM32 = 0x0000_0101;
+
+/// The additional error code of a tester-present error event (`PDU_ERR_EVT_TESTER_PRESENT_ERROR`)
+/// for a tester-present the attached ECU did not answer (ADR-423). Like the code above, the value
+/// is the mock's own (D.4.2).
+pub const MOCK_XTRA_ERR_TP_NO_RSP: UNUM32 = 0x0000_0102;
+
+/// The additional error code of a tester-present error event for a tester-present the ECU
+/// answered with anything but the expected positive response (ADR-423).
+pub const MOCK_XTRA_ERR_TP_NEG_RSP: UNUM32 = 0x0000_0103;
 
 /// IOCTL command id for which `PDUIoCtl` reports success without filling in the output item,
 /// so tests can check how the wrapper handles a library that returns a null item.
@@ -82,14 +131,90 @@ pub const MOCK_IOCTL_NULL_OUTPUT: UNUM32 = 0x7FFF_FF00;
 /// attach when `PDUConstruct` is called, as `sim-vci` reads it (ADR-299).
 pub const ECU_CONFIG_ENV: &str = "NGR_SIM_ECU_CONFIG";
 
+/// Environment variable holding a JSON array of [`SimEcuCommand`]s that `PDUConstruct` applies,
+/// in order, after it attached the ECU of [`ECU_CONFIG_ENV`] (ADR-423): faults armed from the
+/// start, for a worker process whose test cannot reach `__mock_sim_ecu_control`. Applied only
+/// when `PDUConstruct` finds no ECU attached; a command that does not parse or cannot apply
+/// fails the call.
+pub const ECU_COMMANDS_ENV: &str = "NGR_SIM_ECU_COMMANDS";
+
 #[derive(Clone)]
 struct PendingEvent {
     h_mod: UNUM32,
     h_cll: UNUM32,
     h_cop: UNUM32,
     tag: usize,
+    /// The module clock when the item is produced, set as it is queued ([`stamp`]).
     timestamp: UNUM32,
+    /// For a response of the attached ECU, and the start-of-message indication of one: the
+    /// module clock when its request was sent, that is, when the ComPrimitive began. The item is
+    /// then stamped strictly after it.
+    tx_done: Option<UNUM32>,
+    /// Whether a result item's `TimestampFlags` mark `tx_done` and the item's own time as the
+    /// transmit done and the start of message. Set on a response of the attached ECU, unless
+    /// [`SimEcuCommand::ResponseTimestamps`] switched it off.
+    times_valid: bool,
+    /// The CAN identifier the item's `pExtraInfo` header carries, big-endian. Two sources
+    /// (ADR-428): an indication item the mock queues unbound ([`SimEcuCommand::IndicationBinding`]),
+    /// which has `hCop` undefined, takes it from that control; a result item of the attached ECU
+    /// takes the response identifier of the unique response table, when its ComPrimitive set
+    /// ENABLE_EXTRA_INFO and the table gave one ([`MockState::table_active`], as it was when the ComPrimitive started).
+    identifier: Option<u32>,
     kind: EventKind,
+    /// The link state change that takes effect when this item is delivered, set on the last
+    /// item of a STARTCOMM, UPDATEPARAM or STOPCOMM ComPrimitive (its `PDU_COPST_FINISHED`
+    /// status, or the synthetic completion).
+    on_finish: Option<Hook>,
+}
+
+/// The CAN identifiers of the unbound indication items ([`SimEcuCommand::IndicationBinding`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct UnboundIds {
+    /// The identifier of a transmit indication: the one the request goes out on.
+    request: u32,
+    /// The identifier of a start-of-message indication: the one the response comes in on.
+    response: u32,
+}
+
+/// Sets the item's time to the module clock now. A response is delivered strictly after its
+/// request's transmit done, so a latency measured between them is positive even when the ECU
+/// answers at once.
+fn stamp(event: &mut PendingEvent) {
+    stamp_at(event, clock_now());
+}
+
+/// Like [`stamp`], for the clock reading `now`.
+fn stamp_at(event: &mut PendingEvent, now: UNUM32) {
+    event.timestamp = match event.tx_done {
+        Some(tx_done) if (now.wrapping_sub(tx_done) as i32) <= 0 => tx_done.wrapping_add(1),
+        _ => now,
+    };
+}
+
+/// Extends the `UNUM32` time `timestamp`, which lies within about 35 minutes of the clock
+/// reading `reference_us` (microseconds since the mock's epoch, [`clock_us`]), to microseconds
+/// since the epoch.
+fn unwrap_stamp(timestamp: UNUM32, reference_us: u64) -> u64 {
+    let ahead = i64::from(timestamp.wrapping_sub(reference_us as UNUM32) as i32);
+    reference_us.saturating_add_signed(ahead)
+}
+
+/// Makes the item's time, already set by [`stamp_at`], strictly later than the time of the last
+/// item stamped through here, and records it as the new last one. The link's items (a
+/// ComPrimitive's and the tester-present's) then never share a time, however briefly the delivery
+/// cycle took. The last time is kept in microseconds since the epoch, without the wrap of
+/// `UNUM32`, so a link idle for longer than half the `UNUM32` range is not held behind the clock;
+/// the item's time is truncated to `UNUM32` only here. `reference_us` is the clock reading the
+/// item's time was taken from ([`unwrap_stamp`]).
+fn bump_stamp(state: &mut MockState, event: &mut PendingEvent, reference_us: u64) {
+    let mut stamp = unwrap_stamp(event.timestamp, reference_us);
+    if let Some(last) = state.last_stamp
+        && stamp <= last
+    {
+        stamp = last + 1;
+    }
+    event.timestamp = stamp as UNUM32;
+    state.last_stamp = Some(stamp);
 }
 
 /// What an event item carries.
@@ -101,6 +226,320 @@ enum EventKind {
     Status(T_PDU_STATUS),
     /// An error item, with its additional error code.
     Error(T_PDU_ERR_EVT, UNUM32),
+    /// Marks a tester-present sent by the mock until its answer is due, in `scheduled`: it holds
+    /// the link's next ComPrimitive back (ISO 22900-2 (2022) 8.1.3 Table 1) and, when the answer
+    /// was not the expected one, becomes the tester-present error item with this additional
+    /// error code. Never queued as it is (ADR-423).
+    TesterPresentAnswer { error: Option<UNUM32> },
+    /// A transmit or start-of-message indication: a result item with no data bytes, bound to the
+    /// ComPrimitive, whose RxFlag names the indication (ISO 22900-2 (2022) B.5.1 for
+    /// `CP_TransmitIndEnable` and `CP_StartMsgIndEnable`, D.2.2). Its time is the item's own
+    /// `Timestamp` (8.1.6.2, 8.1.6.4, 8.1.6.5).
+    Indication(Indication),
+}
+
+/// Which indication an [`EventKind::Indication`] item is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Indication {
+    /// The request was sent: RxFlag `TX_INDICATION`.
+    Transmit,
+    /// A multi-frame message began to arrive: RxFlag `START_OF_MESSAGE`.
+    Start,
+}
+
+/// RxFlag byte 3 of an indication item (ISO 22900-2 (2022) D.2.2, Table D.5: bit 3
+/// `TX_INDICATION`, bit 1 `START_OF_MESSAGE`).
+const RX_FLAG_TX_INDICATION: UNUM8 = 0x08;
+const RX_FLAG_START_OF_MESSAGE: UNUM8 = 0x02;
+
+/// The longest message that is one frame, in bytes: a single frame holds seven data bytes with
+/// normal addressing on classic CAN (ISO 15765-2 (2024) 9.6.2, Table 11). The mock's ECU has no
+/// addressing format, so it takes this one. A longer message is multi-frame and gets a
+/// start-of-message indication; a single frame gets none, as B.5.1 and D.2.2 name the first frame
+/// of a multi-frame message only.
+const SINGLE_FRAME_MAX: usize = 7;
+
+/// What a ComPrimitive that changes the link's state does when it finishes (ISO 22900-2 (2022)
+/// 8.2.6, 8.4.6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Hook {
+    /// STARTCOMM: the link is COMM_STARTED, and the working tester-present ComParams become the
+    /// active ones.
+    StartComm,
+    /// UPDATEPARAM: the working tester-present ComParams become the active ones.
+    UpdateParam,
+    /// STOPCOMM: the link is ONLINE again.
+    StopComm,
+}
+
+/// The link's communication state, as `PDUGetStatus` of the link reports it (8.4.6).
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+enum LinkState {
+    #[default]
+    Online,
+    CommStarted,
+}
+
+/// The ComParams of the cyclic tester-present (Annex B.5.1), by the values the mock keeps.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TesterPresent {
+    handling: u32,
+    message: Vec<u8>,
+    req_rsp: u32,
+    exp_pos: Vec<u8>,
+    exp_neg: Vec<u8>,
+    send_type: u32,
+    time_us: u32,
+    addr_mode: u32,
+}
+
+/// The defaults of the protocol UDS on CAN (B.5.1): handling on, the message with the
+/// suppress-positive-response bit set, no response expected, functional addressing, every 2 s.
+impl Default for TesterPresent {
+    fn default() -> Self {
+        Self {
+            handling: 1,
+            message: vec![0x3E, 0x80],
+            req_rsp: 0,
+            exp_pos: Vec::new(),
+            exp_neg: Vec::new(),
+            send_type: 0,
+            time_us: 2_000_000,
+            addr_mode: 1,
+        }
+    }
+}
+
+/// The ComParams of the response pending handling (Annex B.5.1), by the values the mock keeps
+/// (ADR-299, extended): `CP_RC78Handling`, `CP_P2Star`, `CP_RC78CompletionTimeout` and
+/// `CP_RCByteOffset`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Rc78 {
+    /// 0 passes each response pending message on as a result item; 1 absorbs them until the
+    /// completion timeout; 2 absorbs them with no limit.
+    handling: u32,
+    /// The receive timeout after a response pending message, in microseconds.
+    p2_star_us: u32,
+    /// How long a chain of response pending messages is accepted, in microseconds.
+    completion_us: u32,
+    /// The index of the response code in a negative response, counted from 0 (the agent sets 2
+    /// for `7F SID code`); 0xFFFF_FFFF is the last byte.
+    byte_offset: u32,
+}
+
+/// The mock's start: handling off, so a response pending message is passed on as before (the
+/// B.5.1 default of the UDS protocols is on, which a library has and the mock does not unless a
+/// ComParam turns it on), and the B.5.1 timings of the UDS protocols (ADR-424).
+impl Default for Rc78 {
+    fn default() -> Self {
+        Self {
+            handling: 0,
+            p2_star_us: 5_050_000,
+            completion_us: 25_000_000,
+            byte_offset: 0xFFFF_FFFF,
+        }
+    }
+}
+
+/// A ComParam of [`Rc78`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rc78Param {
+    Handling,
+    P2Star,
+    Completion,
+    ByteOffset,
+}
+
+/// The [`Rc78`] ComParam with object id `id`.
+fn rc78_param(id: UNUM32) -> Option<Rc78Param> {
+    let (name, _) = STANDARD_COMPARAMS.iter().find(|(_, known)| *known == id)?;
+    Some(match *name {
+        "CP_RC78Handling" => Rc78Param::Handling,
+        "CP_P2Star" => Rc78Param::P2Star,
+        "CP_RC78CompletionTimeout" => Rc78Param::Completion,
+        "CP_RCByteOffset" => Rc78Param::ByteOffset,
+        _ => return None,
+    })
+}
+
+impl Rc78 {
+    fn number(&self, param: Rc78Param) -> u32 {
+        match param {
+            Rc78Param::Handling => self.handling,
+            Rc78Param::P2Star => self.p2_star_us,
+            Rc78Param::Completion => self.completion_us,
+            Rc78Param::ByteOffset => self.byte_offset,
+        }
+    }
+
+    /// Stores `value`; false for one outside the range of B.5.1 (handling 0 to 2, P2* up to
+    /// [`P2_STAR_MAX_US`], offset not 0; the completion timeout's maximum is protocol specific, so
+    /// any value is kept).
+    fn set_number(&mut self, param: Rc78Param, value: u32) -> bool {
+        match param {
+            Rc78Param::Handling if value <= 2 => self.handling = value,
+            Rc78Param::ByteOffset if value != 0 => self.byte_offset = value,
+            Rc78Param::P2Star if value <= P2_STAR_MAX_US => self.p2_star_us = value,
+            Rc78Param::Completion => self.completion_us = value,
+            _ => return false,
+        }
+        true
+    }
+
+    /// Whether `message` is a response pending message to `request`: a negative response that
+    /// names the request's service id, with 0x78 at the response code offset.
+    fn is_pending(&self, request: &[u8], message: &[u8]) -> bool {
+        let index = if self.byte_offset == 0xFFFF_FFFF {
+            message.len().checked_sub(1)
+        } else {
+            Some(self.byte_offset as usize)
+        };
+        message.first() == Some(&0x7F)
+            && !request.is_empty()
+            && message.get(1) == request.first()
+            && index.and_then(|i| message.get(i)) == Some(&0x78)
+    }
+}
+
+/// The largest `CP_P2Star` B.5.1 allows, in microseconds.
+const P2_STAR_MAX_US: u32 = 655_350_000;
+
+/// The class `PDUGetComParam` reports for an [`Rc78`] ComParam (B.5.1): timing for P2*, error
+/// handling for the others.
+fn rc78_class(param: Rc78Param) -> E_PDU_PC {
+    if param == Rc78Param::P2Star {
+        E_PDU_PC::PDU_PC_TIMING
+    } else {
+        E_PDU_PC::PDU_PC_ERRHDL
+    }
+}
+
+/// The indication ComParams (Annex B.5.1), by the values the mock keeps: `CP_TransmitIndEnable`
+/// and `CP_StartMsgIndEnable`. Both start disabled, B.5.1's default for every protocol of the
+/// transmit indication and for the UDS protocols of the start-of-message indication. They have
+/// a working and an active buffer like every ComParam (8.4.15.6): `PDUConnect` and the start of
+/// an UPDATEPARAM copy working to active, and a ComPrimitive takes the active buffer as it is
+/// when it is started.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Indications {
+    /// A transmit indication follows the start of a ComPrimitive that sends.
+    transmit: bool,
+    /// A start-of-message indication precedes a multi-frame message the ComPrimitive receives.
+    start: bool,
+}
+
+/// An [`Indications`] ComParam.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IndicationParam {
+    Transmit,
+    Start,
+}
+
+/// The [`Indications`] ComParam with object id `id`.
+fn indication_param(id: UNUM32) -> Option<IndicationParam> {
+    let (name, _) = STANDARD_COMPARAMS.iter().find(|(_, known)| *known == id)?;
+    Some(match *name {
+        "CP_TransmitIndEnable" => IndicationParam::Transmit,
+        "CP_StartMsgIndEnable" => IndicationParam::Start,
+        _ => return None,
+    })
+}
+
+impl Indications {
+    fn number(&self, param: IndicationParam) -> u32 {
+        u32::from(match param {
+            IndicationParam::Transmit => self.transmit,
+            IndicationParam::Start => self.start,
+        })
+    }
+
+    /// Stores `value`; false for one outside B.5.1's range (0 or 1).
+    fn set_number(&mut self, param: IndicationParam, value: u32) -> bool {
+        if value > 1 {
+            return false;
+        }
+        match param {
+            IndicationParam::Transmit => self.transmit = value == 1,
+            IndicationParam::Start => self.start = value == 1,
+        }
+        true
+    }
+}
+
+/// Microseconds as whole milliseconds, rounded up (the mock's schedule counts milliseconds).
+fn us_to_ms(us: u32) -> u32 {
+    us.div_ceil(1_000)
+}
+
+/// The longest a tester-present byte field may be (`ParamMaxLen` of B.5.1).
+const TESTER_PRESENT_MAX_LEN: usize = 12;
+
+/// The shortest period the mock keeps: a `CP_TesterPresentTime` below it is sent every 1 ms.
+const TESTER_PRESENT_MIN_PERIOD: Duration = Duration::from_millis(1);
+
+/// A tester-present ComParam.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TpParam {
+    Handling,
+    Message,
+    ReqRsp,
+    ExpPos,
+    ExpNeg,
+    SendType,
+    Time,
+    AddrMode,
+}
+
+/// The tester-present ComParam with object id `id`.
+fn tester_present_param(id: UNUM32) -> Option<TpParam> {
+    let (name, _) = STANDARD_COMPARAMS.iter().find(|(_, known)| *known == id)?;
+    Some(match *name {
+        "CP_TesterPresentHandling" => TpParam::Handling,
+        "CP_TesterPresentMessage" => TpParam::Message,
+        "CP_TesterPresentReqRsp" => TpParam::ReqRsp,
+        "CP_TesterPresentExpPosResp" => TpParam::ExpPos,
+        "CP_TesterPresentExpNegResp" => TpParam::ExpNeg,
+        "CP_TesterPresentSendType" => TpParam::SendType,
+        "CP_TesterPresentTime" => TpParam::Time,
+        "CP_TesterPresentAddrMode" => TpParam::AddrMode,
+        _ => return None,
+    })
+}
+
+impl TesterPresent {
+    /// The value of a numeric ComParam; `None` for a byte field.
+    fn number(&self, param: TpParam) -> Option<u32> {
+        match param {
+            TpParam::Handling => Some(self.handling),
+            TpParam::ReqRsp => Some(self.req_rsp),
+            TpParam::SendType => Some(self.send_type),
+            TpParam::Time => Some(self.time_us),
+            TpParam::AddrMode => Some(self.addr_mode),
+            TpParam::Message | TpParam::ExpPos | TpParam::ExpNeg => None,
+        }
+    }
+
+    fn set_number(&mut self, param: TpParam, value: u32) -> bool {
+        match param {
+            TpParam::Handling => self.handling = value,
+            TpParam::ReqRsp => self.req_rsp = value,
+            TpParam::SendType => self.send_type = value,
+            TpParam::Time => self.time_us = value,
+            TpParam::AddrMode => self.addr_mode = value,
+            TpParam::Message | TpParam::ExpPos | TpParam::ExpNeg => return false,
+        }
+        true
+    }
+
+    fn set_bytes(&mut self, param: TpParam, value: Vec<u8>) -> bool {
+        match param {
+            TpParam::Message => self.message = value,
+            TpParam::ExpPos => self.exp_pos = value,
+            TpParam::ExpNeg => self.exp_neg = value,
+            _ => return false,
+        }
+        true
+    }
 }
 
 #[derive(Default, Clone, Copy)]
@@ -163,6 +602,10 @@ struct MockState {
     /// The simulated ECU that answers `PDU_COPT_SENDRECV` ComPrimitives, if one is attached
     /// (`__mock_sim_ecu_control`, or `NGR_SIM_ECU_CONFIG` at `PDUConstruct`; ADR-299).
     ecu: Option<SimEcu>,
+    /// The latest time stamp, in microseconds since the mock's epoch ([`clock_us`], not wrapped),
+    /// that a ComPrimitive began at, a tester-present item took ([`bump_stamp`]) or a delivered
+    /// item carried; the next such item is stamped after it. A reset clears it.
+    last_stamp: Option<u64>,
     /// ComPrimitives started while an ECU is attached (or while others still wait or run),
     /// waiting for the one before them to finish, in start order. The delivery thread
     /// ([`deliver`]) begins each in turn. Discarded with the event queue (`PDUConstruct`,
@@ -173,9 +616,73 @@ struct MockState {
     scheduled: VecDeque<(Instant, PendingEvent)>,
     /// Set by `PDUDestruct` to end the delivery thread.
     stop_delivery: bool,
+    /// The link's state: COMM_STARTED once a STARTCOMM finished, whatever the ECU answered
+    /// (ISO 22900-2 (2022) 8.2.6.3.2), ONLINE again after a STOPCOMM, a disconnect, a destroy
+    /// or a reset (ADR-423).
+    link_state: LinkState,
+    /// The tester-present ComParams `PDUSetComParam` wrote: the working buffer (8.4.16).
+    tp_working: TesterPresent,
+    /// The tester-present ComParams in force: the working buffer as a STARTCOMM or an
+    /// UPDATEPARAM last copied it.
+    tp_active: TesterPresent,
+    /// The response pending ComParams `PDUSetComParam` wrote: the working buffer (8.4.15.6).
+    rc78_working: Rc78,
+    /// The response pending ComParams in force: the working buffer as `PDUConnect` or an
+    /// UPDATEPARAM last copied it. A ComPrimitive takes its values from here when it is started.
+    rc78_active: Rc78,
+    /// The indication ComParams `PDUSetComParam` wrote: the working buffer.
+    ind_working: Indications,
+    /// The indication ComParams in force: the working buffer as `PDUConnect` or an UPDATEPARAM
+    /// last copied it. A ComPrimitive takes its values from here when it is started.
+    ind_active: Indications,
+    /// Set by [`SimEcuCommand::ResponseTimestamps`]: the ECU's response items carry no
+    /// `TimestampFlags` times, so a client has only the indication items to take them from.
+    no_response_times: bool,
+    /// Set by [`SimEcuCommand::IndicationBinding`]: the indication items are unbound, with these
+    /// request and response identifiers. `None`: bound to the ComPrimitive.
+    unbound_indications: Option<UnboundIds>,
+    /// The `CP_CanRespUSDTId` value of the entry with `UniqueRespIdentifier` 1 in the table
+    /// `PDUSetUniqueRespIdTable` last set (the mock's ECU always answers as unique 1): the
+    /// response identifier the result items of a ComPrimitive that set ENABLE_EXTRA_INFO carry
+    /// in their header (ADR-428). `None` until a table gave one. Reset with the link.
+    table_active: Option<u32>,
+    /// The id the last `PDUSetUniqueRespIdTable` gave: the working buffer, which `PDUConnect` and
+    /// the start of an UPDATEPARAM copy to `table_active` like the other ComParams (ISO 22900-2
+    /// (2022) 8.4.28.1, 8.4.15.6). A ComPrimitive keeps the active id from when it was started.
+    table_working: Option<u32>,
+    /// When the next tester-present is due; `None` while the tester-present is off, that is,
+    /// unless the link is COMM_STARTED with the active handling on.
+    tp_due: Option<Instant>,
 }
 
 impl MockState {
+    /// Forgets the link: ONLINE, no tester-present, the ComParams at their defaults.
+    fn reset_link(&mut self) {
+        self.go_online();
+        self.tp_working = TesterPresent::default();
+        self.tp_active = TesterPresent::default();
+        self.rc78_working = Rc78::default();
+        self.rc78_active = Rc78::default();
+        self.ind_working = Indications::default();
+        self.ind_active = Indications::default();
+        self.table_working = None;
+        self.table_active = None;
+    }
+
+    /// The link is ONLINE with no tester-present. A ComPrimitive still waiting or running keeps
+    /// its events, but its state change is dropped, so a STARTCOMM that finishes after the link
+    /// went away does not start it again.
+    fn go_online(&mut self) {
+        self.link_state = LinkState::Online;
+        self.tp_due = None;
+        for cop in &mut self.waiting {
+            cop.hook = None;
+        }
+        for (_, event) in &mut self.scheduled {
+            event.on_finish = None;
+        }
+    }
+
     fn next_primitive_handle(&mut self) -> UNUM32 {
         if self.next_com_primitive_handle == 0 {
             self.next_com_primitive_handle = MOCK_COM_PRIMITIVE_HANDLE;
@@ -189,7 +696,11 @@ impl MockState {
 
 fn state() -> &'static Mutex<MockState> {
     static STATE: OnceLock<Mutex<MockState>> = OnceLock::new();
-    STATE.get_or_init(|| Mutex::new(MockState::default()))
+    STATE.get_or_init(|| {
+        // The module clock starts with the state.
+        clock_now();
+        Mutex::new(MockState::default())
+    })
 }
 
 fn no_error() -> T_PDU_ERROR {
@@ -330,16 +841,75 @@ unsafe fn make_unique_resp_table_item() -> *mut PDU_UNIQUE_RESP_ID_TABLE_ITEM {
     }))
 }
 
-unsafe fn make_param_item(param_id: UNUM32) -> *mut PDU_PARAM_ITEM {
-    let value = Box::new(0u32);
+unsafe fn make_param_item(param_id: UNUM32, value: u32, class: E_PDU_PC) -> *mut PDU_PARAM_ITEM {
+    let value = Box::new(value);
     let value_ptr = Box::into_raw(value).cast::<c_void>();
 
     Box::into_raw(Box::new(PDU_PARAM_ITEM {
         ItemType: E_PDU_IT::PDU_IT_PARAM,
         ComParamId: param_id,
         ComParamDataType: E_PDU_PT::PDU_PT_UNUM32,
-        ComParamClass: E_PDU_PC::PDU_PC_COM,
+        ComParamClass: class,
         pComParamData: value_ptr,
+    }))
+}
+
+/// The `CP_CanRespUSDTId` (ComParam 3217) `PDU_PT_UNUM32` value of the entry with
+/// `UniqueRespIdentifier` 1 in `table`, if there is one.
+///
+/// # Safety
+/// `table` is null or a table whose entries and ComParam items are valid, as the caller of
+/// `PDUSetUniqueRespIdTable` guarantees.
+unsafe fn table_response_id(table: *const PDU_UNIQUE_RESP_ID_TABLE_ITEM) -> Option<u32> {
+    let table = unsafe { table.as_ref()? };
+    if table.pUniqueData.is_null() {
+        return None;
+    }
+    let entries =
+        unsafe { std::slice::from_raw_parts(table.pUniqueData, table.NumEntries as usize) };
+    let entry = entries
+        .iter()
+        .find(|entry| entry.UniqueRespIdentifier == 1)?;
+    if entry.pParams.is_null() {
+        return None;
+    }
+    let params = unsafe { std::slice::from_raw_parts(entry.pParams, entry.NumParamItems as usize) };
+    params
+        .iter()
+        .find(|param| {
+            param.ComParamId == CP_CAN_RESP_USDT_ID
+                && param.ComParamDataType == E_PDU_PT::PDU_PT_UNUM32
+                && !param.pComParamData.is_null()
+        })
+        .map(|param| unsafe { param.pComParamData.cast::<UNUM32>().read_unaligned() })
+        // All ones is the value for "not used".
+        .filter(|&id| id != u32::MAX)
+}
+
+/// A flag field with no bytes.
+fn no_flags() -> PDU_FLAG_DATA {
+    PDU_FLAG_DATA {
+        NumFlagBytes: 0,
+        pFlagData: ptr::null_mut(),
+    }
+}
+
+/// A flag field of the default four bytes (D.2), which `PDUDestroyItem` frees.
+fn flag_bytes(bytes: [UNUM8; 4]) -> PDU_FLAG_DATA {
+    PDU_FLAG_DATA {
+        NumFlagBytes: 4,
+        pFlagData: Box::into_raw(Box::new(bytes)).cast::<UNUM8>(),
+    }
+}
+
+/// A `PDU_EXTRA_INFO` whose four header bytes are the CAN identifier `id`, big-endian, and with
+/// no footer; `PDUDestroyItem` frees it with its header bytes.
+fn extra_info(id: u32) -> *mut PDU_EXTRA_INFO {
+    Box::into_raw(Box::new(PDU_EXTRA_INFO {
+        NumHeaderBytes: 4,
+        NumFooterBytes: 0,
+        pHeaderBytes: Box::into_raw(Box::new(id.to_be_bytes())).cast::<UNUM8>(),
+        pFooterBytes: ptr::null_mut(),
     }))
 }
 
@@ -353,21 +923,51 @@ unsafe fn make_event_item(event: PendingEvent) -> *mut PDU_EVENT_ITEM {
                 Box::into_raw(bytes.into_boxed_slice()).cast::<UNUM8>()
             };
             let result_data = Box::new(PDU_RESULT_DATA {
-                RxFlag: PDU_FLAG_DATA {
-                    NumFlagBytes: 0,
-                    pFlagData: ptr::null_mut(),
-                },
+                RxFlag: no_flags(),
                 UniqueRespIdentifier: 1,
                 AcceptanceId: 1,
-                TimestampFlags: PDU_FLAG_DATA {
-                    NumFlagBytes: 0,
-                    pFlagData: ptr::null_mut(),
+                TimestampFlags: if event.times_valid {
+                    // A response: the request's transmit done and the response's start.
+                    flag_bytes([TIMESTAMP_FLAG_TX_DONE | TIMESTAMP_FLAG_START_MSG, 0, 0, 0])
+                } else {
+                    // No transmission behind the item (the synthetic completion): no time valid.
+                    no_flags()
                 },
-                TxMsgDoneTimestamp: event.timestamp,
-                StartMsgTimestamp: event.timestamp,
-                pExtraInfo: ptr::null_mut(),
+                TxMsgDoneTimestamp: if event.times_valid {
+                    event.tx_done.unwrap_or(0)
+                } else {
+                    0
+                },
+                StartMsgTimestamp: if event.times_valid {
+                    event.timestamp
+                } else {
+                    0
+                },
+                pExtraInfo: event.identifier.map_or(ptr::null_mut(), extra_info),
                 NumDataBytes: num_data_bytes,
                 pDataBytes: data_bytes,
+            });
+            (
+                E_PDU_IT::PDU_IT_RESULT,
+                Box::into_raw(result_data).cast::<c_void>(),
+            )
+        }
+        EventKind::Indication(indication) => {
+            // No data bytes and no time in the result: the item's own `Timestamp` is the time.
+            let flag = match indication {
+                Indication::Transmit => RX_FLAG_TX_INDICATION,
+                Indication::Start => RX_FLAG_START_OF_MESSAGE,
+            };
+            let result_data = Box::new(PDU_RESULT_DATA {
+                RxFlag: flag_bytes([0, 0, 0, flag]),
+                UniqueRespIdentifier: 1,
+                AcceptanceId: 1,
+                TimestampFlags: no_flags(),
+                TxMsgDoneTimestamp: 0,
+                StartMsgTimestamp: 0,
+                pExtraInfo: event.identifier.map_or(ptr::null_mut(), extra_info),
+                NumDataBytes: 0,
+                pDataBytes: ptr::null_mut(),
             });
             (
                 E_PDU_IT::PDU_IT_RESULT,
@@ -378,6 +978,9 @@ unsafe fn make_event_item(event: PendingEvent) -> *mut PDU_EVENT_ITEM {
             E_PDU_IT::PDU_IT_STATUS,
             Box::into_raw(Box::new(status)).cast::<c_void>(),
         ),
+        EventKind::TesterPresentAnswer { .. } => {
+            unreachable!("a tester-present marker is never queued")
+        }
         EventKind::Error(code, extra) => (
             E_PDU_IT::PDU_IT_ERROR,
             Box::into_raw(Box::new(PDU_ERROR_DATA {
@@ -410,12 +1013,13 @@ unsafe fn notify_data_available(callback: CALLBACKFNC, event: &PendingEvent, api
     }
 }
 
-unsafe fn queue_event(event: PendingEvent) {
-    let notified = event.clone();
-    let (callback, api_tag) = {
+unsafe fn queue_event(mut event: PendingEvent) {
+    stamp(&mut event);
+    let (notified, callback, api_tag) = {
         let mut guard = state().lock().expect("mock state poisoned");
-        guard.pending_events.push(event);
-        (guard.callback, guard.api_tag)
+        bump_stamp(&mut guard, &mut event, clock_us(Instant::now()));
+        guard.pending_events.push(event.clone());
+        (event, guard.callback, guard.api_tag)
     };
 
     unsafe { notify_data_available(callback, &notified, api_tag) };
@@ -440,6 +1044,19 @@ struct WaitingCop {
     event: PendingEvent,
     /// The request and cycles of a send-and-receive ComPrimitive with request bytes, for the ECU.
     request: Option<(Vec<u8>, Cycles)>,
+    /// The response pending ComParams in force when it was started.
+    rc78: Rc78,
+    /// The indication ComParams in force when it was started.
+    indications: Indications,
+    /// The indication binding in force when it was started.
+    unbound: Option<UnboundIds>,
+    /// Whether its control set ENABLE_EXTRA_INFO in the TxFlag (ISO 22900-2 (2022) D.2.1): its
+    /// result items then carry the table's response identifier as a header (ADR-428).
+    extra_info: bool,
+    /// The table's response identifier in force when it was started (`table_active`).
+    table_id: Option<u32>,
+    /// The state change its last item makes when delivered.
+    hook: Option<Hook>,
 }
 
 /// Begins the next waiting ComPrimitive at `now`: its request reaches the ECU only now, as a
@@ -450,14 +1067,87 @@ fn begin_next(state: &mut MockState, now: Instant) {
     let Some(cop) = state.waiting.pop_front() else {
         return;
     };
-    let events = match (state.ecu.as_mut(), cop.request) {
-        (Some(ecu), Some((request, cycles))) => ecu_events(ecu, &request, cycles, &cop.event),
+    let hook = cop.hook;
+    let no_response_times = state.no_response_times;
+    let unbound = cop.unbound;
+    let header_id = if cop.extra_info { cop.table_id } else { None };
+    // The ComPrimitive's first item is stamped after the link's last stamp ([`bump_stamp`]); all
+    // its items move by the same amount, so the equal times its items share (the transmit
+    // indication and the response's transmit done, a start indication and its response) stay equal.
+    let clock = clock_us(now);
+    let sent_us = match state.last_stamp {
+        Some(last) if clock <= last => last + 1,
+        _ => clock,
+    };
+    let sent = sent_us as UNUM32;
+    let offset = sent.wrapping_sub(clock as UNUM32);
+    let mut events = match (state.ecu.as_mut(), cop.request) {
+        (Some(ecu), Some((request, cycles))) => {
+            let mut events = ecu_events(
+                ecu,
+                &request,
+                cycles,
+                cop.rc78,
+                cop.indications,
+                unbound,
+                &cop.event,
+            );
+            // The request is sent now; each response item carries that as its transmit done, and
+            // a start-of-message indication is stamped as the message it announces is.
+            for (_, event) in &mut events {
+                match event.kind {
+                    EventKind::Result(_) => {
+                        event.tx_done = Some(sent);
+                        event.times_valid = !no_response_times;
+                        event.identifier = header_id;
+                    }
+                    EventKind::Indication(Indication::Start) => event.tx_done = Some(sent),
+                    _ => {}
+                }
+            }
+            events
+        }
         _ => vec![(0, cop.event)],
     };
-    for (delay_ms, event) in events {
+    // The ComPrimitive's last item, its end, changes the link's state when it is delivered.
+    if let Some((_, last)) = events.last_mut() {
+        last.on_finish = hook;
+    }
+    // Each item is stamped with the clock at its scheduled time, as `sim-vci` does, so a latency
+    // between two items is the ECU's delay and not the delivery thread's scheduling. Items keep
+    // their order: no item is stamped earlier than the one before it.
+    let mut previous: Option<UNUM32> = None;
+    for (delay_ms, mut event) in events {
         let due = now + Duration::from_millis(delay_ms.into());
+        stamp_at(&mut event, clock_at(due).wrapping_add(offset));
+        if let Some(previous) = previous
+            && (event.timestamp.wrapping_sub(previous) as i32) < 0
+        {
+            event.timestamp = previous;
+        }
+        previous = Some(event.timestamp);
         state.scheduled.push_back((due, event));
     }
+    // Only the begin stamp counts here; each item raises it as it is delivered ([`note_delivered`]),
+    // so a later item of the link is not stamped after this ComPrimitive's future items.
+    state.last_stamp = Some(sent_us);
+}
+
+/// Records that the item stamped `timestamp` was delivered: the link's last stamp is raised to
+/// it, so an item stamped from now on (a tester-present that its finish made due) comes after
+/// everything delivered. `reference_us` is the clock reading now ([`unwrap_stamp`]).
+/// [`note_delivered`] for a delivered scheduled event. A tester-present answer marker carries no
+/// stamp (`timestamp` 0): it is an internal marker, not an item, so it does not move the last
+/// stamp (unwrapping its 0 would put the last stamp up to a whole clock range ahead).
+fn note_delivered_event(state: &mut MockState, event: &PendingEvent, reference_us: u64) {
+    if !matches!(event.kind, EventKind::TesterPresentAnswer { .. }) {
+        note_delivered(state, event.timestamp, reference_us);
+    }
+}
+
+fn note_delivered(state: &mut MockState, timestamp: UNUM32, reference_us: u64) {
+    let stamp = unwrap_stamp(timestamp, reference_us);
+    state.last_stamp = Some(state.last_stamp.map_or(stamp, |last| last.max(stamp)));
 }
 
 /// Starts the delivery thread unless one runs. Called with the state locked; neither the
@@ -532,10 +1222,20 @@ fn deliver() {
         }
         let now = Instant::now();
         match guard.scheduled.front().map(|(due, _)| *due) {
+            // A ComPrimitive goes before a tester-present that is due (ADR-423).
             None if !guard.waiting.is_empty() => begin_next(&mut guard, now),
-            None => {
-                guard = delivery_signal().wait(guard).expect("mock state poisoned");
-            }
+            None => match guard.tp_due {
+                Some(due) if due <= now => send_tester_present(&mut guard, now),
+                Some(due) => {
+                    guard = delivery_signal()
+                        .wait_timeout(guard, due - now)
+                        .expect("mock state poisoned")
+                        .0;
+                }
+                None => {
+                    guard = delivery_signal().wait(guard).expect("mock state poisoned");
+                }
+            },
             Some(due) if due > now => {
                 guard = delivery_signal()
                     .wait_timeout(guard, due - now)
@@ -543,7 +1243,27 @@ fn deliver() {
                     .0;
             }
             Some(_) => {
-                let (_, event) = guard.scheduled.pop_front().expect("an event is due");
+                // Stamped with its scheduled time when the ComPrimitive began (`begin_next`).
+                let (_, mut event) = guard.scheduled.pop_front().expect("an event is due");
+                note_delivered_event(&mut guard, &event, clock_us(now));
+                if let Some(hook) = event.on_finish {
+                    apply_hook(&mut guard, hook, now);
+                }
+                if let EventKind::TesterPresentAnswer { error } = event.kind {
+                    // An answer as expected, or one nobody waits for any more (the tester-present
+                    // was switched off meanwhile), reports nothing.
+                    match error {
+                        Some(extra) if tester_present_on(&guard) => {
+                            event.kind = EventKind::Error(
+                                E_PDU_ERR_EVT::PDU_ERR_EVT_TESTER_PRESENT_ERROR,
+                                extra,
+                            );
+                            stamp(&mut event);
+                            bump_stamp(&mut guard, &mut event, clock_us(Instant::now()));
+                        }
+                        _ => continue,
+                    }
+                }
                 guard.pending_events.push(event.clone());
                 let (callback, api_tag) = (guard.callback, guard.api_tag);
                 drop(guard);
@@ -552,6 +1272,129 @@ fn deliver() {
             }
         }
     }
+}
+
+/// Whether the link sends its tester-present: COMM_STARTED with the active handling on
+/// (ISO 22900-2 (2022) 8.2.6.3.2, B.5.1).
+fn tester_present_on(state: &MockState) -> bool {
+    state.link_state == LinkState::CommStarted && state.tp_active.handling != 0
+}
+
+/// Copies the working tester-present ComParams to the active ones (8.4.16) and schedules the
+/// tester-present accordingly: on, it is due at once when it was off or a ComParam changed
+/// (B.5.1, the note on the tester-present ComParams); off, it is not due.
+fn activate_tester_present(state: &mut MockState, now: Instant) {
+    let was_on = tester_present_on(state);
+    let before = std::mem::replace(&mut state.tp_active, state.tp_working.clone());
+    state.tp_due = if !tester_present_on(state) {
+        None
+    } else if !was_on || before != state.tp_active {
+        Some(now)
+    } else {
+        state.tp_due.or(Some(now))
+    };
+}
+
+/// Applies the state change of a finished STARTCOMM, UPDATEPARAM or STOPCOMM.
+fn apply_hook(state: &mut MockState, hook: Hook, now: Instant) {
+    match hook {
+        Hook::StartComm => {
+            state.link_state = LinkState::CommStarted;
+            activate_tester_present(state, now);
+        }
+        Hook::UpdateParam => activate_tester_present(state, now),
+        Hook::StopComm => {
+            state.link_state = LinkState::Online;
+            state.tp_due = None;
+        }
+    }
+}
+
+/// Sends the tester-present that is due to the attached ECU (ADR-423) and schedules the next
+/// one a period later, whatever the answer. Without an ECU nothing is sent and no error is
+/// raised. A send that expects a response puts a marker in `scheduled` at the time of the final
+/// answer, which holds the link's ComPrimitives back until then (ISO 22900-2 (2022) 8.1.3
+/// Table 1) and reports a missing or unexpected answer. Judged against the active ComParams:
+/// the answer is positive when it starts with the expected positive response; with that field
+/// empty, when it does not start with the expected negative one. Send type 1 is sent as type 0,
+/// every period.
+fn send_tester_present(state: &mut MockState, now: Instant) {
+    if !tester_present_on(state) {
+        state.tp_due = None;
+        return;
+    }
+    let tp = state.tp_active.clone();
+    let period = Duration::from_micros(tp.time_us.into()).max(TESTER_PRESENT_MIN_PERIOD);
+    state.tp_due = Some(now + period);
+    if tp.message.is_empty() {
+        return;
+    }
+    let Some(ecu) = state.ecu.as_mut() else {
+        return;
+    };
+    let addressing = if tp.addr_mode == 0 {
+        Addressing::Physical
+    } else {
+        Addressing::Functional
+    };
+    let exchange = ecu.exchange(addressing, &tp.message);
+    // The API's own physical request completed on the bus: with the transmit indication enabled
+    // it raises one (B.5.1, `CP_TransmitIndEnable`). The item belongs to no ComPrimitive, so it is
+    // unbound and, in every mode, carries no extra info header (ISO 22900-2 (2022) 10.1.4.11,
+    // 10.1.4.11.4, D.2.1; ADR-430). A functional one goes out on another identifier, which the
+    // mock does not model, so it raises none.
+    if state.ind_active.transmit && tp.addr_mode == 0 {
+        let mut event = PendingEvent {
+            h_mod: MOCK_MODULE_HANDLE,
+            h_cll: MOCK_LOGICAL_LINK_HANDLE,
+            h_cop: PDU_HANDLE_UNDEF,
+            tag: 0,
+            timestamp: 0,
+            tx_done: None,
+            times_valid: false,
+            identifier: None,
+            kind: EventKind::Indication(Indication::Transmit),
+            on_finish: None,
+        };
+        stamp_at(&mut event, clock_at(now));
+        bump_stamp(state, &mut event, clock_us(now));
+        state.scheduled.push_back((now, event));
+    }
+    if tp.req_rsp == 0 {
+        // No answer is expected, so nothing waits for one.
+        return;
+    }
+    let answer = exchange.response.to_bytes();
+    let last_pending = exchange.pending.last().map_or(0, |(delay_ms, _)| *delay_ms);
+    let (delay_ms, error) = match answer {
+        None => (last_pending, Some(MOCK_XTRA_ERR_TP_NO_RSP)),
+        // An empty expected-positive field is not enabled (B.5.1): any answer is positive unless
+        // it is the expected negative one.
+        Some(bytes) if tp.exp_pos.is_empty() => {
+            let negative = !tp.exp_neg.is_empty() && bytes.starts_with(&tp.exp_neg);
+            (
+                exchange.delay_ms,
+                negative.then_some(MOCK_XTRA_ERR_TP_NEG_RSP),
+            )
+        }
+        Some(bytes) if bytes.starts_with(&tp.exp_pos) => (exchange.delay_ms, None),
+        Some(_) => (exchange.delay_ms, Some(MOCK_XTRA_ERR_TP_NEG_RSP)),
+    };
+    state.scheduled.push_back((
+        now + Duration::from_millis(delay_ms.into()),
+        PendingEvent {
+            h_mod: MOCK_MODULE_HANDLE,
+            h_cll: MOCK_LOGICAL_LINK_HANDLE,
+            h_cop: PDU_HANDLE_UNDEF,
+            tag: 0,
+            timestamp: 0,
+            tx_done: None,
+            times_valid: false,
+            identifier: None,
+            kind: EventKind::TesterPresentAnswer { error },
+            on_finish: None,
+        },
+    ));
 }
 
 /// How a send-and-receive ComPrimitive's control data says to run it.
@@ -566,6 +1409,18 @@ enum Cycles {
     SendReceive,
 }
 
+/// Whether the control's TxFlag sets ENABLE_EXTRA_INFO: byte 0, bit 5 (D.2.1 Table D.4). Reads
+/// the flag only when it has a byte to read.
+fn requests_extra_info(control: Option<&PDU_COP_CTRL_DATA>) -> bool {
+    let Some(control) = control else {
+        return false;
+    };
+    let flag = control.TxFlag;
+    flag.NumFlagBytes >= 1
+        && !flag.pFlagData.is_null()
+        && unsafe { *flag.pFlagData } & TX_FLAG_ENABLE_EXTRA_INFO != 0
+}
+
 /// `PDU_COP_CTRL_DATA`'s send and receive cycles (ISO 22900-2 (2022) 8.2.6.2). Without control
 /// data the mock sends once and receives once.
 fn cycles(control: Option<&PDU_COP_CTRL_DATA>) -> Cycles {
@@ -577,19 +1432,137 @@ fn cycles(control: Option<&PDU_COP_CTRL_DATA>) -> Cycles {
     }
 }
 
+/// What a send-and-receive ComPrimitive receives of the ECU's messages: `pending` (response
+/// pending messages with their delays), then `response` at `response_delay_ms`, or nothing; and
+/// the delay at which it ends.
+///
+/// With the handling off, each pending message is a result item, and a missing response is a
+/// receive timeout right after the last message (the mock keeps no P2Max). With the handling on
+/// (ISO 22900-2 (2022) B.5.1, Table 9, Figure I.4), the pending messages are absorbed: each
+/// reloads the receive timer with P2*, so the next message is due within P2* of it and, with
+/// handling 1, within the completion timeout of the first. Only the response is a result item;
+/// when a message comes too late, or the ECU sends no response, the receive timeout is the item,
+/// at the instant the timer ran out, and the response (if any) is not delivered.
+fn receive_events(
+    rc78: Rc78,
+    request: &[u8],
+    mut pending: Vec<(u32, Vec<u8>)>,
+    mut response: Option<Vec<u8>>,
+    response_delay_ms: u32,
+) -> (Vec<(u32, EventKind)>, u32) {
+    // With the handling on, a final message that is itself a response pending message (a
+    // negative response fault with code 0x78 and no pending list) is absorbed like one.
+    if rc78.handling != 0
+        && pending
+            .iter()
+            .all(|(_, bytes)| rc78.is_pending(request, bytes))
+        && response
+            .as_deref()
+            .is_some_and(|bytes| rc78.is_pending(request, bytes))
+    {
+        pending.push((response_delay_ms, response.take().expect("checked")));
+    }
+    let timeout = |at| {
+        (
+            at,
+            EventKind::Error(
+                E_PDU_ERR_EVT::PDU_ERR_EVT_RX_TIMEOUT,
+                MOCK_XTRA_ERR_RX_TIMEOUT_NO_RSP,
+            ),
+        )
+    };
+    let absorbed = rc78.handling != 0
+        && !pending.is_empty()
+        && pending
+            .iter()
+            .all(|(_, bytes)| rc78.is_pending(request, bytes));
+    if !absorbed {
+        let mut events: Vec<(u32, EventKind)> = pending
+            .into_iter()
+            .map(|(delay_ms, bytes)| (delay_ms, EventKind::Result(bytes)))
+            .collect();
+        let last = match response {
+            Some(bytes) => {
+                events.push((response_delay_ms, EventKind::Result(bytes)));
+                response_delay_ms
+            }
+            None => {
+                let at = events.last().map_or(0, |(delay_ms, _)| *delay_ms);
+                events.push(timeout(at));
+                at
+            }
+        };
+        return (events, last);
+    }
+    let p2_star_ms = us_to_ms(rc78.p2_star_us);
+    let first = pending[0].0;
+    // A completion timeout of 0 is no ceiling (B.5.1 does not say; ADR-424), as handling 2.
+    let completion = (rc78.handling == 1 && rc78.completion_us != 0)
+        .then(|| first.saturating_add(us_to_ms(rc78.completion_us)));
+    // The instant the receive timer runs out: P2* after the last pending message, or the end of
+    // the completion timeout, whichever is first.
+    let limit = |last_pending: u32| {
+        let reload = last_pending.saturating_add(p2_star_ms);
+        completion.map_or(reload, |end| reload.min(end))
+    };
+    let mut last_pending = first;
+    for (at, _) in &pending[1..] {
+        if *at > limit(last_pending) {
+            let at = limit(last_pending);
+            return (vec![timeout(at)], at);
+        }
+        last_pending = *at;
+    }
+    match response {
+        Some(bytes) if response_delay_ms <= limit(last_pending) => (
+            vec![(response_delay_ms, EventKind::Result(bytes))],
+            response_delay_ms,
+        ),
+        _ => {
+            let at = limit(last_pending);
+            (vec![timeout(at)], at)
+        }
+    }
+}
+
 /// The events a `PDU_COPT_SENDRECV` ComPrimitive gets from the attached ECU, each with its delay
 /// from the request in milliseconds (ADR-299): the `PDU_COPST_EXECUTING` status item; when it
 /// receives, a result item for each response pending message and for the response, or a receive
-/// timeout error item when the ECU sends no response; then the `PDU_COPST_FINISHED` status item.
+/// timeout error item when the ECU sends no response ([`receive_events`] decides, by `rc78`, whether
+/// the pending messages are items or absorbed); then the `PDU_COPST_FINISHED` status item.
+///
+/// With `indications` on (`CP_TransmitIndEnable`, `CP_StartMsgIndEnable`), the transmit indication
+/// follows the EXECUTING status of every ComPrimitive that sends, a send-only one included, and a
+/// start-of-message indication precedes each received result item of more than one frame, at the
+/// item's delay. A ComPrimitive that sends nothing gets neither. With `unbound` set the
+/// indication items are not bound to the ComPrimitive (`hCop` undefined) and name the CAN
+/// identifier in their extra info.
 fn ecu_events(
     ecu: &mut SimEcu,
     request: &[u8],
     cycles: Cycles,
+    rc78: Rc78,
+    indications: Indications,
+    unbound: Option<UnboundIds>,
     event: &PendingEvent,
 ) -> Vec<(u32, PendingEvent)> {
     let with = |kind| PendingEvent {
         kind,
         ..event.clone()
+    };
+    // An indication item is bound to the ComPrimitive, or, with `unbound` set, has no ComPrimitive
+    // and names the CAN identifier of the message instead.
+    let indication = |kind: Indication| {
+        let mut item = with(EventKind::Indication(kind));
+        if let Some(ids) = unbound {
+            item.h_cop = PDU_HANDLE_UNDEF;
+            item.tag = 0;
+            item.identifier = Some(match kind {
+                Indication::Transmit => ids.request,
+                Indication::Start => ids.response,
+            });
+        }
+        item
     };
     let mut events = vec![(
         0,
@@ -600,36 +1573,34 @@ fn ecu_events(
         return events;
     }
     let exchange = ecu.exchange(Addressing::Physical, request);
+    // The request is on the bus: the transmit indication follows the EXECUTING status (the
+    // sequences of 8.2.6.4.1 and 8.2.6.4.3 queue it after the status). It is the time the request
+    // was sent, so it is due with no delay.
+    if indications.transmit {
+        events.push((0, indication(Indication::Transmit)));
+    }
     if cycles == Cycles::SendOnly {
         // The request reached the ECU; whatever it answers is not received.
         events.push((0, with(EventKind::Status(E_PDU_STATUS::PDU_COPST_FINISHED))));
         return events;
     }
-    events.extend(
-        exchange
-            .pending
-            .into_iter()
-            .map(|(delay_ms, bytes)| (delay_ms, with(EventKind::Result(bytes)))),
+    let (received, last) = receive_events(
+        rc78,
+        request,
+        exchange.pending,
+        exchange.response.to_bytes(),
+        exchange.delay_ms,
     );
-    let last = match exchange.response.to_bytes() {
-        Some(bytes) => {
-            events.push((exchange.delay_ms, with(EventKind::Result(bytes))));
-            exchange.delay_ms
+    for (delay_ms, kind) in received {
+        // A message of more than one frame is announced when its first frame arrives; the mock
+        // delivers a message whole, so that is the time of the message.
+        if indications.start
+            && matches!(&kind, EventKind::Result(bytes) if bytes.len() > SINGLE_FRAME_MAX)
+        {
+            events.push((delay_ms, indication(Indication::Start)));
         }
-        None => {
-            // The mock keeps no ComParams, so there is no P2 to wait for: the timeout is
-            // reported right after the last message the ECU sent.
-            let at = events.last().map_or(0, |(delay_ms, _)| *delay_ms);
-            events.push((
-                at,
-                with(EventKind::Error(
-                    E_PDU_ERR_EVT::PDU_ERR_EVT_RX_TIMEOUT,
-                    MOCK_XTRA_ERR_RX_TIMEOUT_NO_RSP,
-                )),
-            ));
-            at
-        }
-    };
+        events.push((delay_ms, with(kind)));
+    }
     events.push((
         last,
         with(EventKind::Status(E_PDU_STATUS::PDU_COPST_FINISHED)),
@@ -649,6 +1620,55 @@ fn ecu_config_from(path: Option<std::ffi::OsString>) -> Result<Option<EcuConfig>
             Ok(Some(config))
         }
     }
+}
+
+/// The commands in `text`, a JSON array of [`SimEcuCommand`]s (`NGR_SIM_ECU_COMMANDS`), if there
+/// is one; `Err` when it does not parse.
+fn ecu_commands_from(text: Option<std::ffi::OsString>) -> Result<Vec<SimEcuCommand>, ()> {
+    match text {
+        None => Ok(Vec::new()),
+        Some(text) => {
+            let text = text.to_str().ok_or(())?;
+            // A variable that is set but blank names no commands.
+            if text.trim().is_empty() {
+                return Ok(Vec::new());
+            }
+            serde_json::from_str(text).map_err(|_| ())
+        }
+    }
+}
+
+/// Applies the commands `text` holds (`NGR_SIM_ECU_COMMANDS`) in order; stops at the first that
+/// fails, leaving what the earlier ones did (the caller undoes it).
+fn apply_ecu_commands(state: &mut MockState, text: Option<std::ffi::OsString>) -> Result<(), ()> {
+    for command in ecu_commands_from(text)? {
+        apply_sim_ecu_command(state, command)?;
+    }
+    Ok(())
+}
+
+/// What `PDUConstruct` does about the ECU when none is attached: attaches the one the
+/// configuration file `config` names, then applies the commands `commands` holds (ADR-423), so a
+/// fault can be armed from the start. All or nothing: when a step fails the ECU is detached
+/// again, and a retried construct does not succeed without the faults.
+fn attach_from_environment(
+    state: &mut MockState,
+    config: Option<std::ffi::OsString>,
+    commands: Option<std::ffi::OsString>,
+) -> Result<(), ()> {
+    if state.ecu.is_some() {
+        return Ok(());
+    }
+    let result = ecu_config_from(config).and_then(|config| {
+        if let Some(config) = config {
+            state.ecu = Some(SimEcu::new(config));
+        }
+        apply_ecu_commands(state, commands)
+    });
+    if result.is_err() {
+        state.ecu = None;
+    }
+    result
 }
 
 /// The configuration an ECU attached without one gets, as `sim-vci`'s default.
@@ -674,6 +1694,31 @@ pub enum SimEcuCommand {
     },
     /// Detaches the ECU: ComPrimitives get the synthetic completion event again.
     Detach {},
+    /// Sets whether the result items of the ECU's responses carry the transmit-done and
+    /// start-of-message times in their `TimestampFlags` (they do until switched off). Without
+    /// them a client has only the indication items (`CP_TransmitIndEnable`,
+    /// `CP_StartMsgIndEnable`) to take those times from. Not reset by `Detach`.
+    ResponseTimestamps { enabled: bool },
+    /// Sets whether the indication items (`CP_TransmitIndEnable`, `CP_StartMsgIndEnable`) are
+    /// bound to their ComPrimitive (they are until switched). With `bound` false they take the
+    /// shape the J2534 worker gives its indications (ADR-051, ADR-151), as a test double for the
+    /// guarded handle's unbound path: `hCop` undefined, and a `pExtraInfo` whose four header
+    /// bytes are the big-endian CAN identifier, `request_id` for a transmit indication and
+    /// `response_id` for a start-of-message one. A D-PDU library attaches extra info only to the
+    /// items of a ComPrimitive that set ENABLE_EXTRA_INFO (ISO 22900-2 (2022) 10.1.4.11.4, D.2.1),
+    /// so this header comes from the control, not from a library (the result items of a bound
+    /// ECU response take theirs from the unique response table instead, ADR-428). Both are required with `bound` false (the command fails without them) and
+    /// ignored with `bound` true. The ECU's own tester-present raises an unbound transmit
+    /// indication with no header, whatever the binding, when `CP_TransmitIndEnable` is active
+    /// and `CP_TesterPresentAddrMode` is 0 (ADR-430). A ComPrimitive takes the binding when it is started, like
+    /// the indication ComParams. Reset by `__mock_reset`, not by `Detach`.
+    IndicationBinding {
+        bound: bool,
+        #[serde(default)]
+        request_id: Option<u32>,
+        #[serde(default)]
+        response_id: Option<u32>,
+    },
     /// Arms a `sim_ecu::Fault` on the attached ECU (`SimEcu::inject`), or, with `service`, once
     /// a request of that service reaches it, or, with `request`, once a request that starts
     /// with those bytes does. At most one of `service` and `request`.
@@ -702,6 +1747,21 @@ fn apply_sim_ecu_command(state: &mut MockState, command: SimEcuCommand) -> Resul
             state.ecu = Some(SimEcu::new(config));
         }
         SimEcuCommand::Detach {} => state.ecu = None,
+        SimEcuCommand::ResponseTimestamps { enabled } => state.no_response_times = !enabled,
+        SimEcuCommand::IndicationBinding {
+            bound,
+            request_id,
+            response_id,
+        } => {
+            state.unbound_indications = if bound {
+                None
+            } else {
+                Some(UnboundIds {
+                    request: request_id.ok_or(())?,
+                    response: response_id.ok_or(())?,
+                })
+            };
+        }
         SimEcuCommand::InjectFault {
             fault,
             service,
@@ -755,12 +1815,14 @@ macro_rules! exported_fn {
 
 exported_fn!(PDUConstruct(_option_str: *mut CHAR8, p_api_tag: *mut c_void) -> T_PDU_ERROR {
     let mut guard = state().lock().expect("mock state poisoned");
-    if guard.ecu.is_none() {
-        match ecu_config_from(std::env::var_os(ECU_CONFIG_ENV)) {
-            Ok(Some(config)) => guard.ecu = Some(SimEcu::new(config)),
-            Ok(None) => {}
-            Err(()) => return E_PDU_ERROR::PDU_ERR_FCT_FAILED,
-        }
+    if attach_from_environment(
+        &mut guard,
+        std::env::var_os(ECU_CONFIG_ENV),
+        std::env::var_os(ECU_COMMANDS_ENV),
+    )
+    .is_err()
+    {
+        return E_PDU_ERROR::PDU_ERR_FCT_FAILED;
     }
     // A delivery thread that a `PDUDestruct` from its own callback left to end keeps the stop
     // flag set until here.
@@ -776,6 +1838,7 @@ exported_fn!(PDUConstruct(_option_str: *mut CHAR8, p_api_tag: *mut c_void) -> T_
     guard.pending_events.clear();
     guard.waiting.clear();
     guard.scheduled.clear();
+    guard.reset_link();
     guard.counters.construct += 1;
     no_error()
 });
@@ -871,7 +1934,7 @@ exported_fn!(PDUGetVersion(_h_mod: UNUM32, p_version_data: *mut PDU_VERSION_DATA
     unsafe { set_out(p_version_data, fixed_version()) }
 });
 
-exported_fn!(PDUGetStatus(_h_mod: UNUM32, _h_cll: UNUM32, h_cop: UNUM32, p_status_code: *mut T_PDU_STATUS, p_timestamp: *mut UNUM32, p_extra_info: *mut UNUM32) -> T_PDU_ERROR {
+exported_fn!(PDUGetStatus(_h_mod: UNUM32, h_cll: UNUM32, h_cop: UNUM32, p_status_code: *mut T_PDU_STATUS, p_timestamp: *mut UNUM32, p_extra_info: *mut UNUM32) -> T_PDU_ERROR {
     if p_status_code.is_null() || p_timestamp.is_null() || p_extra_info.is_null() {
         return invalid_parameters();
     }
@@ -879,11 +1942,20 @@ exported_fn!(PDUGetStatus(_h_mod: UNUM32, _h_cll: UNUM32, h_cop: UNUM32, p_statu
     let status = {
         let mut guard = state().lock().expect("mock state poisoned");
         guard.counters.get_status += 1;
-        // A ComPrimitive waiting for its turn is idle, one with events to come is executing
+        // The status of a link, asked with no ComPrimitive (8.4.6), is its state (ADR-423); a
+        // ComPrimitive waiting for its turn is idle, one with events to come is executing
         // (ADR-299).
-        if h_cop != 0 && guard.waiting.iter().any(|cop| cop.event.h_cop == h_cop) {
+        // The marker of a tester-present in `scheduled` has no ComPrimitive handle; it is not one
+        // a caller can ask about.
+        let is_cop_handle = h_cop != 0 && h_cop != PDU_HANDLE_UNDEF;
+        if h_cop == PDU_HANDLE_UNDEF && h_cll != PDU_HANDLE_UNDEF {
+            match guard.link_state {
+                LinkState::Online => E_PDU_STATUS::PDU_CLLST_ONLINE,
+                LinkState::CommStarted => E_PDU_STATUS::PDU_CLLST_COMM_STARTED,
+            }
+        } else if is_cop_handle && guard.waiting.iter().any(|cop| cop.event.h_cop == h_cop) {
             E_PDU_STATUS::PDU_COPST_IDLE
-        } else if h_cop != 0 && guard.scheduled.iter().any(|(_, event)| event.h_cop == h_cop) {
+        } else if is_cop_handle && guard.scheduled.iter().any(|(_, event)| event.h_cop == h_cop) {
             E_PDU_STATUS::PDU_COPST_EXECUTING
         } else {
             E_PDU_STATUS::PDU_COPST_FINISHED
@@ -892,7 +1964,7 @@ exported_fn!(PDUGetStatus(_h_mod: UNUM32, _h_cll: UNUM32, h_cop: UNUM32, p_statu
 
     unsafe {
         *p_status_code = status;
-        *p_timestamp = MOCK_TIMESTAMP;
+        *p_timestamp = clock_now();
         *p_extra_info = 0;
     }
     no_error()
@@ -953,6 +2025,7 @@ exported_fn!(PDUCreateComLogicalLink(_h_mod: UNUM32, _p_rsc_data: *mut PDU_RSC_D
 exported_fn!(PDUDestroyComLogicalLink(_h_mod: UNUM32, _h_cll: UNUM32) -> T_PDU_ERROR {
     let mut guard = state().lock().expect("mock state poisoned");
     guard.counters.destroy_com_logical_link += 1;
+    guard.reset_link();
     drop(guard);
     no_error()
 });
@@ -960,6 +2033,9 @@ exported_fn!(PDUDestroyComLogicalLink(_h_mod: UNUM32, _h_cll: UNUM32) -> T_PDU_E
 exported_fn!(PDUConnect(_h_mod: UNUM32, _h_cll: UNUM32) -> T_PDU_ERROR {
     let mut guard = state().lock().expect("mock state poisoned");
     guard.counters.connect += 1;
+    guard.rc78_active = guard.rc78_working;
+    guard.ind_active = guard.ind_working;
+    guard.table_active = guard.table_working;
     drop(guard);
     no_error()
 });
@@ -967,6 +2043,7 @@ exported_fn!(PDUConnect(_h_mod: UNUM32, _h_cll: UNUM32) -> T_PDU_ERROR {
 exported_fn!(PDUDisconnect(_h_mod: UNUM32, _h_cll: UNUM32) -> T_PDU_ERROR {
     let mut guard = state().lock().expect("mock state poisoned");
     guard.counters.disconnect += 1;
+    guard.go_online();
     drop(guard);
     no_error()
 });
@@ -987,12 +2064,93 @@ exported_fn!(PDUUnlockResource(_h_mod: UNUM32, _h_cll: UNUM32, _lock_mask: UNUM3
     no_error()
 });
 
+// The tester-present and the response pending ComParams are read back as the working value (8.4.16) when numeric; a byte
+// field, like every other ComParam, reads as the number 0, as `PDUDestroyItem` frees a ComParam
+// item's data as one.
 exported_fn!(PDUGetComParam(_h_mod: UNUM32, _h_cll: UNUM32, param_id: UNUM32, p_param_item: *mut *mut PDU_PARAM_ITEM) -> T_PDU_ERROR {
-    unsafe { set_out_ptr(p_param_item, make_param_item(param_id)) }
+    let (value, class) = match tester_present_param(param_id) {
+        None if indication_param(param_id).is_some() => {
+            let guard = state().lock().expect("mock state poisoned");
+            let param = indication_param(param_id).expect("checked");
+            (guard.ind_working.number(param), E_PDU_PC::PDU_PC_COM)
+        }
+        None if rc78_param(param_id).is_some() => {
+            let guard = state().lock().expect("mock state poisoned");
+            let param = rc78_param(param_id).expect("checked");
+            (guard.rc78_working.number(param), rc78_class(param))
+        }
+        Some(param) => {
+            let guard = state().lock().expect("mock state poisoned");
+            (
+                guard.tp_working.number(param).unwrap_or(0),
+                E_PDU_PC::PDU_PC_TESTER_PRESENT,
+            )
+        }
+        None => (0, E_PDU_PC::PDU_PC_COM),
+    };
+    unsafe { set_out_ptr(p_param_item, make_param_item(param_id, value, class)) }
 });
 
-exported_fn!(PDUSetComParam(_h_mod: UNUM32, _h_cll: UNUM32, _p_param_item: *mut PDU_PARAM_ITEM) -> T_PDU_ERROR {
-    no_error()
+// Stores the tester-present ComParams in the working buffer (ADR-423); they take effect with a
+// STARTCOMM or an UPDATEPARAM. The response pending ComParams are stored in another working buffer
+// that PDUConnect and an UPDATEPARAM copy to the active one (ADR-299, extended); a wrong data type or a value
+// out of range (handling, P2*, offset) is refused. Any other ComParam is accepted and forgotten. A tester-present
+// ComParam of the wrong data type, or a byte field longer than 12 bytes, is refused.
+exported_fn!(PDUSetComParam(_h_mod: UNUM32, _h_cll: UNUM32, p_param_item: *mut PDU_PARAM_ITEM) -> T_PDU_ERROR {
+    let Some(item) = (unsafe { p_param_item.as_ref() }) else {
+        return no_error();
+    };
+    if let Some(param) = rc78_param(item.ComParamId) {
+        if item.pComParamData.is_null() || item.ComParamDataType != E_PDU_PT::PDU_PT_UNUM32 {
+            return invalid_parameters();
+        }
+        let value = unsafe { *item.pComParamData.cast::<UNUM32>() };
+        let mut guard = state().lock().expect("mock state poisoned");
+        return if guard.rc78_working.set_number(param, value) {
+            no_error()
+        } else {
+            invalid_parameters()
+        };
+    }
+    if let Some(param) = indication_param(item.ComParamId) {
+        if item.pComParamData.is_null() || item.ComParamDataType != E_PDU_PT::PDU_PT_UNUM32 {
+            return invalid_parameters();
+        }
+        let value = unsafe { *item.pComParamData.cast::<UNUM32>() };
+        let mut guard = state().lock().expect("mock state poisoned");
+        return if guard.ind_working.set_number(param, value) {
+            no_error()
+        } else {
+            invalid_parameters()
+        };
+    }
+    let Some(param) = tester_present_param(item.ComParamId) else {
+        return no_error();
+    };
+    if item.pComParamData.is_null() {
+        return invalid_parameters();
+    }
+    let mut guard = state().lock().expect("mock state poisoned");
+    let stored = if item.ComParamDataType == E_PDU_PT::PDU_PT_UNUM32 {
+        let value = unsafe { *item.pComParamData.cast::<UNUM32>() };
+        guard.tp_working.set_number(param, value)
+    } else if item.ComParamDataType == E_PDU_PT::PDU_PT_BYTEFIELD {
+        let field = unsafe { *item.pComParamData.cast::<PDU_PARAM_BYTEFIELD_DATA>() };
+        let length = field.ParamActLen as usize;
+        if length > TESTER_PRESENT_MAX_LEN || (length > 0 && field.pDataArray.is_null()) {
+            false
+        } else {
+            let bytes = if length == 0 {
+                Vec::new()
+            } else {
+                unsafe { std::slice::from_raw_parts(field.pDataArray, length) }.to_vec()
+            };
+            guard.tp_working.set_bytes(param, bytes)
+        }
+    } else {
+        false
+    };
+    if stored { no_error() } else { invalid_parameters() }
 });
 
 exported_fn!(PDUStartComPrimitive(_h_mod: UNUM32, _h_cll: UNUM32, cop_type: T_PDU_COPT, cop_data_size: UNUM32, p_cop_data: *mut UNUM8, p_cop_ctrl_data: *mut PDU_COP_CTRL_DATA, p_cop_tag: *mut c_void, ph_cop: *mut UNUM32) -> T_PDU_ERROR {
@@ -1016,17 +2174,65 @@ exported_fn!(PDUStartComPrimitive(_h_mod: UNUM32, _h_cll: UNUM32, cop_type: T_PD
             h_cll: MOCK_LOGICAL_LINK_HANDLE,
             h_cop: handle,
             tag: p_cop_tag as usize,
-            timestamp: MOCK_TIMESTAMP,
+            timestamp: 0,
+            tx_done: None,
+            times_valid: false,
+            identifier: None,
             kind: EventKind::Result(Vec::new()),
+            on_finish: None,
         };
+        let hook = if cop_type == E_PDU_COPT::PDU_COPT_STARTCOMM {
+            Some(Hook::StartComm)
+        } else if cop_type == E_PDU_COPT::PDU_COPT_UPDATEPARAM {
+            Some(Hook::UpdateParam)
+        } else if cop_type == E_PDU_COPT::PDU_COPT_STOPCOMM {
+            Some(Hook::StopComm)
+        } else {
+            None
+        };
+        // A tester-present that fell due while the link was idle goes before a ComPrimitive that
+        // arrives after it, whether or not the delivery thread has got to it yet: otherwise the
+        // order of the two would depend on how soon that thread runs after the item that made
+        // it due (ADR-423 item 6 holds it back only behind a ComPrimitive that runs or waits).
+        // It goes with the buffers in force before this start, so ahead of an UPDATEPARAM's copy.
+        let idle = guard.waiting.is_empty() && guard.scheduled.is_empty();
+        let now = Instant::now();
+        if idle && guard.tp_due.is_some_and(|due| due <= now) {
+            send_tester_present(&mut guard, now);
+        }
         // While an ECU is attached, and while other ComPrimitives still wait or run, the
         // ComPrimitive waits its turn, and the ECU answers a send-and-receive request when it
         // begins (ADR-299). Otherwise the synthetic completion event is queued at once.
+        // An UPDATEPARAM copies the working buffer when it starts, with or without an ECU
+        // (8.4.15.6 step 12); a ComPrimitive is tied to the active buffer as it is then. The
+        // TempParamUpdate flag (working buffer for one ComPrimitive) is not supported.
+        if cop_type == E_PDU_COPT::PDU_COPT_UPDATEPARAM {
+            guard.rc78_active = guard.rc78_working;
+            guard.ind_active = guard.ind_working;
+            guard.table_active = guard.table_working;
+        }
         let busy = !guard.waiting.is_empty() || !guard.scheduled.is_empty();
         let immediate = if guard.ecu.is_some() || busy {
-            let request = (cop_type == E_PDU_COPT::PDU_COPT_SENDRECV && !request.is_empty())
+            // A STARTCOMM with a request is sent as a send-and-receive is (ADR-418 item 3).
+            let sends = cop_type == E_PDU_COPT::PDU_COPT_SENDRECV
+                || cop_type == E_PDU_COPT::PDU_COPT_STARTCOMM;
+            let request = (sends && !request.is_empty())
                 .then(|| (request.to_vec(), cycles(control)));
-            guard.waiting.push_back(WaitingCop { event, request });
+            let rc78 = guard.rc78_active;
+            let indications = guard.ind_active;
+            let unbound = guard.unbound_indications;
+            let extra_info = requests_extra_info(control);
+            let table_id = guard.table_active;
+            guard.waiting.push_back(WaitingCop {
+                event,
+                request,
+                rc78,
+                indications,
+                unbound,
+                extra_info,
+                table_id,
+                hook,
+            });
             // On an idle link it begins at once, as it would without the delivery thread.
             if !busy {
                 begin_next(&mut guard, Instant::now());
@@ -1039,6 +2245,15 @@ exported_fn!(PDUStartComPrimitive(_h_mod: UNUM32, _h_cll: UNUM32, cop_type: T_PD
             }
             None
         } else {
+            // Nothing else is running, so the ComPrimitive finishes now.
+            if let Some(hook) = hook {
+                apply_hook(&mut guard, hook, Instant::now());
+                if guard.tp_due.is_some() && guard.constructed {
+                    // Due with no ECU attached yet: the delivery thread keeps the schedule.
+                    ensure_delivery_thread();
+                    delivery_signal().notify_all();
+                }
+            }
             Some(event)
         };
         (handle, immediate)
@@ -1177,6 +2392,33 @@ exported_fn!(PDUDestroyItem(p_item: *mut PDU_ITEM) -> T_PDU_ERROR {
                             data.NumDataBytes as usize,
                         ));
                     }
+                    if !data.RxFlag.pFlagData.is_null() {
+                        let _ = Box::from_raw(ptr::slice_from_raw_parts_mut(
+                            data.RxFlag.pFlagData,
+                            data.RxFlag.NumFlagBytes as usize,
+                        ));
+                    }
+                    if !data.TimestampFlags.pFlagData.is_null() {
+                        let _ = Box::from_raw(ptr::slice_from_raw_parts_mut(
+                            data.TimestampFlags.pFlagData,
+                            data.TimestampFlags.NumFlagBytes as usize,
+                        ));
+                    }
+                    if !data.pExtraInfo.is_null() {
+                        let extra = Box::from_raw(data.pExtraInfo);
+                        if !extra.pHeaderBytes.is_null() {
+                            let _ = Box::from_raw(ptr::slice_from_raw_parts_mut(
+                                extra.pHeaderBytes,
+                                extra.NumHeaderBytes as usize,
+                            ));
+                        }
+                        if !extra.pFooterBytes.is_null() {
+                            let _ = Box::from_raw(ptr::slice_from_raw_parts_mut(
+                                extra.pFooterBytes,
+                                extra.NumFooterBytes as usize,
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -1296,7 +2538,15 @@ exported_fn!(PDUGetUniqueRespIdTable(_h_mod: UNUM32, _h_cll: UNUM32, p_unique_re
     unsafe { set_out_ptr(p_unique_resp_id_table, make_unique_resp_table_item()) }
 });
 
-exported_fn!(PDUSetUniqueRespIdTable(_h_mod: UNUM32, _h_cll: UNUM32, _p_unique_resp_id_table: *mut PDU_UNIQUE_RESP_ID_TABLE_ITEM) -> T_PDU_ERROR {
+exported_fn!(PDUSetUniqueRespIdTable(_h_mod: UNUM32, _h_cll: UNUM32, p_unique_resp_id_table: *mut PDU_UNIQUE_RESP_ID_TABLE_ITEM) -> T_PDU_ERROR {
+    // The mock keeps only the response identifier of the entry its ECU answers as (ADR-428).
+    if p_unique_resp_id_table.is_null() {
+        // 8.4.28.2: no table is a parameter error. The wrapper always passes a table struct,
+        // with a null entry array when it is empty, which this accepts.
+        return invalid_parameters();
+    }
+    let id = unsafe { table_response_id(p_unique_resp_id_table) };
+    state().lock().expect("mock state poisoned").table_working = id;
     no_error()
 });
 
@@ -1309,7 +2559,7 @@ exported_fn!(PDUModuleDisconnect(_h_mod: UNUM32) -> T_PDU_ERROR {
 });
 
 exported_fn!(PDUGetTimestamp(_h_mod: UNUM32, p_timestamp: *mut UNUM32) -> T_PDU_ERROR {
-    unsafe { set_out(p_timestamp, MOCK_TIMESTAMP) }
+    unsafe { set_out(p_timestamp, clock_now()) }
 });
 
 // Exported FFI back-door: Reset all mock state for test isolation.
@@ -1719,7 +2969,8 @@ mod library_path_tests {
         }
 
         let root = std::env::temp_dir().join(format!(
-            "iso22900-mock-search-test-{}",
+            "iso22900-mock-search-test-{}-{}",
+            std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -1850,6 +3101,237 @@ mod sim_ecu_tests {
     }
 
     #[test]
+    fn items_stamped_at_the_same_instant_get_strictly_increasing_times() {
+        let item = |kind| PendingEvent {
+            h_mod: MOCK_MODULE_HANDLE,
+            h_cll: MOCK_LOGICAL_LINK_HANDLE,
+            h_cop: PDU_HANDLE_UNDEF,
+            tag: 0,
+            timestamp: 0,
+            tx_done: None,
+            times_valid: false,
+            identifier: None,
+            kind,
+            on_finish: None,
+        };
+        let mut state = MockState::default();
+        // A tester-present indication and a ComPrimitive item, scheduled at the same instant.
+        let now = Instant::now();
+        let mut stamps = Vec::new();
+        for kind in [
+            EventKind::Indication(Indication::Transmit),
+            EventKind::Result(vec![0x62]),
+            EventKind::Result(vec![0x62]),
+        ] {
+            let mut event = item(kind);
+            stamp_at(&mut event, clock_at(now));
+            bump_stamp(&mut state, &mut event, clock_us(now));
+            stamps.push(event.timestamp);
+        }
+        assert!(
+            stamps
+                .windows(2)
+                .all(|w| w[1].wrapping_sub(w[0]) as i32 > 0),
+            "{stamps:?}"
+        );
+        // A later clock reading is kept as it is.
+        let reference = clock_us(now) + 100;
+        let mut later = item(EventKind::Result(vec![0x62]));
+        later.timestamp = reference as UNUM32;
+        bump_stamp(&mut state, &mut later, reference);
+        assert_eq!(later.timestamp, reference as UNUM32);
+        assert_eq!(state.last_stamp, Some(reference));
+    }
+
+    #[test]
+    fn a_link_idle_for_longer_than_half_the_clock_range_is_stamped_at_the_clock() {
+        let mut state = MockState::default();
+        // The clock reads more than 2^32 microseconds, so its 32-bit value has wrapped; the link's
+        // last stamp is older than 2^31 microseconds.
+        let reference: u64 = (1 << 32) + 1_000;
+        state.last_stamp = Some(reference - (1 << 31) - 5);
+        let mut event = PendingEvent {
+            h_mod: MOCK_MODULE_HANDLE,
+            h_cll: MOCK_LOGICAL_LINK_HANDLE,
+            h_cop: PDU_HANDLE_UNDEF,
+            tag: 0,
+            timestamp: reference as UNUM32,
+            tx_done: None,
+            times_valid: false,
+            identifier: None,
+            kind: EventKind::Result(vec![0x62]),
+            on_finish: None,
+        };
+        bump_stamp(&mut state, &mut event, reference);
+        assert_eq!(event.timestamp, reference as UNUM32);
+        assert_eq!(state.last_stamp, Some(reference));
+        // Across the wrap, a stamp at the last one's value plus one is still ahead of it.
+        state.last_stamp = Some(u64::from(UNUM32::MAX));
+        event.timestamp = UNUM32::MAX;
+        bump_stamp(&mut state, &mut event, u64::from(UNUM32::MAX));
+        assert_eq!(event.timestamp, 0);
+        assert_eq!(state.last_stamp, Some(1 << 32));
+    }
+
+    #[test]
+    fn a_com_primitive_begun_at_the_instant_of_a_tester_present_item_is_stamped_after_it() {
+        let mut state = MockState::default();
+        let now = Instant::now();
+        // The tester-present's item took the clock at `now`.
+        state.last_stamp = Some(clock_us(now));
+        let template = PendingEvent {
+            h_mod: MOCK_MODULE_HANDLE,
+            h_cll: MOCK_LOGICAL_LINK_HANDLE,
+            h_cop: MOCK_COM_PRIMITIVE_HANDLE,
+            tag: 0,
+            timestamp: 0,
+            tx_done: None,
+            times_valid: false,
+            identifier: None,
+            kind: EventKind::Result(Vec::new()),
+            on_finish: None,
+        };
+        state.waiting.push_back(WaitingCop {
+            event: template,
+            request: None,
+            rc78: Rc78::default(),
+            indications: Indications::default(),
+            unbound: None,
+            extra_info: false,
+            table_id: None,
+            hook: None,
+        });
+        begin_next(&mut state, now);
+        let (_, event) = &state.scheduled[0];
+        assert!(event.timestamp.wrapping_sub(clock_at(now)) as i32 > 0);
+        assert_eq!(state.last_stamp, Some(u64::from(event.timestamp)));
+    }
+
+    #[test]
+    fn a_delivered_tester_present_answer_marker_does_not_move_the_last_stamp() {
+        let mut state = MockState::default();
+        // 36 minutes in: unwrapping the marker's 0 stamp against this clock would give 2^32.
+        let reference = 2_160_000_000_u64;
+        state.last_stamp = Some(reference - 10);
+        let marker = PendingEvent {
+            h_mod: MOCK_MODULE_HANDLE,
+            h_cll: MOCK_LOGICAL_LINK_HANDLE,
+            h_cop: MOCK_COM_PRIMITIVE_HANDLE,
+            tag: 0,
+            timestamp: 0,
+            tx_done: None,
+            times_valid: false,
+            identifier: None,
+            kind: EventKind::TesterPresentAnswer { error: None },
+            on_finish: None,
+        };
+        note_delivered_event(&mut state, &marker, reference);
+        assert_eq!(state.last_stamp, Some(reference - 10));
+        // A real item still raises it.
+        let item = PendingEvent {
+            timestamp: (reference - 5) as UNUM32,
+            kind: EventKind::Result(Vec::new()),
+            ..marker
+        };
+        note_delivered_event(&mut state, &item, reference);
+        assert_eq!(state.last_stamp, Some(reference - 5));
+    }
+
+    #[test]
+    fn a_tester_present_right_after_a_delivered_item_is_stamped_after_it() {
+        let mut state = MockState::default();
+        apply_sim_ecu_command(
+            &mut state,
+            serde_json::from_str(r#"{"attach":{}}"#).unwrap(),
+        )
+        .unwrap();
+        state.link_state = LinkState::CommStarted;
+        // Physical addressing, so the tester present raises a transmit indication.
+        state.tp_active = TesterPresent {
+            addr_mode: 0,
+            ..TesterPresent::default()
+        };
+        state.ind_active.transmit = true;
+        let template = PendingEvent {
+            h_mod: MOCK_MODULE_HANDLE,
+            h_cll: MOCK_LOGICAL_LINK_HANDLE,
+            h_cop: MOCK_COM_PRIMITIVE_HANDLE,
+            tag: 0,
+            timestamp: 0,
+            tx_done: None,
+            times_valid: false,
+            identifier: None,
+            kind: EventKind::Result(Vec::new()),
+            on_finish: None,
+        };
+        state.waiting.push_back(WaitingCop {
+            event: template,
+            request: Some((vec![0x10, 0x03], Cycles::SendReceive)),
+            rc78: Rc78::default(),
+            indications: Indications {
+                transmit: true,
+                start: false,
+            },
+            unbound: None,
+            extra_info: false,
+            table_id: None,
+            hook: None,
+        });
+        let begun = Instant::now();
+        begin_next(&mut state, begun);
+        // The delivery thread delivers every item (all are due at once), as `deliver` does.
+        let mut delivered = Vec::new();
+        while let Some((_, event)) = state.scheduled.pop_front() {
+            note_delivered(&mut state, event.timestamp, clock_us(begun));
+            delivered.push(event.timestamp);
+        }
+        let finished = delivered.iter().copied().max().unwrap();
+        assert!(
+            finished.wrapping_sub(clock_at(begun)) as i32 >= 1,
+            "the response is stamped after the begin stamp"
+        );
+        // The finished item makes the tester present due; the clock has not passed it.
+        send_tester_present(&mut state, begun);
+        assert_eq!(state.scheduled.len(), 1);
+        let stamp = state.scheduled[0].1.timestamp;
+        assert!(
+            stamp.wrapping_sub(finished) as i32 > 0,
+            "{stamp} after {delivered:?}"
+        );
+    }
+
+    #[test]
+    fn a_response_is_stamped_strictly_after_its_transmit_done() {
+        let event = |tx_done| PendingEvent {
+            h_mod: MOCK_MODULE_HANDLE,
+            h_cll: MOCK_LOGICAL_LINK_HANDLE,
+            h_cop: MOCK_COM_PRIMITIVE_HANDLE,
+            tag: 0,
+            timestamp: 0,
+            tx_done,
+            times_valid: tx_done.is_some(),
+            identifier: None,
+            kind: EventKind::Result(vec![0x62]),
+            on_finish: None,
+        };
+        // Sent at the clock now, so the response cannot be later than one microsecond past it
+        // unless time really passed.
+        let sent = clock_now();
+        let mut response = event(Some(sent));
+        stamp(&mut response);
+        assert!(response.timestamp > sent);
+        // A transmit done in the future still leaves the response after it.
+        let mut early = event(Some(clock_now().wrapping_add(1_000_000)));
+        stamp(&mut early);
+        assert_eq!(early.timestamp, early.tx_done.unwrap().wrapping_add(1));
+        // An item with no transmission is just stamped with the clock.
+        let before = clock_now();
+        let mut plain = event(None);
+        stamp(&mut plain);
+        assert!(plain.timestamp >= before && plain.timestamp <= clock_now());
+    }
+
+    #[test]
     fn control_data_selects_the_cycles() {
         let control = |send, receive| PDU_COP_CTRL_DATA {
             Time: 0,
@@ -1871,6 +3353,10 @@ mod sim_ecu_tests {
         assert_eq!(cycles(Some(&control(1, -2))), Cycles::SendReceive);
     }
 }
+
+/// Taken by the tests that use the mock's one global state, so they do not run beside each other.
+#[cfg(test)]
+static GLOBAL_STATE: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]
 mod delivery_tests {
@@ -1935,6 +3421,7 @@ mod delivery_tests {
 
     #[test]
     fn destruct_waits_for_a_running_callback_and_stops_the_rest() {
+        let _serial = GLOBAL_STATE.lock().unwrap_or_else(|e| e.into_inner());
         mock_reset();
         unsafe {
             assert_eq!(
@@ -2005,5 +3492,2320 @@ mod delivery_tests {
         // The thread has ended, so the response and FINISHED items never reach the callback.
         assert_eq!(CALLS.load(Ordering::SeqCst), 1);
         mock_reset();
+    }
+}
+
+/// What a send-and-receive ComPrimitive receives when the library absorbs response pending
+/// messages (`CP_RC78Handling`) and when it does not.
+#[cfg(test)]
+mod response_pending_tests {
+    use super::*;
+
+    /// The request the pending messages answer: a ReadDataByIdentifier.
+    const REQ: &[u8] = &[0x22, 0xF1, 0x90];
+
+    fn pending(delays: &[u32]) -> Vec<(u32, Vec<u8>)> {
+        delays
+            .iter()
+            .map(|d| (*d, vec![0x7F, 0x22, 0x78]))
+            .collect()
+    }
+
+    fn rc78(handling: u32, p2_star_ms: u32, completion_ms: u32) -> Rc78 {
+        Rc78 {
+            handling,
+            p2_star_us: p2_star_ms * 1_000,
+            completion_us: completion_ms * 1_000,
+            byte_offset: 2,
+        }
+    }
+
+    fn timeout_at(at: u32) -> (u32, EventKind) {
+        (
+            at,
+            EventKind::Error(
+                E_PDU_ERR_EVT::PDU_ERR_EVT_RX_TIMEOUT,
+                MOCK_XTRA_ERR_RX_TIMEOUT_NO_RSP,
+            ),
+        )
+    }
+
+    /// Compares the kinds, which have no `PartialEq`, by their debug-free shape.
+    fn shape(events: &[(u32, EventKind)]) -> Vec<(u32, String)> {
+        events
+            .iter()
+            .map(|(at, kind)| {
+                let text = match kind {
+                    EventKind::Result(bytes) => format!("result {bytes:02X?}"),
+                    EventKind::Error(code, extra) => format!("error {} {extra:#x}", code.0),
+                    _ => "other".to_owned(),
+                };
+                (*at, text)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn with_the_handling_off_each_pending_message_is_a_result_item() {
+        let answer = Some(vec![0x62, 0xF1, 0x90]);
+        let (events, last) =
+            receive_events(Rc78::default(), REQ, pending(&[0, 20]), answer.clone(), 40);
+        assert_eq!(last, 40);
+        assert_eq!(
+            shape(&events),
+            [
+                (0, "result [7F, 22, 78]".to_owned()),
+                (20, "result [7F, 22, 78]".to_owned()),
+                (40, "result [62, F1, 90]".to_owned()),
+            ]
+        );
+        // Silence after the pending messages: the timeout comes right after the last of them.
+        let (events, last) = receive_events(Rc78::default(), REQ, pending(&[0, 20]), None, 0);
+        assert_eq!(last, 20);
+        assert_eq!(shape(&events)[2], shape(&[timeout_at(20)])[0]);
+        assert_eq!(events.len(), 3);
+    }
+
+    #[test]
+    fn with_the_handling_on_the_pending_messages_are_absorbed_and_the_answer_delivered() {
+        let answer = Some(vec![0x62, 0xF1, 0x90]);
+        for handling in [1, 2] {
+            let (events, last) = receive_events(
+                rc78(handling, 100, 1_000),
+                REQ,
+                pending(&[0, 20]),
+                answer.clone(),
+                40,
+            );
+            assert_eq!(last, 40);
+            assert_eq!(shape(&events), [(40, "result [62, F1, 90]".to_owned())]);
+        }
+    }
+
+    #[test]
+    fn with_the_handling_on_silence_after_a_pending_message_is_only_the_timeout() {
+        // P2* after the last pending message (20 ms + 100 ms).
+        let (events, last) = receive_events(rc78(1, 100, 1_000), REQ, pending(&[0, 20]), None, 0);
+        assert_eq!(last, 120);
+        assert_eq!(shape(&events), shape(&[timeout_at(120)]));
+        // A message later than P2* after the one before it comes too late.
+        let (events, last) = receive_events(
+            rc78(2, 100, 1_000),
+            REQ,
+            pending(&[0, 150]),
+            Some(vec![0x62]),
+            160,
+        );
+        assert_eq!(last, 100);
+        assert_eq!(shape(&events), shape(&[timeout_at(100)]));
+        // The answer itself may be too late too.
+        let (events, last) = receive_events(
+            rc78(1, 100, 1_000),
+            REQ,
+            pending(&[0]),
+            Some(vec![0x62]),
+            101,
+        );
+        assert_eq!(last, 100);
+        assert_eq!(shape(&events), shape(&[timeout_at(100)]));
+    }
+
+    #[test]
+    fn the_completion_timeout_ends_a_chain_of_pending_messages_unless_the_handling_is_unlimited() {
+        // A message every 40 ms, within P2* of 100 ms, past the 100 ms completion timeout of
+        // handling 1, which counts from the first.
+        let chain = pending(&[0, 40, 80, 120, 160]);
+        let (events, last) =
+            receive_events(rc78(1, 100, 100), REQ, chain.clone(), Some(vec![0x62]), 200);
+        assert_eq!(last, 100);
+        assert_eq!(shape(&events), shape(&[timeout_at(100)]));
+        let (events, last) = receive_events(rc78(2, 100, 100), REQ, chain, Some(vec![0x62]), 200);
+        assert_eq!(last, 200);
+        assert_eq!(shape(&events), [(200, "result [62]".to_owned())]);
+    }
+
+    #[test]
+    fn the_response_code_offset_decides_what_is_a_pending_message() {
+        let found = Rc78 {
+            byte_offset: 2,
+            ..Rc78::default()
+        };
+        assert!(found.is_pending(REQ, &[0x7F, 0x22, 0x78]));
+        assert!(!found.is_pending(REQ, &[0x7F, 0x22, 0x31]));
+        assert!(!found.is_pending(REQ, &[0x62, 0x22, 0x78]));
+        // A pending message for another service is not an answer to this request.
+        assert!(!found.is_pending(REQ, &[0x7F, 0x10, 0x78]));
+        assert!(!found.is_pending(&[], &[0x7F, 0x22, 0x78]));
+        let last = Rc78::default();
+        assert!(last.is_pending(REQ, &[0x7F, 0x22, 0x78]));
+        assert!(!last.is_pending(REQ, &[0x7F, 0x10, 0x78]));
+        // With the offset elsewhere the messages are not pending ones: passed on.
+        let elsewhere = Rc78 {
+            handling: 1,
+            byte_offset: 1,
+            ..Rc78::default()
+        };
+        let (events, _) = receive_events(elsewhere, REQ, pending(&[0]), Some(vec![0x62]), 5);
+        assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn a_completion_timeout_of_0_is_no_ceiling() {
+        // Handling 1 with completion timeout 0 behaves as handling 2 for the limit.
+        let chain = pending(&[0, 40, 80, 120, 160]);
+        let (events, last) = receive_events(rc78(1, 100, 0), REQ, chain, Some(vec![0x62]), 200);
+        assert_eq!(last, 200);
+        assert_eq!(shape(&events), [(200, "result [62]".to_owned())]);
+    }
+
+    #[test]
+    fn a_final_pending_message_is_absorbed_like_a_pending_one() {
+        // No pending list, the response itself is `7F SID 78`: silence for P2* after it.
+        let last_message = Some(vec![0x7F, 0x22, 0x78]);
+        let (events, last) = receive_events(
+            rc78(1, 100, 1_000),
+            REQ,
+            Vec::new(),
+            last_message.clone(),
+            30,
+        );
+        assert_eq!(last, 130);
+        assert_eq!(shape(&events), shape(&[timeout_at(130)]));
+        // With the handling off it is a result item.
+        let (events, _) =
+            receive_events(Rc78::default(), REQ, Vec::new(), last_message.clone(), 30);
+        assert_eq!(shape(&events), [(30, "result [7F, 22, 78]".to_owned())]);
+        // A pending message for another service is not absorbed.
+        let (events, _) = receive_events(
+            rc78(1, 100, 1_000),
+            REQ,
+            Vec::new(),
+            Some(vec![0x7F, 0x10, 0x78]),
+            30,
+        );
+        assert_eq!(shape(&events), [(30, "result [7F, 10, 78]".to_owned())]);
+    }
+
+    #[test]
+    fn the_comparams_are_range_checked() {
+        let mut rc78 = Rc78::default();
+        assert!(rc78.set_number(Rc78Param::Handling, 2));
+        assert!(!rc78.set_number(Rc78Param::Handling, 3));
+        assert!(!rc78.set_number(Rc78Param::ByteOffset, 0));
+        assert!(rc78.set_number(Rc78Param::ByteOffset, 2));
+        assert_eq!((rc78.handling, rc78.byte_offset), (2, 2));
+        assert!(rc78.set_number(Rc78Param::P2Star, P2_STAR_MAX_US));
+        assert!(!rc78.set_number(Rc78Param::P2Star, P2_STAR_MAX_US + 1));
+        assert!(rc78.set_number(Rc78Param::Completion, u32::MAX));
+        assert_eq!(rc78_class(Rc78Param::P2Star), E_PDU_PC::PDU_PC_TIMING);
+        assert_eq!(rc78_class(Rc78Param::Handling), E_PDU_PC::PDU_PC_ERRHDL);
+        assert_eq!(
+            rc78_param(standard_comparam_id("CP_P2Star").unwrap()).map(|p| p == Rc78Param::P2Star),
+            Some(true)
+        );
+        assert!(rc78_param(standard_comparam_id("CP_P2Max").unwrap()).is_none());
+    }
+}
+
+/// The link's tester-present (ADR-423), driven through the exported functions of the mock.
+#[cfg(test)]
+mod tester_present_tests {
+    use super::*;
+
+    /// What an event item says.
+    #[derive(Debug, PartialEq)]
+    enum Seen {
+        Result(Vec<u8>),
+        Status(E_PDU_STATUS),
+        Error(E_PDU_ERR_EVT, UNUM32),
+        Indication(Indication),
+    }
+
+    const EXECUTING: Seen = Seen::Status(E_PDU_STATUS::PDU_COPST_EXECUTING);
+    const FINISHED: Seen = Seen::Status(E_PDU_STATUS::PDU_COPST_FINISHED);
+    const TP_ERROR: E_PDU_ERR_EVT = E_PDU_ERR_EVT::PDU_ERR_EVT_TESTER_PRESENT_ERROR;
+
+    /// A constructed mock with an ECU attached, alone in the process; destructed on drop.
+    struct Rig {
+        _serial: MutexGuard<'static, ()>,
+    }
+
+    impl Rig {
+        fn new() -> Self {
+            let serial = GLOBAL_STATE.lock().unwrap_or_else(|e| e.into_inner());
+            mock_reset();
+            unsafe {
+                assert_eq!(
+                    PDUConstruct(ptr::null_mut(), ptr::dangling_mut::<c_void>()),
+                    no_error()
+                );
+            }
+            let rig = Self { _serial: serial };
+            rig.ecu(r#"{"attach":{}}"#);
+            rig
+        }
+
+        /// A `SimEcuCommand`, as `__mock_sim_ecu_control` takes it.
+        fn ecu(&self, command: &str) {
+            let command = serde_json::from_str(command).unwrap();
+            apply_sim_ecu_command(&mut state().lock().unwrap(), command).unwrap();
+        }
+
+        /// The ComParams of a keep-alive as the agent sets them, with `period_ms`.
+        fn keep_alive(&self, period_ms: u32) {
+            self.set_bytes("CP_TesterPresentMessage", &[0x3E, 0x00]);
+            self.set_number("CP_TesterPresentReqRsp", 1);
+            self.set_bytes("CP_TesterPresentExpPosResp", &[0x7E, 0x00]);
+            self.set_bytes("CP_TesterPresentExpNegResp", &[0x7F, 0x3E]);
+            self.set_number("CP_TesterPresentAddrMode", 0);
+            self.set_number("CP_TesterPresentSendType", 0);
+            self.set_number("CP_TesterPresentTime", period_ms * 1000);
+            self.set_number("CP_TesterPresentHandling", 1);
+        }
+
+        fn set_number(&self, name: &str, mut value: u32) {
+            let mut item = PDU_PARAM_ITEM {
+                ItemType: E_PDU_IT::PDU_IT_PARAM,
+                ComParamId: standard_comparam_id(name).unwrap(),
+                ComParamDataType: E_PDU_PT::PDU_PT_UNUM32,
+                ComParamClass: E_PDU_PC::PDU_PC_TESTER_PRESENT,
+                pComParamData: (&mut value as *mut u32).cast(),
+            };
+            let status =
+                unsafe { PDUSetComParam(MOCK_MODULE_HANDLE, MOCK_LOGICAL_LINK_HANDLE, &mut item) };
+            assert_eq!(status, no_error(), "{name}");
+        }
+
+        fn try_set_bytes(&self, name: &str, bytes: &[u8]) -> T_PDU_ERROR {
+            let mut data = bytes.to_vec();
+            let mut field = PDU_PARAM_BYTEFIELD_DATA {
+                ParamMaxLen: 12,
+                ParamActLen: data.len() as UNUM32,
+                pDataArray: data.as_mut_ptr(),
+            };
+            let mut item = PDU_PARAM_ITEM {
+                ItemType: E_PDU_IT::PDU_IT_PARAM,
+                ComParamId: standard_comparam_id(name).unwrap(),
+                ComParamDataType: E_PDU_PT::PDU_PT_BYTEFIELD,
+                ComParamClass: E_PDU_PC::PDU_PC_TESTER_PRESENT,
+                pComParamData: (&mut field as *mut PDU_PARAM_BYTEFIELD_DATA).cast(),
+            };
+            unsafe { PDUSetComParam(MOCK_MODULE_HANDLE, MOCK_LOGICAL_LINK_HANDLE, &mut item) }
+        }
+
+        fn set_bytes(&self, name: &str, bytes: &[u8]) {
+            assert_eq!(self.try_set_bytes(name, bytes), no_error(), "{name}");
+        }
+
+        fn start(&self, cop_type: T_PDU_COPT, data: &[u8]) -> UNUM32 {
+            let mut data = data.to_vec();
+            let mut handle = 0;
+            unsafe {
+                PDUStartComPrimitive(
+                    MOCK_MODULE_HANDLE,
+                    MOCK_LOGICAL_LINK_HANDLE,
+                    cop_type,
+                    data.len() as UNUM32,
+                    data.as_mut_ptr(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    &mut handle,
+                );
+            }
+            handle
+        }
+
+        /// Takes the events queued so far, with the ComPrimitive handle of each.
+        fn events(&self) -> Vec<(UNUM32, Seen)> {
+            let queued = std::mem::take(&mut state().lock().unwrap().pending_events);
+            queued
+                .into_iter()
+                .map(|event| {
+                    let seen = match event.kind {
+                        EventKind::Result(bytes) => Seen::Result(bytes),
+                        EventKind::Status(status) => Seen::Status(status),
+                        EventKind::Error(code, extra) => Seen::Error(code, extra),
+                        EventKind::TesterPresentAnswer { .. } => panic!("a marker was queued"),
+                        EventKind::Indication(kind) => Seen::Indication(kind),
+                    };
+                    (event.h_cop, seen)
+                })
+                .collect()
+        }
+
+        /// Waits for `condition` of the state, at most 5 s.
+        fn wait_for(&self, what: &str, condition: impl Fn(&MockState) -> bool) {
+            let started = Instant::now();
+            while !condition(&state().lock().unwrap()) {
+                assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "timed out: {what}"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+
+        /// Waits for the events of ComPrimitive `handle` up to its `PDU_COPST_FINISHED`, and
+        /// returns the events taken from the queue up to then.
+        fn finished(&self, handle: UNUM32) -> Vec<(UNUM32, Seen)> {
+            let mut seen = Vec::new();
+            let started = Instant::now();
+            loop {
+                seen.extend(self.events());
+                if seen
+                    .iter()
+                    .any(|(cop, event)| *cop == handle && *event == FINISHED)
+                {
+                    return seen;
+                }
+                assert!(started.elapsed() < Duration::from_secs(5), "{seen:?}");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+
+        fn link_status(&self) -> E_PDU_STATUS {
+            self.status_of(MOCK_LOGICAL_LINK_HANDLE, PDU_HANDLE_UNDEF)
+        }
+
+        fn status_of(&self, h_cll: UNUM32, h_cop: UNUM32) -> E_PDU_STATUS {
+            let (mut status, mut timestamp, mut extra) = (E_PDU_STATUS(0), 0, 0);
+            unsafe {
+                assert_eq!(
+                    PDUGetStatus(
+                        MOCK_MODULE_HANDLE,
+                        h_cll,
+                        h_cop,
+                        &mut status,
+                        &mut timestamp,
+                        &mut extra,
+                    ),
+                    no_error()
+                );
+            }
+            status
+        }
+
+        /// Arms a probe: a tester-present reaching the ECU uses it up.
+        fn arm_probe(&self) {
+            self.ecu(r#"{"inject_fault":{"fault":{"delay_response":{"ms":1}},"service":62}}"#);
+        }
+
+        fn probe_used(state: &MockState) -> bool {
+            let ecu = state.ecu.as_ref().unwrap();
+            ecu.faults_for_request().is_empty() && ecu.armed_faults().is_empty()
+        }
+
+        fn marker_pending(state: &MockState) -> bool {
+            state
+                .scheduled
+                .iter()
+                .any(|(_, event)| matches!(event.kind, EventKind::TesterPresentAnswer { .. }))
+        }
+    }
+
+    impl Drop for Rig {
+        fn drop(&mut self) {
+            unsafe { PDUDestruct() };
+            mock_reset();
+        }
+    }
+
+    fn start_comm() -> T_PDU_COPT {
+        E_PDU_COPT::PDU_COPT_STARTCOMM
+    }
+
+    #[test]
+    fn the_tester_present_comparams_resolve_and_ids_are_unique() {
+        let mut ids: Vec<UNUM32> = STANDARD_COMPARAMS.iter().map(|(_, id)| *id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), STANDARD_COMPARAMS.len());
+        let tester_present: Vec<&str> = STANDARD_COMPARAMS
+            .iter()
+            .map(|(name, _)| *name)
+            .filter(|name| name.starts_with("CP_TesterPresent"))
+            .collect();
+        assert_eq!(tester_present.len(), 8, "{tester_present:?}");
+        for name in tester_present {
+            let id = standard_comparam_id(name).unwrap();
+            assert!(tester_present_param(id).is_some(), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_commands_variable_is_a_json_array() {
+        assert!(ecu_commands_from(None).unwrap().is_empty());
+        let text = r#"[{"inject_fault":{"fault":"drop_response","service":62}},{"detach":{}}]"#;
+        assert_eq!(ecu_commands_from(Some(text.into())).unwrap().len(), 2);
+        assert!(ecu_commands_from(Some(r#"{"detach":{}}"#.into())).is_err());
+        assert!(ecu_commands_from(Some("[{\"reboot\":{}}]".into())).is_err());
+        // Set but blank: no commands.
+        assert!(ecu_commands_from(Some("".into())).unwrap().is_empty());
+        assert!(ecu_commands_from(Some(" \n\t ".into())).unwrap().is_empty());
+    }
+
+    /// A construct whose commands fail leaves no ECU behind, so a retry does not succeed without
+    /// the faults.
+    #[test]
+    fn a_failed_command_detaches_the_ecu_again() {
+        let _serial = GLOBAL_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = MockState::default();
+        // The second command names both a service and a request, which is refused.
+        let bad = r#"[{"attach":{}},{"inject_fault":{"fault":"drop_response","service":62,"request":[62]}}]"#;
+        assert!(attach_from_environment(&mut state, None, Some(bad.into())).is_err());
+        assert!(state.ecu.is_none());
+        // The first command alone, with the second arming a fault, succeeds.
+        let good = r#"[{"attach":{}},{"inject_fault":{"fault":"drop_response","service":62}}]"#;
+        assert!(attach_from_environment(&mut state, None, Some(good.into())).is_ok());
+        assert!(state.ecu.is_some());
+        // Blank commands attach nothing and are no error.
+        let mut state = MockState::default();
+        assert!(attach_from_environment(&mut state, None, Some("  ".into())).is_ok());
+        assert!(state.ecu.is_none());
+    }
+
+    /// Row 1: a ComParam set with no primitive changes the working buffer and nothing else.
+    #[test]
+    fn set_com_param_writes_only_the_working_buffer() {
+        let rig = Rig::new();
+        rig.arm_probe();
+        rig.keep_alive(50);
+        {
+            let guard = state().lock().unwrap();
+            assert_eq!(guard.tp_working.time_us, 50_000);
+            assert_eq!(guard.tp_working.message, [0x3E, 0x00]);
+            assert_eq!(guard.tp_active, TesterPresent::default());
+            assert_eq!(guard.tp_due, None);
+        }
+        // A numeric value reads back; a wrong type or a field that is too long is refused.
+        let mut item = ptr::null_mut();
+        let time = standard_comparam_id("CP_TesterPresentTime").unwrap();
+        unsafe {
+            assert_eq!(
+                PDUGetComParam(
+                    MOCK_MODULE_HANDLE,
+                    MOCK_LOGICAL_LINK_HANDLE,
+                    time,
+                    &mut item
+                ),
+                no_error()
+            );
+            let param = item.as_ref().expect("PDUGetComParam sets the item");
+            let value = param.pComParamData.cast::<u32>().as_ref();
+            assert_eq!(value.copied(), Some(50_000));
+            assert_eq!(PDUDestroyItem(item.cast()), no_error());
+        }
+        assert_eq!(
+            rig.try_set_bytes("CP_TesterPresentMessage", &[0; 13]),
+            invalid_parameters()
+        );
+        assert_eq!(
+            rig.try_set_bytes("CP_TesterPresentTime", &[1]),
+            invalid_parameters()
+        );
+        assert_eq!(rig.link_status(), E_PDU_STATUS::PDU_CLLST_ONLINE);
+        std::thread::sleep(Duration::from_millis(250));
+        assert!(
+            !Rig::probe_used(&state().lock().unwrap()),
+            "a tester-present was sent"
+        );
+        assert!(rig.events().is_empty());
+    }
+
+    /// The first tester-present goes when the link starts, not after a period (ISO 22900-2
+    /// (2022) 8.2.6.3.2).
+    #[test]
+    fn the_first_tester_present_goes_at_once() {
+        let rig = Rig::new();
+        rig.keep_alive(10_000);
+        rig.arm_probe();
+        let started = Instant::now();
+        let cop = rig.start(start_comm(), &[0x10, 0x02]);
+        rig.finished(cop);
+        rig.wait_for("the tester-present", Rig::probe_used);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Rows 2, 7 and 12: a STARTCOMM with a request is answered, starts the link and the
+    /// tester-present, which sends at once and every period; an expected answer is dropped
+    /// silently; a second STARTCOMM is a send-receive.
+    #[test]
+    fn a_startcomm_with_a_request_starts_the_link_and_the_tester_present() {
+        let rig = Rig::new();
+        rig.keep_alive(100);
+        rig.arm_probe();
+        let cop = rig.start(start_comm(), &[0x10, 0x02]);
+        let events = rig.finished(cop);
+        let kinds: Vec<_> = events.iter().map(|(_, seen)| seen).collect();
+        assert_eq!(kinds.len(), 3, "{events:?}");
+        assert_eq!(*kinds[0], EXECUTING);
+        assert!(matches!(kinds[1], Seen::Result(bytes) if bytes.starts_with(&[0x50, 0x02])));
+        assert_eq!(rig.link_status(), E_PDU_STATUS::PDU_CLLST_COMM_STARTED);
+        // The first one went at once, not after a period.
+        rig.wait_for("the first tester-present", Rig::probe_used);
+        // And the next after the period.
+        rig.arm_probe();
+        let armed = Instant::now();
+        rig.wait_for("the second tester-present", Rig::probe_used);
+        assert!(armed.elapsed() < Duration::from_millis(500));
+        // A second STARTCOMM runs as a send-receive on the started link.
+        let second = rig.start(start_comm(), &[0x10, 0x03]);
+        let events = rig.finished(second);
+        assert!(
+            events.iter().any(
+                |(_, seen)| matches!(seen, Seen::Result(bytes) if bytes.starts_with(&[0x50, 0x03]))
+            ),
+            "{events:?}"
+        );
+        assert_eq!(rig.link_status(), E_PDU_STATUS::PDU_CLLST_COMM_STARTED);
+        // The answers were the expected ones: no error item came.
+        std::thread::sleep(Duration::from_millis(250));
+        assert!(
+            rig.events()
+                .iter()
+                .all(|(_, seen)| !matches!(seen, Seen::Error(..))),
+            "an error item came"
+        );
+    }
+
+    /// Row 3: a request with no answer times out and still starts the link.
+    #[test]
+    fn a_startcomm_the_ecu_does_not_answer_starts_the_link() {
+        let rig = Rig::new();
+        rig.keep_alive(100);
+        rig.arm_probe();
+        let cop = rig.start(start_comm(), &[0x10, 0x82]);
+        let events = rig.finished(cop);
+        let kinds: Vec<_> = events.into_iter().map(|(_, seen)| seen).collect();
+        assert_eq!(
+            kinds,
+            [
+                EXECUTING,
+                Seen::Error(
+                    E_PDU_ERR_EVT::PDU_ERR_EVT_RX_TIMEOUT,
+                    MOCK_XTRA_ERR_RX_TIMEOUT_NO_RSP
+                ),
+                FINISHED
+            ]
+        );
+        assert_eq!(rig.link_status(), E_PDU_STATUS::PDU_CLLST_COMM_STARTED);
+        rig.wait_for("the tester-present", Rig::probe_used);
+    }
+
+    /// Rows 4 and 10 (the switch-off): a refused STARTCOMM starts the link; an UPDATEPARAM with
+    /// the handling at 0 stops the tester-present at its end.
+    #[test]
+    fn a_negatively_answered_startcomm_starts_the_link_and_an_updateparam_switches_off() {
+        let rig = Rig::new();
+        rig.keep_alive(50);
+        rig.ecu(r#"{"inject_fault":{"fault":{"negative_response":{"nrc":"conditions_not_correct"}},"service":16}}"#);
+        let cop = rig.start(start_comm(), &[0x10, 0x02]);
+        let events = rig.finished(cop);
+        assert!(
+            events
+                .iter()
+                .any(|(_, seen)| matches!(seen, Seen::Result(bytes) if bytes[..2] == [0x7F, 0x10])),
+            "{events:?}"
+        );
+        assert_eq!(rig.link_status(), E_PDU_STATUS::PDU_CLLST_COMM_STARTED);
+        rig.wait_for("the tester-present", |state| state.tp_due.is_some());
+        rig.set_number("CP_TesterPresentHandling", 0);
+        // Not yet: the working value only.
+        assert!(state().lock().unwrap().tp_due.is_some());
+        let update = rig.start(E_PDU_COPT::PDU_COPT_UPDATEPARAM, &[]);
+        rig.finished_or_result(update);
+        rig.wait_for("the tester-present off", |state| state.tp_due.is_none());
+        assert_eq!(rig.link_status(), E_PDU_STATUS::PDU_CLLST_COMM_STARTED);
+        std::thread::sleep(Duration::from_millis(100));
+        rig.arm_probe();
+        std::thread::sleep(Duration::from_millis(250));
+        assert!(!Rig::probe_used(&state().lock().unwrap()), "sent while off");
+    }
+
+    /// Row 5: with the handling at 0 the link starts and nothing is sent.
+    #[test]
+    fn a_startcomm_with_the_handling_off_sends_no_tester_present() {
+        let rig = Rig::new();
+        rig.keep_alive(50);
+        rig.set_number("CP_TesterPresentHandling", 0);
+        rig.arm_probe();
+        let cop = rig.start(start_comm(), &[0x10, 0x02]);
+        rig.finished(cop);
+        assert_eq!(rig.link_status(), E_PDU_STATUS::PDU_CLLST_COMM_STARTED);
+        assert_eq!(state().lock().unwrap().tp_due, None);
+        std::thread::sleep(Duration::from_millis(250));
+        assert!(!Rig::probe_used(&state().lock().unwrap()), "sent while off");
+    }
+
+    /// Row 6: a send-receive started while a tester-present awaits its answer waits for it, and
+    /// a tester-present that falls due while a ComPrimitive runs waits for its end.
+    #[test]
+    fn a_tester_present_and_a_com_primitive_take_turns() {
+        let rig = Rig::new();
+        rig.keep_alive(100);
+        // The first tester-present is answered after 2 s, far longer than the checks below take.
+        rig.ecu(r#"{"inject_fault":{"fault":{"delay_response":{"ms":2000}},"service":62}}"#);
+        let start = rig.start(start_comm(), &[0x10, 0x02]);
+        rig.finished(start);
+        rig.wait_for("the marker", Rig::marker_pending);
+        // The read waits for the answer; its tester-present falls due meanwhile.
+        rig.arm_probe();
+        let read = rig.start(E_PDU_COPT::PDU_COPT_SENDRECV, &[0x22, 0xF1, 0x90]);
+        rig.wait_for("the next tester-present to fall due", |state| {
+            state.tp_due.is_some_and(|due| due <= Instant::now())
+        });
+        {
+            let guard = state().lock().unwrap();
+            assert_eq!(guard.waiting.len(), 1, "the read began before the answer");
+            assert!(guard.pending_events.is_empty());
+            assert!(!Rig::probe_used(&guard), "sent beside the outstanding one");
+        }
+        // Then the read goes first, and the tester-present after it.
+        rig.wait_for("the second tester-present", Rig::probe_used);
+        let events = rig.events();
+        let read_events: Vec<_> = events.iter().filter(|(cop, _)| *cop == read).collect();
+        assert_eq!(read_events.len(), 3, "{events:?}");
+        assert_eq!(read_events[2].1, FINISHED);
+        assert!(
+            events
+                .iter()
+                .all(|(_, seen)| !matches!(seen, Seen::Error(..))),
+            "{events:?}"
+        );
+    }
+
+    /// A tester-present that fell due while the link was idle goes before a ComPrimitive started
+    /// after it, even when the delivery thread has not yet got to it: the thread is asleep here
+    /// (nothing signals it when the due time is set), so only the start can send it.
+    #[test]
+    fn a_tester_present_due_on_an_idle_link_goes_before_a_com_primitive_started_after_it() {
+        let rig = Rig::new();
+        rig.keep_alive(2000);
+        let start = rig.start(start_comm(), &[0x10, 0x02]);
+        rig.finished(start);
+        rig.wait_for("the first tester-present answered", |state| {
+            state.scheduled.is_empty() && state.waiting.is_empty() && state.tp_due.is_some()
+        });
+        rig.arm_probe();
+        // Due now, with the delivery thread asleep until the next period.
+        state().lock().unwrap().tp_due = Some(Instant::now());
+        let read = rig.start(E_PDU_COPT::PDU_COPT_SENDRECV, &[0x22, 0xF1, 0x90]);
+        {
+            let guard = state().lock().unwrap();
+            assert!(
+                Rig::probe_used(&guard),
+                "the read went before the tester-present"
+            );
+            assert!(
+                guard
+                    .tp_due
+                    .is_some_and(|due| due > Instant::now() + Duration::from_secs(1))
+            );
+        }
+        let events = rig.finished(read);
+        assert!(
+            events
+                .iter()
+                .all(|(_, seen)| !matches!(seen, Seen::Error(..))),
+            "{events:?}"
+        );
+    }
+
+    /// Row 8: a missing and an unexpected answer are each reported once, with no ComPrimitive,
+    /// and the sending goes on.
+    #[test]
+    fn a_missing_or_unexpected_answer_is_reported_once_and_sending_continues() {
+        let rig = Rig::new();
+        rig.keep_alive(100);
+        rig.ecu(r#"{"inject_fault":{"fault":"drop_response","service":62}}"#);
+        let cop = rig.start(start_comm(), &[0x10, 0x02]);
+        let mut events = rig.finished(cop);
+        let error = |extra| (PDU_HANDLE_UNDEF, Seen::Error(TP_ERROR, extra));
+        let started = Instant::now();
+        while !events.contains(&error(MOCK_XTRA_ERR_TP_NO_RSP)) {
+            assert!(started.elapsed() < Duration::from_secs(5), "{events:?}");
+            std::thread::sleep(Duration::from_millis(5));
+            events.extend(rig.events());
+        }
+        // The error came after the StartComm's FINISHED (checked by the order of the list).
+        let finished = events
+            .iter()
+            .position(|(_, seen)| *seen == FINISHED)
+            .unwrap();
+        let reported = events
+            .iter()
+            .position(|item| *item == error(MOCK_XTRA_ERR_TP_NO_RSP));
+        assert!(finished < reported.unwrap());
+        rig.ecu(r#"{"inject_fault":{"fault":{"negative_response":{"nrc":"conditions_not_correct"}},"service":62}}"#);
+        let started = Instant::now();
+        while !events.contains(&error(MOCK_XTRA_ERR_TP_NEG_RSP)) {
+            assert!(started.elapsed() < Duration::from_secs(5), "{events:?}");
+            std::thread::sleep(Duration::from_millis(5));
+            events.extend(rig.events());
+        }
+        // Answered as expected from then on: nothing more.
+        std::thread::sleep(Duration::from_millis(350));
+        events.extend(rig.events());
+        let errors = events
+            .iter()
+            .filter(|(_, seen)| matches!(seen, Seen::Error(..)))
+            .count();
+        assert_eq!(errors, 2, "{events:?}");
+    }
+
+    /// Row 9: with no response expected the tester-present never reports an error.
+    #[test]
+    fn a_tester_present_that_expects_no_response_never_reports_an_error() {
+        let rig = Rig::new();
+        rig.keep_alive(50);
+        rig.set_number("CP_TesterPresentReqRsp", 0);
+        rig.ecu(r#"{"inject_fault":{"fault":"drop_response","service":62}}"#);
+        let cop = rig.start(start_comm(), &[0x10, 0x02]);
+        rig.finished(cop);
+        rig.wait_for("the tester-present", |state| {
+            let ecu = state.ecu.as_ref().unwrap();
+            ecu.faults_for_request().is_empty() && ecu.armed_faults().is_empty()
+        });
+        std::thread::sleep(Duration::from_millis(250));
+        assert!(rig.events().is_empty());
+        assert!(!Rig::marker_pending(&state().lock().unwrap()));
+    }
+
+    /// Rows 10 and 11: the answer to a tester-present that is outstanding when the link is
+    /// disconnected reports nothing, and a disconnect, a STOPCOMM and a destroy leave the link
+    /// ONLINE with no tester-present.
+    #[test]
+    fn the_link_goes_online_and_the_tester_present_stops() {
+        let rig = Rig::new();
+        rig.keep_alive(50);
+        // A tester-present whose answer never matches, due after 300 ms.
+        rig.set_bytes("CP_TesterPresentExpPosResp", &[0xAA]);
+        rig.ecu(r#"{"inject_fault":{"fault":{"delay_response":{"ms":300}},"service":62}}"#);
+        let cop = rig.start(start_comm(), &[0x10, 0x02]);
+        rig.finished(cop);
+        rig.wait_for("the marker", Rig::marker_pending);
+        unsafe {
+            assert_eq!(
+                PDUDisconnect(MOCK_MODULE_HANDLE, MOCK_LOGICAL_LINK_HANDLE),
+                no_error()
+            );
+        }
+        assert_eq!(rig.link_status(), E_PDU_STATUS::PDU_CLLST_ONLINE);
+        assert_eq!(state().lock().unwrap().tp_due, None);
+        rig.wait_for("the marker's end", |state| !Rig::marker_pending(state));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(rig.events().is_empty());
+
+        // STOPCOMM.
+        let cop = rig.start(start_comm(), &[0x10, 0x02]);
+        rig.finished(cop);
+        assert_eq!(rig.link_status(), E_PDU_STATUS::PDU_CLLST_COMM_STARTED);
+        let stop = rig.start(E_PDU_COPT::PDU_COPT_STOPCOMM, &[]);
+        rig.finished_or_result(stop);
+        rig.wait_for("online", |state| state.link_state == LinkState::Online);
+        assert_eq!(rig.link_status(), E_PDU_STATUS::PDU_CLLST_ONLINE);
+        assert_eq!(state().lock().unwrap().tp_due, None);
+
+        // Destroy forgets the ComParams too.
+        let cop = rig.start(start_comm(), &[0x10, 0x02]);
+        rig.finished(cop);
+        unsafe {
+            assert_eq!(
+                PDUDestroyComLogicalLink(MOCK_MODULE_HANDLE, MOCK_LOGICAL_LINK_HANDLE),
+                no_error()
+            );
+        }
+        assert_eq!(rig.link_status(), E_PDU_STATUS::PDU_CLLST_ONLINE);
+        let guard = state().lock().unwrap();
+        assert_eq!(guard.tp_working, TesterPresent::default());
+        assert_eq!(guard.tp_active, TesterPresent::default());
+        assert_eq!(guard.tp_due, None);
+    }
+
+    /// Row 13: with the ECU detached the tester-present is skipped without an error, and goes
+    /// on when it is attached again.
+    #[test]
+    fn a_detached_ecu_gets_no_tester_present_and_raises_no_error() {
+        let rig = Rig::new();
+        rig.keep_alive(50);
+        let cop = rig.start(start_comm(), &[0x10, 0x02]);
+        rig.finished(cop);
+        rig.ecu(r#"{"detach":{}}"#);
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(rig.events().is_empty());
+        assert!(state().lock().unwrap().tp_due.is_some());
+        rig.ecu(r#"{"attach":{}}"#);
+        rig.arm_probe();
+        rig.wait_for("the tester-present", Rig::probe_used);
+    }
+
+    /// Row 14: `PDUDestruct` drops a marker with the rest of the schedule.
+    #[test]
+    fn destruct_drops_an_outstanding_tester_present() {
+        let rig = Rig::new();
+        rig.keep_alive(50);
+        rig.ecu(r#"{"inject_fault":{"fault":{"delay_response":{"ms":2000}},"service":62}}"#);
+        let cop = rig.start(start_comm(), &[0x10, 0x02]);
+        rig.finished(cop);
+        rig.wait_for("the marker", Rig::marker_pending);
+        unsafe { PDUDestruct() };
+        let guard = state().lock().unwrap();
+        assert!(guard.scheduled.is_empty());
+        assert!(guard.waiting.is_empty());
+    }
+
+    /// A STARTCOMM still running when the link is disconnected does not start it again.
+    #[test]
+    fn a_startcomm_that_finishes_after_a_disconnect_does_not_start_the_link() {
+        let rig = Rig::new();
+        rig.keep_alive(50);
+        rig.ecu(r#"{"inject_fault":{"fault":{"delay_response":{"ms":300}},"service":16}}"#);
+        let cop = rig.start(start_comm(), &[0x10, 0x02]);
+        assert!(!state().lock().unwrap().scheduled.is_empty());
+        unsafe {
+            assert_eq!(
+                PDUDisconnect(MOCK_MODULE_HANDLE, MOCK_LOGICAL_LINK_HANDLE),
+                no_error()
+            );
+        }
+        // The link is used again before the old STARTCOMM ends.
+        unsafe {
+            assert_eq!(
+                PDUConnect(MOCK_MODULE_HANDLE, MOCK_LOGICAL_LINK_HANDLE),
+                no_error()
+            );
+        }
+        rig.finished(cop);
+        rig.arm_probe();
+        std::thread::sleep(Duration::from_millis(250));
+        assert_eq!(rig.link_status(), E_PDU_STATUS::PDU_CLLST_ONLINE);
+        let guard = state().lock().unwrap();
+        assert_eq!(guard.tp_due, None);
+        assert!(!Rig::probe_used(&guard), "a tester-present was sent");
+    }
+
+    /// The same for a STARTCOMM that still waits for its turn when the link is destroyed.
+    #[test]
+    fn a_waiting_startcomm_does_not_start_a_destroyed_link() {
+        let rig = Rig::new();
+        rig.keep_alive(50);
+        rig.ecu(r#"{"inject_fault":{"fault":{"delay_response":{"ms":300}},"service":34}}"#);
+        let read = rig.start(E_PDU_COPT::PDU_COPT_SENDRECV, &[0x22, 0xF1, 0x90]);
+        let cop = rig.start(start_comm(), &[0x10, 0x02]);
+        assert_eq!(state().lock().unwrap().waiting.len(), 1);
+        unsafe {
+            assert_eq!(
+                PDUDestroyComLogicalLink(MOCK_MODULE_HANDLE, MOCK_LOGICAL_LINK_HANDLE),
+                no_error()
+            );
+        }
+        rig.wait_for("both to end", |state| {
+            state.waiting.is_empty() && state.scheduled.is_empty()
+        });
+        let events = rig.events();
+        for handle in [read, cop] {
+            assert!(events.contains(&(handle, FINISHED)), "{events:?}");
+        }
+        rig.arm_probe();
+        std::thread::sleep(Duration::from_millis(250));
+        assert_eq!(rig.link_status(), E_PDU_STATUS::PDU_CLLST_ONLINE);
+        let guard = state().lock().unwrap();
+        assert_eq!(guard.tp_due, None);
+        assert!(!Rig::probe_used(&guard), "a tester-present was sent");
+    }
+
+    /// The outstanding tester-present is not a ComPrimitive: the module's status stays as it
+    /// was.
+    #[test]
+    fn a_tester_present_marker_does_not_make_the_module_executing() {
+        let rig = Rig::new();
+        rig.keep_alive(50);
+        rig.ecu(r#"{"inject_fault":{"fault":{"delay_response":{"ms":2000}},"service":62}}"#);
+        let cop = rig.start(start_comm(), &[0x10, 0x02]);
+        rig.finished(cop);
+        rig.wait_for("the marker", Rig::marker_pending);
+        assert_eq!(
+            rig.status_of(PDU_HANDLE_UNDEF, PDU_HANDLE_UNDEF),
+            E_PDU_STATUS::PDU_COPST_FINISHED
+        );
+        assert_eq!(
+            rig.status_of(MOCK_LOGICAL_LINK_HANDLE, cop),
+            E_PDU_STATUS::PDU_COPST_FINISHED
+        );
+    }
+
+    /// An empty expected-positive field is not enabled: any answer is positive unless it is the
+    /// expected negative one; no answer is still an error.
+    #[test]
+    fn an_empty_expected_positive_response_accepts_any_answer_but_the_negative_one() {
+        let rig = Rig::new();
+        rig.keep_alive(50);
+        rig.set_bytes("CP_TesterPresentExpPosResp", &[]);
+        // A negative answer that is not the expected one counts as positive.
+        rig.ecu(r#"{"inject_fault":{"fault":{"negative_response":{"nrc":"request_out_of_range"}},"service":62}}"#);
+        let cop = rig.start(start_comm(), &[0x10, 0x02]);
+        rig.finished(cop);
+        rig.wait_for("the tester-present", Rig::probe_used);
+        rig.wait_for("the answer", |state| !Rig::marker_pending(state));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(rig.events().is_empty());
+        // The expected negative answer is an error.
+        rig.set_bytes("CP_TesterPresentExpNegResp", &[0x7F, 0x3E, 0x22]);
+        let update = rig.start(E_PDU_COPT::PDU_COPT_UPDATEPARAM, &[]);
+        rig.finished_or_result(update);
+        rig.ecu(r#"{"inject_fault":{"fault":{"negative_response":{"nrc":"conditions_not_correct"}},"service":62}}"#);
+        let error = (
+            PDU_HANDLE_UNDEF,
+            Seen::Error(TP_ERROR, MOCK_XTRA_ERR_TP_NEG_RSP),
+        );
+        let mut events = Vec::new();
+        let started = Instant::now();
+        while !events.contains(&error) {
+            assert!(started.elapsed() < Duration::from_secs(5), "{events:?}");
+            std::thread::sleep(Duration::from_millis(5));
+            events.extend(rig.events());
+        }
+        // No answer at all is an error, too.
+        rig.ecu(r#"{"inject_fault":{"fault":"drop_response","service":62}}"#);
+        let no_answer = (
+            PDU_HANDLE_UNDEF,
+            Seen::Error(TP_ERROR, MOCK_XTRA_ERR_TP_NO_RSP),
+        );
+        let started = Instant::now();
+        while !events.contains(&no_answer) {
+            assert!(started.elapsed() < Duration::from_secs(5), "{events:?}");
+            std::thread::sleep(Duration::from_millis(5));
+            events.extend(rig.events());
+        }
+    }
+
+    /// An UPDATEPARAM that changes a tester-present value while the tester-present is on sends at
+    /// once; one that changes nothing leaves the schedule alone.
+    #[test]
+    fn an_updateparam_that_changes_a_value_sends_the_tester_present_at_once() {
+        let rig = Rig::new();
+        rig.keep_alive(10_000);
+        let cop = rig.start(start_comm(), &[0x10, 0x02]);
+        rig.finished(cop);
+        rig.wait_for("the first tester-present", |state| {
+            state
+                .tp_due
+                .is_some_and(|due| due > Instant::now() + Duration::from_secs(5))
+        });
+        let due = state().lock().unwrap().tp_due;
+        // Nothing changed: the next one stays due a period after the last.
+        let update = rig.start(E_PDU_COPT::PDU_COPT_UPDATEPARAM, &[]);
+        rig.finished_or_result(update);
+        assert_eq!(state().lock().unwrap().tp_due, due);
+        // A changed period: sent now, the next one a (new) period later.
+        rig.set_number("CP_TesterPresentTime", 20_000_000);
+        rig.arm_probe();
+        let update = rig.start(E_PDU_COPT::PDU_COPT_UPDATEPARAM, &[]);
+        rig.finished_or_result(update);
+        rig.wait_for("the tester-present", Rig::probe_used);
+        assert_ne!(state().lock().unwrap().tp_due, due);
+    }
+
+    /// An answer that comes after a response pending message is judged when the final answer is
+    /// due, and expected it reports nothing.
+    #[test]
+    fn a_tester_present_answered_after_response_pending_reports_nothing() {
+        let rig = Rig::new();
+        rig.keep_alive(50);
+        rig.ecu(r#"{"inject_fault":{"fault":{"response_pending":{"count":1,"interval_ms":1500}},"service":62}}"#);
+        let cop = rig.start(start_comm(), &[0x10, 0x02]);
+        rig.finished(cop);
+        rig.wait_for("the marker", Rig::marker_pending);
+        // The marker waits for the final answer: a read started now waits for it.
+        let read = rig.start(E_PDU_COPT::PDU_COPT_SENDRECV, &[0x22, 0xF1, 0x90]);
+        assert_eq!(state().lock().unwrap().waiting.len(), 1);
+        let events = rig.finished(read);
+        assert!(
+            events
+                .iter()
+                .all(|(_, seen)| !matches!(seen, Seen::Error(..))),
+            "{events:?}"
+        );
+    }
+
+    /// The mock's response pending ComParams, set the way the agent does, absorb a pending
+    /// message of the ECU: a suppressed request gets only the receive timeout (the silence),
+    /// and with the handling off (the start) the pending message is a result item.
+    #[test]
+    fn a_pending_message_is_absorbed_once_the_handling_is_set() {
+        let rig = Rig::new();
+        let pending = Seen::Result(vec![0x7F, 0x10, 0x78]);
+        let silent = r#"[{"inject_fault":{"fault":{"response_pending":{"count":1,"interval_ms":10}},"request":[16,131]}},
+            {"inject_fault":{"fault":"drop_response","request":[16,131]}}]"#;
+        let arm = |rig: &Rig| {
+            for command in serde_json::from_str::<Vec<serde_json::Value>>(silent).unwrap() {
+                rig.ecu(&command.to_string());
+            }
+        };
+        arm(&rig);
+        let cop = rig.start(E_PDU_COPT::PDU_COPT_SENDRECV, &[0x10, 0x83]);
+        let events = rig.finished(cop);
+        let kinds: Vec<&Seen> = events.iter().map(|(_, seen)| seen).collect();
+        assert_eq!(
+            kinds,
+            [
+                &EXECUTING,
+                &pending,
+                &Seen::Error(
+                    E_PDU_ERR_EVT::PDU_ERR_EVT_RX_TIMEOUT,
+                    MOCK_XTRA_ERR_RX_TIMEOUT_NO_RSP
+                ),
+                &FINISHED
+            ]
+        );
+
+        rig.set_number("CP_RC78Handling", 1);
+        rig.set_number("CP_P2Star", 50_000);
+        rig.set_number("CP_RCByteOffset", 2);
+        // The rig never calls PDUConnect, so the values are in the working buffer only: the
+        // pending message is still passed on until an UPDATEPARAM copies them.
+        arm(&rig);
+        let cop = rig.start(E_PDU_COPT::PDU_COPT_SENDRECV, &[0x10, 0x83]);
+        let events = rig.finished(cop);
+        assert!(
+            events.iter().any(|(_, seen)| *seen == pending),
+            "{events:?}"
+        );
+        let update = rig.start(E_PDU_COPT::PDU_COPT_UPDATEPARAM, &[]);
+        rig.finished_or_result(update);
+        arm(&rig);
+        let cop = rig.start(E_PDU_COPT::PDU_COPT_SENDRECV, &[0x10, 0x83]);
+        let started = Instant::now();
+        let events = rig.finished(cop);
+        let kinds: Vec<&Seen> = events.iter().map(|(_, seen)| seen).collect();
+        assert_eq!(
+            kinds,
+            [
+                &EXECUTING,
+                &Seen::Error(
+                    E_PDU_ERR_EVT::PDU_ERR_EVT_RX_TIMEOUT,
+                    MOCK_XTRA_ERR_RX_TIMEOUT_NO_RSP
+                ),
+                &FINISHED
+            ]
+        );
+        // The pending message came at 0 ms, so the timeout waited P2* (50 ms) after it.
+        assert!(
+            started.elapsed() >= Duration::from_millis(45),
+            "{:?}",
+            started.elapsed()
+        );
+
+        // A value out of range is refused, and a wrong data type too.
+        let mut value = 3u32;
+        let mut item = PDU_PARAM_ITEM {
+            ItemType: E_PDU_IT::PDU_IT_PARAM,
+            ComParamId: standard_comparam_id("CP_RC78Handling").unwrap(),
+            ComParamDataType: E_PDU_PT::PDU_PT_UNUM32,
+            ComParamClass: E_PDU_PC::PDU_PC_COM,
+            pComParamData: (&mut value as *mut u32).cast(),
+        };
+        let status =
+            unsafe { PDUSetComParam(MOCK_MODULE_HANDLE, MOCK_LOGICAL_LINK_HANDLE, &mut item) };
+        assert_eq!(status, invalid_parameters());
+    }
+
+    /// An UPDATEPARAM copies the working buffer even when no ECU is attached at that time.
+    #[test]
+    fn an_updateparam_without_an_ecu_activates_the_response_pending_comparams() {
+        let rig = Rig::new();
+        rig.ecu(r#"{"detach":{}}"#);
+        rig.set_number("CP_RC78Handling", 1);
+        rig.set_number("CP_P2Star", 50_000);
+        rig.set_number("CP_RCByteOffset", 2);
+        let update = rig.start(E_PDU_COPT::PDU_COPT_UPDATEPARAM, &[]);
+        rig.finished_or_result(update);
+        assert_eq!(state().lock().unwrap().rc78_active.handling, 1);
+        rig.ecu(r#"{"attach":{}}"#);
+        rig.ecu(r#"{"inject_fault":{"fault":{"response_pending":{"count":1,"interval_ms":10}},"request":[16,131]}}"#);
+        rig.ecu(r#"{"inject_fault":{"fault":"drop_response","request":[16,131]}}"#);
+        let cop = rig.start(E_PDU_COPT::PDU_COPT_SENDRECV, &[0x10, 0x83]);
+        let events = rig.finished(cop);
+        assert!(
+            events
+                .iter()
+                .all(|(_, seen)| *seen != Seen::Result(vec![0x7F, 0x10, 0x78])),
+            "{events:?}"
+        );
+    }
+
+    /// `PDUConnect` copies the working response pending ComParams to the active ones.
+    #[test]
+    fn pdu_connect_activates_the_response_pending_comparams() {
+        let rig = Rig::new();
+        rig.set_number("CP_RC78Handling", 2);
+        rig.set_number("CP_P2Star", 50_000);
+        rig.set_number("CP_RCByteOffset", 2);
+        assert_eq!(state().lock().unwrap().rc78_active.handling, 0);
+        unsafe { PDUConnect(MOCK_MODULE_HANDLE, MOCK_LOGICAL_LINK_HANDLE) };
+        assert_eq!(state().lock().unwrap().rc78_active.handling, 2);
+        rig.ecu(r#"{"inject_fault":{"fault":{"response_pending":{"count":1,"interval_ms":10}},"request":[16,3]}}"#);
+        let cop = rig.start(E_PDU_COPT::PDU_COPT_SENDRECV, &[0x10, 0x03]);
+        let events = rig.finished(cop);
+        assert!(
+            events
+                .iter()
+                .all(|(_, seen)| *seen != Seen::Result(vec![0x7F, 0x10, 0x78])),
+            "{events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|(_, seen)| matches!(seen, Seen::Result(bytes) if bytes[0] == 0x50)),
+            "{events:?}"
+        );
+    }
+
+    impl Rig {
+        /// Waits for the end of a ComPrimitive that has no request: its synthetic completion is
+        /// one result item.
+        fn finished_or_result(&self, handle: UNUM32) {
+            let started = Instant::now();
+            loop {
+                if self.events().iter().any(|(cop, _)| *cop == handle) {
+                    return;
+                }
+                assert!(started.elapsed() < Duration::from_secs(5), "no completion");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+    }
+
+    /// The extra info of a result item: the unique response table's response identifier as a
+    /// header when the ComPrimitive set ENABLE_EXTRA_INFO (ADR-428; ISO 22900-2 (2022)
+    /// 10.1.4.11.4, D.2.1).
+    mod extra_info {
+        use super::*;
+
+        const SESSION: &[u8] = &[0x10, 0x03];
+        /// A response of several frames, which raises a start-of-message indication.
+        const VIN_READ: &[u8] = &[0x22, 0xF1, 0x90];
+        const UNBOUND: &str =
+            r#"{"indication_binding":{"bound":false,"request_id":2016,"response_id":2024}}"#;
+
+        /// Sets a table with the entry for unique 1 (answering on `id`, when given) and another
+        /// entry for unique 2 (answering on 0x123).
+        fn set_table(id: Option<u32>) {
+            let mut one = id.unwrap_or(0);
+            let mut two = 0x123u32;
+            let param = |value: &mut u32| PDU_PARAM_ITEM {
+                ItemType: E_PDU_IT::PDU_IT_PARAM,
+                ComParamId: CP_CAN_RESP_USDT_ID,
+                ComParamDataType: E_PDU_PT::PDU_PT_UNUM32,
+                ComParamClass: E_PDU_PC::PDU_PC_COM,
+                pComParamData: (value as *mut u32).cast(),
+            };
+            let mut params_one = vec![param(&mut one)];
+            let mut params_two = vec![param(&mut two)];
+            let mut entries = vec![
+                PDU_ECU_UNIQUE_RESP_DATA {
+                    UniqueRespIdentifier: 2,
+                    NumParamItems: 1,
+                    pParams: params_two.as_mut_ptr(),
+                },
+                PDU_ECU_UNIQUE_RESP_DATA {
+                    UniqueRespIdentifier: 1,
+                    NumParamItems: if id.is_some() { 1 } else { 0 },
+                    pParams: params_one.as_mut_ptr(),
+                },
+            ];
+            let mut table = PDU_UNIQUE_RESP_ID_TABLE_ITEM {
+                ItemType: E_PDU_IT::PDU_IT_UNIQUE_RESP_ID_TABLE,
+                NumEntries: entries.len() as UNUM32,
+                pUniqueData: entries.as_mut_ptr(),
+            };
+            let status = unsafe {
+                PDUSetUniqueRespIdTable(MOCK_MODULE_HANDLE, MOCK_LOGICAL_LINK_HANDLE, &mut table)
+            };
+            assert_eq!(status, no_error());
+        }
+
+        /// Runs `request` as a send-receive with the TxFlag `flag` (none: an empty flag field),
+        /// after activating the ComParams, and returns the events up to the end.
+        fn run(rig: &Rig, request: &[u8], flag: Option<&[u8]>) -> Vec<PendingEvent> {
+            let update = rig.start(E_PDU_COPT::PDU_COPT_UPDATEPARAM, &[]);
+            rig.finished_or_result(update);
+            let mut bytes = flag.unwrap_or(&[]).to_vec();
+            let mut control = PDU_COP_CTRL_DATA {
+                Time: 0,
+                NumSendCycles: 1,
+                NumReceiveCycles: 1,
+                TempParamUpdate: 0,
+                TxFlag: PDU_FLAG_DATA {
+                    NumFlagBytes: bytes.len() as UNUM32,
+                    pFlagData: if bytes.is_empty() {
+                        ptr::null_mut()
+                    } else {
+                        bytes.as_mut_ptr()
+                    },
+                },
+                NumPossibleExpectedResponses: 0,
+                pExpectedResponseArray: ptr::null_mut(),
+            };
+            let mut data = request.to_vec();
+            let mut handle = 0;
+            unsafe {
+                PDUStartComPrimitive(
+                    MOCK_MODULE_HANDLE,
+                    MOCK_LOGICAL_LINK_HANDLE,
+                    E_PDU_COPT::PDU_COPT_SENDRECV,
+                    data.len() as UNUM32,
+                    data.as_mut_ptr(),
+                    &mut control,
+                    ptr::null_mut(),
+                    &mut handle,
+                );
+            }
+            let mut taken = Vec::new();
+            let started = Instant::now();
+            loop {
+                let queued = std::mem::take(&mut state().lock().unwrap().pending_events);
+                taken.extend(
+                    queued
+                        .into_iter()
+                        .filter(|event| event.h_cop == handle || event.identifier.is_some()),
+                );
+                if taken.iter().any(|event| {
+                    matches!(event.kind, EventKind::Status(s) if s == E_PDU_STATUS::PDU_COPST_FINISHED)
+                }) {
+                    return taken;
+                }
+                assert!(started.elapsed() < Duration::from_secs(5), "no end");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+
+        /// The header, whether there is a footer, and the data bytes of an event as the item
+        /// the library hands out; frees the item (the data, flags, header once each).
+        fn item_of(event: &PendingEvent) -> (Option<Vec<u8>>, bool, Vec<u8>) {
+            let item = unsafe { make_event_item(event.clone()) };
+            unsafe {
+                let data = &*(*item).pData.cast::<PDU_RESULT_DATA>();
+                let extra = data.pExtraInfo.as_ref().map(|extra| {
+                    assert_eq!(extra.NumHeaderBytes, 4);
+                    std::slice::from_raw_parts(extra.pHeaderBytes, 4).to_vec()
+                });
+                let footer = data.pExtraInfo.as_ref().is_some_and(|extra| {
+                    extra.NumFooterBytes != 0 || !extra.pFooterBytes.is_null()
+                });
+                let bytes = if data.pDataBytes.is_null() {
+                    Vec::new()
+                } else {
+                    std::slice::from_raw_parts(data.pDataBytes, data.NumDataBytes as usize).to_vec()
+                };
+                assert_eq!(PDUDestroyItem(item.cast()), no_error());
+                (extra, footer, bytes)
+            }
+        }
+
+        /// Starts `request` as a send-receive with `control` (null: none) and returns its handle.
+        fn start_with(request: &[u8], control: *mut PDU_COP_CTRL_DATA) -> UNUM32 {
+            let mut data = request.to_vec();
+            let mut handle = 0;
+            unsafe {
+                PDUStartComPrimitive(
+                    MOCK_MODULE_HANDLE,
+                    MOCK_LOGICAL_LINK_HANDLE,
+                    E_PDU_COPT::PDU_COPT_SENDRECV,
+                    data.len() as UNUM32,
+                    data.as_mut_ptr(),
+                    control,
+                    ptr::null_mut(),
+                    &mut handle,
+                );
+            }
+            handle
+        }
+
+        /// A control for one send and one receive with the TxFlag `flag` of `count` bytes.
+        fn control_with(flag: &mut [u8], count: UNUM32) -> PDU_COP_CTRL_DATA {
+            PDU_COP_CTRL_DATA {
+                Time: 0,
+                NumSendCycles: 1,
+                NumReceiveCycles: 1,
+                TempParamUpdate: 0,
+                TxFlag: PDU_FLAG_DATA {
+                    NumFlagBytes: count,
+                    pFlagData: flag.as_mut_ptr(),
+                },
+                NumPossibleExpectedResponses: 0,
+                pExpectedResponseArray: ptr::null_mut(),
+            }
+        }
+
+        /// The events of `handle` up to its end (a FINISHED status).
+        fn until_finished(handle: UNUM32) -> Vec<PendingEvent> {
+            let mut taken = Vec::new();
+            let started = Instant::now();
+            loop {
+                let queued = std::mem::take(&mut state().lock().unwrap().pending_events);
+                taken.extend(queued.into_iter().filter(|event| event.h_cop == handle));
+                if taken.iter().any(|event| {
+                    matches!(event.kind, EventKind::Status(s) if s == E_PDU_STATUS::PDU_COPST_FINISHED)
+                }) {
+                    return taken;
+                }
+                assert!(started.elapsed() < Duration::from_secs(5), "no end");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+
+        /// Every event queued, until `done` holds for what has been taken so far.
+        fn collect(done: impl Fn(&[PendingEvent]) -> bool) -> Vec<PendingEvent> {
+            let mut taken = Vec::new();
+            let started = Instant::now();
+            loop {
+                taken.extend(std::mem::take(&mut state().lock().unwrap().pending_events));
+                if done(&taken) {
+                    return taken;
+                }
+                assert!(started.elapsed() < Duration::from_secs(10), "not done");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+
+        fn finished(events: &[PendingEvent], handle: UNUM32) -> bool {
+            events.iter().any(|event| {
+                event.h_cop == handle
+                    && matches!(event.kind, EventKind::Status(s) if s == E_PDU_STATUS::PDU_COPST_FINISHED)
+            })
+        }
+
+        fn update_param(rig: &Rig) {
+            let update = rig.start(E_PDU_COPT::PDU_COPT_UPDATEPARAM, &[]);
+            rig.finished_or_result(update);
+        }
+
+        fn results(events: &[PendingEvent]) -> Vec<&PendingEvent> {
+            events
+                .iter()
+                .filter(|event| matches!(event.kind, EventKind::Result(_)))
+                .collect()
+        }
+
+        const FLAG_SET: &[u8] = &[0x20, 0, 0, 0];
+
+        #[test]
+        fn the_table_response_id_is_a_working_buffer_active_at_connect_and_cleared_with_the_link() {
+            let rig = Rig::new();
+            assert_eq!(state().lock().unwrap().table_active, None);
+            set_table(Some(0x7E8));
+            assert_eq!(state().lock().unwrap().table_working, Some(0x7E8));
+            assert_eq!(state().lock().unwrap().table_active, None);
+            unsafe { PDUConnect(MOCK_MODULE_HANDLE, MOCK_LOGICAL_LINK_HANDLE) };
+            assert_eq!(state().lock().unwrap().table_active, Some(0x7E8));
+            // A later table is active at the next UPDATEPARAM.
+            set_table(None);
+            assert_eq!(state().lock().unwrap().table_active, Some(0x7E8));
+            update_param(&rig);
+            assert_eq!(state().lock().unwrap().table_active, None);
+            set_table(Some(0x7E8));
+            update_param(&rig);
+            unsafe { PDUDestroyComLogicalLink(MOCK_MODULE_HANDLE, MOCK_LOGICAL_LINK_HANDLE) };
+            assert_eq!(state().lock().unwrap().table_active, None);
+            assert_eq!(state().lock().unwrap().table_working, None);
+        }
+
+        #[test]
+        fn a_table_set_after_connect_without_an_updateparam_keeps_the_connect_time_id() {
+            let rig = Rig::new();
+            // Nothing active at connect: no header, though the working buffer has an id.
+            unsafe { PDUConnect(MOCK_MODULE_HANDLE, MOCK_LOGICAL_LINK_HANDLE) };
+            set_table(Some(0x7E8));
+            let mut flag = FLAG_SET.to_vec();
+            let mut control = control_with(&mut flag, 4);
+            let handle = start_with(SESSION, &mut control);
+            assert_eq!(item_of(results(&until_finished(handle))[0]).0, None);
+            // An id active at connect stays until the next UPDATEPARAM.
+            unsafe { PDUConnect(MOCK_MODULE_HANDLE, MOCK_LOGICAL_LINK_HANDLE) };
+            set_table(Some(0x7E9));
+            let handle = start_with(SESSION, &mut control);
+            assert_eq!(
+                item_of(results(&until_finished(handle))[0]).0,
+                Some(vec![0, 0, 0x07, 0xE8])
+            );
+            drop(rig);
+        }
+
+        #[test]
+        fn a_primitive_keeps_the_id_active_when_it_started() {
+            let rig = Rig::new();
+            set_table(Some(0x7E8));
+            update_param(&rig);
+            let mut flag = FLAG_SET.to_vec();
+            let mut control = control_with(&mut flag, 4);
+            rig.ecu(r#"{"inject_fault":{"fault":{"response_pending":{"count":1,"interval_ms":200}},"request":[16,3]}}"#);
+            let first = start_with(SESSION, &mut control);
+            let second = start_with(&[0x22, 0xF1, 0x90], &mut control);
+            // Both are started: a table change that is active from now on leaves them alone.
+            set_table(Some(0x7E9));
+            let _update = rig.start(E_PDU_COPT::PDU_COPT_UPDATEPARAM, &[]);
+            assert_eq!(state().lock().unwrap().table_active, Some(0x7E9));
+            let events = collect(|e| finished(e, first) && finished(e, second));
+            let of = |handle: UNUM32| -> Vec<PendingEvent> {
+                events
+                    .iter()
+                    .filter(|e| e.h_cop == handle)
+                    .cloned()
+                    .collect()
+            };
+            for handle in [first, second] {
+                for event in results(&of(handle)) {
+                    assert_eq!(item_of(event).0, Some(vec![0, 0, 0x07, 0xE8]));
+                }
+            }
+            // A primitive started now takes the new id.
+            let third = start_with(SESSION, &mut control);
+            let events = collect(|e| finished(e, third));
+            let third_events: Vec<_> = events
+                .iter()
+                .filter(|e| e.h_cop == third)
+                .cloned()
+                .collect();
+            assert_eq!(
+                item_of(results(&third_events)[0]).0,
+                Some(vec![0, 0, 0x07, 0xE9])
+            );
+        }
+
+        #[test]
+        fn a_table_id_of_all_ones_means_not_used_and_no_table_is_refused() {
+            let rig = Rig::new();
+            set_table(Some(u32::MAX));
+            assert_eq!(state().lock().unwrap().table_working, None);
+            let status = unsafe {
+                PDUSetUniqueRespIdTable(
+                    MOCK_MODULE_HANDLE,
+                    MOCK_LOGICAL_LINK_HANDLE,
+                    ptr::null_mut(),
+                )
+            };
+            assert_eq!(status, invalid_parameters());
+            drop(rig);
+        }
+
+        #[test]
+        fn the_flag_and_the_table_give_the_result_a_four_byte_header_and_no_footer() {
+            let rig = Rig::new();
+            set_table(Some(0x7E8));
+            let events = run(&rig, SESSION, Some(FLAG_SET));
+            let results = results(&events);
+            assert_eq!(results.len(), 1);
+            let (header, footer, data) = item_of(results[0]);
+            assert_eq!(header, Some(vec![0, 0, 0x07, 0xE8]));
+            assert!(!footer);
+            // The data is the response, with no header in it.
+            assert_eq!(data[0], 0x50);
+            assert_eq!(data.len(), 6);
+        }
+
+        #[test]
+        fn the_flag_bit_alone_in_a_longer_or_other_flag_is_enough() {
+            let rig = Rig::new();
+            set_table(Some(0x7E8));
+            let events = run(&rig, SESSION, Some(&[0x60, 0xFF, 0, 0, 0, 0]));
+            let (header, ..) = item_of(results(&events)[0]);
+            assert_eq!(header, Some(vec![0, 0, 0x07, 0xE8]));
+        }
+
+        #[test]
+        fn a_response_pending_item_carries_the_header_too() {
+            let rig = Rig::new();
+            set_table(Some(0x7E8));
+            rig.ecu(r#"{"inject_fault":{"fault":{"response_pending":{"count":1,"interval_ms":10}},"request":[16,3]}}"#);
+            let events = run(&rig, SESSION, Some(FLAG_SET));
+            let results = results(&events);
+            assert_eq!(results.len(), 2);
+            for result in results {
+                assert_eq!(item_of(result).0, Some(vec![0, 0, 0x07, 0xE8]));
+            }
+        }
+
+        #[test]
+        fn without_the_flag_or_a_readable_flag_no_header() {
+            let rig = Rig::new();
+            set_table(Some(0x7E8));
+            for flag in [
+                None,
+                Some(&[0u8, 0, 0, 0][..]),
+                Some(&[0x40, 0, 0, 0][..]),
+                Some(&[0xDF, 0xFF, 0xFF, 0xFF][..]),
+            ] {
+                let events = run(&rig, SESSION, flag);
+                assert_eq!(item_of(results(&events)[0]).0, None, "{flag:?}");
+            }
+        }
+
+        #[test]
+        fn a_null_control_gives_no_header() {
+            let rig = Rig::new();
+            set_table(Some(0x7E8));
+            update_param(&rig);
+            let handle = start_with(SESSION, ptr::null_mut());
+            let events = until_finished(handle);
+            assert_eq!(item_of(results(&events)[0]).0, None);
+            assert!(!requests_extra_info(None));
+        }
+
+        #[test]
+        fn a_flag_with_no_bytes_but_a_pointer_gives_no_header() {
+            let rig = Rig::new();
+            set_table(Some(0x7E8));
+            update_param(&rig);
+            let mut flag = FLAG_SET.to_vec();
+            let mut control = control_with(&mut flag, 0);
+            let handle = start_with(SESSION, &mut control);
+            assert_eq!(item_of(results(&until_finished(handle))[0]).0, None);
+        }
+
+        #[test]
+        fn the_flag_without_a_table_response_id_gives_no_header() {
+            let rig = Rig::new();
+            let events = run(&rig, SESSION, Some(FLAG_SET));
+            assert_eq!(item_of(results(&events)[0]).0, None);
+            // A table whose entry for unique 1 has no CP_CanRespUSDTId likewise.
+            set_table(None);
+            let events = run(&rig, SESSION, Some(FLAG_SET));
+            assert_eq!(item_of(results(&events)[0]).0, None);
+        }
+
+        #[test]
+        fn the_synthetic_completion_has_no_header() {
+            let rig = Rig::new();
+            set_table(Some(0x7E8));
+            update_param(&rig);
+            let mut flag = FLAG_SET.to_vec();
+            let mut control = control_with(&mut flag, 4);
+            let completion_of = |events: &[PendingEvent], handle: UNUM32| -> Option<PendingEvent> {
+                events
+                    .iter()
+                    .find(|e| e.h_cop == handle && matches!(e.kind, EventKind::Result(_)))
+                    .cloned()
+            };
+            // No ECU at the start: the completion is queued at once.
+            rig.ecu(r#"{"detach":{}}"#);
+            let handle = start_with(&[], &mut control);
+            let events = collect(|e| completion_of(e, handle).is_some());
+            assert_eq!(item_of(&completion_of(&events, handle).unwrap()).0, None);
+
+            // Queued behind a running primitive while attached, the ECU gone when it begins:
+            // the completion comes from `begin_next`'s fallback.
+            rig.ecu(r#"{"attach":{}}"#);
+            rig.ecu(r#"{"inject_fault":{"fault":{"response_pending":{"count":1,"interval_ms":300}},"request":[16,3]}}"#);
+            let first = start_with(SESSION, &mut control);
+            let second = start_with(&[0x22, 0xF1, 0x90], &mut control);
+            rig.ecu(r#"{"detach":{}}"#);
+            let events = collect(|e| finished(e, first) && completion_of(e, second).is_some());
+            let completion = completion_of(&events, second).unwrap();
+            assert_eq!(item_of(&completion).0, None);
+        }
+
+        #[test]
+        fn bound_indications_have_no_header_but_the_response_has() {
+            let rig = Rig::new();
+            set_table(Some(0x7E8));
+            rig.set_number("CP_TransmitIndEnable", 1);
+            rig.set_number("CP_StartMsgIndEnable", 1);
+            let events = run(&rig, VIN_READ, Some(FLAG_SET));
+            let mut indications = 0;
+            for event in &events {
+                match event.kind {
+                    EventKind::Indication(_) => {
+                        indications += 1;
+                        assert_eq!(item_of(event).0, None);
+                    }
+                    EventKind::Result(_) => {
+                        assert_eq!(item_of(event).0, Some(vec![0, 0, 0x07, 0xE8]));
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(indications, 2);
+        }
+
+        #[test]
+        fn unbound_indications_keep_the_control_and_the_response_takes_the_table() {
+            let rig = Rig::new();
+            // A table identifier unlike the control's, to tell the sources apart.
+            set_table(Some(0x7E9));
+            rig.set_number("CP_TransmitIndEnable", 1);
+            rig.set_number("CP_StartMsgIndEnable", 1);
+            rig.ecu(UNBOUND);
+            let events = run(&rig, VIN_READ, Some(FLAG_SET));
+            let headers: Vec<_> = events
+                .iter()
+                .filter(|event| {
+                    matches!(event.kind, EventKind::Indication(_) | EventKind::Result(_))
+                })
+                .map(|event| item_of(event).0)
+                .collect();
+            assert_eq!(
+                headers,
+                [
+                    Some(vec![0, 0, 0x07, 0xE0]),
+                    Some(vec![0, 0, 0x07, 0xE8]),
+                    Some(vec![0, 0, 0x07, 0xE9]),
+                ]
+            );
+        }
+    }
+
+    /// The indication items (`CP_TransmitIndEnable`, `CP_StartMsgIndEnable`; ISO 22900-2 (2022)
+    /// B.5.1, D.2.2).
+    mod indications {
+        use super::*;
+
+        /// A ReadDataByIdentifier of the VIN: a 20-byte response, so a multi-frame message.
+        const VIN_READ: &[u8] = &[0x22, 0xF1, 0x90];
+        /// A DiagnosticSessionControl: a response of a single frame.
+        const SESSION: &[u8] = &[0x10, 0x01];
+
+        /// What a queued item is, for comparing the order.
+        #[derive(Debug, PartialEq, Clone, Copy)]
+        enum Item {
+            Executing,
+            Finished,
+            Transmit,
+            Start,
+            Response,
+        }
+
+        impl Rig {
+            /// Starts `data` as a send-receive with `send` and `receive` cycles (none: the
+            /// default control data), activating the ComParams first.
+            fn run(&self, data: &[u8], cycles: Option<(i32, i32)>) -> Vec<PendingEvent> {
+                let update = self.start(E_PDU_COPT::PDU_COPT_UPDATEPARAM, &[]);
+                self.finished_or_result(update);
+                let mut control = cycles.map(|(send, receive)| PDU_COP_CTRL_DATA {
+                    Time: 0,
+                    NumSendCycles: send,
+                    NumReceiveCycles: receive,
+                    TempParamUpdate: 0,
+                    TxFlag: no_flags(),
+                    NumPossibleExpectedResponses: 0,
+                    pExpectedResponseArray: ptr::null_mut(),
+                });
+                let mut bytes = data.to_vec();
+                let mut handle = 0;
+                unsafe {
+                    PDUStartComPrimitive(
+                        MOCK_MODULE_HANDLE,
+                        MOCK_LOGICAL_LINK_HANDLE,
+                        E_PDU_COPT::PDU_COPT_SENDRECV,
+                        bytes.len() as UNUM32,
+                        bytes.as_mut_ptr(),
+                        control.as_mut().map_or(ptr::null_mut(), |c| c as *mut _),
+                        ptr::null_mut(),
+                        &mut handle,
+                    );
+                }
+                let mut taken = Vec::new();
+                let started = Instant::now();
+                loop {
+                    let queued = std::mem::take(&mut state().lock().unwrap().pending_events);
+                    taken.extend(
+                        queued
+                            .into_iter()
+                            .filter(|event| event.h_cop == handle || event.identifier.is_some()),
+                    );
+                    if taken.iter().any(|event| {
+                        matches!(event.kind, EventKind::Status(s) if s == E_PDU_STATUS::PDU_COPST_FINISHED)
+                    }) {
+                        return taken;
+                    }
+                    assert!(started.elapsed() < Duration::from_secs(5), "no end");
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+        }
+
+        fn items(events: &[PendingEvent]) -> Vec<Item> {
+            events
+                .iter()
+                .map(|event| match &event.kind {
+                    EventKind::Status(s) if *s == E_PDU_STATUS::PDU_COPST_EXECUTING => {
+                        Item::Executing
+                    }
+                    EventKind::Status(_) => Item::Finished,
+                    EventKind::Indication(Indication::Transmit) => Item::Transmit,
+                    EventKind::Indication(Indication::Start) => Item::Start,
+                    EventKind::Result(_) => Item::Response,
+                    other => panic!("unexpected {:?}", std::mem::discriminant(other)),
+                })
+                .collect()
+        }
+
+        fn set(rig: &Rig, transmit: u32, start: u32) {
+            rig.set_number("CP_TransmitIndEnable", transmit);
+            rig.set_number("CP_StartMsgIndEnable", start);
+        }
+
+        #[test]
+        fn with_the_indications_off_no_item_is_queued_for_them() {
+            let rig = Rig::new();
+            let events = rig.run(VIN_READ, None);
+            assert_eq!(
+                items(&events),
+                [Item::Executing, Item::Response, Item::Finished]
+            );
+        }
+
+        #[test]
+        fn the_transmit_indication_follows_the_executing_status_at_the_time_the_request_was_sent() {
+            let rig = Rig::new();
+            set(&rig, 1, 0);
+            let events = rig.run(VIN_READ, None);
+            assert_eq!(
+                items(&events),
+                [
+                    Item::Executing,
+                    Item::Transmit,
+                    Item::Response,
+                    Item::Finished
+                ]
+            );
+            let (indication, response) = (&events[1], &events[2]);
+            // The transmit done the response itself carries, on the module clock.
+            assert_eq!(Some(indication.timestamp), response.tx_done);
+            assert!(response.timestamp.wrapping_sub(indication.timestamp) as i32 > 0);
+            assert_eq!(indication.h_cop, response.h_cop);
+        }
+
+        #[test]
+        fn the_start_indication_precedes_a_multi_frame_response_at_its_time() {
+            let rig = Rig::new();
+            set(&rig, 0, 1);
+            let events = rig.run(VIN_READ, None);
+            assert_eq!(
+                items(&events),
+                [Item::Executing, Item::Start, Item::Response, Item::Finished]
+            );
+            assert_eq!(events[1].timestamp, events[2].timestamp);
+            assert!(events[1].timestamp.wrapping_sub(events[2].tx_done.unwrap()) as i32 > 0);
+        }
+
+        #[test]
+        fn both_indications_come_in_order_before_the_response() {
+            let rig = Rig::new();
+            set(&rig, 1, 1);
+            let events = rig.run(VIN_READ, None);
+            assert_eq!(
+                items(&events),
+                [
+                    Item::Executing,
+                    Item::Transmit,
+                    Item::Start,
+                    Item::Response,
+                    Item::Finished
+                ]
+            );
+            let times: Vec<UNUM32> = events.iter().map(|event| event.timestamp).collect();
+            assert!(
+                times
+                    .windows(2)
+                    .all(|w| w[1].wrapping_sub(w[0]) as i32 >= 0)
+            );
+            assert!(times[2].wrapping_sub(times[1]) as i32 > 0);
+        }
+
+        #[test]
+        fn a_single_frame_response_gets_no_start_indication() {
+            let rig = Rig::new();
+            set(&rig, 1, 1);
+            let events = rig.run(SESSION, None);
+            assert_eq!(
+                items(&events),
+                [
+                    Item::Executing,
+                    Item::Transmit,
+                    Item::Response,
+                    Item::Finished
+                ]
+            );
+        }
+
+        #[test]
+        fn a_send_only_primitive_gets_the_transmit_indication_and_a_no_send_one_none() {
+            let rig = Rig::new();
+            set(&rig, 1, 1);
+            let events = rig.run(VIN_READ, Some((1, 0)));
+            assert_eq!(
+                items(&events),
+                [Item::Executing, Item::Transmit, Item::Finished]
+            );
+            let events = rig.run(VIN_READ, Some((0, 1)));
+            assert_eq!(items(&events), [Item::Executing, Item::Finished]);
+        }
+
+        #[test]
+        fn the_comparams_have_a_working_and_an_active_buffer() {
+            let rig = Rig::new();
+            // Written to the working buffer only: nothing changes until an UPDATEPARAM.
+            set(&rig, 1, 1);
+            assert_eq!(state().lock().unwrap().ind_active, Indications::default());
+            let cop = rig.start(E_PDU_COPT::PDU_COPT_SENDRECV, VIN_READ);
+            let events = rig.finished(cop);
+            assert!(
+                events
+                    .iter()
+                    .all(|(_, seen)| !matches!(seen, Seen::Indication(_)))
+            );
+            // The active value is what a ComPrimitive takes when it is started.
+            let events = rig.run(VIN_READ, None);
+            assert!(items(&events).contains(&Item::Transmit));
+            set(&rig, 0, 0);
+            let cop = rig.start(E_PDU_COPT::PDU_COPT_SENDRECV, VIN_READ);
+            let events = rig.finished(cop);
+            assert!(
+                events
+                    .iter()
+                    .any(|(_, seen)| matches!(seen, Seen::Indication(_)))
+            );
+            // PDUGetComParam reads the working buffer.
+            let mut item = ptr::null_mut();
+            let id = standard_comparam_id("CP_TransmitIndEnable").unwrap();
+            unsafe {
+                assert_eq!(
+                    PDUGetComParam(MOCK_MODULE_HANDLE, MOCK_LOGICAL_LINK_HANDLE, id, &mut item),
+                    no_error()
+                );
+                let param = item.as_ref().expect("PDUGetComParam sets the item");
+                let value = param.pComParamData.cast::<u32>().as_ref();
+                assert_eq!(value.copied(), Some(0));
+                assert_eq!(param.ComParamClass, E_PDU_PC::PDU_PC_COM);
+                assert_eq!(PDUDestroyItem(item.cast()), no_error());
+            }
+        }
+
+        #[test]
+        fn a_value_out_of_range_or_of_the_wrong_type_is_refused() {
+            let mut indications = Indications::default();
+            assert!(indications.set_number(IndicationParam::Start, 1));
+            assert!(!indications.set_number(IndicationParam::Start, 2));
+            assert!(indications.start && !indications.transmit);
+            let _rig = Rig::new();
+            let mut field = PDU_PARAM_BYTEFIELD_DATA {
+                ParamMaxLen: 12,
+                ParamActLen: 0,
+                pDataArray: ptr::null_mut(),
+            };
+            let mut item = PDU_PARAM_ITEM {
+                ItemType: E_PDU_IT::PDU_IT_PARAM,
+                ComParamId: standard_comparam_id("CP_StartMsgIndEnable").unwrap(),
+                ComParamDataType: E_PDU_PT::PDU_PT_BYTEFIELD,
+                ComParamClass: E_PDU_PC::PDU_PC_COM,
+                pComParamData: (&mut field as *mut PDU_PARAM_BYTEFIELD_DATA).cast(),
+            };
+            let status =
+                unsafe { PDUSetComParam(MOCK_MODULE_HANDLE, MOCK_LOGICAL_LINK_HANDLE, &mut item) };
+            assert_eq!(status, invalid_parameters());
+        }
+
+        /// The items as `PDUGetEventItem` hands them out: a result with no data bytes, bound to
+        /// the ComPrimitive, whose RxFlag byte 3 names the indication, and no time in the result.
+        #[test]
+        fn an_indication_item_is_a_result_without_data_bytes_that_names_its_kind() {
+            let rig = Rig::new();
+            set(&rig, 1, 1);
+            let events = rig.run(VIN_READ, None);
+            let cop = events[0].h_cop;
+            for event in events
+                .iter()
+                .filter(|e| matches!(e.kind, EventKind::Indication(_)))
+            {
+                state().lock().unwrap().pending_events.push(event.clone());
+            }
+            let mut flags = Vec::new();
+            for _ in 0..2 {
+                let mut item = ptr::null_mut();
+                unsafe {
+                    assert_eq!(
+                        PDUGetEventItem(MOCK_MODULE_HANDLE, MOCK_LOGICAL_LINK_HANDLE, &mut item),
+                        no_error()
+                    );
+                    let event = item.as_ref().expect("PDUGetEventItem sets the item");
+                    assert_eq!(event.ItemType, E_PDU_IT::PDU_IT_RESULT);
+                    assert_eq!(event.hCop, cop);
+                    let data = event
+                        .pData
+                        .cast::<PDU_RESULT_DATA>()
+                        .as_ref()
+                        .expect("a result item has its data");
+                    assert_eq!(data.NumDataBytes, 0);
+                    assert!(data.pDataBytes.is_null());
+                    assert_eq!(data.TimestampFlags.NumFlagBytes, 0);
+                    assert_eq!(data.RxFlag.NumFlagBytes, 4);
+                    flags.push(std::slice::from_raw_parts(data.RxFlag.pFlagData, 4).to_vec());
+                    assert_eq!(PDUDestroyItem(item.cast()), no_error());
+                }
+            }
+            assert_eq!(flags, [[0, 0, 0, 0x08], [0, 0, 0, 0x02]]);
+        }
+
+        #[test]
+        fn a_response_carries_no_times_when_they_are_switched_off() {
+            let rig = Rig::new();
+            set(&rig, 1, 1);
+            let result_flags = |events: &[PendingEvent]| {
+                let event = events
+                    .iter()
+                    .find(|e| matches!(e.kind, EventKind::Result(_)))
+                    .unwrap()
+                    .clone();
+                let item = unsafe { make_event_item(event) };
+                unsafe {
+                    let data = &*(*item).pData.cast::<PDU_RESULT_DATA>();
+                    let read = (
+                        data.TimestampFlags.NumFlagBytes,
+                        data.TxMsgDoneTimestamp,
+                        data.StartMsgTimestamp,
+                    );
+                    assert_eq!(PDUDestroyItem(item.cast()), no_error());
+                    read
+                }
+            };
+            let on = result_flags(&rig.run(VIN_READ, None));
+            assert_eq!(on.0, 4);
+            assert_ne!(on.1, 0);
+            rig.ecu(r#"{"response_timestamps":{"enabled":false}}"#);
+            let events = rig.run(VIN_READ, None);
+            // The indications still come, and still before the response.
+            assert_eq!(
+                items(&events),
+                [
+                    Item::Executing,
+                    Item::Transmit,
+                    Item::Start,
+                    Item::Response,
+                    Item::Finished
+                ]
+            );
+            let off = result_flags(&events);
+            assert_eq!(off, (0, 0, 0));
+        }
+
+        const UNBOUND: &str =
+            r#"{"indication_binding":{"bound":false,"request_id":2016,"response_id":2024}}"#;
+
+        #[test]
+        fn the_indications_are_bound_to_the_primitive_by_default() {
+            let rig = Rig::new();
+            set(&rig, 1, 1);
+            assert_eq!(state().lock().unwrap().unbound_indications, None);
+            let events = rig.run(VIN_READ, None);
+            assert!(events.iter().all(|event| event.identifier.is_none()));
+            assert!(events.iter().all(|event| event.h_cop != PDU_HANDLE_UNDEF));
+            // Binding it again, or resetting, leaves the default.
+            rig.ecu(UNBOUND);
+            rig.ecu(r#"{"indication_binding":{"bound":true}}"#);
+            assert_eq!(state().lock().unwrap().unbound_indications, None);
+        }
+
+        #[test]
+        fn unbound_indications_have_no_primitive_and_name_the_identifier_in_the_extra_info() {
+            let rig = Rig::new();
+            set(&rig, 1, 1);
+            rig.ecu(UNBOUND);
+            let events = rig.run(VIN_READ, None);
+            assert_eq!(
+                items(&events),
+                [
+                    Item::Executing,
+                    Item::Transmit,
+                    Item::Start,
+                    Item::Response,
+                    Item::Finished
+                ]
+            );
+            // The order, the times and the response are as when bound.
+            assert_eq!(Some(events[1].timestamp), events[3].tx_done);
+            assert_eq!(events[2].timestamp, events[3].timestamp);
+            let header = |event: &PendingEvent| {
+                let item = unsafe { make_event_item(event.clone()) };
+                unsafe {
+                    let hcop = (*item).hCop;
+                    let data = &*(*item).pData.cast::<PDU_RESULT_DATA>();
+                    let extra = data.pExtraInfo.as_ref().map(|extra| {
+                        assert_eq!((extra.NumHeaderBytes, extra.NumFooterBytes), (4, 0));
+                        assert!(extra.pFooterBytes.is_null());
+                        std::slice::from_raw_parts(extra.pHeaderBytes, 4).to_vec()
+                    });
+                    // Frees the data, the flags, the extra info and its header exactly once.
+                    assert_eq!(PDUDestroyItem(item.cast()), no_error());
+                    (hcop, extra)
+                }
+            };
+            assert_eq!(
+                header(&events[1]),
+                (PDU_HANDLE_UNDEF, Some(vec![0, 0, 0x07, 0xE0]))
+            );
+            assert_eq!(
+                header(&events[2]),
+                (PDU_HANDLE_UNDEF, Some(vec![0, 0, 0x07, 0xE8]))
+            );
+            // The status items and the response stay bound; the response carries no extra info.
+            assert_eq!(header(&events[3]), (events[3].h_cop, None));
+            for event in [&events[0], &events[3], &events[4]] {
+                assert_ne!(event.h_cop, PDU_HANDLE_UNDEF);
+            }
+        }
+
+        #[test]
+        fn an_unbound_binding_needs_both_identifiers_and_refuses_unknown_fields() {
+            let rig = Rig::new();
+            let try_command = |text: &str| {
+                serde_json::from_str::<SimEcuCommand>(text)
+                    .map_err(|_| ())
+                    .and_then(|command| {
+                        apply_sim_ecu_command(&mut state().lock().unwrap(), command)
+                    })
+            };
+            for missing in [
+                r#"{"indication_binding":{"bound":false}}"#,
+                r#"{"indication_binding":{"bound":false,"request_id":2016}}"#,
+                r#"{"indication_binding":{"bound":false,"response_id":2024}}"#,
+            ] {
+                assert!(try_command(missing).is_err(), "{missing}");
+            }
+            assert!(
+                try_command(r#"{"indication_binding":{"bound":false,"request_id":1,"id":2}}"#)
+                    .is_err()
+            );
+            assert_eq!(state().lock().unwrap().unbound_indications, None);
+            rig.ecu(UNBOUND);
+            assert!(try_command(r#"{"indication_binding":{"bound":false}}"#).is_err());
+        }
+
+        #[test]
+        fn a_primitive_keeps_the_binding_it_was_started_with() {
+            let rig = Rig::new();
+            set(&rig, 1, 0);
+            let update = rig.start(E_PDU_COPT::PDU_COPT_UPDATEPARAM, &[]);
+            rig.finished_or_result(update);
+            rig.ecu(r#"{"inject_fault":{"fault":{"delay_response":{"ms":300}},"service":34}}"#);
+            let first = rig.start(E_PDU_COPT::PDU_COPT_SENDRECV, VIN_READ);
+            // Queued behind the first: started bound, then the binding is switched.
+            let second = rig.start(E_PDU_COPT::PDU_COPT_SENDRECV, SESSION);
+            rig.ecu(UNBOUND);
+            let third = rig.start(E_PDU_COPT::PDU_COPT_SENDRECV, SESSION);
+            let mut seen = Vec::new();
+            let started = Instant::now();
+            while seen
+                .iter()
+                .filter(|e: &&PendingEvent| {
+                    e.h_cop == third
+                        && matches!(&e.kind, EventKind::Status(s) if *s == E_PDU_STATUS::PDU_COPST_FINISHED)
+                })
+                .count()
+                == 0
+            {
+                seen.extend(std::mem::take(&mut state().lock().unwrap().pending_events));
+                assert!(started.elapsed() < Duration::from_secs(5), "no end");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let bound_transmits = |cop| {
+                seen.iter()
+                    .filter(|e| e.h_cop == cop && e.identifier.is_none())
+                    .filter(|e| matches!(e.kind, EventKind::Indication(Indication::Transmit)))
+                    .count()
+            };
+            assert_eq!(bound_transmits(first), 1);
+            assert_eq!(bound_transmits(second), 1);
+            assert_eq!(bound_transmits(third), 0);
+            assert!(
+                seen.iter()
+                    .any(|e| e.identifier == Some(2016) && e.tag == 0)
+            );
+        }
+
+        #[test]
+        fn the_binding_survives_a_detach_and_a_reset_clears_it() {
+            let rig = Rig::new();
+            rig.ecu(UNBOUND);
+            rig.ecu(r#"{"detach":{}}"#);
+            assert!(state().lock().unwrap().unbound_indications.is_some());
+            mock_reset();
+            assert_eq!(state().lock().unwrap().unbound_indications, None);
+        }
+
+        /// The unbound transmit indications the ECU's own tester-present raises in 200 ms (the
+        /// period is 20 ms), under the given conditions, each with no header (ADR-430).
+        fn tester_present_indications(unbound: bool, transmit: u32, addr_mode: u32) -> usize {
+            let rig = Rig::new();
+            rig.keep_alive(20);
+            rig.set_number("CP_TesterPresentAddrMode", addr_mode);
+            set(&rig, transmit, 0);
+            if unbound {
+                rig.ecu(UNBOUND);
+            }
+            let update = rig.start(E_PDU_COPT::PDU_COPT_UPDATEPARAM, &[]);
+            rig.finished_or_result(update);
+            let cop = rig.start(E_PDU_COPT::PDU_COPT_STARTCOMM, &[]);
+            rig.finished_or_result(cop);
+            std::thread::sleep(Duration::from_millis(200));
+            let queued = std::mem::take(&mut state().lock().unwrap().pending_events);
+            assert!(
+                queued
+                    .iter()
+                    .all(|event| !matches!(event.kind, EventKind::Error(..))),
+                "a tester-present error"
+            );
+            let indications = queued
+                .iter()
+                .filter(|event| {
+                    matches!(event.kind, EventKind::Indication(Indication::Transmit))
+                        && event.h_cop == PDU_HANDLE_UNDEF
+                })
+                .collect::<Vec<_>>();
+            assert!(indications.iter().all(|event| event.identifier.is_none()));
+            indications.len()
+        }
+
+        #[test]
+        fn the_tester_present_raises_a_headerless_unbound_transmit_indication_each_time_in_every_mode()
+         {
+            // About ten sends fit in 200 ms; at least a few must show.
+            assert!(tester_present_indications(true, 1, 0) >= 3);
+            assert!(tester_present_indications(false, 1, 0) >= 3);
+        }
+
+        #[test]
+        fn the_tester_present_raises_no_indication_unless_enabled_and_physical() {
+            // `CP_TransmitIndEnable` off.
+            assert_eq!(tester_present_indications(true, 0, 0), 0);
+            // Functional addressing goes out on another identifier.
+            assert_eq!(tester_present_indications(true, 1, 1), 0);
+        }
+
+        /// A tester-present due on an idle link goes out with the indication settings in force
+        /// before an UPDATEPARAM that is started after it, not with that UPDATEPARAM's.
+        #[test]
+        fn a_tester_present_sent_at_the_start_of_an_updateparam_uses_the_settings_before_it() {
+            let rig = Rig::new();
+            // A long period keeps the delivery thread asleep: only the start can send it.
+            rig.keep_alive(2000);
+            rig.ecu(UNBOUND);
+            set(&rig, 0, 0);
+            let update = rig.start(E_PDU_COPT::PDU_COPT_UPDATEPARAM, &[]);
+            rig.finished_or_result(update);
+            let start = rig.start(E_PDU_COPT::PDU_COPT_STARTCOMM, &[]);
+            rig.finished_or_result(start);
+            rig.wait_for("the first tester-present answered", |state| {
+                state.scheduled.is_empty() && state.waiting.is_empty() && state.tp_due.is_some()
+            });
+            // Working transmit indication on, the active one still off; the next send is due.
+            rig.set_number("CP_TransmitIndEnable", 1);
+            rig.arm_probe();
+            state().lock().unwrap().pending_events.clear();
+            state().lock().unwrap().tp_due = Some(Instant::now());
+            let update = rig.start(E_PDU_COPT::PDU_COPT_UPDATEPARAM, &[]);
+            {
+                let guard = state().lock().unwrap();
+                assert!(Rig::probe_used(&guard), "the tester-present was not sent");
+                let raised = guard
+                    .scheduled
+                    .iter()
+                    .map(|(_, event)| event)
+                    .chain(guard.pending_events.iter())
+                    .filter(|event| {
+                        matches!(event.kind, EventKind::Indication(Indication::Transmit))
+                            && event.h_cop == PDU_HANDLE_UNDEF
+                    })
+                    .count();
+                assert_eq!(raised, 0, "judged with the UPDATEPARAM's settings");
+            }
+            rig.finished_or_result(update);
+            // The UPDATEPARAM's settings apply from then on: the next send raises one.
+            rig.set_number("CP_TesterPresentTime", 20_000);
+            let update = rig.start(E_PDU_COPT::PDU_COPT_UPDATEPARAM, &[]);
+            rig.finished_or_result(update);
+            state().lock().unwrap().pending_events.clear();
+            rig.wait_for("a transmit indication", |state| {
+                state.pending_events.iter().any(|event| {
+                    matches!(event.kind, EventKind::Indication(Indication::Transmit))
+                        && event.h_cop == PDU_HANDLE_UNDEF
+                })
+            });
+        }
+
+        /// Sets a ComParam through the FFI, whatever the value.
+        fn try_set(name: &str, mut value: u32) -> T_PDU_ERROR {
+            let mut item = PDU_PARAM_ITEM {
+                ItemType: E_PDU_IT::PDU_IT_PARAM,
+                ComParamId: standard_comparam_id(name).unwrap(),
+                ComParamDataType: E_PDU_PT::PDU_PT_UNUM32,
+                ComParamClass: E_PDU_PC::PDU_PC_COM,
+                pComParamData: (&mut value as *mut u32).cast(),
+            };
+            unsafe { PDUSetComParam(MOCK_MODULE_HANDLE, MOCK_LOGICAL_LINK_HANDLE, &mut item) }
+        }
+
+        #[test]
+        fn a_value_of_2_through_the_ffi_is_refused_and_leaves_the_buffer() {
+            let _rig = Rig::new();
+            for name in ["CP_TransmitIndEnable", "CP_StartMsgIndEnable"] {
+                assert_eq!(try_set(name, 2), invalid_parameters(), "{name}");
+            }
+            assert_eq!(state().lock().unwrap().ind_working, Indications::default());
+        }
+
+        #[test]
+        fn pdu_connect_copies_the_working_buffer_to_the_active_one() {
+            let rig = Rig::new();
+            set(&rig, 1, 1);
+            assert_eq!(state().lock().unwrap().ind_active, Indications::default());
+            unsafe { PDUConnect(MOCK_MODULE_HANDLE, MOCK_LOGICAL_LINK_HANDLE) };
+            let both = Indications {
+                transmit: true,
+                start: true,
+            };
+            assert_eq!(state().lock().unwrap().ind_active, both);
+            // A later write waits in the working buffer.
+            set(&rig, 0, 0);
+            assert_eq!(state().lock().unwrap().ind_active, both);
+        }
+
+        #[test]
+        fn a_queued_primitive_keeps_the_copy_it_took_when_an_updateparam_follows() {
+            let rig = Rig::new();
+            set(&rig, 1, 0);
+            let update = rig.start(E_PDU_COPT::PDU_COPT_UPDATEPARAM, &[]);
+            rig.finished_or_result(update);
+            // A slow response keeps the first primitive running while the others queue.
+            rig.ecu(r#"{"inject_fault":{"fault":{"delay_response":{"ms":300}},"service":34}}"#);
+            let first = rig.start(E_PDU_COPT::PDU_COPT_SENDRECV, VIN_READ);
+            // Queued behind it with the transmit indication on, then the setting is turned off
+            // and activated by an UPDATEPARAM started after it.
+            let second = rig.start(E_PDU_COPT::PDU_COPT_SENDRECV, SESSION);
+            set(&rig, 0, 0);
+            let update = rig.start(E_PDU_COPT::PDU_COPT_UPDATEPARAM, &[]);
+            assert_eq!(state().lock().unwrap().ind_active, Indications::default());
+            let mut seen = Vec::new();
+            let started = Instant::now();
+            while !seen.iter().any(|e: &PendingEvent| {
+                e.h_cop == update && matches!(&e.kind, EventKind::Result(_) | EventKind::Status(_))
+            }) {
+                seen.extend(std::mem::take(&mut state().lock().unwrap().pending_events));
+                assert!(started.elapsed() < Duration::from_secs(5), "no end");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let transmits = |cop| {
+                seen.iter()
+                    .filter(|e| e.h_cop == cop)
+                    .filter(|e| matches!(e.kind, EventKind::Indication(Indication::Transmit)))
+                    .count()
+            };
+            assert_eq!(transmits(first), 1);
+            assert_eq!(transmits(second), 1);
+        }
     }
 }

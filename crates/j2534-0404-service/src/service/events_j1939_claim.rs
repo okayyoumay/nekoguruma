@@ -1073,7 +1073,7 @@ pub(super) async fn run_j1939_claim_loop(
             // `run_due_tick_duties`'s own call, not the in-flight-transfer
             // shape `isotp_send` needs.
             run_detached_registrant_maintenance(ctx).await;
-            dispatch_due_tester_present(false, None, None, false, ctx).await;
+            dispatch_due_tester_present(None, None, None, false, ctx).await;
             tokio::time::sleep(poll_interval).await;
             if !poll_rx(ctx).await.is_ok() {
                 return J1939ClaimLoopOutcome::HardError;
@@ -2112,6 +2112,7 @@ mod tests {
             tester_present_state: TesterPresentState::None,
             tester_present_base_tx_flags: 0,
             open_tp_discards: Vec::new(),
+            open_func_tx: None,
             working_unique_resp_id_table: Vec::new(),
             active_unique_resp_id_table: Vec::new(),
             unique_resp_filter_ids: Vec::new(),

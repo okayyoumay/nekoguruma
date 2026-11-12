@@ -1,7 +1,7 @@
 # ADR-099: Tester-Present Discard Extends to Indication Frames (SOM / TX_DONE / Loopback), and Now Windows on Every Successful Send
 
 **Date:** 2026-07-17
-**Status:** Accepted (amends ADR-088, ADR-093; amended by ADR-100)
+**Status:** Accepted (amends ADR-088, ADR-093; amended by ADR-100; D-PDU counterpart: ADR-430)
 **Affects:** `j2534-0404-service` service, events
 
 ## Context

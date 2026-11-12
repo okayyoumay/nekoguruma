@@ -238,6 +238,7 @@ fn program() -> Program {
         },
     ]);
     let ecu = |field_id| Source::EcuService {
+        target: 0,
         service_id: 1,
         field_id,
     };
@@ -257,6 +258,7 @@ fn program() -> Program {
         },
         preconditions: Default::default(),
         flash: Vec::new(),
+        targets: Vec::new(),
     };
     program.preconditions.voltage_mv = Some(Precondition {
         satisfied: Satisfied {
@@ -267,6 +269,7 @@ fn program() -> Program {
         programming_session: vbatt,
     });
     program.flash.push(FlashRecovery {
+        target: 0,
         flash_session: 1,
         stage: STAGE,
         max_resumes: 2,
@@ -809,7 +812,16 @@ fn a_worker_crashed_mid_transfer_is_restarted_like_a_killed_agent() {
         &env,
         &spec,
         &crash,
-        |cause| matches!(cause, HostError::Rpc { status, .. } if status.code() == tonic::Code::Unavailable),
+        // The dead worker's event stream fails while the `Wait` runs, which the host reads at the
+        // `Wait`'s next poll and reports by refusing the next request, unsent, with that failure
+        // (ADR-420 item 8); a request that reached the worker first fails to start instead.
+        |cause| match cause {
+            HostError::StreamFailedBeforeSend(inner) => {
+                matches!(&**inner, HostError::Rpc { rpc, .. } if *rpc == "SubscribeEvent")
+            }
+            HostError::Rpc { status, .. } => status.code() == tonic::Code::Unavailable,
+            _ => false,
+        },
     );
     assert!(
         crash.link_unconfirmed,
@@ -950,7 +962,8 @@ fn an_ecu_power_loss_mid_transfer_is_restarted_once_power_returns() {
 
 /// The VCI is unplugged while the agent waits after block 4 (design 5.6, 8.2.5; ADR-229 item 1,
 /// ADR-238): the next block's transfer fails on the lost device and the run ends there, keeping
-/// its guards and its journal; the link cannot be confirmed closed on a lost device (ADR-258).
+/// its guards and its journal; the link's first close is answered `ERR_DEVICE_NOT_CONNECTED`,
+/// which confirms it (ADR-393, ADR-422).
 /// The ECU, untouched, stays in its programming session with the transfer running. The agent's
 /// next run, on a new worker with the VCI plugged back in, takes the same restart order as after
 /// an agent kill and completes, with the restart's ECUReset the only power cycle.
@@ -967,14 +980,14 @@ fn a_vci_disconnect_mid_transfer_is_restarted_once_the_vci_is_back() {
     );
     assert!(env.commands_applied(), "the disconnect should be applied");
     assert!(
-        run.link_unconfirmed,
-        "a link on a lost device cannot be confirmed closed"
+        !run.link_unconfirmed,
+        "the lost path's first close is answered ERR_DEVICE_NOT_CONNECTED and confirms the link"
     );
     let first_attempt = assert_interrupted_at_the_next_block(&env, &spec, &run, |cause| {
         // The worker's receive poll met the lost device and took the link offline, so the
         // transfer finds no connected link; the worker's refusal carries the lost VCI, which
         // the host reports as such (ADR-294).
-        matches!(cause, HostError::VciLost)
+        matches!(cause, HostError::VciLost { .. })
     });
     // The probe loads the library in a process of its own, with the VCI present: the
     // disconnect belonged to the stopped worker's process.
@@ -1021,7 +1034,9 @@ fn a_write_failure_mid_transfer_is_restarted() {
         &spec,
         KILL_AFTER_BLOCK,
         WAIT_FOR_BLOCK,
-        r#"{"command": "fail_writes", "times": 1}"#,
+        // TransferData only: a tester present the job's keep-alive sends during the park must
+        // not take the failure (ADR-418, ADR-420).
+        r#"{"command": "fail_writes", "times": 1, "service": 54}"#,
     );
     assert!(
         env.commands_applied(),
@@ -1065,7 +1080,9 @@ fn a_write_failure_mid_transfer_is_restarted() {
 
 /// The VCI crashes while the agent waits after block 4 (design 5.6, 13.4; ADR-229 item 1,
 /// ADR-292): it stays plugged in, but every J2534 call fails, so the next block's transfer fails
-/// and the run ends there, keeping its guards and its journal. The ECU, untouched, stays in its
+/// and the run ends there, keeping its guards and its journal; the link's first close releases
+/// the device but reports `ERR_FAILED`, so the worker keeps its slot, and the second close is
+/// answered `ERR_INVALID_DEVICE_ID` and confirms it (ADR-292, ADR-422). The ECU, untouched, stays in its
 /// programming session with the transfer running. The agent's next run, on a new worker whose
 /// VCI answers again, takes the same restart order as after an agent kill and completes, with
 /// the restart's ECUReset the only power cycle.
@@ -1082,14 +1099,15 @@ fn a_vci_crash_mid_transfer_is_restarted_once_the_vci_answers_again() {
     );
     assert!(env.commands_applied(), "the crash should be applied");
     assert!(
-        run.link_unconfirmed,
-        "the crashed VCI fails the close, so the link cannot be confirmed closed"
+        !run.link_unconfirmed,
+        "the first close releases the device but reports ERR_FAILED, so the worker keeps its slot; \
+         the second is answered ERR_INVALID_DEVICE_ID and confirms the link"
     );
     let first_attempt = assert_interrupted_at_the_next_block(&env, &spec, &run, |cause| {
         // The worker's receive poll met the failing VCI and took the link offline, as for a lost
         // device, so the transfer finds no connected link and the host reports the lost VCI
         // (ADR-294).
-        matches!(cause, HostError::VciLost)
+        matches!(cause, HostError::VciLost { .. })
     });
     let before = env.probe();
     assert_eq!(
@@ -1183,12 +1201,25 @@ fn kill_while_unanswered(
     // The program waits right before the request, so the fault is armed before it goes out,
     // and nothing else is sent in between to take it.
     env.wait_for(spec, "the wait before the request", WAIT_FOR_BLOCK, &parked);
+    // Aimed at the request: the job's link keeps its session alive (ADR-420), so the worker's
+    // tester-present may reach the ECU first, and an unaimed fault would be spent on it.
+    let hex: String = request.split_whitespace().skip(1).collect();
+    let bytes: Vec<String> = (0..hex.len())
+        .step_by(2)
+        .map(|at| {
+            u8::from_str_radix(&hex[at..at + 2], 16)
+                .expect("hex")
+                .to_string()
+        })
+        .collect();
     env.inject(&format!(
         concat!(
-            r#"{{"command": "inject_fault", "fault": {{"response_pending": "#,
+            r#"{{"command": "inject_fault", "request": [{}], "fault": {{"response_pending": "#,
             r#"{{"count": {}, "interval_ms": {}}}}}}}"#
         ),
-        PENDING_COUNT, PENDING_INTERVAL_MS
+        bytes.join(", "),
+        PENDING_COUNT,
+        PENDING_INTERVAL_MS
     ));
     env.wait_for(spec, request, WAIT_FOR_BLOCK, |state| {
         // A fault still waiting when the program has moved on was missed: fail on that. The
@@ -1204,8 +1235,9 @@ fn kill_while_unanswered(
         parked(state) && sent && applied
     });
     let sent_at = std::time::Instant::now();
-    // The trace line is written as the request is sent, just before the ECU handles it; the
-    // kill waits until the ECU has, well within the response-pending sequence.
+    // `sim-vci` writes the trace line only once the ECU has handled the request and saved its
+    // state, so the kill cannot overtake that save, however long the worker is descheduled. The
+    // kill comes well within the response-pending sequence.
     std::thread::sleep(KILL_DELAY);
     let status = agent.kill();
     assert!(
@@ -1663,7 +1695,7 @@ fn a_next_run_with_the_vci_still_unplugged_keeps_the_job_for_a_later_run() {
     );
     assert!(env.commands_applied(), "the disconnect should be applied");
     let first_attempt = assert_interrupted_at_the_next_block(&env, &spec, &run, |cause| {
-        matches!(cause, HostError::VciLost)
+        matches!(cause, HostError::VciLost { .. })
     });
     let before = env.probe();
     let journal_before =
@@ -1741,7 +1773,8 @@ fn a_converted_starlark_procedure_killed_mid_transfer_is_restarted() {
             && env.commands_applied()
     });
     let sent_at = std::time::Instant::now();
-    // The kill waits until the ECU has the request, well within the response-pending sequence.
+    // `sim-vci` traces the block only once the ECU has handled it and saved its state, so the
+    // kill cannot overtake that save; it comes well within the response-pending sequence.
     std::thread::sleep(KILL_DELAY);
     let status = agent.kill();
     assert!(

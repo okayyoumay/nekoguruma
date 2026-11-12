@@ -75,9 +75,9 @@ pub const T2_T3_READ_CHECK: CheckDecl = CheckDecl {
     operations: &[],
 };
 
-/// `hw_t2_timing`: on a bench ECU, the P2 and P2* the ECU reports and the agent's round trips of
-/// a few requests, compared with the values `sim-ecu` uses (`checks::t2_timing`). It needs a T2
-/// profile and no operation beyond reads.
+/// `hw_t2_timing`: on a bench ECU, the P2 and P2* the ECU reports, compared with the values
+/// `sim-ecu` uses, and the latency the VCI measured for a few requests, judged against that P2
+/// (`checks::t2_timing`, ADR-356). It needs a T2 profile and no operation beyond reads.
 pub const T2_TIMING_CHECK: CheckDecl = CheckDecl {
     name: "hw_t2_timing",
     classes: &[Class::T2],

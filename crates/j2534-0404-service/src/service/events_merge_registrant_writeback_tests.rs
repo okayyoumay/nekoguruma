@@ -24,6 +24,7 @@ fn registrant(matches_got: u32, pending_rc: Option<u8>) -> CopRegistrant {
         concat_enabled: false,
         concat: Vec::new(),
         concat_segments_got: 0,
+        som_started: Vec::new(),
     }
 }
 
@@ -33,6 +34,7 @@ fn baseline(matches_got: u32, pending_rc: Option<u8>) -> RegistrantBaseline {
         matches_got,
         pending_rc,
         concat_segments_got: 0,
+        som_started: Vec::new(),
         timing_accumulator: None,
     }
 }
@@ -252,14 +254,17 @@ fn absolute_overwrite_would_have_pulled_the_deadline_backward() {
 fn concat_segments_got_delta_merge_sums_the_passs_own_contribution() {
     let mut live = CopRegistrant {
         concat_segments_got: 1,
+        som_started: Vec::new(),
         ..registrant(0, None)
     };
     let snap = CopRegistrant {
         concat_segments_got: 3,
+        som_started: Vec::new(),
         ..registrant(0, None)
     };
     let base = RegistrantBaseline {
         concat_segments_got: 1,
+        som_started: Vec::new(),
         ..baseline(0, None)
     };
 
@@ -307,10 +312,12 @@ fn concat_buffers_are_written_back_from_the_snapshot() {
     let snap = CopRegistrant {
         concat: vec![buf_a.clone(), buf_b.clone()],
         concat_segments_got: 2,
+        som_started: Vec::new(),
         ..registrant(0, None)
     };
     let base = RegistrantBaseline {
         concat_segments_got: 0,
+        som_started: Vec::new(),
         ..baseline(0, None)
     };
 
@@ -347,6 +354,7 @@ fn concat_buffer_finalize_clears_live_too() {
     let mut live = CopRegistrant {
         concat: vec![stale_buf],
         concat_segments_got: 1,
+        som_started: Vec::new(),
         ..registrant(0, None)
     };
     // This pass's own snapshot already finalized the buffer (e.g. via
@@ -355,11 +363,13 @@ fn concat_buffer_finalize_clears_live_too() {
     let snap = CopRegistrant {
         concat: Vec::new(),
         concat_segments_got: 1,
+        som_started: Vec::new(),
         matches_got: 1,
         ..registrant(0, None)
     };
     let base = RegistrantBaseline {
         concat_segments_got: 1,
+        som_started: Vec::new(),
         ..baseline(0, None)
     };
 
@@ -454,4 +464,264 @@ fn merge_registrant_writeback_applies_a_genuinely_changed_timing_accumulator() {
         live.timing_accumulator, new_value,
         "a snapshot that genuinely changed since its own baseline must still be applied"
     );
+}
+
+/// A pass that saw a message start adds its URID live; a pass carrying the
+/// unchanged set forward never undoes a change another pass merged; a pass
+/// that ended the message (a content frame from that URID) removes it.
+#[test]
+fn som_started_merges_only_a_change_made_by_the_pass_itself() {
+    let mut live = registrant(0, None);
+    let set = CopRegistrant {
+        som_started: vec![1],
+        ..registrant(0, None)
+    };
+    merge_registrant_writeback(&mut live, &set, &baseline(0, None));
+    assert_eq!(
+        live.som_started,
+        [1],
+        "a pass that started a message sets it live"
+    );
+
+    // A stale pass: baseline empty, snapshot empty -- no change, set stays.
+    merge_registrant_writeback(&mut live, &registrant(0, None), &baseline(0, None));
+    assert_eq!(
+        live.som_started,
+        [1],
+        "an unchanged snapshot must not clear it"
+    );
+
+    // A pass that started from [1] and ended it.
+    let base = RegistrantBaseline {
+        som_started: vec![1],
+        ..baseline(0, None)
+    };
+    merge_registrant_writeback(&mut live, &registrant(0, None), &base);
+    assert!(
+        live.som_started.is_empty(),
+        "a pass that ended it clears it live"
+    );
+}
+
+fn waiting(cop_handle: u32, ids: Vec<u32>) -> CopRegistrant {
+    CopRegistrant {
+        cop_handle,
+        expected: vec![ExpectedResponse {
+            mask: Vec::new(),
+            pattern: Vec::new(),
+            unique_resp_ids: ids,
+            acceptance_id: 0,
+        }],
+        ..registrant(0, None)
+    }
+}
+
+/// Only a registrant that waits on the indication's response ID (and belongs
+/// to this connection) is marked, and the timeout is named only for a marked
+/// registrant.
+#[test]
+fn start_of_message_marks_only_registrants_waiting_on_that_response_id() {
+    let mut registrants = vec![
+        waiting(1, vec![1]),
+        waiting(2, vec![2]),
+        waiting(3, vec![]),
+        CopRegistrant {
+            connect_generation: 9,
+            ..waiting(4, vec![])
+        },
+        CopRegistrant {
+            expected: Vec::new(),
+            ..registrant(0, None)
+        },
+    ];
+    registrants[4].cop_handle = 5;
+    note_start_of_message(&mut registrants, 1, 1);
+    note_start_of_message(&mut registrants, 1, 1);
+    assert_eq!(registrants[0].som_started, [1], "marked once");
+    assert_eq!(
+        rx_timeout_name(&registrants, 1),
+        Some("ISO15765_CF_TIMEOUT")
+    );
+    assert_eq!(rx_timeout_name(&registrants, 2), None);
+    assert_eq!(
+        rx_timeout_name(&registrants, 3),
+        Some("ISO15765_CF_TIMEOUT"),
+        "a descriptor that accepts any ECU waits on every response ID"
+    );
+    assert_eq!(rx_timeout_name(&registrants, 4), None, "another connection");
+    assert_eq!(rx_timeout_name(&registrants, 5), None, "no descriptors");
+    assert_eq!(rx_timeout_name(&registrants, 99), None);
+}
+
+/// A content frame from a URID ends that URID's started message for every
+/// registrant, and only that URID's: another ECU's started message stays, so
+/// the timeout stays named while one is still open. Fails if the ending is
+/// removed.
+#[test]
+fn a_content_frame_ends_only_its_own_started_message() {
+    let mut registrants = vec![waiting(1, vec![]), waiting(2, vec![])];
+    note_start_of_message(&mut registrants, 1, 1);
+    note_start_of_message(&mut registrants, 1, 2);
+    note_message_ended(&mut registrants, 1);
+    for cop in [1, 2] {
+        assert_eq!(
+            rx_timeout_name(&registrants, cop),
+            Some("ISO15765_CF_TIMEOUT"),
+            "ECU 2's message is still open for COP {cop}"
+        );
+    }
+    note_message_ended(&mut registrants, 2);
+    for cop in [1, 2] {
+        assert_eq!(rx_timeout_name(&registrants, cop), None, "COP {cop}");
+    }
+}
+
+/// A software ISO-TP reassembly failure binds to the one COP waiting on the
+/// response ID at the first frame: none when no COP or more than one waits,
+/// and none when the recorded COP no longer waits when the failure comes.
+#[test]
+fn a_reassembly_failure_binds_to_the_sole_waiting_cop_while_it_still_waits() {
+    let registrants = vec![
+        waiting(1, vec![1]),
+        waiting(2, vec![2]),
+        CopRegistrant {
+            connect_generation: 9,
+            ..waiting(3, vec![])
+        },
+    ];
+    assert_eq!(sole_waiting_cop(&registrants, 1, 1), Some(1));
+    assert_eq!(sole_waiting_cop(&registrants, 1, 3), None, "none waits");
+    let with_monitor = [registrants.clone(), vec![waiting(4, vec![])]].concat();
+    assert_eq!(
+        sole_waiting_cop(&with_monitor, 1, 1),
+        None,
+        "two wait on the response ID"
+    );
+
+    let tag = |c: u32| (c == 1).then(|| vec![0xAB]);
+    assert_eq!(
+        reassembly_failure_cop(Some(1), &registrants, tag),
+        Some((1, Some(vec![0xAB])))
+    );
+    assert_eq!(reassembly_failure_cop(None, &registrants, tag), None);
+    assert_eq!(
+        reassembly_failure_cop(Some(1), &registrants[1..], tag),
+        None,
+        "the recorded COP has finished"
+    );
+}
+
+/// A first or single frame replacing an unfinished reassembly takes it as an
+/// `ISO15765_UNEXPECTED_PDU` frame-structure failure carrying the COP recorded
+/// at its first frame; nothing when none was in progress, for the echo of the
+/// service's own request, or when the replacing frame is that echo; and one
+/// already past N_Cr is taken by the expiry sweep first, as `CF_TIMEOUT`.
+#[test]
+fn a_replaced_reassembly_is_taken_as_an_unexpected_pdu() {
+    let start = Instant::now();
+    let long = Duration::from_secs(60);
+    let key = (0x7E8, false);
+    let mut map = HashMap::new();
+    assert_eq!(take_replaced_reassembly(&mut map, &key, false), None);
+
+    let mut open = isotp::Reassembly::start(20, &[0; 6], start, long);
+    open.waiting_cop = Some(5);
+    map.insert(key, open);
+    assert_eq!(
+        take_replaced_reassembly(&mut map, &key, false),
+        Some(IsoTpRxNote::Failed {
+            error: PduErrorEvent::PduErrEvtFrameStruct,
+            name: ISO15765_UNEXPECTED_PDU_NAME,
+            waiting_cop: Some(5),
+        })
+    );
+    assert!(map.is_empty());
+
+    let mut echo = isotp::Reassembly::start(20, &[0; 6], start, long);
+    echo.tx_echo = true;
+    map.insert(key, echo);
+    assert_eq!(take_replaced_reassembly(&mut map, &key, false), None);
+    assert!(map.is_empty());
+
+    map.insert(key, isotp::Reassembly::start(20, &[0; 6], start, long));
+    assert_eq!(take_replaced_reassembly(&mut map, &key, true), None);
+    assert!(map.is_empty());
+
+    let mut late = isotp::Reassembly::start(20, &[0; 6], start, Duration::from_millis(10));
+    late.waiting_cop = Some(5);
+    map.insert(key, late);
+    let later = start + Duration::from_millis(11);
+    assert_eq!(
+        take_expired_reassemblies(&mut map, later),
+        [n_cr_expired(Some(5))]
+    );
+    assert_eq!(take_replaced_reassembly(&mut map, &key, false), None);
+}
+
+/// A first or single frame reaching a reassembly already past N_Cr, with no
+/// sweep since, raises the one `ISO15765_CF_TIMEOUT` and no
+/// `ISO15765_UNEXPECTED_PDU`; an unfinished one still within N_Cr raises only
+/// the latter, and an echo of the service's own request nothing.
+#[test]
+fn a_frame_ending_an_expired_reassembly_raises_only_the_timeout() {
+    let start = Instant::now();
+    let key = (0x7E8, false);
+    let mut map = HashMap::new();
+    let mut late = isotp::Reassembly::start(20, &[0; 6], start, Duration::from_millis(10));
+    late.waiting_cop = Some(5);
+    map.insert(key, late);
+    let after = start + Duration::from_millis(11);
+    assert_eq!(
+        end_unfinished_reassembly(&mut map, &key, after, false),
+        [n_cr_expired(Some(5))]
+    );
+    assert!(map.is_empty());
+
+    let mut open = isotp::Reassembly::start(20, &[0; 6], start, Duration::from_secs(60));
+    open.waiting_cop = Some(5);
+    map.insert(key, open);
+    assert_eq!(
+        end_unfinished_reassembly(&mut map, &key, after, false),
+        [IsoTpRxNote::Failed {
+            error: PduErrorEvent::PduErrEvtFrameStruct,
+            name: ISO15765_UNEXPECTED_PDU_NAME,
+            waiting_cop: Some(5),
+        }]
+    );
+
+    let mut echo = isotp::Reassembly::start(20, &[0; 6], start, Duration::from_millis(10));
+    echo.tx_echo = true;
+    map.insert(key, echo);
+    assert_eq!(end_unfinished_reassembly(&mut map, &key, after, false), []);
+    assert!(map.is_empty());
+}
+
+/// Only the reassemblies past N_Cr are taken, each as a receive timeout named
+/// `ISO15765_CF_TIMEOUT` carrying the COP recorded at its first frame; the
+/// echo of the service's own request is dropped with no failure.
+#[test]
+fn only_reassemblies_past_n_cr_are_taken_as_cf_timeouts() {
+    let start = Instant::now();
+    let mut map = HashMap::new();
+    let mut late = isotp::Reassembly::start(20, &[0; 6], start, Duration::from_millis(10));
+    late.waiting_cop = Some(5);
+    map.insert((0x7E8, false), late);
+    map.insert(
+        (0x7E9, false),
+        isotp::Reassembly::start(20, &[0; 6], start, Duration::from_secs(60)),
+    );
+    let mut echo = isotp::Reassembly::start(20, &[0; 6], start, Duration::from_millis(10));
+    echo.tx_echo = true;
+    map.insert((0x7E0, false), echo);
+    let expired = take_expired_reassemblies(&mut map, start + Duration::from_millis(11));
+    assert_eq!(
+        expired,
+        [IsoTpRxNote::Failed {
+            error: PduErrorEvent::PduErrEvtRxTimeout,
+            name: ISO15765_CF_TIMEOUT_NAME,
+            waiting_cop: Some(5),
+        }]
+    );
+    assert_eq!(map.len(), 1);
+    assert!(map.contains_key(&(0x7E9, false)));
 }

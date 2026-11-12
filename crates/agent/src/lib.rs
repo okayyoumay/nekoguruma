@@ -9,6 +9,10 @@
 //! - [`link`]: the communication link a job runs on, set up through the worker's D-PDU API
 //!   before the procedure starts
 //! - [`host`]: [`diag_ir::DiagHost`] on top of the worker gRPC client
+//! - [`identification`]: the identification job's plan, its checks and the endpoints it derives (ADR-395)
+//! - [`identity`]: the agent's key in a named-secret store, created once under a lock (design 6.4,
+//!   ADR-459, ADR-460)
+//! - [`state`]: where the agent keeps its state for each operating mode (design 6.2, ADR-460)
 //! - [`inputs`]: the runtime inputs and service fields a restart reads (ADR-229, ADR-245)
 //! - [`journal`]: the write-job journal a restart resumes from (ADR-244)
 //! - [`restart`]: how a job whose journal exists goes on (ADR-253, ADR-255)
@@ -28,9 +32,12 @@ pub mod comm_log;
 pub mod document;
 pub mod guards;
 pub mod host;
+pub mod identification;
+pub mod identity;
 pub mod inputs;
 pub mod journal;
 mod journaling;
+mod keep_alive;
 pub mod launch;
 pub mod link;
 pub mod logging;
@@ -39,10 +46,13 @@ pub mod policy;
 pub mod restart;
 pub mod runner;
 pub mod send_receive;
+pub mod state;
 
 pub use artifact::Artifact;
-pub use client::WorkerApi;
-pub use comm_log::{CommLog, CommLogIncomplete, CommLogSetup, CommLogStatus, VciFacts, run_key};
+pub use client::{ExitHow, WorkerApi, WorkerExit, WorkerSource, WorkerStatus};
+pub use comm_log::{
+    CommLog, CommLogIncomplete, CommLogSetup, CommLogStatus, VciFacts, VciMargins, run_key,
+};
 pub use document::JobDocument;
 pub use host::{HostError, Timings, WorkerHost};
 pub use journal::Vin;

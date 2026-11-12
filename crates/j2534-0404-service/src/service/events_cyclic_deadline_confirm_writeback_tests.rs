@@ -34,6 +34,7 @@ fn minimal_link() -> LogicalLinkState {
         tester_present_state: TesterPresentState::None,
         tester_present_base_tx_flags: 0,
         open_tp_discards: Vec::new(),
+        open_func_tx: None,
         working_unique_resp_id_table: Vec::new(),
         active_unique_resp_id_table: Vec::new(),
         unique_resp_filter_ids: Vec::new(),
@@ -84,6 +85,7 @@ fn cyclic_registrant(cop_handle: u32, deadline: tokio::time::Instant) -> CopRegi
         concat_enabled: false,
         concat: Vec::new(),
         concat_segments_got: 0,
+        som_started: Vec::new(),
     }
 }
 
@@ -310,6 +312,7 @@ fn a_finite_count_tier_one_registrant_never_enters_confirm_scope() {
         concat_enabled: false,
         concat: Vec::new(),
         concat_segments_got: 0,
+        som_started: Vec::new(),
     };
     assert!(
         !is_eager_cyclic_deadline_confirm_scope(&tier1),

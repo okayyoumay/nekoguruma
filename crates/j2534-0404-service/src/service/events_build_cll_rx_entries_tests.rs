@@ -45,6 +45,7 @@ fn minimal_link() -> LogicalLinkState {
         tester_present_state: TesterPresentState::None,
         tester_present_base_tx_flags: 0,
         open_tp_discards: Vec::new(),
+        open_func_tx: None,
         working_unique_resp_id_table: Vec::new(),
         active_unique_resp_id_table: Vec::new(),
         unique_resp_filter_ids: Vec::new(),
@@ -119,6 +120,31 @@ async fn absent_cll_is_stamped_none() {
         entries[0].set_seq_at_read, None,
         "a CLL absent from the pre-read snapshot must stamp None, never a live fallback"
     );
+}
+
+/// ADR-421: `open_func_tx` is snapshotted into `func_tx_can_id`, and an
+/// unmarked link snapshots `None`.
+#[tokio::test]
+async fn open_func_tx_is_snapshotted_into_func_tx_can_id() {
+    let marked = LogicalLinkState {
+        open_func_tx: Some(0x7DF),
+        ..minimal_link()
+    };
+    let logical_links = Arc::new(Mutex::new(HashMap::from([
+        (PRESENT_CLL, marked),
+        (ABSENT_CLL, minimal_link()),
+    ])));
+    let mut entries = build_cll_rx_entries(
+        CHANNEL,
+        &logical_links,
+        &no_cop_tags(),
+        &HashMap::new(),
+        CanChannelMode::SingleChannel,
+    )
+    .await;
+    entries.sort_by_key(|e| e.handle);
+    assert_eq!(entries[0].func_tx_can_id, Some(0x7DF));
+    assert_eq!(entries[1].func_tx_can_id, None);
 }
 
 /// ADR-217 Codex-review fix, PR #132 round 2: a qualified (pin-selected)
@@ -196,6 +222,49 @@ async fn unqualified_link_on_a_native_mixed_module_gets_native_mixed_true() {
             ..
         }
     ));
+}
+
+/// ADR-352: an entry's `CP_CanPhysReqId` becomes its key's request ID when
+/// its requests are normally addressed, and none when `CP_CanPhysReqFormat`
+/// selects extended addressing, since entries behind one CAN ID that differ
+/// only by their address extension would share it.
+#[tokio::test]
+async fn the_physical_request_id_keys_only_a_normally_addressed_entry() {
+    let entry = |uid: u32, format: Option<u32>| {
+        let mut params = ComParamSet::default();
+        params.unum32.insert(PARAM_CAN_RESP_USDT_ID, 0x7E8 + uid);
+        params.unum32.insert(PARAM_CAN_PHYS_REQ_ID, 0x7E0 + uid);
+        if let Some(format) = format {
+            params.unum32.insert(PARAM_CAN_PHYS_REQ_FORMAT, format);
+        }
+        EcuUniqueRespEntry {
+            unique_resp_identifier: uid,
+            params,
+        }
+    };
+    let link = LogicalLinkState {
+        // No format, a normal-addressing format, and an extended one (bit 3).
+        active_unique_resp_id_table: vec![entry(0, None), entry(1, Some(0)), entry(2, Some(0x08))],
+        ..minimal_link()
+    };
+    let logical_links = Arc::new(Mutex::new(HashMap::from([(PRESENT_CLL, link)])));
+    let snapshot: HashMap<u32, u64> = HashMap::from([(PRESENT_CLL, 7)]);
+
+    let entries = build_cll_rx_entries(
+        CHANNEL,
+        &logical_links,
+        &no_cop_tags(),
+        &snapshot,
+        CanChannelMode::SingleChannel,
+    )
+    .await;
+
+    let request_ids: Vec<_> = entries[0]
+        .unique_resp_ids
+        .iter()
+        .map(|key| (key.unique_resp_identifier, key.can_phys_req_id))
+        .collect();
+    assert_eq!(request_ids, [(0, Some(0x7E0)), (1, Some(0x7E1)), (2, None)]);
 }
 
 /// ADR-184: an `active_unique_resp_id_table` entry keyed ONLY by
@@ -461,6 +530,7 @@ fn minimal_registrant(cop_handle: u32) -> CopRegistrant {
         concat_enabled: false,
         concat: Vec::new(),
         concat_segments_got: 0,
+        som_started: Vec::new(),
     }
 }
 
@@ -595,4 +665,30 @@ async fn cop_tags_snapshot_survives_a_primitives_removal_racing_the_later_resolu
         "the tag captured at snapshot time must survive a concurrent primitives removal \
          landing after the snapshot but before this frame's own resolution"
     );
+}
+
+/// ADR-421: a marker is set only for the link's own generation and while it is
+/// still on the sending channel; a clear needs no channel.
+#[tokio::test]
+async fn set_open_func_tx_needs_the_generation_and_the_channel() {
+    let detached = LogicalLinkState {
+        channel_id: None,
+        ..minimal_link()
+    };
+    let links = Mutex::new(HashMap::from([
+        (PRESENT_CLL, detached),
+        (ABSENT_CLL, minimal_link()),
+    ]));
+    // minimal_link's generation is 7.
+    set_open_func_tx(&links, PRESENT_CLL, 7, CHANNEL, Some(0x7DF)).await;
+    set_open_func_tx(&links, ABSENT_CLL, 6, CHANNEL, Some(0x7DF)).await;
+    {
+        let guard = links.lock().await;
+        assert_eq!(guard[&PRESENT_CLL].open_func_tx, None, "no channel");
+        assert_eq!(guard[&ABSENT_CLL].open_func_tx, None, "other generation");
+    }
+    set_open_func_tx(&links, ABSENT_CLL, 7, CHANNEL, Some(0x7DF)).await;
+    assert_eq!(links.lock().await[&ABSENT_CLL].open_func_tx, Some(0x7DF));
+    set_open_func_tx(&links, ABSENT_CLL, 7, CHANNEL, None).await;
+    assert_eq!(links.lock().await[&ABSENT_CLL].open_func_tx, None);
 }

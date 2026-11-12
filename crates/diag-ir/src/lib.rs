@@ -5,6 +5,9 @@
 //! - [`dry_run`]: a procedure run with vehicle access mocked (12.1, ADR-328).
 //! - [`identify`]: the identification runs of candidate variants and the variant they select
 //!   (8.9.1).
+//! - [`link`]: the rules a declared link must meet, applied by both the agent and the CSV
+//!   conversion (8.2.4, ADR-406).
+//! - [`plan`]: the identification plan an identification job carries (8.8.2, ADR-395).
 //! - Procedure part: custom bytecode VM. The entire execution state must be serializable (8.2.3).
 
 // The FlatBuffers bindings of the declaration part name `alloc::` paths (`declaration`).
@@ -16,6 +19,8 @@ pub mod dry_run;
 pub mod encode;
 pub mod hmi;
 pub mod identify;
+pub mod link;
+pub mod plan;
 mod recovery;
 
 pub use recovery::*;
@@ -54,10 +59,61 @@ use crate::declaration::{EcuVariant, Shape};
 /// 19: `Op` gained `HmiRequestFromStack`, and `VmError` gained `BadHmiForm` and
 /// `HmiFormTooLong`; the constant of `HmiRequest` and `RecordInput` is an encoded
 /// [`hmi::HmiTemplate`] (ADR-340).
-pub const IR_SCHEMA_VERSION: u32 = 19;
+/// 20: `EcuDocument` gained `definition_id`, the identifier of the ECU definition a vehicle
+/// definition names (ADR-363); a document of version 19 has none.
+/// 21: `Program` gained `targets`, `Op` gained `SelectTarget`, `VmState` gained `target` and
+/// `VmError` gained `BadTarget` (ADR-325 item 3, ADR-409); a program or state of version 20 does
+/// not decode.
+/// 22: `Source::EcuService` and `FlashRecovery` gained `target`, the index into the program's
+/// target list (ADR-325 items 3 and 4, ADR-410); a program of version 21 does not decode.
+pub const IR_SCHEMA_VERSION: u32 = 22;
+
+/// The step budget of one run of a procedure, shared by the agent's default job limit and the
+/// conversion's dry run (ADR-391), so a procedure the conversion accepts does not run out of
+/// steps on a vehicle that answers the same way.
+pub const DEFAULT_MAX_STEPS: u64 = 1_000_000;
+
+/// Whether `level` (a SecurityAccess sub-function without the suppress bit) is a seed level of
+/// the standard's requestSeed and sendKey pairing: odd from 0x01 to 0x41, or 0x5F (ISO 14229-1
+/// (2026) 9.4.2.2). The supplier-specific range 0x61 to 0x7E and the reserved values define no
+/// pairing, so nothing reads their data as a seed. The lowering's zero-seed rule (ADR-405) and
+/// the agent's communication-log redaction (ADR-347) both decide by this.
+pub const fn is_standard_seed_level(level: u8) -> bool {
+    matches!(level, 0x01..=0x41 | 0x5F) && level & 1 == 1
+}
+
+/// Whether `request` asks for its positive response to be suppressed: bit 7 of the
+/// sub-function of a service that has one (ISO 14229-1:2026 8.2.2: DiagnosticSessionControl,
+/// ECUReset, SecurityAccess, CommunicationControl, Authentication, ReadDTCInformation,
+/// TesterPresent, ControlDTCSetting, ResponseOnEvent, LinkControl,
+/// DynamicallyDefineDataIdentifier, RoutineControl), which the ECU leaves unanswered when the
+/// request succeeds. One function for the agent's host (the result and the log) and the dry run
+/// (ADR-408, ADR-397).
+pub fn suppresses_positive_response(request: &[u8]) -> bool {
+    matches!(
+        request,
+        [0x10 | 0x11 | 0x19 | 0x27 | 0x28 | 0x29 | 0x2C | 0x31 | 0x3E | 0x85 | 0x86 | 0x87, sub, ..]
+            if sub & 0x80 != 0
+    )
+}
 
 /// The longest code, in bytes, that `Program::validate` accepts for a `Fail` (ADR-280).
 pub const MAX_FAILURE_CODE_LEN: usize = 128;
+
+/// UDS's read-only services (ADR-235 item 8, ADR-309 item 4): ReadDTCInformation and
+/// ReadDataByIdentifier, which change nothing on the ECU. TesterPresent is left out: it keeps
+/// the ECU's current session alive, which a job may only do once it owns that session.
+pub const UDS_READ_ONLY_SERVICES: &[u8] = &[0x19, 0x22];
+
+/// The service identifiers a read-only job may send on the application layer a protocol names
+/// (`Protocol::application_layer`), or `None` for a layer without a list (ADR-327 item 1: a
+/// variant pattern, a VIN source or a matching rule may name only these).
+pub fn read_only_services(layer: &str) -> Option<&'static [u8]> {
+    match layer {
+        "UDS" => Some(UDS_READ_ONLY_SERVICES),
+        _ => None,
+    }
+}
 /// The longest detail of a `Fail`, in bytes of text, that a caller keeps (ADR-280).
 pub const MAX_FAILURE_DETAIL_LEN: usize = 1024;
 /// The longest byte string `Concat` builds: the bound of an encoded request
@@ -290,6 +346,17 @@ pub enum Op {
     HmiRequestFromStack {
         form: u32,
     },
+
+    // Targets. Appended after `HmiRequestFromStack` (ADR-233, ADR-325 item 3).
+    /// Makes target `target` (an index into `Program::targets`; 0, the primary, is the only
+    /// index of a program with no list) current for the instructions that address an ECU. The
+    /// host is told through `DiagHost::select_target` when the target changes; naming the
+    /// current target completes without a host call. An index at or past
+    /// `Program::target_count()` is `VmError::BadTarget`, before anything changes. Sends
+    /// nothing and is no diagnostic primitive.
+    SelectTarget {
+        target: u8,
+    },
 }
 
 // ---------------------------------------------------------------- Program
@@ -312,6 +379,32 @@ pub struct Program {
     /// Recovery plans, one per flash session (8.10.1, ADR-245). [`Program::validate`] checks them.
     #[serde(default)]
     pub flash: Vec<FlashRecovery>,
+    /// The ECUs the program addresses (ADR-325 item 3). Empty means the primary alone: the
+    /// program addresses the ECU of the document it travels in, as a program that declares no
+    /// target does. `SelectTarget` indexes this list.
+    #[serde(default)]
+    pub targets: Vec<Target>,
+}
+
+/// One ECU a program addresses (ADR-325 item 3), in declaration order, the primary first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Target {
+    /// An access target (ADR-325 item 5): its session and unlock other targets depend on.
+    pub access: bool,
+    /// The content hash (design 8.2.6) of the declaration-only document of the variant this
+    /// program was lowered against for this target.
+    pub declarations: plan::Sha256,
+}
+
+/// The most targets a program may list (ADR-325 item 1's limit, applied to the IR as well).
+pub const MAX_TARGETS: usize = 8;
+
+impl Program {
+    /// How many targets `SelectTarget` may name: the list's length, or one for an empty list.
+    pub fn target_count(&self) -> usize {
+        self.targets.len().max(1)
+    }
 }
 
 /// Interruptibility sections from 8.10.1. Expressed with the same mechanism as the idempotency attribute of the resume model (8.2.5).
@@ -413,6 +506,7 @@ impl Op {
             | Op::DecodeField { .. }
             | Op::FlashBlock { .. }
             | Op::ReadInput { .. }
+            | Op::SelectTarget { .. }
             | Op::Fail { .. } => false,
         }
     }
@@ -441,6 +535,8 @@ pub struct VmState {
     /// Instructions completed so far. Survives resumption; used for audit and for step limits
     /// the job runner may enforce.
     pub steps: u64,
+    /// The current target, an index into `Program::targets` (ADR-325 item 3); 0 at the start.
+    pub target: u8,
 }
 
 /// A suspended caller: where to return to and its locals.
@@ -468,10 +564,13 @@ pub enum Value {
 pub trait DiagHost {
     type Error: std::error::Error + Send + Sync + 'static;
 
+    /// An empty answer is the silence of a request whose positive response is suppressed
+    /// ([`suppresses_positive_response`], ADR-408).
     fn service_request(&mut self, service: u16, payload: &[u8]) -> Result<Vec<u8>, Self::Error>;
     /// [`Op::SendReceive`]: sends `request` as it is and returns the answer to it, matched
     /// against the positive response of `service` (`Service.id`) and the negative-response
-    /// shape of the link's protocol (ADR-309 item 4, ADR-321).
+    /// shape of the link's protocol (ADR-309 item 4, ADR-321). An empty answer is as for
+    /// [`service_request`](Self::service_request).
     fn send_receive(&mut self, service: u32, request: &[u8]) -> Result<Vec<u8>, Self::Error>;
     fn read_dtc(&mut self, mask: u8) -> Result<Vec<u8>, Self::Error>;
     fn routine_control(
@@ -523,12 +622,22 @@ pub trait DiagHost {
     /// declares (the communication log's `identity` event, design 8.11). The VM never calls it;
     /// a host that keeps no such record ignores it.
     fn note_identity(&mut self, _kind: IdentityKind, _read: IdentityRead<'_>) {}
+    /// The target the following instructions address (ADR-325 item 3, ADR-409): called once
+    /// before the first instruction of a run, new or restored, and whenever
+    /// [`Op::SelectTarget`] changes the target. A notification, not a request: it cannot fail,
+    /// and a host that serves one target refuses the next exchange instead. A host with one
+    /// target ignores it.
+    fn select_target(&mut self, _target: u8) {}
 }
 
 // ---------------------------------------------------------------- VM
 
 pub struct Vm {
     pub state: VmState,
+    /// Whether the host has been told the current target in this run
+    /// ([`DiagHost::select_target`]). False after `new` and `resume`; set at the first
+    /// instruction that runs.
+    told_target: bool,
 }
 
 impl Vm {
@@ -542,13 +651,24 @@ impl Vm {
                 globals: Vec::new(),
                 call_stack: Vec::new(),
                 steps: 0,
+                target: 0,
             },
+            told_target: false,
         }
     }
 
     /// Resume from an interrupted journal.
     pub fn resume(state: VmState) -> Self {
-        Self { state }
+        Self {
+            state,
+            told_target: false,
+        }
+    }
+
+    /// The one call of [`DiagHost::select_target`] (ADR-409).
+    fn tell_target<H: DiagHost>(&mut self, host: &mut H) {
+        host.select_target(self.state.target);
+        self.told_target = true;
     }
 
     /// The instruction the next [`Vm::step`] executes, or `None` when the program has finished.
@@ -612,6 +732,9 @@ impl Vm {
         if self.state.pc as usize > program.code.len() {
             return Err(VmError::BadPc(self.state.pc));
         }
+        if usize::from(self.state.target) >= program.target_count() {
+            return Err(VmError::BadTarget(self.state.target));
+        }
         Ok(())
     }
 
@@ -646,6 +769,13 @@ impl Vm {
         let Some(op) = self.current_op(program)? else {
             return Ok(StepOutcome::Finished);
         };
+        // After `check_state` and the instruction's pre-host checks (`check_primitive`), so a
+        // refused state or primitive never reaches the host. A non-primitive's run-time error
+        // (a stack underflow, say) can still follow: the notification is infallible and changes
+        // nothing in the ECU.
+        if !self.told_target {
+            self.tell_target(host);
+        }
         match self.execute(op, program, declarations, host)? {
             Executed::Done => {
                 self.state.steps += 1;
@@ -958,6 +1088,14 @@ impl Vm {
                 self.state.stack.pop();
             }
 
+            Op::SelectTarget { target } => {
+                // Range checked in `check_primitive`, before any host call.
+                if *target != self.state.target {
+                    self.state.target = *target;
+                    self.tell_target(host);
+                }
+            }
+
             // Terminal and not a primitive: the state stays on the instruction, like a wait, so
             // stepping again gives the same outcome (ADR-280).
             Op::Fail { code } => {
@@ -1058,6 +1196,13 @@ impl Vm {
             | Op::ReadInput { .. } => HostInput::Nothing,
             // The checks of `Fail` run in `execute`, before it changes anything.
             Op::Fail { .. } => HostInput::Nothing,
+            // Not a primitive, but its range check precedes the host's first-step notification.
+            Op::SelectTarget { target } => {
+                if usize::from(*target) >= program.target_count() {
+                    return Err(VmError::BadTarget(*target));
+                }
+                HostInput::Nothing
+            }
         })
     }
 
@@ -1243,6 +1388,17 @@ fn store(slots: &mut Vec<Option<Value>>, slot: u16, value: Value) {
 ///   segment with a zero block size, one whose end (offset plus length) passes `u64::MAX`, or one
 ///   whose longest block is longer than [`MAX_BYTES_LEN`] (ADR-336).
 ///
+/// After the instructions, each flash recovery plan of `program.flash`, in plan order, must name
+/// a flash session the variant declares (`FlashSession.id`), else [`VmError::UnknownFlashSession`]
+/// (ADR-245), and every segment of that session must pass the segment checks above, as
+/// [`flash_session_extents`] reads them for the job's artifact check; the error is reported at
+/// the plan's `boundaries.entry_pc`. Whether a job has an artifact does not change the result.
+/// An instruction's error takes precedence over a plan's.
+///
+/// The declarations checked are those of one target: a caller of a program with several targets
+/// passes target 0's part, and the agent refuses a program with several targets before this
+/// check (ADR-409, ADR-410).
+///
 /// These errors depend only on the declarations, so a caller can refuse such a program before
 /// it runs.
 pub fn check_declarations(
@@ -1266,6 +1422,12 @@ pub fn check_declarations(
             _ => Ok(()),
         };
         checked.map_err(|error| (u32::try_from(pc).unwrap_or(u32::MAX), error))?;
+    }
+    // Every segment of a plan's session, as the job's artifact check reads them: whether the
+    // segments are well formed depends only on the declarations, not on the artifact.
+    for plan in &program.flash {
+        flash_session_extents(variant, plan.flash_session)
+            .map_err(|error| (plan.boundaries.entry_pc, error))?;
     }
     Ok(())
 }
@@ -1291,14 +1453,23 @@ pub fn flash_session_extents(
     variant: &EcuVariant<'_>,
     session: u32,
 ) -> Result<Vec<(u64, u64)>, VmError> {
-    let declared = variant
-        .flash_sessions()
-        .and_then(|sessions| sessions.iter().find(|s| s.id() == session))
-        .ok_or(VmError::UnknownFlashSession { session })?;
+    let declared = declared_session(variant, session)?;
     let count = declared.segments().map_or(0, |segments| segments.len());
     (0..count)
         .map(|segment| flash_segment_extent(variant, session, segment as u32))
         .collect()
+}
+
+/// The flash session `session` (`FlashSession.id`) of `variant`, or
+/// [`VmError::UnknownFlashSession`] when the variant does not declare it.
+fn declared_session<'a>(
+    variant: &EcuVariant<'a>,
+    session: u32,
+) -> Result<crate::declaration::FlashSession<'a>, VmError> {
+    variant
+        .flash_sessions()
+        .and_then(|sessions| sessions.iter().find(|s| s.id() == session))
+        .ok_or(VmError::UnknownFlashSession { session })
 }
 
 /// The offset, block size and length of segment `segment` (an index into `segments`) of flash
@@ -1309,10 +1480,7 @@ fn declared_segment(
     session: u32,
     segment: u32,
 ) -> Result<(u64, u32, u64), VmError> {
-    let declared = variant
-        .flash_sessions()
-        .and_then(|sessions| sessions.iter().find(|s| s.id() == session))
-        .ok_or(VmError::UnknownFlashSession { session })?;
+    let declared = declared_session(variant, session)?;
     let found = declared
         .segments()
         .filter(|segments| (segment as usize) < segments.len())
@@ -1637,6 +1805,8 @@ pub enum VmError {
     /// The encoded length, or the length of the text operands alone when they already pass it.
     #[error("the HMI form encodes to {0} bytes or more, more than {max}", max = hmi::MAX_HMI_FORM_LEN)]
     HmiFormTooLong(u64),
+    #[error("target {0} is not in the program's target list")]
+    BadTarget(u8),
 }
 
 #[cfg(test)]

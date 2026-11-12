@@ -4,20 +4,50 @@ use std::time::Duration;
 
 use crate::client::WorkerApi;
 use diag_ir::declaration::{EcuVariant, Protocol};
+use diag_ir::link as link_rules;
 use tonic::Streaming;
 use vci_service_interface::{
     ComLogicalLinkHandle, ConnectComLogicalLinkRequest, CreateComLogicalLinkRequest,
     DestroyComLogicalLinkRequest, DisconnectComLogicalLinkRequest, EcuUniqueRespData,
     EventNotification, GetModuleIdsRequest, GetObjectIdRequest, GetResourceIdsRequest,
     ModuleConnectRequest, ModuleDisconnectRequest, ModuleHandle, ObjectType, ParamItem,
-    PduParamClass, PinData, ResourceData, SetComParamRequest, SetUniqueRespIdTableRequest,
-    SubscribeEventRequest, UniqueRespIdTableItem, VersionData, create_com_logical_link_request,
-    param_item, pin_data, resource_data, subscribe_event_request,
+    PduParamClass, PendingForwarding, PinData, ResourceData, SetComParamRequest,
+    SetUniqueRespIdTableRequest, SubscribeEventRequest, UniqueRespIdTableItem, VersionData,
+    create_com_logical_link_request, param_item, pin_data, resource_data, subscribe_event_request,
 };
 
 use crate::host::{HostError, unary};
 use crate::oplog::LogSafe;
 use crate::policy::{ApplicationLayer, Permission};
+
+/// The longest a classic ISO-TP message carries (a 12-bit length), the response the job-end
+/// wait allows for ([`LinkConfig::job_end_wait`]).
+pub const JOB_END_RESPONSE_BYTES: u64 = 4_095;
+/// An upper bound of one classic CAN frame's bits on the bus, stuffing included.
+pub const CAN_FRAME_BITS: u64 = 160;
+/// The longest message one classic CAN frame carries as a single frame whatever the addressing
+/// format: seven bytes only with normal addressing, six with extended or mixed (ISO
+/// 15765-2:2024 9.6.2.1).
+pub const CAN_SINGLE_FRAME_BYTES: usize = 6;
+/// A message a link sends as one frame ([`LinkConfig::single_frame`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SingleFrame {
+    /// The longest message one frame surely carries.
+    pub max_bytes: usize,
+    /// The longest that frame's transfer takes, in microseconds.
+    pub transfer_us: u64,
+}
+
+/// The `CP_Cr` the job-end wait takes when the link leaves it to the library: the timeout
+/// ISO 15765-2:2024 9.8.1 gives the receiver's wait for the next consecutive frame, 1 s.
+pub const JOB_END_DEFAULT_CR_US: u64 = 1_000_000;
+/// The job-end wait's cap (ADR-358).
+pub const JOB_END_WAIT_MAX: Duration = Duration::from_secs(10);
+
+/// The keep-alive's period when a link gives none (ADR-417 item 2).
+pub const DEFAULT_KEEP_ALIVE: Duration = Duration::from_secs(2);
+/// The shortest keep-alive period a link accepts (ADR-417 item 2).
+pub const MIN_KEEP_ALIVE: Duration = Duration::from_millis(200);
 
 /// What a job's link needs: from the protocol a job's document declares
 /// ([`LinkConfig::declared`], ADR-324), or built by the caller for a program without one.
@@ -39,6 +69,28 @@ pub struct LinkConfig {
     /// Further ComParams by short name, set on the link as the document declares them, after
     /// the link's own (ADR-324 item 3).
     pub params: Vec<(String, u32)>,
+    /// Functional addressing, for the link of an identification job's presence request
+    /// (ADR-327 item 2, ADR-396): `None` on every other link, which addresses its one ECU by
+    /// `tx_id` and `rx_id`. On a functional link `tx_id` is the functional identifier and `rx_id`
+    /// is 0, since no one response identifier is the link's.
+    pub functional: Option<FunctionalAddressing>,
+    /// The period of the worker's cyclic tester-present that keeps a non-default session alive
+    /// on this link (design 8.2.5, ADR-418, ADR-420), or `None` for a link that keeps none
+    /// (ADR-264 item 4 then holds for it). On by default, every
+    /// [`DEFAULT_KEEP_ALIVE`]; a period below [`MIN_KEEP_ALIVE`] is refused by
+    /// [`LinkConfig::validate`].
+    pub keep_alive: Option<Duration>,
+}
+
+/// A link that sends its request to a functional identifier and receives from several ECUs
+/// (ADR-396).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionalAddressing {
+    /// The CAN identifier the request is sent to (`CP_CanFuncReqId`).
+    pub functional_id: u32,
+    /// The receive table: the physical request and response identifier of each ECU the link
+    /// listens for, in the order of its unique-response entries.
+    pub table: Vec<(u32, u32)>,
 }
 
 impl LinkConfig {
@@ -54,6 +106,25 @@ impl LinkConfig {
             p2_star_ms: 5_000,
             rc78_completion_ms: 25_000,
             params: Vec::new(),
+            functional: None,
+            keep_alive: Some(DEFAULT_KEEP_ALIVE),
+        }
+    }
+
+    /// This link's protocol, baud rate, timings and ComParams on a functional link to
+    /// `functional_id` that receives from `table` (ADR-396). The caller has set the timings it
+    /// wants on `self`. A functional link keeps no session alive: its requests are presence
+    /// requests, and the tester-present ComParams address one ECU physically.
+    pub fn functional(&self, functional_id: u32, table: Vec<(u32, u32)>) -> Self {
+        Self {
+            tx_id: functional_id,
+            rx_id: 0,
+            functional: Some(FunctionalAddressing {
+                functional_id,
+                table,
+            }),
+            keep_alive: None,
+            ..self.clone()
         }
     }
 
@@ -61,74 +132,30 @@ impl LinkConfig {
     /// its identifiers and baud rate. P2, P2* and the 0x78 completion timeout come from its
     /// ComParams `CP_P2Max`, `CP_P2Star` and `CP_RC78CompletionTimeout` in microseconds, rounded
     /// up to whole milliseconds, or from [`LinkConfig::iso15765`] when it declares none; its
-    /// other ComParams are set on the link as they are. ComParam names are compared ignoring
-    /// case, as the workers resolve them, and a ComParam with a unit is refused, since the agent
-    /// cannot convert units. The result is validated.
+    /// other ComParams are set on the link as they are. The rules are `diag_ir::link`'s, which
+    /// the CSV conversion applies too (ADR-406); the result is validated.
     pub fn declared(variant: &EcuVariant<'_>) -> Result<Self, HostError> {
         let refuse = |why: String| HostError::DeclaredLink(why);
         let protocols: Vec<Protocol<'_>> = variant.protocols().into_iter().flatten().collect();
-        let protocol = match protocols.as_slice() {
-            [only] => *only,
-            [] => return Err(refuse("the variant declares no protocol".to_owned())),
-            _ => {
-                return Err(refuse(
-                    "the variant declares several protocols; choosing one is not supported yet"
-                        .to_owned(),
-                ));
-            }
+        let protocol = link_rules::only_protocol(&protocols).map_err(|r| refuse(r.to_string()))?;
+        let declared = link_rules::check_protocol(&(*protocol).into()).map_err(|refusals| {
+            refuse(
+                refusals
+                    .first()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
+            )
+        })?;
+        let defaults = Self::iso15765(declared.tx_id, declared.rx_id);
+        let ms = |us: Option<u32>, default: u32| us.map_or(default, |us| us.div_ceil(1_000));
+        let config = Self {
+            baud_rate: declared.baud_rate,
+            p2_max_ms: ms(declared.p2_max_us, defaults.p2_max_ms),
+            p2_star_ms: ms(declared.p2_star_us, defaults.p2_star_ms),
+            rc78_completion_ms: ms(declared.rc78_completion_us, defaults.rc78_completion_ms),
+            params: declared.params,
+            ..defaults
         };
-        let name = protocol.short_name().unwrap_or_default();
-        if !UDS_ON_CAN_NAMES.contains(&name) || protocol.application_layer() != Some("UDS") {
-            return Err(refuse(format!(
-                "protocol {name:?} carrying {:?} is not UDS on CAN",
-                protocol.application_layer().unwrap_or_default()
-            )));
-        }
-        if protocol.extended_addressing() {
-            return Err(refuse(
-                "extended addressing is not supported: the link does not set it".to_owned(),
-            ));
-        }
-        let mut config = Self {
-            baud_rate: protocol.baud_rate(),
-            params: Vec::new(),
-            ..Self::iso15765(protocol.tx_id(), protocol.rx_id())
-        };
-        let mut seen: Vec<&str> = Vec::new();
-        for param in protocol.params().into_iter().flatten() {
-            let name = param.short_name().unwrap_or_default();
-            if seen.iter().any(|seen| seen.eq_ignore_ascii_case(name)) {
-                return Err(refuse(format!("ComParam {name} is declared twice")));
-            }
-            seen.push(name);
-            // A unit is an id of the server's unit table, which the agent does not have: a
-            // value is taken in the ComParam's own unit (microseconds for a time).
-            if param.unit_id() != 0 {
-                return Err(refuse(format!(
-                    "ComParam {name} has a unit; give it in the ComParam's own unit, without one"
-                )));
-            }
-            let value = u32::try_from(param.value()).map_err(|_| {
-                refuse(format!(
-                    "ComParam {name} is {}, not a 32-bit unsigned value",
-                    param.value()
-                ))
-            })?;
-            let is = |standard: &str| name.eq_ignore_ascii_case(standard);
-            let timing = if is("CP_P2Max") {
-                Some(&mut config.p2_max_ms)
-            } else if is("CP_P2Star") {
-                Some(&mut config.p2_star_ms)
-            } else if is("CP_RC78CompletionTimeout") {
-                Some(&mut config.rc78_completion_ms)
-            } else {
-                None
-            };
-            match timing {
-                Some(ms) => *ms = value.div_ceil(1_000),
-                None => config.params.push((name.to_owned(), value)),
-            }
-        }
         config
             .validate()
             .map_err(|error| refuse(error.to_string()))?;
@@ -139,6 +166,48 @@ impl LinkConfig {
     /// accepts, and none on any other, so that a read-only job could send nothing on it.
     pub fn application_layer(&self) -> Option<ApplicationLayer> {
         (self.protocol_short_name == PROTOCOL_UDS_ON_CAN).then_some(ApplicationLayer::Uds)
+    }
+
+    /// The longest message the link surely sends as one frame, and the longest that frame's
+    /// transfer takes at the baud rate (design 8.11 "Timing judged", ADR-364): on UDS on CAN,
+    /// [`CAN_SINGLE_FRAME_BYTES`] in one frame of at most [`CAN_FRAME_BITS`]. `None` on any
+    /// other protocol, which [`LinkConfig::validate`] refuses.
+    pub fn single_frame(&self) -> Option<SingleFrame> {
+        (self.protocol_short_name == PROTOCOL_UDS_ON_CAN && self.baud_rate != 0).then(|| {
+            SingleFrame {
+                max_bytes: CAN_SINGLE_FRAME_BYTES,
+                transfer_us: (CAN_FRAME_BITS * 1_000_000).div_ceil(u64::from(self.baud_rate)),
+            }
+        })
+    }
+
+    /// How long the agent keeps the link open at job end for a primitive past its deadline
+    /// before it cancels it (design 8.11 "Settlement", ADR-358): the link's worst case for a
+    /// response already under way, one wait for a consecutive frame (`CP_Cr`) plus the transfer
+    /// of the longest response a classic ISO-TP message carries, received at the separation
+    /// time the tester's flow control requests (`CP_STmin`, ISO 15765-2:2024 9.6.5, 9.8.1), each
+    /// frame taking at most [`CAN_FRAME_BITS`] at the baud rate; at most
+    /// [`JOB_END_WAIT_MAX`]. A `CP_Cr` the link leaves to the library, or declares 0, counts as
+    /// [`JOB_END_DEFAULT_CR_US`], an unset `CP_STmin` as none. By the agent's deadline every
+    /// limit in force has passed, so none is added; an ECU that sends slower than `CP_STmin`
+    /// is cut off by the cap.
+    pub fn job_end_wait(&self) -> Duration {
+        let param = |name: &str| {
+            self.params
+                .iter()
+                .find(|(given, _)| given.eq_ignore_ascii_case(name))
+                .map(|(_, value)| u64::from(*value))
+        };
+        // A zero `CP_Cr` is taken as the library's default, as a zero P2 is (`validate`).
+        let cr_us = param("CP_Cr")
+            .filter(|&cr| cr != 0)
+            .unwrap_or(JOB_END_DEFAULT_CR_US);
+        let st_min_us = param("CP_STmin").unwrap_or(0);
+        // A first frame carries 6 bytes and each consecutive frame 7.
+        let frames = 1 + (JOB_END_RESPONSE_BYTES - 6).div_ceil(7);
+        let frame_us = (CAN_FRAME_BITS * 1_000_000).div_ceil(u64::from(self.baud_rate.max(1)));
+        let wait = Duration::from_micros(cr_us + frames * (frame_us + st_min_us));
+        wait.min(JOB_END_WAIT_MAX)
     }
 
     /// Refuses values the worker would read differently from the host: the worker replaces a
@@ -169,85 +238,107 @@ impl LinkConfig {
         if self.baud_rate == 0 {
             return Err(HostError::Setup("the baud rate must not be zero"));
         }
-        // The link sets these itself, from the fields above or for its response pending
-        // handling, and a further one would override it. The others would let a primitive run
-        // past the host's deadline: the worker would go on sending after the host gave up.
-        let named = |list: &[&str], name: &str| list.iter().any(|n| n.eq_ignore_ascii_case(name));
-        if self
-            .params
-            .iter()
-            .any(|(name, _)| named(&SET_BY_LINK, name) || named(&OUTLAST_THE_HOST, name))
+        if let Some(functional) = &self.functional {
+            functional.validate()?;
+        }
+        if let Some(period) = self.keep_alive
+            && period < MIN_KEEP_ALIVE
         {
             return Err(HostError::Setup(
-                "a further ComParam is one the link sets itself, or one that lets a primitive \
-                 outlast the host's deadline (ADR-324 item 3)",
+                "the keep-alive period must be at least 200 ms (a zero period is not one)",
             ));
         }
-        // Only the standard's ComParams: the J2534 worker also resolves names of its own, which
-        // could name what the link sets under another name.
-        if self
-            .params
-            .iter()
-            .any(|(name, _)| !name.get(..3).is_some_and(|p| p.eq_ignore_ascii_case("CP_")))
+        if let Some(period) = self.keep_alive
+            && period > Duration::from_micros(u64::from(u32::MAX))
         {
             return Err(HostError::Setup(
-                "a further ComParam must have a standard name, starting with CP_",
+                "the keep-alive period does not fit the worker's microsecond ComParam",
             ));
+        }
+        // The link sets some itself, from the fields above or for its response pending
+        // handling, and a further one would override it; others would let a primitive run past
+        // the host's deadline: the worker would go on sending after the host gave up. Only the
+        // standard's ComParams: the J2534 worker also resolves names of its own, which could
+        // name what the link sets under another name.
+        for (name, _) in &self.params {
+            match link_rules::further_comparam(name) {
+                Ok(()) => {}
+                Err(link_rules::ComParamRefusal::NotStandardName) => {
+                    return Err(HostError::Setup(
+                        "a further ComParam must have a standard name, starting with CP_",
+                    ));
+                }
+                Err(_) => {
+                    return Err(HostError::Setup(
+                        "a further ComParam is one the link sets itself, or one that lets a \
+                         primitive outlast the host's deadline (ADR-324 item 3)",
+                    ));
+                }
+            }
         }
         Ok(())
     }
 
     /// How long a send-receive may take before the host gives up: the first response window,
     /// the whole 0x78 chain, one more P2*, and a margin for the worker and the transmission of
-    /// the request (ADR-235 item 6).
+    /// the request (ADR-235 item 6). On a functional link the API restarts the window for each
+    /// answer, so the window is allowed once per receive-table entry (ADR-396).
     pub fn send_recv_ceiling(&self) -> Duration {
+        let windows = self
+            .functional
+            .as_ref()
+            .map_or(1, |functional| functional.table.len().max(1) as u64);
         Duration::from_millis(
-            u64::from(self.p2_max_ms)
+            u64::from(self.p2_max_ms) * windows
                 + u64::from(self.rc78_completion_ms)
                 + u64::from(self.p2_star_ms),
         ) + Duration::from_secs(2)
     }
 }
 
-/// The one protocol the runner supports: UDS on CAN, by its ISO 22900-2 (2022) short name
-/// (Annex B.1). Both worker kinds resolve the link's resource from the standard names (ADR-319).
-pub const PROTOCOL_UDS_ON_CAN: &str = "ISO_14229_3_on_ISO_15765_2";
-/// The protocol names a document may declare UDS on CAN by (ADR-324 item 2): the transport's
-/// name the CSV tables use, or the ISO 22900-2 (2022) short name the link names its resource by
-/// (Annex B.1, ADR-319).
-const UDS_ON_CAN_NAMES: [&str; 2] = ["ISO15765", PROTOCOL_UDS_ON_CAN];
-/// The ComParams the link sets itself ([`set_up_link`]).
-const SET_BY_LINK: [&str; 12] = [
-    "CP_Baudrate",
-    "CP_P2Max",
-    "CP_P2Star",
-    "CP_RC78Handling",
-    "CP_RCByteOffset",
-    "CP_RC78CompletionTimeout",
-    "CP_RC21Handling",
-    "CP_RC23Handling",
-    "CP_TransmitIndEnable",
-    "CP_StartMsgIndEnable",
-    "CP_CanPhysReqId",
-    "CP_CanRespUSDTId",
-];
+impl FunctionalAddressing {
+    /// The table must name at least one ECU, every identifier must fit 11 bits, and the
+    /// functional identifier must not be one of the table's (a request to it would be answered
+    /// by the tester's own filter), nor may a pair repeat.
+    fn validate(&self) -> Result<(), HostError> {
+        if self.table.is_empty() {
+            return Err(HostError::Setup("a functional link needs a receive table"));
+        }
+        let ids = self.table.iter().flat_map(|&(tx, rx)| [tx, rx]);
+        if ids
+            .clone()
+            .chain([self.functional_id])
+            .any(|id| id > MAX_CAN_ID)
+        {
+            return Err(HostError::Setup(
+                "only 11-bit CAN IDs are supported: the link does not set the ID format yet",
+            ));
+        }
+        if ids.clone().any(|id| id == self.functional_id) {
+            return Err(HostError::Setup(
+                "the functional identifier equals a physical identifier of the receive table",
+            ));
+        }
+        let repeats = self
+            .table
+            .iter()
+            .enumerate()
+            .any(|(at, pair)| self.table[..at].contains(pair));
+        if repeats {
+            return Err(HostError::Setup("the receive table repeats a pair"));
+        }
+        Ok(())
+    }
+}
+
+pub use diag_ir::link::{MAX_CAN_ID, MAX_TIMING_MS, PROTOCOL_UDS_ON_CAN};
+/// `CP_RequestAddrMode`'s value for functional addressing (ISO 22900-2 (2022) Annex B ComParam
+/// table; the J2534 worker reads it the same way).
+const REQUEST_ADDR_MODE_FUNCTIONAL: u32 = 2;
 /// The indications the link turns on for the communication log (design 8.11 "Link settings
 /// for the log"): transmit indications and start-of-message indications, which the J2534 worker
 /// passes on only under them (ADR-151). A library that refuses one opens the link without it.
 pub(crate) const INDICATION_COMPARAMS: [&str; 2] = ["CP_TransmitIndEnable", "CP_StartMsgIndEnable"];
-/// ComParams that let a primitive run longer than [`LinkConfig::send_recv_ceiling`] allows:
-/// the limits and request times of repeating the request on a busy (0x21) or not-yet-complete
-/// (0x23) answer, which the link turns off (`CP_RC21Handling`, `CP_RC23Handling`), repeating it
-/// at the application or transport layer, and taking P2 and P2* from the ECU's session response.
-const OUTLAST_THE_HOST: [&str; 7] = [
-    "CP_RC21CompletionTimeout",
-    "CP_RC21RequestTime",
-    "CP_RC23CompletionTimeout",
-    "CP_RC23RequestTime",
-    "CP_RepeatReqCountApp",
-    "CP_RepeatReqCountTrans",
-    "CP_ModifyTiming",
-];
 /// The ID GetObjectId gives a name the implementation does not know (`PDU_ID_UNDEF`, ISO
 /// 22900-2 (2022) 8.4.23).
 const PDU_ID_UNDEF: u32 = 0xFFFF_FFFE;
@@ -257,12 +348,6 @@ pub const BUS_TYPE_DWCAN: &str = "ISO_11898_2_DWCAN";
 /// on pin 6, CAN low on pin 14.
 pub const DWCAN_PINS: [(u32, &str); 2] = [(6, "HI"), (14, "LOW")];
 
-/// Longest timing the worker's microsecond ComParams can hold.
-pub const MAX_TIMING_MS: u32 = u32::MAX / 1_000;
-/// 11-bit IDs only: a 29-bit ID needs `CP_CanPhysReqFormat` / `CP_CanRespUSDTFormat`, which
-/// `open` does not set yet.
-const MAX_CAN_ID: u32 = 0x7FF;
-
 /// Where the response code sits in a negative response: `7F`, SID, code.
 const RC_BYTE_OFFSET: u32 = 2;
 
@@ -270,7 +355,8 @@ const RC_BYTE_OFFSET: u32 = 2;
 pub struct Link {
     pub module_handle: ModuleHandle,
     pub cll_handle: ComLogicalLinkHandle,
-    pub events: Streaming<EventNotification>,
+    /// `None` once the host dropped the stream to close the link for a reopen (ADR-393).
+    pub events: Option<Streaming<EventNotification>>,
     /// What the job may send on this link: decided from the VCI the module reports (ADR-247).
     /// Not public: only [`open`] may decide it, so a library caller cannot grant a link to a
     /// real VCI the simulator permission.
@@ -283,6 +369,10 @@ pub struct Link {
     /// The module's version data, for the communication log's `vci_connected` (design 8.11);
     /// `None` when the worker did not give it.
     pub(crate) version: Option<VersionData>,
+    /// Whether the worker passes on every response pending the link sees, as its answer to
+    /// `CreateComLogicalLink` says (ADR-355); `None` when it does not say. The agent takes it
+    /// from the worker's answer alone (design principle 6).
+    pub(crate) forwards_pendings: Option<bool>,
 }
 
 /// Which indications the link has on: those of [`INDICATION_COMPARAMS`] the library accepted
@@ -293,6 +383,11 @@ pub(crate) struct Indications {
     pub(crate) transmit: bool,
     /// `CP_StartMsgIndEnable`.
     pub(crate) start_of_message: bool,
+    /// Not an indication: whether the library accepted the keep-alive's tester-present ComParams
+    /// ([`tester_present_comparams`]), the other thing a library may refuse at open. A link whose
+    /// library refused one opens without the keep-alive (design 8.2.5); false too when the link
+    /// asked for none.
+    pub(crate) tester_present: bool,
 }
 
 impl Indications {
@@ -314,11 +409,74 @@ impl Link {
 }
 
 fn param(id: u32, class: PduParamClass, value: u32) -> ParamItem {
+    param_valued(id, class, ParamValue::U32(value))
+}
+
+/// A ComParam's value as the link sets it: a number, or a byte field (ISO 22900-2 (2022)
+/// Annex B gives three of the tester-present ComParams that form).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParamValue {
+    U32(u32),
+    Bytes(&'static [u8]),
+}
+
+fn param_valued(id: u32, class: PduParamClass, value: ParamValue) -> ParamItem {
     ParamItem {
         id: Some(param_item::Id::ParamId(id)),
         com_param_class: class as i32,
-        param_data: Some(param_item::ParamData::Unum32(value)),
+        param_data: Some(match value {
+            ParamValue::U32(value) => param_item::ParamData::Unum32(value),
+            ParamValue::Bytes(bytes) => param_item::ParamData::Bytefield(bytes.to_vec()),
+        }),
     }
+}
+
+/// The tester-present request the worker sends cyclically: TesterPresent with sub-function 0,
+/// the two bytes the policy accepts for it (`policy::check_presence_request`).
+const TESTER_PRESENT_MESSAGE: &[u8] = &[0x3E, 0x00];
+/// The positive response to it the worker expects.
+const TESTER_PRESENT_POSITIVE: &[u8] = &[0x7E, 0x00];
+/// The negative response to it the worker expects: the negative-response SID and the service.
+const TESTER_PRESENT_NEGATIVE: &[u8] = &[0x7F, 0x3E];
+
+/// The name of the ComParam that switches the cyclic tester-present on and off: set last when
+/// the link opens, and by itself afterwards (`host`'s switch, ADR-420).
+pub(crate) const TESTER_PRESENT_HANDLING: &str = "CP_TesterPresentHandling";
+
+/// The ComParams of the worker's cyclic tester-present that the link sets when its keep-alive is
+/// on (ADR-418 item 2), by name, in the order they are set: [`TESTER_PRESENT_HANDLING`] last, so
+/// that it switches on only a complete set. Empty when the keep-alive is off. The message and
+/// the two expected responses are byte fields, the others numbers; the period is in
+/// microseconds. They are set under the class `PDU_PC_TESTER_PRESENT`, the concrete class the
+/// D-PDU worker passes to its library for these ComParams. The communication log's `link_opened`
+/// names the same (design 8.11).
+pub(crate) fn tester_present_comparams(config: &LinkConfig) -> Vec<(&'static str, ParamValue)> {
+    let Some(period) = config.keep_alive else {
+        return Vec::new();
+    };
+    vec![
+        (
+            "CP_TesterPresentMessage",
+            ParamValue::Bytes(TESTER_PRESENT_MESSAGE),
+        ),
+        ("CP_TesterPresentReqRsp", ParamValue::U32(1)),
+        (
+            "CP_TesterPresentExpPosResp",
+            ParamValue::Bytes(TESTER_PRESENT_POSITIVE),
+        ),
+        (
+            "CP_TesterPresentExpNegResp",
+            ParamValue::Bytes(TESTER_PRESENT_NEGATIVE),
+        ),
+        ("CP_TesterPresentAddrMode", ParamValue::U32(0)),
+        // Every period, whatever else the bus carries (ADR-418 item 2).
+        ("CP_TesterPresentSendType", ParamValue::U32(0)),
+        (
+            "CP_TesterPresentTime",
+            ParamValue::U32(u32::try_from(period.as_micros()).unwrap_or(u32::MAX)),
+        ),
+        (TESTER_PRESENT_HANDLING, ParamValue::U32(1)),
+    ]
 }
 
 /// `ms` is at most [`MAX_TIMING_MS`] after [`LinkConfig::validate`].
@@ -334,10 +492,8 @@ pub(crate) fn valued_by_document(variant: &EcuVariant<'_>) -> Vec<&'static str> 
     let mut named = vec!["CP_Baudrate"];
     for param in protocol.params().into_iter().flatten() {
         let name = param.short_name().unwrap_or_default();
-        for timing in ["CP_P2Max", "CP_P2Star", "CP_RC78CompletionTimeout"] {
-            if name.eq_ignore_ascii_case(timing) {
-                named.push(timing);
-            }
+        if let Some(timing) = link_rules::timing_of(name) {
+            named.push(timing.comparam());
         }
     }
     named
@@ -347,8 +503,8 @@ pub(crate) fn valued_by_document(variant: &EcuVariant<'_>) -> Vec<&'static str> 
 /// identifiers go into the response ID table instead, and the indications are set apart, since
 /// a library may refuse them ([`INDICATION_COMPARAMS`]). The communication log's `link_opened`
 /// names the same (design 8.11).
-pub(crate) fn own_comparams(config: &LinkConfig) -> [(&'static str, u32); 8] {
-    [
+pub(crate) fn own_comparams(config: &LinkConfig) -> Vec<(&'static str, u32)> {
+    let mut own = vec![
         ("CP_Baudrate", config.baud_rate),
         ("CP_P2Max", micros(config.p2_max_ms)),
         ("CP_P2Star", micros(config.p2_star_ms)),
@@ -364,7 +520,14 @@ pub(crate) fn own_comparams(config: &LinkConfig) -> [(&'static str, u32); 8] {
         // declares neither a pending code (ADR-309 item 5).
         ("CP_RC21Handling", 0),
         ("CP_RC23Handling", 0),
-    ]
+    ];
+    // The request goes to the functional identifier; the receive table still names the ECUs
+    // (ADR-396).
+    if let Some(functional) = &config.functional {
+        own.push(("CP_RequestAddrMode", REQUEST_ADDR_MODE_FUNCTIONAL));
+        own.push(("CP_CanFuncReqId", functional.functional_id));
+    }
+    own
 }
 
 fn micros(ms: u32) -> u32 {
@@ -412,6 +575,12 @@ pub(crate) struct OpenFailure {
     /// Whether what the open had already opened on the worker was closed again, or nothing was
     /// opened. When it is false the worker may still hold the module or the link (ADR-258).
     pub(crate) cleaned_up: bool,
+    /// The worker answered, refusing the receive table or the connect of the link: not a
+    /// timeout, not a lost path (ADR-396, the halving's trigger).
+    pub(crate) table_refused: bool,
+    /// What the failing step and the cleanup showed of the worker, for settling it when the
+    /// cleanup failed (ADR-394).
+    pub(crate) evidence: CloseEvidence,
 }
 
 impl OpenFailure {
@@ -420,8 +589,41 @@ impl OpenFailure {
         Self {
             error,
             cleaned_up: true,
+            table_refused: false,
+            evidence: CloseEvidence::default(),
         }
     }
+
+    /// A failure whose cleanup left `cleaned_up` and showed `evidence` of the worker.
+    fn unclean(error: HostError, cleaned_up: bool, mut evidence: CloseEvidence) -> Self {
+        evidence.note_error(&error);
+        Self {
+            error,
+            cleaned_up,
+            table_refused: false,
+            evidence,
+        }
+    }
+
+    /// [`OpenFailure::unclean`] after the module's disconnect, whose result is `closed`.
+    fn after_disconnect(error: HostError, closed: Result<(), HostError>) -> Self {
+        let mut evidence = CloseEvidence::default();
+        if let Err(cleanup) = &closed {
+            evidence.note_error(cleanup);
+        }
+        Self::unclean(error, closed.is_ok(), evidence)
+    }
+}
+
+/// Whether `error` is the worker's own answer refusing the unique-response table or the connect
+/// (rpc-api-guide "Reading a Worker's Answer"): a status the worker gave, which is not a loss of
+/// the path to the VCI. A deadline that passed and a connection that failed are not.
+fn refuses_receive_table(error: &HostError) -> bool {
+    matches!(
+        error,
+        HostError::Rpc { rpc: "SetUniqueRespIdTable" | "ConnectComLogicalLink", status }
+            if refused(status) && !crate::host::names_lost_vci(status)
+    )
 }
 
 /// [`open`], also telling whether a failed open left anything open on the worker.
@@ -441,38 +643,44 @@ pub(crate) async fn open_tracked<C: WorkerApi>(
     let version = vci_version(client, deadline, module_handle).await;
     let permission = vci_permission(version.as_ref());
 
-    let cll_handle = match create_link(client, config, deadline, module_handle).await {
-        Ok(cll_handle) => cll_handle,
-        Err(error) => {
-            // A module the client holds is not disconnected here, so that proves nothing: the
-            // failed create left nothing behind only when the worker refused it. A create that
-            // timed out or failed otherwise may have made a link nobody holds a handle for
-            // (ADR-258).
-            let cleaned_up = if client.held_module().is_some() {
-                nothing_created(&error)
-            } else {
-                disconnect_module(client, module_handle, deadline)
-                    .await
-                    .is_ok()
-            };
-            return Err(OpenFailure { error, cleaned_up });
-        }
-    };
+    let (cll_handle, forwards_pendings) =
+        match create_link(client, config, deadline, module_handle).await {
+            Ok(created) => created,
+            Err(error) => {
+                // A module the client holds is not disconnected here, so that proves nothing: the
+                // failed create left nothing behind only when the worker refused it. A create that
+                // timed out or failed otherwise may have made a link nobody holds a handle for
+                // (ADR-258).
+                if client.held_module().is_some() {
+                    let cleaned_up = nothing_created(&error);
+                    return Err(OpenFailure::unclean(
+                        error,
+                        cleaned_up,
+                        CloseEvidence::default(),
+                    ));
+                }
+                let closed = disconnect_module(client, module_handle, deadline).await;
+                return Err(OpenFailure::after_disconnect(error, closed));
+            }
+        };
     match set_up_link(client, config, deadline, cll_handle).await {
         Ok((events, indications)) => Ok(Link {
             module_handle,
             cll_handle,
-            events,
+            events: Some(events),
             permission,
             application_layer: config.application_layer(),
             indications,
             version,
+            forwards_pendings,
         }),
         Err(error) => {
-            let cleaned_up = teardown(client, module_handle, cll_handle, deadline)
-                .await
-                .is_ok();
-            Err(OpenFailure { error, cleaned_up })
+            let (closed, evidence) =
+                teardown_observed(client, module_handle, cll_handle, deadline, false).await;
+            Err(OpenFailure {
+                table_refused: refuses_receive_table(&error),
+                ..OpenFailure::unclean(error, closed.is_ok(), evidence)
+            })
         }
     }
 }
@@ -524,10 +732,8 @@ async fn open_module<C: WorkerApi>(
         // The connect may have completed on the worker after the deadline. Disconnecting a
         // module that is not connected changes nothing; when that disconnect fails too, the
         // module is not known to be disconnected.
-        let cleaned_up = disconnect_module(client, module_handle, deadline)
-            .await
-            .is_ok();
-        return Err(OpenFailure { error, cleaned_up });
+        let closed = disconnect_module(client, module_handle, deadline).await;
+        return Err(OpenFailure::after_disconnect(error, closed));
     }
     Ok(module_handle)
 }
@@ -634,7 +840,7 @@ async fn create_link<C: WorkerApi>(
     config: &LinkConfig,
     deadline: Duration,
     module_handle: ModuleHandle,
-) -> Result<ComLogicalLinkHandle, HostError> {
+) -> Result<(ComLogicalLinkHandle, Option<bool>), HostError> {
     let resource_id = unary(
         deadline,
         "GetResourceIds",
@@ -649,7 +855,7 @@ async fn create_link<C: WorkerApi>(
     .and_then(|data| data.resource_id_array.into_iter().next())
     .ok_or(HostError::Setup(NO_RESOURCE))?;
 
-    unary(
+    let created = unary(
         deadline,
         "CreateComLogicalLink",
         client.create_com_logical_link(CreateComLogicalLinkRequest {
@@ -660,9 +866,30 @@ async fn create_link<C: WorkerApi>(
             cll_create_flag: None,
         }),
     )
-    .await?
-    .cll_handle
-    .ok_or(HostError::Setup("no logical link handle"))
+    .await?;
+    let cll_handle = created
+        .cll_handle
+        .ok_or(HostError::Setup("no logical link handle"))?;
+    Ok((cll_handle, forwards_pendings(created.pending_forwarding)))
+}
+
+/// Whether the worker said the link forwards every pending (ADR-355): what it says, and only
+/// that; an unspecified or unknown value is not a guess.
+fn forwards_pendings(pending_forwarding: i32) -> Option<bool> {
+    match PendingForwarding::try_from(pending_forwarding) {
+        Ok(PendingForwarding::All) => Some(true),
+        Ok(PendingForwarding::NotAll) => Some(false),
+        Ok(PendingForwarding::Unspecified) | Err(_) => None,
+    }
+}
+
+/// The pairs of the link's receive table, one unique-response entry each, numbered from 1 in
+/// this order: the link's own pair, or a functional link's table.
+pub(crate) fn receive_table(config: &LinkConfig) -> Vec<(u32, u32)> {
+    match &config.functional {
+        Some(functional) => functional.table.clone(),
+        None => vec![(config.tx_id, config.rx_id)],
+    }
 }
 
 async fn set_up_link<C: WorkerApi>(
@@ -713,6 +940,11 @@ async fn set_up_link<C: WorkerApi>(
         .await?;
     }
     let mut indications = Indications::default();
+    let tester_present = tester_present_comparams(config);
+    if !tester_present.is_empty() {
+        indications.tester_present =
+            set_tester_present(client, deadline, cll_handle, &tester_present, &mut set).await?;
+    }
     for name in INDICATION_COMPARAMS {
         let accepted = set_indication(client, deadline, cll_handle, name, &mut set).await?;
         if name == INDICATION_COMPARAMS[0] {
@@ -729,13 +961,19 @@ async fn set_up_link<C: WorkerApi>(
         client.set_unique_resp_id_table(SetUniqueRespIdTableRequest {
             cll_handle: Some(cll_handle),
             unique_resp_id_table: Some(UniqueRespIdTableItem {
-                unique_data: vec![EcuUniqueRespData {
-                    unique_resp_identifier: 1,
-                    params: vec![
-                        param(phys_req, PduParamClass::PduPcUniqueId, config.tx_id),
-                        param(resp, PduParamClass::PduPcUniqueId, config.rx_id),
-                    ],
-                }],
+                unique_data: receive_table(config)
+                    .into_iter()
+                    .zip(1..)
+                    .map(
+                        |((tx_id, rx_id), unique_resp_identifier)| EcuUniqueRespData {
+                            unique_resp_identifier,
+                            params: vec![
+                                param(phys_req, PduParamClass::PduPcUniqueId, tx_id),
+                                param(resp, PduParamClass::PduPcUniqueId, rx_id),
+                            ],
+                        },
+                    )
+                    .collect(),
             }),
         }),
     )
@@ -805,6 +1043,79 @@ async fn set_indication<C: WorkerApi>(
     }
 }
 
+/// Sets the keep-alive's tester-present ComParams `comparams` and returns whether the library
+/// accepted them all. A library that does not know one, or refuses one, leaves the link without
+/// the keep-alive, as for an indication (design 8.2.5, 8.11): the handling is then set to 0
+/// (best effort), so that a library whose default is on does not send a half-set message. A worker
+/// that does not answer, or whose connection is gone, fails the link as for any other ComParam.
+async fn set_tester_present<C: WorkerApi>(
+    client: &mut C,
+    deadline: Duration,
+    cll_handle: ComLogicalLinkHandle,
+    comparams: &[(&'static str, ParamValue)],
+    set: &mut Vec<u32>,
+) -> Result<bool, HostError> {
+    for &(name, value) in comparams {
+        let id = match comparam_id(client, deadline, name).await {
+            Ok(id) => id,
+            Err(HostError::DeclaredLink(_)) => {
+                return Ok(refused_tester_present(client, deadline, cll_handle, name, set).await);
+            }
+            Err(HostError::Rpc { status, .. }) if refused(&status) => {
+                return Ok(refused_tester_present(client, deadline, cll_handle, name, set).await);
+            }
+            Err(error) => return Err(error),
+        };
+        set.push(id);
+        match unary(
+            deadline,
+            "SetComParam",
+            client.set_com_param(SetComParamRequest {
+                cll_handle: Some(cll_handle),
+                param_item: Some(param_valued(id, PduParamClass::PduPcTesterPresent, value)),
+            }),
+        )
+        .await
+        {
+            Ok(_) => {}
+            Err(HostError::Rpc { status, .. }) if refused(&status) => {
+                return Ok(refused_tester_present(client, deadline, cll_handle, name, set).await);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(true)
+}
+
+/// The library refused the keep-alive's ComParam `name`: switches its handling off, ignoring
+/// the answer, and returns false.
+async fn refused_tester_present<C: WorkerApi>(
+    client: &mut C,
+    deadline: Duration,
+    cll_handle: ComLogicalLinkHandle,
+    name: &str,
+    set: &[u32],
+) -> bool {
+    tracing::info!(
+        comparam = name,
+        "the library refused a tester-present ComParam; the link opens without the keep-alive"
+    );
+    if let Ok(id) = comparam_id(client, deadline, TESTER_PRESENT_HANDLING).await
+        && !set.contains(&id)
+    {
+        let _ = unary(
+            deadline,
+            "SetComParam",
+            client.set_com_param(SetComParamRequest {
+                cll_handle: Some(cll_handle),
+                param_item: Some(param(id, PduParamClass::PduPcTesterPresent, 0)),
+            }),
+        )
+        .await;
+    }
+    false
+}
+
 /// Whether `status` is the worker refusing a request, rather than the connection to it failing.
 fn refused(status: &tonic::Status) -> bool {
     !matches!(
@@ -827,18 +1138,174 @@ pub async fn close<C: WorkerApi>(
         application_layer: _,
         indications: _,
         version: _,
+        forwards_pendings: _,
     } = link;
     drop(events);
-    teardown(client, module_handle, cll_handle, deadline).await
+    teardown(client, module_handle, cll_handle, deadline, false).await
+}
+
+/// Whether a failed step of closing the link is the worker's own answer, that it did not do what
+/// was asked (rpc-api-guide "Reading a Worker's Answer", last row), as against no answer: a
+/// deadline that passed, or a connection to the worker that failed. Read from the status alone,
+/// never from which worker answered (design principle 6).
+pub(crate) fn is_workers_answer(error: &HostError) -> bool {
+    matches!(error, HostError::Rpc { status, .. } if refused(status))
 }
 
 /// Runs every step even after one fails, and returns the first failure.
+///
+/// On a lost path (`path_lost`: the VCI was lost, so the device is gone), a link step the
+/// worker answered with a failure does not leave the close unconfirmed when the module's
+/// disconnect succeeded: disconnecting the module releases every link on it (ADR-393, which
+/// narrows ADR-258's mark for this case only). A failure that is no answer of the worker, a
+/// module disconnect that fails, a module the client holds (its owner closes it, so nothing was
+/// disconnected here) and a path that was not lost keep the failure.
+///
+/// A lost path whose close still fails is closed once more, and only once, when the worker
+/// answered every step of the first (ADR-393): a J2534
+/// library releases the device on the first close yet may report the loss from it, so the
+/// second close finds the link gone. The second close confirms when the link answers that no
+/// object has its handle, or its disconnect fails with a worker's answer, and the module's
+/// disconnect then succeeded.
 pub(crate) async fn teardown<C: WorkerApi>(
     client: &mut C,
     module_handle: ModuleHandle,
     cll_handle: ComLogicalLinkHandle,
     deadline: Duration,
+    path_lost: bool,
 ) -> Result<(), HostError> {
+    teardown_observed(client, module_handle, cll_handle, deadline, path_lost)
+        .await
+        .0
+}
+
+/// What the steps of a close showed of the worker, over every pass made (ADR-394). The error
+/// [`teardown`] returns is the first failure, which hides a later step that went unanswered.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CloseEvidence {
+    /// Some step got no answer from the worker: a deadline that passed, or a connection that
+    /// failed.
+    pub(crate) unanswered: bool,
+    /// Some step timed out: the worker is there and does not answer.
+    pub(crate) hung: bool,
+}
+
+impl CloseEvidence {
+    /// Whether some step showed the worker silent: a worker that answered every step is alive.
+    pub(crate) fn silent(&self) -> bool {
+        self.unanswered || self.hung
+    }
+
+    /// Takes in a step that failed with `error`.
+    pub(crate) fn note_error(&mut self, error: &HostError) {
+        self.unanswered |= !is_workers_answer(error);
+        self.hung |= matches!(error, HostError::WorkerUnresponsive(_));
+    }
+
+    fn note(&mut self, outcome: &CloseOutcome) {
+        for step in [&outcome.disconnect, &outcome.destroy, &outcome.module] {
+            if let Err(error) = step {
+                self.note_error(error);
+            }
+        }
+    }
+}
+
+/// [`teardown`] that also returns what its steps showed of the worker.
+pub(crate) async fn teardown_observed<C: WorkerApi>(
+    client: &mut C,
+    module_handle: ModuleHandle,
+    cll_handle: ComLogicalLinkHandle,
+    deadline: Duration,
+    path_lost: bool,
+) -> (Result<(), HostError>, CloseEvidence) {
+    let mut evidence = CloseEvidence::default();
+    let first = close_steps(client, module_handle, cll_handle, deadline).await;
+    evidence.note(&first);
+    if !path_lost || first.all_ok() {
+        return (first.first_failure(), evidence);
+    }
+    if lost_path_confirmed(client, &first) {
+        return (Ok(()), evidence);
+    }
+    // A second close is for a worker that answered every step of the first: one that did not
+    // answer (a deadline that passed, a connection that failed) would cost another full pass.
+    if !first.all_answered() || client.held_module().is_some() {
+        return (first.first_failure(), evidence);
+    }
+    let second = close_steps(client, module_handle, cll_handle, deadline).await;
+    evidence.note(&second);
+    if lost_path_confirmed(client, &second) {
+        return (Ok(()), evidence);
+    }
+    // The first failure of the last close, after every step was tried.
+    (second.first_failure(), evidence)
+}
+
+/// The outcomes of one close, kept apart: the link's disconnect, the link's destroy and the
+/// module's disconnect. The confirmation and the retry both look at each step, so a step's
+/// failure is never hidden behind an earlier one.
+struct CloseOutcome {
+    disconnect: Result<(), HostError>,
+    destroy: Result<(), HostError>,
+    module: Result<(), HostError>,
+}
+
+impl CloseOutcome {
+    fn all_ok(&self) -> bool {
+        self.disconnect.is_ok() && self.destroy.is_ok() && self.module.is_ok()
+    }
+
+    /// Whether the worker answered every step: none failed for want of an answer (a deadline
+    /// that passed, a connection that failed).
+    fn all_answered(&self) -> bool {
+        [&self.disconnect, &self.destroy, &self.module]
+            .into_iter()
+            .all(|step| step.as_ref().err().is_none_or(is_workers_answer))
+    }
+
+    /// The first failure in the order of the steps.
+    fn first_failure(self) -> Result<(), HostError> {
+        self.disconnect.and(self.destroy).and(self.module)
+    }
+}
+
+/// Whether a close on a lost path counts as confirmed: the module's disconnect succeeded here,
+/// and the link's failure, if any, is the worker's answer (or names an unknown handle).
+fn lost_path_confirmed<C: WorkerApi>(client: &C, outcome: &CloseOutcome) -> bool {
+    if outcome.module.is_err() || client.held_module().is_some() {
+        return false;
+    }
+    // Each of the link's steps is judged on its own: an unanswered destroy is not hidden by a
+    // disconnect that failed with the worker's answer.
+    [&outcome.disconnect, &outcome.destroy]
+        .into_iter()
+        .all(|step| match step {
+            Ok(()) => true,
+            Err(error) => {
+                let unknown_handle = matches!(
+                    error,
+                    HostError::Rpc { status, .. } if crate::host::names_invalid_handle(status)
+                );
+                let confirmed = unknown_handle || is_workers_answer(error);
+                if confirmed {
+                    tracing::info!(
+                        error = %error.log_text(),
+                        "the link did not close on the lost VCI, but the module's disconnect released it"
+                    );
+                }
+                confirmed
+            }
+        })
+}
+
+/// One pass over the close's steps, each tried even after one fails.
+async fn close_steps<C: WorkerApi>(
+    client: &mut C,
+    module_handle: ModuleHandle,
+    cll_handle: ComLogicalLinkHandle,
+    deadline: Duration,
+) -> CloseOutcome {
     // A link that was never connected refuses the disconnect; destroying it still works.
     let disconnected = unary(
         deadline,
@@ -859,8 +1326,11 @@ pub(crate) async fn teardown<C: WorkerApi>(
     .await
     .map(drop);
     let module_disconnected = disconnect_module(client, module_handle, deadline).await;
-    // The first failure, after every step was tried.
-    disconnected.and(destroyed).and(module_disconnected)
+    CloseOutcome {
+        disconnect: disconnected,
+        destroy: destroyed,
+        module: module_disconnected,
+    }
 }
 
 async fn disconnect_module<C: WorkerApi>(
@@ -900,6 +1370,71 @@ mod tests {
 
     use super::*;
     use crate::JobDocument;
+
+    /// ADR-364: on UDS on CAN a message of up to six bytes is one frame of at most 160 bits;
+    /// another protocol has no bound.
+    #[test]
+    fn a_single_frame_is_bounded_on_uds_on_can_only() {
+        let mut config = LinkConfig::iso15765(0x7E0, 0x7E8);
+        assert_eq!(
+            config.single_frame(),
+            Some(SingleFrame {
+                max_bytes: 6,
+                transfer_us: 320,
+            })
+        );
+        config.baud_rate = 125_000;
+        assert_eq!(
+            config.single_frame().map(|frame| frame.transfer_us),
+            Some(1_280)
+        );
+        config.protocol_short_name = "ISO_14230_3_on_ISO_14230_2".to_owned();
+        assert_eq!(config.single_frame(), None);
+    }
+
+    /// ADR-358: the job-end wait is one `CP_Cr` wait plus a 4095-byte response at `CP_STmin`,
+    /// a frame taking at most 160 bits, capped at 10 s; unset ComParams count as 1 s and none.
+    #[test]
+    fn the_job_end_wait_is_the_link_s_worst_case_for_a_response() {
+        // 586 frames of 320 µs at 500 kbit/s, after the 1 s default.
+        let plain = LinkConfig::iso15765(0x7E0, 0x7E8);
+        assert_eq!(
+            plain.job_end_wait(),
+            Duration::from_micros(1_000_000 + 586 * 320)
+        );
+        let declared = LinkConfig {
+            params: vec![
+                ("cp_cr".to_owned(), 150_000),
+                ("CP_STmin".to_owned(), 1_000),
+            ],
+            ..LinkConfig::iso15765(0x7E0, 0x7E8)
+        };
+        assert_eq!(
+            declared.job_end_wait(),
+            Duration::from_micros(150_000 + 586 * (320 + 1_000))
+        );
+        let slow = LinkConfig {
+            baud_rate: 10_000,
+            ..LinkConfig::iso15765(0x7E0, 0x7E8)
+        };
+        assert_eq!(slow.job_end_wait(), JOB_END_WAIT_MAX);
+    }
+
+    /// ADR-355: the worker's answer, and only it, says whether the link forwards every pending;
+    /// an unspecified or unknown value is unknown.
+    #[test]
+    fn forwards_pendings_is_what_the_worker_answered() {
+        assert_eq!(forwards_pendings(PendingForwarding::All as i32), Some(true));
+        assert_eq!(
+            forwards_pendings(PendingForwarding::NotAll as i32),
+            Some(false)
+        );
+        assert_eq!(
+            forwards_pendings(PendingForwarding::Unspecified as i32),
+            None
+        );
+        assert_eq!(forwards_pendings(7), None);
+    }
 
     /// Only a refusal or a missing resource proves a failed create left no link: a create that
     /// answered without a handle, or a timeout, may have created one the runner cannot name.
@@ -1076,6 +1611,8 @@ mod tests {
             vec![with(|p| p.extended_addressing = true)],
             // What `validate` refuses.
             vec![with(|p| p.tx_id = 0x800)],
+            vec![with(|p| p.functional_id = 0x800)],
+            vec![protocol(&[("CP_P2Max", 4_294_967_001)])],
             vec![with(|p| p.baud_rate = 0)],
             vec![protocol(&[("CP_P2Max", 0)])],
             vec![protocol(&[("CP_P2Star", 4_294_967_296)])],
@@ -1107,6 +1644,273 @@ mod tests {
             assert!(
                 matches!(error, HostError::DeclaredLink(_)),
                 "{protocols:?}: {error}"
+            );
+        }
+    }
+
+    /// The names `diag_ir::link::SET_BY_LINK` refuses a document are the ones the link writes
+    /// itself: its own ComParams (physical and functional), the indications, and the two
+    /// identifiers the receive table carries. A name added on one side only fails here.
+    #[test]
+    fn the_names_set_by_link_are_the_ones_the_link_writes() {
+        let physical = LinkConfig::iso15765(0x7E0, 0x7E8);
+        let mut written: Vec<&str> = own_comparams(&physical.functional(0x7DF, table()))
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        written.extend(own_comparams(&physical).into_iter().map(|(name, _)| name));
+        written.extend(INDICATION_COMPARAMS);
+        written.extend(
+            tester_present_comparams(&physical)
+                .into_iter()
+                .map(|(name, _)| name),
+        );
+        written.extend(["CP_CanPhysReqId", "CP_CanRespUSDTId"]);
+        written.sort_unstable();
+        written.dedup();
+        let mut listed = diag_ir::link::SET_BY_LINK.to_vec();
+        listed.sort_unstable();
+        assert_eq!(listed, written);
+        // The timings the document may value are among the link's own.
+        let own: Vec<&str> = own_comparams(&physical)
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        for name in diag_ir::link::TIMING_COMPARAMS {
+            assert!(own.contains(&name), "{name}");
+        }
+    }
+
+    fn table() -> Vec<(u32, u32)> {
+        vec![(0x7E0, 0x7E8), (0x7E1, 0x7E9)]
+    }
+
+    /// ADR-396: a functional link sends to the functional identifier, listens for every pair of
+    /// its table, and sets the two ComParams that make the worker address functionally; a
+    /// physical link sets neither and has its one pair as its table.
+    #[test]
+    fn a_functional_link_addresses_functionally_and_listens_for_its_table() {
+        let physical = LinkConfig::iso15765(0x7E0, 0x7E8);
+        let config = physical.functional(0x7DF, table());
+        config.validate().expect("usable");
+        assert_eq!((config.tx_id, config.rx_id), (0x7DF, 0));
+        let own = own_comparams(&config);
+        assert_eq!(
+            own[own.len() - 2..],
+            [("CP_RequestAddrMode", 2), ("CP_CanFuncReqId", 0x7DF)]
+        );
+        assert_eq!(own.len(), own_comparams(&physical).len() + 2);
+        assert_eq!(receive_table(&config), table());
+        assert_eq!(receive_table(&physical), [(0x7E0, 0x7E8)]);
+        assert_eq!(physical.functional, None);
+    }
+
+    #[test]
+    fn a_functional_link_the_agent_cannot_open_is_refused() {
+        let base = LinkConfig::iso15765(0x7E0, 0x7E8);
+        for (config, why) in [
+            (base.functional(0x7DF, Vec::new()), "receive table"),
+            (base.functional(0x800, table()), "11-bit"),
+            (base.functional(0x7DF, vec![(0x7E0, 0x800)]), "11-bit"),
+            // The functional identifier is one of the table's.
+            (base.functional(0x7E8, table()), "equals a physical"),
+            (base.functional(0x7E0, table()), "equals a physical"),
+            (
+                base.functional(0x7DF, vec![(0x7E0, 0x7E8), (0x7E0, 0x7E8)]),
+                "repeats",
+            ),
+        ] {
+            let error = config.validate().expect_err(why);
+            assert!(
+                matches!(&error, HostError::Setup(text) if text.contains(why)),
+                "{error}"
+            );
+        }
+    }
+
+    /// ADR-396: the window restarts for each answer, so the ceiling allows one window per pair.
+    #[test]
+    fn a_functional_link_s_ceiling_allows_a_window_per_pair() {
+        let physical = LinkConfig::iso15765(0x7E0, 0x7E8);
+        assert_eq!(
+            physical.send_recv_ceiling(),
+            Duration::from_millis(1_000 + 25_000 + 5_000 + 2_000)
+        );
+        let functional = physical.functional(0x7DF, vec![(1, 2), (3, 4), (5, 6)]);
+        assert_eq!(
+            functional.send_recv_ceiling(),
+            Duration::from_millis(3 * 1_000 + 25_000 + 5_000 + 2_000)
+        );
+    }
+
+    /// A document cannot set the two ComParams of functional addressing: the link does.
+    #[test]
+    fn a_document_cannot_set_the_functional_addressing_comparams() {
+        for name in ["CP_RequestAddrMode", "cp_canfuncreqid"] {
+            let error = declared(vec![protocol(&[(name, 2)])]).expect_err("refused");
+            assert!(
+                matches!(error, HostError::DeclaredLink(_)),
+                "{name}: {error}"
+            );
+        }
+    }
+
+    /// ADR-396: only a status the worker gave for the table or the connect is a refusal the
+    /// agent halves on; a deadline that passed, a connection that failed, a lost VCI and any
+    /// other step are not.
+    #[test]
+    fn only_the_workers_answer_at_the_table_or_the_connect_is_a_refusal() {
+        use vci_service_interface::{ErrorDetail, ErrorEventData, PduError, PduErrorEvent};
+        let rpc = |rpc, status| HostError::Rpc {
+            rpc,
+            status: Box::new(status),
+        };
+        let refusal = tonic::Status::invalid_argument("too many entries");
+        assert!(refuses_receive_table(&rpc(
+            "SetUniqueRespIdTable",
+            refusal.clone()
+        )));
+        assert!(refuses_receive_table(&rpc(
+            "ConnectComLogicalLink",
+            tonic::Status::failed_precondition("no device")
+        )));
+        assert!(!refuses_receive_table(&rpc("SetComParam", refusal)));
+        for status in [
+            tonic::Status::unavailable("gone"),
+            tonic::Status::cancelled("gone"),
+            tonic::Status::unknown("gone"),
+        ] {
+            assert!(!refuses_receive_table(&rpc("SetUniqueRespIdTable", status)));
+        }
+        assert!(!refuses_receive_table(&HostError::WorkerUnresponsive(
+            "SetUniqueRespIdTable"
+        )));
+        assert!(!refuses_receive_table(&HostError::WorkerUnresponsive(
+            "ConnectComLogicalLink"
+        )));
+        let lost = vci_service_interface::status_with_error_detail(
+            tonic::Code::FailedPrecondition,
+            "the VCI is lost",
+            ErrorDetail {
+                pdu_error: PduError::PduErrCllNotConnected as i32,
+                error_event_data: Some(ErrorEventData {
+                    error_event: PduErrorEvent::PduErrEvtLostCommToVci as i32,
+                    cop_handle: None,
+                    timestamp: 1,
+                    extra_error_info: 0,
+                }),
+                detail_text: None,
+                refusal: None,
+            },
+        );
+        assert!(!refuses_receive_table(&rpc("ConnectComLogicalLink", lost)));
+    }
+
+    /// ADR-420 item 1: the keep-alive is on at 2 s by default, from `iso15765` and from a
+    /// declared link; a period under 200 ms, zero included, is refused, and so is one the
+    /// worker's microsecond ComParam cannot hold; off is `None`; a functional link has none.
+    #[test]
+    fn the_keep_alive_is_on_at_two_seconds_and_no_shorter_than_200_ms() {
+        let base = LinkConfig::iso15765(0x7E0, 0x7E8);
+        assert_eq!(base.keep_alive, Some(Duration::from_secs(2)));
+        assert_eq!(
+            declared(vec![protocol(&[])]).expect("usable").keep_alive,
+            Some(Duration::from_secs(2))
+        );
+        for period in [
+            Some(Duration::from_millis(200)),
+            Some(Duration::from_secs(2)),
+            Some(Duration::from_secs(60)),
+            None,
+        ] {
+            let config = LinkConfig {
+                keep_alive: period,
+                ..base.clone()
+            };
+            config.validate().expect("usable");
+        }
+        for period in [
+            Duration::ZERO,
+            Duration::from_millis(1),
+            Duration::from_millis(199),
+            Duration::from_secs(4_295),
+        ] {
+            let config = LinkConfig {
+                keep_alive: Some(period),
+                ..base.clone()
+            };
+            assert!(
+                matches!(config.validate(), Err(HostError::Setup(_))),
+                "{period:?}"
+            );
+        }
+        let functional = base.functional(0x7DF, table());
+        assert_eq!(functional.keep_alive, None);
+        assert!(tester_present_comparams(&functional).is_empty());
+    }
+
+    /// ADR-418 item 2, ADR-420 item 2: the tester-present ComParams, in the order they are set,
+    /// the handling last; the message and the expected responses as byte fields; the period in
+    /// microseconds; none when the keep-alive is off.
+    #[test]
+    fn the_tester_present_comparams_are_the_set_adr_418_names() {
+        use ParamValue::{Bytes, U32};
+        let config = LinkConfig {
+            keep_alive: Some(Duration::from_millis(750)),
+            ..LinkConfig::iso15765(0x7E0, 0x7E8)
+        };
+        assert_eq!(
+            tester_present_comparams(&config),
+            [
+                ("CP_TesterPresentMessage", Bytes(&[0x3E, 0x00])),
+                ("CP_TesterPresentReqRsp", U32(1)),
+                ("CP_TesterPresentExpPosResp", Bytes(&[0x7E, 0x00])),
+                ("CP_TesterPresentExpNegResp", Bytes(&[0x7F, 0x3E])),
+                ("CP_TesterPresentAddrMode", U32(0)),
+                ("CP_TesterPresentSendType", U32(0)),
+                ("CP_TesterPresentTime", U32(750_000)),
+                ("CP_TesterPresentHandling", U32(1)),
+            ]
+        );
+        let off = LinkConfig {
+            keep_alive: None,
+            ..config
+        };
+        assert!(tester_present_comparams(&off).is_empty());
+        // The class the byte fields go out under, and as which data.
+        let item = param_valued(
+            7,
+            PduParamClass::PduPcTesterPresent,
+            ParamValue::Bytes(&[0x7F, 0x3E]),
+        );
+        assert_eq!(
+            item.com_param_class,
+            PduParamClass::PduPcTesterPresent as i32
+        );
+        assert_eq!(
+            item.param_data,
+            Some(param_item::ParamData::Bytefield(vec![0x7F, 0x3E]))
+        );
+    }
+
+    /// ADR-324 item 3, ADR-420 item 2: a document cannot declare a tester-present ComParam, whose
+    /// values the keep-alive sets, in any spelling.
+    #[test]
+    fn a_document_cannot_declare_a_tester_present_comparam() {
+        for name in [
+            "CP_TesterPresentHandling",
+            "cp_testerpresentmessage",
+            "CP_TESTERPRESENTREQRSP",
+            "CP_TesterPresentExpPosResp",
+            "CP_TesterPresentExpNegResp",
+            "CP_TesterPresentAddrMode",
+            "CP_TesterPresentSendType",
+            "CP_TesterPresentTime",
+        ] {
+            let error = declared(vec![protocol(&[(name, 1)])]).expect_err("refused");
+            assert!(
+                matches!(error, HostError::DeclaredLink(_)),
+                "{name}: {error}"
             );
         }
     }

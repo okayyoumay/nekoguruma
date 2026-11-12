@@ -131,7 +131,12 @@ impl Iso22900Service {
         let request = request.into_inner();
         let h_mod = require_module_message(request.module_handle, "module_handle")?;
         let timestamp = self.with_api(|api| api.get_timestamp(h_mod)).await?;
-        Ok(Response::new(TimestampResponse { timestamp }))
+        // ADR-353: `PDUGetTimestamp` reads the module's own time base, the clock its items are
+        // on.
+        Ok(Response::new(TimestampResponse {
+            timestamp,
+            timestamp_clock: vci_service_interface::TimestampClock::Device as i32,
+        }))
     }
 
     pub(super) async fn rpc_get_resource_status(

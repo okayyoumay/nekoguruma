@@ -1,12 +1,15 @@
 // Relies on the debug-only runtime VCI_CONFIG_PATH override; see ADR-073.
 #![cfg(debug_assertions)]
-//! A link that cannot be confirmed closed keeps the job's guards (ADR-258): `worker-host`
-//! launches the real `j2534-0404-service` binary against the `sim-vci` cdylib, a job runs a
-//! program that waits between two requests, and this test unplugs the simulated VCI during the
-//! wait. The second request fails, and so do the disconnects of the job's close, so the returned
-//! guards are marked. Another job on the same VCI keeps waiting for the lock until the worker
-//! has been stopped and `worker_gone` is called; then it takes the guards and reads the VIN
-//! from a fresh worker.
+//! A link on a lost device is confirmed closed (ADR-393, which narrows ADR-258's mark for a lost
+//! path): `worker-host` launches the real `j2534-0404-service` binary against the `sim-vci`
+//! cdylib, a job runs a program that waits between two requests, and this test unplugs the
+//! simulated VCI during the wait. The second request fails and the VCI does not return in time;
+//! the library answers the first close of the lost device as the device being gone, which the
+//! worker counts as closed (ADR-422), so the module's disconnect succeeds and the returned guards
+//! are unmarked. Another job takes them at once and reads the VIN from a fresh worker. Both jobs
+//! write one communication log: the first records the loss, and the second settles it after its
+//! VCI connected (design 8.11 `vci_loss_settled`, ADR-373). `agent_marked_guards.rs` covers a close
+//! that stays unconfirmed.
 //!
 //! This file holds a single test, so the process-wide environment it sets for the spawned
 //! service cannot race with another test.
@@ -16,7 +19,10 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent::guards::{GuardSetup, JobGuards};
-use agent::{JobError, JobLimits, JobRun, LinkConfig, run_program};
+use agent::{
+    CommLogSetup, CommLogStatus, Job, JobError, JobLimits, JobRun, LinkConfig, VciFacts,
+    run_program,
+};
 use diag_ir::{IR_SCHEMA_VERSION, Op, Program, Value};
 use worker_host::client::ConnectOptions;
 use worker_host::service::{LaunchOptions, OperatingMode, ServiceKind, WorkerProcess};
@@ -58,6 +64,7 @@ struct TempPaths {
     definitions: PathBuf,
     ecu_state: PathBuf,
     locks: PathBuf,
+    comm_log: PathBuf,
 }
 
 impl Drop for TempPaths {
@@ -67,6 +74,7 @@ impl Drop for TempPaths {
         let _ = std::fs::remove_dir_all(&self.control_dir);
         let _ = std::fs::remove_dir_all(&self.definitions);
         let _ = std::fs::remove_dir_all(&self.locks);
+        let _ = std::fs::remove_dir_all(&self.comm_log);
     }
 }
 
@@ -89,6 +97,7 @@ fn program(code: Vec<Op>) -> Program {
         identity: Default::default(),
         preconditions: Default::default(),
         flash: Vec::new(),
+        targets: Vec::new(),
     }
 }
 
@@ -147,18 +156,20 @@ fn take_guards(setup: &GuardSetup) -> JobGuards {
 }
 
 #[test]
-fn a_link_that_cannot_be_closed_keeps_the_guards_until_the_worker_is_gone() {
+fn a_link_on_a_lost_device_is_confirmed_closed_and_the_loss_settles_in_the_next_job() {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock should be after unix epoch")
         .as_nanos();
+    let pid = std::process::id();
     let temp = std::env::temp_dir();
     let paths = TempPaths {
-        config: temp.join(format!("sim-vci-unconfirmed-{nanos}.toml")),
-        control_dir: temp.join(format!("sim-vci-unconfirmed-{nanos}")),
-        definitions: temp.join(format!("sim-vci-unconfirmed-definitions-{nanos}")),
-        ecu_state: temp.join(format!("sim-vci-unconfirmed-{nanos}.ecu")),
-        locks: temp.join(format!("sim-vci-unconfirmed-locks-{nanos}")),
+        config: temp.join(format!("sim-vci-unconfirmed-{pid}-{nanos}.toml")),
+        control_dir: temp.join(format!("sim-vci-unconfirmed-{pid}-{nanos}")),
+        definitions: temp.join(format!("sim-vci-unconfirmed-definitions-{pid}-{nanos}")),
+        ecu_state: temp.join(format!("sim-vci-unconfirmed-{pid}-{nanos}.ecu")),
+        locks: temp.join(format!("sim-vci-unconfirmed-locks-{pid}-{nanos}")),
+        comm_log: temp.join(format!("sim-vci-unconfirmed-commlog-{pid}-{nanos}")),
     };
     std::fs::write(&paths.config, "").expect("test config file should be writable");
     // The registration definition names the library, through the debug-only
@@ -167,6 +178,7 @@ fn a_link_that_cannot_be_closed_keeps_the_guards_until_the_worker_is_gone() {
     j2534_0404_mock::write_definition(&paths.definitions, LIBRARY_NAME, &sim_vci_path())
         .expect("definition file should be writable");
     std::fs::create_dir(&paths.control_dir).expect("control directory should be created");
+    std::fs::create_dir(&paths.comm_log).expect("log directory should be created");
     // SAFETY: this test binary runs only this test, and the runtime, the only other source of
     // threads here, is built below, so nothing reads the environment concurrently.
     unsafe {
@@ -196,7 +208,7 @@ fn a_link_that_cannot_be_closed_keeps_the_guards_until_the_worker_is_gone() {
         .block_on(async {
             tokio::time::timeout(
                 Duration::from_secs(120),
-                flow(&paths.control_dir, &paths.ecu_state, setup),
+                flow(&paths.control_dir, &paths.ecu_state, setup, &paths.comm_log),
             )
             .await
         })
@@ -221,16 +233,49 @@ async fn wait_for_first_request(ecu_state: &Path) {
     tokio::time::sleep(UNPLUG_AFTER).await;
 }
 
-async fn flow(control_dir: &Path, ecu_state: &Path, setup: GuardSetup) {
+/// A job of `program` that writes the communication log in `dir`, told it runs on J2534.
+fn logged(program: Program, dir: &Path) -> Job {
+    Job::from(program)
+        .with_comm_log(CommLogSetup {
+            dir: dir.to_owned(),
+            key: agent::journal::JobKey {
+                job_id: shared_proto::JobId("0190f5a8-7c2e-7d4b-9a6e-3f1c2b4d5e80".to_owned()),
+                generation: 1,
+            },
+        })
+        .with_vci(VciFacts {
+            api: agent::launch::Api::J2534,
+            long_size: long_size(),
+        })
+}
+
+fn log_lines(dir: &Path) -> Vec<serde_json::Value> {
+    let path = std::fs::read_dir(dir)
+        .expect("the log directory")
+        .map(|entry| entry.expect("an entry").path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+        .expect("the log file");
+    std::fs::read_to_string(path)
+        .expect("the log")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("a JSON line"))
+        .collect()
+}
+
+async fn flow(control_dir: &Path, ecu_state: &Path, setup: GuardSetup, comm_log: &Path) {
     let (worker, client) = launch_worker().await;
     let job = tokio::spawn({
         let guards = take_guards(&setup);
+        let log_dir = comm_log.to_owned();
         async move {
             run_program(
                 client,
                 &link_config(),
-                waiting_program(),
-                JobLimits::default(),
+                logged(waiting_program(), &log_dir),
+                JobLimits {
+                    vci_return_wait: Duration::from_secs(2),
+                    ..JobLimits::default()
+                },
                 guards,
             )
             .await
@@ -241,8 +286,11 @@ async fn flow(control_dir: &Path, ecu_state: &Path, setup: GuardSetup) {
     wait_for_first_request(ecu_state).await;
     send(control_dir, "001", r#"{"command": "disconnect_vci"}"#);
     let JobRun {
-        result, mut guards, ..
+        result,
+        mut guards,
+        comm_log: status,
     } = job.await.expect("the job task should not panic");
+    assert_eq!(status, CommLogStatus::Complete);
 
     // A loss during the open would be a `JobError::Link`; this one is the second request's.
     assert!(
@@ -255,34 +303,31 @@ async fn flow(control_dir: &Path, ecu_state: &Path, setup: GuardSetup) {
         ),
         "{result:?}"
     );
+    // The path was lost: the library answers the close as the device being gone, which the worker
+    // counts as closed, so the module's disconnect succeeds and the close is confirmed (ADR-393,
+    // ADR-422).
     assert!(
-        guards.link_unconfirmed(),
-        "the close of a lost device is not confirmed"
+        !guards.link_unconfirmed(),
+        "the close of a lost device is confirmed"
     );
-
-    // Another job on this VCI keeps waiting, although the first one is over.
-    let waiter = {
-        let setup = setup.clone();
-        std::thread::spawn(move || take_guards(&setup))
-    };
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(!waiter.is_finished(), "the marked guards must stay held");
-
     let stopped = worker.stop(Duration::from_secs(5)).await;
     assert!(stopped.is_ok(), "{stopped:?}");
-    assert!(!waiter.is_finished(), "stopping the worker is not enough");
     guards.worker_gone();
     drop(guards);
-    let guards = waiter.join().expect("the waiter should take the guards");
+    let guards = take_guards(&setup);
 
-    // The VCI is plugged back in for the fresh worker, which reads the VIN on the waiter's
-    // guards.
+    // The VCI is plugged back in for the fresh worker, which reads the VIN on the guards
+    // the first job released.
     send(control_dir, "002", r#"{"command": "connect_vci"}"#);
     let (worker, client) = launch_worker().await;
-    let JobRun { result, guards, .. } = run_program(
+    let JobRun {
+        result,
+        guards,
+        comm_log: status,
+    } = run_program(
         client,
         &link_config(),
-        read_vin(),
+        logged(read_vin(), comm_log),
         JobLimits::default(),
         guards,
     )
@@ -292,9 +337,84 @@ async fn flow(control_dir: &Path, ecu_state: &Path, setup: GuardSetup) {
     vin.extend_from_slice(VIN);
     assert_eq!(state.stack, [Value::Bytes(vin)], "{state:?}");
     assert!(!guards.link_unconfirmed());
+    assert_eq!(status, CommLogStatus::Complete);
+    assert_loss_settled(comm_log);
     drop(guards);
     worker
         .stop(Duration::from_secs(5))
         .await
         .expect("worker should stop");
+}
+
+/// The first job's log records the loss of the VCI on the second request, and the second job's
+/// settles it right after its VCI connected. The J2534 worker reads its clock on its own
+/// synthetic clock, not the VCI's, so nothing shows whether the VCI kept its power and the loss
+/// stays `undetermined`.
+fn assert_loss_settled(dir: &Path) {
+    let lines = log_lines(dir);
+    let text = || format!("{lines:#?}");
+    let lost: Vec<&serde_json::Value> = lines
+        .iter()
+        .filter(|line| line["event"] == "exchange" && line["outcome"]["result"] == "vci_lost")
+        .collect();
+    assert_eq!(lost.len(), 1, "{}", text());
+    let lost_seq = lost[0]["seq"].as_u64().expect("a seq");
+    assert_eq!(lost[0]["classification"], "undetermined", "{}", text());
+    // Refused on the offline link: it never reached the bus.
+    assert_eq!(lost[0]["sent"], "not_sent", "{}", text());
+    let records: Vec<&serde_json::Value> = lines
+        .iter()
+        .filter(|line| line["event"] == "vci_loss")
+        .collect();
+    let record = records.last().expect("a loss record");
+    let named: Vec<u64> = ["ended", "refused"]
+        .iter()
+        .flat_map(|list| record[*list].as_array().expect("a list"))
+        .map(|exchange| exchange["seq"].as_u64().expect("a seq"))
+        .collect();
+    assert!(named.contains(&lost_seq), "{}", text());
+    // The second run: right after its `vci_connected`, the settlement.
+    let connected = lines
+        .iter()
+        .rposition(|line| line["event"] == "vci_connected")
+        .expect("the second run's vci_connected");
+    let settled = lines[connected + 1..]
+        .iter()
+        .find(|line| line["event"] != "clock_epoch")
+        .expect("a line after vci_connected");
+    assert_eq!(settled["event"], "vci_loss_settled", "{}", text());
+    assert_eq!(settled["loss"], record["loss"], "{settled}");
+    assert!(
+        settled["refers_to"]
+            .as_array()
+            .expect("refers_to")
+            .contains(&serde_json::json!(lost_seq)),
+        "{settled}"
+    );
+    assert_eq!(settled["power_kept"], "unknown", "{settled}");
+    // The runner timed its clock read at the reconnect (ADR-374).
+    assert!(
+        settled["clock"]["round_trip_us"]
+            .as_u64()
+            .is_some_and(|round_trip| round_trip > 0),
+        "{settled}"
+    );
+    assert_eq!(settled["classification"], "undetermined", "{settled}");
+    assert!(
+        settled["reason"]
+            .as_str()
+            .expect("a reason")
+            .contains("own clock"),
+        "{settled}"
+    );
+    // Only one settlement.
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line["event"] == "vci_loss_settled")
+            .count(),
+        1,
+        "{}",
+        text()
+    );
 }

@@ -1,7 +1,7 @@
 # ADR-299: iso22900-mock Answers ComPrimitives from sim-ecu
 
 **Date:** 2026-10-15
-**Status:** Accepted
+**Status:** Accepted (extended by ADR-423: the tester-present ComParams, the link state and a `CoptStartcomm` with a request; extended by ADR-424: the response pending ComParams, which limit Decision items 2, 4 and 5 as they apply, so they hold only while `CP_RC78Handling` is off, which it is until a ComParam is set and `PDUConnect` or an UPDATEPARAM activates it; extended by ADR-428: result items carry the unique response table's response identifier as a header when the ComPrimitive's TxFlag sets ENABLE_EXTRA_INFO)
 **Affects:** `crates/iso22900-mock` (`PDUStartComPrimitive`, event items, `__mock_sim_ecu_control`,
 `NGR_SIM_ECU_CONFIG`), `crates/iso22900-service/tests/grpc_mock.rs`
 

@@ -896,31 +896,38 @@ async fn tester_present_negative_reply_does_not_suspend_via_unrelated_none_reque
         .into_inner()
         .cop_handle
         .expect("cop_handle should be present");
-    // Two writes precede the injection below, in unspecified relative order:
-    // this registrant's own (empty-payload) send, and `CoptStartcomm`'s
-    // periodic-mode tester-present arm, which (empirically, unlike mode 1's
-    // documented immediate idle-triggered send) also transmits its first
-    // `CP_TesterPresentMessage` promptly rather than waiting a full
-    // `CP_TesterPresentTime` interval. Waiting for both up front (rather than
-    // a hardcoded `1`) ensures the unrelated registrant's own send has
-    // actually happened -- and so its registrant is inserted and live -- by
-    // the time the frame below is injected.
-    wait_for_written_count(&server, MOCK_CHANNEL_ID, 2).await;
+    // ADR-419: the tester-present arm sent above expects an answer
+    // (`CP_TesterPresentReqRsp` 1), so it holds the channel (ISO 22900-2:2022
+    // 8.1.3 Table 1) and the registrant's own send waits behind it: only the
+    // arm's frame is on the wire, and the registrant does not exist until the
+    // answer settles the tester-present. (Before the hold, this registrant was
+    // live when the reply arrived; the property that an unrelated registrant's
+    // `rc_cfg` cannot turn the reply into a suspension is now covered at the
+    // `bind_frame` level by
+    // `tester_present_negative_reply_is_not_a_suspension_for_an_unrelated_registrant`.)
+    wait_for_written_count(&server, MOCK_CHANNEL_ID, 1).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    assert_eq!(
+        server.backdoor.written_count(MOCK_CHANNEL_ID),
+        1,
+        "the registrant's request must wait for the outstanding tester-present's answer"
+    );
 
     // The ECU's tester-present negative reply -- matches the configured
-    // ExpNegResp prefix, so it binds at step 3 (tester-present discard).
+    // ExpNegResp prefix, so it binds at step 3 (tester-present discard) and
+    // ends the hold.
     server.backdoor.inject_rx(
         MOCK_CHANNEL_ID,
         &can_frame(0x7E8, &[0x7F, 0x3E, 0x22]),
         j2534_0404::CAN,
     );
+    wait_for_written_count(&server, MOCK_CHANNEL_ID, 2).await;
 
     // Unlike the sibling regression tests in this file, this injected frame
     // binds via tester-present's own discard (step 3), not any registrant --
     // there is no COP terminal event to synchronize on via `wait_for_event`.
-    // Give the poll task (10 ms tick) time to actually read and classify this
-    // frame, while the unrelated registrant is still live for its
-    // `Tier1NonVacuous` scan to run against, before proceeding below.
+    // Give the poll task (10 ms tick) time to settle the tester-present, and
+    // the registrant time to register, before proceeding below.
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
     // Cancel the still-waiting unrelated registrant now that the frame above

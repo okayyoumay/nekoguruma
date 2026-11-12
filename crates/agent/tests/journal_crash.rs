@@ -102,7 +102,8 @@ fn temp_dir(name: &str) -> TempDir {
         .duration_since(UNIX_EPOCH)
         .expect("system clock should be after unix epoch")
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!("ngr-journal-crash-{name}-{nanos}"));
+    let pid = std::process::id();
+    let dir = std::env::temp_dir().join(format!("ngr-journal-crash-{name}-{pid}-{nanos}"));
     std::fs::create_dir_all(&dir).expect("temporary directory should be created");
     TempDir(dir)
 }
@@ -170,6 +171,9 @@ fn check_named_point(commits: usize, state: &JournalState) -> Option<&'static st
                 run_stopped: None,
                 first_request: None,
                 last_request: None,
+                last_request_unsent: None,
+                standing_request: None,
+                standing_before_last_request: None,
             }
         ),
         // The newest VM state is the run start's, and it names no request.

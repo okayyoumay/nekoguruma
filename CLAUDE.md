@@ -24,6 +24,13 @@ If an instruction contains a contradiction, ambiguity or missing information tha
 outcome, ask before making changes. When a choice is reversible and the instruction leaves it
 open, pick the reasonable default and say which one you picked.
 
+After the maintainer answers a design question, do not implement from that one answer. First
+write a short design summary and get it confirmed: which layer does what (design principle 6:
+the agent does not branch on the worker, the workers absorb their APIs' differences), which
+interfaces, design sections and ADRs change, and which further choices the answer leaves
+open. Ask those choices together, not one at a time after implementing. A run that may be
+unattended follows the `unattended-clarification` skill instead of waiting for the answer.
+
 ### Temporary vs. permanent files
 
 `work/` holds temporary working material (task lists, open items, status notes, the worker-crate
@@ -52,10 +59,12 @@ The format, the P0-P3 scale and the file list are in `work/README.md` ("Backlog 
 - `next-task`: recommend what to pick up next
 - `backlog-triage` (run on request only): clean up stale, duplicate or mis-prioritized items
 - `milestone-exit`: count what is left of the current milestone per exit criterion, sweep the
-  lower priorities for work it should still take, and close it on request
+  lower priorities for work it should still take and its blocked P1 items for work it cannot
+  unblock, and close it on request (the close starts with that sweep)
 - `backlog-loop` (run on request only): work through the backlog one item and one pull request
-  at a time, replacing failing Dependabot pull requests first; the next item starts only after
-  the maintainer merges the previous PR
+  at a time, replacing failing Dependabot pull requests first; the next PR opens only after
+  the maintainer merges the previous one, and the next item may be prepared locally meanwhile
+  (ADR-382)
 
 ### Documentation sync
 
@@ -147,6 +156,12 @@ scripts/check-adr-index.sh
 scripts/check-backlog.sh
 ```
 
+The workspace tests need PostgreSQL's server binaries (`initdb`, `pg_ctl`): the server's database
+tests start a throwaway cluster per test, and a missing PostgreSQL fails them. The helper looks
+in `NGR_TEST_PG_BIN`, then on `PATH`, then in the highest `/usr/lib/postgresql/<version>/bin`,
+then in `PGBIN` (ADR-458); CI sets `NGR_TEST_PG_BIN` from the runner image. As root the helper
+runs PostgreSQL as the `postgres` account, so `TMPDIR` must be a directory that account can enter.
+
 CI runs the tests with [cargo-nextest](https://nexte.st/) instead. The `core-linux` job runs
 `cargo nextest run --workspace --locked --profile ci`, then
 the doc tests with `cargo test ... --doc`, which leaves out `sim-vci`: it is built only as a
@@ -209,8 +224,9 @@ use a recently stabilized language or library feature.
 
 `dependabot-auto-merge.yml` turns on GitHub auto-merge (squash) for Dependabot's grouped Cargo
 minor/patch pull request only, so it merges once the required checks pass (ADR-248). Dependabot's
-other pull requests (Cargo updates Cargo treats as breaking, such as 0.22 to 0.23, and GitHub
-Actions) wait for the maintainer like any other.
+other pull requests (Cargo updates Cargo treats as breaking, such as 0.22 to 0.23, updates of
+`p256`, which the group leaves out (ADR-459), and GitHub Actions) wait for the maintainer like
+any other.
 
 Compiler warnings fail CI: `core-linux`, `core-windows` and `worker-check` build with
 `RUSTFLAGS=-D warnings`, and `core-linux` runs `cargo fmt --check`. Clippy is not run in CI
@@ -228,13 +244,14 @@ the attribute fails the build once the code is used and gets removed.
    fix or answer every finding, and re-request until a round is clean or its fixes need no
    re-review under the skill's re-request rule (ADR-251). A PR that changes only the backlog
    files gets no automated review (same ADR). If Codex cannot review (not set up, usage limit
-   reached, or a stalled review), the skill switches that PR to GitHub Copilot code review for
-   the rest of the PR (ADR-312); if Copilot is not available either, or the owner's Copilot
+   reached, or a review that stalls or errors again after one re-request on the same commit,
+   ADR-360), the skill switches that PR to GitHub Copilot code review for the rest of the PR
+   (ADR-312); if Copilot is not available either, or the owner's Copilot
    budget is used up, it falls back to an `edge-case-hunter` pass over the whole diff and tells
-   the maintainer. On a specification pull request (every changed file outside `work/` is
-   Markdown, and one is an ADR or the design document), the loop pauses after the eighth round with findings when more than half of the
-   last four rounds' findings land on text earlier fixes wrote, and asks the maintainer to cut
-   the scope, rewrite or continue (ADR-349).
+   the maintainer. On any pull request, specification or code, the loop pauses after the eighth
+   round with findings when more than half of the last four rounds' findings land on lines earlier
+   fixes wrote, and asks the maintainer to cut the scope, rewrite or continue (ADR-349,
+   ADR-381).
 4. Before marking the PR ready, check that nothing deferred during the work exists only in the
    conversation: every follow-up is either done in the PR or added to the backlog (`backlog`
    skill). Items the PR finishes are closed in the same PR.

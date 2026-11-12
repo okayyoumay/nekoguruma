@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Idempotency, Interruptible, MAX_FAILURE_CODE_LEN, Op, Program};
+use crate::{Idempotency, Interruptible, MAX_FAILURE_CODE_LEN, MAX_TARGETS, Op, Program};
 
 // ---------------------------------------------------------------- Sources
 
@@ -17,8 +17,14 @@ use crate::{Idempotency, Interruptible, MAX_FAILURE_CODE_LEN, Op, Program};
 #[serde(deny_unknown_fields)]
 pub enum Source {
     /// A field of a diagnostic service response. Both ids start at 1 (`Service` and `Field` in
-    /// the declaration part, `ir.fbs`).
-    EcuService { service_id: u32, field_id: u32 },
+    /// the declaration part, `ir.fbs`) and index the declaration part of `target`, the index
+    /// into [`Program::targets`] (0 is the primary; ADR-325 items 3 and 4, ADR-410).
+    EcuService {
+        #[serde(default)]
+        target: u8,
+        service_id: u32,
+        field_id: u32,
+    },
     /// A value the agent measures or derives itself.
     RuntimeInput(RuntimeInput),
 }
@@ -117,7 +123,9 @@ pub struct Precondition {
     pub default_session: Option<Source>,
     /// Where the value is read in the programming session: the source the restart's second check
     /// reads immediately before the erase, after the plan's steps from its entry have run
-    /// (ADR-229 item 2 step 4). It must be usable in the programming session. The agent tracks
+    /// (ADR-229 item 2 step 4). It must be usable in the programming session; that remark
+    /// concerns the reprogramming target, and a source on another target is read in whatever
+    /// session that target is in (ADR-410). The agent tracks
     /// no session: a plan whose `[entry_pc, erase_pc)` re-enters no programming session leaves
     /// the ECU in its default session at that point, and a source that answers only in the
     /// programming session then fails the check, with nothing erased.
@@ -163,6 +171,11 @@ impl Preconditions {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FlashRecovery {
+    /// The target the plan is on: an index into [`Program::targets`] (ADR-325 item 9,
+    /// ADR-410). Every plan of a program names the same one
+    /// ([`Program::reprogramming_target`]).
+    #[serde(default)]
+    pub target: u8,
     /// `FlashSession.id` in the declaration part (`ir.fbs`).
     pub flash_session: u32,
     /// The stage of the agent's journal this plan drives (ADR-229).
@@ -375,6 +388,56 @@ pub enum ProgramError {
         "flash session {flash_session}: stage {stage} is reserved for the plain procedure's resume count"
     )]
     ReservedStage { flash_session: u32, stage: u32 },
+    #[error("the program lists {count} targets, more than {MAX_TARGETS} (ADR-325 item 1)")]
+    TooManyTargets { count: usize },
+    #[error(
+        "instruction {pc}: target {target} is not in the program's target list (ADR-325 item 3)"
+    )]
+    TargetOutOfRange { pc: u32, target: u8 },
+    #[error("targets {a} and {b} have the same declaration hash (ADR-325 item 1)")]
+    DuplicateTargetDeclarations { a: usize, b: usize },
+    #[error(
+        "recovery plans of flash sessions {a} and {b} are on different targets; a program reprograms one target (ADR-325 item 9)"
+    )]
+    FlashPlansOnSeveralTargets { a: u32, b: u32 },
+    #[error(
+        "{kind:?} source is on target {target} but the reprogramming target is {reprogramming_target} (ADR-325 item 4)"
+    )]
+    SourceOffReprogrammingTarget {
+        kind: IdentityKind,
+        target: u8,
+        reprogramming_target: u8,
+    },
+    #[error(
+        "flash session {flash_session}: target {target} is an access target, which takes no flash plan (ADR-325 item 13)"
+    )]
+    FlashPlanOnAccessTarget { flash_session: u32, target: u8 },
+    #[error(
+        "the VIN source is on target {target} but the first access target is {first_access_target} (ADR-325 item 5)"
+    )]
+    VinOffFirstAccessTarget { target: u8, first_access_target: u8 },
+    #[error("target {target} of the source ({owner:?}) is not in the program's target list")]
+    SourceTargetOutOfRange { owner: SourceOwner, target: u8 },
+    #[error(
+        "flash session {flash_session}: target {target} is not in the program's target list (ADR-325 item 3)"
+    )]
+    PlanTargetOutOfRange { flash_session: u32, target: u8 },
+    #[error(
+        "flash session {flash_session}: the steps before the erase at {pc} do not select the plan's target {target} on every path (ADR-325 item 4)"
+    )]
+    PlanTargetNotSelected {
+        flash_session: u32,
+        pc: u32,
+        target: u8,
+    },
+    #[error(
+        "flash session {flash_session}: instruction {pc} selects target {target} between the erase and the post-transfer end, which run on the plan's target (ADR-325 item 4)"
+    )]
+    OtherTargetInPlan {
+        flash_session: u32,
+        pc: u32,
+        target: u8,
+    },
 }
 
 impl ProgramError {
@@ -396,7 +459,10 @@ impl ProgramError {
             | Self::UndeclaredTransferBoundary { pc, .. }
             | Self::TransferBeforeRequestDownload { pc, .. }
             | Self::TransferInterrupted { pc, .. }
-            | Self::PlanInSubroutine { pc, .. } => Some(*pc),
+            | Self::PlanInSubroutine { pc, .. }
+            | Self::TargetOutOfRange { pc, .. }
+            | Self::PlanTargetNotSelected { pc, .. }
+            | Self::OtherTargetInPlan { pc, .. } => Some(*pc),
             Self::TooManyFlashRecoveries { .. }
             | Self::BoundaryOutOfOrder { .. }
             | Self::DuplicateFlashSession(_)
@@ -416,7 +482,15 @@ impl ProgramError {
             | Self::ZeroResumeLimit { .. }
             | Self::InvalidSection { .. }
             | Self::MissingRequestDownload { .. }
-            | Self::ReservedStage { .. } => None,
+            | Self::ReservedStage { .. }
+            | Self::TooManyTargets { .. }
+            | Self::DuplicateTargetDeclarations { .. }
+            | Self::FlashPlansOnSeveralTargets { .. }
+            | Self::SourceOffReprogrammingTarget { .. }
+            | Self::FlashPlanOnAccessTarget { .. }
+            | Self::VinOffFirstAccessTarget { .. }
+            | Self::SourceTargetOutOfRange { .. }
+            | Self::PlanTargetOutOfRange { .. } => None,
         }
     }
 }
@@ -452,23 +526,64 @@ fn is_download(op: &Op) -> bool {
     )
 }
 
-fn check_ids(source: Source, owner: SourceOwner) -> Result<(), ProgramError> {
+/// The checks every source passes: ids start at 1 and the target is in the list of
+/// `target_count` targets (ADR-410).
+fn check_source(
+    source: Source,
+    owner: SourceOwner,
+    target_count: usize,
+) -> Result<(), ProgramError> {
     match source {
+        Source::EcuService { target, .. } if usize::from(target) >= target_count => {
+            Err(ProgramError::SourceTargetOutOfRange { owner, target })
+        }
         Source::EcuService {
             service_id,
             field_id,
+            ..
         } if service_id == 0 || field_id == 0 => Err(ProgramError::ZeroId { owner }),
         _ => Ok(()),
     }
 }
 
+/// The target of a service source; `None` for a runtime input.
+fn source_target(source: Option<Source>) -> Option<u8> {
+    match source {
+        Some(Source::EcuService { target, .. }) => Some(target),
+        _ => None,
+    }
+}
+
+/// Where execution goes after `op` at `pc`, a call taken to continue at the next instruction: a
+/// return or a declared failure ends the path (ADR-280), a jump goes to its target, a
+/// conditional jump to both its target and the next instruction.
+fn successors(op: &Op, pc: u32) -> [Option<u32>; 2] {
+    match *op {
+        Op::Ret | Op::Fail { .. } => [None, None],
+        Op::Jump(to) => [Some(to), None],
+        Op::JumpIfFalse(to) => [Some(to), Some(pc + 1)],
+        _ => [Some(pc + 1), None],
+    }
+}
+
 impl Program {
+    /// The target the flash plans name, which [`Program::validate`] requires them to share
+    /// (ADR-325 item 9, ADR-410); `None` for a program without a plan. Meaningful once
+    /// `validate` has passed.
+    pub fn reprogramming_target(&self) -> Option<u8> {
+        self.flash.first().map(|plan| plan.target)
+    }
+
     /// Checks the restart declaration (ADR-245): the sections, each plan's boundaries and the
     /// instructions at them, where download instructions sit, the control flow into, inside
     /// and out of each plan, and the identity and precondition sources. It does not check the
     /// schema version or the program's size ([`crate::Vm::check_state`]) or each instruction's
     /// operands, which fail when the VM reaches them. It also checks the constants it can
     /// check without running: a `Fail`'s code (ADR-280) and an HMI form's template (ADR-340).
+    ///
+    /// Each plan must select its own target on every path before the erase and select no other
+    /// target up to the post-transfer end (ADR-325 item 4, ADR-412). Whether a VIN source's
+    /// service is a read is checked where the document is (the agent's source table), not here.
     ///
     /// The restart rules (identity sources, session mapping, timeout, resume limit) apply only
     /// when some plan allows a restart ([`FlashRecovery::allows_restart`]); a program whose
@@ -478,6 +593,20 @@ impl Program {
             return Err(ProgramError::TooManyFlashRecoveries {
                 count: self.flash.len(),
             });
+        }
+        // The target list's shape (ADR-325 items 1 and 3, ADR-409).
+        if self.targets.len() > MAX_TARGETS {
+            return Err(ProgramError::TooManyTargets {
+                count: self.targets.len(),
+            });
+        }
+        for (b, target) in self.targets.iter().enumerate() {
+            if let Some(a) = self.targets[..b]
+                .iter()
+                .position(|other| other.declarations == target.declarations)
+            {
+                return Err(ProgramError::DuplicateTargetDeclarations { a, b });
+            }
         }
         // The code of a declared failure is a constant the dry run can check (ADR-280).
         for (pc, op) in self.code.iter().enumerate() {
@@ -489,6 +618,14 @@ impl Program {
                     .is_some_and(|text| (1..=MAX_FAILURE_CODE_LEN).contains(&text.len()))
             {
                 return Err(ProgramError::BadFailureCode { pc: pc as u32 });
+            }
+            if let Op::SelectTarget { target } = op
+                && usize::from(*target) >= self.target_count()
+            {
+                return Err(ProgramError::TargetOutOfRange {
+                    pc: pc as u32,
+                    target: *target,
+                });
             }
             // A form template decodes and has the shape its instruction takes (ADR-340 item 2).
             if let Op::HmiRequest { form: index }
@@ -509,6 +646,7 @@ impl Program {
                 return Err(ProgramError::InvalidSection { section });
             }
         }
+        let target_count = self.target_count();
         for (index, plan) in self.flash.iter().enumerate() {
             if plan.stage == PLAIN_PROCEDURE_STAGE {
                 return Err(ProgramError::ReservedStage {
@@ -516,8 +654,31 @@ impl Program {
                     stage: plan.stage,
                 });
             }
+            // The plan's target (ADR-325 items 3 and 13, ADR-410).
+            if usize::from(plan.target) >= target_count {
+                return Err(ProgramError::PlanTargetOutOfRange {
+                    flash_session: plan.flash_session,
+                    target: plan.target,
+                });
+            }
+            if self
+                .targets
+                .get(usize::from(plan.target))
+                .is_some_and(|t| t.access)
+            {
+                return Err(ProgramError::FlashPlanOnAccessTarget {
+                    flash_session: plan.flash_session,
+                    target: plan.target,
+                });
+            }
             self.validate_plan(plan)?;
             for other in &self.flash[..index] {
+                if other.target != plan.target {
+                    return Err(ProgramError::FlashPlansOnSeveralTargets {
+                        a: other.flash_session,
+                        b: plan.flash_session,
+                    });
+                }
                 if other.flash_session == plan.flash_session {
                     return Err(ProgramError::DuplicateFlashSession(plan.flash_session));
                 }
@@ -532,6 +693,8 @@ impl Program {
                     });
                 }
             }
+            // After the cross-plan errors, so a program with plans on two targets is told so.
+            self.validate_plan_target(plan)?;
         }
 
         for (index, op) in self.code.iter().enumerate() {
@@ -576,9 +739,49 @@ impl Program {
                 Some(Source::RuntimeInput(_)) => {
                     return Err(ProgramError::IdentityFromRuntimeInput(kind));
                 }
-                Some(source) => check_ids(source, SourceOwner::Identity(kind))?,
+                Some(source) => check_source(source, SourceOwner::Identity(kind), target_count)?,
                 None => {}
             }
+        }
+        // The reprogramming target's own sources (ADR-325 item 4): the plan's entry record reads
+        // the hardware part number and the software version whether or not the plan allows a
+        // restart. A program without a plan has no such rule (ADR-410 item 2).
+        if let Some(reprogramming) = self.reprogramming_target() {
+            for (kind, source) in [
+                (
+                    IdentityKind::HardwarePartNumber,
+                    self.identity.hardware_part_number,
+                ),
+                (
+                    IdentityKind::SoftwareVersion,
+                    self.identity.software_version,
+                ),
+            ] {
+                if let Some(target) = source_target(source)
+                    && target != reprogramming
+                {
+                    return Err(ProgramError::SourceOffReprogrammingTarget {
+                        kind,
+                        target,
+                        reprogramming_target: reprogramming,
+                    });
+                }
+            }
+        }
+        // The VIN (ADR-325 items 4 and 5): required with several targets or an access target
+        // (a lone access primary included), and then on the first access target when there is
+        // one.
+        let first_access = self.targets.iter().position(|t| t.access);
+        if (self.target_count() > 1 || first_access.is_some()) && self.identity.vin.is_none() {
+            return Err(ProgramError::MissingIdentitySource(IdentityKind::Vin));
+        }
+        if let (Some(first), Some(target)) = (first_access, source_target(self.identity.vin))
+            && usize::from(target) != first
+        {
+            return Err(ProgramError::VinOffFirstAccessTarget {
+                target,
+                first_access_target: first as u8,
+            });
         }
         for (kind, precondition) in self.preconditions.declared() {
             let Some(precondition) = precondition else {
@@ -613,7 +816,11 @@ impl Program {
                     Some(Source::RuntimeInput(input)) if !input.reports(kind) => {
                         return Err(ProgramError::InputDoesNotReport { kind, input });
                     }
-                    Some(source) => check_ids(source, SourceOwner::Precondition { kind, session })?,
+                    Some(source) => check_source(
+                        source,
+                        SourceOwner::Precondition { kind, session },
+                        target_count,
+                    )?,
                     None => {}
                 }
             }
@@ -816,6 +1023,72 @@ impl Program {
         self.validate_control_flow(plan)
     }
 
+    /// The target of every instruction between a plan's erase and its post-transfer end is the
+    /// plan's (ADR-325 item 4, ADR-412). `validate_control_flow` has made the plan a
+    /// single-entry region, so the window is entered only at the erase. The checks are local
+    /// to the plan: the target before the plan is not trusted.
+    ///
+    /// (a) The window selects no other target. (b) On every path from the entry to the erase
+    /// the last `SelectTarget` names the plan's target; a forward dataflow over the pre-erase
+    /// window alone, the state a bitmask of the targets that may be current (at most
+    /// [`MAX_TARGETS`], so it fits a `u8`). The target before the entry counts as every target,
+    /// so a plan whose entry is its erase (entered from outside, by a jump or by falling
+    /// through) satisfies (b) only in a program with one target. An erase no path from the
+    /// entry reaches enters nothing and is accepted.
+    fn validate_plan_target(&self, plan: &FlashRecovery) -> Result<(), ProgramError> {
+        let flash_session = plan.flash_session;
+        let b = &plan.boundaries;
+        for pc in b.erase_pc..b.post_transfer_end_pc {
+            if let Op::SelectTarget { target } = self.code[pc as usize]
+                && target != plan.target
+            {
+                return Err(ProgramError::OtherTargetInPlan {
+                    flash_session,
+                    pc,
+                    target,
+                });
+            }
+        }
+        let all = ((1u16 << self.target_count()) - 1) as u8;
+        let width = (b.erase_pc - b.entry_pc + 1) as usize;
+        // 0 = not reached yet.
+        let mut states = vec![0u8; width];
+        states[0] = all;
+        let mut pending = vec![b.entry_pc];
+        while let Some(pc) = pending.pop() {
+            if pc >= b.erase_pc {
+                continue;
+            }
+            let mut state = states[(pc - b.entry_pc) as usize];
+            let op = &self.code[pc as usize];
+            if let Op::SelectTarget { target } = *op {
+                state = 1 << target;
+            }
+            for next in successors(op, pc).into_iter().flatten() {
+                // `validate_control_flow` keeps a pre-erase jump inside the window.
+                let Some(slot) = next
+                    .checked_sub(b.entry_pc)
+                    .and_then(|i| states.get_mut(i as usize))
+                else {
+                    continue;
+                };
+                let merged = *slot | state;
+                if merged != *slot {
+                    *slot = merged;
+                    pending.push(next);
+                }
+            }
+        }
+        if states[width - 1] & !(1u8 << plan.target) != 0 {
+            return Err(ProgramError::PlanTargetNotSelected {
+                flash_session,
+                pc: b.erase_pc,
+                target: plan.target,
+            });
+        }
+        Ok(())
+    }
+
     /// The plan's range is a single-entry region whose stages follow in order: no call or
     /// return inside, no way in except at the entry, and jumps inside only where the stage they
     /// sit in allows.
@@ -828,14 +1101,7 @@ impl Program {
         let mut predecessors = vec![Vec::new(); len];
         for (index, op) in self.code.iter().enumerate() {
             let pc = index as u32;
-            let successors: &[u32] = match *op {
-                // A return or a declared failure ends the path (ADR-280).
-                Op::Ret | Op::Fail { .. } => &[],
-                Op::Jump(to) => &[to],
-                Op::JumpIfFalse(to) => &[to, pc + 1],
-                _ => &[pc + 1],
-            };
-            for &next in successors {
+            for next in successors(op, pc).into_iter().flatten() {
                 if (next as usize) < len {
                     predecessors[next as usize].push(pc);
                 }

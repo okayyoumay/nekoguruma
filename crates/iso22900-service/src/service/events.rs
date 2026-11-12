@@ -19,7 +19,7 @@ use vci_service_interface::{
 };
 
 use crate::error::{map_runtime_error, map_runtime_error_for_link};
-use crate::service::rpc::{CopTagMap, SubscriptionMap};
+use crate::service::rpc::{CopTagMap, SubscriptionMap, UnboundItemKind};
 
 const PDU_ERR_EVENT_QUEUE_EMPTY: u32 = 113;
 
@@ -58,6 +58,73 @@ fn to_notification_handle(
     }
 }
 
+/// The clock of an item's times (ADR-353): an item of a module is timed by
+/// the library on that module's one time base (ISO 22900-2:2022 8.1.6.1), the
+/// VCI's own clock. A system-level item belongs to no module, and the standard
+/// names no time base for it, so its clock is left unspecified.
+fn item_clock(h_mod: ModuleHandle) -> vci_service_interface::TimestampClock {
+    if h_mod.0 == PDU_HANDLE_UNDEF {
+        vci_service_interface::TimestampClock::Unspecified
+    } else {
+        vci_service_interface::TimestampClock::Device
+    }
+}
+
+/// The kind of an item from its RxFlag: byte 3 of the four-byte flag carries the transmit
+/// indication (bit 3) and start of message (bit 1) bits (ISO 22900-2 (2022) D.2.2).
+fn unbound_item_kind(rx_flag: &[u8]) -> UnboundItemKind {
+    match rx_flag.get(3).copied().unwrap_or(0) {
+        flags if flags & 0x08 != 0 => UnboundItemKind::TransmitIndication,
+        flags if flags & 0x02 != 0 => UnboundItemKind::StartOfMessage,
+        _ => UnboundItemKind::Other,
+    }
+}
+
+/// The header's identifier when it has four bytes (big-endian, as the J2534 worker and the mock
+/// write it), else its length, for the warning's text.
+fn header_description(header: &[u8]) -> String {
+    match <[u8; 4]>::try_from(header) {
+        Ok(bytes) => format!("identifier {:#x}", u32::from_be_bytes(bytes)),
+        Err(_) => format!("{} bytes", header.len()),
+    }
+}
+
+/// A result item of no ComPrimitive that carries extra info header bytes is outside the standard
+/// (ISO 22900-2 (2022) 10.1.4.11, 10.1.4.11.4, D.2.1): design 8.11 relies on the API's own
+/// tester present raising no item the agent could take for a request's (ADR-430). The item is
+/// forwarded unchanged; the first one of a link and kind is warned about, the rest counted under
+/// the same lock as the tags and summed up when the link or module goes (`rpc.rs`). An item of a
+/// ComPrimitive (`h_cop` defined) may carry a header (10.1.4.11.4; ADR-428).
+fn note_unbound_header(
+    cop_tags: &mut CopTagMap,
+    h_mod: ModuleHandle,
+    h_cll: ComLogicalLinkHandle,
+    h_cop: u32,
+    rx_flag: &[u8],
+    extra_info: Option<&ExtraInfo>,
+) {
+    let Some(extra) = extra_info else {
+        return;
+    };
+    let header = extra.header_bytes.as_slice();
+    if h_cop != PDU_HANDLE_UNDEF || header.is_empty() {
+        return;
+    }
+    let kind = unbound_item_kind(rx_flag);
+    if cop_tags.count_unbound_header(h_mod.0, h_cll.0, kind) {
+        tracing::warn!(
+            module = h_mod.0,
+            cll = h_cll.0,
+            kind = kind.label(),
+            "the D-PDU library gave an item of no ComPrimitive ({}) an extra info header ({}); a \
+             conforming library gives such an item no header (ADR-430); further ones on this link \
+             are counted",
+            kind.label(),
+            header_description(header)
+        );
+    }
+}
+
 pub(super) fn to_proto_event_item(
     api: &DPduApi,
     borrowed: &BorrowedEventItem,
@@ -87,8 +154,18 @@ pub(super) fn to_proto_event_item(
                     ((flags & 0x80) != 0, (flags & 0x40) != 0)
                 });
 
+            let rx_flag = result.rx_flag().bytes().map_err(map_err)?.to_vec();
+            note_unbound_header(
+                cop_tags,
+                h_mod,
+                h_cll,
+                borrowed.com_primitive_handle(),
+                &rx_flag,
+                extra_info.as_ref(),
+            );
+
             Some(EventItemData::ResultData(ResultData {
-                rx_flag: result.rx_flag().bytes().map_err(map_err)?.to_vec(),
+                rx_flag,
                 unique_resp_identifier: result.unique_resp_identifier(),
                 acceptance_id: result.acceptance_id(),
                 tx_msg_done_timestamp: if has_tx_msg_done_timestamp {
@@ -176,6 +253,7 @@ pub(super) fn to_proto_event_item(
     Ok(EventItem {
         cop_handle,
         timestamp: borrowed.timestamp(),
+        timestamp_clock: item_clock(h_mod) as i32,
         data,
         cop_tag,
     })
@@ -262,5 +340,135 @@ pub(super) async fn run_event_subscription_task(
                 None => break,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<StdMutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn header(id: u32) -> ExtraInfo {
+        ExtraInfo {
+            header_bytes: id.to_be_bytes().to_vec(),
+            footer_bytes: Vec::new(),
+        }
+    }
+
+    const TX: [u8; 4] = [0, 0, 0, 0x08];
+    const START: [u8; 4] = [0, 0, 0, 0x02];
+
+    /// ADR-430: an item of no ComPrimitive with a header is warned about once per link and kind,
+    /// the rest counted and summed up when the link goes; a bound item with a header (ADR-428),
+    /// and an unbound one without, are not.
+    #[test]
+    fn an_unbound_item_with_a_header_warns_once_per_link_and_kind() {
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .finish();
+        let mut tags = CopTagMap::default();
+        let (module, link, other_link) = (
+            ModuleHandle(1),
+            ComLogicalLinkHandle(2),
+            ComLogicalLinkHandle(3),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            let undef = PDU_HANDLE_UNDEF;
+            for _ in 0..3 {
+                note_unbound_header(&mut tags, module, link, undef, &TX, Some(&header(0x7E0)));
+            }
+            note_unbound_header(&mut tags, module, link, undef, &START, Some(&header(0x7E8)));
+            note_unbound_header(
+                &mut tags,
+                module,
+                other_link,
+                undef,
+                &TX,
+                Some(&header(0x7E0)),
+            );
+            // Not warned about: bound with a header, unbound without one, unbound with an empty one.
+            note_unbound_header(&mut tags, module, link, 7, &TX, Some(&header(0x7E0)));
+            note_unbound_header(&mut tags, module, link, undef, &TX, None);
+            note_unbound_header(
+                &mut tags,
+                module,
+                link,
+                undef,
+                &TX,
+                Some(&ExtraInfo::default()),
+            );
+        });
+        let text = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        let warnings = text.lines().collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 3, "{text}");
+        assert!(warnings[0].contains("transmit indication"), "{text}");
+        assert!(warnings[0].contains("identifier 0x7e0"), "{text}");
+        assert!(warnings[0].contains("cll=2"), "{text}");
+        assert!(warnings[0].contains("ADR-430"), "{text}");
+        assert!(warnings[1].contains("start of message"), "{text}");
+        assert!(warnings[2].contains("cll=3"), "{text}");
+        // The link's destruction gives the one count above one; the other kinds had one item.
+        let counts = tags.take_unbound_header_counts(|m, c| m == module.0 && c == link.0);
+        assert_eq!(counts, [(1, 2, UnboundItemKind::TransmitIndication, 3)]);
+        assert!(
+            tags.take_unbound_header_counts(|_, c| c == link.0)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_kind_comes_from_the_rx_flag_and_a_header_not_of_four_bytes_gives_its_length() {
+        assert_eq!(unbound_item_kind(&TX), UnboundItemKind::TransmitIndication);
+        assert_eq!(unbound_item_kind(&START), UnboundItemKind::StartOfMessage);
+        assert_eq!(unbound_item_kind(&[0; 4]), UnboundItemKind::Other);
+        assert_eq!(unbound_item_kind(&[]), UnboundItemKind::Other);
+        // Byte 3 decides: a one-byte flag has none, a longer one is read at its fourth byte.
+        assert_eq!(unbound_item_kind(&[0x08]), UnboundItemKind::Other);
+        assert_eq!(
+            unbound_item_kind(&[0, 0, 0, 0x08, 0x02]),
+            UnboundItemKind::TransmitIndication
+        );
+        assert_eq!(
+            unbound_item_kind(&[0, 0, 0, 0, 0x08]),
+            UnboundItemKind::Other
+        );
+        assert_eq!(header_description(&[0, 0, 7, 0xE0]), "identifier 0x7e0");
+        assert_eq!(header_description(&[1, 2]), "2 bytes");
+    }
+
+    /// ADR-353: a module's items are on the VCI's clock; a system-level item,
+    /// which belongs to no module, names none.
+    #[test]
+    fn an_item_of_a_module_is_on_the_device_clock_and_a_system_item_on_none() {
+        assert_eq!(
+            item_clock(ModuleHandle(1)),
+            vci_service_interface::TimestampClock::Device
+        );
+        assert_eq!(
+            item_clock(ModuleHandle(PDU_HANDLE_UNDEF)),
+            vci_service_interface::TimestampClock::Unspecified
+        );
     }
 }

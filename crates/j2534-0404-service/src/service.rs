@@ -40,6 +40,10 @@ pub(super) type SubscriptionKey = (u32, u32);
 #[derive(Debug)]
 pub(super) struct ReceivedFrame {
     pub(super) timestamp: u32,
+    /// The clock `timestamp` is on (ADR-353): `Device` for a frame the
+    /// library read (`PASSTHRU_MSG.Timestamp`), `Worker` for one this
+    /// service makes up itself, such as the fast-init response.
+    pub(super) clock: vci_service_interface::TimestampClock,
     /// Payload only — leading header bytes (e.g. a CAN ID) and trailing
     /// footer bytes (e.g. a KWP2000/J1850 checksum) are split into
     /// `header_bytes`/`footer_bytes` instead, for the protocols ADR-051
@@ -1849,6 +1853,19 @@ pub(super) struct CopRegistrant {
     /// contribution can be diffed against a baseline the same way. Always
     /// `0` when `concat_enabled` is `false`.
     pub(super) concat_segments_got: u32,
+    /// Unique response IDs (URIDs) whose message has started and not ended,
+    /// for a response this registrant waits on, on a native ISO 15765
+    /// channel (SAE J2534-1 v04.04 Appendix A.2, A.4: the start-of-message
+    /// indication marks the start; the completed message itself, a content
+    /// frame from that sender, marks the end). `poll_rx_inner` inserts the
+    /// URID of a start-of-message indication into every registrant waiting on
+    /// it and removes it from every registrant on any content frame from that
+    /// URID, bound or not. Read when the receive phase times out: a non-empty
+    /// set names the timeout `ISO15765_CF_TIMEOUT`. Always empty on every
+    /// other channel kind. Merged back like `pending_rc`: a pass's value wins
+    /// only if the pass changed it against its baseline
+    /// (`merge_registrant_writeback`).
+    pub(super) som_started: Vec<u32>,
 }
 
 /// Accumulator for one in-progress `CP_EnableConcatenation` segment merge
@@ -2960,6 +2977,18 @@ struct SharedChannel {
     /// covered it, while an entry that started at or after it is a genuine
     /// post-clear leak this clear never touched and must stay tracked.
     leaked_periodic_message_ids: Vec<(j2534_0404::PeriodicMessageId, u64)>,
+    /// ADR-398: the point-to-point filters (`FLOW_CONTROL_FILTER`s, and the
+    /// native-mixed UUDT `PASS_FILTER`) installed on this channel from the
+    /// links' `UniqueRespIdTable`s, one slot per distinct filter (pattern,
+    /// flow-control address, type and protocol id) with the number of links
+    /// using it. A link whose table repeats a filter another link already
+    /// installed shares it instead of installing it again (an adapter
+    /// refuses a repeated pattern or flow-control id), and the filter is
+    /// stopped when its last user leaves (`Disconnect`, `Destroy`, a failed
+    /// connect, a promoted or reinstalled table). Part of the entry, so it
+    /// goes with the channel when the last link closes it, and is cleared
+    /// when a hard error kills the channel. Guarded by `shared_channels`.
+    p2p_filters: HashMap<rpc_link::P2pFilterKey, rpc_link::P2pFilterSlot>,
     /// SAE J2534-2 clause 10 Analog Inputs (ADR-178): the CONFIG_SAMPLE_RATE
     /// value actually applied to this physical channel via SET_CONFIG at
     /// connect time, `Some(rate)` iff this channel was opened for one of the
@@ -3430,6 +3459,42 @@ pub(super) struct ResidualTesterPresentDiscard {
     pub(super) window: DiscardWindow,
     pub(super) target_can_ids: Option<TesterPresentTargetCanIds>,
     pub(super) tx_can_id: Option<u32>,
+    /// ISO 22900-2:2022 8.1.3 Table 1 hold state (ADR-419): `Some` exactly
+    /// when the send expected a response (`CP_TesterPresentReqRsp == 1` at
+    /// send time), which makes this entry hold the shared channel until the
+    /// answer settles it ([`TpHold`]) or `window.until` passes and the
+    /// per-tick sweep removes it. `None` keeps the ADR-099 behaviour: a
+    /// TX-echo identity window that prunes at `until` and never holds.
+    pub(super) hold: Option<TpHold>,
+}
+
+impl ResidualTesterPresentDiscard {
+    /// Whether this entry holds the channel (ADR-419).
+    pub(super) fn holds_bus(&self) -> bool {
+        self.hold.is_some()
+    }
+}
+
+/// The part of a [`ResidualTesterPresentDiscard`] that exists only while its
+/// send expected an answer (ADR-419). Everything but `first_pending_at` and
+/// `got_response` is frozen at the send, like the window's own fields, so a
+/// later `CoptUpdateparam` never changes how an outstanding send settles.
+#[derive(Debug, Clone)]
+pub(super) struct TpHold {
+    /// Physical addressing (also the class of an unresolved addressing, as on
+    /// K-line and J1850). The answer of a physical send ends the hold; a
+    /// functional send's hold lasts until its window expires.
+    pub(super) physical: bool,
+    /// Frozen response-code handling (offset, 0x78 handling, `CP_P2Star`,
+    /// completion ceiling), with `request_sid` set to the tester-present
+    /// message's service identifier.
+    pub(super) rc_cfg: RcHandlingConfig,
+    /// When the first pending answer of this send was seen (anchors the
+    /// completion ceiling once, as ADR-102 does for a send-receive).
+    pub(super) first_pending_at: Option<tokio::time::Instant>,
+    /// A positive answer was seen (decides whether the expiry of a
+    /// functional send reports a missing answer).
+    pub(super) got_response: bool,
 }
 
 /// `LogicalLinkState::tester_present_state`: what (if anything) `CoptStartcomm`
@@ -3569,6 +3634,11 @@ pub(super) struct TrackedError {
     /// added (`Vec<u8>` isn't `Copy`) -- callers that used to copy a
     /// `TrackedError` out of a lock now clone it instead.
     pub(super) cop_tag: Option<Vec<u8>>,
+    /// This service's own name for the case (ADR-351), sent as
+    /// `ErrorData.extra_error_info_name`: set only where the service tells
+    /// the case apart itself (`ISO15765_PADDING`, `ISO15765_CF_TIMEOUT`, see
+    /// `docs/j2534-0404-architecture.md`), `None` everywhere else.
+    pub(super) name: Option<&'static str>,
 }
 
 /// The `(cll_handle, cop_handle)` pair a [`TrackedError`] pertains to.
@@ -3612,6 +3682,7 @@ impl Default for ModuleState {
                 timestamp: 0,
                 cop: None,
                 cop_tag: None,
+                name: None,
             },
         }
     }
@@ -3949,6 +4020,14 @@ struct LogicalLinkState {
     /// presents will be sent" governs future sends, not replies already
     /// elicited by sends that already went out.
     open_tp_discards: Vec<ResidualTesterPresentDiscard>,
+    /// The CAN ID of the functional request this link sent and whose receive
+    /// phase is still running (ADR-421), read from the first four bytes of the
+    /// sent `SendRecvTx.data` as ADR-099's `tx_can_id` is. Written by
+    /// `handle_send_recv` after the request's write succeeds and cleared when
+    /// that cycle's `wait_for_expected_response` returns, and on
+    /// `DisconnectComLogicalLink` (`DestroyComLogicalLink` drops the whole
+    /// state). `build_cll_rx_entries` snapshots it for `route_frame_with_role`.
+    open_func_tx: Option<u32>,
     /// Working UniqueRespIdTable — written by `SetUniqueRespIdTable`, read by
     /// `GetUniqueRespIdTable`. Promoted to `active_unique_resp_id_table` at
     /// this CLL's own `ConnectComLogicalLink` and at `CoptUpdateparam`
@@ -3965,14 +4044,17 @@ struct LogicalLinkState {
     /// `working_unique_resp_id_table`; a temp COP's completion never touches
     /// either table.
     active_unique_resp_id_table: Vec<EcuUniqueRespEntry>,
-    /// Filter IDs of the point-to-point `FLOW_CONTROL_FILTER`s currently installed
-    /// on `channel_id` for this CLL's `active_unique_resp_id_table` entries (ISO15765
-    /// only). Empty when the table has no entry with a full `CP_CanRespUSDTId` +
+    /// The point-to-point filters this CLL uses on its channel for its
+    /// `active_unique_resp_id_table` entries (ISO15765 only), as keys into the
+    /// channel's `SharedChannel::p2p_filters` (ADR-398): a filter a sibling
+    /// installed first is listed here too and only counted, not installed
+    /// again. Formerly the filter ids installed for this CLL alone, hence the
+    /// name. Empty when the table has no entry with a full `CP_CanRespUSDTId` +
     /// `CP_CanPhysReqId` address pair — this CLL then has no `FLOW_CONTROL_FILTER`
     /// of its own on the shared channel at all (the zero-mask pass-all fallback
     /// that used to cover this case was spec-non-conformant and has been removed
     /// entirely, ADR-122).
-    unique_resp_filter_ids: Vec<MessageFilterId>,
+    unique_resp_filter_ids: Vec<rpc_link::P2pFilterKey>,
     /// cop_handles that have been cancelled but not yet dequeued by the poll task.
     /// The poll task checks this set before executing each TxItem and emits
     /// PduCopstCancelled then skips the item when the handle is present.
@@ -4612,6 +4694,7 @@ mod clear_error_suspension_tests {
             tester_present_state: TesterPresentState::None,
             tester_present_base_tx_flags: 0,
             open_tp_discards: Vec::new(),
+            open_func_tx: None,
             working_unique_resp_id_table: Vec::new(),
             active_unique_resp_id_table: Vec::new(),
             unique_resp_filter_ids: Vec::new(),

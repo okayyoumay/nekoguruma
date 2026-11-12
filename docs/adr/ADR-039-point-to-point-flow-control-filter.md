@@ -1,7 +1,7 @@
 # ADR-039: Point-to-Point `FLOW_CONTROL_FILTER` from UniqueRespIdTable Addressing
 
 **Date:** 2026-07-02
-**Status:** Accepted
+**Status:** Accepted (the connect-time install fails the connect on a refused filter, by ADR-398)
 **Affects:** `j2534-0404-service/src/service.rs` (`LogicalLinkState`, `SharedChannel`, `LinkView`),
              `j2534-0404-service/src/service/rpc_link.rs` (`install_pass_all_filter` and friends,
              `rpc_connect_com_logical_link`), `j2534-0404-service/src/service/rpc_misc.rs`
@@ -146,7 +146,10 @@ so tests can assert the exact bytes sent to `PassThruStartMsgFilter`.
   / `PassThruStartMsgFilter`) when the CLL is connected on an ISO15765
   channel, where before it only updated in-memory state. Individual
   `PassThruStartMsgFilter` failures are logged and skipped rather than
-  failing the whole call, consistent with ADR-008's best-effort posture.
+  failing the whole call, consistent with ADR-008's best-effort posture. At
+  `ConnectComLogicalLink` this is superseded by ADR-398: a refused filter of
+  the connect-time table fails the connect; the promotion and the reinstall
+  after `CLEAR_MSG_FILTERS` keep logging and skipping.
 - `CLEAR_MSG_FILTERS` on an ISO15765 channel is more expensive (one
   `PassThruStartMsgFilter` call per covered CLL instead of one), but restores
   the full spec-conformant filter set rather than regressing to the zero-mask

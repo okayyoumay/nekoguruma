@@ -20,10 +20,18 @@ fn mock_library_supports_basic_wrapper_calls() {
     assert_eq!(version.hardware_name, "Mock Hardware");
     assert_eq!(version.api_software_name, "iso22900-mock");
 
-    let timestamp = api
+    // The mock's module clock counts microseconds and only moves forward.
+    let first = api
         .get_timestamp(module_handle)
         .expect("timestamp should succeed");
-    assert_eq!(timestamp, 4242);
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let second = api
+        .get_timestamp(module_handle)
+        .expect("timestamp should succeed");
+    assert!(
+        second.wrapping_sub(first) >= 2_000,
+        "the module clock should advance by at least the 2 ms slept: {first} then {second}"
+    );
 }
 
 #[test]

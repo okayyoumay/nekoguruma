@@ -56,7 +56,7 @@ Acts as a D-PDU API compliant gRPC service that maps ISO 22900-2 operations onto
 
 ## Test-suite reliability: past flaky-test root causes
 
-Eleven flaky-test root causes have been found and fixed, seven in the `tests/grpc_mock/` suite, three in `tests/agent_restart_end_to_end.rs` and one in `tests/agent_flash_transfer.rs`. Each turned out to be a defect in the test or its harness: no production defect was found, and no production code changed to fix them. The write-time rules these led to are in `tests/grpc_mock/harness.rs`'s module doc and ADR-149. The measured round-trip ceiling is `GRPC_ROUND_TRIP_OVERHEAD_CEILING_MS` in the same file (about 85 ms under load).
+Thirteen flaky-test root causes have been found and fixed, eight in the `tests/grpc_mock/` suite, three in `tests/agent_restart_end_to_end.rs`, one in `tests/agent_flash_transfer.rs` and one in `tests/ngr_agent_end_to_end.rs`. Each turned out to be a defect in the test or its harness: no production defect was found, and no production code changed to fix them. The write-time rules these led to are in `tests/grpc_mock/harness.rs`'s module doc and ADR-149. The measured round-trip ceiling is `GRPC_ROUND_TRIP_OVERHEAD_CEILING_MS` in the same file (about 85 ms under load).
 
 Triage lessons:
 
@@ -84,6 +84,14 @@ Timing-margin cause found later (ADR-149):
 9. **A kill that took longer than the window it must land in.** `agent_restart_end_to_end.rs::a_kill_before_the_post_transfer_steps_completed_redoes_the_transfer` kills the agent during the program's 1 s `Wait` (`PARK_MS`) after RequestTransferExit, once the journal records that request's answer. On Windows the harness killed by starting `taskkill /F /T`; on a loaded runner, with the restart scenarios beside it running three to four times slower than usual, starting that process took longer than the wait, the agent ran the integrity check first, and the journal recorded the post-transfer steps complete. The agent now starts suspended, is put in a job object of its own and only then resumes, so the worker it starts is created in the job, and the kill is `TerminateJobObject`; a worker alone is ended with `TerminateProcess` (`tests/common/restart.rs`). Both act within the call, as SIGKILL does on unix.
 10. **A hang guard close to the run's own time.** `agent_flash_transfer.rs` bounds its two jobs with a timeout that only exists to catch a wedged service. At 120 s it was about seven times the jobs' 16 s on the Windows runner, and the same load as cause 9, the restart scenarios running beside it, took them past it. Raising the bound would also hide a real slowdown, so the bound stays and the `ci-windows` profile (`.config/nextest.toml`) runs the test alone instead.
 11. **A session timer racing another process's start-up, again.** After cause 8, `agent_restart_end_to_end.rs::a_non_default_session_on_the_completed_path_is_confirmed_after_the_passive_retry` still failed once on the Windows runner with one F186 read: the restart's link came up about 6 s after the probe's last read, and its gate reads came too late for the 10 s timer. No longer timer fits every runner, since the timer must not outlast the plan's declared timeout, which the passive wait waits out. The probe now ends by holding the session (`Env::probe_holding_session`, `sim-vci`'s `hold_session`, `SimEcu::hold_session`): the session's timer stops until the next request reaches the ECU, so the restart's start-up no longer counts against it, and the test still asserts both F186 reads. A 12 s pause before the restart, longer than the timer, leaves the test passing. The hold leaves only the restart's own reads to race the timer, and they lost it once more on the Windows runner, in a run where `a_kill_before_the_integrity_check_response_was_recorded_redoes_the_transfer` also lost its session within the timer: the load of cause 9, four scenarios at a time on four cores. The `ci-windows` profile (`.config/nextest.toml`) now runs the restart scenarios at most two at a time.
+
+Build cause:
+
+12. **A binary of another package that the run did not rebuild.** `ngr_agent_end_to_end.rs::ngr_agent_identifies_the_vin_on_sim_vci` sometimes got a report from `ngr-agent identify` with no `vin`, then passed. The test starts `target/debug/ngr-agent`, which belongs to the `agent` package: a run that builds only this package's tests (`cargo test -p j2534-0404-service`, or `-p agent` beside a `--test` of this package, which builds no binary of a package whose tests it leaves out) relinks the agent library into the test but leaves the binary an earlier build made. A binary built before the VIN read reports no `vin`, so the failure followed whichever build had run last, and it also appeared on the commit that added the test. Building that commit's predecessor's `ngr-agent` into the target directory reproduces the report every time. The lookup the three `ngr-agent` end-to-end tests share (`crates/agent/tests/support/ngr_agent_binary.rs`, included through `#[path]` by this test and by `iso22900-service`'s `ngr_agent_dpdu_end_to_end.rs` and `ngr_agent_definition_end_to_end.rs`) now checks the binary against the files it is compiled from: those the compiler's dep-info files in `deps` list for the binary and for the library of the `agent` package and of every workspace crate its manifests link (dev-dependencies left out), each library's read from the dep-info that names its `.rlib`, with each crate's build script. A listed file newer than the binary is one cargo would rebuild it for, and fails the test at once with the command that rebuilds it (`cargo build -p agent --bin ngr-agent`); a file only a test build compiles, or another binary's source, is not listed, so changing it does not. A test build writes no top-level `target/debug/ngr-agent.d` (only `cargo build` does), and the binary's own dep-info lists none of the library's files, hence the libraries'. CI builds the whole workspace, so its binary is always current.
+
+Runtime-driver cause:
+
+13. **A runtime timer awaited while a held native call blocks the worker that drives it.** `connect_filter_refusal.rs::auto_mode_joiner_waits_for_the_creators_probe_before_installing` hung forever about one run in thirty: it held `core-linux`'s nextest step for hours three times, until the CI profiles' time limit named it (ADR-404). A's connect blocks a tokio worker in the mock's connect hold, which only the test releases, and the test body waited for the hold to engage with `tokio::time::sleep`. When the blocked worker was the last to drive the runtime's timers and I/O, nothing handed the driver to another worker (tokio does so only when a worker is woken, and the others were parked with nothing to wake them), so the sleep never fired and the hold was never released; gdb on the stuck processes showed no thread in the driver's park. Nothing in the service deadlocks: in production a native call returns once the adapter answers. The test body, which runs on the test's own thread and not on a worker, now waits with `std::thread::sleep`, and checks B with `is_finished` after a fixed sleep instead of `tokio::time::timeout`; spawning B wakes a parked worker, which drives B's connect. The hang reproduced 16 times in 120 parallel runs before the change and passed 150 of 150 after it, and 120 nextest stress runs. A test that holds a native call on a worker without limit must not wait for its release on that runtime's timers or I/O. That a slow native call stalls the runtime's timers for its duration is the existing item on moving native calls to a dedicated thread.
 
 ## SAE J2534-2 Discovery Mechanism (ADR-153, Phase 1)
 
@@ -6377,12 +6385,14 @@ above did not account for those two native calls themselves failing — a round-
 found that a genuine double failure of both left a committed periodic transmitting device-side with
 no tracking anywhere and no way to ever retry stopping it, since neither call's result was checked
 before this function proceeded. A `design-advisor` consult confirmed leak-tracking the failure was
-a dead end specifically here, not a general objection: by the time such a failure could be observed,
-`slot.take()` has already unconditionally cleared `self.device_id` (ADR-107 addendum (h)), and the
-opportunistic leaked-stop retry mechanisms (`retry_leaked_periodic_message_stops`/
-`retry_leaked_repeat_message_stops`, `rpc_misc.rs`) only ever probe a live `SharedChannel` on an
-open device, so nothing could ever reach the old device again to retry against regardless of what
-got tracked. The validated fix instead adds an explicit best-effort native stop of its own: while
+a dead end specifically here, not a general objection: the opportunistic leaked-stop retry
+mechanisms (`retry_leaked_periodic_message_stops`/`retry_leaked_repeat_message_stops`,
+`rpc_misc.rs`) only ever probe a live `SharedChannel` on an open device, and this function has
+already drained `shared_channels` by then. Since ADR-422 the slot is cleared only when the close
+succeeds or is answered `ERR_INVALID_DEVICE_ID`/`ERR_DEVICE_NOT_CONNECTED`; a failed close keeps
+the slot and a later disconnect closes the device again, but the drained map still holds nothing
+to retry against, and the invariant slot `None` implies `shared_channels` empty still holds. The
+validated fix instead adds an explicit best-effort native stop of its own: while
 iterating `links.values_mut()` in the same loop the round-17 fix already added, each link now also
 resolves its owning `SharedChannel` via `link.channel_key.and_then(|k| chans.get(&k))` (the
 already-held `chans` guard) and skips collecting anything for that link if the resolved channel is
@@ -7707,8 +7717,11 @@ every area — no silent wrong-constant class of bug was found anywhere in this 
   filters per protocol on a minimally-conforming adapter. `SetUniqueRespIdTable` has no entry cap,
   and connect-time filter installation can install up to two filters per table entry (the ADR-041
   UUDT-workaround path, `rpc_link.rs:3623-3725`) — a large table can hit `PDU_ERR_EXCEEDED_LIMIT` at
-  connect time on such hardware. Surfaces loudly (not silent); worth a doc note next time this area
-  is touched, not a dedicated fix.
+  connect time on such hardware. Since ADR-398 the connect fails with that refusal (after the filters
+  the table took are given back and the link is rolled back) instead of logging and skipping the
+  entry; a table promoted later by `CoptUpdateparam` still skips a refused entry. The channel's
+  filters are counted (`SharedChannel::p2p_filters`): a pair a sibling's table already
+  installed is shared, so the limit counts distinct filters, not entries of all the tables.
 
 ## SAE J2534-2 (DEC2020) already-implemented-phases conformance audit (2026-08-11)
 

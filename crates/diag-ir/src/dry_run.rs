@@ -1,11 +1,20 @@
 //! Dry run of a procedure with vehicle access mocked (design 12.1, ADR-328).
 //!
-//! [`dry_run`] steps a [`Program`] with the declaration part of its variant against a host that
-//! sends nothing. Each request is resolved to the declared service it belongs to, answered from
-//! a [`Script`] or, without a scripted answer, with a positive response built from the
-//! service's declaration, and decoded through that declaration. The [`DryRunReport`] lists the
-//! requests with their answers and decoded values, the other primitives the procedure reached,
-//! and how the run ended.
+//! [`dry_run`] steps a [`Program`] with the declaration part of its current target against a host
+//! that sends nothing. Each request is resolved to the declared service it belongs to, answered
+//! from a [`Script`] or, without a scripted answer, with a positive response built from the
+//! service's declaration, and decoded through the current target's declaration part. The
+//! [`DryRunReport`] lists the requests with their answers and decoded values, the other primitives
+//! the procedure reached, and how the run ended.
+//!
+//! A variant that declares no SecurityAccess service still lets `diag.security_access` run: the
+//! requests the frontend lowers it to are the UDS profile's, not a declared service's (ADR-390).
+//! They are found by their place around an `Op::SecurityAccess`: the nearest `ServiceRequest`
+//! before it is the seed request and the nearest one after it is the send-key request, each only
+//! when no other host-facing instruction, `SelectTarget`, call or return lies between. When such a
+//! request belongs to no declared service, the dry run answers it in the profile's shape and
+//! reports it under [`PROFILE_SEED_REQUEST`] or [`PROFILE_KEY_REQUEST`]; a declared service still
+//! answers first, and any other undeclared request ends the run.
 
 use std::collections::HashMap;
 
@@ -16,11 +25,11 @@ use crate::declaration::{
 use crate::decode::{DecodeError, DecodedField, Layouts, PhysicalValue, decode_positive_response};
 use crate::hmi::{self, HmiForm};
 use crate::{
-    DiagHost, Failure, Program, ProgramError, RuntimeInput, StepError, StepOutcome, Vm, VmError,
-    WaitingOn,
+    DiagHost, Failure, Op, Program, ProgramError, RuntimeInput, StepError, StepOutcome, Vm,
+    VmError, WaitingOn, suppresses_positive_response,
 };
 
-/// The most bytes of requests, answers, transfer data, forms and messages one report holds,
+/// The most bytes of requests, answers, forms and messages one report holds,
 /// each event counted as at least [`EVENT_COST`] bytes, so a definition run at ingestion cannot
 /// make the report take unbounded memory (ADR-328 item 7).
 pub const MAX_REPORT_BYTES: usize = 64 << 20;
@@ -29,11 +38,69 @@ pub const MAX_REPORT_BYTES: usize = 64 << 20;
 /// events list, since the list's storage can grow to twice its length.
 pub const EVENT_COST: usize = 2 * size_of::<DryRunEvent>();
 
+/// The `service` of a [`DryRunEvent::Request`] for a seed request the dry run answered as the UDS
+/// profile's, with no declared service (ADR-390). The colon keeps it from being any
+/// `Service.short_name`.
+pub const PROFILE_SEED_REQUEST: &str = "profile:security_access_seed";
+
+/// Like [`PROFILE_SEED_REQUEST`], for the send-key request.
+pub const PROFILE_KEY_REQUEST: &str = "profile:security_access_key";
+
+/// The digest a [`DryRunEvent::FlashTransfer`] carries: 64-bit FNV-1a over the block's bytes.
+/// Not cryptographic; it tells blocks apart in a report and nothing more.
+pub fn block_digest(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+/// The seed a built answer to the profile's seed request carries; not zero, which on UDS means
+/// the ECU is already unlocked.
+const BUILT_SEED: [u8; 4] = [1, 2, 3, 4];
+
+/// A built positive answer to a seed request (ADR-390 item 3, ADR-405): the positive SID, the
+/// level, then [`BUILT_SEED`] cut or repeated to `seed_len` bytes when the declaration fixes the
+/// seed's length. It is never all zero for a seed of one byte or more, so the procedure takes
+/// the key path.
+fn built_seed_response(positive_sid: u8, level: u8, seed_len: Option<usize>) -> Vec<u8> {
+    let seed = BUILT_SEED.iter().copied().cycle();
+    let mut bytes = vec![positive_sid, level];
+    match seed_len {
+        Some(len) => bytes.extend(seed.take(len)),
+        None => bytes.extend_from_slice(&BUILT_SEED),
+    }
+    bytes
+}
+
+/// Every [`RuntimeInput`]; [`Script::built_defaults`] gives each a value. Its `match` fails to
+/// compile when a new input is added without a value, and a test that decodes every variant tag
+/// fails when the input is missing from this list.
+const ALL_INPUTS: [RuntimeInput; 5] = [
+    RuntimeInput::SupplyVoltageMillivolts,
+    RuntimeInput::ExternalSupplyConnected,
+    RuntimeInput::IgnitionOn,
+    RuntimeInput::EngineRunning,
+    RuntimeInput::VehicleSpeedKmh,
+];
+
 /// The answers a dry run gives. Each list is answered in order, and its last answer again once
 /// the list is used up, so a procedure that polls gets a steady answer.
+///
+/// The profile's SecurityAccess requests (module docs) are answered from [`Script::seed`] and
+/// [`Script::key`]; a scripted response for the send-key request itself is out of scope: its
+/// answer is always built.
+///
+/// What models an ECU's answer is kept per target (ADR-411): [`Script::response`] and
+/// [`Script::seed`] address target 0, the primary, and [`Script::response_on`] and
+/// [`Script::seed_on`] another target of the program (ADR-325 item 3). What models the server,
+/// the operator or the agent is shared by all targets: keys, form and record answers, inputs.
+/// An answer for a target the program does not list is never used.
 #[derive(Debug, Clone, Default)]
 pub struct Script {
-    responses: HashMap<String, Vec<Vec<u8>>>,
+    /// By target and `Service.short_name`.
+    responses: HashMap<(u8, String), Vec<Vec<u8>>>,
+    /// By target.
+    seeds: HashMap<u8, Vec<Vec<u8>>>,
     keys: Vec<Vec<u8>>,
     forms: Vec<Vec<u8>>,
     records: Vec<Vec<u8>>,
@@ -45,15 +112,61 @@ impl Script {
         Self::default()
     }
 
+    /// The script for a run on answers built from the declarations alone, as the conversion
+    /// dry-runs a procedure (ADR-391): a key of four zero bytes, the empty positive answer to
+    /// every HMI form and record template, and 0 for every [`RuntimeInput`]. Nothing is scripted
+    /// for a service, so each request is answered from its declaration. Like the zero answers of
+    /// ADR-328 item 3, the values are placeholders that make no claim about a vehicle.
+    pub fn built_defaults() -> Self {
+        let script = Self::new()
+            .key([0u8; 4])
+            .form(hmi::answered(""))
+            .record(hmi::answered(""));
+        // Exhaustive, so a new input must be given its value here.
+        let inputs = |input: RuntimeInput| match input {
+            RuntimeInput::SupplyVoltageMillivolts
+            | RuntimeInput::ExternalSupplyConnected
+            | RuntimeInput::IgnitionOn
+            | RuntimeInput::EngineRunning
+            | RuntimeInput::VehicleSpeedKmh => (input, 0),
+        };
+        Self {
+            inputs: ALL_INPUTS.into_iter().map(inputs).collect(),
+            ..script
+        }
+    }
+
     /// Adds a whole response, starting with its SID, to the answers to the service named
-    /// `service` (`Service.short_name`). A negative response may be scripted too; it is the
-    /// final answer, so a response-pending code, which the worker absorbs on a real link, is
-    /// not one to script.
-    pub fn response(mut self, service: &str, bytes: impl Into<Vec<u8>>) -> Self {
+    /// `service` (`Service.short_name`) of target 0. A negative response may be scripted too; it
+    /// is the final answer, so a response-pending code, which the worker absorbs on a real link,
+    /// is not one to script.
+    pub fn response(self, service: &str, bytes: impl Into<Vec<u8>>) -> Self {
+        self.response_on(0, service, bytes)
+    }
+
+    /// As [`Script::response`], for the service named `service` of `target`, an index into
+    /// [`Program::targets`]. Each target has its own list and its own count of answers used.
+    pub fn response_on(mut self, target: u8, service: &str, bytes: impl Into<Vec<u8>>) -> Self {
         self.responses
-            .entry(service.to_owned())
+            .entry((target, service.to_owned()))
             .or_default()
             .push(bytes.into());
+        self
+    }
+
+    /// Adds a whole response, SID included, to the answers to the profile's seed request, in place
+    /// of the built `positive SID, sub-function, 01 02 03 04` answer. A negative response may be
+    /// scripted; the call then ends as it would on a vehicle. It applies only when no declared
+    /// service answers the request: when a declared service does, it is not used, and that
+    /// service's [`Script::response`] list *of the same target* answers both requests. The answer
+    /// is target 0's.
+    pub fn seed(self, bytes: impl Into<Vec<u8>>) -> Self {
+        self.seed_on(0, bytes)
+    }
+
+    /// As [`Script::seed`], for the seed request on `target`.
+    pub fn seed_on(mut self, target: u8, bytes: impl Into<Vec<u8>>) -> Self {
+        self.seeds.entry(target).or_default().push(bytes.into());
         self
     }
 
@@ -118,13 +231,15 @@ pub enum DryRunEvent {
     /// whole request starting with its SID.
     Request {
         request: Vec<u8>,
-        /// `Service.short_name` of the declared service the request belongs to.
+        /// `Service.short_name` of the declared service the request belongs to, or
+        /// [`PROFILE_SEED_REQUEST`] / [`PROFILE_KEY_REQUEST`] for the profile's SecurityAccess
+        /// requests.
         service: String,
         answer: Vec<u8>,
         /// Whether the answer was built from the declaration rather than scripted.
         built: bool,
         /// The answer decoded through the service's positive response; `None` when the service
-        /// declares none.
+        /// declares none, and for the profile's requests, which have no declaration.
         decoded: Option<Result<Vec<DecodedField>, DecodeError>>,
     },
     SecurityAccess {
@@ -132,9 +247,13 @@ pub enum DryRunEvent {
         seed: Vec<u8>,
         key: Vec<u8>,
     },
+    /// A block sent with `FlashTransfer`. The report keeps its length and a digest of its
+    /// bytes ([`block_digest`]), not the bytes: a dry run serves a block as zeros (ADR-336 item
+    /// 15), and a flash image can be larger than the report's budget (ADR-391).
     FlashTransfer {
         block: u32,
-        data: Vec<u8>,
+        len: u64,
+        digest: u64,
     },
     /// Passes at once: a dry run does not wait.
     Wait {
@@ -152,6 +271,11 @@ pub enum DryRunEvent {
     },
     MonitorCapture {
         back_millis: u32,
+    },
+    /// The target the following events belong to changed (ADR-411). An event's target is the
+    /// last of these before it, or 0 when there is none; a run on one target records none.
+    SelectTarget {
+        target: u8,
     },
     Log {
         level: u8,
@@ -223,6 +347,10 @@ pub enum DryRunError {
     /// The report would grow past [`MAX_REPORT_BYTES`].
     #[error("the report would hold more than {MAX_REPORT_BYTES} bytes")]
     ReportTooLarge,
+    /// [`dry_run_targets`] was given a number of declaration parts other than the program's
+    /// target count (ADR-411).
+    #[error("the program has {expected} targets but {given} declaration parts were given")]
+    DeclarationParts { expected: usize, given: usize },
 }
 
 /// How a dry run ended.
@@ -247,38 +375,76 @@ pub struct DryRunReport {
     pub end: DryRunEnd,
     /// Instructions executed.
     pub steps: u64,
+    /// The pc the run ended at. The VM leaves it on the instruction that failed or stopped the
+    /// run, so it locates the end in the source through [`Program::source_map`]; 0 when the
+    /// program was refused before it ran.
+    pub pc: u32,
+    /// The target current when the run ended, so an error at [`DryRunReport::pc`] can be named
+    /// with its target; 0 when the program was refused before it ran (ADR-411).
+    pub target: u8,
 }
 
-/// Runs `program` on `variant` with vehicle access mocked by `script`, for at most `max_steps`
-/// instructions.
+/// Runs `program`, a program on one target (an empty [`Program::targets`] list), on `variant`
+/// with vehicle access mocked by `script`, for at most `max_steps` instructions. It is
+/// [`dry_run_targets`] with that one declaration part (ADR-411).
 pub fn dry_run(
     program: &Program,
     variant: &EcuVariant<'_>,
     script: &Script,
     max_steps: u64,
 ) -> DryRunReport {
-    let mut host = ScriptedHost {
-        variant,
-        script,
-        used: HashMap::new(),
+    dry_run_targets(program, std::slice::from_ref(variant), script, max_steps)
+}
+
+/// Runs `program` with vehicle access mocked by `script`, for at most `max_steps` instructions.
+/// `declarations[i]` is the declaration part of `program.targets[i]`, and the run answers, builds
+/// and decodes through the part of the current target (ADR-325 items 3 and 4); a program with no
+/// target list has one target and takes one part. After [`Program::validate`], a number of parts
+/// other than [`Program::target_count`] ends the run before it starts with
+/// [`DryRunError::DeclarationParts`]. The hashes in [`crate::Target::declarations`] are not
+/// verified: matching the parts to them is the caller's, as `check_job`'s is (ADR-411).
+pub fn dry_run_targets(
+    program: &Program,
+    declarations: &[EcuVariant<'_>],
+    script: &Script,
+    max_steps: u64,
+) -> DryRunReport {
+    let refused = |end| DryRunReport {
         events: Vec::new(),
-        report_bytes: 0,
-        over_budget: false,
+        end,
+        steps: 0,
+        pc: 0,
+        target: 0,
     };
     if let Err(error) = program.validate() {
-        return DryRunReport {
-            events: Vec::new(),
-            end: DryRunEnd::Invalid(error),
-            steps: 0,
-        };
+        return refused(DryRunEnd::Invalid(error));
     }
+    let expected = program.target_count();
+    if declarations.len() != expected {
+        return refused(DryRunEnd::Host(DryRunError::DeclarationParts {
+            expected,
+            given: declarations.len(),
+        }));
+    }
+    let mut host = ScriptedHost {
+        declarations,
+        target: 0,
+        script,
+        used: HashMap::new(),
+        marks: profile_requests(program),
+        pc: 0,
+        events: Vec::new(),
+        report_bytes: 0,
+        over_budget: None,
+    };
     let mut vm = Vm::new(program);
     let end = loop {
         if vm.state.steps >= max_steps {
             break DryRunEnd::StepLimit;
         }
-        let outcome = vm.step_with_declarations(program, Some(variant), &mut host);
-        if host.over_budget {
+        host.pc = vm.state.pc;
+        let outcome = vm.step_with_declarations(program, Some(&host.variant()), &mut host);
+        if host.over_budget.is_some() {
             break DryRunEnd::Host(DryRunError::ReportTooLarge);
         }
         match outcome {
@@ -294,30 +460,115 @@ pub fn dry_run(
         events: host.events,
         end,
         steps: vm.state.steps,
+        // A `log` past the budget cannot fail, so the step completes and moves the pc on; the
+        // report names the instruction that went over.
+        pc: host.over_budget.unwrap_or(vm.state.pc),
+        target: host.target,
     }
+}
+
+/// A request of the UDS profile's SecurityAccess call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProfileRequest {
+    Seed,
+    Key,
+}
+
+/// Whether `op` ends a scan from a `SecurityAccess` for its requests: any instruction that
+/// reaches the host, and a call or return, which leaves the straight-line code of one function.
+/// Every `SelectTarget` does: the scan is static, so it cannot tell whether one changes the
+/// target on the path taken (ADR-411). A `SelectTarget` between two requests in code order
+/// keeps them from being paired; the scan does not follow jumps, so a jump can still pair
+/// requests across targets. The lowering never builds such a program, and ADR-390 accepts this.
+fn ends_profile_scan(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::ServiceRequest { .. }
+            | Op::SendReceive { .. }
+            | Op::ReadDtc { .. }
+            | Op::RoutineControl { .. }
+            | Op::SecurityAccess { .. }
+            | Op::FlashTransfer { .. }
+            | Op::SelectTarget { .. }
+            | Op::Wait { .. }
+            | Op::WaitFromStack
+            | Op::HmiRequest { .. }
+            | Op::HmiRequestFromStack { .. }
+            | Op::RecordInput { .. }
+            | Op::MonitorCapture { .. }
+            | Op::Log { .. }
+            | Op::LogFromStack { .. }
+            | Op::Fail { .. }
+            | Op::FlashBlock { .. }
+            | Op::ReadInput { .. }
+            | Op::Call(_)
+            | Op::Ret
+    )
+}
+
+/// The seed and send-key requests of `program`'s `SecurityAccess` steps, by pc (ADR-390): for
+/// each, the nearest `ServiceRequest` before it and the nearest after it, when
+/// [`ends_profile_scan`] holds for no instruction between.
+fn profile_requests(program: &Program) -> HashMap<u32, ProfileRequest> {
+    let mut marks = HashMap::new();
+    let code = &program.code;
+    for (at, op) in code.iter().enumerate() {
+        let Op::SecurityAccess { .. } = op else {
+            continue;
+        };
+        let near = |mut range: Box<dyn Iterator<Item = usize>>| {
+            range
+                .find(|&pc| ends_profile_scan(&code[pc]))
+                .filter(|&pc| matches!(code[pc], Op::ServiceRequest { .. }))
+        };
+        let seed = near(Box::new((0..at).rev()));
+        let key = near(Box::new(at + 1..code.len()));
+        for (pc, request) in [(seed, ProfileRequest::Seed), (key, ProfileRequest::Key)] {
+            if let Some(pc) = pc.and_then(|pc| u32::try_from(pc).ok()) {
+                marks.entry(pc).or_insert(request);
+            }
+        }
+    }
+    marks
 }
 
 /// Which list of the script an answer comes from, for the count of answers used.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Answers {
-    Response(String),
+    Response(u8, String),
+    Seed(u8),
     Key,
     Form,
     Record,
 }
 
 struct ScriptedHost<'s, 'v> {
-    variant: &'s EcuVariant<'v>,
+    /// One declaration part per target, indexed by target.
+    declarations: &'s [EcuVariant<'v>],
+    /// The current target, which [`ScriptedHost::variant`] indexes `declarations` with.
+    target: u8,
     script: &'s Script,
     used: HashMap<Answers, usize>,
+    /// The profile's SecurityAccess requests by the pc of their `ServiceRequest`.
+    marks: HashMap<u32, ProfileRequest>,
+    /// The pc of the instruction being stepped.
+    pc: u32,
     events: Vec<DryRunEvent>,
     /// What the events count toward [`MAX_REPORT_BYTES`].
     report_bytes: usize,
-    /// Whether an event was refused for the budget; the run ends after that step.
-    over_budget: bool,
+    /// The pc of the instruction whose event was refused for the budget, if any; the run ends
+    /// after that step, and the report's pc is this one.
+    over_budget: Option<u32>,
 }
 
-impl ScriptedHost<'_, '_> {
+impl<'v> ScriptedHost<'_, 'v> {
+    /// The declaration part of the current target. The run checks that there is one part per
+    /// target and the VM refuses a target out of range before any host call, so the index is
+    /// in range.
+    fn variant(&self) -> EcuVariant<'v> {
+        self.declarations[usize::from(self.target)]
+    }
+
     /// Records `event`, which holds `bytes` bytes, unless the report would grow past
     /// [`MAX_REPORT_BYTES`]. Called before the event's bytes are copied.
     fn charge(&mut self, bytes: usize) -> Result<(), DryRunError> {
@@ -328,7 +579,7 @@ impl ScriptedHost<'_, '_> {
     fn charge_total(&mut self, cost: usize) -> Result<(), DryRunError> {
         let total = self.report_bytes.saturating_add(cost);
         if total > MAX_REPORT_BYTES {
-            self.over_budget = true;
+            self.over_budget.get_or_insert(self.pc);
             return Err(DryRunError::ReportTooLarge);
         }
         self.report_bytes = total;
@@ -345,25 +596,50 @@ impl ScriptedHost<'_, '_> {
     }
 
     /// Answers `request` as `service`, records it, and returns the answer.
-    fn answer(&mut self, request: &[u8], service: Service<'_>) -> Result<Vec<u8>, DryRunError> {
+    /// `seed` is set for the request marked as the profile's seed request: a built answer then
+    /// carries a seed that is not zero (ADR-405).
+    fn answer(
+        &mut self,
+        request: &[u8],
+        service: Service<'_>,
+        seed: bool,
+    ) -> Result<Vec<u8>, DryRunError> {
         let name = service.short_name().unwrap_or_default().to_owned();
         let script = self.script;
-        let scripted = script.responses.get(&name).map_or(&[][..], Vec::as_slice);
-        let (answer, built) = match self.next(Answers::Response(name.clone()), scripted) {
-            Some(answer) => (answer, false),
-            None => {
-                let positive =
-                    service
-                        .positive()
-                        .ok_or_else(|| DryRunError::NoPositiveResponse {
-                            service: error_name(&service),
-                        })?;
-                (built_response(&positive, self.variant.layouts()), true)
-            }
-        };
+        let scripted = script
+            .responses
+            .get(&(self.target, name.clone()))
+            .map_or(&[][..], Vec::as_slice);
+        // A request whose positive response is suppressed is answered with no bytes unless the
+        // script gives an answer, as the host returns the ECU's silence (ADR-408).
+        let silent = suppresses_positive_response(request);
+        let (answer, built) =
+            match self.next(Answers::Response(self.target, name.clone()), scripted) {
+                Some(answer) => (answer, false),
+                None if silent => (Vec::new(), true),
+                None => {
+                    let positive =
+                        service
+                            .positive()
+                            .ok_or_else(|| DryRunError::NoPositiveResponse {
+                                service: error_name(&service),
+                            })?;
+                    let built = built_response(&positive, self.variant().layouts());
+                    let answer = match (seed, request.get(1)) {
+                        // The declaration's own fields after the SID and the level are the seed.
+                        (true, Some(&level)) => {
+                            let fixed = built.len().checked_sub(2).filter(|&len| len > 0);
+                            built_seed_response(positive.sid(), level, fixed)
+                        }
+                        _ => built,
+                    };
+                    (answer, true)
+                }
+            };
         let decoded = service
             .positive()
-            .map(|positive| decode_positive_response(&positive, self.variant.layouts(), &answer));
+            .filter(|_| !(silent && answer.is_empty()))
+            .map(|positive| decode_positive_response(&positive, self.variant().layouts(), &answer));
         let decoded_bytes = match &decoded {
             // Twice the count: the decoder's vectors and strings grow as they fill, so their
             // storage can reach twice their length.
@@ -387,9 +663,62 @@ impl ScriptedHost<'_, '_> {
         Ok(answer)
     }
 
+    /// Answers `request`, the profile's `kind` of SecurityAccess request that no declared
+    /// service has, and records it. A request that matches several declared services is
+    /// `Ambiguous` and never reaches here.
+    fn answer_profile(
+        &mut self,
+        request: &[u8],
+        kind: ProfileRequest,
+    ) -> Result<Vec<u8>, DryRunError> {
+        // The positive SID and the sub-function echo come from the request. A request without
+        // a sub-function is none of the profile's.
+        let &[sid, sub, ..] = request else {
+            return Err(DryRunError::Undeclared {
+                request: error_request(request),
+            });
+        };
+        let positive_sid = sid.wrapping_add(0x40);
+        let mut built_answer = vec![positive_sid, sub];
+        let script = self.script;
+        let (name, scripted) = match kind {
+            ProfileRequest::Seed => {
+                built_answer = built_seed_response(positive_sid, sub, None);
+                (
+                    PROFILE_SEED_REQUEST,
+                    self.next(
+                        Answers::Seed(self.target),
+                        script
+                            .seeds
+                            .get(&self.target)
+                            .map_or(&[][..], Vec::as_slice),
+                    ),
+                )
+            }
+            // Its scripted response is out of scope (`Script`): always built.
+            ProfileRequest::Key => (PROFILE_KEY_REQUEST, None),
+        };
+        let built = scripted.is_none();
+        let answer = scripted.unwrap_or(built_answer);
+        self.charge(
+            request
+                .len()
+                .saturating_add(answer.len())
+                .saturating_add(name.len()),
+        )?;
+        self.events.push(DryRunEvent::Request {
+            request: request.to_vec(),
+            service: name.to_owned(),
+            answer: answer.clone(),
+            built,
+            decoded: None,
+        });
+        Ok(answer)
+    }
+
     fn send(&mut self, request: Vec<u8>) -> Result<Vec<u8>, DryRunError> {
-        let service = resolve(*self.variant, &request)?;
-        self.answer(&request, service)
+        let service = resolve(self.variant(), &request)?;
+        self.answer(&request, service, false)
     }
 }
 
@@ -638,12 +967,20 @@ impl DiagHost for ScriptedHost<'_, '_> {
         let mut request =
             vec![u8::try_from(service).map_err(|_| DryRunError::NotASid { service })?];
         request.extend_from_slice(payload);
-        self.send(request)
+        let resolved = resolve(self.variant(), &request);
+        // `Ambiguous` and every other error end the run, as for any request (ADR-328 item 2):
+        // only a request no declared service has is answered as the profile's.
+        let kind = self.marks.get(&self.pc).copied();
+        if let (Err(DryRunError::Undeclared { .. }), Some(kind)) = (&resolved, kind) {
+            return self.answer_profile(&request, kind);
+        }
+        let seed = kind == Some(ProfileRequest::Seed);
+        self.answer(&request, resolved?, seed)
     }
 
     fn send_receive(&mut self, service: u32, request: &[u8]) -> Result<Vec<u8>, DryRunError> {
         let declared = self
-            .variant
+            .variant()
             .services()
             .into_iter()
             .flatten()
@@ -660,7 +997,7 @@ impl DiagHost for ScriptedHost<'_, '_> {
                 request: error_request(request),
             });
         }
-        self.answer(request, declared)
+        self.answer(request, declared, false)
     }
 
     // The bytes the agent sends for these primitives (`agent::host`): ReadDTCInformation with
@@ -702,10 +1039,11 @@ impl DiagHost for ScriptedHost<'_, '_> {
     }
 
     fn flash_transfer(&mut self, block: u32, data: &[u8]) -> Result<(), DryRunError> {
-        self.charge(data.len())?;
+        self.charge(0)?;
         self.events.push(DryRunEvent::FlashTransfer {
             block,
-            data: data.to_vec(),
+            len: data.len() as u64,
+            digest: block_digest(data),
         });
         Ok(())
     }
@@ -762,11 +1100,11 @@ impl DiagHost for ScriptedHost<'_, '_> {
     }
 
     // A dry run has no artifact: the block is zero bytes of the requested length (ADR-336 item
-    // 15). It leaves no event, as it is no request, so only its bytes are charged (no event
-    // cost). One block is at most `MAX_BYTES_LEN` (`check_declarations`); the charge, made before
-    // the allocation, bounds the total over a run.
+    // 15). It leaves no event and the report keeps none of its bytes (`flash_transfer` records
+    // a length and a digest), so it is not charged: an image larger than the report's budget
+    // is a valid plan (ADR-391). One block is at most `MAX_BYTES_LEN` (`check_declarations`),
+    // and the VM's stack bounds how many it holds at once.
     fn artifact_bytes(&mut self, _offset: u64, len: u32) -> Result<Vec<u8>, DryRunError> {
-        self.charge_total(len as usize)?;
         Ok(vec![0; len as usize])
     }
 
@@ -781,6 +1119,19 @@ impl DiagHost for ScriptedHost<'_, '_> {
             .ok_or(DryRunError::NotScripted {
                 what: "value for the runtime input",
             })
+    }
+
+    // A notification that cannot fail, so over the budget the event is dropped as `log`'s is,
+    // and the target is updated all the same. The call before the first instruction names
+    // target 0, the initial one, and records nothing (ADR-411).
+    fn select_target(&mut self, target: u8) {
+        if target == self.target {
+            return;
+        }
+        self.target = target;
+        if self.charge(0).is_ok() {
+            self.events.push(DryRunEvent::SelectTarget { target });
+        }
     }
 
     // `log` cannot fail, so a message past the budget is dropped and the run ends after this

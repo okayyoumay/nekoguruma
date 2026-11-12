@@ -33,6 +33,8 @@ impl ConcatDelivery {
     fn into_received_frame(self, cop_tag: Option<Vec<u8>>) -> ReceivedFrame {
         ReceivedFrame {
             timestamp: self.timestamp,
+            // The segments' own library times (ADR-353).
+            clock: vci_service_interface::TimestampClock::Device,
             data: self.data,
             header_bytes: self.header_bytes,
             footer_bytes: self.footer_bytes,

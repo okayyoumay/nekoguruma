@@ -5,7 +5,7 @@
 2026-07-17, to also cover SOM/TX_DONE/loopback indication frames, for both modes; this ADR's
 "ADR-010 fully superseded" claim is narrowed to tester-present specifically by ADR-192, which
 reintroduces native periodic-message usage, and its ADR-010-class leak-cleanup discipline, for a
-different feature)
+different feature; the send stamp's classification made correct by the hold of ADR-419)
 **Affects:** `j2534-0404-service` service, rpc_primitive, events, rpc_link, rpc_misc (supersedes ADR-083's
 mode-0 dispatch mechanism, extends ADR-084's re-arm contract to mode 0, supersedes ADR-088's mode-0
 discard carve-out, supersedes ADR-010)

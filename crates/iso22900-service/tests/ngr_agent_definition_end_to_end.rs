@@ -9,9 +9,11 @@
 //! values, and the routine procedure runs with the same result: a debug-build agent treats
 //! `iso22900-mock` as a simulated VCI and may change the session there (ADR-331).
 //!
-//! `ngr-agent` belongs to another package, so cargo builds it only when the `agent` package is
-//! tested in the same run (as `cargo test --workspace` and CI do). It is looked up next to the
-//! test's `deps` directory.
+//! `ngr-agent` belongs to another package, so cargo builds it only when the run builds the
+//! `agent` package's binaries (as `cargo test --workspace` and CI do). It is looked up next to
+//! the test's `deps` directory and checked against its sources
+//! (`crates/agent/tests/support/ngr_agent_binary.rs`): build it first with
+//! `cargo build -p agent --bin ngr-agent` to run this package's tests alone.
 
 #[path = "../../diag-frontend/tests/support/definition_end_to_end.rs"]
 mod definition;
@@ -24,20 +26,11 @@ use diag_ir::VmState;
 
 const LIBRARY_NAME: &str = "NGR Mock D-PDU API";
 
+#[path = "../../agent/tests/support/ngr_agent_binary.rs"]
+mod ngr_agent_binary;
+
 fn ngr_agent_path() -> PathBuf {
-    let exe = std::env::current_exe().expect("test executable path");
-    let path = exe
-        .parent()
-        .and_then(Path::parent)
-        .expect("the test executable is in a deps directory")
-        .join(format!("ngr-agent{}", std::env::consts::EXE_SUFFIX));
-    assert!(
-        path.is_file(),
-        "{} should be built: test the agent package in the same run \
-         (cargo test --workspace, or -p agent -p iso22900-service)",
-        path.display()
-    );
-    path
+    ngr_agent_binary::ngr_agent_path("iso22900-service")
 }
 
 /// Installs the service binary as `<workers>/<ABI name>/iso22900-service`, the layout

@@ -78,6 +78,9 @@ jobs:
   # linker prints a warning of its own.
   core-linux:
     needs: changes
+    # A backstop if a step hangs outside the tests' own time limit (ADR-404); the job takes
+    # about 5 minutes.
+    timeout-minutes: 45
     if: ${{ always() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
     runs-on: ubuntu-latest
     env:
@@ -92,6 +95,13 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@nextest
       - run: cargo fmt --all -- --check
+      # The server's database tests start a throwaway PostgreSQL from the runner image's binaries
+      # (ADR-458); this fails with one clear message when the image stops shipping it.
+      - name: Locate PostgreSQL
+        run: |
+          bin=$(ls -d /usr/lib/postgresql/*/bin | sort -V | tail -n 1)
+          echo "NGR_TEST_PG_BIN=$bin" >> "$GITHUB_ENV"
+          "$bin/postgres" --version
       # fuzz/ is a workspace of its own whose seeds depend on this workspace's crates, so a
       # dependency added here can leave fuzz/Cargo.lock stale. The fuzz job runs on main only, so
       # this resolves the fuzz workspace against its lock on every pull request; nothing is built.
@@ -110,6 +120,9 @@ jobs:
   # it on every pull request. main runs everything.
   core-windows:
     needs: changes
+    # A backstop if a step hangs outside the tests' own time limit (ADR-404); the job takes
+    # about 20 minutes on main.
+    timeout-minutes: 90
     if: ${{ always() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
     runs-on: windows-latest
     env:
@@ -125,6 +138,13 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@nextest
+      # The server's database tests start a throwaway PostgreSQL from the runner image's binaries
+      # (ADR-458); this fails with one clear message when the image stops shipping it.
+      - name: Locate PostgreSQL
+        shell: pwsh
+        run: |
+          "NGR_TEST_PG_BIN=$env:PGBIN" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          & "$env:PGBIN\postgres.exe" --version
       - shell: bash
         run: cargo nextest run --workspace --locked $EXCLUDE --profile ci-windows-parallel -E "$AGENT_TESTS"
       - shell: bash

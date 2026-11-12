@@ -553,6 +553,14 @@ pub struct Exchange {
     /// Response pending messages (`7F SID 78`) sent before the response, each with its delay
     /// from the request in milliseconds, in order ([`Fault::ResponsePending`]).
     pub pending: Vec<(u32, Vec<u8>)>,
+    /// Messages sent after the response, each with its delay from the request in milliseconds,
+    /// in order ([`Fault::RepeatResponse`]).
+    pub after: Vec<(u32, Vec<u8>)>,
+    /// Whether the request reached the ECU. It does not while the ECU is off, starting up after
+    /// a reset, when a [`Fault::BusError`] loses it, or when `EcuConfig::drop_at_block` loses
+    /// the block; the ECU then takes no part in the
+    /// transfer, so a segmented request gets no flow control from it.
+    pub reached: bool,
 }
 
 impl Exchange {
@@ -561,6 +569,8 @@ impl Exchange {
             response: SimResponse::NoResponse,
             delay_ms: 0,
             pending: Vec::new(),
+            after: Vec::new(),
+            reached: false,
         }
     }
 }
@@ -815,7 +825,10 @@ impl SimEcu {
         }
         let power_cycles = self.power_cycles;
         let delay_before = self.security_delay_until;
-        let (exchange, sent_after_ms) = self.handle(addressing, message);
+        let (mut exchange, sent_after_ms) = self.handle(addressing, message);
+        // `drop_at_block` loses its block and silences the ECU inside `handle`, as a power loss
+        // armed for the request does before it.
+        exchange.reached = !self.silent;
         if self.power_cycles != power_cycles {
             // The ECU applies a reset at once, but on a vehicle it follows the response, so a
             // security delay the reset restarts runs from when the response goes out, and one
@@ -862,9 +875,35 @@ impl SimEcu {
                 }),
             None => None,
         };
+        // After a response pending message the ECU owes its final response, whatever the
+        // suppress bit says (clause 7.7.3.2): a request with the bit that a pending fault fires
+        // on is handled as if the client had not set it, so its positive response is sent last.
+        let owed = services::has_sub_function(message)
+            && message[1] & SUPPRESS_POS_RSP != 0
+            && self
+                .armed
+                .iter()
+                .find(|f| matches!(f, Fault::ResponsePending { .. }))
+                .is_some_and(|f| matches!(f, Fault::ResponsePending { count, .. } if *count > 0));
         let response = match refused {
             Some(response) => response,
+            None if owed => {
+                let mut owing = message.to_vec();
+                owing[1] &= !SUPPRESS_POS_RSP;
+                self.respond(addressing, &owing)
+            }
             None => self.respond(addressing, message),
+        };
+        let response = match response {
+            SimResponse::Positive(mut bytes) => {
+                if let Some(Fault::TruncateResponse { len }) =
+                    self.take_armed(|f| matches!(f, Fault::TruncateResponse { .. }))
+                {
+                    bytes.truncate(len.max(1));
+                }
+                SimResponse::Positive(bytes)
+            }
+            other => other,
         };
         let dropped = self
             .take_armed(|f| matches!(f, Fault::DropResponse))
@@ -897,10 +936,21 @@ impl SimEcu {
             };
             return (exchange, delay_ms);
         }
+        // The response goes out again `interval_ms` after the first time; the ECU's timers run
+        // from the first.
+        let mut after = Vec::new();
+        if let Some(Fault::RepeatResponse { interval_ms }) =
+            self.take_armed(|f| matches!(f, Fault::RepeatResponse { .. }))
+            && let Some(bytes) = response.to_bytes()
+        {
+            after.push((delay_ms.saturating_add(interval_ms), bytes));
+        }
         let exchange = Exchange {
             response,
             delay_ms,
             pending,
+            after,
+            reached: true,
         };
         (exchange, delay_ms)
     }
@@ -1057,12 +1107,26 @@ pub enum Fault {
     CorruptBlock { block: u32 },
     /// The next request the ECU answers gets `count` response pending messages (NRC 78) before
     /// its response: the first when the response was due, the others `interval_ms` apart, and
-    /// the response `interval_ms` after the last. A request without a response (suppressed, or
-    /// not for this ECU to answer) leaves the fault armed. `count` is capped at
+    /// the response `interval_ms` after the last. A request with the suppress bit gets its
+    /// positive response after the last message, since a final response is owed after one
+    /// (clause 7.7.3.2); a request without a response (not for this ECU to answer) leaves the
+    /// fault armed. `count` is capped at
     /// [`MAX_RESPONSE_PENDING`]; zero uses the fault up without sending any.
     ResponsePending { count: u32, interval_ms: u32 },
     /// The next request that reaches the ECU is refused with this NRC and has no effect: the
     /// ECU does not dispatch it, so no state changes. The refusal is sent whatever the
     /// addressing and the request's suppress bit.
     NegativeResponse { nrc: Nrc },
+    /// The next positive response the ECU sends is cut to its first `len` bytes, as a response
+    /// that does not answer its request (ADR-359): the request is handled as usual. A request
+    /// with no positive response leaves the fault armed; a `len` at or above the response's
+    /// length uses the fault up without cutting anything. A `len` of 0 leaves a message no
+    /// transport carries, so the response is cut to its service identifier instead. With
+    /// [`Fault::DropResponse`] armed too, both fire on the response: it is cut, then lost.
+    TruncateResponse { len: usize },
+    /// The next final response the ECU sends goes out twice, the second copy `interval_ms` after
+    /// the first, as a second ECU answering the same request on the same identifier would. A
+    /// request with no response leaves the fault armed; with [`Fault::DropResponse`] armed too,
+    /// both copies are lost and the fault stays armed.
+    RepeatResponse { interval_ms: u32 },
 }

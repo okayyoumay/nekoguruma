@@ -27,7 +27,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use j2534_defs::consts::{connect_flag, filter, ioctl, protocol, status, tx_flag};
+use j2534_defs::consts::{connect_flag, filter, ioctl, protocol, rx_flag, status, tx_flag};
 use serde::{Deserialize, Serialize};
 use sim_ecu::{Addressing, EcuConfig, EcuSnapshot, Fault, SimEcu, SystemClock};
 
@@ -229,11 +229,19 @@ struct Pending {
     ready_at: Instant,
     /// `SimEcu::power_cycles` when the response was produced.
     power_cycle: u64,
+    /// The message's `RxStatus`: 0 for a response, [`TX_DONE`] for a TxDone indication.
+    rx_status: PassThruUlong,
     data: Vec<u8>,
     /// Whether the filters let the response in. Decided once it has appeared on the bus, with
-    /// the filters of that moment (`Channel::settle`).
+    /// the filters of that moment (`Channel::settle`); an indication passes no filter and is
+    /// accepted from the start.
     accepted: bool,
 }
+
+/// The `RxStatus` of a TxDone indication: a transmitted message (`TX_MSG_TYPE`) whose
+/// transmission is done (`TX_INDICATION`), SAE J2534-1 v04.04 clauses 8.6 and 8.7.1.
+const TX_DONE: PassThruUlong =
+    (rx_flag::RX_TX_MSG_TYPE | rx_flag::RX_FLAG_TX_INDICATION) as PassThruUlong;
 
 /// A flow-control filter (J2534-1 7.2.9): receive from `pattern`, send to `flow_control`.
 #[derive(Clone, Copy)]
@@ -342,6 +350,11 @@ struct Bus {
     state_path: Option<PathBuf>,
     /// `PassThruWriteMsgs` calls to fail (`Command::FailWrites`).
     write_failures: WriteFailures,
+    /// The service a write must start with to fail and count against `write_failures`, if
+    /// `Command::FailWrites` named one; other writes go through untouched.
+    write_failure_service: Option<u8>,
+    /// `PassThruClose` calls of the open device to fail (`Command::FailCloses`).
+    close_failures: WriteFailures,
 }
 
 /// Which `PassThruWriteMsgs` calls fail with `ERR_FAILED`, sending nothing.
@@ -391,6 +404,8 @@ fn bus() -> &'static (Mutex<Bus>, Condvar) {
                 battery_mv: DEFAULT_BATTERY_MV,
                 state_path: std::env::var_os(ECU_STATE_ENV).map(PathBuf::from),
                 write_failures: WriteFailures::None,
+                write_failure_service: None,
+                close_failures: WriteFailures::None,
             }),
             Condvar::new(),
         )
@@ -578,14 +593,26 @@ impl Bus {
                 self.battery_mv = millivolts;
                 Ok(())
             }
-            Command::FailWrites { times: Some(0) } => Err(ERR_FAILED),
-            Command::FailWrites { times } => {
+            Command::FailWrites { times: Some(0), .. } => Err(ERR_FAILED),
+            Command::FailWrites { times, service } => {
                 self.write_failures =
                     times.map_or(WriteFailures::UntilCleared, WriteFailures::Next);
+                self.write_failure_service = service;
                 Ok(())
             }
             Command::ClearWriteFailures {} => {
                 self.write_failures = WriteFailures::None;
+                self.write_failure_service = None;
+                Ok(())
+            }
+            Command::FailCloses { times: Some(0) } => Err(ERR_FAILED),
+            Command::FailCloses { times } => {
+                self.close_failures =
+                    times.map_or(WriteFailures::UntilCleared, WriteFailures::Next);
+                Ok(())
+            }
+            Command::ClearCloseFailures {} => {
+                self.close_failures = WriteFailures::None;
                 Ok(())
             }
         }
@@ -702,30 +729,50 @@ impl Bus {
             ECU_PHYSICAL_REQUEST_ID => Addressing::Physical,
             FUNCTIONAL_REQUEST_ID => Addressing::Functional,
             // No simulated ECU listens on this ID.
-            _ => return Ok(()),
+            _ => {
+                self.tx_done_unanswered(channel_id, id, payload.len());
+                return Ok(());
+            }
         };
         if self.ecu.is_none() {
+            self.tx_done_unanswered(channel_id, id, payload.len());
             return Ok(());
         }
-        self.trace_request(payload);
         let ecu = self.ecu.as_mut().expect("checked above");
         let before = ecu.power_cycles();
         let exchange = ecu.exchange(addressing, payload);
+        let reached = exchange.reached;
         let power_cycle = ecu.power_cycles();
         self.after_ecu_change(before);
         // A request the next process must know about fails if it cannot be recorded; its
         // response is then not sent either.
         self.save_ecu()?;
+        // Traced once the ECU's state after it is saved, all under the bus lock: a test that sees
+        // the line and then kills the worker finds the request's effect in the state file, however
+        // late the kill comes. Its response is queued after the line.
+        self.trace_request(payload);
+        if reached {
+            self.tx_done(channel_id, id);
+        } else {
+            // The ECU is off, starting up or lost the request on the bus.
+            self.tx_done_unanswered(channel_id, id, payload.len());
+        }
         let Some(channel) = self.channels.get_mut(&channel_id) else {
             return Ok(());
         };
-        // Response pending messages (NRC 78) first, then the response itself.
+        // Response pending messages (NRC 78) first, then the response itself, then the copies
+        // of it a `repeat_response` fault sends.
         let now = Instant::now();
         let final_response = exchange
             .response
             .to_bytes()
             .map(|bytes| (exchange.delay_ms, bytes));
-        for (delay_ms, bytes) in exchange.pending.into_iter().chain(final_response) {
+        let sends = exchange
+            .pending
+            .into_iter()
+            .chain(final_response)
+            .chain(exchange.after);
+        for (delay_ms, bytes) in sends {
             let mut data = ECU_RESPONSE_ID.to_be_bytes().to_vec();
             data.extend_from_slice(&bytes);
             let ready_at = now + Duration::from_millis(delay_ms.into());
@@ -735,12 +782,46 @@ impl Bus {
                 Pending {
                     ready_at,
                     power_cycle,
+                    rx_status: 0,
                     data,
                     accepted: false,
                 },
             );
         }
         Ok(())
+    }
+
+    /// Queues the TxDone indication of a message of `payload_len` bytes sent to `can_id` that no
+    /// simulated ECU takes (none listens there, or the ECU is off, starting up or lost the
+    /// request): a single frame goes out, but a segmented message gets no flow control and does
+    /// not complete, so it gives none (SAE J2534-1 v04.04 clause 8.6).
+    fn tx_done_unanswered(&mut self, channel_id: PassThruUlong, can_id: &[u8], payload_len: usize) {
+        if payload_len <= SINGLE_FRAME_MAX {
+            self.tx_done(channel_id, can_id);
+        }
+    }
+
+    /// Queues the TxDone indication of a message just sent to `can_id` on the channel that sent
+    /// it, ahead of any response to it. The device sends a whole message at once, so the
+    /// indication is readable at once. SAE J2534-1 v04.04 clause 8.6 gives it on ISO 15765, the
+    /// only protocol the simulator has, with the message's CAN ID as its data.
+    fn tx_done(&mut self, channel_id: PassThruUlong, can_id: &[u8]) {
+        let power_cycle = self.power_cycles();
+        let Some(channel) = self.channels.get_mut(&channel_id) else {
+            return;
+        };
+        let ready_at = Instant::now();
+        let at = channel.rx.partition_point(|p| p.ready_at <= ready_at);
+        channel.rx.insert(
+            at,
+            Pending {
+                ready_at,
+                power_cycle,
+                rx_status: TX_DONE,
+                data: can_id.to_vec(),
+                accepted: true,
+            },
+        );
     }
 }
 
@@ -803,6 +884,8 @@ fn reset(config: EcuConfig) {
     bus.trace_path = None;
     bus.battery_mv = DEFAULT_BATTERY_MV;
     bus.write_failures = WriteFailures::None;
+    bus.write_failure_service = None;
+    bus.close_failures = WriteFailures::None;
 }
 
 // ---------------------------------------------------------------- Control
@@ -814,8 +897,8 @@ pub const CONTROL_DIR_ENV: &str = "NGR_SIM_VCI_CONTROL_DIR";
 
 /// Environment variable naming a file `sim-vci` appends a request trace to, for a test that
 /// checks the order of the requests a worker sent: one line per UDS request sent towards the
-/// simulated ECU (a send attempt, traced before the ECU sees it, so a request lost on the bus or
-/// ignored is listed too; see `trace_line`), and a `vbatt` line per `READ_VBATT`. Read once, on the first
+/// simulated ECU (a send attempt, traced once the ECU has handled it and its state is saved, before its
+/// response is queued, so a request lost on the bus or ignored is listed too; see `trace_line`), and a `vbatt` line per `READ_VBATT`. Read once, on the first
 /// call into the library, and only in debug builds. The file is created if missing and never
 /// truncated by the library.
 pub const TRACE_ENV: &str = "NGR_SIM_VCI_TRACE";
@@ -826,7 +909,8 @@ const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// A control command, as JSON: `{"command": "inject_fault", "fault": "power_loss"}`,
 /// `{"command": "reconnect_ecu"}`, `{"command": "disconnect_vci"}`, `{"command": "connect_vci"}`,
 /// `{"command": "set_battery_voltage", "millivolts": 11500}`, `{"command": "fail_writes",
-/// "times": 1}`, `{"command": "clear_write_failures"}`, `{"command": "crash_vci"}`,
+/// "times": 1}`, `{"command": "clear_write_failures"}`, `{"command": "fail_closes", "times": 1}`,
+/// `{"command": "clear_close_failures"}`, `{"command": "crash_vci"}`,
 /// `{"command": "restart_vci"}`, `{"command": "hold_session"}`.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
@@ -858,13 +942,28 @@ enum Command {
     /// disconnect, until it is closed (J2534-1 6.10.1).
     RestartVci {},
     /// Makes `PassThruWriteMsgs` fail with `ERR_FAILED`, sending nothing: the next `times` calls
-    /// (at least one), or, without `times`, every call until `ClearWriteFailures`.
+    /// (at least one), or, without `times`, every call until `ClearWriteFailures`. With
+    /// `service`, only a call whose first message's data starts with that service after the CAN
+    /// identifier fails and counts; other calls go through (so a test can fail one request kind
+    /// while a tester present or another request is sent beside it).
     FailWrites {
         #[serde(default)]
         times: Option<u32>,
+        #[serde(default)]
+        service: Option<u8>,
     },
     /// Ends `FailWrites`.
     ClearWriteFailures {},
+    /// Makes `PassThruClose` of the open device (healthy, lost or crashed) fail with
+    /// `ERR_FAILED`, releasing nothing: the next `times` calls (at least one), or, without
+    /// `times`, every call until `ClearCloseFailures`. A close of an unknown device ID still
+    /// answers `ERR_INVALID_DEVICE_ID` and keeps the count.
+    FailCloses {
+        #[serde(default)]
+        times: Option<u32>,
+    },
+    /// Ends `FailCloses`.
+    ClearCloseFailures {},
     /// `SimEcu::hold_session`: a non-default session does not time out until the next request
     /// reaches the ECU.
     HoldSession {},
@@ -980,6 +1079,11 @@ pub unsafe extern "system" fn PassThruOpen(
 #[unsafe(no_mangle)]
 pub extern "system" fn PassThruClose(device_id: PassThruUlong) -> PassThruUlong {
     let mut bus = lock();
+    if bus.device_open && bus.device_ok(device_id) && bus.close_failures.take() {
+        // `Command::FailCloses`: the close fails and the device stays as it was, so the
+        // application can close it again.
+        return ERR_FAILED;
+    }
     if bus.vci_crashed && bus.device_open && bus.device_ok(device_id) {
         // The VCI does not answer, but the application gives the device up: it is released as
         // after a loss, and the call reports the failure (ADR-292).
@@ -987,6 +1091,12 @@ pub extern "system" fn PassThruClose(device_id: PassThruUlong) -> PassThruUlong 
         bus.device_lost = false;
         bus.device_id = bus.device_id.wrapping_add(1).max(1);
         return ERR_FAILED;
+    }
+    if bus.vci_crashed && !bus.device_ok(device_id) {
+        // The library knows which device IDs it holds without asking the VCI: a close of one it
+        // does not hold, such as the device a close above already released, is refused as with
+        // the VCI answering (ADR-422: a later close then confirms the device closed).
+        return ERR_INVALID_DEVICE_ID;
     }
     if bus.device_lost && bus.device_ok(device_id) {
         // Closing is how the application recovers from a lost device; the call still reports
@@ -1101,7 +1211,7 @@ pub unsafe extern "system" fn PassThruReadMsgs(
             let pending = channel.rx.pop_front().expect("front checked above");
             let mut msg = PassThruMsg {
                 protocol_id: channel.protocol_id,
-                rx_status: 0,
+                rx_status: pending.rx_status,
                 tx_flags: 0,
                 timestamp: timestamp(epoch, pending.ready_at),
                 data_size: pending.data.len() as PassThruUlong,
@@ -1141,8 +1251,9 @@ pub unsafe extern "system" fn PassThruReadMsgs(
 }
 
 /// Sends each message to the simulated ECU. The ECU handles the request at once; its response
-/// becomes readable after the delay it reports. No TxDone indications or loopback messages
-/// are generated. A call that `Command::FailWrites` fails returns `ERR_FAILED` with no message
+/// becomes readable after the delay it reports. Each message sent queues its TxDone indication
+/// ahead of the response, except a segmented message no ECU takes, which gets no flow control
+/// and does not complete; no loopback messages are generated. A call that `Command::FailWrites` fails returns `ERR_FAILED` with no message
 /// sent.
 ///
 /// # Safety
@@ -1175,8 +1286,22 @@ pub unsafe extern "system" fn PassThruWriteMsgs(
     let Some(protocol_id) = bus.channels.get(&channel_id).map(|c| c.protocol_id) else {
         return fail(ERR_INVALID_CHANNEL_ID);
     };
-    // A write failure the test armed: the device takes none of the messages.
-    if bus.write_failures.take() {
+    // A write failure the test armed: the device takes none of the messages. With a service
+    // named, only a call whose first message starts with that service after the CAN identifier
+    // fails and counts.
+    let armed = match bus.write_failure_service {
+        None => true,
+        // SAFETY: `msgs` is non-null (checked above) and the caller guarantees `wanted`
+        // readable messages; the first is read only when there is one.
+        Some(service) => {
+            wanted > 0 && {
+                let first = unsafe { &*msgs };
+                let size = (first.data_size as usize).min(MAX_MSG_DATA);
+                first.data[..size].get(CAN_ID_LEN) == Some(&service)
+            }
+        }
+    };
+    if armed && bus.write_failures.take() {
         return fail(ERR_FAILED);
     }
     let mut sent = 0;

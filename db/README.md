@@ -4,6 +4,28 @@
 `migrations/0002_extensions_without_vci_profile.sql` removes `vciProfile` from the extension kinds:
 VCI profiles are installed on devices outside this software (design 9.3, ADR-228).
 
+## How migrations are applied
+
+The server embeds the files of `migrations/` when it is built (`sqlx::migrate!`; `build.rs` makes
+cargo rebuild the crate when the directory changes) and applies the ones the database lacks when
+it starts, before it listens (ADR-458). Nothing else applies them. sqlx records each applied
+migration in the table `_sqlx_migrations` (version, description, checksum of the file's bytes,
+success flag) and runs each file in one transaction.
+
+- Names are `NNNN_snake_case.sql`: the digits before the first underscore are the version, and
+  versions apply in numeric order.
+- A merged file is immutable, byte for byte. The recorded checksum is compared at every start,
+  and a server whose embedded file differs refuses to start; a fix is a new file.
+- Line endings are LF: `.gitattributes` pins `migrations/*.sql`, since a checkout that converts
+  them would change the checksum. A test fails when an embedded migration contains a carriage
+  return.
+- A database that holds a migration the server does not carry (a newer server migrated it)
+  refuses the start of the older one, so a downgrade needs the database restored.
+- Two servers starting together are safe: sqlx's advisory lock lets one apply the migrations and
+  the other find nothing to do. The lock is held per session and counts how often it
+  was taken, so after a failed run the server closes that connection and exits instead of
+  retrying. PostgreSQL's own `lock_timeout` and `statement_timeout` bound a run to 60 seconds.
+
 ## Design decisions
 
 **Put tenant ID in every table**

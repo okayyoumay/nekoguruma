@@ -37,6 +37,7 @@ fn minimal_link() -> LogicalLinkState {
         tester_present_state: TesterPresentState::None,
         tester_present_base_tx_flags: 0,
         open_tp_discards: Vec::new(),
+        open_func_tx: None,
         working_unique_resp_id_table: Vec::new(),
         active_unique_resp_id_table: Vec::new(),
         unique_resp_filter_ids: Vec::new(),
@@ -87,6 +88,7 @@ fn sample_registrant(cop_handle: u32) -> CopRegistrant {
         concat_enabled: false,
         concat: Vec::new(),
         concat_segments_got: 0,
+        som_started: Vec::new(),
     }
 }
 
@@ -462,6 +464,12 @@ async fn finalize_and_deliver_concat_buffers_if_live_delivers_and_advances_when_
             .all(|item| matches!(item, CllQueueItem::Frame(_))),
         "each delivered item must be a CllQueueItem::Frame"
     );
+    // ADR-353: a concatenated message's time is its first segment's library
+    // time, so it is on the device clock.
+    assert!(queue.items.iter().all(|item| matches!(
+        item,
+        CllQueueItem::Frame(frame) if frame.clock == vci_service_interface::TimestampClock::Device
+    )));
 }
 
 /// ADR-205 follow-up (edge-case-hunter finding, round 5): pins the fix's own

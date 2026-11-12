@@ -8,7 +8,7 @@ see Second Amendment below, fixing a live-vs-snapshot mismatch the first Amendme
 indication frames, and to open `discard_until` on every successful send regardless of
 `CP_TesterPresentReqRsp` — this ADR's content-prefix discard mechanism itself is otherwise unchanged;
 precedence rule ("a pending COP's own claim always wins over discard") superseded by ADR-100
-2026-07-17, which replaces probe-then-discard with an explicit attribution precedence table)
+2026-07-17, which replaces probe-then-discard with an explicit attribution precedence table; the end of the discard window of a send that expects an answer superseded by ADR-419)
 **Affects:** `j2534-0404-service` service, events, rpc_primitive, comparam_defaults
 
 ## Context

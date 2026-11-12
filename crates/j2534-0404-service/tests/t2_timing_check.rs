@@ -6,7 +6,10 @@
 //! through `j2534-0404-service`, against the simulated ECU behind `sim-vci`. The ECU is
 //! configured with a P2 and P2* other than `sim-ecu`'s defaults, so the test shows the reported
 //! values come from the ECU's answer through the worker and the VCI, and that the comparison with
-//! `sim-ecu`'s values marks them as different.
+//! `sim-ecu`'s values marks them as different. The link's transmit indications give each
+//! request's transmit done on the device clock, and the single-frame responses their end, so
+//! each latency is the VCI's, judged against the reported P2 beyond the profile's margin
+//! (ADR-356).
 //!
 //! This file holds a single test, so the process-wide variables it sets for the spawned service
 //! cannot race with another test.
@@ -14,7 +17,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use ngr_hw_checks::checks::t2_timing::{SAMPLES, SessionTiming, run};
+use ngr_hw_checks::checks::t2_timing::{Judgement, MeasuredBy, SAMPLES, SessionTiming, run};
 use ngr_hw_checks::guard::{GuardedHandle, HandleOptions};
 use ngr_hw_checks::profile::{Setup, parse};
 use ngr_hw_checks::report::RunGuard;
@@ -60,6 +63,7 @@ label = "sim"
 pname = "sim-vci"
 firmware_version = "unchecked here"
 library_version = "unchecked here"
+timing_margin_us = 500
 
 [link]
 protocol = "ISO_14229_3_on_ISO_15765_2"
@@ -176,13 +180,26 @@ fn the_timing_check_reads_the_ecu_s_p2_and_p2_star_through_the_guard() {
                 );
                 assert_eq!(outcome.simulator, SessionTiming::simulator());
                 assert!(!outcome.matches_simulator());
-                assert_eq!(outcome.round_trips.len(), SAMPLES);
+                assert_eq!(outcome.samples.len(), SAMPLES);
+                assert_eq!(outcome.margin, Some(Duration::from_micros(500)));
+                for sample in &outcome.samples {
+                    // `sim-vci` gives no start of message for a single frame, so the latency runs
+                    // to the response's end, which a response within P2 proves on time.
+                    let (latency, by) = sample.latency.unwrap_or_else(|| {
+                        panic!("the VCI measured {}: {sample:?}", sample.request)
+                    });
+                    assert_eq!(by, MeasuredBy::VciTxDoneToRxEnd, "{sample:?}");
+                    assert!(latency < Duration::from_millis(25), "{sample:?}");
+                    assert_eq!(sample.judgement, Judgement::WithinP2, "{sample:?}");
+                }
+                let summary = outcome.summary();
                 assert!(
-                    outcome
-                        .summary()
-                        .contains("P2 25 ms (sim-ecu 50 ms, differs)"),
-                    "{}",
-                    outcome.summary()
+                    summary.contains("P2 25 ms (sim-ecu 50 ms, differs)"),
+                    "{summary}"
+                );
+                assert!(
+                    summary.contains("(vci_tx_done_to_rx_end), within P2"),
+                    "{summary}"
                 );
                 drop(handle);
                 guard.pass();

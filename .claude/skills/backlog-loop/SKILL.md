@@ -1,6 +1,6 @@
 ---
 name: backlog-loop
-description: Work through the nekoguruma backlog one item at a time. Handle open Dependabot pull requests first, then pick the next unblocked item, implement it in one pull request, run pr-review-loop, hand the PR to the maintainer, and start the next item only after the maintainer merges it. The final report ends with a retrospective on the loop itself. Run only when the maintainer asks for it.
+description: Work through the nekoguruma backlog one pull request at a time, preparing the next item locally while a PR waits for merge. Handle open Dependabot pull requests first, then pick the next unblocked item that, checked against the code before it is claimed, fits one pull request and leaves no design choice open, implement it in one pull request, run pr-review-loop, hand the PR to the maintainer, prepare the next item locally while it waits, and open the next PR only after the maintainer merges it. The final report ends with a retrospective on the loop itself. Run only when the maintainer asks for it.
 disable-model-invocation: true
 argument-hint: "[max items, default 3] [lowest priority to include: P1 (default) or P2] | pr=<number of the PR to resume>"
 ---
@@ -8,10 +8,11 @@ argument-hint: "[max items, default 3] [lowest priority to include: P1 (default)
 # Backlog loop
 
 One iteration is one backlog item, or one failing Dependabot pull request (step 2), and one
-pull request. Iterations run strictly one after
-another: the next one starts only after the maintainer has merged the previous PR. Claude never
-merges, and never works on two loop items at once. ADR-230 records why claims, run state and the
-branch reset work the way they do.
+pull request. Pull requests run strictly one after another: the next one opens only after the
+maintainer has merged the previous PR. While a PR waits for that merge, the next item may be
+prepared locally ("Preparing the next item", step 6; ADR-382), but never pushed or reviewed.
+Claude never merges. ADR-230 records why claims, run state and the branch reset work the way
+they do.
 
 Arguments: $ARGUMENTS. To start a run: the number of items for this run (default 3), then the
 lowest priority to include: P1 (default: P0, P1 and the `Known Flaky Tests` entries) or P2. P3
@@ -28,7 +29,8 @@ the priority cap, and four lists (merged PRs with their shadow risk verdicts, sk
 the reason, backlog-only PRs, the one that ends the run marked "final", and Dependabot PRs: each
 one this run replaced, with its replacement, or reported to the maintainer, with the reason),
 and the milestone count at the start: the number of milestone P1 items, counted on `origin/main`
-when the run starts by the counting rules of the `milestone-exit` skill. Keep it in a "Loop
+when the run starts by the counting rules of the `milestone-exit` skill, and the prepared item,
+if any (its first line, and "prepared locally in this session"). Keep it in a "Loop
 run" section of the current loop PR's description and update it at every step that changes it,
 so it survives a compacted conversation or a fresh session; a merged PR's description can still
 be edited. That section is the only source of the state. A PR belongs to this run only when its
@@ -55,7 +57,8 @@ from branches here, and anyone can choose a fork PR's title. If one belongs to t
 it as described under "Run state" instead of going on. If one belongs to another run, stop the
 run and go to "Final report" (one item at a time).
 
-Otherwise start the branch afresh from `origin/main`, locally and on the remote (ADR-249). This
+Otherwise start the branch afresh from `origin/main`, locally and on the remote (ADR-249). With
+a prepared item, read "After the merge" in step 6 first: it replaces the `checkout` below. This
 discards everything on the local branch, so first check that nothing else needs it: stop and
 tell the maintainer if `git status --porcelain` prints anything, or if any open PR, labelled or
 not, has this branch as its head. Then:
@@ -143,8 +146,15 @@ pick and the alternative that passes these checks:
 
 - **Blocked.** It has a `Blocked on:` clause. If `next-task` reports the blocker as resolved,
   verify that, remove the clause with the `backlog` skill, and take the item; otherwise skip it.
-- **Too big.** It does not fit in one pull request: record the split with the `backlog` skill and
-  skip it.
+- **Too big or undecided.** Judge this from the code, not from the item's text alone, before
+  claiming it: open the files the item names, estimate the files and lines the change touches
+  against `scripts/classify-pr-risk.sh`'s limits (20 files, 800 lines), and look for a design
+  choice the design document and the ADRs leave open (where the work belongs, an interface it
+  changes, an outcome or rule it would have to invent). If it does not fit one pull request,
+  record the split with the `backlog` skill and skip it. If a choice is open, add `Blocked on:
+  the maintainer's decision on ...` with the `backlog` skill (the forms in `work/README.md`) and
+  skip it. An estimate over the limits is no reason to split when the excess is tests or
+  generated code the one change needs; say so in the PR.
 - **Stale.** `next-task` reports it as already done: close it with the `backlog` skill and skip it.
   Close every other item `next-task` lists as stale the same way.
 
@@ -165,14 +175,17 @@ this repository; ADR-243). The title prefix is set when the PR is created, so th
 when either PR got its label. If one of them has a lower number than this one (two runs started together), mark this one "final" in its run
 state, close it with a comment naming the other, and stop the run. Backlog edits made while
 picking are dropped with it on purpose: the winning run, or a later one, finds the same stale,
-too-big or unblocked items with the same checks and makes those edits again. The final report
+too-big, undecided or unblocked items with the same checks and makes those edits again. The final report
 lists the dropped edits. The same check follows every loop PR this skill opens, including a
 backlog-only PR.
 
 ## 4. Implement
 
 Work the item as any other task, following CLAUDE.md and `.claude/README.md` (task size, agents,
-documentation sync, ADRs). Close the item with the `backlog` skill in the same PR. A Dependabot
+documentation sync, ADRs). For an item whose blocker a decision of the maintainer just resolved,
+write CLAUDE.md's design summary ("Guidelines") and get it confirmed before implementing. When
+the item meets the case-table gate in `.claude/README.md` (ADR-381), get `design-advisor`'s case
+table before implementing it. Close the item with the `backlog` skill in the same PR. A Dependabot
 replacement (step 2) has no item to close. If its work shows the loop cannot finish it, put the
 Dependabot PR on the run's Dependabot list with the reason, mark the replacement "final" in its
 run state, close it unmerged with a comment giving the reason, and write the final report. Its
@@ -226,9 +239,10 @@ verdict or its reasons changed.
 
 ## 6. Wait for the merge, then continue
 
-End the turn. While the PR is open, any wake other than its merge or close (a review, a CI
-result, a comment) is handled by `pr-review-loop`, and the turn ends again; it does not start
-step 1.
+Prepare the next item if the rules below allow it. Start the 30-minute merge-wait timer
+(`pr-review-loop`, "Waking up" in Step 0; ADR-380) and end the turn. A timer wake reads the PR's state: merged or closed goes on as below, and still open
+starts the next timer. While the PR is open, any other wake (a review, a CI result, a comment) is
+handled by `pr-review-loop`, and the turn ends again; it does not start step 1.
 
 A PR marked "final" ends the run whether it is merged or closed: write the final report if it
 was not written yet, and do nothing else.
@@ -238,9 +252,54 @@ list, items left decreased; a backlog-only PR does not count), then copy the sta
 to step 1. When it is closed without merging, go to step 1, which stops the run.
 
 Each item should start with a small context. If the session can start a fresh session for the
-next iteration (for example a project coordinator that opens a new thread), hand off there with
-the command `/backlog-loop pr=<n>`, naming the PR whose merge was just recorded. Otherwise continue in
-this session.
+next iteration (for example a project coordinator that opens a new thread), and it holds no
+prepared item, hand off there with the command `/backlog-loop pr=<n>`, naming the PR whose merge
+was just recorded. Otherwise continue in this session: prepared work lives only in this
+session's worktree.
+
+### Preparing the next item (ADR-382)
+
+While the current PR waits for the merge, prepare the next item when all of these hold: the PR
+is not marked "final", at least one item would be left after it, and nothing is prepared yet.
+At most one item is prepared at a time.
+
+1. In the session's own checkout, list the files the current PR changes, the backlog files aside:
+   `git fetch origin && git diff --name-only origin/main...HEAD`. Change nothing there.
+2. Make a local worktree from `origin/main` on a local branch that is never pushed:
+   `git worktree add ../loop-next origin/main -B loop-next`, and work only there from now on; the
+   session's branch stays on the current PR. Pick as step 2's "Backlog item" does, passing
+   `next-task` also `avoid=` followed by the files just listed; any backlog edits the pick makes
+   go into the worktree. Also leave out an item that needs the current PR's change. Do not handle
+   Dependabot PRs here; step 2 does that at the next iteration. If nothing passes, prepare
+   nothing: remove the worktree and the local branch (`git worktree remove --force ../loop-next`,
+   `git branch -D loop-next`), and leave any backlog edits the pick made to the next iteration's
+   step 2.
+3. Implement the item as step 4 does, the case-table gate and the backlog edits included, through
+   Step 3's local checks of `pr-review-loop` and its `edge-case-hunter` pass, and commit in the
+   worktree. Do not push, open a PR or request a review. Name the item in the current PR's run
+   state.
+
+The current PR comes first. A review, a CI failure, a conflict or a maintainer comment on it is
+handled before any preparation work, which waits until that turn's work on the PR is done.
+
+**After the merge.** Record the merge as above, then run step 1's checks; a stop there discards
+the prepared work. In step 2, Dependabot replacements still come first: keep the prepared work
+for the iteration after that one. Otherwise check that the prepared item is still open, not
+blocked and not done on the new `origin/main`; if not, discard the work and pick as usual. Then,
+in the worktree, `git fetch origin && git rebase origin/main` (the commits were never pushed, so
+this rewrites nothing shared). Resolve a conflict in a backlog file by taking `origin/main`'s
+side and redoing the item's own backlog edits with the `backlog` skill; resolve a code conflict
+as `pr-review-loop` resolves one with its base (Step 3, check 5), then run its local checks and
+the `edge-case-hunter` pass again. Then set the session's branch to the result and drop the
+temporary ones: `git worktree remove ../loop-next`, `git checkout -B <branch> loop-next`,
+`git branch -D loop-next` (the remote branch was deleted with the merged PR). Push it with
+`git push -u origin <branch>`, and claim the item as
+step 3 does, the claim race check included. Its PR then goes straight to step 5.
+
+**Discarding.** Prepared work is dropped when the current PR is closed unmerged (step 1 stops the
+run), when the item is no longer eligible after the merge, or when the session that holds the
+worktree ends: a session that resumes with `pr=<n>` finds no worktree and picks as usual. Remove
+the worktree and the local branch, and list the item in the final report.
 
 ## Final report
 
@@ -259,9 +318,10 @@ One message to the maintainer:
   recommendation; for the rest (another precondition is still open), give only their count;
 - one line on the current milestone: its P1 count now, counted the same way on the latest
   `origin/main`, and the change from the count at the start. Give no per-item list; the
-  `milestone-exit` skill's `status` mode gives the full report. When the count is zero, say so
-  and recommend that the maintainer run its `sweep` mode. Never run `sweep` or `close` from the
-  loop: both need the maintainer;
+  `milestone-exit` skill's `status` mode gives the full report. When the count is zero, or every
+  milestone item left is blocked, say so and recommend that the maintainer ask for its `close`
+  mode, which starts with a sweep (ADR-413). Never run `sweep` or `close` from the loop: both
+  need the maintainer;
 - why the run stopped (no items left, nothing eligible within the cap or five `next-task` calls
   without a pick, `main` red, another loop PR open or a lost claim race, a PR closed without merging, a Dependabot replacement the loop could not finish (with the
   branch the maintainer should delete), or three backlog-only PRs);

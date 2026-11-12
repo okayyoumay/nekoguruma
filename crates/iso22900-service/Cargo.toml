@@ -39,6 +39,9 @@ diag-frontend = { path = "../diag-frontend" }
 postcard = { workspace = true }
 iso22900-mock = { workspace = true }
 worker-host = { workspace = true }
-serial_test = "3"
+tracing-subscriber = { workspace = true }
+serial_test = "4"
 tempfile = "3"
 serde_json = "1"
+# tests/agent_keep_alive.rs names the job ids of its communication logs.
+shared-proto = { workspace = true }

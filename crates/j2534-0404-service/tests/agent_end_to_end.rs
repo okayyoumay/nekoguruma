@@ -12,7 +12,10 @@
 //! does not know, and a DID whose response `sim-vci` drops, and the log holds an exchange entry
 //! for each, classified by what the host saw. A sixth sends a request longer than ISO 15765 can
 //! carry, which the worker refuses with its reason (ADR-350), and its log shows the request not
-//! sent, refused by the worker. Every job comes from a document and opens the link its variant
+//! sent, refused by the worker. A seventh set of jobs sends requests whose positive response is
+//! suppressed (ADR-408), also through the generic send-receive: the ECU's silence is the result, a negative response is returned, and a
+//! response pending obliges a final response. Every job comes from a document and opens the link
+//! its variant
 //! declares (ADR-324).
 //!
 //! This file holds a single test, so the process-wide `VCI_CONFIG_PATH` it sets for the
@@ -26,7 +29,7 @@ use agent::guards::{GuardSetup, JobGuards};
 use agent::{CommLogSetup, CommLogStatus, Job, JobDocument, JobLimits, JobRun, run_program};
 use diag_ir::declaration::{
     DataKind, EcuDocumentT, EcuVariantT, FieldT, NegativeShapeT, Placement, PositiveResponseT,
-    ProtocolT, ServiceT, encode_ecu_document,
+    ProtocolT, RequestT, ServiceT, encode_ecu_document,
 };
 use diag_ir::{IR_SCHEMA_VERSION, Op, Program, Value};
 use worker_host::client::ConnectOptions;
@@ -87,6 +90,7 @@ fn program() -> Program {
         identity: Default::default(),
         preconditions: Default::default(),
         flash: Vec::new(),
+        targets: Vec::new(),
     }
 }
 
@@ -121,6 +125,7 @@ fn write_program() -> Program {
         identity: Default::default(),
         preconditions: Default::default(),
         flash: Vec::new(),
+        targets: Vec::new(),
     }
 }
 
@@ -142,6 +147,17 @@ fn vin_document(procedure: &Program) -> Vec<u8> {
     service.id = 1;
     service.short_name = Some("readVin".into());
     service.positive = Some(Box::new(positive));
+    // Service 2: DiagnosticSessionControl, for the generic send-receive (ADR-321), whose positive
+    // response starts with 0x50.
+    let mut session_positive = PositiveResponseT::default();
+    session_positive.sid = 0x50;
+    let mut session = ServiceT::default();
+    session.id = 2;
+    session.short_name = Some("sessionControl".into());
+    let mut request = RequestT::default();
+    request.sid = 0x10;
+    session.request = Some(Box::new(request));
+    session.positive = Some(Box::new(session_positive));
     let mut shape = NegativeShapeT::default();
     shape.marker = 0x7F;
     shape.echoes_sid = true;
@@ -158,7 +174,7 @@ fn vin_document(procedure: &Program) -> Vec<u8> {
     variant.id = 1;
     variant.short_name = Some("sim".into());
     variant.protocols = Some(vec![protocol]);
-    variant.services = Some(vec![service]);
+    variant.services = Some(vec![service, session]);
     let mut document = EcuDocumentT::default();
     document.schema_version = IR_SCHEMA_VERSION;
     document.source_format = Some("csv-starlark".into());
@@ -252,16 +268,17 @@ fn agent_job_reads_the_vin_from_sim_vci() {
         .duration_since(UNIX_EPOCH)
         .expect("system clock should be after unix epoch")
         .as_nanos();
-    let config_path = std::env::temp_dir().join(format!("agent-e2e-{nanos}-sim-vci.toml"));
+    let pid = std::process::id();
+    let config_path = std::env::temp_dir().join(format!("agent-e2e-{pid}-{nanos}-sim-vci.toml"));
     let config = TempFile(config_path.clone());
     std::fs::write(&config_path, "").expect("test config file should be writable");
     // The registration definition names the library, through the debug-only
     // `NGR_J2534_DEFINITION_DIR` override (ADR-282).
-    let definition_dir = std::env::temp_dir().join(format!("agent-e2e-{nanos}-definitions"));
+    let definition_dir = std::env::temp_dir().join(format!("agent-e2e-{pid}-{nanos}-definitions"));
     // The control directory `sim-vci` takes faults from (`crates/sim-vci/docs/simulated-vci.md`),
     // and the fifth job's communication log.
-    let control_dir = std::env::temp_dir().join(format!("agent-e2e-{nanos}-control"));
-    let comm_log_dir = std::env::temp_dir().join(format!("agent-e2e-{nanos}-commlog"));
+    let control_dir = std::env::temp_dir().join(format!("agent-e2e-{pid}-{nanos}-control"));
+    let comm_log_dir = std::env::temp_dir().join(format!("agent-e2e-{pid}-{nanos}-commlog"));
     for dir in [&control_dir, &comm_log_dir] {
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).expect("test directory");
@@ -461,6 +478,23 @@ async fn run_the_job(control_dir: &std::path::Path, comm_log_dir: &std::path::Pa
     .expect("the control file should be writable");
     std::fs::rename(control_dir.join("001.tmp"), control_dir.join("001.json"))
         .expect("the control file should be renamed");
+    // And it answers the VIN read with two response pendings before the response, which the
+    // worker passes on and the log lists with their intervals (design 8.11 `pending`, ADR-355).
+    std::fs::write(
+        control_dir.join("002.tmp"),
+        r#"{"command": "inject_fault", "request": [34, 241, 144], "fault": {"response_pending": {"count": 2, "interval_ms": 30}}}"#,
+    )
+    .expect("the control file should be writable");
+    std::fs::rename(control_dir.join("002.tmp"), control_dir.join("002.json"))
+        .expect("the control file should be renamed");
+    // And it refuses the read of 1234 with an ECU-state code, conditionsNotCorrect.
+    std::fs::write(
+        control_dir.join("003.tmp"),
+        r#"{"command": "inject_fault", "request": [34, 18, 52], "fault": {"negative_response": {"nrc": "conditions_not_correct"}}}"#,
+    )
+    .expect("the control file should be writable");
+    std::fs::rename(control_dir.join("003.tmp"), control_dir.join("003.json"))
+        .expect("the control file should be renamed");
     let setup = CommLogSetup {
         dir: comm_log_dir.to_owned(),
         key: agent::journal::JobKey {
@@ -468,7 +502,14 @@ async fn run_the_job(control_dir: &std::path::Path, comm_log_dir: &std::path::Pa
             generation: 1,
         },
     };
-    let job = document_job(&comm_log_program()).with_comm_log(setup.clone());
+    // A profile gives `sim-vci`'s timing margin, so the log judges the windows below; with
+    // none it would record the times and judge nothing (ADR-377).
+    let job = document_job(&comm_log_program())
+        .with_comm_log(setup.clone())
+        .with_vci_margins(agent::VciMargins {
+            timing_margin_us: Some(2_000),
+            ..agent::VciMargins::default()
+        });
     let JobRun {
         result: state,
         guards: _guards,
@@ -485,7 +526,14 @@ async fn run_the_job(control_dir: &std::path::Path, comm_log_dir: &std::path::Pa
     )
     .await;
     assert!(
-        matches!(state, Err(agent::JobError::Host { .. })),
+        matches!(
+            state,
+            Err(agent::JobError::OnSiteInterventionRequired(
+                agent::restart::OnSiteReason::UnconfirmedRequest {
+                    at: agent::journal::StepRef { pc: 5, steps: 5 }
+                }
+            ))
+        ),
         "the dropped response ends the job: {state:?}"
     );
     assert_eq!(comm_log, CommLogStatus::Complete);
@@ -543,16 +591,381 @@ async fn run_the_job(control_dir: &std::path::Path, comm_log_dir: &std::path::Pa
         "{entry}"
     );
 
+    // A response that does not answer its request (ADR-359): the ECU cuts its answer to the VIN
+    // read to `62 F1`, which the worker passes on as the primitive's result and the host does
+    // not take. The read gets no answer, the entry lists the response under `rejected`, and its
+    // outcome is that response, `positive_unusable` (design 8.11 `outcome`).
+    std::fs::write(
+        control_dir.join("004.tmp"),
+        r#"{"command": "inject_fault", "request": [34, 241, 144], "fault": {"truncate_response": {"len": 2}}}"#,
+    )
+    .expect("the control file should be writable");
+    std::fs::rename(control_dir.join("004.tmp"), control_dir.join("004.json"))
+        .expect("the control file should be renamed");
+    let setup = CommLogSetup {
+        dir: comm_log_dir.to_owned(),
+        key: agent::journal::JobKey {
+            job_id: shared_proto::JobId("0190f5a8-7c2e-7d4b-9a6e-3f1c2b4d5e74".to_owned()),
+            generation: 1,
+        },
+    };
+    let vin_read = Program {
+        code: vec![Op::PushBytes(0), Op::ServiceRequest { service: 0x22 }],
+        constants: vec![vec![0xF1, 0x90]],
+        ..program()
+    };
+    let job = document_job(&vin_read).with_comm_log(setup.clone());
+    let JobRun {
+        result: state,
+        guards: _guards,
+        comm_log,
+    } = run_program(
+        worker
+            .connect(&ConnectOptions::default())
+            .await
+            .expect("client should connect"),
+        &job.declared_link().expect("the document declares its link"),
+        job,
+        JobLimits::default(),
+        job_guards(false),
+    )
+    .await;
+    assert!(
+        matches!(
+            state,
+            Err(agent::JobError::OnSiteInterventionRequired(
+                agent::restart::OnSiteReason::UnconfirmedRequest {
+                    at: agent::journal::StepRef { pc: 1, steps: 1 }
+                }
+            ))
+        ),
+        "the read gets no answer: {state:?}"
+    );
+    assert_eq!(comm_log, CommLogStatus::Complete);
+    let text = std::fs::read_to_string(setup.path().expect("the log's path")).expect("the log");
+    let entry: serde_json::Value = text
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("a JSON line"))
+        .find(|line| line["event"] == "exchange")
+        .unwrap_or_else(|| panic!("an exchange entry in {text}"));
+    let rejected = entry["rejected"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{entry}"));
+    assert_eq!(rejected.len(), 1, "{entry}");
+    assert_eq!(rejected[0]["response"]["clear"], "62f1", "{entry}");
+    assert_eq!(rejected[0]["reason"], "wrong_echo", "{entry}");
+    assert_eq!(rejected[0]["rx_id"], 0x7E8, "{entry}");
+    assert!(rejected[0]["agent_us"].is_u64(), "{entry}");
+    assert_eq!(entry["outcome"]["result"], "positive_unusable", "{entry}");
+    assert_eq!(entry["classification"], "undetermined", "{entry}");
+
+    suppressed_requests(&worker, control_dir, comm_log_dir).await;
+
     worker
         .stop(Duration::from_secs(5))
         .await
         .expect("worker should stop");
 }
 
+/// Hands `command` to `sim-vci` through its control directory, as file `name`.
+fn control(control_dir: &std::path::Path, name: &str, command: &str) {
+    std::fs::write(control_dir.join(format!("{name}.tmp")), command)
+        .expect("the control file should be writable");
+    std::fs::rename(
+        control_dir.join(format!("{name}.tmp")),
+        control_dir.join(format!("{name}.json")),
+    )
+    .expect("the control file should be renamed");
+}
+
+/// Runs `procedure` as a writing job with a communication log under the job id `last` (the final
+/// group of a UUID of this file), and returns its result and its exchange entries.
+async fn logged_run(
+    worker: &WorkerProcess,
+    comm_log_dir: &std::path::Path,
+    last: &str,
+    procedure: &Program,
+) -> (
+    Result<diag_ir::VmState, agent::JobError>,
+    Vec<serde_json::Value>,
+) {
+    let setup = CommLogSetup {
+        dir: comm_log_dir.to_owned(),
+        key: agent::journal::JobKey {
+            job_id: shared_proto::JobId(format!("0190f5a8-7c2e-7d4b-9a6e-{last}")),
+            generation: 1,
+        },
+    };
+    let job = document_job(procedure).with_comm_log(setup.clone());
+    let JobRun {
+        result,
+        guards: _guards,
+        comm_log,
+    } = run_program(
+        worker
+            .connect(&ConnectOptions::default())
+            .await
+            .expect("client should connect"),
+        &job.declared_link().expect("the document declares its link"),
+        job,
+        JobLimits::default(),
+        job_guards(true),
+    )
+    .await;
+    assert_eq!(comm_log, CommLogStatus::Complete);
+    let text = std::fs::read_to_string(setup.path().expect("the log's path")).expect("the log");
+    let entries = text
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("a JSON line"))
+        .filter(|line| line["event"] == "exchange")
+        .collect();
+    (result, entries)
+}
+
+/// Requests whose positive response is suppressed (ADR-408), against the simulated ECU: its
+/// silence at the end of P2 is the request's result and the run goes on; a negative response is
+/// returned; a response pending obliges a final response, which is the result, and silence after
+/// one is a failure. Each entry keeps `outcome: no_response` and `request.suppressed` for the
+/// silence.
+async fn suppressed_requests(
+    worker: &WorkerProcess,
+    control_dir: &std::path::Path,
+    comm_log_dir: &std::path::Path,
+) {
+    let single = |constants: Vec<Vec<u8>>| Program {
+        code: vec![Op::PushBytes(0), Op::ServiceRequest { service: 0x10 }],
+        constants,
+        ..program()
+    };
+
+    // A read of the DTCs, the DTC read with the bit set, DiagnosticSessionControl with the bit
+    // set, and a VIN read: each silence succeeds with no bytes and the run goes on.
+    let send = |sid, constant| [Op::PushBytes(constant), Op::ServiceRequest { service: sid }];
+    let (state, entries) = logged_run(
+        worker,
+        comm_log_dir,
+        "3f1c2b4d5e80",
+        &Program {
+            code: [
+                &send(0x19, 0)[..],
+                &send(0x19, 1)[..],
+                &send(0x10, 2)[..],
+                &send(0x22, 3)[..],
+            ]
+            .concat(),
+            constants: vec![
+                vec![0x02, 0x08],
+                vec![0x82, 0x08],
+                vec![0x83],
+                vec![0xF1, 0x90],
+            ],
+            ..program()
+        },
+    )
+    .await;
+    let state = state.expect("a suppressed request's silence is not a failure");
+    let mut vin = vec![0x62, 0xF1, 0x90];
+    vin.extend_from_slice(VIN);
+    let [
+        Value::Bytes(dtcs),
+        Value::Bytes(dtc_silence),
+        Value::Bytes(session),
+        Value::Bytes(read),
+    ] = state.stack.as_slice()
+    else {
+        panic!("{state:?}");
+    };
+    assert!(dtcs.starts_with(&[0x59, 0x02]), "{state:?}");
+    assert!(session.is_empty() && dtc_silence.is_empty(), "{state:?}");
+    assert_eq!(read, &vin, "{state:?}");
+    for (entry, request) in [(&entries[1], "198208"), (&entries[2], "1083")] {
+        assert_eq!(entry["request"]["bytes"]["clear"], request, "{entry}");
+        assert_eq!(entry["request"]["suppressed"], true, "{entry}");
+        assert_eq!(entry["outcome"]["result"], "no_response", "{entry}");
+        assert!(entry["detail"].get("host_error").is_none(), "{entry}");
+        assert_eq!(entry["sent"], "confirmed", "{entry}");
+        assert_eq!(entry["classification"], "undetermined", "{entry}");
+    }
+    // The DTC read follows an answer matched the same way; the worker times its receive timeout
+    // on its own clock, so nothing shows the wait ran its course: the suppressed request's row,
+    // not `none`.
+    let reason = entries[1]["reason"].as_str().expect("a reason");
+    assert!(
+        reason.contains("No response was expected and none came")
+            && reason.contains("no receive timeout is judged at P2 on one clock"),
+        "{reason}"
+    );
+    // The session change has no answer matched the same way before it (an accepted change of
+    // session does not count as one), so the silence leaves a wrong address or filter open.
+    let reason = entries[2]["reason"].as_str().expect("a reason");
+    assert!(
+        reason.contains("No response was expected, but") && reason.contains("(H2)"),
+        "{reason}"
+    );
+    assert_eq!(
+        entries[3]["outcome"]["result"], "positive",
+        "{}",
+        entries[3]
+    );
+
+    // The same through the generic send-receive (ADR-321, ADR-408): `10 83` of the declared
+    // service 2 is answered by silence, which is the empty result, and the run goes on to a VIN
+    // read. The entry is the one the service request gives.
+    let (state, entries) = logged_run(
+        worker,
+        comm_log_dir,
+        "3f1c2b4d5e85",
+        &Program {
+            code: vec![
+                Op::PushBytes(0),
+                Op::SendReceive { service: 2 },
+                Op::PushBytes(1),
+                Op::ServiceRequest { service: 0x22 },
+            ],
+            constants: vec![vec![0x10, 0x83], vec![0xF1, 0x90]],
+            ..program()
+        },
+    )
+    .await;
+    let state = state.expect("a suppressed send-receive's silence is not a failure");
+    assert_eq!(
+        state.stack,
+        [Value::Bytes(Vec::new()), Value::Bytes(vin.clone())],
+        "{state:?}"
+    );
+    let silent = &entries[0];
+    assert_eq!(silent["request"]["bytes"]["clear"], "1083", "{silent}");
+    assert_eq!(silent["request"]["suppressed"], true, "{silent}");
+    assert_eq!(silent["outcome"]["result"], "no_response", "{silent}");
+    assert!(silent["detail"].get("host_error").is_none(), "{silent}");
+    assert_eq!(silent["sent"], "confirmed", "{silent}");
+    assert_eq!(silent["classification"], "undetermined", "{silent}");
+
+    // A sub-function the ECU refuses, with the bit set: the negative response is sent anyway.
+    let (state, entries) = logged_run(
+        worker,
+        comm_log_dir,
+        "3f1c2b4d5e81",
+        &single(vec![vec![0xFF]]),
+    )
+    .await;
+    let state = state.expect("a negative response is a result");
+    assert_eq!(
+        state.stack,
+        [Value::Bytes(vec![0x7F, 0x10, 0x12])],
+        "{state:?}"
+    );
+    assert_eq!(entries[0]["request"]["suppressed"], true, "{}", entries[0]);
+    assert_eq!(
+        entries[0]["outcome"]["result"], "negative",
+        "{}",
+        entries[0]
+    );
+
+    // A response pending, then the final response: it is owed whatever the bit says, and it is
+    // the result.
+    control(
+        control_dir,
+        "010",
+        r#"{"command": "inject_fault", "request": [16, 131], "fault": {"response_pending": {"count": 2, "interval_ms": 30}}}"#,
+    );
+    let (state, entries) = logged_run(
+        worker,
+        comm_log_dir,
+        "3f1c2b4d5e82",
+        &single(vec![vec![0x83]]),
+    )
+    .await;
+    let state = state.expect("the final response after a pending is the result");
+    let [Value::Bytes(answer)] = state.stack.as_slice() else {
+        panic!("{state:?}");
+    };
+    assert!(answer.starts_with(&[0x50, 0x03]), "{state:?}");
+    assert_eq!(
+        entries[0]["outcome"]["result"], "positive",
+        "{}",
+        entries[0]
+    );
+    assert_eq!(
+        entries[0]["pending"].as_array().map(Vec::len),
+        Some(2),
+        "{}",
+        entries[0]
+    );
+    assert_eq!(
+        entries[0]["classification"], "undetermined",
+        "{}",
+        entries[0]
+    );
+
+    // A response pending, then the final negative response.
+    control(
+        control_dir,
+        "011",
+        r#"{"command": "inject_fault", "request": [16, 255], "fault": {"response_pending": {"count": 1, "interval_ms": 30}}}"#,
+    );
+    let (state, entries) = logged_run(
+        worker,
+        comm_log_dir,
+        "3f1c2b4d5e83",
+        &single(vec![vec![0xFF]]),
+    )
+    .await;
+    let state = state.expect("the final negative response after a pending is the result");
+    assert_eq!(
+        state.stack,
+        [Value::Bytes(vec![0x7F, 0x10, 0x12])],
+        "{state:?}"
+    );
+    assert_eq!(
+        entries[0]["outcome"]["result"], "negative",
+        "{}",
+        entries[0]
+    );
+
+    // A response pending, then silence: the final response is owed, so this is a failure, as for
+    // any request without a response.
+    control(
+        control_dir,
+        "012",
+        r#"{"command": "inject_fault", "request": [16, 131], "fault": {"response_pending": {"count": 2, "interval_ms": 30}}}"#,
+    );
+    control(
+        control_dir,
+        "013",
+        r#"{"command": "inject_fault", "request": [16, 131], "fault": "drop_response"}"#,
+    );
+    let (state, entries) = logged_run(
+        worker,
+        comm_log_dir,
+        "3f1c2b4d5e84",
+        &single(vec![vec![0x83]]),
+    )
+    .await;
+    // The session change may have reached the ECU, so the job's verdict is on-site intervention
+    // for the unconfirmed request, not a primitive error.
+    assert!(
+        matches!(
+            state,
+            Err(agent::JobError::OnSiteInterventionRequired(
+                agent::restart::OnSiteReason::UnconfirmedRequest {
+                    at: agent::journal::StepRef { pc: 1, steps: 1 }
+                }
+            ))
+        ),
+        "silence after a pending fails: {state:?}"
+    );
+    let owed = &entries[0];
+    assert_eq!(owed["request"]["suppressed"], true, "{owed}");
+    assert_eq!(owed["outcome"]["result"], "no_response", "{owed}");
+    assert_eq!(owed["detail"]["host_error"], "NoResponse", "{owed}");
+    assert_eq!(owed["pending"].as_array().map(Vec::len), Some(2), "{owed}");
+}
+
 /// The fifth job's exchange entries (design 8.11 "Exchange entry"): one per request, at the
-/// instruction that sent it, classified as today's evidence allows. The J2534 worker's link
-/// absorbs pendings and no time is judged yet, so a pending may have come first (H4) behind
-/// every answer and every silence: none of them is `none` or `vehicle` yet.
+/// instruction that sent it, classified as today's evidence allows. The J2534 worker says its
+/// link forwards every pending (ADR-355), so no absorbed pending stands behind an answer or a
+/// silence (H4): a confirmed positive response is `none`, while no time is judged yet.
 fn assert_comm_log(setup: &CommLogSetup) {
     let text = std::fs::read_to_string(setup.path().expect("the log's path")).expect("the log");
     let lines: Vec<serde_json::Value> = text
@@ -587,7 +1000,10 @@ fn assert_comm_log(setup: &CommLogSetup) {
         ("CP_RC23Handling", "link"),
         ("CP_TransmitIndEnable", "link"),
         ("CP_StartMsgIndEnable", "link"),
-        ("CP_TesterPresentHandling", "library_default"),
+        // The keep-alive is on (ADR-420), so the link sets the tester present's ComParams.
+        ("CP_TesterPresentHandling", "link"),
+        ("CP_TesterPresentTime", "link"),
+        ("CP_TesterPresentMessage", "link"),
     ] {
         assert!(
             comparams
@@ -611,17 +1027,58 @@ fn assert_comm_log(setup: &CommLogSetup) {
         assert_eq!(comparam(name)["value"], 1, "{name} in {opened}");
         assert_eq!(comparam(name)["accepted"], true, "{name} in {opened}");
     }
-    // Whether the worker forwards pendings is not known to the agent yet.
-    assert!(opened["forwards_pendings"].is_null(), "{opened}");
+    // The J2534 worker says it passes on every pending (ADR-355).
+    assert_eq!(opened["forwards_pendings"], true, "{opened}");
+    // `sim-vci` gives a TxDone indication for each request (SAE J2534-1 v04.04 clause 8.6),
+    // which the worker passes on with no primitive under `CP_TransmitIndEnable` (ADR-151).
+    assert_eq!(
+        opened["transmit_confirmation"],
+        serde_json::json!(["transmit_indication"]),
+        "{opened}"
+    );
+    // Each request's TxDone carries its request identifier, and no earlier exchange could own
+    // it, so it is the exchange's send evidence rather than an `unattached` item (design 8.11
+    // `sent_evidence`, ADR-346 item 4).
+    // Each clock's first time opens its epoch, written before the entry that uses it, and no
+    // time of the job opens another: the device clock's for the frames, the worker's for the
+    // receive timeout (design 8.11 `clock_epoch`, ADR-361).
+    assert_eq!(
+        &events[4..events.len() - 1],
+        [
+            "clock_epoch",
+            "exchange",
+            "exchange",
+            "clock_epoch",
+            "exchange"
+        ],
+        "{text}"
+    );
+    let epochs: Vec<(&serde_json::Value, &serde_json::Value, &serde_json::Value)> = lines
+        .iter()
+        .filter(|line| line["event"] == "clock_epoch")
+        .map(|line| (&line["clock"], &line["epoch"], &line["reason"]))
+        .collect();
+    assert_eq!(
+        epochs,
+        [
+            (&"device".into(), &0.into(), &"first".into()),
+            (&"worker".into(), &0.into(), &"first".into())
+        ],
+        "{text}"
+    );
     let entries: Vec<&serde_json::Value> = lines
         .iter()
         .filter(|line| line["event"] == "exchange")
         .collect();
     assert_eq!(entries.len(), 3, "{text}");
-    for (entry, (pc, request)) in entries
-        .iter()
-        .zip([(1, "22f190"), (3, "221234"), (5, "22f187")])
-    {
+    // Each window judged from the transmit indication on the device clock (design 8.11 "Timing
+    // judged"): the VIN read's end after its pendings, within P2*; the refusal's end within P2;
+    // the dropped read's receive timeout, which the worker times on its own clock, not judged.
+    for (entry, (pc, request, window)) in entries.iter().zip([
+        (1, "22f190", "within_p2_star"),
+        (3, "221234", "within_p2"),
+        (5, "22f187", "not_judged"),
+    ]) {
         assert_eq!(entry["origin"], "procedure", "{entry}");
         assert_eq!(entry["link"], 1, "{entry}");
         assert_eq!(entry["target"]["link"], 1, "{entry}");
@@ -633,8 +1090,8 @@ fn assert_comm_log(setup: &CommLogSetup) {
             "{entry}"
         );
         assert_eq!(entry["request"]["bytes"]["clear"], request, "{entry}");
-        assert_eq!(entry["pending_visibility"], "absorbed_by_vci", "{entry}");
-        assert_eq!(entry["timing"]["window"], "not_judged", "{entry}");
+        assert_eq!(entry["pending_visibility"], "forwarded", "{entry}");
+        assert_eq!(entry["timing"]["window"], window, "{entry}");
         assert!(
             entry["times"]["agent"]["end_us"].as_u64()
                 >= entry["times"]["agent"]["before_us"].as_u64()
@@ -654,38 +1111,98 @@ fn assert_comm_log(setup: &CommLogSetup) {
         "{seqs:?}"
     );
 
+    // The worker times the receive timeout on its own clock (ADR-120), which the transmit
+    // indication's device time is not compared with.
+    assert_eq!(
+        entries[2]["timing"]["not_judged_reason"], "other_clock",
+        "{}",
+        entries[2]
+    );
     let (vin, unknown, dropped) = (entries[0], entries[1], entries[2]);
     assert_eq!(vin["outcome"]["result"], "positive", "{vin}");
     assert_eq!(vin["sent"], "confirmed", "{vin}");
-    assert_eq!(vin["sent_evidence"], "answer", "{vin}");
-    assert_eq!(vin["classification"], "undetermined", "{vin}");
+    assert_eq!(vin["sent_evidence"], "tx_indication", "{vin}");
+    // The worker forwards every pending, so none can have been absorbed (H4, ADR-355), and a
+    // positive response confirmed on the bus leaves nothing open.
+    assert_eq!(vin["classification"], "none", "{vin}");
+    // Its pendings are listed, with the VCI time on the device clock, the agent's read time and
+    // the interval from the transmit indication or the previous pending, on the device clock.
+    let pending = vin["pending"].as_array().expect("a pending list");
+    assert_eq!(pending.len(), 2, "{vin}");
+    for (index, item) in pending.iter().enumerate() {
+        assert!(item["vci_us"].is_u64(), "{vin}");
+        assert_eq!(item["clock"], "device", "{vin}");
+        assert!(item["agent_us"].is_u64(), "{vin}");
+        let interval = item["since_previous_ms"]
+            .as_f64()
+            .unwrap_or_else(|| panic!("pending {index} has an interval: {vin}"));
+        assert!(interval >= 0.0, "{vin}");
+    }
+    // The second follows the first by the injected interval: sim-vci stamps each pending from
+    // its scheduled time, so the difference is exact whatever the runner's load.
+    assert!(
+        (29.9..=30.1).contains(&pending[1]["since_previous_ms"].as_f64().unwrap()),
+        "{vin}"
+    );
     assert_eq!(vin["link_history"]["this_exchange"], true, "{vin}");
+    // Its VCI times, each with its own clock (design 8.11 `times`, ADR-353): the transmit
+    // indication and the response's end are frames, on the device clock.
+    let vci = &vin["times"]["vci"];
+    for time in ["tx_done", "rx_end"] {
+        assert_eq!(vci[time]["clock"], "device", "{vin}");
+        assert_eq!(vci[time]["epoch"], 0, "{vin}");
+    }
+    let tx_done = vci["tx_done"]["us"].as_u64().expect("a transmit done");
+    assert!(vci["rx_end"]["us"].as_u64().unwrap() >= tx_done, "{vin}");
+    // The first pending's interval runs from that transmit done.
+    let first = pending[0]["vci_us"].as_u64().unwrap() - tx_done;
+    assert!(
+        (pending[0]["since_previous_ms"].as_f64().unwrap() - first as f64 / 1000.0).abs() < 1e-9,
+        "{vin}"
+    );
 
     // The ECU's negative response, with its code named.
     assert_eq!(unknown["outcome"]["result"], "negative", "{unknown}");
-    assert_eq!(unknown["outcome"]["nrc"], "0x31", "{unknown}");
+    assert_eq!(unknown["outcome"]["nrc"], "0x22", "{unknown}");
     assert_eq!(
-        unknown["outcome"]["nrc_name"], "requestOutOfRange",
+        unknown["outcome"]["nrc_name"], "conditionsNotCorrect",
         "{unknown}"
     );
     assert_eq!(
-        unknown["outcome"]["response"]["clear"], "7f2231",
+        unknown["outcome"]["response"]["clear"], "7f2222",
         "{unknown}"
     );
-    assert_eq!(unknown["classification"], "undetermined", "{unknown}");
+    // An ECU-state code says the vehicle refused it, and the reason names the code.
+    assert_eq!(unknown["classification"], "vehicle", "{unknown}");
+    let unknown_reason = unknown["reason"].as_str().expect("a reason");
+    assert!(
+        unknown_reason.contains("conditionsNotCorrect"),
+        "{unknown_reason}"
+    );
     assert_eq!(unknown["link_history"]["answered"], 1, "{unknown}");
 
-    // The dropped response: no evidence the request reached the bus, and H4 open.
+    // The dropped response: its TxDone shows the request reached the bus, so the no-response
+    // rows judge it by what else is open, not by the send (H1). The link forwards every
+    // pending, so no absorbed pending explains it (H4, ADR-355); no answer was matched this
+    // way, so a dropped response is (H2).
     assert_eq!(dropped["outcome"]["result"], "no_response", "{dropped}");
-    assert_eq!(dropped["sent"], "unknown", "{dropped}");
+    assert_eq!(dropped["sent"], "confirmed", "{dropped}");
+    assert_eq!(dropped["sent_evidence"], "tx_indication", "{dropped}");
     assert_eq!(dropped["classification"], "undetermined", "{dropped}");
     assert_eq!(dropped["detail"]["host_error"], "NoResponse", "{dropped}");
     let reason = dropped["reason"].as_str().expect("a reason");
     assert!(
-        reason.contains("(H4)") && reason.contains("(H1)"),
+        reason.contains("(H2)") && !reason.contains("(H4)") && !reason.contains("(H1)"),
         "{reason}"
     );
     assert_eq!(dropped["link_history"]["answered"], 2, "{dropped}");
+    // The transmit indication is a frame, on the device clock; the receive timeout is the J2534
+    // worker's own event, on its clock (design 8.11 "On one clock").
+    let vci = &dropped["times"]["vci"];
+    assert_eq!(vci["tx_done"]["clock"], "device", "{dropped}");
+    assert_eq!(vci["error"]["clock"], "worker", "{dropped}");
+    assert!(vci["error"]["us"].is_u64(), "{dropped}");
+    assert!(vci.get("rx_end").is_none(), "{dropped}");
 
     assert_eq!(lines.last().expect("a line")["event"], "job_end", "{text}");
 }

@@ -4,7 +4,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic::{Request, Response, Status};
 
-use iso22900::{ComPrimitiveControl, ComPrimitiveType, E_PDU_COPT, FlagData};
+use iso22900::{ComPrimitiveType, E_PDU_COPT};
 use vci_service_interface::{
     CancelComPrimitiveRequest, ComOperationType, ComPrimitiveResponse, EventItemResponse,
     EventNotification, GetEventItemRequest, GetStatusRequest, Response as VciServiceResponse,
@@ -13,7 +13,7 @@ use vci_service_interface::{
 };
 
 use crate::error::{api_not_initialized_status, map_runtime_error, map_runtime_error_for_link};
-use crate::service::convert::{to_iso_control, to_status_response};
+use crate::service::convert::{control_for_start, to_status_response};
 use crate::service::events::to_proto_event_item;
 use crate::service::handles::{
     parse_event_item_handle, parse_status_handle, parse_subscribe_event_handle,
@@ -35,17 +35,7 @@ impl Iso22900Service {
     ) -> Result<Response<ComPrimitiveResponse>, Status> {
         let request = request.into_inner();
         let (h_mod, h_cll) = require_cll_message(request.cll_handle, "cll_handle")?;
-        let control = request
-            .cop_ctrl_data
-            .map(to_iso_control)
-            .unwrap_or_else(|| ComPrimitiveControl {
-                time: 0,
-                send_cycles: 0,
-                receive_cycles: 0,
-                temp_param_update: 0,
-                tx_flags: FlagData::default(),
-                expected_responses: Vec::new(),
-            });
+        let control = control_for_start(request.cop_ctrl_data);
 
         let cop_type = match ComOperationType::try_from(request.cop_type)
             .map_err(|_| Status::invalid_argument("cop_type is invalid"))?

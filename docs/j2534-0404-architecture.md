@@ -383,7 +383,17 @@ Key internals:
      first — closing the field bug ADR-088 originally left open (a vacuous
      `CoptSendrecv` capturing a tester-present reply meant for nobody). See
      "Tester-Present Dispatch" (§5) for the discard-window/identity-signature
-     matching mechanics, and ADR-100/ADR-137 for the precedence history.
+     matching mechanics, and ADR-100/ADR-137 for the precedence history. A
+     content frame that matches an entry of a send that expects an answer
+     also *settles* that entry (ADR-419): `bind_frame` records the pending,
+     positive or negative answer per entry in frame order, and the end of the
+     poll pass applies the records to the live entries under the
+     `logical_links` lock (a pending answer reloads the window, a final one
+     ends the entry), so a `7F 3E 78` and a `7E 00` in one batch are a
+     reload and a final answer, neither delivered. While a physical
+     tester-present is outstanding no client primitive with a receive phase
+     is registered (the serialization below), so step 2 has no competing
+     claim for its answer.
   4. **Tier-1, vacuous claims** (empty mask/pattern descriptor), in COP
      registration order. For a `concat_enabled` registrant, this is also the
      step where a continuation matching an open buffer whose own
@@ -432,7 +442,9 @@ Key internals:
   FirstFrames with a FlowControl built from
   `CP_BlockSize` / `CP_StMin`, sent to the `CP_CanPhysReqId` paired with the
   sender's `CP_CanRespUSDTId` in the UniqueRespIdTable, and abandons
-  reassembly on `CP_Cr` (N_Cr) expiry.
+  reassembly on `CP_Cr` (N_Cr) expiry or a wrong sequence number, raising a
+  named error event for each (ADR-351; "Named error cases on a native ISO
+  15765 channel" below).
 - Extended addressing (`isotp::Addressing::Extended(ae)`, ADR-047) is
   resolved per UniqueRespIdTable entry from the same `CP_Can*Format` bit 3 /
   `CP_Can*ExtAddr` pair the hardware `FLOW_CONTROL_FILTER` path already
@@ -637,9 +649,9 @@ findings and loads it.
 |-----|-------------|
 | `GetModuleIds` | Return one row per configured module entry (or the single synthetic entry when none are configured, ADR-107). `module_status` is `self.module_state.status` (the same value `GetStatus` reports) for the row matching whichever handle is currently open, `PDU_MODST_AVAIL` for every other row (ADR-132, closing ADR-107 Accepted Residual #1) |
 | `ModuleConnect` | Open the J2534 device for the requested module (lazy); rejected with `PDU_ERR_RESOURCE_BUSY` if a *different* module is already open (ADR-107); rejected with `PDU_ERR_FCT_FAILED` if the SAME module is already open but its tracked status is `PduModstNotAvail` (a hard channel error) — that already-open no-op path never revalidates the device, so `ModuleDisconnect` then `ModuleConnect` is the only recovery sequence (ADR-131) |
-| `ModuleDisconnect` | Close the device and terminate all subscriptions |
+| `ModuleDisconnect` | Tear down the links and channels, close the device and terminate all subscriptions. The device slot is cleared only when `PassThruClose` succeeds or answers `ERR_INVALID_DEVICE_ID` / `ERR_DEVICE_NOT_CONNECTED` (the library no longer has the device); any other close error keeps the slot, returns the mapped status, sends no `ModuleListChg` and leaves the module's row open, so a later `ModuleDisconnect` closes again and `ModuleConnect` reuses the device (ADR-422) |
 | `GetVersion` | Read FW / DLL / API version strings |
-| `GetTimestamp` | Return `events::module_timestamp_us()` — a monotonic microsecond clock (`Instant`-backed, wraps at 2^32 µs / ~71.6 min), zeroed at process start and rebased to (approximately) zero again on `PDU_IOCTL_RESET` (`events::reset_module_clock()`, called from `rpc_misc.rs::ioctl_reset`, ADR-120 amendment). J2534 v04.04 has no module-clock IOCTL to read, so this is synthesized; the same function backs the synthetic status/error event timestamps below, so `GetTimestamp` and `GetStatus`/error events share one time base (ISO 22900-2 §9.1.6.1/§9.4.31.1). RX-frame timestamps (`GetEventItem`'s frame data) are a *different*, unrelated clock — the raw native `PASSTHRU_MSG.Timestamp` device value, deliberately left untouched (ADR-120). |
+| `GetTimestamp` | Return `events::module_timestamp_us()` — a monotonic microsecond clock (`Instant`-backed, wraps at 2^32 µs / ~71.6 min), zeroed at process start and rebased to (approximately) zero again on `PDU_IOCTL_RESET` (`events::reset_module_clock()`, called from `rpc_misc.rs::ioctl_reset`, ADR-120 amendment). J2534 v04.04 has no module-clock IOCTL to read, so this is synthesized; the same function backs the synthetic status/error event timestamps below, so `GetTimestamp` and `GetStatus`/error events share one time base (ISO 22900-2 §9.1.6.1/§9.4.31.1). RX-frame timestamps (`GetEventItem`'s frame data) are a *different*, unrelated clock — the raw native `PASSTHRU_MSG.Timestamp` device value, deliberately left untouched (ADR-120). Each `EventItem` names its clock in `timestamp_clock` (ADR-353): `DEVICE` for a frame read from the library, `WORKER` for the K-line fast-init response and 5-baud init keybytes this service makes up and for every error, status and information item. The response's own `timestamp_clock` is `WORKER`, since the reading is that synthesized clock, the one the error, status and information items are on, not the frames' (ADR-353). |
 
 **rpc_link.rs** — Logical link lifecycle:
 
@@ -648,7 +660,7 @@ findings and loads it.
 | `GetResourceStatus` | Query whether a protocol/resource is currently in use (accepts a table resource ID/name or a legacy raw/extended `ChannelProtocol` value/name, ADR-069) |
 | `GetResourceIds` | List resource IDs (ADR-069's opaque `0x0200`-namespace table, §6) matching a protocol/bus-type/pin filter |
 | `GetConflictingResources` | Report resource-table rows that share a DLC pin, or sit on the same physical controller (same `bus_type_id`), with a given resource, computed statically from the table (independent of CLL/connection state, ADR-106) |
-| `CreateComLogicalLink` | Allocate a CLL handle from a resource ID/name (table row, or legacy raw/extended `ChannelProtocol` fallback, ADR-069); defers `PassThruConnect` |
+| `CreateComLogicalLink` | Allocate a CLL handle from a resource ID/name (table row, or legacy raw/extended `ChannelProtocol` fallback, ADR-069); defers `PassThruConnect`; answers `pending_forwarding` `PENDING_FORWARDING_ALL`, since the service runs the response-pending handling itself and passes each pending on (ADR-355) |
 | `DestroyComLogicalLink` | Free the CLL and cancel any queued COPs |
 | `ConnectComLogicalLink` | Call `PassThruConnect`, apply params, spawn poll task |
 | `DisconnectComLogicalLink` | Disconnect the channel and release locks |
@@ -955,6 +967,39 @@ ADR-126's check-and-write atomicity).
 | `PduErrorEvent` | An error occurred |
 | `PDU_EVT_DATA_LOST` | A CLL's event queue (`rx_buf`) reached its configured capacity and dropped an entry — sent only to a live `SubscribeEvent` subscriber, never as a `GetEventItem` queue item (ADR-115). Single-consumer semantics: a live subscriber opportunistically drains `rx_buf`, but the cap/mode policy is enforced on every push regardless of subscriber state, so a stale backlog can still cross the cap on the next push and fire one `Lost` even to a healthy, actively-draining subscriber — this is rare in practice (the queue empties every cycle for a keeping-up subscriber) but not structurally impossible |
 
+##### Named error cases on a native ISO 15765 channel (ADR-351)
+
+On a native ISO 15765 channel (`dual-channel`, `single-channel`, `auto`, and the native-mixed modes; not `software-isotp`, not plain CAN) the adapter runs the transport, and SAE J2534-1 v04.04 reports only the receive status and the start-of-message indication (Appendix A.2, A.4); it has no end-of-message indication, the completed message itself marks the end. The service tells two cases apart from that and gives each an error event named in `ErrorData.extra_error_info_name`, with no `extra_error_info` code (J2534 has none; the names follow ISO 22900-2:2022 Table D.8):
+
+| Name | Event | When |
+|------|-------|------|
+| `ISO15765_PADDING` | `PduErrEvtFrameStruct` | A received frame carries the `ISO15765_PADDING_ERROR` status bit and counts as a response match for its COP (the bind that completes one of the COP's expected responses). The frame is delivered exactly as before; the error follows it, bound to that COP (with its `cop_tag`). A pending-response frame (a short `7F xx 78` is typically padded) and an unbound frame raise none, so a COP that then times out still ends as a plain timeout. |
+| `ISO15765_CF_TIMEOUT` | `PduErrEvtRxTimeout` | A COP's receive phase ends on its deadline, and a message started from a response ID the COP waits on (a start-of-message indication, matched by the same unique-response-ID test that binds a response) and no ISO 15765 content message from that response ID has ended it since. One sender has one segmented message in progress, so any ISO 15765 content message from that ID ends it, whether it bound as a response, as a pending-response frame, or to nothing; a raw UUDT frame routed to the same entry under the native-mixed modes does not. Tracked per COP as the set `CopRegistrant::som_started` of started response IDs, merged back per poll pass like `pending_rc`. The indication counts whether or not `CP_StartMsgIndEnable` lets it reach the client. |
+
+Naming changes neither when a COP times out nor how it finishes: a timeout with no started message, or whose started messages all ended or came from response IDs the COP does not wait on, stays unnamed, as does every other error event. Plain CAN channels name nothing; software ISO-TP names its own cases (below).
+
+A native channel cannot tell apart the other ways a segmented response goes wrong: a flow control that does not come, more flow-control waits than the limit allows, and an overflow the peer reports in its flow control. The adapter reports none of them, so each reaches the client as the same unnamed receive timeout (when the response starts and stalls, as `ISO15765_CF_TIMEOUT`, which therefore says only that a started response did not complete) or as nothing.
+
+Software ISO-TP (`can_channel_mode = "software-isotp"`, ADR-046) sees the flow control itself, so its transmit side tells the three cases apart and names each, with no code (the event codes are unchanged):
+
+| Name | Event | When |
+|------|-------|------|
+| `ISO15765_FC_TIMEOUT` | `PduErrEvtRxTimeout` | No flow-control frame arrived within N_Bs after a first frame or a full block. |
+| `MAX_WAIT_FRAME` | `PduErrEvtProtErr` | More wait flow-control frames in a row than the sender's defensive bound allows (ADR-124). |
+| `ISO15765_FC_OVERFLOW` | `PduErrEvtProtErr` | The peer's flow control reports an overflow. The name is this worker's own; ISO 22900-2:2022 Table D.8 gives no example for it. A reserved flow status is not parsed as a flow control at all, so it is ignored and the wait ends as `ISO15765_FC_TIMEOUT`. |
+
+ISO 22900-2:2022 Table D.8 lists `MAX_WAIT_FRAME` under the transmit error event, while this service raises it as `PduErrEvtProtErr`; only the name is added, the event code is not changed.
+
+Its receive side reassembles the response itself, so it names the three ways a reassembly fails (no code; the first two are Table D.8's names):
+
+| Name | Event | When |
+|------|-------|------|
+| `ISO15765_CF_TIMEOUT` | `PduErrEvtRxTimeout` | N_Cr (`CP_Cr`, `isotp_n_cr_timeout_ms`) passed after the first frame or the last consecutive frame with no further consecutive frame (ISO 15765-2:2024 9.8.2). The poll task sweeps for such reassemblies each time it has read the channel empty, before it stamps the drain watermark (so a receive-only COP reaped on that drain gets the error first); a late consecutive frame that finds its reassembly expired, or a first or single frame that finds one expired, raises the same error. |
+| `ISO15765_FRAME_NUM` | `PduErrEvtFrameStruct` | A consecutive frame carries an unexpected sequence number, which aborts the reception (ISO 15765-2:2024 9.6.4.4). |
+| `ISO15765_UNEXPECTED_PDU` | `PduErrEvtFrameStruct` | A first or single frame arrives from a response ID while a reassembly from it is unfinished and still within N_Cr; the reception in progress is aborted and the unexpected frame reported (ISO 15765-2:2024 9.8.3). It is raised for the replaced message and reaches the client before the new message's result. The name is this worker's own; ISO 22900-2:2022 Table D.8 gives no example for it. |
+
+Each of these errors drops the reassembly; a later consecutive frame from that response ID is ignored as stray. The loopback echo or transmit indication of the service's own segmented request, reassembled only on a link with no unique response table, raises none of them and starts no response (a first or single frame from the service's own request, reachable only when the request and response CAN IDs are equal, drops a response reassembly in progress without an error). At the first frame the service records the COP that waits on the response ID, by the unique-response-ID test of `note_start_of_message`, when exactly one does; the error binds to that COP (with its `cop_tag`) while it still waits, and to none when no COP or more than one waited, or the recorded COP has finished since. The COP's wait goes on: the first frame marks every COP waiting on the response ID in `CopRegistrant::som_started` as a native start-of-message indication does, and a single or reassembled message from that ID ends the mark, so a deadline that follows a failure is named `ISO15765_CF_TIMEOUT` as on a native channel. A COP deadline that comes before N_Cr (the default timings, `CP_P2Max` 50 ms against `CP_Cr` 1 s, do this) ends the COP with that named timeout first; the N_Cr error then follows, bound to no COP. A first or single frame that replaces an unfinished reassembly of the same response ID, before its N_Cr, raises `ISO15765_UNEXPECTED_PDU` for the replaced message, bound like the other two to the COP recorded at the replaced first frame; the new frame is then handled as usual (a single frame is delivered, a first frame starts a new reassembly and marks `som_started`). One already past N_Cr is raised as `ISO15765_CF_TIMEOUT` instead.
+
 ---
 
 ### j2534-0404-mock — Test Mock
@@ -1118,6 +1163,10 @@ struct ResidualTesterPresentDiscard {
     window: DiscardWindow,
     target_can_ids: Option<TesterPresentTargetCanIds>,
     tx_can_id: Option<u32>,
+    hold: Option<TpHold>,   // ADR-419: Some iff the send expected an answer; the entry
+                            // then holds the shared channel (physical, frozen RcHandlingConfig,
+                            // first_pending_at, got_response) until the answer settles it or
+                            // the per-tick sweep removes it after window.until
 }
 
 // Attribution registrant (ADR-100 Decision §1/§2) -- one per outstanding COP
@@ -1204,7 +1253,8 @@ Both `CP_TesterPresentSendType` modes are dispatched by this service's own
 software poll loop (ADR-093) through the single `Armed` variant above,
 discriminated by `resolved.send_type`. Mode 0 ("periodic") fires strictly
 every `interval` since its own last fire/arm, never deferred by other bus
-traffic. Mode 1 ("idle-triggered") fires once the shared channel has been
+traffic (only by the Table 1 hold below, which defers it to the first free
+pass). Mode 1 ("idle-triggered") fires once the shared channel has been
 idle for `interval`, measured from `max(last_bus_activity,
 last_fired.unwrap_or(armed_at))` (see `last_bus_activity` below) — a CLL's
 own arming never resets the shared clock, so it cannot push out a sibling
@@ -1231,7 +1281,9 @@ all, immediately sends and re-arms the same way — for either mode. A
 **Discard-window identity-signature matching (ADR-088/093/099/137).** Every
 successful tester-present send opens an entry in
 `LogicalLinkState.open_tp_discards` (`ResidualTesterPresentDiscard`, above),
-scoped to a `CP_P2Max` deadline; `bind_frame`'s tier-3 (see "Response
+scoped to a `CP_P2Max` deadline (for a send that expects an answer, the
+window ends as "Serialization with client primitives" below says, ADR-419);
+`bind_frame`'s tier-3 (see "Response
 attribution" under "CAN Channel Operating Modes" above) matches an incoming
 frame against ANY still-open entry, not first-match-wins, since each entry
 is an independently elicited send. Three ways a frame matches: (a)
@@ -1246,6 +1298,43 @@ to the CLL's own tester-present target's physical response CAN ID(s)
 does not restrict them); case (c) is restricted to tester-present's own
 frozen outgoing TX CAN ID (`tx_can_id`). A match is discarded outright.
 
+**Serialization with client primitives (ADR-419, ISO 22900-2:2022 8.1.3
+Table 1).** Every diagnostic request written on the shared channel (client
+primitives, the `CoptStartcomm` request and arm, the K-line init exchange after
+its top-up, the `CoptStopcomm` message, re-arms and tester-present dispatches;
+not the J1939 address-claim frames or the TP2.0 transport frames) goes through
+`wait_for_bus_clear`, which applies the pure per-channel rule
+`bus_hold(prev, next)` and then the `CP_P3Func`/`CP_P3Phys` gap wait. An
+exchange that expects an answer is outstanding until it completes: after a
+functional one everything waits; after a physical one a physical send and a
+functional send with an answer wait, and a functional send without an
+answer goes at once, except while the physical exchange is an IS-CYCLIC
+client primitive that has had no response yet. An exchange without an
+answer does not hold (the P3 rows apply). An unresolved addressing (K-line,
+J1850 style protocols) counts as physical; the hold applies on every
+protocol, the P3 rows stay CAN-only. The hold's two sources are the poll
+task's own inline response wait (passed into `dispatch_due_tester_present`
+as `Option<Outstanding>`; the ISO-TP send loops pass a segmented send in
+flight) and the entries of `open_tp_discards` that carry a `TpHold`. A
+client primitive, `CoptStartcomm`/`CoptStopcomm` and a re-arm wait in the
+gate (polling RX, cancellable where they were), so a request issued while a
+tester-present is outstanding goes after its answer; a tester-present
+dispatch, and any dispatch from inside an inline wait, is deferred instead
+and stays due with `last_fired` unstamped, so a tester-present due during a
+client request's response wait is sent after the final response. A physical
+send's entry ends at its final answer (the expected positive answer, or the
+expected negative answer with a code other than 0x78); 0x78 reloads the
+window to `CP_P2Star` limited by the `CP_RC78CompletionTimeout` ceiling
+anchored at the first pending answer. A functional send's entry lasts to its
+window end, and any ECU's 0x78 reloads it (upward only). An expired entry is
+swept only after an exhaustive RX drain at or after its end, and until then
+the read-side snapshot still lets it settle a late-read answer. The entry outlives `until` until
+the per-tick sweep, which removes it and raises `PduErrEvtTesterPresentError`
+for a send that ended with a negative final answer or without an answer
+(functional: without a positive answer) while the link's tester-present is
+still armed; after a disarm or `CoptStopcomm` the hold persists but its end
+is silent. Disconnect and Destroy clear the entries.
+
 **Addressing source (ADR-138).** Tester-present's addressing is resolved
 independently, via `CP_TesterPresentAddrMode` — not `CP_RequestAddrMode`,
 which every other TX construction site uses — see "TX Message
@@ -1254,10 +1343,28 @@ Construction" (§6) for the header-construction table this feeds.
 **Bus-gap participation (ADR-058/060/083/093).** Every tester-present send
 (both modes) participates in the same `CP_P3Func`/`CP_P3Phys` inter-request
 gap enforcement as `CoptSendrecv`, classified by `CP_TesterPresentReqRsp`
-rather than `NumReceiveCycles`; mode 1 additionally drives a separate
+rather than `NumReceiveCycles` (a send that expects an answer is not paced by
+this gap because the Table 1 hold above waits for the answer instead); mode 1
+additionally drives a separate
 per-shared-channel `last_bus_activity` clock (stamped on TX and RX) for its
 own idle-triggered dispatch — mode 0 never reads it. See "Service-Level
 Parameters" (§7) for the full gap-state model.
+
+**Use by the agent (ADR-418).** The agent keeps a job's non-default session
+alive with this dispatch rather than a sender of its own: it sets the
+tester-present ComParams at link open (`3E 00`, response expected, physical
+addressing, mode 0 with the keep-alive period, since mode 1's idle clock is
+per shared channel and another link's traffic would hold it off), starts the link with the
+first non-default DiagnosticSessionControl as the request of `CoptStartcomm`
+(which sends it and receives its response like `CoptSendrecv`, then arms
+tester-present), and switches `CP_TesterPresentHandling` on and off by
+`CoptUpdateparam` (the live re-arm above), never by `CoptStopcomm`. What the
+agent relies on from this service is that a tester-present is serialized with
+client primitives as ISO 22900-2:2022 8.1.3 Table 1 requires, that its
+discard window ends at the final response, not at a fixed `CP_P2Max`, and
+that a missing or negative answer raises `PduErrEvtTesterPresentError` while
+sending continues; all three are implemented here (ADR-419). A vendor
+D-PDU library's behaviour is not covered by this service.
 
 ### ComParamSet — parameter storage
 
@@ -1810,6 +1917,21 @@ above is rejected with `PDU_ERR_INVALID_PARAMETERS` (ADR-078), superseding
 the `0`-fallback this section previously described. See ADR-069 for the full
 design rationale.
 
+### RawMode on `_PS` and `_CHx` Links (ADR-196, ADR-198, ADR-200, ADR-414)
+
+`CreateComLogicalLink` accepts the RawMode create flag for a fixed set of protocol
+families (ADR-196 and its Phase 2 and 3 extensions: CAN, hardware ISO15765, K-line,
+J1850 with ChecksumMode ON, J1939 and the SCI and analog protocols; TP2.0 is excluded for good).
+A pin-selected (`_PS`, SAE J2534-2 clause 6) or additional-channel (`_CHx`, clause 7) link gets
+the answer of the protocol it stands for (ADR-414): the service resolves the link with
+`resources::base_protocol_id` and applies the same list, with the same conditions, to the result.
+So the Single Wire, Fault-Tolerant and CAN FD families, which resolve to CAN or ISO15765, accept
+RawMode, and a RawMode `CAN_CHn` or `CAN_PS` link that FD ComParams promote at connect keeps it
+(the FD format and rate-switch flags come from the link, and the raw message is passed on
+unchanged). GM UART, UART Echo Byte, Honda DIAG-H, J1708 and TP2.0 stay refused in every form. A
+`_PS` or `_CHx` link is never software ISO-TP (ADR-157), so that refusal does not reach it. The
+hardware harness uses this for a T0 loopback between two channels of one module.
+
 ### BUSTYPE (Physical Layer) Resolution — Legacy Fallback
 
 This is the pre-ADR-069 `map_bustype_name()` mapping, still consulted as the
@@ -2042,7 +2164,7 @@ therefore an empty Working set) for a bare `ResourceId`/`ResourceName` with no
 
 Some ComParams carry per-ECU addressing information (CAN IDs, source addresses, J1939 NAME) that must vary independently for each ECU on the same physical channel. These belong to the `PDU_PC_UNIQUE_ID` class and are **managed exclusively through `GetUniqueRespIdTable` / `SetUniqueRespIdTable`**. They cannot be used with `GetComParam` or `SetComParam` (ISO 22900-2 §9.3.3.6) — enforced in both directions by `comparam_support::is_param_allowed` / `unique_id_params` (ADR-042).
 
-**Working/Active split (ADR-068).** Like `ComParamSet`'s `working`/`active` sets (ADR-067), the UniqueRespIdTable is split into `working_unique_resp_id_table` (written by `SetUniqueRespIdTable`, read by `GetUniqueRespIdTable`) and `active_unique_resp_id_table` (the table actually reflected by installed ISO15765 `FLOW_CONTROL_FILTER`s, RX routing, and COP TX-addressing resolution). `SetUniqueRespIdTable` performs **no hardware I/O**: it only stages Working, after validating the `PDU_PC_UNIQUE_ID` class boundary and — on ISO15765 — checking `LOCK_PHYSICAL_COM_PARAMS` (ADR-043; the check stays at Set time even though the hardware I/O itself now happens later). Promotion (Working → Active, plus the `FLOW_CONTROL_FILTER` install/remove, pass-all-fallback resync, and dual-channel-mode UUDT companion-channel resync) happens at exactly two points: this CLL's own `ConnectComLogicalLink` (every connecting CLL, not just the physical channel's creator — FC filters are per-CLL, ADR-039), and `CoptUpdateparam` execution (`J2534Service::promote_unique_resp_id_table`, diff-gated: a table snapshot unchanged from the current Active table does no filter I/O). A `CoptSendrecv`/`CoptStartcomm` always resolves TX addressing against the ACTIVE table, snapshotted at `StartComPrimitive` call time — unconditionally, even when `temp_param_update=1` (unlike `ParamBinding`, there is no Working-side table for a temp COP to borrow). `CoptRestoreParam` copies Active back into Working for the table too, with no filter I/O.
+**Working/Active split (ADR-068).** Like `ComParamSet`'s `working`/`active` sets (ADR-067), the UniqueRespIdTable is split into `working_unique_resp_id_table` (written by `SetUniqueRespIdTable`, read by `GetUniqueRespIdTable`) and `active_unique_resp_id_table` (the table actually reflected by installed ISO15765 `FLOW_CONTROL_FILTER`s, RX routing, and COP TX-addressing resolution). `SetUniqueRespIdTable` performs **no hardware I/O**: it only stages Working, after validating the `PDU_PC_UNIQUE_ID` class boundary and — on ISO15765 — checking `LOCK_PHYSICAL_COM_PARAMS` (ADR-043; the check stays at Set time even though the hardware I/O itself now happens later). Promotion (Working → Active, plus the `FLOW_CONTROL_FILTER` install/remove, pass-all-fallback resync, and dual-channel-mode UUDT companion-channel resync) happens at exactly two points: this CLL's own `ConnectComLogicalLink` (every connecting CLL, not just the physical channel's creator — FC filters are per-CLL, ADR-039), and `CoptUpdateparam` execution (`J2534Service::promote_unique_resp_id_table`, diff-gated: a table snapshot unchanged from the current Active table does no filter I/O). **A refused filter fails the connect (ADR-398).** At `ConnectComLogicalLink` the adapter's refusal of an entry's `PassThruStartMsgFilter` (a pattern or flow-control identifier another filter already uses, or the adapter's filter limit) stops the walk: the filters already installed for the table are stopped, the link is unpublished, the shared-channel reference (or the channel this connect opened) is rolled back as for the other connect rejections, and the connect returns the status of the failure: `Code::Internal` with the `PDUError` of the native status for the adapter's refusal of the filter (`ERR_NOT_UNIQUE`, `ERR_EXCEEDED_LIMIT`, `ERR_INVALID_MSG`, `ERR_MSG_PROTOCOL_ID`), `FAILED_PRECONDITION` with `PDU_ERR_EVT_LOST_COMM_TO_VCI` attached for a lost device (`ERR_DEVICE_NOT_CONNECTED`; the lost VCI of ADR-294), and `Code::Unknown` with `PDU_ERR_FCT_FAILED` for any other error (which is no refusal of the table). The rollback is the teardown `DisconnectComLogicalLink` runs (`take_link_offline`). **The filters of a channel are counted (ADR-398).** `SharedChannel::p2p_filters` holds one slot per distinct point-to-point filter (type, protocol id, pattern address, flow-control address) with the number of CLLs using it; an entry whose filter the channel already holds, from a sibling's table or a repeat in the CLL's own, is counted instead of installed again (an adapter refuses a repeated pattern or flow-control identifier), and a filter is stopped when its last user leaves (`DisconnectComLogicalLink`, `DestroyComLogicalLink`, a failed connect, a promoted table, the reinstall after `CLEAR_MSG_FILTERS`). The counts go with the channel's entry and are cleared by a channel hard error. Entries that are skipped for eligibility (no `CP_CanPhysReqId`, flow-control format bit off, the UUDT sentinel) stay skipped, an empty table installs nothing, and a failure to stop a filter during the rollback is logged and does not replace the refusal. The two later install points keep the older behaviour (a refusal is logged and the entry skipped): `CoptUpdateparam`'s promotion and the reinstall after `CLEAR_MSG_FILTERS`. A `CoptSendrecv`/`CoptStartcomm` always resolves TX addressing against the ACTIVE table, snapshotted at `StartComPrimitive` call time — unconditionally, even when `temp_param_update=1` (unlike `ParamBinding`, there is no Working-side table for a temp COP to borrow). `CoptRestoreParam` copies Active back into Working for the table too, with no filter I/O.
 
 #### Sentinel Constants
 
@@ -2064,6 +2186,10 @@ These are distinct values; confusing them leads to silent failures in table pars
 | SCI / other | — | — |
 
 `CP_CanFuncReqId` (0x806B) is **not** a `PDU_PC_UNIQUE_ID` param — it is a shared functional address set once per channel, not per ECU. `CP_J1939SourceName` (0x8096) is likewise **not** `PDU_PC_UNIQUE_ID` class for any protocol family (ADR-184): it remains a plain settable ComParam on a J1939 CLL, but RX frames are never matched against it — see `events_rx_routing.rs::route_frame`'s own doc comment (`docs/adr/ADR-184-j1939-unique-resp-id-source-address-matching.md`).
+
+A TX-side frame (`RxStatus` `TX_MSG_TYPE` or `TX_INDICATION`: a TxDone indication or a loopback echo) carries the CAN ID the tester sent to, not a response ID (SAE J2534-1 v04.04 clause 8.6). On a CAN CLL with a table, `route_frame` therefore also matches a TX-side frame against the `CP_CanPhysReqId` of each entry whose requests are normally addressed (not extended per `CP_CanPhysReqFormat`) and routes it with that entry's URID; a received frame on that ID is never routed by it, and a TX-side frame of an extended-addressed entry reaches only CLLs without a table ([ADR-352](adr/ADR-352-tx-side-frames-route-by-the-physical-request-id.md)). Before ADR-352 such a frame matched no key and was dropped, so a CAN CLL with a table never received its own TxDone.
+
+A functional request has no table key (`CP_CanFuncReqId`), so its TxDone is routed by a per-send marker instead ([ADR-421](adr/ADR-421-a-functional-requests-txdone-reaches-the-link-that-sent-it.md)). `handle_send_recv` sets `LogicalLinkState::open_func_tx` to the CAN ID in the first four bytes of the sent data after the write of a functional send-receive with a nonzero `NumReceiveCycles` succeeds, and clears it when that cycle's `wait_for_expected_response` returns, by any exit, and on `DisconnectComLogicalLink`. `build_cll_rx_entries` snapshots it into `CllRxEntry::func_tx_can_id`; once the table scan finds no entry, `route_frame_with_role` routes a TX-side frame whose CAN ID equals it to the link with URID 0. `bind_frame` leaves it unbound (a TX-side frame never binds to a registrant), so it reaches the client and the agent's log as a plain transmit indication (a loopback echo on that ID is routed the same way). A set also needs the link to still be on the sending channel, and a fresh connect generation resets the marker, so a send that lost a race with a disconnect leaves nothing for a reconnect. Tester-present, StartComm/StopComm and a functional send with no receive phase set no marker; no format or width gate applies, since the marker belongs to one send of one link. Two residuals: ADR-099's open tester-present window on the same functional ID discards the client's TxDone, and any other TX-side frame on that ID read inside the marker (a sibling's tester-present TxDone, or that of an earlier functional send with no receive phase when `CP_P3Func` is 0) can be taken for the request's.
 
 Point-to-point hardware `FLOW_CONTROL_FILTER`s installed from this table (ISO15765
 CLLs only) are built from `CP_CanPhysReqId`/`CP_CanPhysReqExtAddr` (flow-control

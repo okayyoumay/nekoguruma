@@ -27,16 +27,42 @@ tags:
   - name: extensions
   - name: data
   - name: sovd
+  - name: system
 
 paths:
+  # ------------------------------------------------------------ System
+  /v1/health:
+    get:
+      tags: [system]
+      summary: Liveness and readiness probe
+      description: |
+        Needs no login: the installer, the service manager and tests probe it before any user
+        exists. The server runs `SELECT 1` on its database: 200 when it answers within 2 seconds,
+        otherwise 503 as a problem document with no detail. The body holds nothing else, since
+        other OS users can reach it (13.3). Like every route of the local deployment it is
+        subject to the Host and Origin rules of 13.3.
+      security: []
+      responses:
+        '200':
+          description: The server is serving and its database answers
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+        '503':
+          description: The database does not answer within 2 seconds, or answers with an error
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
   # ------------------------------------------------------------ Jobs
   /v1/jobs:
     post:
       tags: [jobs]
       summary: Issue a job
       description: |
-        The server checks permissions (6.8) and compatibility, generates a signed job instruction,
-        and delivers it to the target agent. Operations requiring seed-key or OEM authentication
+        The server checks permissions (6.8) and compatibility, generates a signed job instruction
+        (one envelope of a key fingerprint, a signature and a postcard payload that names the
+        job's documents by hash, 11.1, ADR-461), and delivers it to the target agent. Operations requiring seed-key or OEM authentication
         must be online (5.7).
       parameters:
         - name: Idempotency-Key
@@ -110,8 +136,8 @@ paths:
       tags: [jobs]
       summary: Get the offline job package (5.7)
       description: |
-        Returns the signed job instruction, references to ECU artifacts, references to IR, and an offline token
-        together. The expiry is short.
+        Returns the signed job instruction, references to ECU artifacts, the IR documents, and an offline token
+        together. The expiry is short: the agent judges it by the signed instruction's start deadline (5.3, 11.1).
       parameters:
         - $ref: '#/components/parameters/JobId'
       responses:
@@ -432,6 +458,12 @@ components:
           schema: { $ref: '#/components/schemas/Problem' }
 
   schemas:
+    Health:
+      type: object
+      required: [status]
+      properties:
+        status: { type: string, enum: [ok] }
+
     Problem:
       type: object
       description: RFC 9457. `code` holds a machine-readable value
@@ -463,12 +495,18 @@ components:
       properties:
         kind:
           type: string
-          enum: [acquire, monitorSession, monitorCapture, runSequence, writeSettings, reprogram]
+          enum: [acquire, monitorSession, monitorCapture, runSequence, writeSettings, reprogram, identify]
         agentId: { type: string }
         vciId: { type: string }
         vin: { type: string }
-        irDigest: { type: string }
-        artifactDigest: { type: string }
+        irDigests:
+          type: array
+          items: { type: string }
+          description: |
+            SHA-256 of each IR document of the job. The server writes them, sorted and without
+            duplicates, into the signed instruction's `document_hashes` (ADR-454, ADR-461); an
+            identification job names its documents through the plan instead.
+        artifactDigest: { type: string, description: Written into the signed instruction's `artifact_hash` }
         parameters:
           type: object
           additionalProperties: true
@@ -506,11 +544,10 @@ components:
     OfflinePackage:
       type: object
       properties:
-        signedJob: { type: string, description: base64 }
+        signedJob: { type: string, description: base64 of the same signed instruction envelope as the control channel's job command (11.1, ADR-461) }
         offlineToken: { type: string }
-        expiresAt: { type: string, format: date-time }
+        expiresAt: { type: string, format: date-time, description: Informational only. The agent judges expiry by the signed instruction's start deadline }
         artifacts: { type: array, items: { type: string } }
-        irDigests: { type: array, items: { type: string } }
 
     Agent:
       type: object

@@ -1,9 +1,10 @@
 # `ngr-agent`
 
-`ngr-agent` is the binary of the `agent` crate (design 3.3). It has one command, which runs the
-procedure of a variant's document on a VCI for local end-to-end runs and tests; it does not
-connect to the server or take jobs from it. A job is always a document: a bare program has no
-declarations to decode with and no declared link, so the command takes none.
+`ngr-agent` is the binary of the `agent` crate (design 3.3). It has three commands. `run` runs the procedure of a variant's document on a VCI, and `identify` runs
+an identification plan's functional presence requests, VIN reads and ECU reads; both are for local
+end-to-end runs and tests (below). `identity` creates the agent's key and prints its public key
+("`ngr-agent identity`" below). It does not connect to the server or take jobs from it. A procedure job is always a document: a bare program has no
+declarations to decode with and no declared link, so `run` takes none.
 
 ## `ngr-agent run`
 
@@ -26,19 +27,53 @@ The job opens the link its variant declares (`agent::Job::declared_link`, ADR-32
 
 - The variant must declare exactly one protocol. It must carry `UDS`, under the short name
   `ISO15765` or `ISO_14229_3_on_ISO_15765_2`, without extended addressing.
-- The baud rate and the two identifiers are the protocol's.
+- The baud rate and the identifiers are the protocol's, within 11 bits.
 - `CP_P2Max`, `CP_P2Star` and `CP_RC78CompletionTimeout`, in microseconds, give the timings,
   rounded up to whole milliseconds. Without them the timings are the link's defaults
   (`LinkConfig::iso15765`): P2 1 s, P2* 5 s and a 25 s bound on a response-pending chain.
 - The protocol's other ComParams are set on the link as declared, after the link's own, with
   the class the worker takes from the ComParam. Names compare ignoring case.
-- Refused: a ComParam the link sets itself, one that lets a primitive outlast the host's
-  deadline (`CP_RC21*`, `CP_RC23*`, `CP_RepeatReqCount*`, `CP_ModifyTiming`), a name not
-  starting `CP_`, a ComParam declared twice or with a unit, and a value outside an unsigned
-  32-bit integer (ADR-324 item 3).
+- Refused, naming the ComParam: a ComParam the link sets itself, one that lets a primitive
+  outlast the host's deadline, a name not starting `CP_`, a ComParam declared twice or with a
+  unit, a timing of 0 or above 4294967000 us (a value under 1 ms is rounded up to 1 ms), and a value outside an unsigned 32-bit integer
+  (ADR-324 item 3). The rules are `diag_ir::link`'s, which the CSV conversion applies too, so
+  the lists are in `crates/diag-frontend/docs/csv-tables.md` 4.3 (ADR-406).
 - A document whose link cannot be used fails before any worker starts. A ComParam the worker
   does not know, or resolves to one the link already set, fails when the link is set up,
   naming the ComParam.
+
+Keeping a session alive (design 8.2.5, ADR-418, ADR-420). `LinkConfig::keep_alive` is the period
+of the worker's cyclic tester present on the job's own link: `Some(2 s)` from
+`LinkConfig::iso15765` and from a declared link, `None` for off (a functional link has none). A
+period below 200 ms is refused, zero included. With it on, the link open sets, after the
+declared ComParams and before the indications, `CP_TesterPresentMessage` `3E 00`,
+`CP_TesterPresentReqRsp` 1, `CP_TesterPresentExpPosResp` `7E 00`, `CP_TesterPresentExpNegResp`
+`7F 3E`, `CP_TesterPresentAddrMode` 0, `CP_TesterPresentSendType` 0 (every period),
+`CP_TesterPresentTime` (microseconds) and `CP_TesterPresentHandling` 1, under the class
+`PDU_PC_TESTER_PRESENT`, the message and the two responses as byte fields; a library that
+refuses one opens the link without the keep-alive, and `link_opened` says so. A document cannot
+declare them. The link's `CP_RC78Handling` and `CP_RCByteOffset` stay as the link sets them, so a
+`7F 3E 78` keeps the worker's window open (ADR-419). The worker's tester present runs only in the
+link state COMM_STARTED, so a request that is a DiagnosticSessionControl into a non-default
+session, sent while the link is still ONLINE, goes as a `CoptStartcomm` (`detail.cop_type`
+`startcomm` in its exchange entry), judged as a send-receive is; a start that got no positive
+answer makes the host ask the link's status (`GetStatus`). From then on the agent switches
+`CP_TesterPresentHandling` by `CoptUpdateparam` as the host's session record (`keep_alive.rs`,
+written after every exchange) enters and leaves a non-default session, never by `CoptStopcomm`,
+and writes a `keep_alive` entry for each switch; a failed switch-on fails the next call (a
+request before it is sent, a `Wait` poll, a runtime read) with `HostError::KeepAliveFailed`.
+
+The link's event stream is read only inside a send-receive's wait and at job end, so the host
+also reads it, without waiting, at the start of each request, `Wait` poll and runtime read (the
+drain), and passes every notification of every reader through one observer (`KeepAlive::observe`,
+ADR-420 item 8). A tester-present error event is noted in a `keep_alive` entry (`action` `error`);
+it also makes the session lost when the session record holds a non-default session, and the
+next call then fails with `HostError::SessionLost`: a request is refused unsent (cause
+`session_lost`, `caused_by` the error's entry, `undetermined`), a `Wait` ends at its next poll,
+and the run ends in the host error without a repeat or a new link. An error read with the record
+in the default session, or after a lost VCI that ends the link, is logged only; a lost VCI the drain read is reported first (the request is refused after the loss and the link is opened again). A lost-events notice read outside an exchange with a session kept is the session lost too, with a `keep_alive` entry of `action` `events_lost` (the error may have been among the events lost). A stream that failed is reported by refusing the next request, unsent, with `HostError::StreamFailedBeforeSend` wrapping its status (a lost path is then reopened and the request sent; cause `stream_failed` in the log). What the drain reads that
+belongs to no exchange keeps its place in the log, and a lost VCI it reads makes the next request
+refused after the loss.
 
 The link's resource is named by the ISO 22900-2 (2022)
 short names of UDS on dual-wire CAN (Annex B.1, B.2), which both worker kinds resolve
@@ -48,13 +83,14 @@ Steps (`agent::check_job`, `agent::guards::JobGuards`, `agent::launch::launch_wo
 
 1. Read the document and its procedure, and check the job (`agent::check_job`):
    a program that decodes a field the document
-   does not declare (ADR-318), a generic send-receive (`Op::SendReceive`, ADR-321) whose
+   does not declare (ADR-318), a flash recovery plan whose flash session the document does not declare (ADR-245), a generic send-receive (`Op::SendReceive`, ADR-321) whose
    service the document does not declare with a request and a positive response, or whose
    variant's negative-response shape the workers do not support (ADR-322), a program whose schema version or
    size this VM does not accept, one whose restart declaration `Program::validate` refuses
    (ADR-245), one with a request this build may never send (a release build sends only
    the read-only requests of the variant's application layer; ADR-235 item 8, ADR-247,
-   ADR-342), or one with a `ReadDtc`, which no build serves (ADR-342), fails here,
+   ADR-342), one with a `ReadDtc`, which no build serves (ADR-342), or one that lists more
+   than one target (`JobError::SeveralTargets`; the agent opens one link per job, ADR-409), fails here,
    before any worker starts. The same check refuses a job whose artifact does not hash to the name it gives (also when no instruction reads it), a program with a `FlashBlock` and no artifact, and any segment of a flash session the program names (by a `FlashBlock` or a flash recovery plan; artifact offset plus length, overflow-checked) that reaches past the end of the file (`JobError::ArtifactMismatch`, `NoArtifact`, `SegmentOutsideArtifact`). A bad operand, such as a missing constant, fails only when the VM
    reaches it, after the worker has started.
 2. Take the job's guards from the `--locks` directory, named by `--vci` ("Job guards" below):
@@ -86,8 +122,8 @@ Steps (`agent::check_job`, `agent::guards::JobGuards`, `agent::launch::launch_wo
    ComParams by their ISO 22900-2 (2022) short names (Annex B.3). A run with `--api dpdu` is
    tested end to end on `iso22900-mock` with a simulated ECU attached (ADR-299,
    `crates/iso22900-service/tests/ngr_agent_dpdu_end_to_end.rs`).
-6. Run the program under the request policy and the default job limits (ADR-235), then stop
-   the worker and release the guards. The stop request may take up to 2 s to be answered; a
+6. Run the program under the request policy and the default job limits (ADR-235; a request that fails at the ECU or the bus and is safe to repeat is sent again up to `JobLimits::max_primitive_repeats` times, "Repeating a failed primitive" below, and a lost path to the VCI continues on a new link under the conditions of "Continuing after a lost path"). The run takes its worker through `launch::RelaunchingWorker`, which owns the worker's process and starts a new worker by the launch recipe of step 5 if the process exits during the run (ADR-394, "A worker that exited" below). Then stop
+   the worker in the source's process slot, which holds the current one, and release the guards. The stop request may take up to 2 s to be answered; a
    worker that has not exited 5 s after that is killed and reported on stderr. When the job's link was not confirmed closed and the worker
    cannot be stopped either, the run fails with "the worker may still hold the VCI", and the
    locks stay held until the process exits (ADR-258). The policy is read-only, except that a debug build may send any request once
@@ -130,11 +166,89 @@ commits 0 (ADR-252).
 
 | Exit status | Meaning | Output |
 |---|---|---|
-| 0 | The program ran to its end | The final `diag_ir::VmState` as one line of JSON on stdout. A negative response is a value on the stack, not a failure |
+| 0 | The program ran to its end | The final `diag_ir::VmState` as one line of JSON on stdout. A negative response is a value on the stack, not a failure, and neither is the silence of a request whose positive response is suppressed (an empty value, ADR-408; for a request longer than one classic CAN frame only with a confirmed send, and never with an error event bound to the primitive) |
 | 1 | Reading the document, launching the worker or the job failed (including a procedure that ended itself as failed, `JobError::ProcedureFailed`), the worker may still hold the VCI after a failed link close, or the final state holds a non-finite float (infinity or NaN), which JSON cannot represent | The reason on stderr |
 | 2 | Invalid command line | The error and the usage on stderr |
 
 The worker's own log goes to stderr.
+
+## `ngr-agent identify`
+
+```sh
+ngr-agent identify --vci <name> --mode <device|user> --plan <file> [--document <file>]... [--api <j2534|dpdu>] [--workers <dir>] [--locks <dir>] [--comm-log <dir>]
+```
+
+Runs the functional presence requests of an identification plan, then reads the VIN its VIN
+rules name, then reads the ECU definitions it names in the order ADR-327 item 4 gives, with the
+fields the candidates' matching rules read, narrowing the candidates on what the reads, the VIN
+rules and those fields show (`run_identification`, ADR-396, ADR-399, ADR-401, ADR-402, ADR-403;
+design 8.8.2), and prints the report, which lists the remaining candidates, the rule fields and
+the component values the rules gave. `--vci`, `--api`, `--mode`, `--workers`, `--locks` and
+`--comm-log` mean what they mean for `run`, and both commands run their job in one shell
+(`run_on_vci`, ADR-397): the communication log's setup, the guards, the worker's launch, its
+source with the slot, the report of the log's path, and the worker's stop with the guards'
+release. The differences:
+
+| Option | Meaning |
+|---|---|
+| `--plan` | The identification plan (`diag_ir::plan::IdentificationPlan`, ADR-395). Required, given once. Unsigned plans are accepted until the plan's signature is verified |
+| `--document` | A document the plan names, by its hash. Any number, including none. The same file twice is one document. A document the plan does not name is ignored, with a warning on stderr. A document the plan names and that is not supplied refuses the plan |
+| `--artifact`, `--artifact-sha256` | Not accepted: the job reads no artifact (unknown options, exit status 2) |
+
+The plan and the documents are read and checked (`load_plan`, `check_plan`) before the log
+directory is made, a lock is taken or a worker starts. The job takes the per-VCI lock
+(`JobGuards::take_vci_only`), since it sends only the presence request and read-only requests
+(the VIN and the ECU definitions' identification requests), and the lock of the vehicle whose VIN it established (below, ADR-399); it keeps a
+communication log only when `--comm-log` is given. The log's header names the job as an
+identification job and carries the plan's SHA-256 (`job.plan_sha256`); `vci_connected` names the
+API and the width as a procedure's does.
+
+| Exit status | Meaning | Output |
+|---|---|---|
+| 0 | The job ended: the report, including a run whose presence section is interrupted (`presence_interrupted`), whose VIN phase is interrupted (`vin_interrupted`), whose ECU phase is interrupted (`ecu_reads_interrupted`) or whose tables the VCI refused | The `IdentificationReport` as one line of JSON on stdout (it holds the VIN when one was established, the ECU reads and entry states, ADR-401, and the rule fields and component values, ADR-403) |
+| 1 | The plan or a document cannot be read (`cannot read <path>`) or the plan is refused (`plan refused: ...`), both before the VCI; the job failed (`job failed: ...`, nothing on stdout; among them guards still marked after the VIN phase's last close when an ECU read remains, `LinkUnconfirmed`); or the worker may still hold the VCI after a failed link close | The reason on stderr |
+| 2 | Invalid command line | The error and the usage on stderr |
+
+## `ngr-agent identity`
+
+```sh
+ngr-agent identity --mode <device|user>
+```
+
+Loads the agent key (design 6.4, ADR-459) from the key store of the build and mode, creating it once when the store holds none, and prints one line of JSON on stdout: `public_key_pem` (the SPKI document as PEM), `fingerprint` (the SHA-256 of the SPKI DER as 64 lowercase hexadecimal digits) and `created` (true only for the process that created the key). `--mode` is required and the only option: the key's name, the store and the state directory depend on the mode. The command needs no worker and no VCI, and `run` and `identify` never touch the store.
+
+| Exit status | Meaning | Output |
+|---|---|---|
+| 0 | The key was found or created | The JSON line |
+| 1 | This build or mode has no key store (every release build until the platform stores land), the store holds no key and cannot create one (an administrator provisions it), randomness is unavailable, or the debug variables are wrong | The reason on stderr |
+| 2 | Invalid command line | The error and the usage on stderr |
+| 3 | The store, the creation lock or the state directory is unavailable; nothing changed and a retry may work | The reason on stderr |
+| 4 | A key is present and cannot be used (the store cannot decrypt it, or it is not a P-256 private key); the store is untouched, and registering again needs an explicit reset | The reason on stderr |
+
+### Agent key
+
+`agent::identity::load_or_create` reads the key from the store by its name, `nekoguruma-agent-key.<mode>.v1`, whose value is the PKCS#8 DER of the key. Only when the store positively answers that it holds nothing does it create one (ADR-460):
+
+1. Take the exclusive lock on `<state directory>/identity/<name>.lock`, polling every 20 ms for up to 10 seconds. A process that races another waits, then adopts the winner's key; a holder stuck longer makes the waiter report the store unavailable (exit 3).
+2. Read again, and adopt a key that appeared.
+3. Generate a key, create it in the store (which never replaces), read it back and use what the store returns. A create that reports a failure after the key is in place is read back the same way and the key adopted, with `created` false.
+
+So two processes that race create one key, a key that is present needs no lock and no writable state directory, a store that cannot be read is never taken for an empty one, and an undecryptable or malformed key is reported and never overwritten. The lock file is never deleted. The loaded key stays in memory (the `Signer` of `AgentKey`), so a store that locks later does not stop a reconnection. Later code that needs the key calls `load_or_create` (or `agent::identity::agent_key`) and never the store's `put_new`; a key reset must take the same lock.
+
+The release build selects no store yet: the platform stores (a DPAPI blob on Windows, the Secret Service in Linux user mode, a systemd credential in Linux device mode) come with their own changes. A debug build has a plain-file store for tests, selected only when both `NGR_AGENT_KEY_STORE=file` and an absolute `NGR_AGENT_STATE_DIR` are set; neither variable is read in a release build, and the plain-file store is not compiled there.
+
+### State directory
+
+`agent::state` resolves where the agent keeps its state, per mode (design 6.2, ADR-460):
+
+| Mode | OS | Root | Created by |
+|---|---|---|---|
+| user | Unix | `$XDG_STATE_HOME/nekoguruma` (absolute), else `~/.local/state/nekoguruma` | the agent, 0700 |
+| user | Windows | `%LOCALAPPDATA%\nekoguruma` | the agent |
+| device | Unix | `/var/lib/nekoguruma` | the installation (for example systemd's `StateDirectory=`, 0700, the service account); the agent creates only sub-directories, and a missing root is an error |
+| device | Windows | the service account's own `%LOCALAPPDATA%\nekoguruma` | the agent |
+
+Each kind of state has a sub-directory of its own: `identity` holds the key's lock file and the debug store, and `journal` is for the write-job journal. A sub-directory is created readable by its account only, and on Unix one that is writable by its group or others is refused. The operational log's directory (below) keeps its own rules.
 
 ## Operational log
 
@@ -288,10 +402,11 @@ share one step count:
 |---|---|---|
 | `Checkpoint { at, vm_state }` | after a diagnostic primitive outside every plan's range, with the VM state after it; not where the step carries a boundary state | `JournalState::latest_checkpoint` only |
 | `Request { at }` | before a diagnostic primitive outside the plans that is not safe to repeat | `RecoveryFacts::first_request` and `last_request` |
+| `RequestNotSent { at }` | when a run ends with the newest `Request` provably unsent (ADR-392, "Repeating a failed primitive" below) | `RecoveryFacts::last_request_unsent`; `last_request_withdrawn()` says it names `last_request` |
 
 The checkpoint must come after the last step and not before the last request or the latest
 checkpoint (it may share their step count), and a request after the last step and after the
-previous request. A VM state whose record would not fit in a frame (`MAX_FRAME`) leaves no
+previous request. A request-not-sent record must name the newest request, once, and come after the last step; the record is appended to the format like the others, with no version change. A VM state whose record would not fit in a frame (`MAX_FRAME`) leaves no
 checkpoint and does not end the job: the commit is refused before anything is appended, the
 journal is unchanged, and the run goes on. A missing checkpoint only makes a restart more
 conservative (ADR-335): the latest checkpoint stays an older one, and a completed request that is
@@ -328,7 +443,9 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   (`Job::with_comm_log_dir`), and without that directory it ends in `JobError::NoCommLogDir`
   before anything opens.
 - **Lines.** Every line has the next `seq` and an `event`. A new log starts with the `header`
-  (seq 0: the job's ID, generation, kind and document SHA-256, the target VIN when the job names
+  (seq 0: the job's ID, generation, kind (`procedure` or `identification`; whether the job writes
+  is in `job_start`), the document SHA-256 of a procedure or the plan SHA-256 of an
+  identification job (ADR-398), the target VIN when the job names
   one, the ECU variant, the agent and IR schema versions, and a reading of the agent's clocks).
   Each run writes `job_start` (the agent's version, `run`: `first`, `resume`, or `plain_start`
   for a resume that finds no journal, and whether the job writes) and, when it ends,
@@ -336,14 +453,35 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   `agent_clock` first, a new reading that starts a new agent epoch. Right after the link opens,
   before anything is sent on it, the run writes `vci_connected`, then `link_opened`.
   `vci_connected` names the API (`dpdu` or `j2534_0404`) when the job was told it
-  (`Job::with_vci`, which `ngr-agent run` sets from the worker it launched), the `unsigned long`
+  (`Job::with_vci`, which `ngr-agent run` sets from the worker it launched, and the `vci` argument
+  of `run_identification`, which `ngr-agent identify` sets the same way), the `unsigned long`
   width of a J2534 worker, and the module's version data, which the link reads with
   `GetVersion` in every build (`null` when the worker gives none):
   - a D-PDU module's vendor, hardware name, serial number and version, firmware name and
     version, and API library name and version;
   - a J2534 worker's firmware, library and API versions only, which is all v04.04 gives.
 
-  Its `drift_bound` and `clock_margin` have `source` `none`, since neither is configured yet.
+  Its `drift_bound` (`ppm`) and `clock_margin` (`us`), and `link_opened`'s `timing_margin`
+  (`us`), each give the value in force and its `source` (ADR-357): `profile` when the job was
+  given it (`Job::with_vci_margins`, which the hardware harness fills from its profile's
+  `[vci]` keys; an identification run takes the same margins as a parameter of
+  `run_identification`, and `ngr-agent identify` passes none, as `ngr-agent run` does), else, for the drift bound and the clock margin, `default`, the agent's own
+  (`VciMargins::DEFAULT_DRIFT_BOUND_PPM` 100 ppm, `DEFAULT_CLOCK_MARGIN_US` 1 ms), which place
+  a clock's times, telling a wrap from a step back but never deciding how many wraps a silence
+  holds (half a wrap of silence opens an epoch, ADR-383), and never settle a loss: with
+  either at its default, `vci_loss_settled` records its comparison and gives `power_kept`
+  `unknown` (ADR-378). The agent
+  has no timing margin of its own: without one, `timing_margin` is `{"source":"none"}` and the
+  link's times are recorded and not judged (`not_judged_reason` `no_margin`, ADR-377).
+  A run that loses the VCI writes `vci_loss`, and writes it again, whole, after each further
+  exchange the loss ended or caused, syncing each one (ADR-373). When the log holds a loss no
+  `vci_loss_settled` names, the next run whose VCI connects reads the VCI's clock once
+  (`GetTimestamp`) before `vci_connected`, timing its round trip, and writes `vci_loss_settled`
+  right after it. Every reopen starts a new agent epoch, so the agent's clock cannot measure the
+  gap since the loss, and `power_kept` is `unknown`. On Linux the machine's boot clock
+  (`CLOCK_BOOTTIME`) measures the gap when both runs lie in one boot (the kernel's boot id),
+  and the entry records it with the machine's sleep in it and the comparison it gives, for a
+  reader to weigh; the log judges nothing from it (ADR-374, ADR-379).
   `link_opened` then gives the link, its endpoint and
   channel, the protocol, baud rate and identifiers, and every ComParam by name with its value
   and `set_by` (`link` for those `agent::link` sets to its own value, `document` for those
@@ -352,10 +490,291 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   sets). The link sets `CP_RC21Handling` and `CP_RC23Handling` to 0, so the API repeats no
   request on a busy answer, and turns `CP_TransmitIndEnable` and `CP_StartMsgIndEnable` on;
   their entries carry `accepted`, and a library that refuses one opens the link without it.
-  The event gives no transmit-confirmation source, response times not judged and no timing
-  margin (`source` `none`), since the agent does not read the indications yet, and
-  `forwards_pendings` `null`, since whether pendings are forwarded depends on the worker and
-  the agent does not know it yet.
+  `transmit_confirmation` names `transmit_indication` when the library accepted
+  `CP_TransmitIndEnable` (the link turns no loopback on). The event gives
+  `response_times_judged`, true when the transmit indication is on, and the timing margin in
+  force (`timing_margin`, above; none without a profile, so no time is judged, ADR-377).
+  `forwards_pendings` is what the worker answered to `CreateComLogicalLink`
+  (`Link::forwards_pendings`, ADR-355): `true` for the J2534 worker, `false` for the D-PDU
+  worker, `null` from a worker that does not say. The agent takes it from that answer alone, and
+  each exchange on the link has `pending_visibility` `forwarded` only when it is `true`, since
+  the link has the API handle 0x78 alone (`send_receive`'s supported pending codes); otherwise
+  `absorbed_by_vci`. The host keeps each pending bound to the primitive for the exchange's
+  `pending` list, with its VCI time and clock as the worker gave them and the agent's time when
+  the host read it, so a forwarded link's empty list means no pending came. The entry's VCI
+  times (`times.vci`, `exchange::VciTimes`) each come from their item, with that item's clock
+  and an epoch of 0 until the log unwraps them:
+  - The transmit done comes from the response's own `tx_msg_done_timestamp`, or else from the
+    attached transmit indication. A response-carried transmit done confirms the send when no
+    indication did (`sent_evidence` `tx_done_time`).
+  - The response's start comes from its own `start_msg_timestamp`, or else from the latest
+    attached start of message. That start counts only when it came after the last pending on one
+    clock (with a pending whose time or clock is unknown the order is unknown, so it does not) and
+    the response is longer than seven bytes, so that it spans frames whatever the addressing format: a
+    start comes only with a multi-frame response's first frame, so one before a single-frame
+    answer was a transfer the ECU aborted.
+  - Of two times for one point, the one with a clock wins.
+  - The response's end comes from the final response's item. Its times are kept only when the
+    exchange ended with that response.
+  - The error comes from the error event the entry names: a lost VCI, a failed primitive's last
+    error, else the last link error or the receive timeout.
+
+  So on a J2534 link a frame's time is on `device` and the receive timeout's on `worker`. Each pending gives its
+  interval from that transmit done or the previous pending
+  (`exchange::pending_intervals`), only between two VCI times on one clock and only forward (a
+  raw time below the one before, a wrap or a reset, gives none, since the log does not unwrap the
+  32-bit VCI times yet); otherwise none. A result bound to the primitive that does not answer
+  the request (`Progress::answers`), and is no indication, transmitted message or break by its
+  RxFlag, goes in the entry's `rejected` with its response identifier (the header's, else the
+  link's), bytes, times and reason (`wrong_echo` or `pattern_mismatch`, ADR-359); it counts for
+  neither the classification nor `link_history`, except that a primitive that ended with no answer
+  after a rejected result of positive form gives that response as the entry's outcome,
+  `positive_unusable` (`unanswered_end`, `Evidence::end_rejected`), redacted as a rejected result
+  and counted for no answer in `link_history`; the job still gets no answer. The log offers each
+  `wrong_echo` result of a request that is not collecting to the exchanges kept owed, with the
+  unbound items in the order the host read them and before the entry
+  (`Inner::offer_rejected`, `late_response_owner_with`, ADR-447): one owner is settled by a
+  `late_response` with `primitive` `in_flight`, several by an unowned one that names no
+  `unattached` line, and the item then carries that line's `seq` as `late_response`, which the
+  entry's classification reason reads (`Evidence::end_placed`, below the rows of the VCI's wait
+  against the limit, so a timing fault stays `system`). The exchange itself counts as an owner in
+  flight only when the result is its own positive prefix cut short (`Evidence::own_cut_short`),
+  which leaves the answer unowned: each earlier exchange that could own it is raised and none is
+  settled, and the texts say it could be the exchange's own response cut short. A `pattern_mismatch`, a collecting request's rejected answers and a result read
+  in a stray's wait after the deadline are not offered. A collecting
+  request lists such results among its `answers` instead (`Answer::is_rejected`): a rejected
+  answer is no answer on its identifier, so it folds no pending, covers no identifier or unnamed
+  pending (`standing_answers_covering`) and leaves its identifier silent; `collecting_end` gives
+  the entry's end as the first standing answer that is neither pending nor rejected, else the
+  first rejected result's bytes with `end_rejected` set, and the host, `primitive_ended` and the
+  late-answer restatement all take both values from it (ADR-437). For timing the VCI took a
+  rejected result as a response and ended its wait, so it still ends a pending's window
+  (`answer_windows`), a final answer delivered late is judged against P2 from its end, and it
+  restarts the window of the answer after it; the link errors read for an end are ordered
+  against the first answer for which `Answer::is_response` holds, as the host orders them. An ordinary
+  primitive keeps its first answering result as its response and its times; when the worker
+  binds more than one answering result to it, the entry lists all of them in `answers` (ADR-400).
+  A collecting request (the presence request) takes no response times for its entry and lists
+  every answer: each is placed on its clock (`clock`, `epoch`), judged from the end of the answer
+  before it, with its pendings kept per response identifier, and classified as an exchange of its
+  own (`Evidence::as_answer`) against its own link history, with its response time from the
+  transmit. Its end is its first standing answer that is neither a pending nor a rejected result,
+  else the first rejected result, else no response (`primitive_ended` keeps a
+  `response_incomplete` end while `collecting_end` gives no response), and it
+  stays owed on each response identifier whose last answer is a pending (ADR-429). The entry's
+  classification is the most severe of its answers' (design 8.11
+  `answers`); its `timing` judges where the window ended, by the primitive's finished item when
+  that is on the clock the answers are, and its transmit done comes from the first answer that
+  carries one. Lost events end the wait at the worker's first
+  report, which the entry records in `events_lost` with the agent time it was read. When the
+  agent's own deadline, not the
+  worker's receive timeout, ends an exchange with no response, the entry's outcome is
+  `vci_did_not_end` (`deadline_end`), classified `undetermined`, since the limit in force may not
+  have run out, with or without a pending (a collecting request with answers is the exception:
+  it takes the most severe of its answers' classifications, at least `undetermined` with the
+  deadline named as an open reading, ADR-434); a pending then silence is `vehicle` only when the
+  VCI ended the wait. It is `system` when the send was confirmed, the link's start-of-message
+  indications are on and showed no response under way (none attached, none bound to the
+  primitive, which the host notes, none unbound that names no identifier or the link's
+  response identifier, and no rejected result, which the worker matched and may have ended the
+  VCI's wait), and the reading at the deadline below, less the time from the deadline to the
+  read's answer, is on the device clock and epoch of the transmit and past the latest
+  limit in force plus the margin by more than a single frame's transfer
+  (`comm_log::timing::past_vci_limits`, `LinkConfig::single_frame`): the VCI did not end the
+  exchange within its own timing. At that deadline the host reads the VCI's clock for an exchange whose entry
+  it writes (`GetTimestamp` of the link's module, one more unary call's budget at most), and the entry's `times.vci.deadline`
+  gives the reading with the clock the worker names in `TimestampResponse.timestamp_clock` and
+  the time from the deadline to the read's answer (`round_trip_us`), which bounds when after
+  the deadline the clock was read; a read that fails gives none. A primitive whose end the host did not read may still hold the link: its
+  own deadline, lost events or a failed event stream ended the wait, though not a lost VCI,
+  whose primitives the worker cancels. The host cancels such a primitive before the link's next
+  request (`WorkerHost::stray`, design 8.11 "Settlement"). The primitive is gone when the cancel
+  succeeds, when the worker names its handle invalid (`PDU_ERR_INVALID_HANDLE`: it had ended), or
+  when the VCI was lost. Any other answer leaves the link held: the request is not started
+  (`HostError::LinkHeld`, logged `not_sent`, refused by the agent with the cause `link_held`), and
+  the next request tries the cancel again. Every start carries a `cop_tag` of the host's own
+  (an 8-byte counter, never reset, ADR-204), so a start that got no answer in time, or answered
+  with no handle, leaves a stray with its tag and no handle (ADR-416). The next request waits
+  one unary call's time for an item carrying the tag; the first one gives the handle and the
+  cancel above runs, and with none the request is refused as `link_held` and the stray stays.
+  A lost VCI or an ended event stream during that wait drops the stray (its end cannot be
+  read), and the request goes on to its start. At job end the same wait is bounded by the
+  job-end wait below, and with no tagged item nothing is cancelled and nothing is written for
+  the exchange. The cancelled primitive's end, when the next
+  exchange's wait reads it (its own items until its finished or cancelled status, lost events,
+  a lost VCI), settles its exchange in a `primitive_ended` entry, as at job end; with no end
+  read, a cancel the worker carried out is recorded as the agent's (ADR-367). Its results and
+  errors that no end carries, and every item it leaves after that, are logged `unattached` with
+  `primitive` `earlier`. At job end (`WorkerHost::settle_at_end`, before the
+  link closes) the host keeps the link open for such a primitive until it ends (its finished or
+  cancelled status, or a lost VCI) or the link's job-end wait passes after the agent's own
+  deadline for it (`LinkConfig::job_end_wait`, ADR-358: one `CP_Cr` wait, 1 s when unset or 0,
+  plus a 4095-byte response at `CP_STmin`, capped at 10 s), then cancels it; one whose cancel
+  before a request already failed, or whose event stream fails, is cancelled at once; a failed cancel is logged and leaves
+  the job's result as it was. The host reads what the primitive gives meanwhile as its exchange
+  would have (a fresh `Progress` for its request's answer), and hands the log every item it read
+  for the end, in read order with the agent's clocks at each read: the primitive's own and the
+  link's result and error items of no primitive or of an earlier one, at job end and on the
+  next request's wait alike. The log places each once, in that order, keeps the exchange's own
+  VCI times and overlays the end's, and writes the end, or the agent's cancel, as a
+  `primitive_ended` settling entry of the exchange
+  (`WorkerHost::log_primitive_end`, `CommLog::primitive_ended`, ADR-366, ADR-386): a link error
+  counts as before its answer only when it was read before it. Each link error read meanwhile
+  then goes through `late_item`: one of no primitive at or after the exchange's earliest placed
+  start, or not set against its starts, is that exchange's own; the rest are placed by their
+  time. A settling entry that changes an exchange a `vci_loss` record lists rewrites the record.
+  The stray of a collecting primitive (the presence request) goes on collecting, so what it
+  reads after the deadline reaches the entry (ADR-425): each result as an answer (`EndItem::Answer`,
+  a pending with the identifier it came on) and the finished status (`EndItem::Finished`). The
+  entry lists them after the exchange's own answers, folds a lone pending whose identifier then
+  got its final answer (a lone pending that stays one leaves the exchange owed, ADR-429), and
+  judges all of them, and its own window from the last answer, with the
+  one function the exchange's entry uses (`judge_windows`, ADR-400).
+  After the entry the log renews an exchange it leaves owed and keeps its record when a pending
+  is open on an identifier or the end read the VCI's receive timeout (whatever it read after),
+  or the finished status of a collecting window that took a result, usable or only rejected,
+  or of a primitive that is not collecting and finished on a wrong echo (the host's `vci_ended`,
+  ADR-440, ADR-443),
+  so the exchange's response is its `late_response`; an end that read none is released
+  (ADR-429, ADR-431).
+  The `primitive_ended` entry gives the end as an
+  exchange entry does, classified by the exchange rows as if the agent had waited, except that a
+  final response or a receive timeout at the limit is `system`; a cancel by the agent, written
+  only when the cancel succeeds, settles nothing, and a failed event stream is `unknown`.
+  The worker host reads every item of the link while a primitive runs and hands the result and
+  error items of no primitive (a transmit indication, a link error) or of an earlier primitive
+  to the log with the exchange during which it read them, for an exchange it logs
+  (`CommLog::exchange_with`). A transmit indication that carries the exchange's request
+  identifier (from the item's header) is the exchange's send evidence (`sent_evidence`
+  `tx_indication`), unless an ended exchange on the link could still own it: one with `sent`
+  `unknown`, which a late TxDone may belong to (design 8.11 `sent_evidence`, ADR-346 item 4).
+  A transmit indication bound to the request's primitive is the exchange's own: it confirms the
+  send and gives the transmit time whatever other exchange could own an unbound one, in the
+  exchange's entry and, read at job end, in its `primitive_ended` entry (`Progress::bound_tx`).
+  Design 8.11's other conditions hold on the agent's link by construction: one primitive runs at
+  a time on the job's one link, and the API's own tester present, which runs once the link's
+  first session control has started communication ("Keeping a session alive" below), sends no
+  request while a primitive is outstanding (ISO 22900-2:2022 8.1.3 Table 1, ADR-419) and has its
+  own transmit indications discarded by the J2534 worker (ADR-099). On D-PDU the
+  condition holds by the standard's structure: an item of no ComPrimitive has no extra info
+  header (ISO 22900-2:2022 10.1.4.11, 10.1.4.11.4, D.2.1), so the API's tester-present
+  indication gives the agent no identifier to match, and the worker logs one that has a header as
+  a sign of a non-conforming library (ADR-430). A start-of-message indication that carries the exchange's
+  response identifier is the first frame of its response, which counts as an answer of the ECU
+  (design 8.11 "Link settings for the log", "Answer of the ECU"), unless an owed request on the
+  link expecting a response on that identifier could own it (one that stays owed after a reopened
+  link too, so it only keeps the indication `unattached`). The exchange then has `sent`
+  `confirmed` with `sent_evidence` `answer` (a transmit indication still wins), and counts as
+  answered for the later exchanges. A start with no final response or pending is no matched
+  answer and leaves H2 open, in this exchange and the later ones, since the worker may have
+  discarded the full response (`Evidence::bound_answer`, design 8.11 "Matched answer",
+  ADR-354); the rows of a pending seen do not take it either, while every other row still
+  counts it as an answer of the ECU. Every
+  start with that identifier read during the exchange attaches, since the ECU may have aborted and
+  begun again. An exchange the VCI ended with no response (the worker reported a receive timeout
+  for the primitive) ends as `response_incomplete`, classified `undetermined`, with H2 among
+  its readings unless a pending in the exchange or a matched answer excludes it; one the agent's
+  own deadline ended is `vci_did_not_end`, since the response may still be arriving (design 8.11).
+  The log writes no time for the start yet: its VCI time needs per-clock epochs (ADR-353), and
+  the agent's entry has no field for it. A received message that exactly one owed exchange the
+  VCI ended could own (by its response identifier and match), that the exchange in flight does
+  not also await and that is not a pending, is a `late_response` settling entry instead,
+  written in the same place: it refers to that exchange, which is owed no more, and classifies
+  it again by the response's end against that exchange's limit in force
+  (`comm_log::timing::judge_late`, `exchange::settle_late_response`, ADR-365). The log keeps
+  each owed exchange the VCI ended, with its evidence, limits and VCI times, for this
+  (`exchange::Kept`); a late response after a timeout not judged at the limit is at most
+  `undetermined`, since the VCI may have ended its wait early. The answer it adds, like the end
+  a `primitive_ended` adds, reclassifies the later exchanges among the last 16 logged on the link
+  (`exchange::LinkState::reclassify_after`, emptied by an accepted ECUReset or session change):
+  each whose classification or reason changes is named in the same entry, and one that has left
+  the window is not (`not_reclassified_through`, ADR-368). The answer also counts for the
+  exchanges logged later, and a later exchange whose answer no owed request can own any more is
+  owed no more. A response two or more exchanges could own stays `unattached`, followed by a
+  `late_response` that chooses no owner and raises each owed one that could own it to at least
+  `undetermined`; the exchange in flight that could own it is at least `undetermined` too. A
+  rejected `wrong_echo` bound to the exchange in flight is settled or raised the same way but with
+  `primitive` `in_flight` and no `unattached` line (ADR-447). Every other
+  item is an `unattached` event, except a link error of no primitive read during the exchange
+  (not a receive timeout or a lost VCI) whose VCI time is not before the exchange's earliest one,
+  or cannot be set against it: that is a link error of the exchange itself. Any other link error,
+  of no primitive or of an earlier one, is a `late_item` (ADR-372). Within an earlier exchange
+  (by its VCI time on one clock and epoch), that exchange takes it: its own fault on its own
+  link, H3 on another. An exchange with only end-side times may have held one no later than
+  its latest time while no exchange has left the window, and takes it as H3 only. Between exchanges, it settles the exchanges after
+  it alone. Either way, the matched answers and the answers since an error from before it end
+  for every target, and the later exchanges are reclassified. An answer counts as matched, and
+  as an answer since a late error, only when its answering item's time, which every exchange
+  keeps, is shown after the error's on one clock and epoch, or its exchange was logged after
+  the error was read: the settling entries, the error's recount and an answer freed through
+  its owners all use that test; the stored time does not place a later error (ADR-384,
+  ADR-385). Before the window,
+  every window exchange is reclassified from the window alone.
+  One that cannot be placed on one clock with the exchanges is a possible link error (H3) during
+  each exchange written since the link's items were last read before it; with none, it stays
+  `unattached`. One bound to the stray primitive the host cancelled before the request is that
+  primitive's exchange's, whatever its time: the host names the exchange's `seq` with it
+  (`UnattachedItem.owner`). An unbound transmit
+  indication, loopback echo or start-of-message indication that the one ended exchange which
+  could own it (one whose `sent` is still `unknown`, or an owed request awaiting a response on
+  that identifier) owns, and not the exchange in flight, is a `late_item` settling entry
+  (ADR-370): the exchange in flight was not yet in flight with the identifier when the item's
+  VCI time comes before its own transmit done (`before_starts`). `exchange_with` goes through
+  the unbound items and the rejected wrong echoes once, in the order the host read them
+  (`Offer`, ADR-447, ADR-453), and judges each against what the items read before it left: the
+  one ended owner's `late_item` first, else the exchange's own transmit indication or start when
+  no ended exchange could own it by then (`may_own_tx_indication`,
+  `may_own_start_indication`), else `late_response` or `unattached` with the possible owners
+  named (`place_unbound_item`). A pending, start or transmit indication read after a late final
+  therefore meets the record that final left, in one read as across two. The link errors follow
+  the pass, since they are set against the exchange's span, which the pass completes;
+  `primitive_ended` goes through the items read in its primitive's wait in the same order, after
+  choosing the indications its own entry takes, which it still does first. The
+  `late_item` restates that
+  exchange's `sent` and outcome, judges its timing again, and reclassifies it (not a record whose
+  evidence settles its exchange, below) and the later exchanges
+  (`exchange::LinkState::update_kept`); a start before the limit less the margin is kept
+  (`Kept::late_start`), so a late response that completes it, spanning frames, is `system`; a
+  start after the limit plus the margin is kept the same way, and any response completing it is
+  judged as a late one (`vehicle` when the VCI ended its wait at the limit).
+  For a collecting exchange these judgements (and a late response's) run from the window that its
+  response identifier's final answer would get at that place, by `late_window`, which reuses
+  `answer_windows`; the time reported stays from the transmit (ADR-426).
+  One that two exchanges could own stays `unattached`, followed by a `late_item` that raises each
+  owed one to at least `undetermined` (once: an owed one already raised is not named again), and
+  the exchange in flight that could own it is at least `undetermined` too when the item could
+  change it: a transmit indication while its send stays unknown, a start while it has no answer
+  of its own. A forwarded pending bound to no primitive (`7F`, the service, 0x78) is a late item
+  the same way (ADR-371): the owed request whose negative pattern it carries takes it, judged
+  against that request's limit in force before it as a late response is (`system` within it;
+  past it plus the margin, `vehicle` when the VCI ended its wait at the limit and `undetermined`
+  when that is not shown; otherwise `undetermined`, and not judged on a link whose VCI absorbs
+  pendings). That judgement stands when the exchange is classified again, and the request's own
+  timing is judged without it. Only a pending in time carries the limit in force on for a later
+  late response; after one whose time is not shown, that limit is not known. A pending or start
+  whose one possible owner is a record kept only for its rows that a late final would not settle
+  (`Kept::late_pending_or_start_settles`) is not settled this way, and the record stands
+  (ADR-450). Such an item, and the
+  others, are `unattached` events, written in the order read
+  and before the exchange's entry: an item bound to an earlier primitive, a
+  start-of-message indication no exchange takes as above, and a transmit indication whose header
+  is not a plain 4-byte CAN identifier (extended or mixed addressing), which therefore never
+  confirms a send. The confirming indication's read time is the entry's
+  `times.agent.tx_confirmed_us`. A transmit indication or loopback echo whose one owner is a record whose evidence
+  settles its exchange (`Kept::late_transmit_reclassifies` false) is still that record's
+  `late_item`, which confirms the send (`sent`, the transmit done kept with the record and its
+  window entry through `LinkState::restate_send`, its `seq` out of the unknown sends) and leaves
+  the classification, the reason and the timing as they were (ADR-452).
+  Status and information items are not written. Each gives the `link`, the `item` (from a result item's
+  RxFlag, ISO 22900-2:2022 D.2.2: `transmit_indication`, `loopback`, `start_of_message`,
+  `break` or `received`; or `error_event`), the `primitive` (`none`, `earlier`, or `in_flight` on the `late_response` of a result bound to the exchange in flight that the host rejected), a result's
+  `identifier` when its header carries one, the raw
+  `vci_us` with the `clock` the worker gives the item (`device` or `worker`, ADR-353), or none
+  when the worker gives none, since the agent does not infer it from the worker (design
+  principle 6), the agent's `epoch` and `read_us`,
+  and for a result its `rx_flag` in hex and its `message`, redacted as a request for a transmit
+  indication or a loopback and as a response otherwise; for an error event its name and its
+  extra error information as the worker gave it (ADR-351).
   Each ECU identity value the runner reads from a source the program declares (the hardware
   part number and software version a write job records at its plan's entry, and the VIN,
   hardware identity and software version a restart checks) is an `identity` event as it is
@@ -397,18 +816,56 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   agent saw of it (`Evidence`) and the link's history (`LinkState`: answers, matched answers,
   owed requests, the last link error, an accepted ECUReset or session change), and classifies it
   by design 8.11's table, first matching row. It decides only the rows the agent's evidence
-  reaches today: without transmit indications a request is `sent` `confirmed` only by an answer
-  no owed request could own; without a transmit time the timing is `not_judged`, so on a link
-  whose VCI absorbs pendings every response is `undetermined` (a pending may have come first);
+  reaches today: a request is `sent` `confirmed` by its transmit indication (above) or by an
+  answer no owed request could own, and a confirmed send with no response is `vehicle` from an
+  ECU that has answered requests matched this way with no link error, `undetermined` otherwise
+  (on a link whose VCI absorbs pendings, the possible-pending row below comes first).
+  `comm_log::timing` judges the window against the limits `link_opened` recorded for the link
+  (P2, P2* and the 0x78 completion timeout, with the timing margin; with none, every time it
+  would compare is `not_judged` `no_margin`, while the reasons the times' own placement gives,
+  such as `no_transmit_time` or `other_clock`, stand, ADR-377), from the transmit done to
+  a VCI time on the same clock and epoch (ADR-361): a response start and the receive timeout
+  both ways, a response end as proof the response was on time and, for a response of at most
+  six bytes on UDS on CAN (one frame whatever the addressing, at most 160 bits at the baud rate,
+  `LinkConfig::single_frame`), as proof it was late past the limit, the margin and that frame's
+  transfer, each forwarded pending against the limit in force before it in the same way (a late
+  one makes the window `late` with `late_pending`, and the exchange `system` whatever follows,
+  ADR-364), and on a link whose VCI
+  absorbs pendings past P2 as `possible_pending` up to the bound from the transmit (P2 plus the
+  completion limit), narrowed by any pending the worker still passes on there (ADR-362). A
+  receive timeout after a response may have begun is the transport's and is not judged; one
+  early or late otherwise is `system`; a final response whose start is late is `system`; a
+  suppressed request's silence with a timeout judged at P2 on a link that forwards pendings, a
+  confirmed send and no hidden cause is `none`. Without a transmit time on the same clock the
+  timing is `not_judged`, with the reason, so on a link whose VCI absorbs pendings a response
+  with no pending seen is `undetermined` (a pending may have come first), while one after a
+  pending seen takes its own row. Nothing presumes a timer right (ADR-376, `exchange::row`):
+  a final response whose time is not judged is never `none` or `vehicle`, since it may have
+  come late with the VCI past its own limit, and a silence is `vehicle` only after a receive
+  timeout judged at the limit on a link that forwards pendings (`exchange::silence_open`);
   an answer an owed request could own leaves the exchange that received it `undetermined`, and
   both stay owed (the earlier exchange is reclassified only by a settling entry, which comes
   later). An accepted session change or ECUReset, of any type (ADR-346 item 6), ends the matched
   answers and the owed requests, and an unusable answer to either ends only the matched
-  answers. A reopened link, a worker
+  answers, as does either one sent with its positive response suppressed whose silence is not
+  `none` (`LinkEffect::unsure_restart`, ADR-376). Read late, in a `late_response` or a `primitive_ended`, either answer ends them as of
+  its exchange's entry (`exchange::LinkState::reset_after`, ADR-369): the later exchanges in the
+  window are reclassified on their matched answers counted again from the window and, after an
+  acceptance, without the owed requests from before it as owners. A link error ends the matched answers too, but a final response that came after
+  every link error of its exchange, in the order the host read the link's items, counts as an answer
+  since the error (VCI times are not compared); an error after it, or from another link of the
+  channel, ends it. A late link error read afterwards tests that answer's time as above. A reopened link, a worker
   restart or a VCI reconnect (`LinkState::reopened`) ends the matched answers and keeps the owed
-  requests. The other rows stand as comments where the table puts them, and evidence only they
-  could classify falls to the last row, `undetermined`, at the place in the table where that row
-  stands.
+  requests. It also empties the set of unknown sends (kept by exchange, ADR-448), so a kept record
+  from before it keeps its `sent` and rows, owns no transmit indication read afterwards, and
+  its later release takes no later send out of the set; what an owed request owns otherwise is
+  unchanged by it. `CommLog::link_opened` makes that call, on the state of the target its event
+  names, after the line is written (ADR-451). It does so for every `link_opened` of a target:
+  the host's own reopening after a lost VCI or a worker's end (`WorkerHost::reopen`, which first
+  writes what the old link left) and each link an identification run opens for a target it used
+  before. A target's first `link_opened` finds no state. The other rows stand as comments where
+  the table puts them, and evidence only they could classify falls to the last row,
+  `undetermined`, at the place in the table where that row stands.
 - **Exchange entries.** The worker host writes one entry for each request a VM step, the runner
   or the restart sends through it (`send_recv`, the generic send-receive) and for each it refuses
   before sending (`not_sent`: the request policy, an undeclared service, TransferData outside
@@ -439,6 +896,145 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   one `LinkState` per target for the run, so it outlives the link within the run; a later run of
   the job starts it over, since the log is not read back. A link error an entry carries is handed
   to every other target's state too. Writing an entry never reaches the job, a panic included.
+
+## Repeating a failed primitive
+
+`restart::repeat_decision` is the one place that decides what the runner (`run_vm`) does with a
+host error of a diagnostic primitive (ADR-392). It reads the error's `HostError::send_state`
+and `HostError::resend_class`, the program's idempotency (`restart::safe_to_repeat`) and the
+count of failed sends of the arrival, which the runner keeps in memory and starts over at every
+arrival at an instruction (`VmState::steps` before it). Only `ServiceRequest`, `ReadDtc`,
+`RoutineControl` and `SendReceive` outside every plan's range are considered; every other
+instruction, anything in a plan's range and an error that is neither a refusal that passes nor
+a lost path to the VCI (`Setup`, a refusal that does not pass) end the run in `JobError::Host`
+as before. A lost path to the VCI (`ResendClass::PathLost`: `VciLost` of either kind,
+`EventStreamEnded`, `WorkerUnresponsive`, and an `Rpc` that failed in transport with
+`Unavailable`, `Cancelled` or `Unknown` and no refusal) is decided too, with a link to open first
+("Continuing after a lost path" below, ADR-393).
+
+| Error | Primitive | Decision |
+|---|---|---|
+| `NoResponse`, `PrimitiveFailed`, `EventsLost` (the request may have reached the ECU) | safe to repeat, bound not used up | send the same request again after `JobLimits::wait_poll`, with a cancel check, in place: the arrival is not repeated, so no second `Request` record; every attempt after the first of the arrival is logged with `origin: repeat` (design 8.11), also when the first was refused before it was sent |
+| the same | safe to repeat, `JobLimits::max_primitive_repeats` resends used (default 2, three sends) | the run ends in `JobError::Host` |
+| the same | not safe to repeat (unsafe, `CheckState`, uncovered, or covered by a safe and a non-safe section) | the verdict of `classify` on the journal as it now stands: when it refuses a resume, `OnSiteInterventionRequired` with its reason (`RecoveryRequiredSection` from the pass's intent, also for a request after the section; else `UnconfirmedRequest { at }`); when it would not (after a completed flash transfer a resume takes ADR-229's restart), the run ends in `JobError::Host`. The `Request` record stays unconfirmed and the ending is not journaled. Without a journal, which no resume reads, `UnconfirmedRequest { at }` |
+| `LinkHeld`, or a start refused with the reason QUEUE_FULL (nothing was sent) | any, bound not used up | resend as the first row, whatever the idempotency; at the bound the run ends in `JobError::Host` |
+| a lost path with `send_state` `MayHaveReached` (`VciLost { refused_after_loss: false }`, `EventStreamEnded`, `WorkerUnresponsive`, a transport `Rpc`) | safe to repeat, bound not used up | `RepeatDecision::ReopenThenRepeat`: continue on a new link when the conditions below hold, else the run ends in `JobError::Host`; at the bound the run ends in `JobError::Host` |
+| the same | not safe to repeat | the verdict of the third row, with no new link |
+| `VciLost { refused_after_loss: true }` (the worker refused the start on the offline link; nothing was sent) | any, bound not used up | `ReopenThenRepeat` whatever the idempotency |
+| any other error with `send_state` `NotSent` | any | the run ends in `JobError::Host` |
+
+The first arrival's `Request` record is written once. When a run ends with it provably unsent (an
+error whose `send_state` is `NotSent`, with no earlier send of the arrival that may have reached
+the ECU; or a cancel taken after `arrive` committed the record and before the request was sent),
+the runner first commits `RequestNotSent { at }` (`JobJournal::withdraw_request`). It is never
+written when a send may have reached the ECU. The classification of a plain procedure reads it as
+no request ("A plain procedure" below). A cancel held by an uninterruptible or recovery-required
+section stays held through the resends.
+
+## Continuing after a lost path
+
+On `RepeatDecision::ReopenThenRepeat` the runner (`continue_on_new_link`) goes on in the same run,
+on a link opened again, when the checkpoint resume's conditions (ADR-335 item 3) hold at the VM's
+current pc (ADR-393). The program decides first, contacting nothing
+(`restart::continues_after_loss`): (I) the pc is an interruptible point
+(`restart::interruptible_point`), and (S) nothing reachable from it, with the suspended callers
+of the VM's call stack, is a hazard (`restart::continuation_hazard`, the check
+`classify_plain_procedure` makes: a flash plan, a diagnostic primitive in a `RecoveryRequired`
+section, or one not safe to repeat). A request that was never sent is not counted itself; the
+search starts at the instruction after it. If a condition fails, `max_link_reopens` reopens have
+been made already, or the host cannot reopen, the run ends in `JobError::Host`, which a later
+resume handles as before.
+
+The host trait `ProcedurePosition` has the method `reopen_link`, whose default is
+`ReopenAttempt::Cannot` (a test host and the flash tests' host need not implement it).
+`WorkerHost` implements it from a `Relink` the runner gives it: the job's `WorkerSource`, the link
+configuration and the handles of the open link, which the runner's link guard shares. An attempt
+settles a primitive left by the loss, drops the event stream and closes the lost link
+(`link::teardown`, told the path was lost): a close that fails marks the guards (ADR-258, they
+stay marked) and gives `Cannot`, so the run ends in `JobError::Host`. On this path alone a
+successful module disconnect confirms the close even when the link's own disconnect failed, if
+the worker answered that failure (any failure status but a transport one, never read from which
+worker answered) and the client does not hold the module, since disconnecting the module
+releases every link on it (ADR-393). A lost path's close that still fails is made once more,
+and only once: the second close confirms when the link answers that no object has its handle (or
+its disconnect fails with a worker's answer) and the module's disconnect succeeds, since a J2534
+library releases the device on the first close yet may report the loss from it (ADR-393). The
+runner's final close follows the same rule when a step of the run failed on a lost path, whatever ending followed (the host error, on-site intervention), and the link has not opened again since; a link that opened again is healthy, so a later failure to close it stays unconfirmed. The second close is made only when the worker answered every step of the first. The host then takes
+a client from the source (every `WorkerApi` client is a source of itself, giving clones, so the
+entry points `run_program`, `run_program_journaled` and `resume_program_journaled` take either),
+opens the link (`link::open_tracked`) and `WorkerHost::reopen` puts the new link in place of the
+old: the document, artifact, communication log and link identifiers stay, the waits, the
+transfer counter, the runtime input ids and the settling state start over. An open that fails
+and was cleaned up is `NotYet`; one whose cleanup failed marks the guards and is `Cannot`.
+
+The runner repeats the attempt every `JobLimits::reopen_poll` (default 1 s) until
+`JobLimits::vci_return_wait` (default 60 s), counted from the end of the first attempt (which closes the lost link), has passed, taking a cancel before each attempt
+(the run's cancel, which a section that holds the cancel keeps held): `JobError::Cancelled`. Each
+continuation counts one against `JobLimits::max_link_reopens` (default 2) in memory, whether or
+not the VCI came back. A VCI that does not come back ends the run in the original `JobError::Host`.
+With a journal, once the link is open and before any request on it, the continuation is counted as a resume
+under the plain procedure's stage (`count_procedure_resume`, `JobLimits::max_procedure_resumes`:
+at the limit `OnSiteInterventionRequired(ProcedureResumeLimitReached)`), and when the journal
+names a target VIN it is read again through the program's source
+(`restart::check_procedure_identity`, logged as an identification read): another VIN is
+`JobError::IdentityMismatch`, journaled first and terminal (ADR-286), one that cannot be
+established `OnSiteInterventionRequired(ProcedureIdentityNotEstablished)` with the resume counted
+(ADR-290). The per-vehicle lock is not taken (no restart is made). A run without a journal
+(`run_program`) counts nothing and reads no VIN. No new `RunStart` is written, the step budget is
+the run's, no session is entered again (ADR-335 item 8), and the resend counts against
+`max_primitive_repeats` and is logged with `origin: repeat`. The communication log writes
+`vci_connected` for the new link (the run's own loss is settled right after it) and
+`link_opened` again (design 8.11).
+
+### A worker that exited
+
+A lost path may be a worker that crashed, which only the worker's process tells from a lost VCI
+(ADR-394); the repeat decision and the conditions above are the same. `WorkerSource` has three
+methods besides `client`: `status` (`Alive`, `Exited(WorkerExit)` with the process ID and how it
+ended, or `Unknown`, the default of every bare client), `end` (ends a worker that is alive and
+does not answer, reaping it; an error by default) and `pid`. `launch::RelaunchingWorker`
+implements them over the process of `launch_worker`'s worker, kept in a `WorkerSlot`
+(`Arc<Mutex<Option<WorkerProcess>>>`) that `main.rs` stops at the end; it is built from a
+`LaunchRecipe` (the binary, service kind, VCI, mode and the launch and connect options of the
+first launch, which `LaunchedWorker::recipe` returns), so a test can build one for
+`CARGO_BIN_EXE_j2534-0404-service`. `WorkerProcess::try_wait` reaps a child that has exited
+without waiting, and `kill` ends one that does not answer.
+
+An attempt of `reopen_link` asks `status` first (once the worker's end was taken in, it asks
+again only after a client of a new worker was given):
+
+- `Exited`: the log gets `worker_exit` (design 8.11 "Worker events") naming the exchange the
+  host had left running, the stream and the primitive in settlement are dropped, the link counts
+  as closed and the shared handles are emptied, with no close made through the dead worker, and
+  the guards' mark is cleared (`Relink::worker_gone`, ADR-258 item 3: a reaped process holds no
+  link). `client` then starts a new worker from the recipe; the log gets `worker_restart` before
+  the link opens (`vci_connected` and `link_opened`, as after a lost VCI).
+- `Alive` or `Unknown`: the lost link is closed through the worker as above. If the close fails
+  and the process has exited meanwhile it is taken in as `Exited`. If any step of the close got no
+  answer in time (`link::teardown_observed` reports it as `CloseEvidence::hung`, also when an
+  earlier step failed with the worker's own answer, which `teardown` returns as its error) and
+  the process is alive, `end` ends it (`worker_exit` with
+  `killed_by_agent`) and a new worker is started. If `end` fails, or the close failed in any
+  other way, the guards are marked and the attempt is `Cannot`, as before.
+- A start that fails because the system will not create the process is
+  `HostError::WorkerStart { spawn_failed: true }` and gives `Cannot` (the log has the exit and no
+  restart; the run ends in the original host error). Any other failure to start or to connect
+  (`spawn_failed: false`) gives `NotYet`: the poll starts again until `vci_return_wait`.
+- The reopen a start belongs to counts against `JobLimits::max_link_reopens` with the reopens
+  of a lost VCI; several starts within one reopen (tried again at each poll) count once.
+- A close with a step that got no answer from a worker still reported alive asks `status` again every
+  50 ms for up to `Relink::exit_grace` (1 s), since a killed process closes its sockets before
+  it can be reaped; `end` kills a worker still alive after that, waiting at most 5 s for the
+  reap, and reports the worker's own exit when it had exited on its own. The source starts a
+  new worker only after `status` or `end` recorded the exit, never at the run's first client.
+- One start can delay a cancel by up to the launch's startup and connect timeouts.
+
+At the run's end, when the run's path was lost (`path_lost`, whatever ending followed),
+`run_job` asks `WorkerHost::reap_exited_worker` before it settles the stray primitive and closes
+the link: a worker still reported alive is asked about again every 50 ms for up to the exit
+grace (a reopen's own first look does not wait), and one that exited is taken in as above, so the final close through it is not made
+and does not mark the guards. The process stays in the slot, and `main.rs`'s stop finds it gone
+(`Stopped::Exited`). A bare client says `Unknown`, so a run on one behaves as it did before.
 
 ## Restart classification
 
@@ -493,6 +1089,7 @@ started transfer keeps the flash path. `restart::classify_plain_procedure` decid
 | Journal | Decision |
 |---|---|
 | no `Request` was ever recorded, whatever the journal's states | plain start on the same journal, counted (below) |
+| every `Request` is withdrawn (`RecoveryFacts::standing_request` is `None`, ADR-392) | the same plain start: no request ever left. Otherwise the newest request that is not withdrawn is the one judged by the rows below |
 | the last `Request` is not older than the state of the latest checkpoint (the newest record that carries a VM state), or there is no such state | `OnSiteInterventionRequired(UnconfirmedRequest { at })`: the unsafe primitive may have reached the ECU. It holds at every later resume until a person acts |
 | the latest checkpoint's state does not decode, or fails `Vm::check_state` with its step count set to `restart::next_steps` | `OnSiteInterventionRequired(InvalidEntryState)`, before the conditions below read the state |
 | otherwise, from the latest checkpoint's state, one of the conditions below fails | `OnSiteInterventionRequired(NotResumable { cause })` |
@@ -501,7 +1098,7 @@ started transfer keeps the flash path. `restart::classify_plain_procedure` decid
 The comparison of the request is with the state's own step count: a checkpoint or a step state is
 taken after the completed step, so its count is one past its record's, and a run start's is the
 step about to run. A cancel while a request's marker was committed leaves a marker with no later
-state, which reads as unconfirmed too. The conditions of the checkpoint resume are checked in this
+state, which reads as unconfirmed too unless the runner withdrew the marker (ADR-392). The conditions of the checkpoint resume are checked in this
 order, and the first that fails is the cause:
 
 1. the checkpoint's pc is an interruptible point (`restart::interruptible_point`, the rule the
@@ -682,7 +1279,8 @@ gates before and after each read.
    `Passive(ResetOutcomeUnknown)`.
 
 A passive teardown sends nothing further (when it follows a refused or unknown ECUReset, that
-reset was the last request; the agent runs no TesterPresent, so there is none to stop) and
+reset was the last request; the teardown's link is new, so no session control has started the
+worker's tester present on it and there is none to stop) and
 waits the flash session's `session_timeout_millis + teardown_margin_millis`, in steps of the
 job's `wait_poll`; a cancel during the wait ends the job in `JobError::Cancelled`.
 
@@ -837,6 +1435,11 @@ stopped. In test builds `OnSiteReason::StoppedBeforeErase` reports a restart tha
 stopped before the erase, with the teardown's outcome, the confirmation and the state check; a
 job never ends in it.
 
+A worker killed during a run is started again by the run, tested end to end in
+`j2534-0404-service` (`tests/agent_worker_crash.rs`, ADR-394): a `Safe` read finishes on a new
+worker, with `worker_exit`, `worker_restart` and the new connection in the communication log and
+the guards unmarked; an `Unsafe` one ends on site with the dead worker reaped at the run's end.
+
 The restart order is tested end to end against `sim-ecu` in `j2534-0404-service`
 (`tests/agent_restart_end_to_end.rs`): the agent runs as a child process that is killed after a
 block of the transfer was journaled, and `resume_program_journaled` resumes the job from the same
@@ -847,8 +1450,9 @@ and the next run resumes on those guards with a new worker and takes the same re
 more interrupt the run at the same point without killing anything: the ECU loses power
 (`sim_ecu::Fault::PowerLoss`) or the VCI is unplugged (`disconnect_vci`, ADR-238). The next
 block's transfer gets no answer, or finds the link offline because the worker met the lost device,
-and the run ends there, keeping its guards and its journal; after the disconnect the guards' link is
-unconfirmed as after a worker crash. The next run, once power is back or on a new worker that finds
+and the run ends there, keeping its guards and its journal; after the disconnect the run's close of
+its lost link is confirmed by the module disconnect, retried once (ADR-393), so the guards are given
+back unmarked. The next run, once power is back or on a new worker that finds
 the VCI plugged in again, takes the same restart order and completes. When the VCI is still
 unplugged at the next run, its worker cannot open the device (`ERR_DEVICE_NOT_CONNECTED`), so the
 run ends in `JobError::Link` before its link opens: nothing is sent, no resume is counted, the
@@ -930,7 +1534,8 @@ process dies, so a crashed run never blocks the next one, and the files are neve
   reads on other VCIs go on while a job reprograms. `JobGuards::holds_slot` tells the two
   apart.
 - `JobGuards::take_vehicle(vin, poll, cancelled)` takes the per-vehicle lock, on guards with or
-  without the slot, for a well-formed VIN only (`GuardError::InvalidVin`). The file is one of
+  without the slot, for a well-formed VIN only (`GuardError::InvalidVin`). The restart and an identification job that
+  established a VIN (ADR-399) take it so, through `runner::promote_to_vehicle`. The file is one of
   4096 buckets: `k` is the first two bytes of SHA-256 over the VIN, read big-endian, masked to
   their low 12 bits (a digest starting `84 b1` gives `vehicle-4b1.lock`). Before it opens its
   bucket, the call lists the lock directory and, when fewer than 4096 bucket files are present,
@@ -1007,7 +1612,8 @@ check as well.
   The worker interface has no defined source for external supply, ignition, engine running or
   vehicle speed: raw pin voltages and analog inputs carry no agreed meaning for them, and
   `sim-vci` simulates only the battery voltage (ADR-238). So they read "cannot be established". `FixedInputs` holds fixed readings for tests.
-- Service fields: `ServiceSources` is a table from `(service_id, field_id)` to the request
+- Service fields: `ServiceSources` is a table from `(service_id, field_id)` (every source is on
+  the primary target, and a source off it is refused before it is sent, ADR-410) to the request
   (SID first), the offset after the response SID, the length and the encoding (unsigned
   big-endian integer, or printable ASCII). A job with a document gets its table from the
   document (`ServiceSources::from_document`, ADR-345): one entry per distinct
@@ -1043,10 +1649,207 @@ stays at the instruction, and the job can be resumed on a VCI that can read the 
 a host error of the job in the same way. The
 restart's own checks read the same sources and still treat any non-integer reading as not met.
 
+## The identification plan
+
+The `identification` module (design 8.8.2, ADR-327, ADR-395) loads and checks the plan of an
+identification job, derives its endpoints, sends its functional presence requests, reads the VIN
+and reads the ECU definitions (`run_identification`, ADR-396, ADR-399, ADR-401). `ngr-agent identify` runs it; the server does not yet.
+
+- `load_plan(plan_bytes, supplied)` decodes the plan (`diag_ir::plan::IdentificationPlan`, a
+  postcard struct with its own schema version; a chosen-definition plan holds one candidate and
+  an every-ECU plan none) and takes the documents it names from `supplied`,
+  each given with the hash it is named by. A missing document, a document whose bytes hash to
+  something else and a document that does not load refuse the plan.
+- `check_plan` refuses a plan that names, in a variant pattern or a rule source, a service that
+  is not declared or not in the read-only set of the variant's layer (a variant with no protocol
+  or layer judges nothing read-only), or a field the response lacks; a VIN rule's source that is
+  not a 17-byte ASCII field ending a single-identifier read, as the ADR-345 table reads it
+  (`PlanRefused::VinSource`, through `inputs::vin_source_field`, which
+  `ServiceSources::from_document` uses for the VIN role too); one resource at two baud
+  rates; a functional identifier wider than 11 bits or equal to a physical identifier of the bus;
+  and declared links of one presence group (bus and functional identifier) that differ in a
+  ComParam other than the listed timings (ADR-395 item 6), which are not compared; and a pattern
+  service whose identification request cannot be built without values
+  (`PlanRefused::IdentificationRequest`, through `diag_ir::identify::identification_requests`); and
+  a field rule's source the job cannot judge (`PlanRefused::FieldSource`, ADR-403): its request
+  needs values (`identification_request_of`), its field is one a variant pattern could not
+  compare (`ExpectedKind::of_field`, ADR-306 item 5), its `expected` could never match
+  (`ExpectedKind::never_matches`: empty, over eight bytes for an integer, a number outside what
+  the field's fixed width holds, longer than a fixed-length bytes or text field can be, text that
+  is not UTF-8), or the sources of one component on one request cannot decode to one value
+  (different kinds, a text and bytes, or one data kind at two fixed lengths). `diag_ir::plan::validate` (so `load_plan`) also refuses a field rule whose source is a
+  document of a definition no entry of its candidate lists.
+  A declared link that ADR-324 refuses is reported, not
+  refused. `load_plan` also refuses the structural errors listed in ADR-395 item 3.
+- `CheckedPlan::report` derives the `IdentificationReport`: the plan's selection (candidates, a definition chosen by
+  hand, or every ECU; only the first narrows), the candidate ids, the remaining candidates (all of
+  them, no drop and an empty read order until the ECU phase has run), one entry per
+  endpoint (bus, request and response identifier) with the documents on it, the presence groups
+  (bus and functional identifier) with the group's largest value of each listed timing (P2 among them), the buses that have no group, the
+  documents whose link is refused, an empty presence section, and the VIN reads with every source
+  `NotRead` (`LinkRefused` for a source whose document's link ADR-324 refuses) and every VIN rule
+  unevaluated, the ECU reads with every declaration `NotRead` (`LinkRefused` for a refused
+  document) and every entry `NotRead`; the rule fields with every source `NotRead` (`LinkRefused`
+  for a refused document), no value established and every rule `Unevaluated`, and no component
+  value.
+- `run_identification(source, plan, limits, guards, comm_log, vci, cancel)` sends one functional
+  presence request (`3E 00`) per presence group, one link at a time, under the per-VCI lock
+  (`JobGuards::take_vci_only`), and fills the report's presence section: the answers as bus,
+  response identifier and bytes (an answer on a pair marks every endpoint with it,
+  `IdentificationReport::answered`; presence drops nothing), the number of presence links opened,
+  the refused tables and `presence_interrupted`. Then it reads the VIN (below). The report
+  serializes to JSON.
+  - The link is functional (`LinkConfig::functional`): `CP_RequestAddrMode` 2, `CP_CanFuncReqId`,
+    one unique-response entry per pair of a receive table of every declared pair on the bus, and
+    a send-receive ceiling of one `CP_P2Max` window per pair. The host's `presence` collects
+    every result within the window (`num_receive_cycles` -2) and is the only path that sends
+    TesterPresent (`policy::check_presence_request`, exactly `3E 00`).
+  - A table the worker answered with a refusal at `SetUniqueRespIdTable` or
+    `ConnectComLogicalLink` is halved in declaration order, each half with a link and a request
+    of its own; a single pair still refused fails the job. A timeout or a lost path is never a
+    refusal.
+  - A lost VCI (also while the link opens), a worker that exited or an event stream that failed
+    reopens the link within the run's bounds (`JobLimits::reopen_poll`, `vci_return_wait`,
+    `max_link_reopens`) and sends the request again within `max_primitive_repeats`, logged with
+    the origin `repeat`; lost events send it again on the same link. The answers heard before
+    count, and bounds that run out set `presence_interrupted`. A worker that exited between two
+    links is logged (`worker_exit`, `worker_restart`) and the next link opens on a new one
+    (ADR-394), as is one found exited after a link failed to open and to close again. Before each link opens the run checks for a cancel and for guards marked by a
+    link that did not close (ADR-258); a table refusal whose link did not close is not halved.
+  - Only response identifiers of the link's receive table mark presence; the exchange entry
+    lists every result.
+  - The VIN phase (ADR-399) runs after the last presence link is closed, unless the presence
+    phase was interrupted (then `vin_interrupted` is set when some read would have opened a link,
+    every source stays `NotRead` and a source whose link is refused stays `LinkRefused`),
+    and only when a candidate (a definition chosen by hand is the only one) declares a VIN rule.
+    The sources group into reads: one endpoint, equal ComParams other than the timings
+    (`raise_timings` gives the read's link the largest timings of its sources' links) and one
+    request, in the order the plan first names them. A read opens its link (`open_part`, the
+    open, settle and reopen step the presence parts use), sends the request once with the origin
+    `identification` and again within `max_primitive_repeats` with the origin `repeat`
+    (`repeat_within_bounds`, the loop the presence part uses; a receive error sends it again, and
+    the reopens count over the whole run), decodes the one response with every declaration of
+    the read (`inputs::field_bytes_of`, noted as the log's `identity` events) and closes the
+    link. Each source is `Decoded`, `NotWellFormed`, `Undecodable`, `Negative` (not sent again),
+    `NoUsableAnswer` (none, the link's error event for the request, a receive error or lost events,
+    after the repeats), `LinkRefused` (the document's declared link ADR-324 refuses, known before
+    any link opens), `WorkerRefused` (the worker refused the link when the read was made, a
+    refused connect or another failure to open that left nothing open; the other reads decide)
+    or `NotRead`.
+  - A read is accepted when every declaration gives one well-formed VIN. `vin` is set when a
+    read was accepted, every accepted read gave the same VIN (`vins_seen` lists each distinct
+    one) and the phase was not interrupted; bounds that run out in a read leave it and the later
+    reads `NotRead` and set `vin_interrupted`, with no VIN and no lock. `vin_reads` holds each
+    read (endpoint, request in hex, the sources' outcomes, the accepted VIN) and `vin_rules` each
+    candidate's VIN rule as `Matched`, `NotMatched` or `Unevaluated`; the ECU phase's first
+    `narrow` drops a candidate of a plan that narrows per component (ADR-402).
+  - An established VIN takes the per-vehicle lock on the job's guards (`promote_to_vehicle`,
+    `JobGuards::take_vehicle`, which allows guards without the slot) once no link is open,
+    waiting for a job that holds the vehicle until it lets go or the cancel, which ends the run
+    in `JobError::Cancelled`; `vehicle_lock_held` says it is held, and the caller's guards
+    release it. Before the promotion the run settles the worker as every open does
+    (`settle_before_open`): a worker that exited during the last close is found and the guards'
+    mark cleared; guards still marked take no lock, and the report comes back with the VIN and
+    `vehicle_lock_held` false (ADR-258) when no ECU read remains to open, else the run ends in
+    `JobError::LinkUnconfirmed` as the first ECU link would open (ADR-401). The VIN is in the report and the communication log only, never in the
+    operational log. `IdentificationReport` holds the VINs as `journal::Vin`, whose `Debug`
+    hides them.
+  - The ECU phase (ADR-401) runs after the promotion, with the vehicle's lock held when a VIN
+    was established, unless the presence or VIN phase was interrupted (then
+    `ecu_reads_interrupted` is set when some read would have opened a link and every declaration
+    stays `NotRead`). `check_plan` derives the reads before any link opens: one `EcuReadPlan` per
+    definition and endpoint, in plan order (the order they stay in the report, `ecu_reads`), whose variants are grouped by the ComParams other
+    than the timings into `LinkGroup`s (`raise_timings` gives the group's link the largest
+    timings), each holding its distinct identification requests
+    (`diag_ir::identify::identification_requests`) with the (document, service) declarations that
+    share the bytes (each flagged `pattern` when a variant pattern names it; `group_rule_fields` adds
+    a field rule's source as a declaration with `pattern` false when no pattern names its
+    service, so its request is sent with the group's and opens nothing of its own). The documents whose link ADR-324 refuses form a read with `endpoint` null and
+    a group with no link, and make their definition inconclusive at every endpoint. A group
+    opens its link (`open_part`), sends each request once with the origin `identification`
+    (`repeat_within_bounds`, as the VIN read does), decodes the one response with every
+    declaration (`inputs::negative_code`, then `diag_ir::identify::decode_identification_answer`),
+    closes the link, and each variant is judged with `diag_ir::decode::variant_matches`, so every
+    match is reported. A declaration is `Decoded` (the fields), `Undecodable`, `Negative` (not
+    sent again), `NoUsableAnswer`, `LinkRefused`, `WorkerRefused`, `NotRead` or `NotInPlay` (no
+    remaining candidate named the definition when the phase ended, so it was not read); bounds that run
+    out leave the read and the rest `NotRead` and set `ecu_reads_interrupted`. A read is
+    `conclusive` when it has a pattern declaration, all pattern declarations `Decoded`, and its
+    definition has no refused variant (no negative response is definitive yet; a rule-only
+    declaration counts for nothing, a definition with no pattern a field rule names is read and
+    never conclusive), and `answered` when any declaration got a response. `evaluate_entries` then sets each entry's state from the reads of its alternatives
+    (every entry stays `NotRead` when the phase was interrupted, and an entry with an
+    alternative that had no physical read, all `NotRead` or `WorkerRefused`, is `NotRead`, an
+    alternative with no pattern declaration is left out, and an entry with none left is `NotRead`; a
+    refused-link alternative is an inconclusive read):
+    `Identified` (one alternative with a matching variant), `Ambiguous` (two or more),
+    `UnrecognizedVariant` (the answered endpoints, every read there conclusive),
+    `AnsweredNotIdentified` (an answered endpoint with an inconclusive read), `NotAnswering` or
+    `NotFitted` (requests sent, nothing answered) or `NotRead` (none sent). The JSON uses serde's
+    default names; field values are the agent's `FieldValue`, with bytes and hashes as lowercase
+    hex.
+  - The rule fields (ADR-403). `group_rule_fields` gives each field rule's source a place in the
+    read of its document's definition: one `RuleFieldPlan` per definition, endpoint, link group,
+    request and component, holding the deduplicated sources. After the groups of a read are
+    judged, `evaluate_rule_fields` gives each source an outcome from its declaration
+    (`RuleSourceOutcome`: `Decoded` with the field's value, `Undecodable`, `Negative`,
+    `NoUsableAnswer`, `LinkRefused`, `WorkerRefused`, `NotRead`, `NotInPlay`), establishes the
+    component's value when every source decoded and all gave one value, and sets each rule on
+    the field `Matched` or `NotMatched` by `diag_ir::decode::expected_matches` (ADR-306), else
+    `Unevaluated`. `contradictions` drops a candidate with rules on an established field none of
+    which matched (`Contradiction::FieldRules`, naming the field); `outcome_sets` adds, per rule
+    field of the definition at an endpoint, one list of alternatives from `rule_classes` (a class
+    per distinct value the remaining candidates' rules expect, built by `expected_value`, and the
+    value no rule matches), so an unevaluated field is not an outcome at any endpoint.
+    `mark_unread` sets `NotInPlay` on the sources of definitions not in play. The report's
+    `rule_fields` is in plan order; `component_values` lists the distinct values the matched VIN
+    rules and field rules give, VIN rules first:
+
+    ```json
+    "rule_fields": [{ "definition": "D2", "endpoint": { "bus": {}, "tx_id": 2017, "rx_id": 2025 },
+      "group": 0, "request": "22f189", "component": "ModelYear",
+      "sources": [{ "document": "<hex>", "service": 2, "field": 1,
+                    "outcome": { "Decoded": { "Text": "SW123" } } }],
+      "established": { "Text": "SW123" },
+      "rules": [{ "candidate": "c1", "value": "2021", "document": "<hex>", "service": 2,
+                  "field": 1, "expected": "535731", "outcome": "Matched" }] }],
+    "component_values": [{ "component": "ModelYear", "value": "2021" }]
+    ```
+
+    `group` is the link group's index within the read (two groups can read one request), and the
+    `FieldRules` contradiction carries it too. `component_values` holds the values of the rules of
+    the candidates that remain. `endpoint` is null for a refused link, `established` null when a source failed or the values
+    differ, and each declaration in `ecu_reads` carries `pattern`.
+  - The loop of the ECU phase (ADR-402; `ecu_phase`) is: `narrow` recomputes the remaining
+    candidates from the facts (`facts_of`: a read with a match identifies its definition at its
+    endpoint, a conclusive one without a match rules it out) and the VIN rules, with the one
+    function `contradictions`; `next_definition` picks among the definitions in play and not yet
+    tried (`in_play`: every definition of a plan that does not narrow, else one a remaining
+    candidate lists) the one with the smallest worst case over its conclusive outcomes
+    (`outcome_sets`), then the most candidates naming it, then the most endpoints that answered
+    presence, then the lowest identifier; `read_definition_at` reads the definition's planned
+    reads (the former loop body, the only caller of `ecu_read_group`); the loop ends when nothing
+    in play is untried. `mark_unread` then sets `NotInPlay` on the declarations of the definitions
+    no remaining candidate names. Only a plan of candidates drops; the report's `remaining`,
+    `dropped` (each with its `Contradiction`, `UnlistedDefinition` with the identified definition,
+    the endpoint and the definitions ruled out there, or `VinRules` with the component, and
+    `after`, the definition whose read completed it, null for the VIN) and `read_order` (each
+    definition with its `worst_case`) are the result. The worst case is the remaining count for
+    every definition without a rule field that can be conclusive at every endpoint (one with a
+    refused variant can score lower). An interruption narrows once more, from the
+    matches of the part read, before it ends the phase. An interrupted phase keeps `remaining` and
+    `dropped` and leaves every entry `NotRead`; the entries of dropped candidates are judged from
+    the same reads.
+
+The bus is the link's protocol short name and bus type with its baud rate (ADR-319); two
+spellings of UDS on CAN that ADR-324 item 2 accepts are one bus.
+
 ## The worker client
 
 The runner, the host and the link set-up call the worker through the trait `agent::client::WorkerApi`
-(ADR-334): one method per RPC they use, with the generated gRPC client's signatures, and
+(ADR-334): one method per RPC they use (`CancelComPrimitive` among them, which the host sends
+for a primitive it stopped waiting for, and `GetTimestamp`, its reading of the VCI's clock at
+its deadline), with the generated gRPC client's signatures, and
 `held_module()`. `ngr-agent` uses `worker_host::client::WorkerClient`, which implements the trait by
 delegating, so a production call is unchanged. A client that holds the worker's module itself
 (`held_module()` is `Some`) is used by the hardware harness's guarded client

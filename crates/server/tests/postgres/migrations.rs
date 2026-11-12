@@ -1,0 +1,263 @@
+//! `Server::start` against a throwaway PostgreSQL: the embedded migrations are applied before the
+//! listener binds, a second start is a no-op, a changed or unknown migration refuses the start
+//! without hanging, and two servers starting at once both succeed (ADR-458).
+
+use std::time::Duration;
+
+use server::config::{Config, Database, Http, Profile};
+use server::db::{self, DbError};
+use server::{Server, StartError};
+use sqlx::migrate::{Migration, MigrationType, Migrator};
+
+use crate::support::{TestPostgres, free_port};
+
+/// Longer than any start below should take; a hang fails the test instead of the run.
+const LIMIT: Duration = Duration::from_secs(30);
+
+fn config(pg: &TestPostgres) -> Config {
+    let mut database = Database::new(pg.url());
+    database.connect_timeout_secs = 5;
+    Config {
+        profile: Profile::Local,
+        http: Http {
+            port: 0,
+            shutdown_grace_secs: 2,
+        },
+        database,
+    }
+}
+
+async fn start(pg: &TestPostgres) -> Result<Server, StartError> {
+    tokio::time::timeout(LIMIT, Server::start(&config(pg)))
+        .await
+        .expect("Server::start must not hang")
+}
+
+/// Ends a server and closes its pool.
+async fn stop(server: Server) {
+    server.run(async {}, std::future::pending()).await.unwrap();
+}
+
+fn migration_error(result: Result<Server, StartError>) -> sqlx::migrate::MigrateError {
+    match result {
+        Err(StartError::Database(DbError::Migrate(error))) => error,
+        Err(other) => panic!("a migration error was expected, not {other}"),
+        Ok(_) => panic!("the start must be refused"),
+    }
+}
+
+#[tokio::test]
+async fn migrations_apply_to_an_empty_database_and_a_second_start_is_a_no_op() {
+    let pg = TestPostgres::start();
+    let embedded = db::MIGRATOR.iter().count();
+    assert_eq!(
+        pg.scalar("SELECT to_regclass('_sqlx_migrations')").await,
+        "",
+        "the cluster starts empty"
+    );
+
+    stop(start(&pg).await.unwrap()).await;
+    let rows = "SELECT count(*) FROM _sqlx_migrations WHERE success";
+    assert_eq!(pg.scalar(rows).await, embedded.to_string());
+    // A table of the first migration exists.
+    assert_eq!(pg.scalar("SELECT to_regclass('jobs')").await, "jobs");
+    let applied = "SELECT string_agg(installed_on::text, ',' ORDER BY version) \
+                   FROM _sqlx_migrations";
+    let first = pg.scalar(applied).await;
+
+    stop(start(&pg).await.unwrap()).await;
+    assert_eq!(pg.scalar(rows).await, embedded.to_string());
+    assert_eq!(
+        pg.scalar(applied).await,
+        first,
+        "a second start changes nothing"
+    );
+}
+
+#[tokio::test]
+async fn an_applied_migration_that_has_changed_refuses_the_start() {
+    let pg = TestPostgres::start();
+    stop(start(&pg).await.unwrap()).await;
+    pg.execute("UPDATE _sqlx_migrations SET checksum = decode('00', 'hex') WHERE version = 1")
+        .await;
+    let error = migration_error(start(&pg).await);
+    assert!(
+        matches!(error, sqlx::migrate::MigrateError::VersionMismatch(1)),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn a_database_with_a_migration_the_binary_lacks_refuses_the_start() {
+    let pg = TestPostgres::start();
+    stop(start(&pg).await.unwrap()).await;
+    pg.execute(
+        "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
+         VALUES (9999, 'from a newer binary', true, decode('00', 'hex'), 0)",
+    )
+    .await;
+    let error = migration_error(start(&pg).await);
+    assert!(
+        matches!(error, sqlx::migrate::MigrateError::VersionMissing(9999)),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn a_migration_that_was_left_half_applied_refuses_the_start() {
+    let pg = TestPostgres::start();
+    stop(start(&pg).await.unwrap()).await;
+    pg.execute("UPDATE _sqlx_migrations SET success = false WHERE version = 2")
+        .await;
+    let error = migration_error(start(&pg).await);
+    assert!(
+        matches!(error, sqlx::migrate::MigrateError::Dirty(2)),
+        "{error}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_servers_starting_together_against_an_empty_database_both_succeed() {
+    let pg = TestPostgres::start();
+    let config = config(&pg);
+    let spawn = || {
+        let config = config.clone();
+        tokio::spawn(async move { Server::start(&config).await })
+    };
+    let (a, b) = (spawn(), spawn());
+    let (a, b) = tokio::time::timeout(LIMIT, async { (a.await.unwrap(), b.await.unwrap()) })
+        .await
+        .expect("both starts finish");
+    let (a, b) = (a.expect("the first start"), b.expect("the second start"));
+    let rows = "SELECT count(*) FROM _sqlx_migrations WHERE success";
+    assert_eq!(
+        pg.scalar(rows).await,
+        db::MIGRATOR.iter().count().to_string()
+    );
+    stop(a).await;
+    stop(b).await;
+}
+
+#[tokio::test]
+async fn a_start_against_a_database_that_is_down_fails_within_the_connect_timeout() {
+    let mut database = Database::new(format!(
+        "postgres://ngr:pw@127.0.0.1:{}/nekoguruma",
+        free_port()
+    ));
+    database.connect_timeout_secs = 1;
+    let config = Config {
+        profile: Profile::Local,
+        http: Http {
+            port: 0,
+            shutdown_grace_secs: 2,
+        },
+        database,
+    };
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(LIMIT, Server::start(&config))
+        .await
+        .expect("Server::start must not hang");
+    assert!(
+        matches!(result, Err(StartError::Database(DbError::Connect { .. }))),
+        "the start must fail on the connection"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+fn migrator(sql: &'static str) -> Migrator {
+    let migration = Migration::new(
+        1,
+        "test".into(),
+        MigrationType::Simple,
+        sqlx::SqlStr::from_static(sql),
+        false,
+    );
+    Migrator::with_migrations(vec![migration])
+}
+
+#[tokio::test]
+async fn a_migration_that_runs_too_long_is_stopped_by_the_server_and_frees_the_lock() {
+    let pg = TestPostgres::start();
+    let pool = pg.pool();
+    let started = std::time::Instant::now();
+    let result = db::migrate_with(
+        &pool,
+        &migrator("SELECT pg_sleep(60)"),
+        Duration::from_secs(1),
+    )
+    .await;
+    // PostgreSQL ends the statement at the limit, ahead of the client's own margin.
+    assert!(matches!(result, Err(DbError::Migrate(_))), "{result:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "{:?}",
+        started.elapsed()
+    );
+    db::close(&pool).await;
+
+    // The lock is gone: another start (a new pool, as after a restart) goes through at once.
+    let next = pg.pool();
+    let started = std::time::Instant::now();
+    db::migrate_with(
+        &next,
+        &migrator("CREATE TABLE after_timeout (id int)"),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("the lock was released");
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        pg.scalar("SELECT to_regclass('after_timeout')").await,
+        "after_timeout"
+    );
+    db::close(&next).await;
+}
+
+#[tokio::test]
+async fn a_migration_whose_sql_fails_is_rolled_back_and_a_fixed_one_applies() {
+    let pg = TestPostgres::start();
+    let pool = pg.pool();
+    let broken = migrator("CREATE TABLE half_done (id int); SELECT 1 / 0;");
+    let result = db::migrate_with(&pool, &broken, Duration::from_secs(5)).await;
+    assert!(
+        matches!(
+            result,
+            Err(DbError::Migrate(
+                sqlx::migrate::MigrateError::ExecuteMigration(_, 1)
+            ))
+        ),
+        "{result:?}"
+    );
+    db::close(&pool).await;
+    assert_eq!(
+        pg.scalar("SELECT to_regclass('half_done')").await,
+        "",
+        "rolled back"
+    );
+    assert_eq!(
+        pg.scalar("SELECT count(*) FROM _sqlx_migrations").await,
+        "0"
+    );
+
+    let pool = pg.pool();
+    db::migrate_with(
+        &pool,
+        &migrator("CREATE TABLE half_done (id int)"),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("the corrected migration applies");
+    assert_eq!(
+        pg.scalar("SELECT to_regclass('half_done')").await,
+        "half_done"
+    );
+    db::close(&pool).await;
+}

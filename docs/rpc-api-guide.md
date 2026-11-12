@@ -46,7 +46,7 @@ SystemHandle          (implicit — no ID)
 |-----|---------|----------|-------------|
 | `GetModuleIds` | `GetModuleIdsRequest` | `ModuleIdsResponse` | List all available VCI modules with their handles and status |
 | `ModuleConnect` | `ModuleConnectRequest` | `Response` | Activate a module (required before any link operations) |
-| `ModuleDisconnect` | `ModuleDisconnectRequest` | `Response` | Deactivate a module; optionally force-clean all its CLLs |
+| `ModuleDisconnect` | `ModuleDisconnectRequest` | `Response` | Deactivate a module; optionally force-clean all its CLLs. The J2534 worker keeps its device open when the library's close fails (other than by reporting the device gone), returns the error and sends no `ModuleListChg`; calling `ModuleDisconnect` again closes it (ADR-422) |
 
 **Typical sequence:**
 
@@ -64,8 +64,8 @@ GetModuleIds → (pick a ModuleHandle with PDU_MODST_AVAIL) → ModuleConnect
 
 | RPC | Request | Response | Description |
 |-----|---------|----------|-------------|
-| `GetVersion` | `GetVersionRequest` | `VersionResponse` | Read firmware/hardware/API version strings from the module |
-| `GetTimestamp` | `GetTimestampRequest` | `TimestampResponse` | Read the module's clock (microseconds, `UNUM32`, wraps at 2^32) |
+| `GetVersion` | `GetVersionRequest` | `VersionResponse` | Read firmware/hardware/API version strings from the module. `hw_serial_number` is 0 when the worker has no serial number to give (the J2534 worker never has one); the agent's communication log reads 0 as none (ADR-373) |
+| `GetTimestamp` | `GetTimestampRequest` | `TimestampResponse` | Read the module's clock (microseconds, `UNUM32`, wraps at 2^32), with the clock the reading is on (`timestamp_clock`) |
 
 **Clock source differs by service:** `iso22900-service` passes the vendor DLL's native `PDUGetTimestamp` hardware clock straight through. `j2534-0404-service` has no equivalent J2534 v04.04 IOCTL to read, so it synthesizes a monotonic microsecond clock (`events::module_timestamp_us()`, shared with its `GetStatus`/error-event timestamps — see ADR-120), zeroed at process start and rebased to (approximately) zero again on `PDU_IOCTL_RESET` (`events::reset_module_clock()`, ADR-120 amendment). Both satisfy ISO 22900-2 §9.1.6.1's unit and boot/reset-relative semantics, but the two services never share the same clock values.
 
@@ -112,7 +112,7 @@ A ComLogicalLink (CLL) represents one logical view of a physical bus channel. Mu
 
 | RPC | Request | Response | Description |
 |-----|---------|----------|-------------|
-| `CreateComLogicalLink` | `CreateComLogicalLinkRequest` | `ComLogicalLinkResponse` | Create a CLL handle for a protocol/resource combination |
+| `CreateComLogicalLink` | `CreateComLogicalLinkRequest` | `ComLogicalLinkResponse` | Create a CLL handle for a protocol/resource combination; the response also says whether the link forwards every response pending (`pending_forwarding`, below) |
 | `ConnectComLogicalLink` | `ConnectComLogicalLinkRequest` | `Response` | Open the underlying physical channel (PassThruConnect) |
 | `DisconnectComLogicalLink` | `DisconnectComLogicalLinkRequest` | `Response` | Close the physical channel (stops communication) |
 | `DestroyComLogicalLink` | `DestroyComLogicalLinkRequest` | `Response` | Release the CLL handle |
@@ -127,6 +127,20 @@ known to the client before any action that could produce a CLL-scoped event
 correlation is sufficient here and no tag is needed. Contrast with
 `cop_tag` below, which exists precisely because the equivalent handle-based
 argument does *not* hold for `StartComPrimitive`.
+
+**Whether the link forwards every pending (ADR-355):** `ComLogicalLinkResponse.pending_forwarding`
+says whether the worker passes on every response pending (0x78) the link sees, bound to its
+primitive:
+
+| Value | Worker | Meaning |
+|---|---|---|
+| `PENDING_FORWARDING_ALL` | `j2534-0404-service` | The service runs the response-pending handling itself and passes each pending on |
+| `PENDING_FORWARDING_NOT_ALL` | `iso22900-service` | The D-PDU library handles a pending itself (`CP_RC78Handling`) and need not deliver it |
+| `PENDING_FORWARDING_UNSPECIFIED` | a worker built before the field | The worker does not say; a client treats a pending as possibly absorbed |
+
+A client takes the value from this field alone, not from which worker it talks to (design
+principle 6). The agent's communication log records it as `link_opened`'s `forwards_pendings`
+and uses it for `pending_visibility` (design 8.11).
 
 **CLL state machine:**
 
@@ -972,6 +986,22 @@ or as an async `PduErrEvtTesterPresentError` from a `COPT_UPDATEPARAM` re-arm
 (the same dual sync/async pattern this function already uses for
 `CP_TesterPresentSendType`/`CP_TesterPresentTime` validation).
 
+**Tester-present answers and serialization (ADR-419).** A tester-present send
+made with `CP_TesterPresentReqRsp` 1 is outstanding until its final answer
+(the expected positive or negative response, a pending response reloading the
+window) or the end of its `CP_P2Max` window; a functional one stays outstanding
+to the window's end. While it is outstanding, a request that ISO 22900-2:2022
+8.1.3 Table 1 makes wait for it (a physical request of any kind, and a
+functional one that expects a response) waits before it writes: `COPT_SENDRECV`,
+`COPT_STARTCOMM`, `COPT_STOPCOMM` and the K-line init exchange, on any link of
+the same shared channel. A functional request without a response does not wait
+for a physical tester-present. In the other direction, a physical
+tester-present that falls due while a request waits for its response is sent
+after the request's final response. A send whose final answer is negative, or
+that ends without an answer, raises `PduErrEvtTesterPresentError` on its link
+(once per such send, sending continues) while the link's tester-present is
+armed; a positive answer raises none.
+
 **Fast-init client contract (ADR-075).** For a K-line (ISO9141/ISO14230)
 `COPT_STARTCOMM` whose bound `CP_InitializationSettings` selects fast-init
 (`= 2`, or the legacy multi-byte-`init_data` heuristic when the ComParam is
@@ -1174,7 +1204,12 @@ window and ends in `PDU_ERR_EVT_RX_TIMEOUT` instead (ADR-058).
 frame is attributed to at most one outstanding ComPrimitive, per ISO
 22900-2 §9.2.6.3.4's ordered scan: (1) indication frames (SOM/TxDone/
 loopback/RxBreak) bypass attribution entirely and are handled separately
-(see `RxStatus / RxFlag` in the glossary); (2) active Send/Receive COPs with
+(see `RxStatus / RxFlag` in the glossary), delivered with no `cop_handle`;
+on a CAN CLL with a UniqueRespIdTable a TxDone or loopback echo, which
+carries the request's CAN ID, reaches the CLL whose normally addressed
+entry names that `CP_CanPhysReqId` (ADR-352), and a TxDone or loopback echo of
+a functional request reaches the CLL waiting on that request's receive phase
+(ADR-421); (2) active Send/Receive COPs with
 a non-vacuous (specifically-expected) `expected_response_array`; (3) the
 service's own tester-present reply/SOM-herald/TX-echo signature, when
 `CP_TesterPresentReqRsp = 1` — a match here is discarded, per spec, and
@@ -1233,6 +1268,13 @@ the same override reason as their named-bit counterparts above, and
 `SUPPRESS_POS_RESP`/`ENABLE_EXTRA_INFO` (D.2.1 byte 0) have no J2534
 `TxFlags` equivalent (ADR-116).
 
+`iso22900-service` always sets `ENABLE_EXTRA_INFO` on a `StartComPrimitive`,
+whichever representation (or none) the client sends, keeps every other bit,
+and passes at least four flag bytes (zero-padded; a longer raw flag keeps its
+length). A client therefore need not request it; the library then gives each
+result item `extra_info` bytes, which the agent reads as the identifier the
+answer came on (ADR-428).
+
 ---
 
 ### Status and Events
@@ -1256,11 +1298,15 @@ the same override reason as their named-bit counterparts above, and
 
 **`PDU_IOCTL_SET_EVENT_QUEUE_PROPERTIES` is pre-Connect-only (ADR-126):** per ISO 22900-2 §9.5.16, it can only be called before `ConnectComLogicalLink`; calling it on a connected CLL is rejected with `PDU_ERR_CLL_CONNECTED` (`Code::FailedPrecondition`) and applies no change. A client must `DisconnectComLogicalLink` before reconfiguring an already-connected CLL's event queue.
 
+**`EventItem.timestamp_clock` (ADR-353):** the clock `timestamp` is on, and with it `result_data`'s `tx_msg_done_timestamp` and `start_msg_timestamp`, so a client can tell which times it may compare (design 8.11 "On one clock") without knowing which worker gave them. `TIMESTAMP_CLOCK_DEVICE` is the VCI's own clock as the library reports it, the time base of the item's module (two modules' `DEVICE` times are not comparable); `TIMESTAMP_CLOCK_WORKER` is the worker's synthetic clock (`module_timestamp_us()`, ADR-120), for an item the library gives no time for; `TIMESTAMP_CLOCK_UNSPECIFIED` (0, and what a worker built before the field sends) means the worker does not say. `iso22900-service` gives `DEVICE` on every item of a module, since the library times them all on that module's one time base (ISO 22900-2:2022 8.1.6.1), and `UNSPECIFIED` on a system-level item, which belongs to no module. `j2534-0404-service` gives `DEVICE` on a frame it read (`PASSTHRU_MSG.Timestamp`, a reassembled or concatenated message included), and `WORKER` on a frame it makes up itself (the K-line fast-init response and 5-baud init keybytes) and on every error, status and information item, since J2534 times none of them.
+
+**`TimestampResponse.timestamp_clock` (ADR-353):** the clock a `GetTimestamp` reading is on, with the same values as `EventItem.timestamp_clock`, so a client can set the reading against the item times on that clock (design 8.11 "Settlement", where the agent reads the clock at its own deadline) without knowing which worker gave it. `iso22900-service` gives `TIMESTAMP_CLOCK_DEVICE`: `PDUGetTimestamp` reads the module's time base, the one its items are on. `j2534-0404-service` gives `TIMESTAMP_CLOCK_WORKER`: J2534 v04.04 has no call that reads the device's clock, so the reading is the worker's synthetic clock (above, ADR-120), which its error, status and information items are on, not its frames. A worker built before the field sends `TIMESTAMP_CLOCK_UNSPECIFIED`.
+
 **`EventItem` data variants:**
 
 | Variant | When fired |
 |---------|-----------|
-| `result_data` | COP completed with RX data, or a matched-but-unattributed indication frame (`cop_handle: None`, see "COP Response Attribution and Unbound Frames" above) — a content frame that binds to no COP is discarded instead and never produces a `result_data` item (ADR-100) |
+| `result_data` | COP completed with RX data, or a matched-but-unattributed indication frame (`cop_handle: None`, see "COP Response Attribution and Unbound Frames" above) — a content frame that binds to no COP is discarded instead and never produces a `result_data` item (ADR-100). A response pending (NRC 0x78) the worker sees while `CP_RC78Handling` keeps a COP waiting is passed on as a `result_data` item bound to that COP (`cop_handle` set), ahead of the final response, so a client can see it (design 8.11 "Link settings for the log"); a pending the native library absorbs never reaches the worker and is not passed on |
 | `module_status` | Module availability changed |
 | `cll_status` | CLL connected/disconnected/comm-started — queued in `rx_buf` for `GetEventItem` pollers, not just live `SubscribeEvent` subscribers (ADR-105 P2 follow-up, `CllQueueItem::Status`) |
 | `cop_status` | COP state transition — queued in `rx_buf` for `GetEventItem` pollers, not just live `SubscribeEvent` subscribers (ADR-140, `CllQueueItem::Status(StatusEvent::Cop)`); resolved from `logical_links` before `send_cop_status`'s callers acquire `primitives`, so ADR-128's `primitives`/`terminal_cops` atomicity guarantee is unaffected |
@@ -1507,7 +1553,18 @@ Promotion (Working → Active) happens at exactly two points:
   point-to-point `FLOW_CONTROL_FILTER`s directly from it, since ISO15765
   `FLOW_CONTROL_FILTER`s are per-CLL (ADR-039), not a property of the shared
   physical channel. A table staged before connecting takes effect
-  immediately at Connect; an empty table installs nothing (ADR-048).
+  immediately at Connect; an empty table installs nothing (ADR-048). If the
+  adapter refuses one of the table's filters (a pattern or flow-control
+  identifier another filter uses, or its filter limit), the connect fails
+  with `Code::Internal` and the `PDUError` of the native status, after the
+  filters the table took are given back and the link is rolled back (ADR-398).
+  Two other failures of that install fail the connect with other statuses: a
+  lost device (`ERR_DEVICE_NOT_CONNECTED`) is `FAILED_PRECONDITION` with
+  `PDU_ERR_EVT_LOST_COMM_TO_VCI` (the lost VCI, below), and any other error is
+  `UNKNOWN` with `PDU_ERR_FCT_FAILED`. A filter a sibling CLL on the channel
+  already installed for the same pattern and flow-control pair is shared, not
+  installed again, and stopped when its last CLL leaves. A refusal during
+  `COPT_UPDATEPARAM`'s promotion does not fail it.
 - **`StartComPrimitive(COPT_UPDATEPARAM)` execution.** Snapshots the Working
   table at the same call time as the Working ComParam set, and — only on
   hardware success — promotes it to Active, reconciling ISO15765
@@ -1674,6 +1731,24 @@ plain `Status` with no `ErrorDetail` — there was never a `GetLastError`-querya
 analog for those either. The exception is `StartComPrimitive`: its
 `INVALID_ARGUMENT` refusals carry an `ErrorDetail` with
 `PDU_ERR_INVALID_PARAMETERS` and their refusal reason (above).
+
+### Reading a Worker's Answer
+
+A client reads a failed RPC from its `ErrorDetail` and the status code classes below, never from
+which worker answered (design principle 6): the outer code of the same condition differs between
+the workers. `iso22900-service` gives every failed library call `INTERNAL` with the library's
+return code in `pdu_error`, while `j2534-0404-service` gives `PDU_ERR_INVALID_HANDLE` as
+`NOT_FOUND` (above). So `INTERNAL` from a D-PDU worker is the library's own answer, not a crashed
+worker. The rows are checked in order; the first that matches is the reading.
+
+| The answer | Reading | The agent's use |
+|---|---|---|
+| The client's own deadline for the call passed (no answer) | The worker does not answer: neither a refusal nor a success | `HostError::WorkerUnresponsive`; a `StartComPrimitive` so answered is `SendState::MayHaveReached` |
+| Code `UNAVAILABLE`, `CANCELLED` or `UNKNOWN` | The connection to the worker failed: the call may not have reached the library, so this is no answer of the library's. `j2534-0404-service` also answers `UNKNOWN` (with `PDU_ERR_FCT_FAILED`) for a `ConnectComLogicalLink` whose receive-table filter failed with an error that is neither a refusal of the filter nor a lost device (ADR-398): the table is not shown to be at fault | Never read as a refusal (`agent::link`'s `refused`; the guarded handle's `refuses_indication` in `ngr-hw-checks` keeps its own copy) |
+| Code `FAILED_PRECONDITION` with `error_event_data.error_event` `PDU_ERR_EVT_LOST_COMM_TO_VCI` | The VCI is lost; the link is offline and the worker ended its primitives. A `StartComPrimitive` answered so was not sent (ADR-294) | `HostError::VciLost { refused_after_loss: true }`, `SendState::NotSent` |
+| `ErrorDetail.pdu_error` `PDU_ERR_INVALID_HANDLE`, whatever the code | The worker knows no object with the handle given (ISO 22900-2:2022 D.3). For a `CancelComPrimitive`, the primitive had already ended, which counts as cancelled | The host's stray-primitive cancel (`names_invalid_handle`); the guarded handle's `cancel_maybe_ended` |
+| A `StartComPrimitive` whose `ErrorDetail.refusal` is set | Refused before anything was sent, for the reason named (ADR-350) | The entry is `not_sent`; `SendState::NotSent` |
+| Any other failure (`INTERNAL` included) | The worker or the library answered and did not do what was asked. For an optional setting, such as an indication ComParam, that is the library refusing it; for a required step, a failure of that step. Whether the request reached the bus is unknown unless a row above says so | An optional setting is left off; a required step's failure is `HostError::Rpc`; a `StartComPrimitive` so answered is `SendState::MayHaveReached` |
 
 ---
 

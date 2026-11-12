@@ -97,8 +97,8 @@ fn t0_end(channel: &str, request: u32, response: u32, padding: Option<u8>) -> St
 fn loopback() -> Profile {
     parse(&format!(
         "class = \"T0\"\n{}{}",
-        t0_end("CAN_CH1", 0x123, 0x124, None),
-        t0_end("CAN_CH2", 0x124, 0x123, None)
+        t0_end("ISO15765_CH1", 0x123, 0x124, None),
+        t0_end("ISO15765_CH2", 0x124, 0x123, None)
     ))
     .unwrap()
 }
@@ -424,7 +424,7 @@ fn an_unlearned_pin_type_id_is_refused_and_a_learned_one_compares_by_name() {
 fn only_the_raw_mode_create_flag_is_allowed() {
     // RawMode exists on T0 only.
     let env = Env::new(loopback());
-    let mut request = create_request(create::Resource::RscData(channel_resource("CAN_CH1")));
+    let mut request = create_request(create::Resource::RscData(channel_resource("ISO15765_CH1")));
     let with = |request: &mut CreateComLogicalLinkRequest, flag| {
         request.cll_create_flag = Some(flag);
         env.decide(Request::CreateComLogicalLink(request))
@@ -500,36 +500,90 @@ fn creates(endpoint: usize) -> Result<Grant, GuardRefusal> {
 fn a_loopback_takes_one_link_per_channel_and_binds_the_one_named() {
     let mut env = Env::new(loopback());
     // Each end creates its own channel's link, and a request for B binds B first.
-    assert_eq!(create_channel(&env, "CAN_CH1"), creates(0));
-    assert_eq!(create_channel(&env, "CAN_CH2"), creates(1));
+    assert_eq!(create_channel(&env, "ISO15765_CH1"), creates(0));
+    assert_eq!(create_channel(&env, "ISO15765_CH2"), creates(1));
     // The name is read as the worker reads it.
-    assert_eq!(create_channel(&env, "can_ch02"), creates(1));
+    assert_eq!(create_channel(&env, "iso15765_ch02"), creates(1));
     env.links.insert(CLL, BoundLink::new(1, false));
-    assert_eq!(create_channel(&env, "CAN_CH1"), creates(0));
+    assert_eq!(create_channel(&env, "ISO15765_CH1"), creates(0));
     // Endpoint B's resource twice is refused.
     assert_eq!(
-        create_channel(&env, "CAN_CH2"),
+        create_channel(&env, "ISO15765_CH2"),
         Err(GuardRefusal::LinkCount)
     );
     env.links.insert(11, BoundLink::new(0, false));
     // A third channel is no endpoint's, and neither is the profile's protocol name.
-    for name in ["CAN_CH3", PROTOCOL, "CAN"] {
+    for name in ["ISO15765_CH3", PROTOCOL, "CAN"] {
         assert!(
             matches!(create_channel(&env, name), Err(GuardRefusal::LinkSetup(_))),
             "{name}"
         );
     }
     assert_eq!(
-        create_channel(&env, "CAN_CH1"),
+        create_channel(&env, "ISO15765_CH1"),
         Err(GuardRefusal::LinkCount)
     );
+}
+
+#[test]
+fn a_channel_resource_must_match_the_profile_link_in_bus_type_and_pins() {
+    // A channel of the profile named by resource data is admitted only with the profile's bus
+    // type and exactly its two pins (6 high, 14 low); a resource by name is refused.
+    let env = Env::new(loopback());
+    assert_eq!(create_channel(&env, "ISO15765_CH1"), creates(0));
+    for bad in [
+        resource(
+            "ISO15765_CH1",
+            "ISO_11898_2_DWCAN",
+            &[(6, "HI"), (13, "LOW")],
+        ),
+        resource(
+            "ISO15765_CH1",
+            "ISO_11898_2_DWCAN",
+            &[(6, "LOW"), (14, "HI")],
+        ),
+        resource("ISO15765_CH1", "ISO_11898_2_DWCAN", &[(6, "HI")]),
+        resource("ISO15765_CH1", "ISO_9141_K", &[(6, "HI"), (14, "LOW")]),
+    ] {
+        assert!(
+            matches!(create_with(&env, &bad), Err(GuardRefusal::LinkSetup(_))),
+            "{bad:?}"
+        );
+    }
+    let by_name = create_request(create::Resource::ResourceName("ISO15765_CH1".to_owned()));
+    assert!(matches!(
+        env.decide(Request::CreateComLogicalLink(&by_name)),
+        Err(GuardRefusal::LinkSetup(_))
+    ));
+}
+
+#[test]
+fn a_channel_of_another_framing_than_the_link_is_refused_by_the_guard() {
+    // The profile loader refuses a raw CAN channel on an ISO 15765 link, so the profile is
+    // built by hand here to reach the guard's own check: end A names `CAN_CH1` while its link
+    // stays on the ISO 15765 protocol.
+    let mut profile = loopback();
+    let Setup::Loopback(ends) = &mut profile.setup else {
+        panic!("a loopback");
+    };
+    ends[0].channel = Some("CAN_CH1".to_owned());
+    let env = Env::new(profile);
+    // The names agree, so only the framing differs.
+    match create_channel(&env, "CAN_CH1") {
+        Err(GuardRefusal::LinkSetup(why)) => {
+            assert!(why.contains("protocol family"), "{why}")
+        }
+        other => panic!("expected a framing refusal, got {other:?}"),
+    }
+    // The other end, whose channel and link agree, is unaffected.
+    assert_eq!(create_channel(&env, "ISO15765_CH2"), creates(1));
 }
 
 #[test]
 fn a_socketcan_end_has_no_worker_link() {
     let text = format!(
         "class = \"T0\"\n[[endpoint]]\nsocketcan = \"can0\"\n[endpoint.link]\n{}\
-         [[endpoint]]\nchannel = \"CAN_CH1\"\n[endpoint.vci]\n{VCI}\n[endpoint.link]\n{}",
+         [[endpoint]]\nchannel = \"ISO15765_CH1\"\n[endpoint.vci]\n{VCI}\n[endpoint.link]\n{}",
         link_toml(&L {
             request: 0x123,
             response: 0x124,
@@ -545,10 +599,10 @@ fn a_socketcan_end_has_no_worker_link() {
     );
     let mut env = Env::new(parse(&text).unwrap());
     // Only the VCI end is a worker link, and it is endpoint 1.
-    assert_eq!(create_channel(&env, "CAN_CH1"), creates(1));
+    assert_eq!(create_channel(&env, "ISO15765_CH1"), creates(1));
     env.links.insert(CLL, BoundLink::new(1, false));
     assert_eq!(
-        create_channel(&env, "CAN_CH1"),
+        create_channel(&env, "ISO15765_CH1"),
         Err(GuardRefusal::LinkCount)
     );
     assert!(create_channel(&env, PROTOCOL).is_err());
@@ -1317,20 +1371,20 @@ fn each_worker_of_a_two_vci_loopback_binds_only_its_own_end() {
 fn both_channels_of_one_vci_stay_available_to_its_worker() {
     // The two-channel loopback: one VCI, so one worker holds both ends.
     let env = Env::new(loopback());
-    assert_eq!(create_channel(&env, "CAN_CH1"), creates(0));
-    assert_eq!(create_channel(&env, "CAN_CH2"), creates(1));
+    assert_eq!(create_channel(&env, "ISO15765_CH1"), creates(0));
+    assert_eq!(create_channel(&env, "ISO15765_CH2"), creates(1));
 }
 
 #[test]
 fn t0_has_raw_links_only_and_nothing_to_start() {
     let env = Env::new(loopback());
     // A link that is not RawMode would speak the protocol.
-    let request = create_request(create::Resource::RscData(channel_resource("CAN_CH1")));
+    let request = create_request(create::Resource::RscData(channel_resource("ISO15765_CH1")));
     assert!(matches!(
         env.decide(Request::CreateComLogicalLink(&request)),
         Err(GuardRefusal::LinkSetup(_))
     ));
-    assert_eq!(create_channel(&env, "CAN_CH1"), creates(0));
+    assert_eq!(create_channel(&env, "ISO15765_CH1"), creates(0));
     // No communication to start or stop, whatever the data, on a raw link too.
     let raw = Env::linked(loopback(), true);
     for cop in [
@@ -1382,8 +1436,8 @@ fn raw_frame_flags_must_equal_the_profile_in_both_directions() {
     };
     let wide = parse(&format!(
         "class = \"T0\"\n{}{}",
-        end("CAN_CH1", 0x18DA_10F1, 0x18DA_F110),
-        end("CAN_CH2", 0x18DA_F110, 0x18DA_10F1)
+        end("ISO15765_CH1", 0x18DA_10F1, 0x18DA_F110),
+        end("ISO15765_CH2", 0x18DA_F110, 0x18DA_10F1)
     ))
     .unwrap();
     let env = Env::linked(wide, true);
@@ -1437,8 +1491,8 @@ fn raw_frame_flags_must_equal_the_profile_in_both_directions() {
     // A padded 11-bit T0 profile refuses an omitted padding bit and takes it when present.
     let padded = parse(&format!(
         "class = \"T0\"\n{}{}",
-        t0_end("CAN_CH1", 0x123, 0x124, Some(0xAA)),
-        t0_end("CAN_CH2", 0x124, 0x123, Some(0xAA))
+        t0_end("ISO15765_CH1", 0x123, 0x124, Some(0xAA)),
+        t0_end("ISO15765_CH2", 0x124, 0x123, Some(0xAA))
     ))
     .unwrap();
     let t0 = Env::linked(padded, true);
@@ -1938,7 +1992,7 @@ fn a_raw_mode_link_is_refused_outside_t0() {
     );
     // T0 keeps RawMode.
     let env = Env::new(loopback());
-    let mut request = create_request(create::Resource::RscData(channel_resource("CAN_CH1")));
+    let mut request = create_request(create::Resource::RscData(channel_resource("ISO15765_CH1")));
     request.cll_create_flag = Some(raw.clone());
     assert_eq!(
         env.decide(Request::CreateComLogicalLink(&request)),

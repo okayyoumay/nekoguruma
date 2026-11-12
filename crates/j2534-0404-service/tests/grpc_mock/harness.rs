@@ -1263,6 +1263,56 @@ impl MockBackdoor {
         }
     }
 
+    /// Forces every subsequent `PassThruStartMsgFilter` call, on every
+    /// channel, to fail with `code` instead of recording the filter -- lets
+    /// tests exercise a connect-time filter install that fails for a reason
+    /// other than a refusal of the filter, such as a lost device (ADR-398).
+    /// `Some(code)` installs the override; `None` clears it (the default
+    /// after `reset()`), mirroring `set_stop_filter_error`'s `Option`
+    /// convention.
+    pub(crate) fn set_start_filter_error(&self, code: Option<c_long>) {
+        unsafe {
+            let f: Symbol<unsafe extern "system" fn(c_long) -> c_long> = self
+                .lib
+                .get(b"__mock_set_start_filter_error\0")
+                .expect("__mock_set_start_filter_error should be exported");
+            let rc = f(code.unwrap_or(0));
+            assert_eq!(rc, NC, "__mock_set_start_filter_error should succeed");
+        }
+    }
+
+    /// Turns on the mock's `sim-vci`-style checks for `FLOW_CONTROL_FILTER`s
+    /// (a pattern or flow-control CAN id another one uses is
+    /// `ERR_NOT_UNIQUE`, more than `max_filters` per channel
+    /// `ERR_EXCEEDED_LIMIT`); `0` turns them off (the default after
+    /// `reset()`).
+    pub(crate) fn set_flow_control_filter_checks(&self, max_filters: usize) {
+        unsafe {
+            let f: Symbol<unsafe extern "system" fn(usize) -> c_long> = self
+                .lib
+                .get(b"__mock_set_flow_control_filter_checks\0")
+                .expect("__mock_set_flow_control_filter_checks should be exported");
+            let rc = f(max_filters);
+            assert_eq!(
+                rc, NC,
+                "__mock_set_flow_control_filter_checks should succeed"
+            );
+        }
+    }
+
+    /// Makes the next `times` `PassThruClose` calls fail with `code`
+    /// (ADR-422); `times == 0` clears the override.
+    pub(crate) fn fail_closes(&self, code: c_long, times: u32) {
+        unsafe {
+            let f: Symbol<unsafe extern "system" fn(c_long, u32) -> c_long> = self
+                .lib
+                .get(b"__mock_fail_closes\0")
+                .expect("__mock_fail_closes should be exported");
+            let rc = f(code, times);
+            assert_eq!(rc, NC, "__mock_fail_closes should succeed");
+        }
+    }
+
     /// Forces every subsequent `PassThruWriteMsgs` call, on every channel, to
     /// fail with `code` instead of its normal success behavior -- lets tests
     /// exercise the RC21/RC23 (NRC 0x21/0x23) auto-re-request path's own
@@ -1404,6 +1454,41 @@ impl MockBackdoor {
                 .expect("__mock_release_become_master_hold should be exported");
             let rc = f();
             assert_eq!(rc, NC, "__mock_release_become_master_hold should succeed");
+        }
+    }
+
+    /// Holds the first `PassThruConnect` made after `after` connects have
+    /// succeeded until [`Self::release_connect_hold`]. With `after = 1` that is
+    /// an `auto`-mode capability probe's connect.
+    pub(crate) fn arm_connect_hold(&self, after: u32) {
+        unsafe {
+            let f: Symbol<unsafe extern "system" fn(u32) -> c_long> = self
+                .lib
+                .get(b"__mock_arm_connect_hold\0")
+                .expect("__mock_arm_connect_hold should be exported");
+            assert_eq!(f(after), NC, "__mock_arm_connect_hold should succeed");
+        }
+    }
+
+    /// `true` once a connect is blocked in the hold [`Self::arm_connect_hold`] armed.
+    pub(crate) fn connect_hold_engaged(&self) -> bool {
+        unsafe {
+            let f: Symbol<unsafe extern "system" fn() -> u32> = self
+                .lib
+                .get(b"__mock_connect_hold_engaged\0")
+                .expect("__mock_connect_hold_engaged should be exported");
+            f() != 0
+        }
+    }
+
+    /// Releases the connect hold; a no-op when none is armed.
+    pub(crate) fn release_connect_hold(&self) {
+        unsafe {
+            let f: Symbol<unsafe extern "system" fn() -> c_long> = self
+                .lib
+                .get(b"__mock_release_connect_hold\0")
+                .expect("__mock_release_connect_hold should be exported");
+            assert_eq!(f(), NC, "__mock_release_connect_hold should succeed");
         }
     }
 
@@ -1959,7 +2044,7 @@ pub(crate) async fn create_cll(
     protocol_id: u32,
     _cll_tag: u64,
 ) -> ComLogicalLinkHandle {
-    client
+    let created = client
         .create_com_logical_link(CreateComLogicalLinkRequest {
             module_handle: Some(ModuleHandle {
                 module_handle: MOCK_MODULE_HANDLE,
@@ -1971,9 +2056,13 @@ pub(crate) async fn create_cll(
         })
         .await
         .expect("create_com_logical_link should succeed")
-        .into_inner()
-        .cll_handle
-        .expect("cll_handle should be present")
+        .into_inner();
+    // ADR-355: this service passes on every response pending, on every link.
+    assert_eq!(
+        created.pending_forwarding,
+        vci_service_interface::PendingForwarding::All as i32
+    );
+    created.cll_handle.expect("cll_handle should be present")
 }
 
 /// Sets a single `PDU_PC_COM`-class Unum32 ComParam on `cll_handle`.

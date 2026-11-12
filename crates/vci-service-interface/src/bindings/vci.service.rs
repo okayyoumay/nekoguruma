@@ -493,6 +493,13 @@ pub struct EventItem {
     /// for that COP. Absent otherwise -- never a zero-length sentinel.
     #[prost(bytes = "vec", optional, tag = "9")]
     pub cop_tag: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    /// ADR-353: the clock `timestamp` is on (design 8.11 "On one clock"),
+    /// and with it the times `result_data` carries (`tx_msg_done_timestamp`,
+    /// `start_msg_timestamp`). Each worker sets it per item; UNSPECIFIED means
+    /// the worker does not say, and a client then compares those times with
+    /// no other.
+    #[prost(enumeration = "TimestampClock", tag = "11")]
+    pub timestamp_clock: i32,
     #[prost(oneof = "event_item::Data", tags = "3, 4, 5, 6, 10, 8")]
     pub data: ::core::option::Option<event_item::Data>,
 }
@@ -660,6 +667,13 @@ pub struct ResourceStatusResponse {
 pub struct ComLogicalLinkResponse {
     #[prost(message, optional, tag = "1")]
     pub cll_handle: ::core::option::Option<ComLogicalLinkHandle>,
+    /// ADR-355: whether the worker passes on every response pending (0x78)
+    /// the link sees, bound to its primitive (design 8.11 "Link settings for
+    /// the log"). UNSPECIFIED means the worker does not say, as a worker
+    /// built before the field does; a client then treats a pending as
+    /// possibly absorbed.
+    #[prost(enumeration = "PendingForwarding", tag = "2")]
+    pub pending_forwarding: i32,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ComParamResponse {
@@ -705,6 +719,13 @@ pub struct UniqueRespIdTableResponse {
 pub struct TimestampResponse {
     #[prost(uint32, tag = "1")]
     pub timestamp: u32,
+    /// ADR-353: the clock `timestamp` is on, as `EventItem.timestamp_clock`
+    /// names an item's (design 8.11 "On one clock"): DEVICE when the library
+    /// reads the VCI's own clock, WORKER for the worker's synthetic one.
+    /// UNSPECIFIED means the worker does not say, and a client then compares
+    /// the reading with no other time.
+    #[prost(enumeration = "TimestampClock", tag = "2")]
+    pub timestamp_clock: i32,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct IoCtlRequest {
@@ -1666,6 +1687,40 @@ impl CllCreateFlagBit {
         }
     }
 }
+/// ADR-353: the clock an item's timestamp is on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum TimestampClock {
+    Unspecified = 0,
+    /// The VCI's own clock, as the vendor library reports it: the time base
+    /// of the item's module.
+    Device = 1,
+    /// The worker's synthetic clock (ADR-120), for an item the library gives
+    /// no time for.
+    Worker = 2,
+}
+impl TimestampClock {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "TIMESTAMP_CLOCK_UNSPECIFIED",
+            Self::Device => "TIMESTAMP_CLOCK_DEVICE",
+            Self::Worker => "TIMESTAMP_CLOCK_WORKER",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "TIMESTAMP_CLOCK_UNSPECIFIED" => Some(Self::Unspecified),
+            "TIMESTAMP_CLOCK_DEVICE" => Some(Self::Device),
+            "TIMESTAMP_CLOCK_WORKER" => Some(Self::Worker),
+            _ => None,
+        }
+    }
+}
 /// ADR-350: why a worker refused a StartComPrimitive before sending it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -1699,6 +1754,38 @@ impl RefusalReason {
             "REFUSAL_REASON_INVALID_PARAMETERS" => Some(Self::InvalidParameters),
             "REFUSAL_REASON_QUEUE_FULL" => Some(Self::QueueFull),
             "REFUSAL_REASON_PROTOCOL_CANNOT_CARRY" => Some(Self::ProtocolCannotCarry),
+            _ => None,
+        }
+    }
+}
+/// ADR-355: whether a link shows a client every response pending.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum PendingForwarding {
+    Unspecified = 0,
+    /// The worker passes on every pending the ECU sends on the link.
+    All = 1,
+    /// The library may handle a pending itself without delivering it.
+    NotAll = 2,
+}
+impl PendingForwarding {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "PENDING_FORWARDING_UNSPECIFIED",
+            Self::All => "PENDING_FORWARDING_ALL",
+            Self::NotAll => "PENDING_FORWARDING_NOT_ALL",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "PENDING_FORWARDING_UNSPECIFIED" => Some(Self::Unspecified),
+            "PENDING_FORWARDING_ALL" => Some(Self::All),
+            "PENDING_FORWARDING_NOT_ALL" => Some(Self::NotAll),
             _ => None,
         }
     }

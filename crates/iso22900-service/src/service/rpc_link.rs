@@ -70,6 +70,9 @@ impl Iso22900Service {
         );
         Ok(Response::new(ComLogicalLinkResponse {
             cll_handle: Some(to_proto_cll_handle(h_mod, handle)),
+            // ADR-355: the library handles a response pending itself
+            // (`CP_RC78Handling`) and need not deliver it.
+            pending_forwarding: vci_service_interface::PendingForwarding::NotAll as i32,
         }))
     }
 

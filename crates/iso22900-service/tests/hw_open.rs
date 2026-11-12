@@ -12,10 +12,12 @@
 
 use std::path::Path;
 
+use agent::launch::{LaunchError, host_runs};
 use ngr_hw_checks::device::MatchRefusal;
 use ngr_hw_checks::open::{OpenError, open_device};
 use ngr_hw_checks::profile::{Api, Vci};
 use serial_test::serial;
+use worker_host::abi::Abi;
 use worker_host::service::{LaunchOptions, OperatingMode, Stopped, WorkerLayout};
 
 const LIBRARY_NAME: &str = "NGR Mock D-PDU API";
@@ -41,6 +43,10 @@ fn vci(module: &str, firmware: &str, library: &str) -> Vci {
         pname: None,
         firmware_version: firmware.to_owned(),
         library_version: library.to_owned(),
+        timing_margin_us: None,
+        drift_bound_ppm: None,
+        clock_margin_us: None,
+        worker_abi: None,
     }
 }
 
@@ -133,4 +139,32 @@ async fn a_different_library_version_is_refused_after_opening() {
             profile: "1.2.3".to_owned()
         }
     );
+}
+
+/// ADR-415: `open_device` passes the profile's `worker_abi` to the launch, so an ABI that is not
+/// the library's fails the open with the build's reason, and the library's own ABI opens.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn the_profiles_worker_abi_decides_the_launch() {
+    let library = iso22900_mock::mock_library_path().expect("the mock cdylib should be built");
+    let own = worker_host::abi::detect_file(&library).expect("the mock should have a known ABI");
+    let named = |worker_abi| Vci {
+        worker_abi: Some(worker_abi),
+        ..vci("iso22900-mock", "0.0.0", "0.0.0")
+    };
+    let stopped = open(&named(own))
+        .await
+        .expect("the library's own ABI should open");
+    assert_eq!(stopped, Stopped::Exited);
+
+    let other = Abi::ALL
+        .into_iter()
+        .find(|&other| other != own && host_runs(other))
+        .expect("the host runs a second ABI");
+    match open(&named(other)).await {
+        Err(OpenError::Launch(error @ LaunchError::Resolve { .. })) => {
+            assert!(error.to_string().contains("is built for"), "{error}");
+        }
+        other => panic!("another ABI should fail the launch, not {other:?}"),
+    }
 }

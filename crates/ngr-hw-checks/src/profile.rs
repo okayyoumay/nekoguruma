@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+use worker_host::abi::Abi;
 
 /// The environment variable that names the profile file.
 pub const PROFILE_VAR: &str = "NGR_HW_PROFILE";
@@ -101,9 +102,57 @@ pub struct Vci {
     pub firmware_version: String,
     /// The library version the device reports.
     pub library_version: String,
+    /// The VCI's timing margin in microseconds (design 8.11 "Timing margin"): the T2 timing
+    /// check judges the latency the VCI measured against the ECU's P2 only beyond it, and
+    /// without it judges nothing (ADR-356).
+    #[serde(default)]
+    pub timing_margin_us: Option<u32>,
+    /// How far the VCI's clock may run from the agent's, in parts per million (design 8.11
+    /// "Drift bound"); without it the agent takes its default (ADR-357).
+    #[serde(default)]
+    pub drift_bound_ppm: Option<u32>,
+    /// The tolerance of one reading of the VCI's clock in microseconds (design 8.11 "Drift
+    /// bound"); without it the agent takes its default (ADR-357).
+    #[serde(default)]
+    pub clock_margin_us: Option<u32>,
+    /// The worker ABI to test, by the name of the ABI table (design 7.1.2, e.g. `win-x86`): the
+    /// check launches only the worker build for it. Without it the agent's preference decides,
+    /// which on a 64-bit Windows host is the x64 build whenever the VCI has a library for it. The
+    /// report states the ABI that ran either way.
+    #[serde(default, deserialize_with = "abi_by_name")]
+    pub worker_abi: Option<Abi>,
+}
+
+/// Reads an optional ABI by the name `Abi::name` gives it.
+fn abi_by_name<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Option<Abi>, D::Error> {
+    let Some(name) = Option::<String>::deserialize(de)? else {
+        return Ok(None);
+    };
+    Abi::ALL
+        .into_iter()
+        .find(|abi| abi.name() == name)
+        .map(Some)
+        .ok_or_else(|| {
+            let known: Vec<_> = Abi::ALL.iter().map(|abi| abi.name()).collect();
+            serde::de::Error::custom(format!(
+                "unknown `worker_abi` {name:?} (expected one of {})",
+                known.join(", ")
+            ))
+        })
 }
 
 impl Vci {
+    /// The margins this profile gives its VCI, for a job the harness runs on it (ADR-357): a
+    /// drift bound or clock margin it leaves out takes the agent's default, and without a timing
+    /// margin the job judges no time (ADR-377).
+    pub fn margins(&self) -> agent::VciMargins {
+        agent::VciMargins {
+            timing_margin_us: self.timing_margin_us,
+            drift_bound_ppm: self.drift_bound_ppm,
+            clock_margin_us: self.clock_margin_us,
+        }
+    }
+
     /// Whether `other` may name the same module. Names are compared exactly, as the library
     /// resolvers match them (design 7.1). A J2534 worker opens the configured entry its label
     /// selects, and its `pname` identifies the device (ADR-281), so for J2534 the same label or
@@ -529,6 +578,40 @@ pub(crate) fn framing(protocol: &str) -> Option<Framing> {
     }
 }
 
+/// Splits an additional channel's `_CHn` suffix off a protocol or channel name (matched as
+/// `framing` matches it): the name before the suffix and the channel number without leading
+/// zeros, or the whole name and `None` when there is no suffix.
+fn split_channel_suffix(name: &str) -> (&str, Option<&str>) {
+    let lower_at = name.to_ascii_lowercase().rfind("_ch");
+    match lower_at {
+        Some(index)
+            if !name[index + 3..].is_empty()
+                && name[index + 3..].bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            let digits = name[index + 3..].trim_start_matches('0');
+            (
+                &name[..index],
+                Some(if digits.is_empty() { "0" } else { digits }),
+            )
+        }
+        _ => (name, None),
+    }
+}
+
+/// Whether `protocol` carries a `_CHn` suffix, which `channel` is the one place to give.
+pub(crate) fn has_channel_suffix(protocol: &str) -> bool {
+    split_channel_suffix(protocol).1.is_some()
+}
+
+/// The physical channel a name stands for, as the J2534 worker reads it: the channel number (0
+/// for the base channel, with no suffix) of a CAN or ISO 15765 name. `CAN_CHn` and `ISO15765_CHn`
+/// with one `n` are one channel: a raw CAN and an ISO 15765 link can share a hardware
+/// channel, so the profile conservatively takes them for one and refuses them as two ends. `None` for a name that is neither family.
+pub(crate) fn physical_channel(name: &str) -> Option<String> {
+    framing(name)?;
+    Some(split_channel_suffix(name).1.unwrap_or("0").to_owned())
+}
+
 /// A channel name as the J2534 worker reads it: ASCII case ignored, surrounding spaces dropped,
 /// and a `_CH` index read as a number, so `CAN_CH1`, `can_ch1` and `CAN_CH01` are one channel.
 pub(crate) fn channel_key(name: &str) -> String {
@@ -568,6 +651,14 @@ fn check_vci(vci: &Vci) -> Result<(), ProfileError> {
             "a D-PDU API `vci` writes `firmware_version` and `library_version` as \
              `major.minor.revision`, each 0 to 255 with no leading zero",
         ));
+    }
+    if let Some(abi) = vci.worker_abi
+        && !agent::launch::host_runs(abi)
+    {
+        return Err(invalid(format!(
+            "`worker_abi` {:?} is not an ABI this host can run a worker for",
+            abi.name()
+        )));
     }
     match vci.api {
         // A J2534 library reports no serial number, so the module is matched through its
@@ -713,6 +804,43 @@ fn check_link(link: &Link) -> Result<(), ProfileError> {
 }
 
 fn check_endpoint(endpoint: &Endpoint) -> Result<(), ProfileError> {
+    // A channel is an SAE J2534-2 clause 7 additional channel, made from its compound protocol
+    // name; a D-PDU API library has no such name to create a link by.
+    if endpoint.channel.is_some()
+        && endpoint
+            .vci
+            .as_ref()
+            .is_some_and(|v| v.api == Api::Iso22900)
+    {
+        return Err(invalid(
+            "a `channel` names an additional channel of a J2534 module; a D-PDU API `vci` has none",
+        ));
+    }
+    if let Some(channel) = &endpoint.channel {
+        // The worker does not trim a protocol name, so a channel with spaces names nothing.
+        if channel.trim() != channel {
+            return Err(invalid(
+                "a `channel` has no surrounding whitespace: the worker does not trim it",
+            ));
+        }
+        // A channel is a channel of the link's own family.
+        let family = framing(channel);
+        if endpoint.vci.is_some()
+            && !channel.trim().is_empty()
+            && (family.is_none() || family != framing(&endpoint.link.protocol))
+        {
+            return Err(invalid(
+                "a `channel` is a channel of the `link`'s protocol family: raw CAN (`CAN_CHn`) or \
+                 ISO 15765 (`ISO15765_CHn`), the same as the `protocol`",
+            ));
+        }
+    }
+    // The channel is named in `channel` only, never as a `_CHn` suffix of the protocol.
+    if has_channel_suffix(&endpoint.link.protocol) {
+        return Err(invalid(
+            "a `link`'s `protocol` names no `_CHn` channel: give it in the endpoint's `channel`",
+        ));
+    }
     match (&endpoint.vci, &endpoint.socketcan) {
         (Some(vci), None)
             if endpoint
@@ -756,7 +884,11 @@ fn check_loopback(a: &Endpoint, b: &Endpoint) -> Result<(), ProfileError> {
     };
     let same_vci_channel = same_module
         && match (&a.channel, &b.channel) {
-            (Some(x), Some(y)) => channel_key(x) == channel_key(y),
+            // The same physical channel, however it is spelled or paired.
+            (Some(x), Some(y)) => match (physical_channel(x), physical_channel(y)) {
+                (Some(x), Some(y)) => x == y,
+                _ => channel_key(x) == channel_key(y),
+            },
             _ => true,
         };
     if same_vci_channel {

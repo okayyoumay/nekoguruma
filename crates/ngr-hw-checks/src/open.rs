@@ -155,7 +155,7 @@ pub async fn open_device(
         profile::Api::J2534V0404 => Api::J2534,
         profile::Api::Iso22900 => Api::Dpdu,
     };
-    let worker = launch_worker(api, &vci.library, mode, workers, options).await?;
+    let worker = launch_worker(api, &vci.library, mode, workers, options, vci.worker_abi).await?;
     let (abi, process, mut client) = (worker.abi, worker.process, worker.client);
     let (library, long_size) = (worker.library, worker.long_size);
     let timeout = options.request_timeout;

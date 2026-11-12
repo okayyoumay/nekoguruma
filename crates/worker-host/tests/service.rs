@@ -70,6 +70,57 @@ async fn stop_kills_a_worker_that_ignores_the_request() {
     assert!(matches!(stopped, Ok(Stopped::Killed)), "{stopped:?}");
 }
 
+/// `try_wait` does not wait: `None` while the worker runs, its exit status once it has exited,
+/// and the same status on a later call.
+#[tokio::test]
+async fn try_wait_reports_a_worker_that_has_exited() {
+    let mut worker = launch("Acme - Turtle", Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert!(worker.try_wait().unwrap().is_none());
+    // The fake exits after it answers the stop request.
+    worker.request("stop", None).await.unwrap();
+    let started = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = worker.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the worker did not exit"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert!(status.success(), "{status:?}");
+    assert_eq!(worker.try_wait().unwrap(), Some(status));
+    // The child is reaped and `stop` finds it gone.
+    assert_eq!(worker.id(), None);
+    assert_eq!(
+        worker.stop(Duration::from_secs(2)).await.unwrap(),
+        Stopped::Exited
+    );
+}
+
+/// `kill` ends a worker that ignores the stop request, reaps it, and leaves the process in
+/// place: it reports the end it was given and `stop` finds it gone.
+#[tokio::test]
+async fn kill_ends_a_worker_that_ignores_the_request() {
+    let mut worker = launch("ignore-stop", Duration::from_secs(5)).await.unwrap();
+    assert!(worker.try_wait().unwrap().is_none());
+    worker.kill().await.unwrap();
+    let status = worker.try_wait().unwrap().expect("the child is reaped");
+    assert!(!status.success(), "{status:?}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(9));
+    }
+    assert_eq!(
+        worker.stop(Duration::from_secs(2)).await.unwrap(),
+        Stopped::Exited
+    );
+}
+
 #[tokio::test]
 async fn reports_startup_error() {
     let result = launch("startup-error", Duration::from_secs(5)).await;
@@ -80,6 +131,51 @@ async fn reports_startup_error() {
 async fn times_out_when_never_running() {
     let result = launch("never-running", Duration::from_millis(500)).await;
     assert!(matches!(result, Err(ServiceError::Timeout(_))));
+}
+
+/// A worker answers its first control request only after its own startup (loading its
+/// library), which can take longer than one request's bound: the start's bound covers it.
+#[tokio::test]
+async fn a_startup_longer_than_one_request_is_waited_for_under_the_startup_bound() {
+    let options = LaunchOptions {
+        startup_timeout: Duration::from_secs(10),
+        request_timeout: Duration::from_millis(200),
+        ..LaunchOptions::default()
+    };
+    let worker = WorkerProcess::launch(
+        fake(),
+        ServiceKind::J2534V0404,
+        "slow-start-800",
+        OperatingMode::User,
+        &options,
+    )
+    .await
+    .expect("a slow start within the startup bound should launch");
+    assert_eq!(worker.endpoints(), ["127.0.0.1:50051", "[::1]:50051"]);
+    worker.stop(Duration::from_secs(5)).await.expect("stop");
+}
+
+/// A startup longer than the start's own bound still fails.
+#[tokio::test]
+async fn a_startup_longer_than_the_startup_bound_times_out() {
+    let options = LaunchOptions {
+        startup_timeout: Duration::from_millis(300),
+        request_timeout: Duration::from_secs(5),
+        ..LaunchOptions::default()
+    };
+    let result = WorkerProcess::launch(
+        fake(),
+        ServiceKind::J2534V0404,
+        "slow-start-3000",
+        OperatingMode::User,
+        &options,
+    )
+    .await;
+    assert!(
+        matches!(result, Err(ServiceError::Timeout(_))),
+        "{:?}",
+        result.err()
+    );
 }
 
 #[tokio::test]

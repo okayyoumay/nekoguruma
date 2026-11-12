@@ -224,12 +224,10 @@ pub enum DtcFields {
 /// its value is a float or shaped, or when an integer's `expected` is longer than eight bytes.
 pub fn pattern_matches(pattern: &VariantPattern<'_>, fields: &[DecodedField]) -> bool {
     let expected = pattern.expected().map_or(&[][..], |e| e.bytes());
-    // An empty prefix would match every value, which identifies nothing.
-    !expected.is_empty()
-        && fields
-            .iter()
-            .find(|field| field.id == pattern.field_id())
-            .is_some_and(|field| value_matches(expected, &field.value))
+    fields
+        .iter()
+        .find(|field| field.id == pattern.field_id())
+        .is_some_and(|field| expected_matches(expected, &field.value))
 }
 
 /// Whether `variant` is identified (ADR-315, as ISO 22901-1 (2008) 7.4.3 describes for ECU
@@ -276,20 +274,122 @@ pub fn select_variant<'v, 'f>(
         .map(|(index, _)| index)
 }
 
-fn value_matches(expected: &[u8], value: &PhysicalValue) -> bool {
+/// Whether `value`, the decoded value of a field, satisfies `expected` as ADR-306 defines it for a
+/// variant pattern: bytes and text by prefix, an unsigned or signed integer by number
+/// ([`expected_value`]), never a float or a shaped value, and never an empty `expected`. The
+/// comparison [`pattern_matches`] makes, and the identification job (8.8.2) makes for a field
+/// rule's source.
+pub fn expected_matches(expected: &[u8], value: &PhysicalValue) -> bool {
+    // An empty prefix would match every value, which identifies nothing.
+    if expected.is_empty() {
+        return false;
+    }
     match value {
         PhysicalValue::Bytes(bytes) => bytes.starts_with(expected),
         PhysicalValue::Text(text) => text.as_bytes().starts_with(expected),
-        PhysicalValue::Unsigned(n) => big_endian(expected) == Some(*n),
-        PhysicalValue::Signed(n) => big_endian(expected).is_some_and(|raw| {
-            // Sign-extend from the width `expected` was written in.
-            let shift = 64 - 8 * expected.len() as u32;
-            ((raw << shift) as i64) >> shift == *n
-        }),
+        PhysicalValue::Unsigned(_) | PhysicalValue::Signed(_) => {
+            expected_value(ExpectedKind::of(value), expected).as_ref() == Some(value)
+        }
         PhysicalValue::Float(_)
         | PhysicalValue::Group(_)
         | PhysicalValue::Repeat(_)
         | PhysicalValue::Select { .. } => false,
+    }
+}
+
+/// How a field's value reads `expected`: the kind of its decoded value (ADR-306 item 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpectedKind {
+    /// Bytes or text: `expected` is a prefix, and stands for the bytes themselves.
+    Bytes,
+    /// An unsigned integer: `expected` is a big-endian number of one to eight bytes.
+    Unsigned,
+    /// A signed integer: `expected` is a big-endian two's complement number of one to eight bytes.
+    Signed,
+}
+
+impl ExpectedKind {
+    /// The kind of a field a variant pattern, or a field rule, can compare, from its declaration
+    /// alone ([`scalar_kind`]); the reason when it cannot (a float, a conversion, a nested
+    /// layout; ADR-306 item 5).
+    pub fn of_field(field: &Field<'_>) -> Result<Self, &'static str> {
+        match scalar_kind(field)? {
+            ScalarKind::Integer if field.kind() == DataKind::Int => Ok(Self::Signed),
+            ScalarKind::Integer => Ok(Self::Unsigned),
+            ScalarKind::Text | ScalarKind::Bytes => Ok(Self::Bytes),
+            ScalarKind::Float => Err("a float"),
+        }
+    }
+
+    /// Why no value of `field` could ever satisfy `expected` (ADR-306 item 5), if so: it is
+    /// empty; an integer's is over eight bytes or names a number the field's fixed width cannot
+    /// hold (a BCD field holds one decimal digit per four bits); a fixed-length bytes or text
+    /// field is shorter than it (text compared in UTF-8, so an ASCII field of n bytes reaches 2n
+    /// bytes, a UTF-8 field n and a UTF-16 field of n bytes 3n/2); or a text field's is not UTF-8.
+    /// `kind` is the field's [`ExpectedKind::of_field`].
+    pub fn never_matches(self, field: &Field<'_>, expected: &[u8]) -> Option<&'static str> {
+        if expected.is_empty() {
+            return Some("its expected value is empty, which no value matches");
+        }
+        let data = field.kind();
+        let fixed = (field.length_kind() == LengthKind::Fixed && field.bit_length() >= 1)
+            .then(|| field.bit_length());
+        if self != Self::Bytes {
+            if expected.len() > 8 {
+                return Some("its expected value is over eight bytes for an integer field");
+            }
+            let number = big_endian(expected).unwrap_or(0);
+            let bits = fixed.filter(|&bits| bits <= 64)?;
+            let outside = match data {
+                DataKind::Bcd => number > 10u64.pow(bits / 4).saturating_sub(1),
+                DataKind::Int => {
+                    let Some(PhysicalValue::Signed(value)) = expected_value(self, expected) else {
+                        return None;
+                    };
+                    bits < 64 && (value < -(1i64 << (bits - 1)) || value >= 1i64 << (bits - 1))
+                }
+                _ => bits < 64 && number >> bits != 0,
+            };
+            return outside.then_some("its expected value is outside what the field's width holds");
+        }
+        let text = matches!(data, DataKind::Ascii | DataKind::Utf8 | DataKind::Unicode2);
+        if text && std::str::from_utf8(expected).is_err() {
+            return Some("its expected value is not UTF-8, which text is compared in");
+        }
+        let bytes = u64::from(fixed? / 8);
+        let longest = match data {
+            DataKind::Ascii => 2 * bytes,
+            DataKind::Unicode2 => bytes / 2 * 3,
+            _ => bytes,
+        };
+        (expected.len() as u64 > longest)
+            .then_some("its expected value is longer than the fixed-length field can be")
+    }
+
+    /// The kind a decoded value is compared as; bytes for any value that is not an integer.
+    fn of(value: &PhysicalValue) -> Self {
+        match value {
+            PhysicalValue::Unsigned(_) => Self::Unsigned,
+            PhysicalValue::Signed(_) => Self::Signed,
+            _ => Self::Bytes,
+        }
+    }
+}
+
+/// `expected` as the value a field of `kind` decodes to when it satisfies `expected` entirely:
+/// the bytes for bytes and text, the big-endian number for an unsigned integer, the number
+/// sign-extended from `expected`'s own width for a signed one (ADR-306 item 3). `None` for an
+/// integer whose `expected` is empty or longer than eight bytes. Callers: [`expected_matches`], and
+/// the identification job's enumeration of the values a rule field can take.
+pub fn expected_value(kind: ExpectedKind, expected: &[u8]) -> Option<PhysicalValue> {
+    match kind {
+        ExpectedKind::Bytes => Some(PhysicalValue::Bytes(expected.to_vec())),
+        ExpectedKind::Unsigned => big_endian(expected).map(PhysicalValue::Unsigned),
+        ExpectedKind::Signed => big_endian(expected).map(|raw| {
+            // Sign-extend from the width `expected` was written in.
+            let shift = 64 - 8 * expected.len() as u32;
+            PhysicalValue::Signed(((raw << shift) as i64) >> shift)
+        }),
     }
 }
 

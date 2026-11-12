@@ -1718,6 +1718,12 @@ pub(super) struct ResolvedTesterPresent {
     /// wire content. Both call sites (`handle_start_comm`,
     /// `handle_update_param`) branch on it explicitly instead.
     pub(super) handling_enabled: bool,
+    /// Response-code handling of the tester-present's own answer (ADR-419),
+    /// resolved from the same call-time Active snapshot, with `request_sid`
+    /// set to the message's service identifier. Frozen into the hold entry a
+    /// send opens (`TpHold::rc_cfg`); excluded from `same_wire_behavior` like
+    /// the other response-side fields.
+    pub(super) rc_cfg: RcHandlingConfig,
 }
 
 impl ResolvedTesterPresent {
@@ -1817,9 +1823,8 @@ pub(super) fn resolve_tester_present(
     // ADR-196 Decision items 1/2: the calling CLL's `LogicalLinkState::
     // raw_mode` -- see `resolve_send_recv_tx`'s identical parameter for the
     // full rationale. TesterPresent is unreachable for TP2.0 regardless (see
-    // this function's own `build_tx_message` call below), and Phase 1's
-    // protocol allowlist means `raw_mode` is only ever `true` for a base CAN
-    // or hardware ISO15765 link, so the two never conflict.
+    // this function's own `build_tx_message` call below), and the
+    // RawMode protocol allowlist (ADR-414) never admits TP2.0, so the two never conflict.
     raw_mode: bool,
 ) -> Result<ResolvedTesterPresent, String> {
     // ADR-137 Codex-review fix: the master enable switch is checked FIRST,
@@ -1854,6 +1859,7 @@ pub(super) fn resolve_tester_present(
             exp_pos_resp: Vec::new(),
             exp_neg_resp: Vec::new(),
             handling_enabled: false,
+            rc_cfg: RcHandlingConfig::default(),
         });
     }
 
@@ -2211,6 +2217,8 @@ pub(super) fn resolve_tester_present(
         exp_pos_resp,
         exp_neg_resp,
         handling_enabled: true,
+        rc_cfg: RcHandlingConfig::from_params(active, protocol)
+            .with_request_sid(tp_payload.first().copied()),
     })
 }
 
@@ -6460,6 +6468,7 @@ mod rollback_stop_comm_pending_tests {
                 tester_present_state: TesterPresentState::None,
                 tester_present_base_tx_flags: 0,
                 open_tp_discards: Vec::new(),
+                open_func_tx: None,
                 working_unique_resp_id_table: Vec::new(),
                 active_unique_resp_id_table: Vec::new(),
                 unique_resp_filter_ids: Vec::new(),
@@ -6918,6 +6927,7 @@ mod tp20_broadcast_periodic_api_fence_tests {
             occupancy_epoch: 0,
             leaked_repeat_message_ids: Vec::new(),
             leaked_periodic_message_ids: Vec::new(),
+            p2p_filters: Default::default(),
             applied_analog_sample_rate: None,
             applied_analog_samples_per_reading: None,
             applied_analog_readings_per_msg: None,
@@ -9128,6 +9138,7 @@ mod rpc_cancel_com_primitive_broadcast_periodic_session_gate_tests {
             tester_present_state: TesterPresentState::None,
             tester_present_base_tx_flags: 0,
             open_tp_discards: Vec::new(),
+            open_func_tx: None,
             working_unique_resp_id_table: Vec::new(),
             active_unique_resp_id_table: Vec::new(),
             unique_resp_filter_ids: Vec::new(),
@@ -9165,6 +9176,7 @@ mod rpc_cancel_com_primitive_broadcast_periodic_session_gate_tests {
             occupancy_epoch: 0,
             leaked_repeat_message_ids: Vec::new(),
             leaked_periodic_message_ids: Vec::new(),
+            p2p_filters: Default::default(),
             applied_analog_sample_rate: None,
             applied_analog_samples_per_reading: None,
             applied_analog_readings_per_msg: None,
@@ -10032,6 +10044,7 @@ mod copt_stopcomm_cancel_all_cancelled_cops_tests {
                 tester_present_state: TesterPresentState::None,
                 tester_present_base_tx_flags: 0,
                 open_tp_discards: Vec::new(),
+                open_func_tx: None,
                 working_unique_resp_id_table: Vec::new(),
                 active_unique_resp_id_table: Vec::new(),
                 unique_resp_filter_ids: Vec::new(),
@@ -10091,6 +10104,7 @@ mod copt_stopcomm_cancel_all_cancelled_cops_tests {
                 occupancy_epoch: 0,
                 leaked_repeat_message_ids: Vec::new(),
                 leaked_periodic_message_ids: Vec::new(),
+                p2p_filters: Default::default(),
                 applied_analog_sample_rate: None,
                 applied_analog_samples_per_reading: None,
                 applied_analog_readings_per_msg: None,

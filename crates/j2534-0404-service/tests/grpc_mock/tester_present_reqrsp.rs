@@ -1128,6 +1128,15 @@ async fn reqrsp_1_mode_0_rearms_and_retargets_on_table_reorder_that_changes_tx_d
     start_comm(&mut client, cll_handle).await;
     wait_for_cop_finished(&mut events).await;
     wait_for_written_count(&server, MOCK_CHANNEL_ID, 1).await;
+    // ADR-419: the arm-time send expects a response, so it holds the channel
+    // until it is answered (ISO 22900-2:2022 8.1.3 Table 1), and the
+    // reorder-triggered re-arm's send below waits for that. Answer it from the
+    // old target, as that ECU would.
+    server.backdoor.inject_rx(
+        MOCK_CHANNEL_ID,
+        &can_frame(0x7E8, &[0x7E, 0x00]),
+        j2534_0404::ISO15765,
+    );
 
     // Reorder the live table: entry 2 (0x7E9, phys 0x7E1) is now first. Its
     // CP_CanPhysReqId (0x7E1) differs from entry 1's (0x7E0), so
@@ -1167,6 +1176,9 @@ async fn reqrsp_1_mode_0_rearms_and_retargets_on_table_reorder_that_changes_tx_d
         "the re-arm should have sent a new tester-present frame addressed via the new first \
          entry's CP_CanPhysReqId"
     );
+    // A receive-only monitor makes a frame that is NOT taken for the
+    // tester-present visible as `ResultData`.
+    arm_receive_only_monitor(&mut client, cll_handle).await;
     // Entry 2's CAN ID (0x7E9) -- the NEW frozen target -- should now be
     // discarded.
     server.backdoor.inject_rx(
@@ -1184,28 +1196,24 @@ async fn reqrsp_1_mode_0_rearms_and_retargets_on_table_reorder_that_changes_tx_d
          target after the reorder-triggered re-arm"
     );
 
-    // Entry 1's CAN ID (0x7E8) -- the OLD target -- should ALSO still be
-    // discarded (ADR-137 fourth Codex-review fix / round-4 restructure): the
-    // arm-time send's own window (generous 5s CP_P2Max, still open) is an
-    // independently elicited discard candidate in
-    // `LogicalLinkState.open_tp_discards`, not a single slot the
-    // reorder-triggered re-arm's own write-back silently overwrote.
+    // Entry 1's CAN ID (0x7E8) -- the OLD target. ADR-137's round-4 list kept
+    // the arm-time send's window as an independent entry; since ADR-419 that
+    // entry ended with the answer injected above (and the new send's entry
+    // with the 0x7E9 answer), so this frame is no tester-present traffic any
+    // more and the monitor receives it.
     server.backdoor.inject_rx(
         MOCK_CHANNEL_ID,
         &can_frame(0x7E8, &[0x7E, 0x00]),
         j2534_0404::ISO15765,
     );
     assert!(
-        !wait_for_event(&mut events, 300, |item| matches!(
+        wait_for_event(&mut events, 2000, |item| matches!(
             item.data,
             Some(event_item::Data::ResultData(_))
         ))
         .await,
-        "entry 1's frame must still be discarded after the reorder-triggered re-arm -- it was \
-         the target of the arm-time send, whose own still-open discard window is an \
-         independently elicited entry in LogicalLinkState.open_tp_discards (ADR-137 fourth \
-         Codex-review fix / round-4 restructure), not a single slot the fresh re-arm silently \
-         overwrites"
+        "entry 1's frame arrives after the arm-time send's entry ended with its answer, so it is \
+         no tester-present traffic any more and must be delivered to the monitor"
     );
 
     drop(events);
@@ -1952,16 +1960,16 @@ async fn reqrsp_1_discards_som_herald_of_response() {
 /// deliberately leaves the `UniqueRespIdTable` EMPTY.
 ///
 /// This is the only way to actually exercise `tx_can_id`-gated TX-side
-/// discard in this harness: `route_frame` only routes a CAN ID that is a
-/// UniqueRespIdTable entry's own `CP_CanRespUSDTId`/`CP_CanRespUUDTId` (or,
-/// with an empty table, routes every CAN ID unconditionally with
-/// `unique_resp_identifier = 0`, ADR-007's no-table wildcard mode) --
-/// tester-present's own TX CAN ID (`framed_data`'s leading 4 bytes,
-/// `CP_CanFuncReqId` here) is never itself a table entry, so a physically
-/// addressed CLL WITH a table (e.g. `create_routed_cll`) would have any
-/// frame on its own phys-req CAN ID dropped by routing before it ever
-/// reaches the tester-present discard check at all -- unrelated to whether
-/// the fix under test works. Leaving the table empty routes every CAN ID
+/// discard in this harness: `route_frame` routes a CAN ID only when it is a
+/// UniqueRespIdTable entry's own `CP_CanRespUSDTId`/`CP_CanRespUUDTId`, or,
+/// for a TX-side frame, its normally addressed `CP_CanPhysReqId`
+/// (ADR-352); with an empty table it routes every CAN ID unconditionally
+/// with `unique_resp_identifier = 0` (ADR-007's no-table wildcard mode).
+/// Tester-present's own TX CAN ID here (`framed_data`'s leading 4 bytes,
+/// `CP_CanFuncReqId`) is never a table key, so a CLL WITH a table would
+/// have a frame on it dropped by routing before it ever reaches the
+/// tester-present discard check at all -- unrelated to whether the fix
+/// under test works. Leaving the table empty routes every CAN ID
 /// unconditionally, letting a frame on `CP_CanFuncReqId` actually reach
 /// `poll_rx_inner`'s discard logic.
 async fn create_functional_no_table_cll(

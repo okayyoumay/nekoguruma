@@ -76,8 +76,9 @@ impl ApplicationLayer {
 
 /// UDS's read-only services: ReadDTCInformation and ReadDataByIdentifier, which change nothing
 /// on the ECU. TesterPresent is left out: it keeps the ECU's current session alive, which a job
-/// may only do once it owns that session.
-pub const UDS_READ_ONLY_SERVICES: &[u8] = &[0x19, 0x22];
+/// may only do once it owns that session. The list is `diag_ir`'s, which the converters check
+/// identification reads against too (ADR-327 item 1).
+pub const UDS_READ_ONLY_SERVICES: &[u8] = diag_ir::UDS_READ_ONLY_SERVICES;
 
 /// The most a job may get in this build, before the VCI behind the worker is known: the
 /// simulator permission in a debug build, read-only in a release build (ADR-247). The
@@ -173,6 +174,28 @@ pub fn check_request(
     }
 }
 
+/// The one request an identification job's functional presence request may be (ADR-327 item 2,
+/// ADR-396): TesterPresent (ISO 14229-1:2026 clause 9.7 service 0x3E) with sub-function zero and
+/// the positive response suppressed bit clear, so every ECU that is there answers it.
+pub const PRESENCE_REQUEST: [u8; 2] = [0x3E, 0x00];
+
+/// Whether `request` may be sent as a presence request on a link carrying `layer`: exactly
+/// [`PRESENCE_REQUEST`], on UDS. [`check_request`] still refuses TesterPresent for every other
+/// path; the host's `presence` is the only caller that sends it (ADR-396). The link's permission
+/// does not matter: a presence request changes nothing on the ECU.
+pub fn check_presence_request(
+    request: &[u8],
+    layer: Option<ApplicationLayer>,
+) -> Result<(), HostError> {
+    if layer == Some(ApplicationLayer::Uds) && request == PRESENCE_REQUEST {
+        Ok(())
+    } else {
+        Err(HostError::NotAllowed(
+            request.first().copied().map_or(0, u16::from),
+        ))
+    }
+}
+
 /// The first instruction of `program` the runner would refuse: its pc and why. `variant` is the
 /// job's document's, which gives a `SendReceive`'s SID (ADR-322 item 1) and the application
 /// layer the SIDs are judged by ([`ApplicationLayer::of_job`]); without one, every
@@ -227,6 +250,7 @@ pub fn check_program(
             | Op::HmiRequestFromStack { .. }
             | Op::RecordInput { .. }
             | Op::MonitorCapture { .. }
+            | Op::SelectTarget { .. }
             | Op::Log { .. } => None,
             Op::PushI64(_)
             | Op::PushF64(_)
@@ -362,6 +386,39 @@ mod tests {
         }
     }
 
+    /// ADR-396: only `3E 00` on UDS is a presence request, and `check_request` keeps refusing
+    /// TesterPresent to every other path on a read-only link.
+    #[test]
+    fn only_the_presence_request_may_be_a_presence_request() {
+        check_presence_request(&[0x3E, 0x00], UDS).unwrap();
+        for request in [
+            &[0x3E, 0x80][..],
+            &[0x3E],
+            &[0x3E, 0x00, 0x00],
+            &[0x22, 0xF1, 0x90],
+            &[0x3E, 0x01],
+        ] {
+            let refused = check_presence_request(request, UDS);
+            assert!(
+                matches!(refused, Err(HostError::NotAllowed(sid)) if u16::from(request[0]) == sid),
+                "{request:02x?}: {refused:?}"
+            );
+        }
+        assert!(matches!(
+            check_presence_request(&[0x3E, 0x00], None),
+            Err(HostError::NotAllowed(0x3E))
+        ));
+        assert!(matches!(
+            check_presence_request(&[], UDS),
+            Err(HostError::NotAllowed(0))
+        ));
+        // The general check does not let it through on a read-only link.
+        assert!(matches!(
+            check_request(&[0x3E, 0x00], UDS, READ_ONLY),
+            Err(HostError::NotAllowed(0x3E))
+        ));
+    }
+
     fn protocol(layer: Option<&str>) -> diag_ir::declaration::ProtocolT {
         let mut protocol = crate::document::tests::uds_on_can();
         protocol.application_layer = layer.map(Into::into);
@@ -449,6 +506,7 @@ mod tests {
             identity: Default::default(),
             preconditions: Default::default(),
             flash: Vec::new(),
+            targets: Vec::new(),
         }
     }
 

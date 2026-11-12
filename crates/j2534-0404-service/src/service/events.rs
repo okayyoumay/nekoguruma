@@ -48,10 +48,10 @@ use super::{
     SYSTEM_SUBSCRIPTION_KEY, SendRecvTx, SessionTimingConfig, SoftIsoTpTx, StatusEvent,
     SubscriptionKey, SubscriptionSender, TerminalCopsLedger, TesterPresentState,
     TesterPresentTargetCanIds, TimingAccumulator, TimingChangeConfig, Tp20BroadcastPeriodic,
-    Tp20Connection, Tp20ConnectionOutcome, Tp20ConnectionPhase, TrackedError, TrackedStatus,
-    TxGapState, TxItem, comparam_defaults, comparam_support, expand_tidle, expand_uart_config,
-    find_physical_lock_holder, isotp, recompute_lock_tx_suspensions, resources, rpc_primitive,
-    to_j2534_config_value, tx_header,
+    Tp20Connection, Tp20ConnectionOutcome, Tp20ConnectionPhase, TpHold, TrackedError,
+    TrackedStatus, TxGapState, TxItem, comparam_defaults, comparam_support, expand_tidle,
+    expand_uart_config, find_physical_lock_holder, isotp, recompute_lock_tx_suspensions, resources,
+    rpc_primitive, to_j2534_config_value, tx_header,
 };
 use isotp::Addressing;
 
@@ -413,6 +413,9 @@ async fn handle_channel_hard_error(channel_id: ChannelId, ctx: &ChannelPollCtx) 
     // deliberately not removed here.
     if let Some(sc) = chans.values_mut().find(|sc| sc.channel_id == channel_id) {
         sc.dead = true;
+        // ADR-398: the filters died with the channel; the links drop their
+        // keys below, so a later disconnect gives nothing back to it.
+        sc.p2p_filters.clear();
     }
     let (cll_handles, wake_targets) = {
         let mut links = logical_links.lock().await;
@@ -439,11 +442,13 @@ async fn handle_channel_hard_error(channel_id: ChannelId, ctx: &ChannelPollCtx) 
                     timestamp: module_timestamp_us(),
                     cop: None,
                     cop_tag: None,
+                    name: None,
                 });
                 l.comm_started = false;
                 l.stop_comm_pending = false;
                 if l.channel_id == Some(channel_id) {
                     l.channel_id = None;
+                    l.unique_resp_filter_ids.clear();
                 }
                 if l.uudt_channel_id == Some(channel_id) {
                     l.uudt_channel_id = None;
@@ -680,6 +685,7 @@ async fn handle_channel_hard_error(channel_id: ChannelId, ctx: &ChannelPollCtx) 
             timestamp: module_timestamp_us(),
             cop: None,
             cop_tag: None,
+            name: None,
         };
     }
     send_module_status(
@@ -793,7 +799,7 @@ enum RxEntryKind {
 /// (ADR-101 Decision §A) to compute this pass's own delta contribution --
 /// never read anywhere else, and deliberately not folded into
 /// `CopRegistrant` (see `CllRxEntry::registrant_baselines`'s doc comment).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct RegistrantBaseline {
     cop_handle: u32,
     matches_got: u32,
@@ -801,6 +807,9 @@ struct RegistrantBaseline {
     /// `CopRegistrant::concat_segments_got` at pass start -- merged the same
     /// delta way as `matches_got` (ADR-148). Always `0` for a non-concat registrant.
     concat_segments_got: u32,
+    /// `CopRegistrant::som_started` at pass start, so the writeback merge can
+    /// tell this pass's own change from a carried-forward value.
+    som_started: Vec<u32>,
     /// `CopRegistrant::timing_accumulator` at pass start (ADR-150) -- used by
     /// `merge_registrant_writeback`'s baseline guard to distinguish "this
     /// pass's own snapshot actually changed the accumulator" from "this
@@ -1032,6 +1041,11 @@ struct CllRxEntry {
     /// the first: each entry is an independently elicited send, not a
     /// precedence chain.
     tester_present_discard: Vec<TesterPresentDiscard>,
+    /// What `bind_frame` observed this pass about outstanding tester-present
+    /// sends that hold the channel, in frame order (ADR-419). Applied to the
+    /// live `open_tp_discards` in the end-of-pass critical section, keyed by
+    /// the entry's signature.
+    tp_settlements: Vec<TpSettlement>,
     /// `CP_SuspendQueueOnError` (ADR-147) bind-time classification, folded
     /// across this whole poll pass by `bind_frame`/`bind_registrant` with
     /// last-frame-wins semantics -- `None` means no frame this pass produced
@@ -1082,6 +1096,12 @@ struct CllRxEntry {
     /// least as correct as a later one, and strictly more resilient against
     /// this exact removal race.
     cop_tags: HashMap<u32, Vec<u8>>,
+    /// Snapshot of `LogicalLinkState::open_func_tx` (ADR-421): the CAN ID of
+    /// the functional request whose receive phase this link is in, so that
+    /// `route_frame_with_role` routes that request's transmit indication
+    /// (a TX-side frame on this ID) to this link although the table names no
+    /// row for the functional ID. `None` outside such a phase.
+    func_tx_can_id: Option<u32>,
 }
 
 impl CllRxEntry {
@@ -1174,6 +1194,10 @@ struct TesterPresentDiscard {
     /// `None` here therefore means arm (c) never fires at all -- see the `is_some_and`
     /// (not `is_none_or`) check at its use site.
     tx_can_id: Option<u32>,
+    /// The originating entry's hold state (ADR-419), `None` for an entry that
+    /// does not hold the channel. `bind_frame` classifies a content match
+    /// against it into a [`TpSettlement`].
+    hold: Option<TpHold>,
 }
 
 /// The `TesterPresentDiscard`/`ResidualTesterPresentDiscard` `tx_can_id`
@@ -1233,20 +1257,311 @@ fn push_open_tp_discard(
     now: tokio::time::Instant,
     entry: Option<ResidualTesterPresentDiscard>,
 ) {
-    open_tp_discards.retain(|r| now < r.window.until);
+    // ADR-419: an entry that holds the channel (`TpHold`) outlives its own
+    // `until`; only a settled answer or `sweep_expired_tp_holds` removes it,
+    // since the expiry of a hold must report a missing answer. Every other
+    // entry prunes at `until` as before.
+    open_tp_discards.retain(|r| r.holds_bus() || now < r.window.until);
     if let Some(entry) = entry {
         if let Some(existing) = open_tp_discards.iter_mut().find(|r| {
             r.window.pos == entry.window.pos
                 && r.window.neg == entry.window.neg
                 && r.target_can_ids == entry.target_can_ids
                 && r.tx_can_id == entry.tx_can_id
+                && r.holds_bus() == entry.holds_bus()
         }) {
-            existing.window.until = existing.window.until.max(entry.window.until);
+            if entry.holds_bus() {
+                // A new send of a holding signature starts a new exchange:
+                // its frozen settings and pending state replace the old
+                // entry's (the old one was not settled, which the hold makes
+                // possible only for a send that bypassed it).
+                *existing = entry;
+            } else {
+                existing.window.until = existing.window.until.max(entry.window.until);
+            }
         } else {
             open_tp_discards.push(entry);
         }
     }
 }
+
+/// Builds the entry a successful tester-present send pushes (ADR-419): the
+/// ADR-099 window plus, when the send expected an answer, its hold state.
+/// `can_functional` classifies the send (`None`, an unresolved addressing as
+/// on K-line and J1850, counts as physical).
+fn tester_present_discard_entry(
+    window: DiscardWindow,
+    target_can_ids: Option<TesterPresentTargetCanIds>,
+    tx_can_id: Option<u32>,
+    can_functional: Option<bool>,
+    expects_response: bool,
+    rc_cfg: &RcHandlingConfig,
+) -> ResidualTesterPresentDiscard {
+    ResidualTesterPresentDiscard {
+        window,
+        target_can_ids,
+        tx_can_id,
+        hold: expects_response.then(|| TpHold {
+            physical: can_functional != Some(true),
+            rc_cfg: rc_cfg.clone(),
+            first_pending_at: None,
+            got_response: false,
+        }),
+    }
+}
+
+/// What the ISO-TP send loops pass to `dispatch_due_tester_present` while a
+/// segmented send is on the wire (ADR-419): a physical exchange that expects
+/// an answer, so a physical tester-present waits and only a functional one
+/// without an answer is dispatched there (as ADR-095 already confines it).
+const IN_FLIGHT_SEND: Option<InlineWait> = Some(InlineWait {
+    hold: Some(Outstanding {
+        functional: false,
+        cyclic_before_first: false,
+    }),
+});
+
+/// The [`InlineWait`] of one receive phase: always an inline wait (so
+/// dispatches made from it defer), and holding the channel only when a request
+/// is outstanding (not for a COP created receive only, IS-MULTIPLE included).
+fn inline_wait_for(
+    created_receive_only: bool,
+    can_functional: Option<bool>,
+    num_receive_cycles: i32,
+) -> InlineWait {
+    InlineWait {
+        hold: (!created_receive_only).then_some(Outstanding {
+            functional: can_functional == Some(true),
+            cyclic_before_first: num_receive_cycles == -1,
+        }),
+    }
+}
+
+/// The poll task is inside its own inline wait (ADR-083), so a dispatch made
+/// from it must never poll RX itself or wait, whether or not the wait has an
+/// exchange outstanding. `hold` is that exchange for Table 1 (ADR-419); it is
+/// `None` for a wait with no request outstanding (a COP created receive only,
+/// IS-MULTIPLE included).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct InlineWait {
+    pub(super) hold: Option<Outstanding>,
+}
+
+/// An exchange outstanding on the shared channel, as ISO 22900-2:2022 8.1.3
+/// Table 1 sees it (ADR-419): either the poll task's own inline response
+/// wait (a client primitive with a receive phase) or a tester-present send
+/// that expects an answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Outstanding {
+    /// Functionally addressed. Unresolved addressing counts as physical.
+    pub(super) functional: bool,
+    /// An IS-CYCLIC (`NumReceiveCycles == -1`) client primitive that has not
+    /// had its first response yet. Table 1's note keeps a physical one from
+    /// letting a functional send without response go ahead.
+    pub(super) cyclic_before_first: bool,
+}
+
+/// The send that asks whether the bus is clear (ADR-419).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NextSend {
+    functional: bool,
+    with_response: bool,
+}
+
+/// The per-channel Table 1 rule (ADR-419): whether `next` must wait for the
+/// completion of `prev`, an outstanding exchange that expects an answer.
+///
+/// - After a functional exchange everything waits for it to end (its window).
+/// - After a physical exchange a physical send waits, and so does a
+///   functional send that expects an answer.
+/// - A functional send without an answer goes ahead of a physical exchange,
+///   except while the latter is an IS-CYCLIC client primitive that has had no
+///   response yet (the table's note).
+///
+/// An exchange that expects no answer never reaches this function: the
+/// P3Phys/P3Func timing of ADR-060 governs what follows it.
+fn bus_hold(prev: Outstanding, next: NextSend) -> bool {
+    if prev.functional {
+        return true;
+    }
+    if !next.functional || next.with_response {
+        return true;
+    }
+    prev.cyclic_before_first
+}
+
+/// One answer-side observation of an outstanding tester-present send that
+/// `bind_frame` made at step 3 (ADR-419), applied to the live entry in frame
+/// order at the end of the poll pass.
+#[derive(Debug, Clone)]
+struct TpSettlement {
+    /// The entry's signature (as `push_open_tp_discard` dedups on it).
+    pos: Vec<u8>,
+    neg: Vec<u8>,
+    target_can_ids: Option<TesterPresentTargetCanIds>,
+    tx_can_id: Option<u32>,
+    at: tokio::time::Instant,
+    kind: TpSettleKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TpSettleKind {
+    /// A pending response (NRC 0x78 with `CP_RC78Handling`): reloads the window.
+    Pending,
+    Positive,
+    /// A negative answer other than a handled pending one.
+    Negative,
+}
+
+/// Applies one [`TpSettlement`] to the live entry it names (ADR-419).
+/// Returns `true` when the settlement ends a physical send with a negative
+/// answer while the link's tester-present is still armed (`armed`), which the
+/// caller reports as `PduErrEvtTesterPresentError`. A settlement whose entry
+/// is already gone (settled earlier, swept, cleared) does nothing.
+fn apply_tp_settlement(
+    list: &mut Vec<ResidualTesterPresentDiscard>,
+    settlement: &TpSettlement,
+    armed: bool,
+) -> bool {
+    let Some(idx) = list.iter().position(|e| {
+        e.holds_bus()
+            && e.window.pos == settlement.pos
+            && e.window.neg == settlement.neg
+            && e.target_can_ids == settlement.target_can_ids
+            && e.tx_can_id == settlement.tx_can_id
+    }) else {
+        return false;
+    };
+    let entry = &mut list[idx];
+    let Some(hold) = entry.hold.as_mut() else {
+        return false;
+    };
+    match settlement.kind {
+        TpSettleKind::Pending => {
+            // ADR-102's reload: `CP_P2Star` from this response, clamped to the
+            // completion ceiling anchored at the first pending response.
+            let first = *hold.first_pending_at.get_or_insert(settlement.at);
+            let mut until =
+                settlement.at + Duration::from_millis(hold.rc_cfg.rc78_p2_star_ms as u64);
+            if let Some(ceiling_ms) = hold.rc_cfg.rc78_total_ceiling_ms {
+                until = until.min(first + Duration::from_millis(ceiling_ms as u64));
+            }
+            // A functional send is answered by several ECUs, so a pending
+            // answer from one never shortens a window another has extended;
+            // a physical send follows ADR-102 exactly (reload, ceiling).
+            entry.window.until = if hold.physical {
+                until
+            } else {
+                until.max(entry.window.until)
+            };
+            false
+        }
+        TpSettleKind::Positive => {
+            if hold.physical {
+                list.remove(idx);
+            } else {
+                hold.got_response = true;
+            }
+            false
+        }
+        TpSettleKind::Negative => {
+            if hold.physical {
+                list.remove(idx);
+                armed
+            } else {
+                false
+            }
+        }
+    }
+}
+
+/// Removes the holding entries whose window has ended and returns how many of
+/// them leave a send without its answer to report (ADR-419): only while the
+/// link's tester-present is still `armed`, and for a functional send only if
+/// no positive answer came. A disarm or CoptStopcomm after the send leaves
+/// its expiry silent. `drained_past(until)` says whether every channel that
+/// serves the entry's link (the primary and, with a UUDT companion, the
+/// companion too) completed an exhaustive RX drain at or after `until`.
+fn sweep_expired_holds(
+    list: &mut Vec<ResidualTesterPresentDiscard>,
+    now: tokio::time::Instant,
+    armed: bool,
+    drained_past: &dyn Fn(tokio::time::Instant) -> bool,
+) -> usize {
+    let mut missing = 0;
+    list.retain(|e| match &e.hold {
+        // An answer that arrived in time but is read one poll late must still
+        // settle the entry, so an expired entry goes only once a drained poll
+        // ran at or after its `until` (`drained_past`, the ADR-101 Decision §E
+        // watermark test).
+        Some(hold) if now >= e.window.until && drained_past(e.window.until) => {
+            if armed && !hold.got_response {
+                missing += 1;
+            }
+            false
+        }
+        _ => true,
+    });
+    missing
+}
+
+/// The per-tick sweep of [`sweep_expired_holds`] over this channel's links,
+/// raising `PduErrEvtTesterPresentError` for each send that ended without an
+/// answer (ADR-419).
+async fn sweep_expired_tp_holds(ctx: &ChannelPollCtx) {
+    let now = tokio::time::Instant::now();
+    let watermarks = ctx.drain_watermarks.lock().await.clone();
+    let mut missing: Vec<u32> = Vec::new();
+    {
+        let mut links = ctx.logical_links.lock().await;
+        for (&cll_handle, link) in links.iter_mut() {
+            if link.channel_id != Some(ctx.channel_id) || link.open_tp_discards.is_empty() {
+                continue;
+            }
+            let armed = matches!(link.tester_present_state, TesterPresentState::Armed { .. });
+            let primary = watermarks.get(&ctx.channel_id).copied();
+            let companion = link.uudt_channel_id;
+            let uudt = companion.and_then(|id| watermarks.get(&id).copied());
+            let drained_past = |until: tokio::time::Instant| {
+                primary.is_some_and(|wm| wm >= until)
+                    && (companion.is_none() || uudt.is_some_and(|wm| wm >= until))
+            };
+            let n = sweep_expired_holds(&mut link.open_tp_discards, now, armed, &drained_past);
+            missing.extend(std::iter::repeat_n(cll_handle, n));
+        }
+    }
+    for cll_handle in missing {
+        send_error_event(
+            &ctx.subscriptions,
+            &ctx.logical_links,
+            cll_handle,
+            PduErrorEvent::PduErrEvtTesterPresentError,
+            None,
+        )
+        .await;
+    }
+}
+
+/// Whether a tester-present send that expects an answer, outstanding on this
+/// channel, holds `next` back (ADR-419).
+async fn tp_hold_blocks(ctx: &ChannelPollCtx, next: NextSend) -> bool {
+    let links = ctx.logical_links.lock().await;
+    links
+        .values()
+        .filter(|l| l.channel_id == Some(ctx.channel_id))
+        .flat_map(|l| l.open_tp_discards.iter())
+        .filter_map(|e| e.hold.as_ref())
+        .any(|h| {
+            bus_hold(
+                Outstanding {
+                    functional: !h.physical,
+                    cyclic_before_first: false,
+                },
+                next,
+            )
+        })
+}
+
 #[path = "events_rx_routing.rs"]
 mod rx_routing;
 use rx_routing::*;
@@ -1351,6 +1666,7 @@ async fn process_frame_for_entry(
     frame: FrameRouteContext,
     data: &[u8],
     is_tx_side: bool,
+    notes: &mut Vec<IsoTpRxNote>,
 ) -> Vec<(Vec<u8>, u32, bool, bool)> {
     match &entry.kind {
         RxEntryKind::Hardware { native_mixed, .. }
@@ -1480,6 +1796,20 @@ async fn process_frame_for_entry(
             let now = Instant::now();
             match isotp::parse_frame(payload, rx_addressing) {
                 Some(isotp::Frame::Single { payload }) => {
+                    // A single frame ends any unfinished message from this
+                    // response ID (ISO 15765-2:2024 9.8.3) like a first frame
+                    // that replaces it: dropped and raised as
+                    // `ISO15765_UNEXPECTED_PDU`, so the N_Cr sweep does not
+                    // report a message the ECU already ended. One already
+                    // past N_Cr is raised first as `CF_TIMEOUT`, as there.
+                    let mut reassembly = ctx.reassembly.lock().await;
+                    notes.extend(end_unfinished_reassembly(
+                        &mut reassembly,
+                        &reassembly_key,
+                        now,
+                        is_tx_side,
+                    ));
+                    drop(reassembly);
                     let mut msg = can_id.to_be_bytes().to_vec();
                     msg.extend_from_slice(payload);
                     vec![(msg, uid, false, false)]
@@ -1532,19 +1862,37 @@ async fn process_frame_for_entry(
                         );
                     }
                     let mut reassembly = ctx.reassembly.lock().await;
-                    // Purge reassemblies whose N_Cr expired without a final
-                    // CF, so abandoned transfers don't accumulate.
-                    reassembly.retain(|_, r| !r.is_expired(now));
                     // ADR-222: keyed by (can_id, canonical width), not can_id
                     // alone -- see `IsoTpRxContext::reassembly`'s and
                     // `CanIdWidthGate::reassembly_key_width`'s own doc
                     // comments for why this uses `reassembly_key` (the
                     // matched entry's own gate), never the raw
                     // `frame.frame_is_29bit` bit.
-                    reassembly.insert(
-                        reassembly_key,
-                        isotp::Reassembly::start(total_len, payload, now, ctx.n_cr),
-                    );
+                    // Reassemblies whose N_Cr expired without a final CF raise
+                    // their failure first, so abandoned transfers don't
+                    // accumulate (`raise_expired_reassemblies` sweeps the rest
+                    // each poll pass). A first frame that replaces an
+                    // unfinished one raises `ISO15765_UNEXPECTED_PDU` for the
+                    // replaced message, bound to the COP recorded at its own
+                    // first frame (ISO 15765-2:2024 9.8.3). A failure of this
+                    // message binds to the COP waiting on this response ID
+                    // now, if only one does (ADR-351). The echo of this
+                    // service's own request starts no response.
+                    notes.extend(end_unfinished_reassembly(
+                        &mut reassembly,
+                        &reassembly_key,
+                        now,
+                        is_tx_side,
+                    ));
+                    let mut started = isotp::Reassembly::start(total_len, payload, now, ctx.n_cr);
+                    if is_tx_side {
+                        started.tx_echo = true;
+                    } else {
+                        started.waiting_cop =
+                            sole_waiting_cop(&entry.registrants, entry.connect_generation, uid);
+                        notes.push(IsoTpRxNote::Started(uid));
+                    }
+                    reassembly.insert(reassembly_key, started);
                     Vec::new()
                 }
                 Some(isotp::Frame::Consecutive {
@@ -1572,12 +1920,23 @@ async fn process_frame_for_entry(
                                 sequence_number,
                                 "software ISO-TP: wrong ConsecutiveFrame sequence; reassembly aborted"
                             );
+                            let (waiting_cop, tx_echo) = (state.waiting_cop, state.tx_echo);
                             reassembly.remove(&key);
+                            if !tx_echo {
+                                notes.push(frame_structure_failure(
+                                    ISO15765_FRAME_NUM_NAME,
+                                    waiting_cop,
+                                ));
+                            }
                             Vec::new()
                         }
                         isotp::ReassemblyStep::TimedOut => {
                             warn!(can_id, "software ISO-TP: N_Cr expired; reassembly aborted");
+                            let (waiting_cop, tx_echo) = (state.waiting_cop, state.tx_echo);
                             reassembly.remove(&key);
+                            if !tx_echo {
+                                notes.push(n_cr_expired(waiting_cop));
+                            }
                             Vec::new()
                         }
                     }
@@ -3575,8 +3934,13 @@ fn bind_frame(
     // sends) -- a match against ANY entry discards the frame; this is not a
     // first-match-wins scan, since every entry is an independently elicited
     // send.
-    if concat_meta.rx_status_flags & RX_BREAK as u8 == 0
-        && entry.tester_present_discard.iter().any(|discard| {
+    //
+    // ADR-419: the scan also settles the first holding entry that a content
+    // frame matches (a loop instead of `any`, so the whole list is visited).
+    let mut tp_matched = false;
+    if concat_meta.rx_status_flags & RX_BREAK as u8 == 0 {
+        let mut settled_hold = false;
+        for discard in &entry.tester_present_discard {
             let resp_can_id_ok = discard.target_can_ids.is_none_or(|ids| {
                 frame_ctx
                     .frame_can_id
@@ -3597,9 +3961,42 @@ fn bind_frame(
                 && discard
                     .tx_can_id
                     .is_some_and(|id| frame_ctx.frame_can_id == Some(id));
-            content_match || som_herald_match || tx_side_match
-        })
-    {
+            if content_match || som_herald_match || tx_side_match {
+                tp_matched = true;
+            }
+            if content_match
+                && !settled_hold
+                && let Some(hold) = &discard.hold
+            {
+                settled_hold = true;
+                let pos_match =
+                    !discard.pos.is_empty() && frame_ctx.payload.starts_with(&discard.pos);
+                let neg_match =
+                    !discard.neg.is_empty() && frame_ctx.payload.starts_with(&discard.neg);
+                let pending = neg_match
+                    && hold
+                        .rc_cfg
+                        .detect_pending_rc(frame_ctx.payload, concat_meta.raw_prefix)
+                        == Some(0x78);
+                let kind = if pending {
+                    TpSettleKind::Pending
+                } else if pos_match {
+                    TpSettleKind::Positive
+                } else {
+                    TpSettleKind::Negative
+                };
+                entry.tp_settlements.push(TpSettlement {
+                    pos: discard.pos.clone(),
+                    neg: discard.neg.clone(),
+                    target_can_ids: discard.target_can_ids,
+                    tx_can_id: discard.tx_can_id,
+                    at: tokio::time::Instant::now(),
+                    kind,
+                });
+            }
+        }
+    }
+    if tp_matched {
         return FrameBinding::TesterPresent;
     }
 
@@ -3698,6 +4095,288 @@ fn bind_frame(
 /// this is called.
 fn resolve_frame_cop_tag(entry: &CllRxEntry, cop_handle: Option<u32>) -> Option<Vec<u8>> {
     cop_handle.and_then(|h| entry.cop_tags.get(&h).cloned())
+}
+
+/// Name of the frame-structure error raised for a frame the adapter tagged
+/// `ISO15765_PADDING_ERROR` on a native ISO 15765 channel (ISO 22900-2:2022
+/// Table D.8; ADR-351).
+pub(super) const ISO15765_PADDING_NAME: &str = "ISO15765_PADDING";
+
+/// Name of the receive timeout raised for a response that began (a
+/// start-of-message indication arrived) but did not complete before the
+/// receive deadline on a native ISO 15765 channel (ISO 22900-2:2022
+/// Table D.8; ADR-351).
+pub(super) const ISO15765_CF_TIMEOUT_NAME: &str = "ISO15765_CF_TIMEOUT";
+
+/// Names of the transmit-side errors of the software ISO-TP sender (ADR-046,
+/// ADR-351): no FlowControl frame within N_Bs (ISO 22900-2:2022 Table D.8's
+/// name), more FS_WAIT frames than the defensive bound (Table D.8's
+/// `MAX_WAIT_FRAME`), and an FS_OVERFLOW frame (a name of this worker's own;
+/// Table D.8 gives none for it).
+pub(super) const ISO15765_FC_TIMEOUT_NAME: &str = "ISO15765_FC_TIMEOUT";
+pub(super) const MAX_WAIT_FRAME_NAME: &str = "MAX_WAIT_FRAME";
+pub(super) const ISO15765_FC_OVERFLOW_NAME: &str = "ISO15765_FC_OVERFLOW";
+
+/// `true` when `entry` is a channel on which the adapter runs the ISO 15765
+/// transport (`dual-channel`, `single-channel`, `auto`, native mixed): not a
+/// software ISO-TP entry, not the UUDT companion, not plain CAN.
+fn is_native_iso15765_entry(entry: &CllRxEntry) -> bool {
+    matches!(entry.kind, RxEntryKind::Hardware { .. })
+        && entry.header_protocol == j2534_0404::ISO15765
+}
+
+/// Records that a message from `unique_resp_identifier` has started in every
+/// registrant of this connection that waits on it (the same URID test as
+/// `bind_registrant`'s positive scan, which never binds a registrant with no
+/// descriptors, and the same `connect_generation` check).
+/// `CopRegistrant::som_started`.
+fn note_start_of_message(
+    registrants: &mut [CopRegistrant],
+    connect_generation: u64,
+    unique_resp_identifier: u32,
+) {
+    for r in registrants {
+        if waits_on_response_id(r, connect_generation, unique_resp_identifier)
+            && !r.som_started.contains(&unique_resp_identifier)
+        {
+            r.som_started.push(unique_resp_identifier);
+        }
+    }
+}
+
+/// `true` when `r` waits on a response from `unique_resp_identifier` on the
+/// connection `connect_generation` (`note_start_of_message`'s test).
+fn waits_on_response_id(
+    r: &CopRegistrant,
+    connect_generation: u64,
+    unique_resp_identifier: u32,
+) -> bool {
+    r.connect_generation == connect_generation
+        && r.expected.iter().any(|e| {
+            e.unique_resp_ids.is_empty() || e.unique_resp_ids.contains(&unique_resp_identifier)
+        })
+}
+
+/// The one COP among `registrants` that waits on `unique_resp_identifier`,
+/// or `None` when none or more than one does: the COP a software ISO-TP
+/// reassembly failure is bound to (`isotp::Reassembly::waiting_cop`).
+fn sole_waiting_cop(
+    registrants: &[CopRegistrant],
+    connect_generation: u64,
+    unique_resp_identifier: u32,
+) -> Option<u32> {
+    let mut waiting = registrants
+        .iter()
+        .filter(|r| waits_on_response_id(r, connect_generation, unique_resp_identifier));
+    match (waiting.next(), waiting.next()) {
+        (Some(r), None) => Some(r.cop_handle),
+        _ => None,
+    }
+}
+
+/// What a software ISO-TP entry's reassembly reports to `poll_rx_inner`
+/// besides its deliveries (`process_frame_for_entry`).
+#[derive(Debug, PartialEq, Eq)]
+enum IsoTpRxNote {
+    /// A first frame from this response ID started a segmented message, so a
+    /// receive timeout of a COP waiting on it is named `ISO15765_CF_TIMEOUT`
+    /// until the message ends (`note_start_of_message`).
+    Started(u32),
+    /// A reassembly failed and was dropped: raise `error` named `name`, bound
+    /// to the COP recorded at the first frame if it still waits.
+    Failed {
+        error: PduErrorEvent,
+        name: &'static str,
+        waiting_cop: Option<u32>,
+    },
+}
+
+/// Name of the frame-structure error raised when a software ISO-TP
+/// consecutive frame carries an unexpected sequence number (ISO 15765-2:2024
+/// 9.6.4.4 aborts the reception; ISO 22900-2:2022 Table D.8's name).
+pub(super) const ISO15765_FRAME_NUM_NAME: &str = "ISO15765_FRAME_NUM";
+
+/// Name of the frame-structure error raised when a first or single frame
+/// arrives while a reassembly from the same response ID is unfinished (ISO
+/// 15765-2:2024 9.8.3 aborts the reception in progress and reports the
+/// unexpected frame upward). A name of this worker's own, like
+/// `ISO15765_FC_OVERFLOW`; ISO 22900-2:2022 Table D.8 gives none for it.
+pub(super) const ISO15765_UNEXPECTED_PDU_NAME: &str = "ISO15765_UNEXPECTED_PDU";
+
+/// The failure note of a reassembly aborted by `ISO15765_FRAME_NUM` or
+/// `ISO15765_UNEXPECTED_PDU`, recorded for `waiting_cop`.
+fn frame_structure_failure(name: &'static str, waiting_cop: Option<u32>) -> IsoTpRxNote {
+    IsoTpRxNote::Failed {
+        error: PduErrorEvent::PduErrEvtFrameStruct,
+        name,
+        waiting_cop,
+    }
+}
+
+/// Removes the unfinished reassembly under `key`, which a first or single
+/// frame from the same response ID has just replaced (ISO 15765-2:2024
+/// 9.8.3), returning its `ISO15765_UNEXPECTED_PDU` note. Nothing is raised
+/// when there was none or for the echo of this service's own request. A
+/// replacing frame that is itself that echo (`replaced_by_tx_side`, reachable
+/// only when the request and response CAN IDs are equal) drops a response
+/// reassembly without an error.
+fn take_replaced_reassembly(
+    reassembly: &mut HashMap<(u32, bool), isotp::Reassembly>,
+    key: &(u32, bool),
+    replaced_by_tx_side: bool,
+) -> Option<IsoTpRxNote> {
+    let replaced = reassembly.remove(key)?;
+    if replaced.tx_echo || replaced_by_tx_side {
+        return None;
+    }
+    warn!(
+        can_id = key.0,
+        "software ISO-TP: first or single frame replaced an unfinished reassembly; reassembly aborted"
+    );
+    Some(frame_structure_failure(
+        ISO15765_UNEXPECTED_PDU_NAME,
+        replaced.waiting_cop,
+    ))
+}
+
+/// What a first or single frame at `now` ends under `key`: every reassembly
+/// past N_Cr first (`ISO15765_CF_TIMEOUT`), then the one it replaces
+/// (`ISO15765_UNEXPECTED_PDU`). The order matters: an expired reassembly of
+/// the same response ID must be reported as the timeout it is.
+fn end_unfinished_reassembly(
+    reassembly: &mut HashMap<(u32, bool), isotp::Reassembly>,
+    key: &(u32, bool),
+    now: Instant,
+    replaced_by_tx_side: bool,
+) -> Vec<IsoTpRxNote> {
+    let mut notes = take_expired_reassemblies(reassembly, now);
+    notes.extend(take_replaced_reassembly(
+        reassembly,
+        key,
+        replaced_by_tx_side,
+    ));
+    notes
+}
+
+/// The failure note of a reassembly whose N_Cr expired before its next
+/// consecutive frame (ISO 15765-2:2024 9.8.2), recorded for `waiting_cop`.
+fn n_cr_expired(waiting_cop: Option<u32>) -> IsoTpRxNote {
+    IsoTpRxNote::Failed {
+        error: PduErrorEvent::PduErrEvtRxTimeout,
+        name: ISO15765_CF_TIMEOUT_NAME,
+        waiting_cop,
+    }
+}
+
+/// Removes every reassembly whose N_Cr has expired from `reassembly`,
+/// returning the failure note of each that is not an echo of a request.
+fn take_expired_reassemblies(
+    reassembly: &mut HashMap<(u32, bool), isotp::Reassembly>,
+    now: Instant,
+) -> Vec<IsoTpRxNote> {
+    let mut expired = Vec::new();
+    reassembly.retain(|_, r| {
+        let keep = !r.is_expired(now);
+        if !keep && !r.tx_echo {
+            expired.push(n_cr_expired(r.waiting_cop));
+        }
+        keep
+    });
+    expired
+}
+
+/// The COP a reassembly failure binds to: the one recorded at the first frame
+/// while it is still among `registrants`, with its tag from `cop_tags`.
+fn reassembly_failure_cop(
+    waiting_cop: Option<u32>,
+    registrants: &[CopRegistrant],
+    cop_tag: impl FnOnce(u32) -> Option<Vec<u8>>,
+) -> Option<ErrorCop> {
+    let cop_handle = waiting_cop.filter(|&h| registrants.iter().any(|r| r.cop_handle == h))?;
+    Some((cop_handle, cop_tag(cop_handle)))
+}
+
+/// Raises the error event of every software ISO-TP reassembly on `channel_id`
+/// whose N_Cr expired with no further frame: a consecutive frame that never
+/// comes reaches no frame path, so each poll pass sweeps for it. Under
+/// `logical_links`, each `isotp_rx` is taken and released in turn (the order
+/// `rpc_link.rs` uses), then `primitives` (as `build_cll_rx_entries`).
+async fn raise_expired_reassemblies(ctx: &ChannelPollCtx) {
+    let now = Instant::now();
+    let failures: Vec<(u32, IsoTpRxNote, Option<ErrorCop>)> = {
+        let links = ctx.logical_links.lock().await;
+        let mut expired = Vec::new();
+        for (&h, l) in links
+            .iter()
+            .filter(|(_, l)| l.software_isotp && l.channel_id == Some(ctx.channel_id))
+        {
+            for note in take_expired_reassemblies(&mut *l.isotp_rx.lock().await, now) {
+                expired.push((h, note));
+            }
+        }
+        if expired.is_empty() {
+            return;
+        }
+        let prims = ctx.primitives.lock().await;
+        expired
+            .into_iter()
+            .map(|(h, note)| {
+                let waiting_cop = match note {
+                    IsoTpRxNote::Failed { waiting_cop, .. } => waiting_cop,
+                    IsoTpRxNote::Started(_) => None,
+                };
+                let cop = reassembly_failure_cop(waiting_cop, &links[&h].registrants, |c| {
+                    prims.get(&c).and_then(|e| e.cop_tag.clone())
+                });
+                (h, note, cop)
+            })
+            .collect()
+    };
+    for (h, note, cop) in failures {
+        raise_reassembly_failure(ctx, h, note, cop).await;
+    }
+}
+
+/// Raises the error event of a software ISO-TP reassembly failure `note` on
+/// `cll_handle`, bound to `cop`; a `Started` note raises nothing.
+async fn raise_reassembly_failure(
+    ctx: &ChannelPollCtx,
+    cll_handle: u32,
+    note: IsoTpRxNote,
+    cop: Option<ErrorCop>,
+) {
+    if let IsoTpRxNote::Failed { error, name, .. } = note {
+        send_named_error_event(
+            &ctx.subscriptions,
+            &ctx.logical_links,
+            cll_handle,
+            error,
+            Some(name),
+            cop,
+        )
+        .await;
+    }
+}
+
+/// A content frame from `unique_resp_identifier` ended that sender's message
+/// (one sender has one segmented message in progress): drops the URID from
+/// every registrant's started set, whether the frame bound, was a pending-RC
+/// frame, or was discarded.
+fn note_message_ended(registrants: &mut [CopRegistrant], unique_resp_identifier: u32) {
+    for r in registrants {
+        r.som_started.retain(|&id| id != unique_resp_identifier);
+    }
+}
+
+/// The name for a receive timeout on `registrants`' COP: `ISO15765_CF_TIMEOUT`
+/// when a message from a response ID it waits on started and no content frame
+/// from that ID has ended it since, otherwise unnamed.
+fn rx_timeout_name(registrants: &[CopRegistrant], cop_handle: u32) -> Option<&'static str> {
+    registrants
+        .iter()
+        .find(|r| r.cop_handle == cop_handle)
+        .is_some_and(|r| !r.som_started.is_empty())
+        .then_some(ISO15765_CF_TIMEOUT_NAME)
 }
 
 /// FlowControl capture state used by the software ISO-TP TX driver (ADR-046):
@@ -4364,12 +5043,9 @@ async fn poll_rx_inner(
         let api = ctx.api.lock().await;
         match api.read_messages(ctx.channel_id, MAX_POLL_MESSAGES, 0) {
             Ok(msgs) => Some(msgs),
+            // An empty buffer is the empty batch below, with `api` released.
             Err(j2534_0404::Error::ApiStatus { code, .. }) if code.is_buffer_empty() => {
-                ctx.drain_watermarks
-                    .lock()
-                    .await
-                    .insert(ctx.channel_id, read_started_at);
-                return PollOutcome::Drained;
+                Some(Vec::new())
             }
             Err(_) => None,
         }
@@ -4380,6 +5056,11 @@ async fn poll_rx_inner(
     };
 
     if messages.is_empty() {
+        // Every frame that arrived has been read, so a software ISO-TP
+        // reassembly still waiting past N_Cr has had no consecutive frame.
+        // Raised before the watermark, so a receive-only reap that waits on
+        // this drain comes after the error.
+        raise_expired_reassemblies(ctx).await;
         ctx.drain_watermarks
             .lock()
             .await
@@ -4734,6 +5415,7 @@ async fn poll_rx_inner(
         }
 
         for entry in &mut cll_entries {
+            let mut isotp_notes = Vec::new();
             let deliveries = process_frame_for_entry(
                 &ctx.api,
                 ctx.channel_id,
@@ -4747,8 +5429,31 @@ async fn poll_rx_inner(
                 },
                 &data,
                 is_tx_side,
+                &mut isotp_notes,
             )
             .await;
+
+            // Software ISO-TP (ADR-046): a first frame marks the COPs that
+            // wait on its response ID as a native start-of-message
+            // indication does, so a receive timeout that follows is named
+            // `ISO15765_CF_TIMEOUT`; a failed reassembly raises its named
+            // error (ADR-351), bound to the COP recorded at the first frame
+            // while that COP still waits, and the COP's wait goes on.
+            for note in isotp_notes {
+                match note {
+                    IsoTpRxNote::Started(unique_resp_identifier) => note_start_of_message(
+                        &mut entry.registrants,
+                        entry.connect_generation,
+                        unique_resp_identifier,
+                    ),
+                    IsoTpRxNote::Failed { waiting_cop, .. } => {
+                        let cop = reassembly_failure_cop(waiting_cop, &entry.registrants, |c| {
+                            resolve_frame_cop_tag(entry, Some(c))
+                        });
+                        raise_reassembly_failure(ctx, entry.handle, note, cop).await;
+                    }
+                }
+            }
 
             for (delivery_data, unique_resp_identifier, raw, uudt_routed) in deliveries {
                 // ADR-051: for CAN, ISO15765, ISO9141, ISO14230, and J1850,
@@ -4882,6 +5587,7 @@ async fn poll_rx_inner(
                 // full reasoning.
                 let mut finalized_concat: Vec<ConcatDelivery> = Vec::new();
                 let mut wrote_suspend = false;
+                let matches_before: u32 = entry.registrants.iter().map(|r| r.matches_got).sum();
                 let binding = bind_frame(
                     entry,
                     FrameContext {
@@ -4907,6 +5613,45 @@ async fn poll_rx_inner(
                     &mut finalized_concat,
                     &mut wrote_suspend,
                 );
+
+                // Whether this frame completed a match for its COP (not a
+                // pending-RC frame, not an unbound one): only such a frame
+                // raises the padding error below.
+                let counted_as_match =
+                    entry.registrants.iter().map(|r| r.matches_got).sum::<u32>() > matches_before;
+
+                // A start-of-message indication on a native ISO 15765 channel
+                // (SAE J2534-1 v04.04 A.4) says an ECU began a response; mark
+                // every registrant that waits on this response ID, so a
+                // receive phase that then ends without a completed response
+                // can name its timeout (`note_start_of_message`). A
+                // tester-present herald is not a response to any COP.
+                if rx_status_flags & RX_START_OF_MESSAGE as u8 != 0
+                    && !is_tx_side
+                    && !matches!(binding, FrameBinding::TesterPresent)
+                    && is_native_iso15765_entry(entry)
+                {
+                    note_start_of_message(
+                        &mut entry.registrants,
+                        entry.connect_generation,
+                        unique_resp_identifier,
+                    );
+                }
+                // Only an ISO 15765 (USDT) delivery ends a started message: in
+                // the native-mixed modes a raw UUDT frame routed to the same
+                // entry (`uudt_routed`) carries the same URID but completes no
+                // segmented message. (A start-of-message indication is ISO
+                // 15765 only, so the insert above needs no such gate.) On a
+                // software ISO-TP entry the service reassembles itself, and
+                // a single or reassembled message (not `raw`) ends it.
+                if is_content_frame
+                    && !is_tx_side
+                    && !uudt_routed
+                    && (is_native_iso15765_entry(entry)
+                        || (matches!(entry.kind, RxEntryKind::SoftwareIsoTp(_)) && !raw))
+                {
+                    note_message_ended(&mut entry.registrants, unique_resp_identifier);
+                }
 
                 // ADR-147 fifth amendment (split direction-specific
                 // anchors): this frame's classification just folded
@@ -5193,8 +5938,16 @@ async fn poll_rx_inner(
                     // delivered. See `CllRxEntry::cop_tags`'s own doc comment
                     // for the full argument.
                     let cop_tag = resolve_frame_cop_tag(entry, frame_cop_handle);
+                    let padding_error_cop = (rx_status_flags & RX_ISO15765_PADDING_ERROR as u8
+                        != 0
+                        && counted_as_match
+                        && is_native_iso15765_entry(entry))
+                    .then(|| frame_cop_handle.map(|h| (h, cop_tag.clone())))
+                    .flatten();
                     let frame = ReceivedFrame {
                         timestamp,
+                        // `PASSTHRU_MSG.Timestamp`, read above (ADR-353).
+                        clock: vci_service_interface::TimestampClock::Device,
                         data: payload,
                         header_bytes: header,
                         footer_bytes: footer,
@@ -5223,6 +5976,25 @@ async fn poll_rx_inner(
                     } else {
                         deliver_or_enqueue(&entry.rx_buf, entry.handle, CllQueueItem::Frame(frame))
                             .await;
+                    }
+                    // The adapter runs the transport on a native ISO 15765
+                    // channel and only tags a frame whose last CAN frame was
+                    // short (SAE J2534-1 v04.04 A.2); the frame itself is
+                    // delivered above unchanged, and the error follows it,
+                    // bound to the COP whose response the frame completed. A
+                    // pending-RC frame (a short `7F xx 78` is typically padded)
+                    // and an unbound frame raise none, so a COP that later
+                    // times out still ends as a plain timeout.
+                    if let Some(error_cop) = padding_error_cop {
+                        send_named_error_event(
+                            &ctx.subscriptions,
+                            &ctx.logical_links,
+                            entry.handle,
+                            PduErrorEvent::PduErrEvtFrameStruct,
+                            Some(ISO15765_PADDING_NAME),
+                            Some(error_cop),
+                        )
+                        .await;
                     }
                 }
             }
@@ -5326,12 +6098,28 @@ async fn poll_rx_inner(
     // see `terminate_tp20_broadcast_periodic_for_suspension`'s own doc
     // comment for why the callee needs them.
     let mut suspended_broadcast_periodics: Vec<SuspendedBroadcastPeriodic> = Vec::new();
+    // ADR-419: links whose outstanding tester-present send ended with a
+    // negative answer this pass, reported once the lock below is released.
+    let mut tp_negative_answers: Vec<u32> = Vec::new();
     {
         let mut links = ctx.logical_links.lock().await;
         for entry in &cll_entries {
             let Some(link) = links.get_mut(&entry.handle) else {
                 continue; // CLL torn down mid-pass; nothing to merge back.
             };
+            // ADR-419: apply what step 3 observed about outstanding
+            // tester-present sends, in frame order, under this same lock.
+            // A pending answer reloads the send's window, a final one ends
+            // the hold. The same-batch `7F 3E 78` then `7E 00` settles as
+            // Pending then Positive here, and neither frame was delivered.
+            let armed = matches!(link.tester_present_state, TesterPresentState::Armed { .. });
+            for settlement in &entry.tp_settlements {
+                if link.connect_generation == entry.connect_generation
+                    && apply_tp_settlement(&mut link.open_tp_discards, settlement, armed)
+                {
+                    tp_negative_answers.push(entry.handle);
+                }
+            }
             for snap in &entry.registrants {
                 let Some(live) = link
                     .registrants
@@ -5500,6 +6288,16 @@ async fn poll_rx_inner(
             }
         }
     }
+    for cll_handle in tp_negative_answers {
+        send_error_event(
+            &ctx.subscriptions,
+            &ctx.logical_links,
+            cll_handle,
+            PduErrorEvent::PduErrEvtTesterPresentError,
+            None,
+        )
+        .await;
+    }
     for (cll_handle, periodic, channel_id, connect_generation, channel_key) in
         suspended_broadcast_periodics
     {
@@ -5595,6 +6393,8 @@ async fn poll_rx_inner(
     // above has landed -- see this function's own doc comment for why the
     // ordering matters.
     if outcome.is_drained() {
+        // As for the empty batch above.
+        raise_expired_reassemblies(ctx).await;
         ctx.drain_watermarks
             .lock()
             .await
@@ -5920,6 +6720,13 @@ fn merge_registrant_writeback(
     live.concat_segments_got = live
         .concat_segments_got
         .saturating_add(snap.concat_segments_got - base.concat_segments_got);
+    // `som_started`: adopt this pass's value only when this pass itself
+    // changed it (set by an indication, cleared by a completed response), so a
+    // snapshot carried forward unchanged never undoes a change another pass
+    // already merged.
+    if snap.som_started != base.som_started {
+        live.som_started = snap.som_started.clone();
+    }
     // `concat` (the open buffers' own contents, as opposed to the segment
     // COUNT above) is overwritten wholesale from `snap` (ADR-148 Amendment:
     // now a `Vec<ConcatBuf>`, still one plain overwrite of the whole `Vec`)
@@ -6312,7 +7119,9 @@ async fn should_skip_cancelled_item(
 enum TxFailure {
     /// A frame failed to build or write; report `PduErrorEvent` and finish
     /// the COP as today.
-    Event(PduErrorEvent),
+    /// The optional name is this service's own name for the case
+    /// (`ErrorData.extra_error_info_name`, ADR-351), `None` when unnamed.
+    Event(PduErrorEvent, Option<&'static str>),
     /// A hard channel error occurred mid-transmission;
     /// `handle_channel_hard_error` has already emitted the full
     /// loss-of-comms event sequence (including `PduCopstCancelled` for this
@@ -6360,8 +7169,8 @@ async fn write_can_frame(
             Ok(mut msg) => api
                 .write_messages(ctx.channel_id, std::slice::from_mut(&mut msg), 0)
                 .map(|_| ())
-                .map_err(|_| TxFailure::Event(PduErrorEvent::PduErrEvtTxError)),
-            Err(_) => Err(TxFailure::Event(PduErrorEvent::PduErrEvtFrameStruct)),
+                .map_err(|_| TxFailure::Event(PduErrorEvent::PduErrEvtTxError, None)),
+            Err(_) => Err(TxFailure::Event(PduErrorEvent::PduErrEvtFrameStruct, None)),
         }
     };
     if result.is_ok() && count_as_bus_activity {
@@ -6506,7 +7315,7 @@ async fn isotp_send(
                 // `transmit_request_inner`, so a tester-present send
                 // triggered from inside this function can never itself
                 // re-enter `isotp_send` (this invariant is load-bearing).
-                // `defer_gap_wait = true` (ADR-083): `dispatch_due_tester_present`'s
+                // `defer = IN_FLIGHT_SEND` (ADR-083, ADR-419): `dispatch_due_tester_present`'s
                 // own `wait_for_p3_gap` call runs an unprobed `poll_rx` with
                 // no `FcCapture` active -- an FC frame arriving during that
                 // unprobed poll would be silently consumed as unattributed
@@ -6553,7 +7362,7 @@ async fn isotp_send(
                 // otherwise need to compute.
                 run_detached_registrant_maintenance(ctx).await;
                 Box::pin(dispatch_due_tester_present(
-                    true,
+                    IN_FLIGHT_SEND,
                     Some(cll_handle),
                     in_flight_target,
                     false,
@@ -6571,7 +7380,12 @@ async fn isotp_send(
             };
             match fc {
                 // N_Bs expired without a FlowControl frame.
-                None => return Err(TxFailure::Event(PduErrorEvent::PduErrEvtRxTimeout)),
+                None => {
+                    return Err(TxFailure::Event(
+                        PduErrorEvent::PduErrEvtRxTimeout,
+                        Some(ISO15765_FC_TIMEOUT_NAME),
+                    ));
+                }
                 Some((isotp::FS_CONTINUE_TO_SEND, block_size, st_min)) => {
                     // Any frame(s) still queued after this batch's terminal
                     // CTS are a spurious trailing FC N_PDU (ISO 15765-2:
@@ -6592,12 +7406,24 @@ async fn isotp_send(
                 Some((isotp::FS_WAIT, ..)) => {
                     wait_frames += 1;
                     if wait_frames > ISOTP_TX_MAX_CONSECUTIVE_RX_WAIT_FRAMES {
-                        return Err(TxFailure::Event(PduErrorEvent::PduErrEvtProtErr));
+                        return Err(TxFailure::Event(
+                            PduErrorEvent::PduErrEvtProtErr,
+                            Some(MAX_WAIT_FRAME_NAME),
+                        ));
                     }
                     continue;
                 }
-                // FS_OVERFLOW (or reserved): the ECU cannot take the message.
-                Some((..)) => return Err(TxFailure::Event(PduErrorEvent::PduErrEvtProtErr)),
+                // FS_OVERFLOW: the ECU cannot take the message.
+                Some((isotp::FS_OVERFLOW, ..)) => {
+                    return Err(TxFailure::Event(
+                        PduErrorEvent::PduErrEvtProtErr,
+                        Some(ISO15765_FC_OVERFLOW_NAME),
+                    ));
+                }
+                // A reserved flow status never reaches here (`isotp::parse_frame`
+                // rejects it, so it is not captured as a FlowControl frame and
+                // the wait ends as an N_Bs expiry); kept unnamed for safety.
+                Some((..)) => return Err(TxFailure::Event(PduErrorEvent::PduErrEvtProtErr, None)),
             }
         };
 
@@ -6617,7 +7443,7 @@ async fn isotp_send(
             // (e.g. ~15 CFs at STmin=127ms is ~1.9s) -- fire any due
             // tester-present CLL on this channel before each CF here too,
             // same reasoning (boxing, recursion-depth-1 invariant,
-            // defer_gap_wait, exclude_cll, in_flight_target) as the FC-wait
+            // defer, exclude_cll, in_flight_target) as the FC-wait
             // loop above.
             //
             // ADR-095 amendment (2026-07-18): reap any detached (tier-2)
@@ -6634,7 +7460,7 @@ async fn isotp_send(
             // unconditionally.
             run_detached_registrant_maintenance(ctx).await;
             Box::pin(dispatch_due_tester_present(
-                true,
+                IN_FLIGHT_SEND,
                 Some(cll_handle),
                 in_flight_target,
                 false,
@@ -6784,8 +7610,8 @@ fn transmit_request_locked(
         Ok(mut msg) => api
             .write_messages(channel_id, std::slice::from_mut(&mut msg), 0)
             .map(|_| ())
-            .map_err(|_| TxFailure::Event(PduErrorEvent::PduErrEvtTxError)),
-        Err(_) => Err(TxFailure::Event(PduErrorEvent::PduErrEvtFrameStruct)),
+            .map_err(|_| TxFailure::Event(PduErrorEvent::PduErrEvtTxError, None)),
+        Err(_) => Err(TxFailure::Event(PduErrorEvent::PduErrEvtFrameStruct, None)),
     }
 }
 
@@ -6968,6 +7794,86 @@ async fn wait_for_p3_gap(
     }
 }
 
+/// The single gate every send on the shared channel passes before it writes
+/// (ADR-419): first the ISO 22900-2:2022 8.1.3 Table 1 completion hold, then
+/// the `CP_P3Func`/`CP_P3Phys` gap of [`wait_for_p3_gap`] (ADR-060, unchanged).
+/// The arguments are those of [`wait_for_p3_gap`] except `defer`.
+///
+/// The hold has two sources, both per shared channel and not per link:
+///
+/// - the poll task's own inline response wait, passed in as `defer`
+///   (`Some(Outstanding)`) by the callers that run from inside it
+///   (`dispatch_due_tester_present` from `wait_for_expected_response_inner`
+///   and from the ISO-TP send loops), and
+/// - the holding entries of `open_tp_discards`, one per tester-present send
+///   that expects an answer and has none yet.
+///
+/// A caller that runs inside an inline wait (`defer.is_some()`) and a
+/// tester-present send itself (`cop_handle == NO_COP`) never wait here: a held
+/// send returns [`P3GapOutcome::Deferred`] and is left due for the next pass,
+/// so an unprobed `poll_rx` cannot take the answer an active wait is matching
+/// (ADR-083), and a held tester-present keeps its cadence from the first free
+/// pass on. Any other caller (a client primitive, `CoptStartcomm`,
+/// `CoptStopcomm`, a re-arm) polls RX in `POLL_INTERVAL_MS` steps until the
+/// outstanding tester-present is answered, expires or is cleared, honouring
+/// `cancellable` and a hard channel error like the gap wait does.
+async fn wait_for_bus_clear(
+    cop_handle: u32,
+    cll_handle: u32,
+    can_functional: Option<bool>,
+    num_receive_cycles: i32,
+    cancellable: bool,
+    defer: Option<InlineWait>,
+    ctx: &ChannelPollCtx,
+) -> P3GapOutcome {
+    let next = NextSend {
+        functional: can_functional == Some(true),
+        with_response: num_receive_cycles != 0,
+    };
+    let never_block = defer.is_some() || cop_handle == NO_COP;
+    let poll_interval = Duration::from_millis(POLL_INTERVAL_MS);
+    loop {
+        sweep_expired_tp_holds(ctx).await;
+        let held = defer
+            .and_then(|d| d.hold)
+            .is_some_and(|client| bus_hold(client, next))
+            || tp_hold_blocks(ctx, next).await;
+        if !held {
+            break;
+        }
+        if never_block {
+            return P3GapOutcome::Deferred;
+        }
+        tokio::time::sleep(poll_interval).await;
+        if !poll_rx(ctx).await.is_ok() {
+            return P3GapOutcome::HardError;
+        }
+        if !cancellable {
+            continue;
+        }
+        let was_cancelled = {
+            let mut links = ctx.logical_links.lock().await;
+            links
+                .get_mut(&cll_handle)
+                .map(|l| l.cancelled_cops.remove(&cop_handle))
+                .unwrap_or(false)
+        };
+        if was_cancelled {
+            return P3GapOutcome::Cancelled;
+        }
+    }
+    wait_for_p3_gap(
+        cop_handle,
+        cll_handle,
+        can_functional,
+        num_receive_cycles,
+        cancellable,
+        defer.is_some(),
+        ctx,
+    )
+    .await
+}
+
 /// Fires each due tester-present CLL (either `CP_TesterPresentSendType`
 /// value) on this shared channel (ADR-083; both native
 /// `PassThruStartPeriodicMsg` mode-0 dispatch and its native periodic-start
@@ -7008,15 +7914,20 @@ async fn wait_for_p3_gap(
 /// a Codex-review-caught regression, see ADR-083 Consequences). Instead, a
 /// successful send stamps this CLL's own `last_fired`, below.
 ///
-/// `defer_gap_wait` is threaded straight through to this send's
-/// `wait_for_p3_gap` call as `defer_if_blocked` (ADR-083): `true` only at
-/// the `wait_for_expected_response` call site, where this function's own
-/// unprobed `poll_rx` inside a `wait_for_p3_gap` wait could otherwise drain
-/// the very ECU response an active `CoptSendrecv` is waiting to match;
-/// `false` at the outer-select and `handle_delay` call sites, which have no
-/// COP-specific match state to protect and keep waiting out the gap as
-/// before. A deferred item is simply left `Armed` for the next call to
-/// re-evaluate.
+/// `defer` is `Some` exactly when this function runs from inside the poll
+/// task's own inline wait (ADR-083, ADR-419), whatever that wait is: the
+/// `wait_for_expected_response` call sites pass the client exchange being
+/// waited for (`InlineWait::hold`, `None` for a COP created receive only,
+/// which still defers), and the ISO-TP send loops pass the segmented send in
+/// flight (`IN_FLIGHT_SEND`). It is threaded to each due send's `wait_for_bus_clear`
+/// call, where it (a) applies ISO 22900-2:2022 8.1.3 Table 1 to the
+/// outstanding exchange (a physical tester-present never goes while a
+/// client exchange is outstanding) and (b) makes any wait a deferral
+/// instead, because this function's own unprobed `poll_rx` could otherwise
+/// drain the very ECU response the active exchange is waiting to match. The
+/// outer-select and `handle_delay` call sites pass `None`: no match state to
+/// protect, so the gap is waited out as before. A deferred item is simply
+/// left `Armed` and due, its `last_fired` unstamped, for the next call.
 ///
 /// `exclude_cll` (ADR-095 audit round) excludes one specific CLL from the
 /// due-snapshot filter entirely -- used only by `isotp_send`'s two in-flight
@@ -7275,7 +8186,7 @@ fn isotp_target_collision(
         && (tx_flags & j2534_0404::TX_EXTENDED_ID != 0) == target.can_29bit
 }
 
-/// Parameters, in order: `defer_gap_wait`, `exclude_cll`,
+/// Parameters, in order: `defer`, `exclude_cll`,
 /// `exclude_isotp_target`, `force`, `ctx`.
 ///
 /// `exclude_isotp_target` (PR #97 sixth Codex review round): see
@@ -7313,15 +8224,21 @@ struct StillDueSnapshot {
     expects_response: bool,
     exp_pos_resp: Vec<u8>,
     exp_neg_resp: Vec<u8>,
+    /// ADR-419: the response-code handling the answer settles under, read
+    /// live like `exp_pos_resp` (the request SID stays the armed one).
+    rc_cfg: RcHandlingConfig,
 }
 
 async fn dispatch_due_tester_present(
-    defer_gap_wait: bool,
+    defer: Option<InlineWait>,
     exclude_cll: Option<u32>,
     exclude_isotp_target: Option<InFlightIsoTpTarget>,
     force: bool,
     ctx: &ChannelPollCtx,
 ) {
+    // ADR-419: end the holds whose window has passed before judging what is
+    // due (reports a send that got no answer).
+    sweep_expired_tp_holds(ctx).await;
     let now = tokio::time::Instant::now();
     let last_activity = *ctx.last_bus_activity.lock().await;
 
@@ -7392,24 +8309,23 @@ async fn dispatch_due_tester_present(
         expects_response: snapshotted_expects_response,
     } in due
     {
-        match wait_for_p3_gap(
+        match wait_for_bus_clear(
             NO_COP,
             cll_handle,
             can_functional,
             if snapshotted_expects_response { 1 } else { 0 },
             true,
-            defer_gap_wait,
+            defer,
             ctx,
         )
         .await
         {
             P3GapOutcome::Ready => {}
             P3GapOutcome::Cancelled | P3GapOutcome::HardError => continue,
-            // A deferred gap wait (ADR-083, defer_gap_wait = true only from
-            // wait_for_expected_response) leaves this CLL Armed; the next
-            // dispatch_due_tester_present pass -- imminent, since the
-            // gap deadline is already close -- re-evaluates it without ever
-            // draining RX via this call's unprobed poll_rx.
+            // A deferred wait (ADR-083 gap; ADR-419 Table 1 hold) leaves this
+            // CLL Armed and its `last_fired` unstamped, so it stays due and
+            // the next dispatch_due_tester_present pass re-evaluates it
+            // without ever draining RX via this call's unprobed poll_rx.
             P3GapOutcome::Deferred => continue,
         }
 
@@ -7514,6 +8430,13 @@ async fn dispatch_due_tester_present(
                             expects_response: l.active.tester_present_req_rsp() == 1,
                             exp_pos_resp: l.active.tester_present_exp_pos_resp().to_vec(),
                             exp_neg_resp: l.active.tester_present_exp_neg_resp().to_vec(),
+                            rc_cfg: RcHandlingConfig::from_params(
+                                &l.active,
+                                ChannelProtocol::from_raw(resources::base_protocol_id(
+                                    l.hw_protocol_id,
+                                )),
+                            )
+                            .with_request_sid(resolved.rc_cfg.request_sid),
                         })
                     }
                     TesterPresentState::None
@@ -7528,6 +8451,7 @@ async fn dispatch_due_tester_present(
             expects_response,
             exp_pos_resp,
             exp_neg_resp,
+            rc_cfg,
         }) = still_due
         else {
             continue;
@@ -7611,22 +8535,27 @@ async fn dispatch_due_tester_present(
                 // so content/SOM-herald discard stays correctly gated on
                 // `expects_response` while the window itself now
                 // unconditionally opens for TX-side discard (`tx_can_id`).
-                send_ok.then(|| ResidualTesterPresentDiscard {
-                    window: DiscardWindow {
-                        until: fired_at + Duration::from_millis(p2_max_ms as u64),
-                        pos: if expects_response {
-                            exp_pos_resp
-                        } else {
-                            Vec::new()
+                send_ok.then(|| {
+                    tester_present_discard_entry(
+                        DiscardWindow {
+                            until: fired_at + Duration::from_millis(p2_max_ms as u64),
+                            pos: if expects_response {
+                                exp_pos_resp
+                            } else {
+                                Vec::new()
+                            },
+                            neg: if expects_response {
+                                exp_neg_resp
+                            } else {
+                                Vec::new()
+                            },
                         },
-                        neg: if expects_response {
-                            exp_neg_resp
-                        } else {
-                            Vec::new()
-                        },
-                    },
-                    target_can_ids: resolved.target_can_ids,
-                    tx_can_id: tester_present_tx_can_id(resolved, framed_data),
+                        resolved.target_can_ids,
+                        tester_present_tx_can_id(resolved, framed_data),
+                        can_functional,
+                        expects_response,
+                        &rc_cfg,
+                    )
                 })
             } else {
                 None
@@ -7661,6 +8590,34 @@ struct SendRecvCycle {
     /// `TxItem::SendRecv::connect_generation`. Never recaptured for a
     /// cyclic follow-up cycle -- see the continuation re-enqueue below.
     connect_generation: u64,
+}
+
+/// The CAN ID a CAN-family request will go out on: the 4-byte prefix of its
+/// header-prefixed `SendRecvTx.data`, the same bytes `tester_present_tx_can_id`
+/// reads (ADR-099). `None` for data too short to carry it.
+fn func_tx_can_id(data: &[u8]) -> Option<u32> {
+    data.get(0..4)
+        .map(|b| u32::from_be_bytes(b.try_into().unwrap()))
+}
+
+/// Writes `LogicalLinkState::open_func_tx` (ADR-421) for the link's current
+/// connection only: a link that was reconnected or removed since `generation`
+/// keeps whatever its newer state holds. Setting a marker also requires the
+/// link to still be on `channel_id`, so a set that lost the race with a
+/// disconnect leaves nothing behind for a later reconnect to inherit.
+async fn set_open_func_tx(
+    logical_links: &Mutex<HashMap<u32, LogicalLinkState>>,
+    cll_handle: u32,
+    generation: u64,
+    channel_id: ChannelId,
+    can_id: Option<u32>,
+) {
+    if let Some(link) = logical_links.lock().await.get_mut(&cll_handle)
+        && link.connect_generation == generation
+        && (can_id.is_none() || link.channel_id == Some(channel_id))
+    {
+        link.open_func_tx = can_id;
+    }
 }
 
 /// Processes one send cycle of a `TxItem::SendRecv` in the poll task
@@ -7815,20 +8772,20 @@ async fn handle_send_recv(cycle: SendRecvCycle, ctx: &ChannelPollCtx) -> Option<
     if should_transmit {
         // CP_P3Func/P3Phys minimum inter-request gap (ADR-060, CAN-family
         // only): wait, if necessary, before actually writing.
-        match wait_for_p3_gap(
+        match wait_for_bus_clear(
             cop_handle,
             cll_handle,
             can_functional,
             num_receive_cycles,
             true,
-            false,
+            None,
             ctx,
         )
         .await
         {
             P3GapOutcome::Cancelled => cancelled = true,
             P3GapOutcome::HardError => channel_lost = true,
-            P3GapOutcome::Deferred => unreachable!("defer_if_blocked = false"),
+            P3GapOutcome::Deferred => unreachable!("defer = None and a client cop handle"),
             P3GapOutcome::Ready => {
                 // ADR-180 Decision 14 Part B (design-advisor consult, PR #72
                 // round 12): re-verify, at THIS cycle's actual transmit
@@ -8250,9 +9207,22 @@ async fn handle_send_recv(cycle: SendRecvCycle, ctx: &ChannelPollCtx) -> Option<
                         no_response_required: num_receive_cycles == 0,
                     });
                 }
+                // ADR-421: a functional request with a receive phase marks
+                // this link, so its transmit indication (read inside that
+                // phase) is routed here. Set before the wait's first read.
+                if can_functional == Some(true) && num_receive_cycles != 0 {
+                    set_open_func_tx(
+                        &ctx.logical_links,
+                        cll_handle,
+                        connect_generation,
+                        ctx.channel_id,
+                        func_tx_can_id(&data),
+                    )
+                    .await;
+                }
                 true
             }
-            Some(Err(TxFailure::Event(error_event))) => {
+            Some(Err(TxFailure::Event(error_event, error_name))) => {
                 // Recheck generation (ADR-086, round 9 fix): the transmit
                 // above performs real I/O and can span a disconnect+
                 // reconnect completing during the call, even though the
@@ -8274,11 +9244,12 @@ async fn handle_send_recv(cycle: SendRecvCycle, ctx: &ChannelPollCtx) -> Option<
                     })
                 };
                 if still_on_this_channel {
-                    send_error_event(
+                    send_named_error_event(
                         &ctx.subscriptions,
                         &ctx.logical_links,
                         cll_handle,
                         error_event,
+                        error_name,
                         Some((cop_handle, cop_tag.clone())),
                     )
                     .await;
@@ -8390,6 +9361,14 @@ async fn handle_send_recv(cycle: SendRecvCycle, ctx: &ChannelPollCtx) -> Option<
         })
     };
     if !still_on_this_channel {
+        set_open_func_tx(
+            &ctx.logical_links,
+            cll_handle,
+            connect_generation,
+            ctx.channel_id,
+            None,
+        )
+        .await;
         emit_terminal_if_live(
             &ctx.primitives,
             &ctx.logical_links,
@@ -8441,7 +9420,7 @@ async fn handle_send_recv(cycle: SendRecvCycle, ctx: &ChannelPollCtx) -> Option<
             cfg.with_request(access_timing_request.as_deref().unwrap_or(&[]), tx_prefix)
         });
         let response_timeout_ms = params.p2_max_timeout_ms();
-        match wait_for_expected_response(
+        let wait_outcome = wait_for_expected_response(
             ExpectedResponseWait {
                 cll_handle,
                 cop_handle,
@@ -8471,11 +9450,22 @@ async fn handle_send_recv(cycle: SendRecvCycle, ctx: &ChannelPollCtx) -> Option<
                 created_receive_only: send_cycles_remaining == 0,
                 cyclic_resp_timeout_ms: params.cyclic_resp_timeout_ms(),
                 enable_concatenation: params.enable_concatenation(),
+                can_functional,
             },
             ctx,
         )
-        .await
-        {
+        .await;
+        // ADR-421: every exit of the wait (match quota, timeout, cancel,
+        // staleness, tier-2 detach, re-request failure) ends the marker.
+        set_open_func_tx(
+            &ctx.logical_links,
+            cll_handle,
+            connect_generation,
+            ctx.channel_id,
+            None,
+        )
+        .await;
+        match wait_outcome {
             ReceivePhaseOutcome::Terminal => return None,
             ReceivePhaseOutcome::CycleComplete => {}
             ReceivePhaseOutcome::ReRequestTxFailed => {
@@ -8793,7 +9783,7 @@ async fn handle_delay(
         // select loop -- fire any due tester-present CLL on this channel on
         // every tick here too, or a sibling CLL sharing this physical
         // channel could starve for the entire delay.
-        dispatch_due_tester_present(false, None, None, false, ctx).await;
+        dispatch_due_tester_present(None, None, None, false, ctx).await;
     }
     if delay_hard_error {
         // cancel_link_cops already emitted PDU_COPST_CANCELLED.
@@ -8928,7 +9918,7 @@ async fn run_due_tick_duties(
     // CP_TesterPresentSendType (either value, ADR-083/ADR-094): fire any CLL
     // on this channel whose due window has elapsed. After the ordinary RX
     // poll, same as every other periodic per-tick duty at this site.
-    dispatch_due_tester_present(false, None, None, false, ctx).await;
+    dispatch_due_tester_present(None, None, None, false, ctx).await;
     // ADR-179 Decision 3 ("later, spontaneous `_LOST`"): re-enter the
     // address-claim retry loop for any CLL on this channel a spontaneous
     // post-claim loss armed since the last tick.
@@ -9282,6 +10272,9 @@ struct ReapedReceiveOnly {
     /// form and its caller-supplied-tag sibling into one signature -- see
     /// that function's own doc comment).
     cop_tag: Option<Vec<u8>>,
+    /// The name for the timeout error (`rx_timeout_name`), read from the
+    /// registrant in the same critical section that removes it.
+    timeout_name: Option<&'static str>,
 }
 
 async fn reap_expired_cyclic_registrants(ctx: &ChannelPollCtx) {
@@ -9407,6 +10400,7 @@ async fn reap_expired_cyclic_registrants(ctx: &ChannelPollCtx) {
                         }
                     }
                 }
+                let timeout_name = rx_timeout_name(&link.registrants, cop_handle);
                 link.registrants.retain(|r| r.cop_handle != cop_handle);
                 // Drain any stale `cancelled_cops` entry for this COP, same
                 // as `reap_cancelled_detached_registrants` and the
@@ -9422,6 +10416,7 @@ async fn reap_expired_cyclic_registrants(ctx: &ChannelPollCtx) {
                     cop_handle,
                     emit_timeout_error,
                     cop_tag,
+                    timeout_name,
                 });
             }
         }
@@ -9457,11 +10452,12 @@ async fn reap_expired_cyclic_registrants(ctx: &ChannelPollCtx) {
             // `logical_links`/`primitives` have both been released and a
             // concurrent first-wins removal of this same `cop_handle` could
             // otherwise have already dropped its tag.
-            send_error_event(
+            send_named_error_event(
                 &ctx.subscriptions,
                 &ctx.logical_links,
                 reaped.cll_handle,
                 PduErrorEvent::PduErrEvtRxTimeout,
+                reaped.timeout_name,
                 Some((reaped.cop_handle, reaped.cop_tag.clone())),
             )
             .await;
@@ -10776,7 +11772,7 @@ async fn handle_start_comm(
         // every other call site in this file): this CLL has no
         // tester-present armed yet at this point regardless, since arming
         // happens later in this same function, well after this call
-        // returns. `defer_gap_wait = false`: this is a one-shot call outside
+        // returns. `defer = None`: this is a one-shot call outside
         // any match-sensitive receive-phase loop, so there is no
         // `wait_for_expected_response`-style reason to defer an unprobed
         // `poll_rx` inside `wait_for_p3_gap`. `exclude_isotp_target = None`
@@ -10784,7 +11780,21 @@ async fn handle_start_comm(
         // at this call site -- this is a one-shot top-up immediately before
         // `run_protocol_init`, not a mid-transfer wait -- so there is no wire
         // target to protect here.
-        dispatch_due_tester_present(false, Some(cll_handle), None, true, ctx).await;
+        dispatch_due_tester_present(None, Some(cll_handle), None, true, ctx).await;
+
+        // ADR-419: the wakeup/StartCommunication exchange is a request on the
+        // shared bus (K-line, so physical), and the top-up just above may have
+        // opened a hold with a sibling's tester-present that expects an
+        // answer. Wait for it as any other request does (ISO 22900-2:2022
+        // 8.1.3 Table 1). Past the point of no return like the arm below, so
+        // not cancellable; a hard channel error has already been reported.
+        match wait_for_bus_clear(cop_handle, cll_handle, None, 1, false, None, ctx).await {
+            P3GapOutcome::Ready => {}
+            P3GapOutcome::HardError => return,
+            P3GapOutcome::Cancelled | P3GapOutcome::Deferred => {
+                unreachable!("cancellable = false, defer = None and a client cop handle")
+            }
+        }
 
         match run_protocol_init(
             five_baud,
@@ -11004,6 +12014,8 @@ async fn handle_start_comm(
                             cll_handle,
                             CllQueueItem::Frame(ReceivedFrame {
                                 timestamp: ts,
+                                // Synthetic: no library time (ADR-353).
+                                clock: vci_service_interface::TimestampClock::Worker,
                                 data: payload,
                                 header_bytes: header,
                                 footer_bytes: footer,
@@ -12508,13 +13520,13 @@ async fn handle_start_comm(
         // analogous final message (ADR-085/ADR-087, always `cancellable:
         // false`), nothing has committed/changed CLL state by this point --
         // this is fully cancellable (`cancellable: true` throughout).
-        match wait_for_p3_gap(
+        match wait_for_bus_clear(
             cop_handle,
             cll_handle,
             tx.send.can_functional,
             tx.num_receive_cycles,
             true,
-            false,
+            None,
             ctx,
         )
         .await
@@ -12561,7 +13573,7 @@ async fn handle_start_comm(
                 // (mirrors handle_send_recv's `!channel_lost` gate).
                 return;
             }
-            P3GapOutcome::Deferred => unreachable!("defer_if_blocked = false"),
+            P3GapOutcome::Deferred => unreachable!("defer = None and a client cop handle"),
             P3GapOutcome::Ready => {
                 let still_on_this_channel = {
                     let links = ctx.logical_links.lock().await;
@@ -12686,6 +13698,7 @@ async fn handle_start_comm(
                                     created_receive_only: false,
                                     cyclic_resp_timeout_ms: 0,
                                     enable_concatenation: tx.enable_concatenation,
+                                    can_functional: tx.send.can_functional,
                                 },
                                 ctx,
                             )
@@ -12831,7 +13844,7 @@ async fn handle_start_comm(
                         // a timed-out/re-request-failed receive phase skips
                         // PDU_CLLST_COMM_STARTED.
                     }
-                    Err(TxFailure::Event(error_event)) => {
+                    Err(TxFailure::Event(error_event, error_name)) => {
                         // ADR-111: the optional message never reached the
                         // bus, so this COP must NOT transition to
                         // COMM_STARTED -- unlike every other failed-transmit
@@ -12882,11 +13895,12 @@ async fn handle_start_comm(
                             )
                             .await;
                         }
-                        send_error_event(
+                        send_named_error_event(
                             &ctx.subscriptions,
                             &ctx.logical_links,
                             cll_handle,
                             error_event,
+                            error_name,
                             Some((cop_handle, cop_tag.clone())),
                         )
                         .await;
@@ -13014,7 +14028,7 @@ async fn handle_start_comm(
         // has already put a real ECU handshake on the wire, past the point of
         // no return -- the pre-existing (pre-ADR-083) invariant that nothing
         // after a successful init is cancellable applies here too.
-        match wait_for_p3_gap(
+        match wait_for_bus_clear(
             cop_handle,
             cll_handle,
             tester_present.can_functional,
@@ -13024,7 +14038,7 @@ async fn handle_start_comm(
                 0
             },
             false,
-            false,
+            None,
             ctx,
         )
         .await
@@ -13047,7 +14061,7 @@ async fn handle_start_comm(
                 // event sequence (including PduCopstCancelled for this COP).
                 return;
             }
-            P3GapOutcome::Deferred => unreachable!("defer_if_blocked = false"),
+            P3GapOutcome::Deferred => unreachable!("defer = None and a client cop handle"),
             P3GapOutcome::Ready => {}
         }
 
@@ -13171,10 +14185,15 @@ async fn handle_start_comm(
         // pushed into `LogicalLinkState.open_tp_discards` at the write-back
         // site instead, under the same lock as the `tester_present_state`
         // write.
-        let new_open_tp_discard = discard_window.map(|window| ResidualTesterPresentDiscard {
-            target_can_ids: tester_present.target_can_ids,
-            tx_can_id: tester_present_tx_can_id(&tester_present, &tester_present_data),
-            window,
+        let new_open_tp_discard = discard_window.map(|window| {
+            tester_present_discard_entry(
+                window,
+                tester_present.target_can_ids,
+                tester_present_tx_can_id(&tester_present, &tester_present_data),
+                tester_present.can_functional,
+                tester_present.expects_response,
+                &tester_present.rc_cfg,
+            )
         });
 
         (
@@ -13419,13 +14438,13 @@ async fn handle_stop_comm(
         // hardcoded `0`. `defer_if_blocked: false`: this is a one-shot
         // terminal send, not an idle-mode keepalive dispatch, so `Deferred`
         // never applies here.
-        match wait_for_p3_gap(
+        match wait_for_bus_clear(
             cop_handle,
             cll_handle,
             tx.send.can_functional,
             tx.num_receive_cycles,
             false,
-            false,
+            None,
             ctx,
         )
         .await
@@ -13684,6 +14703,7 @@ async fn handle_stop_comm(
                                         created_receive_only: false,
                                         cyclic_resp_timeout_ms: 0,
                                         enable_concatenation: tx.enable_concatenation,
+                                        can_functional: tx.send.can_functional,
                                     },
                                     ctx,
                                 )
@@ -13718,7 +14738,7 @@ async fn handle_stop_comm(
                                 }
                             }
                         }
-                        Err(TxFailure::Event(error_event)) => {
+                        Err(TxFailure::Event(error_event, error_name)) => {
                             // Recheck generation before reporting (Codex review,
                             // PR #90 round 8, ADR-086): `transmit_request` itself
                             // does I/O, so a disconnect+reconnect can complete
@@ -13739,11 +14759,12 @@ async fn handle_stop_comm(
                                 })
                             };
                             if still_on_this_channel {
-                                send_error_event(
+                                send_named_error_event(
                                     &ctx.subscriptions,
                                     &ctx.logical_links,
                                     cll_handle,
                                     error_event,
+                                    error_name,
                                     Some((cop_handle, cop_tag.clone())),
                                 )
                                 .await;
@@ -13779,7 +14800,7 @@ async fn handle_stop_comm(
             P3GapOutcome::Cancelled => {
                 unreachable!("cancellable = false: wait_for_p3_gap never checks cancelled_cops")
             }
-            P3GapOutcome::Deferred => unreachable!("defer_if_blocked = false"),
+            P3GapOutcome::Deferred => unreachable!("defer = None and a client cop handle"),
         }
     }
 
@@ -15318,13 +16339,13 @@ async fn handle_update_param(
                             )
                             .await;
                             if !framed_data.is_empty() {
-                                match wait_for_p3_gap(
+                                match wait_for_bus_clear(
                                     cop_handle,
                                     cll_handle,
                                     resolved.can_functional,
                                     if resolved.expects_response { 1 } else { 0 },
                                     false,
-                                    false,
+                                    None,
                                     ctx,
                                 )
                                 .await
@@ -15440,14 +16461,17 @@ async fn handle_update_param(
                                             // itself.
                                             let new_open_tp_discard =
                                                 discard_window.map(|window| {
-                                                    ResidualTesterPresentDiscard {
-                                                        target_can_ids: resolved.target_can_ids,
-                                                        tx_can_id: tester_present_tx_can_id(
+                                                    tester_present_discard_entry(
+                                                        window,
+                                                        resolved.target_can_ids,
+                                                        tester_present_tx_can_id(
                                                             &resolved,
                                                             &framed_data,
                                                         ),
-                                                        window,
-                                                    }
+                                                        resolved.can_functional,
+                                                        expects_response,
+                                                        &resolved.rc_cfg,
+                                                    )
                                                 });
                                             let mut links = ctx.logical_links.lock().await;
                                             if let Some(l) = links.get_mut(&cll_handle)
@@ -15489,7 +16513,7 @@ async fn handle_update_param(
                                         debug_assert!(false, "cancellable = false");
                                     }
                                     P3GapOutcome::Deferred => {
-                                        unreachable!("defer_if_blocked = false")
+                                        unreachable!("defer = None and a client cop handle")
                                     }
                                 }
                             }
@@ -16011,6 +17035,12 @@ struct ExpectedResponseWait<'a> {
     /// `wait_for_expected_response` combines all three into the
     /// `CopRegistrant::concat_enabled` it actually stores.
     enable_concatenation: bool,
+    /// The request's addressing class (`ResolvedSendRecvTx::can_functional`:
+    /// `Some(true)` functional, `Some(false)` physical, `None` unresolved or
+    /// not CAN-family, which ISO 22900-2:2022 8.1.3 Table 1 handling treats as
+    /// physical). Gives the hold this wait imposes on tester-present sends
+    /// (ADR-419).
+    can_functional: Option<bool>,
 }
 
 /// Wraps [`wait_for_expected_response_inner`] (see its doc comment for the
@@ -16193,6 +17223,7 @@ async fn wait_for_expected_response(
                 concat_enabled,
                 concat: Vec::new(),
                 concat_segments_got: 0,
+                som_started: Vec::new(),
             },
         )
         .await;
@@ -16408,7 +17439,7 @@ async fn wait_for_expected_response_inner(
         // insertion -- this loop only ever needs the LIVE registrant's own
         // `cyclic_deadline` (read fresh each pass below), not these
         // call-time inputs.
-        created_receive_only: _,
+        created_receive_only,
         cyclic_resp_timeout_ms: _,
         // Same rationale as `created_receive_only`/`cyclic_resp_timeout_ms`
         // just above: `wait_for_expected_response`'s wrapper already
@@ -16418,7 +17449,15 @@ async fn wait_for_expected_response_inner(
         // fresh each pass, e.g. the deadline-expiry finalize check below),
         // never this call-time input.
         enable_concatenation: _,
+        can_functional,
     } = wait;
+
+    // ADR-419: while this inline wait runs, the exchange it waits for is
+    // outstanding on the shared channel (ISO 22900-2:2022 8.1.3 Table 1), which
+    // the tester-present dispatch below must respect. A COP created receive
+    // only has no request outstanding. Every exit of this function ends the
+    // hold, since the hold exists only while this loop does.
+    let outstanding = inline_wait_for(created_receive_only, can_functional, num_receive_cycles);
 
     let matches_needed: Option<u32> = match num_receive_cycles {
         -2 | -1 => None,     // IS-MULTIPLE / IS-CYCLIC: unbounded match count
@@ -16702,7 +17741,7 @@ async fn wait_for_expected_response_inner(
                                 // `wait_for_expected_response`), so there is
                                 // no async-fn recursion cycle to break here,
                                 // unlike Fix A's `isotp_send` call sites.
-                                // `defer_gap_wait = true`, matching the
+                                // `defer = outstanding`, matching the
                                 // enclosing receive phase's own top-level
                                 // call above: a tester-present send's
                                 // unprobed `poll_rx` inside `wait_for_p3_gap`
@@ -16728,7 +17767,14 @@ async fn wait_for_expected_response_inner(
                                 // cancellation reap above still runs every
                                 // chunk unconditionally.
                                 run_detached_registrant_maintenance(ctx).await;
-                                dispatch_due_tester_present(true, None, None, false, ctx).await;
+                                dispatch_due_tester_present(
+                                    Some(outstanding),
+                                    None,
+                                    None,
+                                    false,
+                                    ctx,
+                                )
+                                .await;
                             }
                         }
 
@@ -16811,7 +17857,7 @@ async fn wait_for_expected_response_inner(
                             .await
                             {
                                 Ok(()) => {}
-                                Err(TxFailure::Event(ev)) => {
+                                Err(TxFailure::Event(ev, ev_name)) => {
                                     // Recheck generation (ADR-086, round 9
                                     // fix): transmit_request performs real
                                     // I/O and can span a disconnect+reconnect
@@ -16848,11 +17894,12 @@ async fn wait_for_expected_response_inner(
                                         .await;
                                         return ReceivePhaseOutcome::Terminal;
                                     }
-                                    send_error_event(
+                                    send_named_error_event(
                                         &ctx.subscriptions,
                                         &ctx.logical_links,
                                         cll_handle,
                                         ev,
+                                        ev_name,
                                         Some((cop_handle, cop_tag.clone())),
                                     )
                                     .await;
@@ -17019,7 +18066,7 @@ async fn wait_for_expected_response_inner(
         // poll_channel_events's outer select loop. Fire any due
         // tester-present CLL on this channel on every non-terminal iteration
         // here too, or a sibling CLL sharing this physical channel could
-        // starve for the whole wait. defer_gap_wait = true here (ADR-083):
+        // starve for the whole wait. defer = outstanding here (ADR-083, ADR-419):
         // unlike the outer-select and handle_delay call sites, this poll
         // loop is match-sensitive for the active COP's response -- a
         // tester-present send's own wait_for_p3_gap wait must not drain RX
@@ -17256,7 +18303,7 @@ async fn wait_for_expected_response_inner(
         // directly, so this call site no longer needs to compute any
         // exhaustiveness signal of its own.
         run_detached_registrant_maintenance(ctx).await;
-        dispatch_due_tester_present(true, None, None, false, ctx).await;
+        dispatch_due_tester_present(Some(outstanding), None, None, false, ctx).await;
 
         if no_deadline {
             // IS-CYCLIC: no response window; keep polling until cancelled.
@@ -17314,9 +18361,10 @@ async fn wait_for_expected_response_inner(
         // captured from the SAME `l` reference in this SAME critical
         // section -- see that function's own doc comment for why the
         // callee needs them.
-        let (still_on_this_channel, suspended_periodic): (
+        let (still_on_this_channel, suspended_periodic, timeout_name): (
             bool,
             Option<SuspendedBroadcastPeriodicEntry>,
+            Option<&'static str>,
         ) = {
             let mut links = ctx.logical_links.lock().await;
             match links.get_mut(&cll_handle) {
@@ -17366,9 +18414,9 @@ async fn wait_for_expected_response_inner(
                             .take()
                             .map(|p| (p, l.channel_id, l.connect_generation, l.channel_key));
                     }
-                    (true, periodic)
+                    (true, periodic, rx_timeout_name(&l.registrants, cop_handle))
                 }
-                _ => (false, None),
+                _ => (false, None, None),
             }
         };
         if let Some((periodic, channel_id, connect_generation, channel_key)) = suspended_periodic {
@@ -17383,11 +18431,12 @@ async fn wait_for_expected_response_inner(
                 .await;
         }
         if still_on_this_channel {
-            send_error_event(
+            send_named_error_event(
                 &ctx.subscriptions,
                 &ctx.logical_links,
                 cll_handle,
                 PduErrorEvent::PduErrEvtRxTimeout,
+                timeout_name,
                 Some((cop_handle, cop_tag.clone())),
             )
             .await;

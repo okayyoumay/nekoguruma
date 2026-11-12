@@ -10,14 +10,22 @@
 //!
 //! The round trips are the agent's times: they start before the RPC and include the worker and
 //! the event path, so they are reported, never judged against P2 (design 8.11 "Timing judged").
-//! A reported value that differs from `sim-ecu`'s is recorded, not a failure: the check measures
-//! the ECU, it does not hold it to the simulator.
+//! What is judged is the latency the VCI measured (ADR-356): from the transmit done to the
+//! response's start, judged both ways, or to its end, judged one way only (a response end proves
+//! the response late only for a single frame, past the limit plus one frame's transfer), each on
+//! one clock. The limit is the P2 the ECU reported, beyond the timing margin the profile gives
+//! its VCI (`timing_margin_us`); a profile without one gets the latencies recorded and nothing
+//! judged. A response within P2 is on time whatever came before it; one past it is judged late
+//! only when no pending was passed on and the link passes on every pending, since a pending
+//! moves the limit in force to P2* (design 8.11 "Limit in force", which the check does not
+//! follow further) and a pending the VCI absorbed leaves no trace ("Possible pending"). A reported value that differs from `sim-ecu`'s, and a late response, are recorded,
+//! not failures: the check measures the ECU, it does not hold it to the simulator.
 
 use std::time::{Duration, Instant};
 
 use vci_service_interface::ComLogicalLinkHandle;
 
-use crate::guard::{GuardedHandle, HandleError};
+use crate::guard::{GuardedHandle, HandleError, Timed, VciTimes};
 
 /// How many requests the check times: the session request and the TesterPresent requests after
 /// it.
@@ -67,6 +75,50 @@ pub enum CheckError {
     },
 }
 
+/// Which two times a latency was taken between (design 8.11 `measured_by`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeasuredBy {
+    /// The VCI's transmit done to the response's start, on one clock.
+    VciTxDoneToRxStart,
+    /// The VCI's transmit done to the response's end, on one clock.
+    VciTxDoneToRxEnd,
+}
+
+impl MeasuredBy {
+    /// The name design 8.11 gives it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::VciTxDoneToRxStart => "vci_tx_done_to_rx_start",
+            Self::VciTxDoneToRxEnd => "vci_tx_done_to_rx_end",
+        }
+    }
+}
+
+/// What the check concludes from a request's VCI times.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Judgement {
+    /// The response came within P2 plus the margin.
+    WithinP2,
+    /// The response came past P2 plus the margin (for a response end, plus one frame's
+    /// transfer too), by this much.
+    Late(Duration),
+    /// No rule decides, for this reason.
+    NotJudged(&'static str),
+}
+
+/// One request the check timed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sample {
+    pub request: &'static str,
+    /// The agent's round trip, reported only.
+    pub round_trip: Duration,
+    /// The VCI times of the exchange, as the link's events gave them.
+    pub times: VciTimes,
+    /// The latency the VCI measured, when two of its times are on one clock.
+    pub latency: Option<(Duration, MeasuredBy)>,
+    pub judgement: Judgement,
+}
+
 /// What the check measured.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimingOutcome {
@@ -74,8 +126,10 @@ pub struct TimingOutcome {
     pub reported: SessionTiming,
     /// What `sim-ecu` uses.
     pub simulator: SessionTiming,
-    /// The agent's round trip of each request, the session request first.
-    pub round_trips: Vec<Duration>,
+    /// The profile's timing margin for its VCI, if it gives one.
+    pub margin: Option<Duration>,
+    /// Each request, the session request first.
+    pub samples: Vec<Sample>,
 }
 
 impl TimingOutcome {
@@ -84,29 +138,148 @@ impl TimingOutcome {
         self.reported == self.simulator
     }
 
+    /// The agent's round trip of each request, the session request first.
+    pub fn round_trips(&self) -> Vec<Duration> {
+        self.samples
+            .iter()
+            .map(|sample| sample.round_trip)
+            .collect()
+    }
+
     /// The outcome as the report's message.
     pub fn summary(&self) -> String {
         let mark = |same: bool| if same { "" } else { ", differs" };
-        let millis = |d: &Duration| d.as_secs_f64() * 1000.0;
-        let min = self
-            .round_trips
+        let round_trips = self.round_trips();
+        let min = round_trips.iter().map(millis).fold(f64::INFINITY, f64::min);
+        let max = round_trips.iter().map(millis).fold(0.0, f64::max);
+        let margin = match self.margin {
+            Some(margin) => format!(
+                "judged against P2 plus a margin of {:.3} ms",
+                millis(&margin)
+            ),
+            None => "the profile gives no timing margin, so nothing is judged".to_owned(),
+        };
+        let vci = self
+            .samples
             .iter()
-            .map(millis)
-            .fold(f64::INFINITY, f64::min);
-        let max = self.round_trips.iter().map(millis).fold(0.0, f64::max);
+            .map(|sample| {
+                let measured = match sample.latency {
+                    Some((latency, by)) => format!("{:.3} ms ({})", millis(&latency), by.name()),
+                    None => "no latency".to_owned(),
+                };
+                let judged = match sample.judgement {
+                    Judgement::WithinP2 => "within P2".to_owned(),
+                    Judgement::Late(by) => format!("late by {:.3} ms", millis(&by)),
+                    Judgement::NotJudged(why) => format!("not judged: {why}"),
+                };
+                format!("{} {measured}, {judged}", sample.request)
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
         format!(
             "the ECU reports P2 {} ms (sim-ecu {} ms{}) and P2* {} ms (sim-ecu {} ms{}); the \
              agent's round trips of {} requests took {min:.1} to {max:.1} ms (agent times, not \
-             judged against P2)",
+             judged against P2); the latencies the VCI measured, {margin}: {vci}",
             self.reported.p2_ms,
             self.simulator.p2_ms,
             mark(self.reported.p2_ms == self.simulator.p2_ms),
             self.reported.p2_star_ms,
             self.simulator.p2_star_ms,
             mark(self.reported.p2_star_ms == self.simulator.p2_star_ms),
-            self.round_trips.len(),
+            round_trips.len(),
         )
     }
+}
+
+fn millis(duration: &Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
+}
+
+/// The longest response a single CAN frame carries under every addressing format the profile
+/// may give (ISO 15765-2 (2024) 9.6.2: one byte of protocol information, and one more for an
+/// address byte): a longer one may span frames.
+const SINGLE_FRAME_MAX: usize = 6;
+
+/// An upper bound on the bits of one classic CAN frame of eight data bytes, extended identifier
+/// and worst-case bit stuffing included.
+const FRAME_BITS_MAX: u64 = 160;
+
+/// How long one CAN frame takes at most at `baud_rate`; none for a rate of zero.
+fn frame_transfer(baud_rate: u32) -> Option<Duration> {
+    (baud_rate > 0)
+        .then(|| Duration::from_micros((FRAME_BITS_MAX * 1_000_000).div_ceil(u64::from(baud_rate))))
+}
+
+/// What an exchange's latency is judged against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    /// The P2 the ECU reported.
+    pub p2: Duration,
+    /// The profile's timing margin for its VCI; nothing is judged without one.
+    pub margin: Option<Duration>,
+    /// The link's baud rate, for the transfer of one frame.
+    pub baud_rate: Option<u32>,
+    /// Whether the worker said the link passes on every response pending (ADR-355).
+    pub forwards_pendings: bool,
+}
+
+/// The latency the VCI measured for one exchange and what it shows (design 8.11 "Timing
+/// judged"): from the transmit done to the response's start where both are on one clock, judged
+/// both ways, else to its end, judged one way only; `response_len` bytes of response.
+pub fn judge(
+    times: &VciTimes,
+    response_len: usize,
+    limits: &Limits,
+) -> (Option<(Duration, MeasuredBy)>, Judgement) {
+    let Some(tx_done) = times.tx_done else {
+        return (None, Judgement::NotJudged("the VCI gave no transmit time"));
+    };
+    let micros = |us: u32| Duration::from_micros(u64::from(us));
+    let start = times
+        .rx_start
+        .and_then(|start| tx_done.until(start))
+        .map(|us| (micros(us), MeasuredBy::VciTxDoneToRxStart));
+    let end = times
+        .rx_end
+        .and_then(|end| tx_done.until(end))
+        .map(|us| (micros(us), MeasuredBy::VciTxDoneToRxEnd));
+    let Some((latency, by)) = start.or(end) else {
+        return (
+            None,
+            Judgement::NotJudged("the VCI gave no response time on the transmit's clock"),
+        );
+    };
+    let Some(margin) = limits.margin else {
+        return (
+            Some((latency, by)),
+            Judgement::NotJudged("the profile gives no timing margin"),
+        );
+    };
+    let limit = limits.p2 + margin;
+    let judgement = if latency <= limit {
+        Judgement::WithinP2
+    } else if times.pending_seen {
+        Judgement::NotJudged("a response pending moved the limit in force to P2*")
+    } else if !limits.forwards_pendings {
+        Judgement::NotJudged("the VCI may have absorbed a response pending")
+    } else if by == MeasuredBy::VciTxDoneToRxStart {
+        Judgement::Late(latency - limit)
+    } else if response_len > SINGLE_FRAME_MAX {
+        Judgement::NotJudged(
+            "a response end past the limit does not prove a multi-frame response late",
+        )
+    } else {
+        match limits.baud_rate.and_then(frame_transfer) {
+            Some(transfer) if latency > limit + transfer => {
+                Judgement::Late(latency - limit - transfer)
+            }
+            Some(_) => Judgement::NotJudged(
+                "the response end lies within one frame's transfer past the limit",
+            ),
+            None => Judgement::NotJudged("the link's baud rate is not known"),
+        }
+    };
+    (Some((latency, by)), judgement)
 }
 
 /// The session timing a DiagnosticSessionControl response for the default session reports:
@@ -134,10 +307,30 @@ pub async fn run(
     handle: &mut GuardedHandle,
     cll: ComLogicalLinkHandle,
 ) -> Result<TimingOutcome, CheckError> {
+    let margin = handle.timing_margin();
+    let baud_rate = handle.baud_rate(cll).ok();
     let (response, first) =
         timed(handle, cll, "DiagnosticSessionControl", &DEFAULT_SESSION).await?;
     let reported = session_timing(&response)?;
-    let mut round_trips = vec![first];
+    let p2 = Duration::from_millis(u64::from(reported.p2_ms));
+    let sample = |request, response: &[u8], (round_trip, timed): (Duration, Timed)| {
+        let limits = Limits {
+            p2,
+            margin,
+            baud_rate,
+            forwards_pendings: timed.forwards_pendings,
+        };
+        let times = timed.times;
+        let (latency, judgement) = judge(&times, response.len(), &limits);
+        Sample {
+            request,
+            round_trip,
+            times,
+            latency,
+            judgement,
+        }
+    };
+    let mut samples = vec![sample("DiagnosticSessionControl", &response, first)];
     for _ in 1..SAMPLES {
         const REQUEST: &str = "TesterPresent";
         let (response, took) = timed(handle, cll, REQUEST, &TESTER_PRESENT).await?;
@@ -156,32 +349,34 @@ pub async fn run(
                 });
             }
         }
-        round_trips.push(took);
+        samples.push(sample(REQUEST, &response, took));
     }
     Ok(TimingOutcome {
         reported,
         simulator: SessionTiming::simulator(),
-        round_trips,
+        margin,
+        samples,
     })
 }
 
-/// Sends `request` and returns its final response with the agent's round trip.
+/// Sends `request` and returns its final response with the agent's round trip and the VCI times
+/// of the exchange.
 async fn timed(
     handle: &mut GuardedHandle,
     cll: ComLogicalLinkHandle,
     name: &'static str,
     request: &[u8],
-) -> Result<(Vec<u8>, Duration), CheckError> {
+) -> Result<(Vec<u8>, (Duration, Timed)), CheckError> {
     let start = Instant::now();
-    let response =
-        handle
-            .send_receive(cll, request)
-            .await
-            .map_err(|error| CheckError::Request {
-                request: name,
-                error,
-            })?;
-    Ok((response, start.elapsed()))
+    let timed = handle
+        .send_receive_timed(cll, request)
+        .await
+        .map_err(|error| CheckError::Request {
+            request: name,
+            error,
+        })?;
+    let took = start.elapsed();
+    Ok((timed.response.clone(), (took, timed)))
 }
 
 #[cfg(test)]

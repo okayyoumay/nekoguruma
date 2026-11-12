@@ -1,7 +1,7 @@
 # ADR-312: Codex as the Pull Request Reviewer, with Copilot as Fallback
 
 **Date:** 2026-10-16
-**Status:** Accepted (Decision item 4 amended 2026-10-19: comparison done, Codex kept)
+**Status:** Accepted (Decision item 4 amended 2026-10-19: comparison done, Codex kept; Decision item 1's switch on a stalled review amended by ADR-360: one re-request on the same head first)
 **Affects:** `.claude/skills/pr-review-loop/SKILL.md` (Steps 0, 1, 4 and 5), `AGENTS.md`, `CLAUDE.md` ("Pull requests"), `.github/instructions/docs.instructions.md`; ADR-251
 
 ## Context

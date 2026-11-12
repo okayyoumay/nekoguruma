@@ -63,7 +63,7 @@ const NO_ERASE_STEPS: &str = "enter-programming-session;security-access;request-
                               transfer-data;transfer-exit";
 
 /// The example's `flash_segments.csv` with a segment of `length` bytes in blocks of `block_size`.
-fn with_segment(
+pub(super) fn with_segment(
     files: Vec<(String, Vec<u8>)>,
     start: &str,
     length: &str,
@@ -509,8 +509,8 @@ impl diag_ir::DiagHost for PlanHost {
     fn service_request(&mut self, service: u16, payload: &[u8]) -> Result<Vec<u8>, NotSent> {
         self.log
             .push(format!("request {service:02x} {}", hex(payload)));
-        // Positive: the SID plus 0x40, which the seed step reads past two bytes of.
-        Ok(vec![service as u8 + 0x40, 0x01])
+        // Positive: the SID plus 0x40, and a non-zero seed past the two bytes the seed step skips.
+        Ok(vec![service as u8 + 0x40, 0x01, 0x01])
     }
     fn send_receive(&mut self, _: u32, _: &[u8]) -> Result<Vec<u8>, NotSent> {
         Err(NotSent)
@@ -647,9 +647,13 @@ def main():
         .events
         .iter()
         .filter_map(|event| match event {
-            DryRunEvent::FlashTransfer { data, .. } => {
-                assert!(data.iter().all(|&byte| byte == 0));
-                Some(data.len())
+            DryRunEvent::FlashTransfer { len, digest, .. } => {
+                // The blocks are zeros, so the digest is that of `len` zero bytes.
+                assert_eq!(
+                    *digest,
+                    diag_ir::dry_run::block_digest(&vec![0; *len as usize])
+                );
+                Some(*len as usize)
             }
             _ => None,
         })

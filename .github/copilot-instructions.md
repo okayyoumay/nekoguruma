@@ -6,7 +6,9 @@ The repository is MIT-licensed and will be public: write review comments as if a
 More rules for Rust, documentation and CI files are in `.github/instructions/`. The skills in
 `.claude/skills/` are workflows for the sessions that write pull requests (for example
 `pr-review-loop` answers your findings); they are not review rules, so do not apply them when
-reviewing.
+reviewing. The same holds for `CLAUDE.md`'s Guidelines on asking the maintainer before changing
+an ambiguous instruction and on confirming a design summary after a design answer: they govern
+how a writing session works, and a diff cannot show whether they were followed.
 
 ## P0
 
@@ -101,10 +103,10 @@ reviewing.
   changed since your previous review and that are not P0 or P1, are not raised; if you notice
   any, give only their number in the summary. Each re-review
   is requested on purpose and spends the owner's review allowance, so it should converge.
-- On a specification pull request (every changed file outside `work/` is Markdown, and one is
-  an ADR or the design document), the writer pauses the loop after eight rounds with findings
-  when more than half of the last four rounds' findings land on text earlier fixes wrote, and
-  the maintainer chooses to cut the scope, rewrite or continue (ADR-349). A review requested after a cut or a rewrite counts as a first review: report
+- On any pull request, specification or code, the writer pauses the loop after eight rounds
+  with findings when more than half of the last four rounds' findings land on lines earlier
+  fixes wrote, and the maintainer chooses to cut the scope, rewrite or continue (ADR-349,
+  ADR-381). A review requested after a cut or a rewrite counts as a first review: report
   everything you find. After a cut, the part moved to a backlog item is out of scope; do not
   report it as missing from the pull request.
 - Write in English.

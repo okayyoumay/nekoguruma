@@ -1,7 +1,7 @@
 # ADR-245: The IR's Restart Declaration Lives in the Procedure Part
 
 **Date:** 2026-10-07
-**Status:** Accepted (items 4 and 6 amended by ADR-250; the restart declaration's sources and plans name their target and `Program::validate` refuses cross-target flash steps since ADR-325 item 4; its sources and plans get their CSV and Starlark syntax, with the boundaries derived by the lowering, by ADR-336; the agent builds its source table from the job's document for a job with one, by ADR-345)
+**Status:** Accepted (items 4 and 6 amended by ADR-250; the restart declaration's sources and plans name their target and `Program::validate` refuses cross-target flash steps since ADR-325 item 4; its sources and plans get their CSV and Starlark syntax, with the boundaries derived by the lowering, by ADR-336; the agent builds its source table from the job's document for a job with one, by ADR-345; the target index on its sources and plans and the rules over it given their IR form by ADR-410)
 **Affects:** `crates/diag-ir` (`src/recovery.rs`, `Program`, `VmState`, `IR_SCHEMA_VERSION`, `schema/ir.fbs` `FlashSession`), `crates/agent` (`check_program`), `docs/system-architecture.md` (8.2.5, 8.9)
 
 ## Context
@@ -122,8 +122,12 @@ runner in M1.
 - Until the declaration part has a decoder, a runner that reads a source of the form "service
   and field" needs a resolver for the request and the field. Part 3 of the restart work supplies
   one for its tests.
-- At M2 the loader also checks each plan's flash-session id against the variant's flash
-  sessions.
+- Each plan's flash-session id is checked against the variant's flash sessions by
+  `diag_ir::check_declarations` when the agent checks the job (`check_job`), not by the document
+  loader. Amendment (2026-11-05, the maintainer's decision): the same check also reads every
+  segment of that session as the artifact check does (`diag_ir::flash_session_extents`: a zero
+  block size, an end past the offset range, a block longer than a byte string may be), so the
+  error does not depend on whether the job has an artifact.
 - A plan has one RequestTransferExit, so a flash session that downloads several regions still
   cannot be declared.
 - A tool that reads only the FlatBuffers declaration does not see the restart parameters; the

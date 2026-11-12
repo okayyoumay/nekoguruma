@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agent::guards::{GuardSetup, JobGuards};
-use agent::{HostError, JobError, JobLimits, JobRun, LinkConfig, run_program};
+use agent::{JobError, JobLimits, JobRun, LinkConfig, run_program};
 use diag_ir::{IR_SCHEMA_VERSION, Op, Program, Value, VmState};
 use worker_host::client::{ConnectOptions, WorkerClient};
 use worker_host::service::{LaunchOptions, OperatingMode, ServiceKind, WorkerProcess};
@@ -96,6 +96,7 @@ fn read_vin() -> Program {
         identity: Default::default(),
         preconditions: Default::default(),
         flash: Vec::new(),
+        targets: Vec::new(),
     }
 }
 
@@ -147,11 +148,12 @@ fn the_worker_absorbs_response_pending_for_the_agent() {
         .duration_since(UNIX_EPOCH)
         .expect("system clock should be after unix epoch")
         .as_nanos();
+    let pid = std::process::id();
     let temp = std::env::temp_dir();
     let paths = TempPaths {
-        config: temp.join(format!("sim-vci-rc78-{nanos}.toml")),
-        control_dir: temp.join(format!("sim-vci-rc78-{nanos}")),
-        definitions: temp.join(format!("sim-vci-rc78-definitions-{nanos}")),
+        config: temp.join(format!("sim-vci-rc78-{pid}-{nanos}.toml")),
+        control_dir: temp.join(format!("sim-vci-rc78-{pid}-{nanos}")),
+        definitions: temp.join(format!("sim-vci-rc78-definitions-{pid}-{nanos}")),
     };
     std::fs::write(&paths.config, "").expect("test config file should be writable");
     // The registration definition names the library, through the debug-only
@@ -240,10 +242,11 @@ async fn jobs(control_dir: &Path) {
     assert!(
         matches!(
             timed_out,
-            Err(JobError::Host {
-                pc: 1,
-                source: HostError::NoResponse
-            })
+            Err(JobError::OnSiteInterventionRequired(
+                agent::restart::OnSiteReason::UnconfirmedRequest {
+                    at: agent::journal::StepRef { pc: 1, steps: 1 }
+                }
+            ))
         ),
         "{timed_out:?}"
     );
@@ -268,10 +271,11 @@ async fn jobs(control_dir: &Path) {
     assert!(
         matches!(
             timed_out,
-            Err(JobError::Host {
-                pc: 1,
-                source: HostError::NoResponse
-            })
+            Err(JobError::OnSiteInterventionRequired(
+                agent::restart::OnSiteReason::UnconfirmedRequest {
+                    at: agent::journal::StepRef { pc: 1, steps: 1 }
+                }
+            ))
         ),
         "{timed_out:?}"
     );

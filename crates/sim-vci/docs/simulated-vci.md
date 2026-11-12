@@ -150,10 +150,14 @@ suppressed, silent ECU) never appears, nor does one still being delayed when the
 
 Simplifications:
 
-- No TxDone indications or loopback messages are generated, and segmentation itself (flow
-  control frames, separation time) is not simulated: a request or response of any length moves
-  as one message.
-- `RxStatus` is always zero. The timestamp is the moment the response appeared on the bus
+- Each message sent queues its TxDone indication (`RxStatus` `TX_MSG_TYPE` and `TX_INDICATION`,
+  the CAN ID as its data, SAE J2534-1 v04.04 clause 8.6) ahead of any response to it, readable
+  at once and passing no filter. A send that fails queues none, nor does a segmented message no
+  ECU takes (none listens on its ID, or the ECU is off, starting up after a reset or loses the
+  request to a bus error), since it gets no flow control and does not complete (ADR-352). No loopback messages
+  are generated, and segmentation itself (flow control frames, separation time) is not
+  simulated: a request or response of any length moves as one message.
+- A response's `RxStatus` is always zero. The timestamp is the moment the response appeared on the bus
   (after its delay), in microseconds since the library was first used.
 
 ## Fault injection
@@ -175,14 +179,16 @@ A control command is a JSON object tagged by `command`:
 
 | Command | Effect |
 |---|---|
-| `{"command": "inject_fault", "fault": F}` | `SimEcu::inject(F)`; `F` is a `sim_ecu::Fault` in snake case: `"power_loss"`, `"drop_response"`, `"bus_error"`, `{"delay_response": {"ms": 500}}`, `{"corrupt_block": {"block": 3}}`, `{"response_pending": {"count": 2, "interval_ms": 300}}`, `{"negative_response": {"nrc": "conditions_not_correct"}}` (the response code by its snake-case name, not its number). With `"service": N` (the service identifier, a JSON number from 0 to 255 such as 17 for ECUReset; anything else rejects the command), `SimEcu::inject_for_service(N, F)` instead: the fault waits for the next request of that service. With `"request": [B, ...]` (bytes as JSON numbers, such as `[34, 241, 134]` for a read of DID F186), `SimEcu::inject_for_request` instead: the fault waits for the next request that starts with those bytes (at least one). A command with both is rejected |
+| `{"command": "inject_fault", "fault": F}` | `SimEcu::inject(F)`; `F` is a `sim_ecu::Fault` in snake case: `"power_loss"`, `"drop_response"`, `"bus_error"`, `{"delay_response": {"ms": 500}}`, `{"corrupt_block": {"block": 3}}`, `{"response_pending": {"count": 2, "interval_ms": 300}}`, `{"negative_response": {"nrc": "conditions_not_correct"}}` (the response code by its snake-case name, not its number), `{"truncate_response": {"len": 2}}`, `{"repeat_response": {"interval_ms": 40}}` (the final response is queued a second time after the interval). With `"service": N` (the service identifier, a JSON number from 0 to 255 such as 17 for ECUReset; anything else rejects the command), `SimEcu::inject_for_service(N, F)` instead: the fault waits for the next request of that service. With `"request": [B, ...]` (bytes as JSON numbers, such as `[34, 241, 134]` for a read of DID F186), `SimEcu::inject_for_request` instead: the fault waits for the next request that starts with those bytes (at least one). A command with both is rejected |
 | `{"command": "reconnect_ecu"}` | `SimEcu::reconnect`, which ends a power loss |
 | `{"command": "disconnect_vci"}` | unplugs the VCI |
 | `{"command": "connect_vci"}` | plugs it back in |
 | `{"command": "set_battery_voltage", "millivolts": N}` | sets the battery voltage `READ_VBATT` reports (default 12000) |
-| `{"command": "fail_writes", "times": N}` | the next `N` calls of `PassThruWriteMsgs` (at least 1) fail with `ERR_FAILED`, sending nothing; without `"times"`, every call fails until `clear_write_failures` |
+| `{"command": "fail_writes", "times": N}` | the next `N` calls of `PassThruWriteMsgs` (at least 1) fail with `ERR_FAILED`, sending nothing; without `"times"`, every call fails until `clear_write_failures`. With `"service": S` (a byte), only a call whose first message starts with service `S` after the CAN identifier fails and counts; other calls, such as a tester present the worker sends meanwhile, go through |
 | `{"command": "clear_write_failures"}` | ends `fail_writes` |
-| `{"command": "crash_vci"}` | crashes the VCI: it stays plugged in, but every J2534 call except `PassThruGetLastError` fails with `ERR_FAILED` (ADR-292) |
+| `{"command": "fail_closes", "times": N}` | the next `N` calls of `PassThruClose` of the open device (at least 1; healthy, lost or crashed) fail with `ERR_FAILED` and release nothing, so the application can close again; without `"times"`, every close fails until `clear_close_failures`. A close of an unknown device ID answers `ERR_INVALID_DEVICE_ID` and keeps the count |
+| `{"command": "clear_close_failures"}` | ends `fail_closes` |
+| `{"command": "crash_vci"}` | crashes the VCI: it stays plugged in, but every J2534 call except `PassThruGetLastError` fails with `ERR_FAILED` (ADR-292), except a close of a device ID the library does not hold, which answers `ERR_INVALID_DEVICE_ID` (ADR-422) |
 | `{"command": "restart_vci"}` | restarts a crashed VCI |
 | `{"command": "hold_session"}` | holds a non-default session that has not timed out (`SimEcu::hold_session`): tS3_Server stops until the next request reaches the ECU. A test harness sends it from a process between two runs, so that the next run's start-up does not count against the session |
 
@@ -220,7 +226,9 @@ A crashed VCI (ADR-292) is plugged in but answers nothing: every function except
 `PassThruGetLastError` returns `ERR_FAILED`, before checking its arguments, and a waiting
 `PassThruReadMsgs` returns with it at once. `PassThruOpen` fails the same way while the VCI is
 crashed. `PassThruClose` on the open device still releases it (with its channels and unread
-responses) and reports `ERR_FAILED`; the next open, once the VCI answers again, returns a new
+responses) and reports `ERR_FAILED`, and a close of a device ID the library does not hold, such
+as the one it just released, answers `ERR_INVALID_DEVICE_ID`, which the library knows without the
+VCI (so a later close confirms the device closed, ADR-422); the next open, once the VCI answers again, returns a new
 device ID. After `restart_vci`, a device that was still open is lost, as after a disconnect, until
 `PassThruClose` releases it. Like a disconnect, a crash is the state of the process that applied
 it, and the ECU keeps its state throughout.
@@ -230,9 +238,12 @@ it, and the ECU keeps its state throughout.
 `NGR_SIM_VCI_TRACE` names a file, read once when the library is first called and only in debug
 builds, so a test can check the order of the requests a worker process sent. `sim-vci` appends
 one line per UDS request the worker sends towards the simulated ECU, and one `vbatt` line per
-`READ_VBATT`. A request is traced when it is sent, before the ECU sees it, so a line records a send
-attempt, not receipt: a request lost on the bus (`Fault::BusError`) or ignored by an ECU that is
-silent or still starting after a reset is listed too.
+`READ_VBATT`. A request is traced once the ECU has handled it and its state after the request is
+saved (`NGR_SIM_ECU_STATE`), before its response is queued. A test that sees the line can
+therefore kill the worker at any point after it and still find the request's effect in the state
+file. A line records a send attempt, not receipt: a request lost on the bus (`Fault::BusError`), or
+ignored by an ECU that is silent or still starting after a reset, is listed too. A request whose
+state cannot be saved fails, gets no response and is not listed.
 A request line is `uds`, the service ID, and what identifies the request, all in hex: the DIDs of
 a 0x22 read (`uds 22 F190 F187`), the DID of a 0x2E write, the sub-function of 0x10, 0x11 and
 0x3E (`uds 11 01`), sub-function and routine ID of 0x31 (`uds 31 01 FF00`), and the block counter

@@ -34,7 +34,7 @@ A TOML file outside the repository. Unknown keys are refused.
 | `class` | `"T0"`, `"T1"`, `"T2"` or `"T3"` (design 13.5) |
 | `[vci]` | T1 to T3: the VCI (below) |
 | `[link]` | T1 to T3: the link (below) |
-| `[[endpoint]]` | T0 only, exactly two: each names a `[endpoint.vci]`, with its `channel` (such as the protocol name of an SAE J2534-2 clause 7 additional channel) at both ends when both are on one VCI, or a `socketcan` interface (such as `"can0"`), and a `[endpoint.link]`. At least one end is a VCI channel, the two ends differ (two ends on one VCI by their `channel`), and their links are one bus: the same `baud_rate` and `id_bits`, each end's `request_id` the other's `response_id` |
+| `[[endpoint]]` | T0 only, exactly two: each names a `[endpoint.vci]`, with its `channel` (the protocol name of an SAE J2534-2 clause 7 additional channel; J2534 only, a D-PDU API `vci` takes none) at both ends when both are on one VCI, or a `socketcan` interface (such as `"can0"`), and a `[endpoint.link]`. At least one end is a VCI channel, the two ends differ (two ends on one VCI by their `channel`), and their links are one bus: the same `baud_rate` and `id_bits`, each end's `request_id` the other's `response_id` |
 | `allow` | Optional. Narrows the class to the listed operations: `"configuration-write"`, `"routine"`, `"reprogramming"`, `"fault-injection"`. Without it the profile keeps its class's operations |
 | `report_full_identifiers` | Optional, `false` by default: `true` puts VINs and serial numbers in the run's report in full instead of masked (see "Reports") |
 | `expendable_ecu` | T2 only: the ECU may be reprogrammed |
@@ -63,6 +63,10 @@ does not take. A T3 profile can add nothing.
 | `module` | D-PDU API: the device name or serial number the library reports (see "The module match"). J2534: a description only, not compared with the device |
 | `label`, `pname` | J2534 only, and required there, not empty, and the label is not `j2534-0404` (the worker's default entry): the label and the device name of the configured `modules` entry (ADR-281) |
 | `firmware_version`, `library_version` | What the device reports, compared after opening (see "The module match"); a D-PDU API profile writes each as `major.minor.revision`, each part 0 to 255 with no leading zero |
+| `timing_margin_us` | Optional: the VCI's timing margin in microseconds (design 8.11 "Timing margin"), the key the agent reads too. The T2 timing check judges the latency the VCI measured only beyond it, and without it judges nothing (see "The T2 timing check", ADR-356). A job the harness runs takes it as its links' timing margin; without it the job's log judges no time against a limit, since the agent has no default (ADR-377) |
+| `drift_bound_ppm` | Optional: how far the VCI's clock may run from the agent's, in parts per million (design 8.11 "Drift bound"). A job the harness runs takes it; without it the job takes the agent's default (100 ppm, ADR-357) for placing clock times, and judges no loss's settlement (ADR-378) |
+| `clock_margin_us` | Optional: the tolerance of one reading of the VCI's clock in microseconds (design 8.11 "Drift bound"). A job the harness runs takes it; without it the job takes the agent's default (1 ms, ADR-357) for placing clock times, and judges no loss's settlement (ADR-378) |
+| `worker_abi` | Optional: the worker ABI to test, by the name of the ABI table (design 7.1.2): `win-x86`, `win-x64`, `linux-x86`, `linux-x86_64`, `linux-arm64` or `linux-armhf`. The check launches only the worker build for that ABI. An ABI other than the harness build's own needs `NGR_HW_WORKERS` to name a directory holding that build, since the hardware tests install only the host-ABI worker (ADR-415). Without it the agent picks as it does for a job: on a 64-bit Windows host the x64 build whenever the VCI has an x64 library, so a vendor's x86 library is checked only by naming `win-x86` (a VCI without an x64 registration runs the x86 build either way). A profile whose name is unknown, or names an ABI of another OS than the host's or one the host's registry views do not serve, is refused when it is loaded. A VCI with no library of the named ABI, or no installed worker for it, fails the open with the reason; it is never checked with another ABI. The report's `device.abi` states the ABI that ran, named or resolved |
 
 `[link]`, the values an IR `Protocol` declaration carries:
 
@@ -95,7 +99,13 @@ The profile cannot see the hardware, so it only refuses what cannot be two chann
   same `pname` (ADR-281), whatever their `module` says. Two D-PDU API ends are on one module
   when they name the same library and `module`.
 - Two ends on one module must describe it identically and name different `channel`s, compared
-  as the J2534 worker reads them: `CAN_CH1`, `can_ch1` and `CAN_CH01` are one channel.
+  as the J2534 worker reads them: `CAN_CH1`, `can_ch1` and `CAN_CH01` are one channel, and so are
+  the worker's synonyms of a family (`ISO15765_CH2` and `ISO_14229_3_on_ISO_15765_2_CH2`). `CAN_CHn`
+  and `ISO15765_CHn` with one `n` are taken, conservatively, for one physical channel as well (a raw CAN and an ISO
+  15765 link can share one), so they are refused as two ends. A bare family name is channel 0.
+- A `channel` is a channel of its link's protocol family (`CAN_CHn` on a raw CAN link,
+  `ISO15765_CHn` on an ISO 15765 link), has no surrounding whitespace (the worker does not trim
+  it) and is the only place a channel is named: a `_CHn` suffix on the link's `protocol` is refused.
 - One device reached through both APIs, one at each end, looks like two modules here. Design
   13.5's procedure (only the profile's VCIs connected) and the module match against the attached
   device cover it.
@@ -137,7 +147,8 @@ device (design 13.5, ADR-275 item 4). It takes the `Vci`, the workers directory
 
 1. Starts the worker for the profile's `library` through the agent's launch path
    (`agent::launch::launch_worker`), so the library is resolved, and the worker build chosen, as
-   in production (design 7.1, 7.3).
+   in production (design 7.1, 7.3), except that a profile's `worker_abi` restricts the choice to
+   that build and never falls back to another (ADR-415).
 2. Asks the worker for its modules (`GetModuleIds`), reads the `modules` entries of the
    configuration for J2534 (`vci-service-config`, in the harness's process), and runs
    `select_module`. A refusal here comes before anything is opened. For J2534 the worker must
@@ -197,7 +208,8 @@ Anything it cannot classify is refused.
 - **Link setup.** `ModuleConnect` is refused (the harness opens the device). A link is created
   only from the profile link's protocol, the bus type the agent uses
   (`ISO_11898_2_DWCAN`) and exactly its two pins (the first of `pins` as `HI`, the second as
-  `LOW`), by resource data or by a learned resource id; a resource by name, or an id not learned,
+  `LOW`), by resource data (an endpoint with a `channel` is created this way, from that name) or by a
+  learned resource id; a resource by name, or an id not learned,
   is refused. A create flag may carry RawMode only, and RawMode only on T0 (a worker passes raw
   data through, so on any other class the guard cannot classify its identifier or payload). One link per profile endpoint (T0: one per
   VCI end, created for the end whose `channel` the resource's protocol name is, or else whose
@@ -449,7 +461,8 @@ carrying its own address byte.
   addressed: every frame would be dropped, and the failure would look like a hardware fault.
 - **Workers and the library.** The worker directory (`<abi>/j2534-0404-service`, design 7.3) is
   the root `NGR_HW_WORKERS` names, else this workspace's build for the host ABI, installed in a
-  temporary directory. The vendor's library is found by the OS lookup (design 7.1.1): the test fails
+  temporary directory (a profile's `worker_abi` other than the host's needs `NGR_HW_WORKERS`
+  to name a directory holding that build). The vendor's library is found by the OS lookup (design 7.1.1): the test fails
   if `NGR_J2534_DEFINITION_DIR`, the debug override of that lookup (ADR-282), is set. The test is
   not gated on `debug_assertions`. A launch that finds no worker for a library's ABI (a 32-bit DLL on Windows without
   `NGR_HW_WORKERS`) fails the check with a message that says to set it, and the temporary
@@ -474,10 +487,14 @@ carrying its own address byte.
   is `SendFailed`, which the check reports as a send failure of that end. A link has one monitor:
   a second `raw_listen` returns it.
 - **One module, two channels.** The check takes the two ends as one handle with two links or as
-  two handles. The test runs two modules: a link on an additional channel (`..._CH1`, SAE J2534-2
-  clause 7) is made by the worker from a compound protocol name that `GetResourceIds` does not
-  accept, and the handle creates links through `GetResourceIds`, so a loopback of two channels of
-  one module is refused by the test with that reason.
+  two handles. A link on an additional channel (`..._CH1`, SAE J2534-2 clause 7) is made by the
+  worker from a compound protocol name that `GetResourceIds` does not accept, so the handle
+  creates an endpoint that names a `channel` from resource data carrying that name (the profile
+  decides, not the worker), and the guard admits it only when the name, the bus type and the
+  pins are the profile link's. The module must have opted into J2534-2 (`pname` prefixed
+  `J2534-2:`), and `j2534-0404-service` accepts RawMode on a `CAN_CHx` or `ISO15765_CHx` link
+  (ADR-414). The test runs two channels of one module and two modules. A `channel` is a J2534
+  notion: the profile refuses it on a D-PDU API `vci`.
 
 ## The T2/T3 read check
 
@@ -533,14 +550,29 @@ profile's link, and CI runs it against `sim-vci` behind `j2534-0404-service`
   TesterPresent with its response not suppressed (9.7), `checks::t2_timing::SAMPLES` requests in
   all. Both are on the T2 and T3 read-only list, so the guard passes them.
 - **What it records.** The reported P2 and P2* beside `sim-ecu`'s defaults
-  (`DEFAULT_P2_SERVER_MAX_MS`, `DEFAULT_P2_STAR_SERVER_MAX_MS`), each marked when it differs, and
-  the agent's round trip of each request. The round trips start before the RPC and include the
-  worker and the event path, so they are reported and never judged against P2 (design 8.11
-  "Timing judged").
+  (`DEFAULT_P2_SERVER_MAX_MS`, `DEFAULT_P2_STAR_SERVER_MAX_MS`), each marked when it differs, the
+  agent's round trip of each request, and the latency the VCI measured for each (ADR-356). The
+  round trips start before the RPC and include the worker and the event path, so they are
+  reported and never judged against P2 (design 8.11 "Timing judged").
+- **The VCI's latency.** The guarded handle turns the transmit and start-of-message indications
+  on for the link (a library may refuse either) and `GuardedHandle::send_receive_timed` returns
+  each request's transmit done, response start and response end with the clock each item names.
+  The latency runs from the transmit done to the response's start, or without one on that clock
+  to its end, named `vci_tx_done_to_rx_start` or `vci_tx_done_to_rx_end` (design 8.11
+  `measured_by`). Two times on different clocks, a time with no clock, or a later time that reads
+  earlier (the 32-bit values are not unwrapped) give no latency. With `timing_margin_us` in
+  `[vci]` each latency is judged against the reported P2 plus the margin: a start both ways, an
+  end one way only, so an end past the limit proves a response of at most six bytes (one frame
+  under every addressing format) late only past one frame's transfer at the link's baud rate,
+  and never proves a longer one late. A response past the limit is not judged after a response
+  pending (the limit in force is then P2*, design 8.11 "Limit in force") or on a link whose
+  worker does not say it passes on every pending (`pending_forwarding`, ADR-355), since the VCI
+  may have absorbed one. Without the key the latency is recorded and nothing judged. Against `sim-vci` the latency runs to the response's end, since `sim-vci` gives no
+  start of message for a single frame.
 - **Result.** It passes when the ECU answers every request with its positive response; the
-  report's message holds the comparison. A reported value that differs from `sim-ecu`'s is not a
-  failure. A negative or malformed response, a request the ECU does not answer, and a link that
-  does not open fail it.
+  report's message holds the comparison and each latency with its verdict. A reported value
+  that differs from `sim-ecu`'s, and a late response, are not failures. A negative or malformed
+  response, a request the ECU does not answer, and a link that does not open fail it.
 
 ## Teardown
 

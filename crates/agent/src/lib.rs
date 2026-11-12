@@ -13,6 +13,7 @@
 //! - [`identity`]: the agent's key in a named-secret store, created once under a lock (design 6.4,
 //!   ADR-459, ADR-460)
 //! - [`state`]: where the agent keeps its state for each operating mode (design 6.2, ADR-460)
+//! - [`instruction`]: the gate that verifies a signed job instruction (design 5.3, 11.1, ADR-461)
 //! - [`inputs`]: the runtime inputs and service fields a restart reads (ADR-229, ADR-245)
 //! - [`journal`]: the write-job journal a restart resumes from (ADR-244)
 //! - [`restart`]: how a job whose journal exists goes on (ADR-253, ADR-255)
@@ -35,6 +36,7 @@ pub mod host;
 pub mod identification;
 pub mod identity;
 pub mod inputs;
+pub mod instruction;
 pub mod journal;
 mod journaling;
 mod keep_alive;

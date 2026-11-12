@@ -250,6 +250,21 @@ The release build selects no store yet: the platform stores (a DPAPI blob on Win
 
 Each kind of state has a sub-directory of its own: `identity` holds the key's lock file and the debug store, and `journal` is for the write-job journal. A sub-directory is created readable by its account only, and on Unix one that is writable by its group or others is refused. The operational log's directory (below) keeps its own rules.
 
+## Job instruction gate
+
+`agent::instruction::open(envelope, trusted_key, own_agent_id)` is the only way to a `VerifiedInstruction` (design 5.3, 11.1; ADR-461 Decision items 9 to 12). The envelope is the signed blob the server delivers; the trusted key is the server's instruction key, which the caller passes in (the registration will store it, and the gate reads it from no file, variable or command-line option); the agent ID is the agent's own. The gate takes no worker handle and opens no link. It checks, in this order, and stops at the first failure:
+
+| Step | Check | Refusal |
+|---|---|---|
+| 1 | the format byte is known, then the envelope is long enough for its header and its payload is within 64 KiB | `Malformed`; `UnsupportedVersion` for an unknown format byte |
+| 2 | the key fingerprint is the trusted key's | `UnknownKey` |
+| 3 | the signature's r and s are in range | `Malformed` |
+| 4 | the signature verifies over the payload bytes as delivered, under the instruction's own domain tag (not the connection proof's); a high-S signature is refused here | `BadSignature` |
+| 5 | the body decodes with no byte left over and within its bounds | `UnsupportedVersion` for an unknown body version, else `Malformed` |
+| 6 | the agent ID in the body is the agent's own | `NotForThisAgent` |
+
+Nothing reads the payload before step 4 has passed and nothing re-encodes the decoded instruction. `VerifiedInstruction` has private fields, no public constructor and no `Clone`; it gives the decoded `JobInstruction` by reference and the envelope bytes it came from, byte for byte, for the journal that will keep and re-verify them. A refusal writes one `warn` entry (reason, the envelope's length and, for `UnknownKey`, the fingerprint the envelope offered; `operational-log.md`) and returns the reason, which the control channel will send back keyed by the command's ID.
+
 ## Operational log
 
 The agent logs its own `tracing` events (design 12.2, ADR-348), with the settings of its own

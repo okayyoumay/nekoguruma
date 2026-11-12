@@ -203,8 +203,9 @@ paths:
         signature check: an unknown, expired, used or revoked code, a key other than the one the
         code is bound to, a bad proof, a code issued under an instruction key that is no longer
         active. The caller cannot tell these apart; the reason goes to the server's log only.
-        Refusals are limited for the whole route, not per caller: more than ten 403 responses in
-        a minute make the route answer 429 to requests that would be refused. Only 403 counts
+        Refusals are limited for the whole route, not per caller: once ten 403 responses were
+        given within the last minute, a request that would be refused is answered 429 until the
+        oldest of those ten is a minute old. Only 403 counts
         toward the limit (400, 413 and 429 do not). A request that redeems successfully (valid
         code, valid proof) succeeds even while the limit is exceeded, so the limit only slows
         guessing and gives a guesser no oracle. The body is at most 4 KiB (413).
@@ -257,7 +258,7 @@ paths:
               schema: { $ref: '#/components/schemas/Problem' }
         '413': { $ref: '#/components/responses/Problem' }
         '429':
-          description: More than ten refusals in the last minute on this route
+          description: Ten refusals were given in the last minute on this route; `Retry-After` is the time until the oldest is a minute old
           headers:
             Retry-After: { schema: { type: integer }, description: Seconds to wait }
           content:

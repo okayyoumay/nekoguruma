@@ -477,3 +477,55 @@ async fn already_revoked_duplicates_are_untouched() {
         "2026-02-01,2026-02-02"
     );
 }
+
+/// A tracing writer that keeps what it is given.
+#[derive(Clone, Default)]
+struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn the_migration_reports_how_many_duplicate_rows_it_revoked() {
+    let pg = TestPostgres::start();
+    let captured = Captured::default();
+    let writer = captured.clone();
+    // PostgreSQL's notices reach tracing from sqlx, on the target below, in the task that runs the
+    // statement; the default subscriber of this thread covers the whole test (current-thread
+    // runtime).
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    upgrade_from_4(
+        &pg,
+        &[
+            TWO_TENANTS,
+            "INSERT INTO agents (id, tenant_id, display_name, mode, public_key, registered_at) \
+             VALUES \
+             ('00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-0000000000a1', \
+              'a', 'user', '\\x0a', '2026-01-01T00:00:00Z'), \
+             ('00000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-0000000000a2', \
+              'b', 'user', '\\x0a', '2026-01-02T00:00:00Z'), \
+             ('00000000-0000-0000-0000-000000000003', '00000000-0000-0000-0000-0000000000a1', \
+              'c', 'user', '\\x0a', '2026-01-03T00:00:00Z')",
+        ],
+    )
+    .await;
+    let text = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        text.contains("sqlx::postgres::notice")
+            && text.contains("revoked 2 duplicate unrevoked agent rows"),
+        "{text}"
+    );
+}

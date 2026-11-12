@@ -111,7 +111,7 @@ fn compare_migrations(
         if !success {
             return Err(MigrationsDiffer::Dirty);
         }
-        match migrator.iter().find(|m| m.version == *version) {
+        match up_migrations(migrator).find(|m| m.version == *version) {
             None => return Err(MigrationsDiffer::Ahead),
             Some(m) if m.checksum.as_ref() != checksum.as_slice() => {
                 return Err(MigrationsDiffer::Changed);
@@ -119,13 +119,18 @@ fn compare_migrations(
             Some(_) => {}
         }
     }
-    if migrator
-        .iter()
-        .any(|m| !applied.iter().any(|(version, _, _)| *version == m.version))
+    if up_migrations(migrator).any(|m| !applied.iter().any(|(version, _, _)| *version == m.version))
     {
         return Err(MigrationsDiffer::Behind);
     }
     Ok(())
+}
+
+/// The migrations that are applied going up: sqlx's own run skips the down ones in the same way.
+fn up_migrations(migrator: &Migrator) -> impl Iterator<Item = &sqlx::migrate::Migration> {
+    migrator
+        .iter()
+        .filter(|m| !m.migration_type.is_down_migration())
 }
 
 /// A pool that connects on first use. Tests only: they exercise the routes without a schema.
@@ -249,6 +254,9 @@ mod tests {
     #[test]
     fn the_read_only_check_reads_the_table_sqlx_writes() {
         assert_eq!(MIGRATOR.table_name, MIGRATIONS_TABLE);
+        // `run_direct` fails on a recorded migration the binary lacks unless this is set, which
+        // is the behaviour `compare_migrations` reproduces with its "ahead" refusal.
+        assert!(!MIGRATOR.ignore_missing);
     }
 
     #[test]

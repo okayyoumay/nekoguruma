@@ -178,6 +178,41 @@ async fn without_an_active_instruction_key_nothing_is_written() {
     assert_eq!(f.rows().await, "0");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_key_retired_between_the_check_and_the_insert_refuses_and_writes_nothing() {
+    let f = Fixture::new().await;
+    // A held table lock stops the issuing statement at its insert, after the key was read.
+    let mut holder = f.pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE agent_registration_codes IN EXCLUSIVE MODE")
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    let pool = f.pool.clone();
+    let issuing =
+        tokio::spawn(
+            async move { registration::issue(&pool, &request(&fingerprint(), None)).await },
+        );
+    let waiting = "SELECT count(*) FROM pg_locks WHERE NOT granted \
+                   AND relation = 'agent_registration_codes'::regclass";
+    let deadline = Instant::now() + LIMIT;
+    while f.pg.scalar(waiting).await == "0" {
+        assert!(
+            Instant::now() < deadline,
+            "the insert never waited for the lock"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    sqlx::query("UPDATE instruction_keys SET retired_at = now()")
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    holder.rollback().await.unwrap();
+
+    let result = tokio::time::timeout(LIMIT, issuing).await.unwrap().unwrap();
+    assert!(matches!(result, Err(IssueError::KeyRetired)), "{result:?}");
+    assert_eq!(f.rows().await, "0");
+}
+
 #[tokio::test]
 async fn an_unknown_disabled_or_ambiguous_owner_is_refused_each_its_own_way() {
     let f = Fixture::migrated().await;
@@ -562,4 +597,35 @@ async fn an_owner_that_cannot_be_used_exits_1_with_its_own_message() {
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&output.stderr).contains("is disabled"));
     assert_eq!(f.rows().await, "0");
+}
+
+#[tokio::test]
+async fn a_failed_write_to_standard_output_exits_1_and_leaves_the_row_to_expire() {
+    let f = Fixture::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(dir.path(), &f.pg.url());
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ngr-server"));
+    command
+        .arg("registration-code")
+        .arg("--config")
+        .arg(&config)
+        .args(issue_flags(&fingerprint()))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().unwrap();
+    // The reader is gone before the command has connected to the database, let alone written.
+    drop(child.stdout.take());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    let output = rx.recv_timeout(LIMIT).expect("the command exits").unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot write the code to standard output"),
+        "{stderr}"
+    );
+    assert_eq!(f.rows().await, "1");
 }

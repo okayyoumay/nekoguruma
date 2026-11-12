@@ -183,7 +183,6 @@ ngr-server registration-code --config <file> --owner alice --name "Bench PC" \
   Only the code's SHA-256 is stored; the code is never logged and appears nowhere else. Errors
   are `ngr-server: <fixed text>` on standard error, without the database URL or the code. Two
   commands at once make independent rows, and an earlier unused code stays valid.
-- The agent's route that redeems a code is not built yet.
 
 ## The request guard
 

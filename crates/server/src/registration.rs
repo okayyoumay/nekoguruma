@@ -1,6 +1,6 @@
 //! Agent registration, server side (design 6.4, 6.7, 14.4; ADR-463, ADR-465). This module holds
 //! issuance: the administrator's `ngr-server registration-code` command writes one row of
-//! `agent_registration_codes` and prints the code once. Redemption comes with the route.
+//! `agent_registration_codes` and prints the code once.
 //!
 //! A code is [`RegistrationCode`], 128 random bits; only its SHA-256 is stored, so the text
 //! exists in the process that issued it and nowhere else. Errors are fixed text, and no value of

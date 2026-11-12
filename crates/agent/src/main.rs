@@ -2,8 +2,9 @@
 //! The binary's commands: `ngr-agent run` runs the procedure of a variant's document on a VCI and
 //! prints the final VM state as JSON, `ngr-agent identify` runs an identification plan's
 //! functional presence requests, VIN reads and ECU reads and prints the report as JSON, and
-//! `ngr-agent identity` creates the agent's key if needed and prints its public key as JSON
-//! (`crates/agent/docs/ngr-agent.md`).
+//! `ngr-agent identity` creates the agent's key if needed and prints its public key as JSON, and
+//! `ngr-agent register` registers the agent with the server and stores the registration record
+//! (ADR-470; `crates/agent/docs/ngr-agent.md`).
 
 use std::ffi::OsString;
 use std::future::Future;
@@ -34,6 +35,8 @@ usage: ngr-agent run --vci <name> --mode <device|user> --document <file> [option
        ngr-agent identify --vci <name> --mode <device|user> --plan <file> [--document <file>]...
                           [options]
        ngr-agent identity --mode <device|user>
+       ngr-agent register --mode <device|user> --server <origin> --server-key <hex>
+                          [--code-file <file>] [--replace]
 
 run: runs the procedure of a variant's document on a J2534 v04.04 or D-PDU API VCI and prints the
 final VM state as JSON on stdout. The job takes its link from the protocol the variant
@@ -53,6 +56,21 @@ but --mode. Exit status: 0 the key is there; 1 this build or mode has no key sto
 cannot create the key, or the debug variables are wrong; 2 a usage error; 3 the store, its lock
 or the state directory is unavailable (nothing changed, try again); 4 the stored key cannot be
 used (nothing changed; register again after an explicit reset).
+
+register: registers the agent with the server at --server (http://127.0.0.1[:port]) and stores
+the registration record in the agent's state directory. The registration code is read from
+standard input (a pipe or a redirect; a terminal is refused) or from --code-file, never from an
+argument. --server-key is the server key ID that `ngr-server registration-code` printed: 64
+hexadecimal digits. A key the agent has to create first stops the command (exit 1) with the
+fingerprint to issue a code for. --replace lets a registration replace an existing record.
+It prints agent_id, owner_id, preset, allow_remote, server_origin, instruction_key_id,
+agent_key_fingerprint and replaced as one JSON line on stdout. Exit status: 0 registered and
+stored; 1 it cannot register as asked (no key store, an unusable code, a key just created, a
+refusal by the server, an answer that is not a registration answer); 2 a usage error; 3 the
+server, the state directory or a lock is unavailable, or the outcome is unknown (the local record
+is unchanged; if the same code is then refused, issue a new one); 4 the stored key cannot be
+used; 5 a record exists and --replace was not given; 6 the answer is not authentic (its key is
+not the --server-key one, or its signature does not verify).
 
 options:
   --vci <name>         library name the worker service resolves: a J2534 library, or the
@@ -123,6 +141,16 @@ enum Command {
     Identify(IdentifyArgs),
     /// `ngr-agent identity --mode <mode>`.
     Identity(OperatingMode),
+    /// `ngr-agent register ...` (ADR-470).
+    Register(RegisterArgs),
+}
+
+/// What `ngr-agent register` takes, checked before any file or socket is touched.
+#[derive(Debug, PartialEq, Eq)]
+struct RegisterArgs {
+    request: agent::registration::Request,
+    /// The file that holds the code; the code is read from standard input without it.
+    code_file: Option<PathBuf>,
 }
 
 impl Command {
@@ -131,6 +159,7 @@ impl Command {
             Command::Run(args) => args.mode,
             Command::Identify(args) => args.mode,
             Command::Identity(mode) => *mode,
+            Command::Register(args) => args.request.mode,
         }
     }
 }
@@ -151,6 +180,9 @@ fn main() -> ExitCode {
     if let Command::Identity(mode) = command {
         return identity(mode);
     }
+    if let Command::Register(args) = command {
+        return register(args);
+    }
     // The job's VM runs on a blocking thread that blocks on the runtime for every primitive,
     // so the runtime must be multi-threaded (ADR-235).
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -166,7 +198,9 @@ fn main() -> ExitCode {
     let outcome = match command {
         Command::Run(args) => runtime.block_on(run(args)),
         Command::Identify(args) => runtime.block_on(identify(args)),
-        Command::Identity(_) => unreachable!("handled before the runtime starts"),
+        Command::Identity(_) | Command::Register(_) => {
+            unreachable!("handled before the runtime starts")
+        }
     };
     match outcome {
         Ok(state) => {
@@ -210,12 +244,52 @@ fn identity(mode: OperatingMode) -> ExitCode {
     }
 }
 
+/// `ngr-agent register`: prints the registration as one JSON line. Nothing it prints or logs
+/// holds the code, an argument or text from the server (`agent::registration`).
+fn register(args: RegisterArgs) -> ExitCode {
+    use std::io::{IsTerminal, Write};
+    let source = match args.code_file {
+        Some(path) => agent::registration::code_input::CodeSource::File(path),
+        None => {
+            // A terminal would show the code as it is typed and keep it in the shell's history
+            // of the session; the code comes from a pipe, a redirect or a file.
+            if std::io::stdin().is_terminal() {
+                eprintln!(
+                    "ngr-agent: register: standard input is a terminal; pipe or redirect the \
+                     code to it, or use --code-file\n\n{USAGE}"
+                );
+                return ExitCode::from(2);
+            }
+            agent::registration::code_input::CodeSource::Stdin
+        }
+    };
+    match agent::registration::register(&args.request, &source) {
+        Ok(done) => {
+            tracing::info!(agent_id = %done.record.agent_id, "agent registered");
+            if done.durability == agent::registration::record::Durability::DirectoryNotSynced {
+                eprintln!(
+                    "ngr-agent: register: warning: the registration is stored, but syncing its \
+                     directory failed"
+                );
+            }
+            // A closed standard output does not undo a registration that is stored.
+            let _ = writeln!(std::io::stdout(), "{}", done.output());
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("ngr-agent: register: {error}");
+            ExitCode::from(error.exit_code())
+        }
+    }
+}
+
 fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
     let mut args = args.into_iter();
     let identify = match args.next() {
         Some(command) if command == "run" => false,
         Some(command) if command == "identify" => true,
         Some(command) if command == "identity" => return parse_identity(args),
+        Some(command) if command == "register" => return parse_register(args),
 
         Some(command) => return Err(format!("unknown command {command:?}")),
         None => return Err("missing command".to_owned()),
@@ -351,6 +425,95 @@ fn parse_identity(mut args: impl Iterator<Item = OsString>) -> Result<Command, S
         );
     }
     Ok(Command::Identity(mode.ok_or("--mode is required")?))
+}
+
+/// How a flag of `register` is named in a message: only a short `--name` of letters, digits and
+/// hyphens, up to its `=`, so that a value the operator mistyped as an argument is not echoed.
+fn flag_name(flag: &str) -> Option<&str> {
+    let name = flag.split('=').next().unwrap_or(flag);
+    (name.len() <= 24
+        && name.starts_with("--")
+        && name[2..]
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'))
+    .then_some(name)
+}
+
+/// The options of `ngr-agent register` (ADR-470): `--mode`, `--server` and `--server-key`, each
+/// once and in any order, `--code-file <file>` and `--replace`. No message repeats a value, and
+/// a stray argument is never echoed.
+fn parse_register(args: impl Iterator<Item = OsString>) -> Result<Command, String> {
+    use agent::registration::origin::{ServerOrigin, parse_server_key};
+    let mut args = args;
+    let mut mode = None;
+    let mut server = None;
+    let mut server_key = None;
+    let mut code_file: Option<PathBuf> = None;
+    let mut replace = false;
+    while let Some(arg) = args.next() {
+        let flag = arg
+            .into_string()
+            .map_err(|_| "an argument is not valid UTF-8".to_owned())?;
+        let known = matches!(
+            flag.as_str(),
+            "--mode" | "--server" | "--server-key" | "--code-file" | "--replace"
+        );
+        if !known {
+            return Err(match flag_name(&flag) {
+                Some(name) => format!("unknown option {name}"),
+                None if flag.starts_with("--") => "unknown option".to_owned(),
+                None => "unexpected argument".to_owned(),
+            });
+        }
+        if flag == "--replace" {
+            if replace {
+                return Err("give --replace once".to_owned());
+            }
+            replace = true;
+            continue;
+        }
+        let value = args.next().ok_or_else(|| format!("{flag} needs a value"))?;
+        let slot_taken = match flag.as_str() {
+            "--mode" => mode.is_some(),
+            "--server" => server.is_some(),
+            "--server-key" => server_key.is_some(),
+            _ => code_file.is_some(),
+        };
+        if slot_taken {
+            return Err(format!("give {flag} once"));
+        }
+        if flag == "--code-file" {
+            code_file = Some(PathBuf::from(value));
+            continue;
+        }
+        let value = value
+            .into_string()
+            .map_err(|_| format!("the value of {flag} is not valid UTF-8"))?;
+        match flag.as_str() {
+            "--mode" => {
+                mode = Some(match value.as_str() {
+                    "device" => OperatingMode::Device,
+                    "user" => OperatingMode::User,
+                    _ => return Err("--mode must be device or user".to_owned()),
+                });
+            }
+            "--server" => server = Some(ServerOrigin::parse(&value).map_err(|e| e.to_string())?),
+            _ => {
+                server_key = Some(
+                    parse_server_key(&value).ok_or("--server-key must be 64 hexadecimal digits")?,
+                );
+            }
+        }
+    }
+    Ok(Command::Register(RegisterArgs {
+        request: agent::registration::Request {
+            mode: mode.ok_or("--mode is required")?,
+            server: server.ok_or("--server is required")?,
+            server_key: server_key.ok_or("--server-key is required")?,
+            replace,
+        },
+        code_file,
+    }))
 }
 
 /// The `workers` directory next to the running executable.
@@ -699,14 +862,18 @@ mod tests {
     fn parse(args: &[&str]) -> Result<RunArgs, String> {
         match parse_command(args)? {
             Command::Run(args) => Ok(args),
-            Command::Identify(_) | Command::Identity(_) => Err("not a run".to_owned()),
+            Command::Identify(_) | Command::Identity(_) | Command::Register(_) => {
+                Err("not a run".to_owned())
+            }
         }
     }
 
     fn identify_args(args: &[&str]) -> Result<IdentifyArgs, String> {
         match parse_command(args)? {
             Command::Identify(args) => Ok(args),
-            Command::Run(_) | Command::Identity(_) => Err("not an identify".to_owned()),
+            Command::Run(_) | Command::Identity(_) | Command::Register(_) => {
+                Err("not an identify".to_owned())
+            }
         }
     }
 
@@ -731,6 +898,79 @@ mod tests {
             &["identity", "extra"],
         ] {
             assert!(parse_command(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// A1: the three required options in any order, with the optional two.
+    #[test]
+    fn parses_a_register_in_any_order() {
+        let key = "ab".repeat(32);
+        let expected = |replace: bool, file: Option<&str>| {
+            Ok(Command::Register(RegisterArgs {
+                request: agent::registration::Request {
+                    mode: OperatingMode::Device,
+                    server: agent::registration::origin::ServerOrigin::parse(
+                        "http://127.0.0.1:8080",
+                    )
+                    .unwrap(),
+                    server_key: [0xab; 32],
+                    replace,
+                },
+                code_file: file.map(PathBuf::from),
+            }))
+        };
+        assert_eq!(
+            parse_command(&[
+                "register",
+                "--mode",
+                "device",
+                "--server",
+                "HTTP://127.0.0.1:8080/",
+                "--server-key",
+                &key.to_uppercase(),
+            ]),
+            expected(false, None)
+        );
+        assert_eq!(
+            parse_command(&[
+                "register",
+                "--replace",
+                "--server-key",
+                &key,
+                "--code-file",
+                "code.txt",
+                "--server",
+                "http://127.0.0.1:8080",
+                "--mode",
+                "device",
+            ]),
+            expected(true, Some("code.txt"))
+        );
+    }
+
+    /// A5: the message names a `--flag` only and never echoes another argument.
+    #[test]
+    fn a_register_message_never_echoes_a_stray_argument() {
+        let key = "ab".repeat(32);
+        let base = [
+            "register",
+            "--mode",
+            "user",
+            "--server",
+            "http://127.0.0.1:1",
+            "--server-key",
+            key.as_str(),
+        ];
+        for (extra, message) in [
+            (vec!["--verbose"], "unknown option --verbose"),
+            (vec!["ngr1-SECRETSECRET"], "unexpected argument"),
+            (vec!["--code=ngr1-SECRET"], "unknown option --code"),
+            (vec!["--ngr1-0123456789ABCDEFGHJKMNPQRS"], "unknown option"),
+            (vec!["--replace", "true"], "unexpected argument"),
+        ] {
+            let args: Vec<&str> = base.iter().copied().chain(extra).collect();
+            let error = parse_command(&args).unwrap_err();
+            assert_eq!(error, message, "{args:?}");
         }
     }
 

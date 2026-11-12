@@ -12,8 +12,9 @@
 //! The installation creates the Unix device root (systemd's `StateDirectory=`), so the agent
 //! creates only the sub-directories under it and a missing root is an error, not something to
 //! make. Each kind of state has a sub-directory of its own ([`private_subdir`]): `identity`
-//! (the agent key's lock and, in a debug build, its test store) and `journal` (the write-job
-//! journal, which a later change wires in).
+//! (the agent key's lock and, in a debug build, its test store), `registration` (the registration
+//! record and its lock, ADR-470) and `journal` (the write-job journal, which a later change wires
+//! in).
 //!
 //! A debug build reads `NGR_AGENT_STATE_DIR`, an absolute directory that replaces the root for
 //! both modes, so tests keep their state in a temporary directory. A release build never reads

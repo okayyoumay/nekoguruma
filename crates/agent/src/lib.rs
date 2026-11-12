@@ -12,6 +12,9 @@
 //! - [`identification`]: the identification job's plan, its checks and the endpoints it derives (ADR-395)
 //! - [`identity`]: the agent's key in a named-secret store, created once under a lock (design 6.4,
 //!   ADR-459, ADR-460)
+//! - [`registration`]: the agent's initial registration with the server, and its record (design 6.4,
+//!   ADR-463, ADR-470)
+//! - [`server_http`]: the HTTP/1 client for the agent's calls to the server (ADR-470)
 //! - [`state`]: where the agent keeps its state for each operating mode (design 6.2, ADR-460)
 //! - [`instruction`]: the gate that verifies a signed job instruction (design 5.3, 11.1, ADR-461)
 //! - [`inputs`]: the runtime inputs and service fields a restart reads (ADR-229, ADR-245)
@@ -45,9 +48,11 @@ pub mod link;
 pub mod logging;
 mod oplog;
 pub mod policy;
+pub mod registration;
 pub mod restart;
 pub mod runner;
 pub mod send_receive;
+pub mod server_http;
 pub mod state;
 
 pub use artifact::Artifact;

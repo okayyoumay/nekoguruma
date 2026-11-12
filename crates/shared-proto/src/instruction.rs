@@ -158,7 +158,7 @@ impl JobInstruction {
 }
 
 /// 36 characters, lowercase hexadecimal digits and hyphens at 8, 13, 18 and 23.
-fn is_canonical_uuid(text: &str) -> bool {
+pub fn is_canonical_uuid(text: &str) -> bool {
     let bytes = text.as_bytes();
     bytes.len() == JOB_ID_LEN
         && bytes.iter().enumerate().all(|(i, b)| match i {

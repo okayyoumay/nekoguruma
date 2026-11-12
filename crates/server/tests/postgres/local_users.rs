@@ -11,13 +11,16 @@
 //! back) while the server is at rest.
 
 use std::net::SocketAddr;
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
+
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use shared_crypto::random_32;
 
 use server::config::Http;
 use server::local_guard::pinned_origin;
-use server::local_user::{
-    self, DUMMY_PASSWORD, Hasher, LOCAL_TENANT_ID, NewUser, ROLES, UserError,
-};
+use server::local_user::{self, Hasher, LOCAL_TENANT_ID, NewUser, ROLES, UserError};
 use server::{Server, db};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -27,7 +30,29 @@ use crate::serving::{Reply, Running, exchange};
 use crate::support::TestPostgres;
 
 const LIMIT: Duration = Duration::from_secs(30);
-const PASSWORD: &str = "correct horse battery";
+
+/// A password made at run time: 43 characters of base64url of random bytes. No test holds a
+/// password as a literal.
+fn secret() -> String {
+    URL_SAFE_NO_PAD.encode(random_32().expect("random bytes"))
+}
+
+/// `n` one-byte characters drawn from a fresh secret.
+fn filler(n: usize) -> String {
+    secret().chars().cycle().take(n).collect()
+}
+
+/// The users' password in the tests of this process.
+fn password() -> &'static str {
+    static USERS: LazyLock<String> = LazyLock::new(secret);
+    &USERS
+}
+
+/// A password that is no user's.
+fn wrong_password() -> &'static str {
+    static WRONG: LazyLock<String> = LazyLock::new(secret);
+    &WRONG
+}
 const CLEARED: &str = "ngr_session=; Max-Age=0; Path=/; HttpOnly; SameSite=Strict";
 
 // ---------------------------------------------------------------------------------------------
@@ -89,7 +114,7 @@ async fn login(addr: SocketAddr, username: &str, password: &str) -> Reply {
 }
 
 async fn login_with_cookie(addr: SocketAddr, username: &str, cookie: &str) -> Reply {
-    login_raw(addr, &login_body(username, PASSWORD), Some(cookie)).await
+    login_raw(addr, &login_body(username, password()), Some(cookie)).await
 }
 
 async fn get_me(addr: SocketAddr, cookies: &[&str]) -> Reply {
@@ -260,12 +285,12 @@ async fn a_login_answers_the_whoami_document_with_the_cookie_and_logs_only_the_i
     let (log, _guard) = capture();
     let lab = Lab::new().await;
     let alice = lab
-        .user("alice", "Alice A", &["viewer", "admin"], PASSWORD)
+        .user("alice", "Alice A", &["viewer", "admin"], password())
         .await;
-    let bob = lab.user("bob", "Bob B", &[], PASSWORD).await;
+    let bob = lab.user("bob", "Bob B", &[], password()).await;
 
     // L18
-    let r = login(lab.addr(), "alice", PASSWORD).await;
+    let r = login(lab.addr(), "alice", password()).await;
     assert_eq!(r.status, 200, "{}", r.head);
     assert_eq!(r.header("content-type"), Some("application/json"));
     assert_eq!(r.header("cache-control"), Some("no-store"));
@@ -291,7 +316,7 @@ async fn a_login_answers_the_whoami_document_with_the_cookie_and_logs_only_the_i
         })
     );
     // L19
-    let r = login(lab.addr(), "bob", PASSWORD).await;
+    let r = login(lab.addr(), "bob", password()).await;
     assert_eq!(r.status, 200);
     assert_eq!(json(&r)["roles"], serde_json::json!([]));
     assert_eq!(json(&r)["operatorId"], bob.as_str());
@@ -345,8 +370,11 @@ async fn a_login_answers_the_whoami_document_with_the_cookie_and_logs_only_the_i
         text.contains("login") && text.contains(&alice),
         "the login is logged with the ID: {text}"
     );
-    for secret in [PASSWORD, token, "alice@", &cookie] {
-        assert!(!text.contains(secret), "the log holds {secret:?}: {text}");
+    for (i, secret) in [password(), token, "alice@", &cookie]
+        .into_iter()
+        .enumerate()
+    {
+        assert!(!text.contains(secret), "the log holds secret number {i}");
     }
     lab.finish().await;
 }
@@ -358,9 +386,9 @@ async fn a_login_answers_the_whoami_document_with_the_cookie_and_logs_only_the_i
 async fn every_refusal_is_one_401_and_costs_a_verification_and_logs_its_reason() {
     let (log, _guard) = capture();
     let lab = Lab::new().await;
-    let alice = lab.user("alice", "Alice", &[], PASSWORD).await;
-    let nocred = lab.user("nocred", "No Credential", &[], PASSWORD).await;
-    let gone = lab.user("gone", "Disabled", &[], PASSWORD).await;
+    let alice = lab.user("alice", "Alice", &[], password()).await;
+    let nocred = lab.user("nocred", "No Credential", &[], password()).await;
+    let gone = lab.user("gone", "Disabled", &[], password()).await;
     lab.sql(
         "DELETE FROM operator_credentials WHERE operator_id = $1::uuid",
         &nocred,
@@ -376,11 +404,10 @@ async fn every_refusal_is_one_401_and_costs_a_verification_and_logs_its_reason()
     // L11 unknown (and L16: with the password the dummy hash was made from), L12 no
     // credential, L13 disabled with the right password, L15 wrong password.
     let attempts: Vec<(&str, &str, &str)> = vec![
-        ("unknown_user", "nosuchuser", PASSWORD),
-        ("unknown_user", "nosuchuser2", DUMMY_PASSWORD),
-        ("no_credential", "nocred", PASSWORD),
-        ("disabled", "gone", PASSWORD),
-        ("wrong_password", "alice", "not the password"),
+        ("unknown_user", "nosuchuser", password()),
+        ("no_credential", "nocred", password()),
+        ("disabled", "gone", password()),
+        ("wrong_password", "alice", wrong_password()),
     ];
     let mut answers = Vec::new();
     for (reason, user, password) in &attempts {
@@ -433,14 +460,11 @@ async fn every_refusal_is_one_401_and_costs_a_verification_and_logs_its_reason()
             .unwrap();
         assert!(line.contains(id.as_str()), "{word}: {line}");
     }
-    for secret in [
-        PASSWORD,
-        DUMMY_PASSWORD,
-        "not the password",
-        "nosuchuser",
-        "$argon2",
-    ] {
-        assert!(!text.contains(secret), "the log holds {secret:?}: {text}");
+    for (i, secret) in [password(), wrong_password(), "nosuchuser", "$argon2"]
+        .into_iter()
+        .enumerate()
+    {
+        assert!(!text.contains(secret), "the log holds secret number {i}");
     }
     // A reason is logged once per 60 s: the two unknown users made one line.
     assert_eq!(text.matches("reason=\"unknown_user\"").count(), 1, "{text}");
@@ -451,7 +475,7 @@ async fn every_refusal_is_one_401_and_costs_a_verification_and_logs_its_reason()
 async fn a_disabled_operator_without_a_credential_is_logged_as_disabled() {
     let (log, _guard) = capture();
     let lab = Lab::new().await;
-    let id = lab.user("both", "Both", &[], PASSWORD).await;
+    let id = lab.user("both", "Both", &[], password()).await;
     lab.sql(
         "DELETE FROM operator_credentials WHERE operator_id = $1::uuid",
         &id,
@@ -462,7 +486,7 @@ async fn a_disabled_operator_without_a_credential_is_logged_as_disabled() {
         &id,
     )
     .await;
-    assert_problem(&login(lab.addr(), "both", PASSWORD).await, 401, "both");
+    assert_problem(&login(lab.addr(), "both", password()).await, 401, "both");
     let text = log.text();
     assert!(text.contains("reason=\"disabled\""), "{text}");
     assert!(!text.contains("reason=\"no_credential\""), "{text}");
@@ -473,14 +497,14 @@ async fn a_disabled_operator_without_a_credential_is_logged_as_disabled() {
 async fn a_stored_hash_that_is_not_an_argon2id_string_is_a_500_without_a_hash_and_keeps_the_slot() {
     let (log, _guard) = capture();
     let lab = Lab::new().await;
-    let id = lab.user("alice", "Alice", &[], PASSWORD).await;
+    let id = lab.user("alice", "Alice", &[], password()).await;
     let argon2i = "$argon2i$v=19$m=19456,t=2,p=1$bmdyLWR1bW15LXNhbHQtMDAx$\
                    CBpwRQcmMcl86Bvwd+qr4xVjgtpTvz6RD0Z8m1Z3Gm4";
     // L17, for a plain text and for another Argon2 variant.
     for stored in ["plain-text-password", argon2i] {
         lab.sql("UPDATE operator_credentials SET password_hash = $1", stored)
             .await;
-        let r = login(lab.addr(), "alice", PASSWORD).await;
+        let r = login(lab.addr(), "alice", password()).await;
         assert_problem(&r, 500, stored);
         assert!(r.header("set-cookie").is_none());
         assert!(!r.body.contains(stored));
@@ -491,13 +515,13 @@ async fn a_stored_hash_that_is_not_an_argon2id_string_is_a_500_without_a_hash_an
         !text.contains("plain-text-password") && !text.contains("argon2i"),
         "{text}"
     );
-    assert!(!text.contains(PASSWORD));
+    assert!(!text.contains(password()));
     // The slot stays on a 500: eight more fill the ten, the next is limited.
     for i in 0..8 {
-        let r = login(lab.addr(), "alice", PASSWORD).await;
+        let r = login(lab.addr(), "alice", password()).await;
         assert_eq!(r.status, 500, "{i}");
     }
-    let r = login(lab.addr(), "alice", PASSWORD).await;
+    let r = login(lab.addr(), "alice", password()).await;
     assert_problem(&r, 429, "eleventh");
     lab.finish().await;
 }
@@ -509,11 +533,11 @@ async fn a_stored_hash_that_is_not_an_argon2id_string_is_a_500_without_a_hash_an
 async fn eleven_concurrent_wrong_logins_are_ten_401s_and_one_429_and_a_full_limiter_needs_no_database_or_hash()
  {
     let mut lab = Lab::new().await;
-    lab.user("alice", "Alice", &[], PASSWORD).await;
+    lab.user("alice", "Alice", &[], password()).await;
     let addr = lab.addr();
     // C1
     let tasks: Vec<_> = (0..11)
-        .map(|_| tokio::spawn(async move { login(addr, "alice", "wrong password!").await }))
+        .map(|_| tokio::spawn(async move { login(addr, "alice", wrong_password()).await }))
         .collect();
     let mut statuses = Vec::new();
     for task in tasks {
@@ -540,7 +564,7 @@ async fn eleven_concurrent_wrong_logins_are_ten_401s_and_one_429_and_a_full_limi
     let permit = lab.hasher.hold().await;
     lab.pg.stop();
     let started = Instant::now();
-    let r = login(addr, "alice", PASSWORD).await;
+    let r = login(addr, "alice", password()).await;
     assert_problem(&r, 429, "right password");
     assert!((1..=60).contains(&retry_after(&r)));
     assert!(started.elapsed() < Duration::from_secs(3));
@@ -551,7 +575,7 @@ async fn eleven_concurrent_wrong_logins_are_ten_401s_and_one_429_and_a_full_limi
 #[tokio::test]
 async fn only_a_200_gives_its_slot_back_and_a_400_never_takes_one() {
     let lab = Lab::new().await;
-    lab.user("alice", "Alice", &[], PASSWORD).await;
+    lab.user("alice", "Alice", &[], password()).await;
     let addr = lab.addr();
     // Shape refusals come before admission: they take no slot.
     for _ in 0..12 {
@@ -560,19 +584,19 @@ async fn only_a_200_gives_its_slot_back_and_a_400_never_takes_one() {
     }
     for i in 0..9 {
         assert_eq!(
-            login(addr, "alice", "wrong password!").await.status,
+            login(addr, "alice", wrong_password()).await.status,
             401,
             "{i}"
         );
     }
     // Three right logins take a slot each and give it back.
     for i in 0..3 {
-        assert_eq!(login(addr, "alice", PASSWORD).await.status, 200, "{i}");
+        assert_eq!(login(addr, "alice", password()).await.status, 200, "{i}");
     }
     // The tenth failure still fits, the eleventh does not.
-    assert_eq!(login(addr, "alice", "wrong password!").await.status, 401);
+    assert_eq!(login(addr, "alice", wrong_password()).await.status, 401);
     assert_problem(
-        &login(addr, "alice", "wrong password!").await,
+        &login(addr, "alice", wrong_password()).await,
         429,
         "eleventh",
     );
@@ -583,11 +607,11 @@ async fn only_a_200_gives_its_slot_back_and_a_400_never_takes_one() {
 async fn a_client_that_disconnects_during_the_hash_keeps_its_slot() {
     // L25
     let lab = Lab::new().await;
-    lab.user("alice", "Alice", &[], PASSWORD).await;
+    lab.user("alice", "Alice", &[], password()).await;
     let addr = lab.addr();
     for i in 0..9 {
         assert_eq!(
-            login(addr, "alice", "wrong password!").await.status,
+            login(addr, "alice", wrong_password()).await.status,
             401,
             "{i}"
         );
@@ -601,7 +625,7 @@ async fn a_client_that_disconnects_during_the_hash_keeps_its_slot() {
             "/api/v1/login",
             Some(&origin(addr)),
             &json_headers(None),
-            &login_body("alice", PASSWORD),
+            &login_body("alice", password()),
         );
         let mut stream = TcpStream::connect(addr).await.unwrap();
         stream.write_all(raw.as_bytes()).await.unwrap();
@@ -613,7 +637,7 @@ async fn a_client_that_disconnects_during_the_hash_keeps_its_slot() {
     wait_for_hash_waiters(&lab.hasher, 0).await;
     drop(permit);
     assert_problem(
-        &login(addr, "alice", "wrong password!").await,
+        &login(addr, "alice", wrong_password()).await,
         429,
         "slot kept",
     );
@@ -627,7 +651,7 @@ async fn a_client_that_disconnects_during_the_hash_keeps_its_slot() {
 async fn the_requests_own_rules_are_judged_before_any_database_access() {
     let s = dead(instruction_key()).await;
     let addr = s.addr;
-    let good = login_body("alice", PASSWORD);
+    let good = login_body("alice", password());
 
     // L1: the guard answers first (ADR-456).
     let host_only = |host: &str, extra: &[String]| {
@@ -729,6 +753,7 @@ async fn the_requests_own_rules_are_judged_before_any_database_access() {
         "repeated",
     );
 
+    let p = secret();
     // L6: the shape. Each of these would be a 503 if it reached the database.
     for (what, body) in [
         ("not json", "nope".to_owned()),
@@ -737,14 +762,14 @@ async fn the_requests_own_rules_are_judged_before_any_database_access() {
         ("missing", r#"{"username":"a"}"#.to_owned()),
         (
             "extra",
-            r#"{"username":"a","password":"b","x":"y"}"#.to_owned(),
+            format!(r#"{{"username":"a","password":"{p}","x":"y"}}"#),
         ),
         (
             "duplicate",
-            r#"{"username":"a","username":"b","password":"b"}"#.to_owned(),
+            format!(r#"{{"username":"a","username":"b","password":"{p}"}}"#),
         ),
         ("number", r#"{"username":"a","password":1}"#.to_owned()),
-        ("null", r#"{"username":null,"password":"b"}"#.to_owned()),
+        ("null", format!(r#"{{"username":null,"password":"{p}"}}"#)),
         ("trailing", format!("{good} x")),
     ] {
         assert_problem(&login_raw(addr, &body, None).await, 400, what);
@@ -752,21 +777,21 @@ async fn the_requests_own_rules_are_judged_before_any_database_access() {
 
     // L7 and L8: no database access, no hash.
     for (what, username, password) in [
-        ("empty user name", String::new(), "pw".to_owned()),
-        ("257-byte user name", "u".repeat(257), "pw".to_owned()),
-        ("control in user name", "a\nb".to_owned(), "pw".to_owned()),
-        ("DEL in user name", "a\u{7f}b".to_owned(), "pw".to_owned()),
+        ("empty user name", String::new(), filler(2)),
+        ("257-byte user name", filler(257), filler(2)),
+        ("control in user name", "a\nb".to_owned(), filler(2)),
+        ("DEL in user name", "a\u{7f}b".to_owned(), filler(2)),
         ("empty password", "alice".to_owned(), String::new()),
-        ("1025-byte password", "alice".to_owned(), "p".repeat(1025)),
+        ("1025-byte password", "alice".to_owned(), filler(1025)),
     ] {
         let r = login_raw(addr, &login_body(&username, &password), None).await;
         assert_problem(&r, 400, what);
     }
     // The bounds themselves pass: 256 bytes, 1 byte, 1024 bytes reach the database (503).
     for (what, username, password) in [
-        ("256-byte user name", "u".repeat(256), "p".to_owned()),
-        ("1024-byte password", "alice".to_owned(), "p".repeat(1024)),
-        ("short password", "alice".to_owned(), "p".to_owned()),
+        ("256-byte user name", filler(256), filler(1)),
+        ("1024-byte password", "alice".to_owned(), filler(1024)),
+        ("short password", "alice".to_owned(), filler(1)),
     ] {
         let r = login_raw(addr, &login_body(&username, &password), None).await;
         assert_problem(&r, 503, what);
@@ -781,13 +806,13 @@ async fn a_row_read_that_fails_is_a_503_that_keeps_the_slot_and_a_full_limiter_n
     let s = dead(instruction_key()).await;
     let addr = s.addr;
     let tasks: Vec<_> = (0..10)
-        .map(|_| tokio::spawn(async move { login(addr, "alice", PASSWORD).await }))
+        .map(|_| tokio::spawn(async move { login(addr, "alice", password()).await }))
         .collect();
     for task in tasks {
         assert_problem(&task.await.unwrap(), 503, "database down");
     }
     let started = Instant::now();
-    let r = login(addr, "alice", PASSWORD).await;
+    let r = login(addr, "alice", password()).await;
     assert_problem(&r, 429, "eleventh");
     assert!((1..=60).contains(&retry_after(&r)));
     assert!(
@@ -798,8 +823,8 @@ async fn a_row_read_that_fails_is_a_503_that_keeps_the_slot_and_a_full_limiter_n
     // The refusal is logged once, as a warning, with no user name.
     let text = log.text();
     assert_eq!(text.matches("login limited").count(), 1, "{text}");
-    assert!(!text.contains("alice") && !text.contains(PASSWORD));
-    assert_problem(&login(addr, "alice", PASSWORD).await, 429, "again");
+    assert!(!text.contains("alice") && !text.contains(password()));
+    assert_problem(&login(addr, "alice", password()).await, 429, "again");
     assert_eq!(log.text().matches("login limited").count(), 1, "gated");
     s.finish().await;
 }
@@ -810,12 +835,12 @@ async fn a_row_read_that_fails_is_a_503_that_keeps_the_slot_and_a_full_limiter_n
 #[tokio::test]
 async fn a_login_replaces_a_presented_session_and_a_failure_leaves_it() {
     let lab = Lab::new().await;
-    lab.user("alice", "Alice", &[], PASSWORD).await;
+    lab.user("alice", "Alice", &[], password()).await;
     let addr = lab.addr();
-    let first = cookie_of(&login(addr, "alice", PASSWORD).await);
+    let first = cookie_of(&login(addr, "alice", password()).await);
 
     // L21: a failure with the cookie leaves the cookie and its session.
-    let r = login_raw(addr, &login_body("alice", "wrong password!"), Some(&first)).await;
+    let r = login_raw(addr, &login_body("alice", wrong_password()), Some(&first)).await;
     assert_problem(&r, 401, "wrong password");
     assert!(r.header("set-cookie").is_none());
     let r = login_raw(addr, "{}", Some(&first)).await;
@@ -853,17 +878,17 @@ async fn a_login_replaces_a_presented_session_and_a_failure_leaves_it() {
 async fn at_sixteen_sessions_a_new_login_drops_the_least_recently_used() {
     // L24
     let lab = Lab::new().await;
-    lab.user("alice", "Alice", &[], PASSWORD).await;
-    lab.user("bob", "Bob", &[], PASSWORD).await;
+    lab.user("alice", "Alice", &[], password()).await;
+    lab.user("bob", "Bob", &[], password()).await;
     let addr = lab.addr();
-    let bob = cookie_of(&login(addr, "bob", PASSWORD).await);
+    let bob = cookie_of(&login(addr, "bob", password()).await);
     let mut cookies = Vec::new();
     for _ in 0..16 {
-        cookies.push(cookie_of(&login(addr, "alice", PASSWORD).await));
+        cookies.push(cookie_of(&login(addr, "alice", password()).await));
     }
     // The oldest is used, so the second is now the least recently used.
     assert_eq!(get_me(addr, &[&cookies[0]]).await.status, 200);
-    let newest = cookie_of(&login(addr, "alice", PASSWORD).await);
+    let newest = cookie_of(&login(addr, "alice", password()).await);
     assert_signed_out(&get_me(addr, &[&cookies[1]]).await, "the evicted session");
     for cookie in cookies
         .iter()
@@ -886,11 +911,11 @@ async fn at_sixteen_sessions_a_new_login_drops_the_least_recently_used() {
 async fn two_right_logins_at_once_make_two_valid_sessions() {
     // C2
     let lab = Lab::new().await;
-    lab.user("alice", "Alice", &[], PASSWORD).await;
+    lab.user("alice", "Alice", &[], password()).await;
     let addr = lab.addr();
     let (a, b) = tokio::join!(
-        tokio::spawn(async move { login(addr, "alice", PASSWORD).await }),
-        tokio::spawn(async move { login(addr, "alice", PASSWORD).await }),
+        tokio::spawn(async move { login(addr, "alice", password()).await }),
+        tokio::spawn(async move { login(addr, "alice", password()).await }),
     );
     let (a, b) = (a.unwrap(), b.unwrap());
     assert_eq!((a.status, b.status), (200, 200));
@@ -908,14 +933,14 @@ async fn two_right_logins_at_once_make_two_valid_sessions() {
 async fn a_disabled_operator_or_a_changed_credential_ends_the_session_at_its_next_request() {
     let lab = Lab::new().await;
     let addr = lab.addr();
-    let alice = lab.user("alice", "Alice", &[], PASSWORD).await;
-    let bob = lab.user("bob", "Bob", &[], PASSWORD).await;
-    let carol = lab.user("carol", "Carol", &[], PASSWORD).await;
-    let dave = lab.user("dave", "Dave", &[], PASSWORD).await;
-    let erin = lab.user("erin", "Erin", &[], PASSWORD).await;
+    let alice = lab.user("alice", "Alice", &[], password()).await;
+    let bob = lab.user("bob", "Bob", &[], password()).await;
+    let carol = lab.user("carol", "Carol", &[], password()).await;
+    let dave = lab.user("dave", "Dave", &[], password()).await;
+    let erin = lab.user("erin", "Erin", &[], password()).await;
     let mut cookies = Vec::new();
     for name in ["alice", "bob", "carol", "dave", "erin"] {
-        cookies.push(cookie_of(&login(addr, name, PASSWORD).await));
+        cookies.push(cookie_of(&login(addr, name, password()).await));
     }
     // M2: no session is answered by the layer's own rules.
     assert_problem(&get_me(addr, &[]).await, 401, "no cookie");
@@ -930,7 +955,7 @@ async fn a_disabled_operator_or_a_changed_credential_ends_the_session_at_its_nex
     )
     .await;
     assert_signed_out(&get_me(addr, &[&cookies[0]]).await, "enabled again");
-    assert_eq!(login(addr, "alice", PASSWORD).await.status, 200);
+    assert_eq!(login(addr, "alice", password()).await.status, 200);
 
     // S12: the operator row is gone.
     lab.sql(
@@ -954,12 +979,12 @@ async fn a_disabled_operator_or_a_changed_credential_ends_the_session_at_its_nex
     local_user::set_password(
         &lab.pool,
         "dave",
-        &Hasher::new().hash(PASSWORD.to_owned()).await.unwrap(),
+        &Hasher::new().hash(password().to_owned()).await.unwrap(),
     )
     .await
     .unwrap();
     assert_signed_out(&get_me(addr, &[&cookies[3]]).await, "new password");
-    assert_eq!(login(addr, "dave", PASSWORD).await.status, 200);
+    assert_eq!(login(addr, "dave", password()).await.status, 200);
 
     // An unrelated change keeps the session: no timestamps are compared.
     lab.sql(
@@ -977,8 +1002,8 @@ async fn a_logout_during_the_row_read_makes_the_request_a_401_and_the_session_is
     // C5 and S14.
     let lab = Lab::new().await;
     let addr = lab.addr();
-    lab.user("alice", "Alice", &[], PASSWORD).await;
-    let cookie = cookie_of(&login(addr, "alice", PASSWORD).await);
+    lab.user("alice", "Alice", &[], password()).await;
+    let cookie = cookie_of(&login(addr, "alice", password()).await);
 
     // The row read waits for this lock.
     let blocker = lab.pg.pool();
@@ -1015,21 +1040,18 @@ async fn a_disable_or_a_new_password_during_a_login_still_gets_its_200_and_the_f
     // C4
     let lab = Lab::new().await;
     let addr = lab.addr();
-    lab.user("alice", "Alice", &[], PASSWORD).await;
-    lab.user("bob", "Bob", &[], PASSWORD).await;
+    lab.user("alice", "Alice", &[], password()).await;
+    lab.user("bob", "Bob", &[], password()).await;
     for (name, change) in [("alice", "disable"), ("bob", "password")] {
         let permit = lab.hasher.hold().await;
-        let pending = tokio::spawn(async move { login(addr, name, PASSWORD).await });
+        let pending = tokio::spawn(async move { login(addr, name, password()).await });
         // The row is read; the hash waits for the permit.
         wait_for_hash_waiters(&lab.hasher, 1).await;
         assert!(!pending.is_finished());
         if change == "disable" {
             local_user::disable(&lab.pool, name).await.unwrap();
         } else {
-            let hash = Hasher::new()
-                .hash("a different password".to_owned())
-                .await
-                .unwrap();
+            let hash = Hasher::new().hash(secret()).await.unwrap();
             local_user::set_password(&lab.pool, name, &hash)
                 .await
                 .unwrap();
@@ -1048,9 +1070,9 @@ async fn a_session_expires_at_the_idle_and_the_absolute_limit_across_jumps_of_th
     // K5 at the route.
     let lab = Lab::new().await;
     let addr = lab.addr();
-    lab.user("alice", "Alice", &[], PASSWORD).await;
-    let idle = cookie_of(&login(addr, "alice", PASSWORD).await);
-    let busy = cookie_of(&login(addr, "alice", PASSWORD).await);
+    lab.user("alice", "Alice", &[], password()).await;
+    let idle = cookie_of(&login(addr, "alice", password()).await);
+    let busy = cookie_of(&login(addr, "alice", password()).await);
     jump(29 * 60).await;
     assert_eq!(get_me(addr, &[&busy]).await.status, 200);
     jump(2 * 60).await;
@@ -1077,11 +1099,11 @@ async fn a_logout_removes_every_session_presented_and_logs_the_id() {
     let (log, _guard) = capture();
     let lab = Lab::new().await;
     let addr = lab.addr();
-    let id = lab.user("alice", "Alice", &[], PASSWORD).await;
-    let a = cookie_of(&login(addr, "alice", PASSWORD).await);
-    let b = cookie_of(&login(addr, "alice", PASSWORD).await);
-    let c = cookie_of(&login(addr, "alice", PASSWORD).await);
-    let d = cookie_of(&login(addr, "alice", PASSWORD).await);
+    let id = lab.user("alice", "Alice", &[], password()).await;
+    let a = cookie_of(&login(addr, "alice", password()).await);
+    let b = cookie_of(&login(addr, "alice", password()).await);
+    let c = cookie_of(&login(addr, "alice", password()).await);
+    let d = cookie_of(&login(addr, "alice", password()).await);
 
     // O1: one session; 204, no-store, cookie cleared, session gone.
     let r = post_logout(addr, std::slice::from_ref(&d)).await;
@@ -1113,8 +1135,8 @@ async fn a_logout_with_a_live_session_needs_no_database() {
     // O1
     let mut lab = Lab::new().await;
     let addr = lab.addr();
-    lab.user("alice", "Alice", &[], PASSWORD).await;
-    let cookie = cookie_of(&login(addr, "alice", PASSWORD).await);
+    lab.user("alice", "Alice", &[], password()).await;
+    let cookie = cookie_of(&login(addr, "alice", password()).await);
     lab.pg.stop();
     let r = post_logout(addr, std::slice::from_ref(&cookie)).await;
     assert_eq!(r.status, 204, "{}", r.head);
@@ -1241,9 +1263,9 @@ async fn add_creates_the_tenant_once_the_operator_its_roles_and_the_credential_i
     let lab = Lab::new().await;
     assert_eq!(lab.pg.scalar("SELECT count(*) FROM tenants").await, "0");
     let a = lab
-        .user("alice", "Alice A", &["viewer", "admin"], PASSWORD)
+        .user("alice", "Alice A", &["viewer", "admin"], password())
         .await;
-    let b = lab.user("bob", "Bob B", &[], PASSWORD).await;
+    let b = lab.user("bob", "Bob B", &[], password()).await;
     assert_ne!(a, b);
     let tenant = |sql: &str| format!("SELECT {sql}");
     assert_eq!(lab.pg.scalar(&tenant("count(*) FROM tenants")).await, "1");
@@ -1297,12 +1319,12 @@ async fn add_creates_the_tenant_once_the_operator_its_roles_and_the_credential_i
 async fn adding_an_existing_user_writes_nothing_and_one_of_two_adds_at_once_loses() {
     // U8
     let lab = Lab::new().await;
-    lab.user("alice", "Alice", &["admin"], PASSWORD).await;
+    lab.user("alice", "Alice", &["admin"], password()).await;
     let before = lab
         .pg
         .scalar("SELECT (SELECT count(*) FROM operators) || '/' || (SELECT count(*) FROM operator_roles) || '/' || (SELECT count(*) FROM operator_credentials)")
         .await;
-    let again = add_user(&lab.pool, "alice", "Other", &["viewer"], "another password").await;
+    let again = add_user(&lab.pool, "alice", "Other", &["viewer"], &secret()).await;
     assert!(matches!(again, Err(UserError::AlreadyExists)), "{again:?}");
     assert_eq!(
         lab.pg
@@ -1319,15 +1341,15 @@ async fn adding_an_existing_user_writes_nothing_and_one_of_two_adds_at_once_lose
     )
     .await;
     assert!(
-        add_user(&lab.pool, "zed", "Zed", &[], PASSWORD)
+        add_user(&lab.pool, "zed", "Zed", &[], password())
             .await
             .is_ok()
     );
     // Two adds at once, on a database with no local tenant yet.
     let fresh = Lab::new().await;
     let (x, y) = tokio::join!(
-        add_user(&fresh.pool, "carol", "Carol", &["viewer"], PASSWORD),
-        add_user(&fresh.pool, "carol", "Carol", &["viewer"], PASSWORD),
+        add_user(&fresh.pool, "carol", "Carol", &["viewer"], password()),
+        add_user(&fresh.pool, "carol", "Carol", &["viewer"], password()),
     );
     let outcomes = [x.is_ok(), y.is_ok()];
     assert_eq!(outcomes.iter().filter(|ok| **ok).count(), 1, "{outcomes:?}");
@@ -1347,17 +1369,15 @@ async fn adding_an_existing_user_writes_nothing_and_one_of_two_adds_at_once_lose
 async fn set_password_replaces_or_creates_the_credential_and_refuses_unknown_and_disabled_users() {
     // U10
     let lab = Lab::new().await;
-    let id = lab.user("alice", "Alice", &[], PASSWORD).await;
-    lab.user("gone", "Gone", &[], PASSWORD).await;
+    let id = lab.user("alice", "Alice", &[], password()).await;
+    lab.user("gone", "Gone", &[], password()).await;
     lab.sql(
         "UPDATE operator_credentials SET updated_at = '2000-01-01T00:00:00Z'",
         "",
     )
     .await;
-    let new = Hasher::new()
-        .hash("a brand new password".to_owned())
-        .await
-        .unwrap();
+    let fresh = secret();
+    let new = Hasher::new().hash(fresh.clone()).await.unwrap();
     assert_eq!(
         local_user::set_password(&lab.pool, "alice", &new)
             .await
@@ -1373,13 +1393,8 @@ async fn set_password_replaces_or_creates_the_credential_and_refuses_unknown_and
             .await,
         "true/true"
     );
-    assert_eq!(login(lab.addr(), "alice", PASSWORD).await.status, 401);
-    assert_eq!(
-        login(lab.addr(), "alice", "a brand new password")
-            .await
-            .status,
-        200
-    );
+    assert_eq!(login(lab.addr(), "alice", password()).await.status, 401);
+    assert_eq!(login(lab.addr(), "alice", &fresh).await.status, 200);
     // A missing credential row is created.
     lab.sql(
         "DELETE FROM operator_credentials WHERE operator_id = $1::uuid",
@@ -1417,7 +1432,7 @@ async fn set_password_replaces_or_creates_the_credential_and_refuses_unknown_and
 async fn disable_sets_the_time_once_keeps_the_credential_and_is_idempotent() {
     // U11
     let lab = Lab::new().await;
-    lab.user("alice", "Alice", &[], PASSWORD).await;
+    lab.user("alice", "Alice", &[], password()).await;
     assert!(matches!(
         local_user::disable(&lab.pool, "nobody").await,
         Err(UserError::Unknown)
@@ -1453,7 +1468,7 @@ async fn disable_sets_the_time_once_keeps_the_credential_and_is_idempotent() {
         stamp,
         "disabled_at is unchanged"
     );
-    assert_eq!(login(lab.addr(), "alice", PASSWORD).await.status, 401);
+    assert_eq!(login(lab.addr(), "alice", password()).await.status, 401);
     lab.finish().await;
 }
 
@@ -1468,7 +1483,7 @@ mod command {
 
     use server::db;
 
-    use super::{LIMIT, PASSWORD};
+    use super::{LIMIT, filler, password};
     use crate::support::{TestPostgres, refused_url};
 
     fn write_config(dir: &Path, database_url: &str) -> PathBuf {
@@ -1571,7 +1586,7 @@ mod command {
     }
 
     fn password_line() -> Vec<u8> {
-        format!("{PASSWORD}\n").into_bytes()
+        format!("{}\n", password()).into_bytes()
     }
 
     #[test]
@@ -1754,7 +1769,7 @@ mod command {
     #[test]
     fn a_terminal_on_standard_input_is_exit_2_with_a_hint() {
         let dir = tempfile::tempdir().unwrap();
-        let config = write_config(dir.path(), &refused_url("x"));
+        let config = write_config(dir.path(), &refused_url(&crate::support::random_password()));
         for sub in ["add", "set-password"] {
             let mut line = format!(
                 "{} user {sub} --config {} --username a",
@@ -1785,7 +1800,7 @@ mod command {
     fn a_value_that_is_not_utf8_is_a_usage_error() {
         use std::os::unix::ffi::OsStrExt;
         let dir = tempfile::tempdir().unwrap();
-        let config = write_config(dir.path(), &refused_url("x"));
+        let config = write_config(dir.path(), &refused_url(&crate::support::random_password()));
         let bad = std::ffi::OsStr::from_bytes(&[0xff, 0xfe]);
         let output = Command::new(env!("CARGO_BIN_EXE_ngr-server"))
             .args(["user", "add", "--config"])
@@ -1828,8 +1843,8 @@ mod command {
                 .await,
             "admin,viewer"
         );
-        assert!(!stdout.contains(PASSWORD));
-        assert!(!errors.contains(PASSWORD));
+        assert!(!stdout.contains(password()));
+        assert!(!errors.contains(password()));
         // No role is implied: none given means none stored.
         let output = s.add("bob", &[], &password_line());
         assert_eq!(output.status.code(), Some(0));
@@ -1844,31 +1859,30 @@ mod command {
     async fn a_password_that_breaks_the_rules_exits_1_and_writes_nothing() {
         // U5 and U6.
         let s = Setup::new().await;
-        let bom = "\u{feff}twelve chars!".as_bytes().to_vec();
-        let too_long = "x".repeat(1025).into_bytes();
-        let endless_ish = "x".repeat(100_000).into_bytes();
+        let (a, b) = (filler(6), filler(6));
+        let line = format!("{a}{b}");
+        let mut not_utf8 = a.clone().into_bytes();
+        not_utf8.extend_from_slice(&[0xff, 0xfe]);
+        not_utf8.extend_from_slice(b.as_bytes());
         let cases: Vec<(&str, Vec<u8>)> = vec![
             ("empty", vec![]),
             ("newline only", b"\n".to_vec()),
-            ("eleven", b"elevenchars\n".to_vec()),
-            ("not utf-8", b"twelve \xff\xfe chars\n".to_vec()),
-            ("byte order mark", bom),
-            (
-                "second line",
-                b"twelve chars!!\nsecond line here\n".to_vec(),
-            ),
-            ("blank second line", b"twelve chars!!\n\n".to_vec()),
-            ("control", b"twelve\tchars!!\n".to_vec()),
-            ("carriage return", b"twelve chars!!\r".to_vec()),
-            ("over 1024", too_long),
-            ("far over", endless_ish),
+            ("eleven", format!("{}\n", filler(11)).into_bytes()),
+            ("not utf-8", not_utf8),
+            ("byte order mark", format!("\u{feff}{line}").into_bytes()),
+            ("second line", format!("{line}\n{a}\n").into_bytes()),
+            ("blank second line", format!("{line}\n\n").into_bytes()),
+            ("control", format!("{a}\t{b}\n").into_bytes()),
+            ("carriage return", format!("{line}\r").into_bytes()),
+            ("over 1024", filler(1025).into_bytes()),
+            ("far over", filler(100_000).into_bytes()),
         ];
         for (what, input) in &cases {
             let output = s.add("alice", &[], input);
             assert_eq!(output.status.code(), Some(1), "{what}: {}", stderr(&output));
             assert!(output.stdout.is_empty(), "{what}");
             assert!(
-                !stderr(&output).contains("twelve"),
+                !stderr(&output).contains(&a),
                 "{what}: the password is echoed"
             );
             let output = s.other("set-password", "alice", Some(input));
@@ -1877,12 +1891,15 @@ mod command {
         assert_eq!(s.count("operators").await, "0");
         assert_eq!(s.count("tenants").await, "0");
         // What is accepted: CRLF, no newline at all, exactly twelve and exactly 1024.
+        let twelve = filler(12);
+        let max = filler(1024);
+        let spaced = format!(" {} ", filler(12));
         for (i, input) in [
-            b"twelve chars\r\n".to_vec(),
-            b"twelve chars".to_vec(),
-            "x".repeat(1024).into_bytes(),
-            format!("{}\r\n", "y".repeat(1024)).into_bytes(),
-            " leading and trailing space ".as_bytes().to_vec(),
+            format!("{twelve}\r\n").into_bytes(),
+            twelve.clone().into_bytes(),
+            max.clone().into_bytes(),
+            format!("{}\r\n", filler(1024)).into_bytes(),
+            spaced.clone().into_bytes(),
         ]
         .iter()
         .enumerate()
@@ -1893,12 +1910,12 @@ mod command {
         // Nothing but one trailing newline is trimmed: the stored hash is of the exact text.
         let lab_hash = s.pg.scalar("SELECT password_hash FROM operator_credentials c JOIN operators o ON o.id = c.operator_id WHERE o.subject = 'u4'").await;
         assert_eq!(
-            server::local_user::verify_password(&lab_hash, " leading and trailing space "),
+            server::local_user::verify_password(&lab_hash, &spaced),
             server::local_user::Verdict::Match
         );
         let hash = s.pg.scalar("SELECT password_hash FROM operator_credentials c JOIN operators o ON o.id = c.operator_id WHERE o.subject = 'u0'").await;
         assert_eq!(
-            server::local_user::verify_password(&hash, "twelve chars"),
+            server::local_user::verify_password(&hash, &twelve),
             server::local_user::Verdict::Match
         );
     }

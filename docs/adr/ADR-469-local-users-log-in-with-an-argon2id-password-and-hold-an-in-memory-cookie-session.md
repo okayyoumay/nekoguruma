@@ -44,8 +44,9 @@ the terminal rule and the accepted cookie risk below.
    shape (exactly a username and a password, both strings; 400), the length bounds (400), the
    limiter (item 5), one database read, one hash verification, then the session. An unknown user,
    an operator without a credential, a disabled operator and a wrong password get one 401 body,
-   byte for byte, and each costs one Argon2 verification (against a fixed dummy hash when there
-   is no hash to check), so neither the answer nor its timing tells them apart. The reason is
+   byte for byte, and each costs one Argon2 verification (when there is no hash to check, against
+   a dummy hash that the server makes once from a random password, so no fixed secret is in the
+   source and no password can match it), so neither the answer nor its timing tells them apart. The reason is
    logged with the operator ID when there is one; the typed username, the password, the cookie,
    the token and the hashes are never logged. A stored hash that does not parse is 500, as a
    stored key that does not decode is (ADR-467). Hashes run one at a time on the blocking pool.

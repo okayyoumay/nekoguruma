@@ -590,21 +590,42 @@ pub async fn login(State(auth): State<OperatorAuth>, request: Request) -> Respon
     // A refusal costs one verification whatever its reason: a real one for a wrong password,
     // the dummy for an account with nothing to check.
     let Some(account) = account else {
-        inner.hasher.verify_dummy(password).await;
+        if inner.hasher.verify_dummy(password).await.is_err() {
+            return inner.internal(
+                None,
+                "the dummy hash could not be made",
+                SLOT_HASH_TASK,
+                session::now(),
+            );
+        }
         if inner.gates.allow(SLOT_UNKNOWN_USER, session::now()) {
             tracing::warn!(reason = "unknown_user", "login refused");
         }
         return Inner::refused();
     };
     if account.disabled {
-        inner.hasher.verify_dummy(password).await;
+        if inner.hasher.verify_dummy(password).await.is_err() {
+            return inner.internal(
+                None,
+                "the dummy hash could not be made",
+                SLOT_HASH_TASK,
+                session::now(),
+            );
+        }
         if inner.gates.allow(SLOT_DISABLED, session::now()) {
             tracing::warn!(reason = "disabled", operator_id = %account.operator_id, "login refused");
         }
         return Inner::refused();
     }
     let Some(stored) = account.password_hash.clone() else {
-        inner.hasher.verify_dummy(password).await;
+        if inner.hasher.verify_dummy(password).await.is_err() {
+            return inner.internal(
+                None,
+                "the dummy hash could not be made",
+                SLOT_HASH_TASK,
+                session::now(),
+            );
+        }
         if inner.gates.allow(SLOT_NO_CREDENTIAL, session::now()) {
             tracing::warn!(reason = "no_credential", operator_id = %account.operator_id, "login refused");
         }

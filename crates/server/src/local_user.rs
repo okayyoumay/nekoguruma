@@ -15,6 +15,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use argon2::password_hash::{self, PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::{Algorithm, Argon2, Params, Version};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use shared_crypto::{RandomError, random_32};
 use sqlx::PgPool;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -54,19 +56,6 @@ pub const ARGON_MEMORY_KIB: u32 = 19456;
 pub const ARGON_PASSES: u32 = 2;
 /// Argon2id lanes.
 pub const ARGON_LANES: u32 = 1;
-
-/// A PHC string under the policy's parameters, fixed in the source. Login
-/// verifies a password against it when the user, the credential or the account cannot be used,
-/// so that every refusal costs about one verification; the result is discarded. A test pins its
-/// parameters to the policy's.
-const DUMMY_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$zcYdQCjtVlHH7zG/qPLWaw$\
-                          AFRwu2Qj+o14VndD7LGQuL001caboiI2ULEk/+sLgFo";
-
-/// The password [`DUMMY_HASH`] was made from. Tests only: a login with it for a user that does
-/// not exist must still be refused, which is the point of verifying against a hash that
-/// actually matches something.
-#[doc(hidden)]
-pub const DUMMY_PASSWORD: &str = "ngr-dummy-password-never-a-user";
 
 fn argon2() -> Argon2<'static> {
     let params = Params::new(ARGON_MEMORY_KIB, ARGON_PASSES, ARGON_LANES, None)
@@ -289,6 +278,8 @@ impl Drop for Waiting<'_> {
 pub struct Hasher {
     permit: Arc<Semaphore>,
     waiting: Arc<AtomicUsize>,
+    /// The dummy hash, made once from random bytes on first need (see [`Hasher::verify_dummy`]).
+    dummy: Arc<tokio::sync::OnceCell<String>>,
 }
 
 impl Default for Hasher {
@@ -302,6 +293,7 @@ impl Hasher {
         Hasher {
             permit: Arc::new(Semaphore::new(1)),
             waiting: Arc::new(AtomicUsize::new(0)),
+            dummy: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 
@@ -351,12 +343,31 @@ impl Hasher {
         self.run(move || verify_password(&stored, &password)).await
     }
 
-    /// A verification against the fixed dummy hash, its result discarded: what a refusal that
-    /// has no real hash to check costs.
-    pub async fn verify_dummy(&self, password: String) {
-        let _ = self
-            .run(move || verify_password(DUMMY_HASH, &password))
-            .await;
+    /// The dummy hash of this hasher: an Argon2id hash under the policy's parameters of a
+    /// password nobody holds (32 random bytes that are dropped at once). It is made on the first
+    /// call, behind the permit, and kept; concurrent first calls share one computation. A
+    /// failing random source fails the call, and the next call tries again.
+    #[doc(hidden)]
+    pub async fn dummy_hash(&self) -> Result<&str, HashError> {
+        self.dummy
+            .get_or_try_init(|| async {
+                self.run(|| {
+                    let secret = URL_SAFE_NO_PAD.encode(random_32()?);
+                    hash_password(&secret)
+                })
+                .await?
+            })
+            .await
+            .map(String::as_str)
+    }
+
+    /// A verification of `password` against the dummy hash, its result discarded: what a refusal
+    /// that has no real hash to check costs, so that its answer takes about as long as a wrong
+    /// password's. Fails only when the dummy hash cannot be made.
+    pub async fn verify_dummy(&self, password: String) -> Result<(), HashError> {
+        let dummy = self.dummy_hash().await?.to_owned();
+        let _ = self.run(move || verify_password(&dummy, &password)).await;
+        Ok(())
     }
 }
 
@@ -524,56 +535,92 @@ mod tests {
         list.iter().map(|r| (*r).to_owned()).collect()
     }
 
-    #[test]
-    fn the_dummy_hash_has_the_policys_parameters() {
-        let hash = PasswordHash::new(DUMMY_HASH).expect("the dummy is a PHC string");
+    /// A password made at run time: 43 characters of base64url of random bytes.
+    fn secret() -> String {
+        URL_SAFE_NO_PAD.encode(random_32().unwrap())
+    }
+
+    /// `n` characters, one byte each, drawn from a fresh secret.
+    fn filler(n: usize) -> String {
+        secret().chars().cycle().take(n).collect()
+    }
+
+    /// `n` characters of three bytes each, drawn from a fresh secret.
+    fn wide(n: usize) -> String {
+        secret()
+            .bytes()
+            .cycle()
+            .take(n)
+            .map(|b| char::from_u32(0x4e00 + u32::from(b)).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_dummy_hash_has_the_policys_parameters() {
+        let hasher = Hasher::new();
+        let dummy = hasher.dummy_hash().await.unwrap();
+        let hash = PasswordHash::new(dummy).expect("the dummy is a PHC string");
         assert_eq!(hash.algorithm.as_str(), "argon2id");
         let params = Params::try_from(&hash).expect("the dummy's parameters");
         assert_eq!(params.m_cost(), ARGON_MEMORY_KIB);
         assert_eq!(params.t_cost(), ARGON_PASSES);
         assert_eq!(params.p_cost(), ARGON_LANES);
         assert_eq!(hash.version, Some(0x13));
-        assert_eq!(verify_password(DUMMY_HASH, DUMMY_PASSWORD), Verdict::Match);
         // The same parameters as a fresh hash of the policy.
-        let fresh = hash_password("a password for the pin").unwrap();
+        let fresh = hash_password(&secret()).unwrap();
         let fresh = PasswordHash::new(&fresh).unwrap();
         assert_eq!(Params::try_from(&fresh).unwrap(), params);
     }
 
+    #[tokio::test]
+    async fn each_hasher_makes_its_own_dummy_once() {
+        let (a, b) = (Hasher::new(), Hasher::new());
+        let first = a.dummy_hash().await.unwrap().to_owned();
+        assert_eq!(a.dummy_hash().await.unwrap(), first, "made once");
+        assert_eq!(
+            a.clone().dummy_hash().await.unwrap(),
+            first,
+            "shared by clones"
+        );
+        assert_ne!(b.dummy_hash().await.unwrap(), first);
+        // Concurrent first calls share one computation.
+        let c = Hasher::new();
+        let (x, y) = tokio::join!(c.dummy_hash(), c.dummy_hash());
+        assert_eq!(x.unwrap(), y.unwrap());
+        assert!(c.verify_dummy(secret()).await.is_ok());
+    }
+
     #[test]
     fn a_hash_verifies_only_its_own_password_and_carries_its_parameters() {
-        let stored = hash_password("correct horse battery").unwrap();
+        let password = secret();
+        let stored = hash_password(&password).unwrap();
         assert!(
             stored.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"),
             "{stored}"
         );
-        assert_eq!(
-            verify_password(&stored, "correct horse battery"),
-            Verdict::Match
-        );
-        assert_eq!(
-            verify_password(&stored, "correct horse batterY"),
-            Verdict::Mismatch
-        );
+        assert_eq!(verify_password(&stored, &password), Verdict::Match);
+        let other = format!("{password}!");
+        assert_eq!(verify_password(&stored, &other), Verdict::Mismatch);
         // A new salt each time.
-        assert_ne!(stored, hash_password("correct horse battery").unwrap());
+        assert_ne!(stored, hash_password(&password).unwrap());
     }
 
     #[test]
     fn a_stored_text_that_is_not_argon2id_is_malformed() {
-        let argon2i = "$argon2i$v=19$m=19456,t=2,p=1$bmdyLWR1bW15LXNhbHQtMDAx$\
-                       CBpwRQcmMcl86Bvwd+qr4xVjgtpTvz6RD0Z8m1Z3Gm4";
-        for stored in [
-            "",
-            "not a hash",
-            "plain-text-password",
-            "$2b$12$abc",
-            argon2i,
+        let real = hash_password(&secret()).unwrap();
+        let argon2i = real.replacen("$argon2id$", "$argon2i$", 1);
+        let plain = secret();
+        for (what, stored) in [
+            ("empty", String::new()),
+            ("not a hash", "not a hash".to_owned()),
+            ("plain text", plain),
+            ("bcrypt", "$2b$12$abc".to_owned()),
+            ("argon2i", argon2i),
         ] {
             assert_eq!(
-                verify_password(stored, "anything"),
+                verify_password(&stored, &secret()),
                 Verdict::Malformed,
-                "{stored}"
+                "{what}"
             );
         }
     }
@@ -581,16 +628,17 @@ mod tests {
     #[tokio::test]
     async fn the_hasher_runs_one_task_at_a_time() {
         let hasher = Hasher::new();
+        let password = secret();
         let permit = hasher.hold().await;
         let waiting = tokio::spawn({
-            let hasher = hasher.clone();
-            async move { hasher.hash("twelve chars!!".into()).await }
+            let (hasher, password) = (hasher.clone(), password.clone());
+            async move { hasher.hash(password).await }
         });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(!waiting.is_finished(), "the hash ran without the permit");
         drop(permit);
         let hash = waiting.await.unwrap().unwrap();
-        assert_eq!(verify_password(&hash, "twelve chars!!"), Verdict::Match);
+        assert_eq!(verify_password(&hash, &password), Verdict::Match);
     }
 
     #[test]
@@ -649,14 +697,17 @@ mod tests {
 
     #[test]
     fn one_trailing_newline_is_removed_and_nothing_else_is_trimmed() {
-        let want = Ok("twelve chars".to_owned());
-        assert_eq!(pw(b"twelve chars"), want);
-        assert_eq!(pw(b"twelve chars\n"), want);
-        assert_eq!(pw(b"twelve chars\r\n"), want);
-        assert_eq!(pw(b" twelve chars "), Ok(" twelve chars ".to_owned()));
-        assert_eq!(pw(b" twelve chars \n"), Ok(" twelve chars ".to_owned()));
-        // Spaces are characters: twelve spaces are a password.
-        assert_eq!(pw(&[b' '; 12]), Ok(" ".repeat(12)));
+        let base = filler(MIN_PASSWORD_CHARS);
+        let want = Ok(base.clone());
+        assert_eq!(pw(base.as_bytes()), want);
+        assert_eq!(pw(format!("{base}\n").as_bytes()), want);
+        assert_eq!(pw(format!("{base}\r\n").as_bytes()), want);
+        let padded = format!(" {base} ");
+        assert_eq!(pw(padded.as_bytes()), Ok(padded.clone()));
+        assert_eq!(pw(format!("{padded}\n").as_bytes()), Ok(padded));
+        // Spaces are characters: twelve of them are a password.
+        let blanks: String = base.chars().map(|_| ' ').collect();
+        assert_eq!(pw(blanks.as_bytes()), Ok(blanks));
     }
 
     #[test]
@@ -664,57 +715,80 @@ mod tests {
         assert_eq!(pw(b""), Err(PasswordError::Empty));
         assert_eq!(pw(b"\n"), Err(PasswordError::Empty));
         assert_eq!(pw(b"\r\n"), Err(PasswordError::Empty));
-        assert_eq!(pw(b"elevenchars"), Err(PasswordError::TooShort));
-        assert_eq!(pw(b"elevenchars\n"), Err(PasswordError::TooShort));
-        // Twelve characters of three bytes each: 36 bytes pass; eleven do not.
-        assert!(pw("\u{732b}".repeat(12).as_bytes()).is_ok());
+        let eleven = filler(MIN_PASSWORD_CHARS - 1);
+        assert_eq!(pw(eleven.as_bytes()), Err(PasswordError::TooShort));
         assert_eq!(
-            pw("\u{732b}".repeat(11).as_bytes()),
+            pw(format!("{eleven}\n").as_bytes()),
             Err(PasswordError::TooShort)
         );
-        let at = "x".repeat(MAX_PASSWORD_BYTES);
+        // Twelve characters of three bytes each: 36 bytes pass; eleven do not.
+        assert!(pw(wide(MIN_PASSWORD_CHARS).as_bytes()).is_ok());
+        assert_eq!(
+            pw(wide(MIN_PASSWORD_CHARS - 1).as_bytes()),
+            Err(PasswordError::TooShort)
+        );
+        let at = filler(MAX_PASSWORD_BYTES);
         assert!(pw(at.as_bytes()).is_ok());
         assert!(pw(format!("{at}\n").as_bytes()).is_ok());
         assert!(pw(format!("{at}\r\n").as_bytes()).is_ok());
-        let over = "x".repeat(MAX_PASSWORD_BYTES + 1);
+        let over = filler(MAX_PASSWORD_BYTES + 1);
         assert_eq!(pw(over.as_bytes()), Err(PasswordError::TooLong));
         assert_eq!(
             pw(format!("{over}\n").as_bytes()),
             Err(PasswordError::TooLong)
         );
         // An endless input ends the read.
+        let byte = filler(1).as_bytes()[0];
         assert_eq!(
-            read_password(std::io::repeat(b'x')),
+            read_password(std::io::repeat(byte)),
             Err(PasswordError::TooLong)
         );
     }
 
     #[test]
     fn input_that_is_not_one_clean_line_of_utf8_is_refused() {
-        assert_eq!(pw(b"twelve \xff\xfe chars"), Err(PasswordError::NotUtf8));
+        let (a, b) = (filler(6), filler(6));
+        let mut broken = a.clone().into_bytes();
+        broken.extend_from_slice(&[0xff, 0xfe]);
+        broken.extend_from_slice(b.as_bytes());
+        assert_eq!(pw(&broken), Err(PasswordError::NotUtf8));
         assert_eq!(
-            pw("\u{feff}twelve chars".as_bytes()),
+            pw(format!("\u{feff}{a}{b}").as_bytes()),
             Err(PasswordError::ByteOrderMark)
         );
-        assert_eq!(pw(b"twelve chars\nsecond"), Err(PasswordError::SecondLine));
-        assert_eq!(pw(b"twelve chars\n\n"), Err(PasswordError::SecondLine));
-        assert_eq!(pw(b"twelve chars\r\n\r\n"), Err(PasswordError::SecondLine));
+        let line = format!("{a}{b}");
+        assert_eq!(
+            pw(format!("{line}\n{a}").as_bytes()),
+            Err(PasswordError::SecondLine)
+        );
+        assert_eq!(
+            pw(format!("{line}\n\n").as_bytes()),
+            Err(PasswordError::SecondLine)
+        );
+        assert_eq!(
+            pw(format!("{line}\r\n\r\n").as_bytes()),
+            Err(PasswordError::SecondLine)
+        );
         for control in ["\t", "\r", "\u{0}", "\u{7f}", "\u{1b}", "\u{85}"] {
-            let text = format!("twelve{control}chars");
+            let text = format!("{a}{control}{b}");
             assert_eq!(
                 pw(text.as_bytes()),
                 Err(PasswordError::Control),
-                "{control:?}"
+                "control character {}",
+                control.escape_unicode()
             );
         }
         // A trailing lone CR is not a line end.
-        assert_eq!(pw(b"twelve chars\r"), Err(PasswordError::Control));
+        assert_eq!(
+            pw(format!("{line}\r").as_bytes()),
+            Err(PasswordError::Control)
+        );
     }
 
     #[test]
     fn a_password_error_never_shows_the_input() {
-        let secret = "s3cret-input\u{1b}";
+        let secret = format!("{}\u{1b}", secret());
         let error = pw(secret.as_bytes()).unwrap_err();
-        assert!(!error.to_string().contains("s3cret"));
+        assert!(!error.to_string().contains(&secret[..8]));
     }
 }

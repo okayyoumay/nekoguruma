@@ -333,7 +333,7 @@ ngr-server user disable --config <file> --username alice
   of the operator, its credential and its roles (503, 500); one Argon2 verification; then the
   session. An unknown username, an operator without a credential, a disabled operator and a
   wrong password get one 401 body with `WWW-Authenticate: Ngr-Session`, and each costs one
-  verification (against a fixed dummy hash when there is none to check). A stored hash that is
+  verification (against a dummy hash made once from 32 random bytes when there is none to check). A stored hash that is
   not an Argon2id string is 500. Verifications run one at a time on the blocking pool.
 - **The session.** A 200 answers `{"operatorId","username","displayName","roles"}` and sets
   `ngr_session` (43 base64url characters; `HttpOnly; SameSite=Strict; Path=/`, no `Max-Age`). The
@@ -597,7 +597,7 @@ a new migration file rebuilds the crate. How migrations are written and applied 
 - `local_users.rs` (database) covers the local users: the login's order (the guard, 405, the
   Origin, the body limits, the shape and the lengths before any database access), one
   byte-identical 401 for an unknown user, no credential, a disabled operator and a wrong password,
-  each waiting for a hash, and an unknown user with the dummy's password; a hash that is not
+  each waiting for a hash; a hash that is not
   Argon2id (500); the limiter (eleven concurrent wrong logins give ten 401s and one 429, a right
   password refused while it is full, a failed database read keeping its place, a client that
   disconnects during the hash keeping its place); the whoami body and cookie; a login replacing
@@ -615,6 +615,7 @@ a new migration file rebuilds the crate. How migrations are written and applied 
   parsing, the session table's limits at each boundary and one step before it (a nanosecond
   on the monotonic clock, a microsecond on the wall clock, which Windows keeps in 100 ns units), the clocks,
   eviction, and the layer's order with a dead pool; those in `local_user.rs` the password rules
-  and the dummy hash's parameters.
+  the dummy hash's parameters and that each hasher makes its own once. The tests generate every
+  password at run time, so no literal reaches a hash.
 - The HTTP/1-only test must also pass in a workspace build, where hyper's HTTP/2 is enabled:
   build with `cargo test --workspace --no-run` and run the `postgres` test binary.

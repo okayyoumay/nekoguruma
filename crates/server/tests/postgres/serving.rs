@@ -154,9 +154,16 @@ impl Running {
         format!("Host: 127.0.0.1:{}", self.addr.port())
     }
 
+    /// Sends the first stop signal and returns at once, without waiting for the listener to
+    /// close: on Windows a connect to a closed port is retried for about two seconds before it
+    /// is refused, so a test that times the stop itself must not include that probe.
+    pub(crate) fn signal_stop(&mut self) {
+        let _ = self.stop.take().unwrap().send(());
+    }
+
     /// Begins the graceful stop and returns once the listener no longer accepts.
     pub(crate) async fn begin_stop(&mut self) {
-        let _ = self.stop.take().unwrap().send(());
+        self.signal_stop();
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while TcpStream::connect(self.addr).await.is_ok() {
             assert!(std::time::Instant::now() < deadline, "still accepting");

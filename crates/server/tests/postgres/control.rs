@@ -621,7 +621,7 @@ async fn a_stop_closes_an_open_connection_with_1001_within_the_grace_period() {
     let mut client = open(u.s.addr, &t).await;
     let Up { w, mut s, .. } = u;
     let started = Instant::now();
-    s.begin_stop().await;
+    s.signal_stop();
     let (code, ()) = tokio::join!(close_code(&mut client), s.joined());
     assert_eq!(code, 1001);
     // The grace period is 2 seconds: a session that was aborted would have taken all of it.
@@ -641,7 +641,7 @@ async fn a_peer_that_never_answers_is_aborted_at_the_end_of_the_grace_period() {
     let client = open(u.s.addr, &t).await;
     let Up { w, mut s, .. } = u;
     let started = Instant::now();
-    s.begin_stop().await;
+    s.signal_stop();
     s.joined().await;
     let waited = started.elapsed();
     // The grace period is 2 seconds and the session would wait 5 for the peer.

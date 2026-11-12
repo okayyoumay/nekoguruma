@@ -66,7 +66,7 @@ newest by `(registered_at, id)`, sets `revoked_at` on the others and reports the
 warning before it creates the index. `agents.owner_id` (the operator the agent is registered to) is
 null only on rows that predate registration.
 
-**Passwords are in their own table, without a tenant ID**
+**Passwords are in their own table, without a tenant ID (another exception to the tenant rule)**
 `operator_credentials` is keyed by `operator_id` alone and holds the Argon2id PHC string of a
 local user's password (ADR-469). Like the registration codes it is an exception to the tenant
 rule: the operator row it references already carries the tenant, and every read goes through the

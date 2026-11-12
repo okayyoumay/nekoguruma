@@ -612,7 +612,8 @@ a new migration file rebuilds the crate. How migrations are written and applied 
   `script`), each refused password (exit 1, nothing written), the configuration, database and
   migration checks, two `add`s of one username at once, the JSON lines, and a failed write to
   standard output after the commit. The unit tests in `operator_session.rs` cover the cookie
-  parsing, the session table's limits at each boundary and one nanosecond before it, the clocks,
+  parsing, the session table's limits at each boundary and one step before it (a nanosecond
+  on the monotonic clock, a microsecond on the wall clock, which Windows keeps in 100 ns units), the clocks,
   eviction, and the layer's order with a dead pool; those in `local_user.rs` the password rules
   and the dummy hash's parameters.
 - The HTTP/1-only test must also pass in a workspace build, where hyper's HTTP/2 is enabled:

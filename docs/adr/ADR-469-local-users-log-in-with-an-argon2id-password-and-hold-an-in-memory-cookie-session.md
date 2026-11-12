@@ -64,7 +64,8 @@ the terminal rule and the accepted cookie risk below.
 7. **A session lives 8 hours from login and 30 minutes from its last use, by two clocks.** Each
    session records its login and its last use on the monotonic clock and on the wall clock, and
    it has expired when either clock says so (exactly 8 hours or 30 minutes counts as expired). The
-   monotonic clock does not advance while the PC sleeps on every platform, and design 6.4 asks for
+   monotonic clock does not advance while the PC sleeps on some platforms (Linux among them), and
+   design 6.4 asks for
    a logout after inactivity, which a night with the lid closed is; a wall clock that steps back
    extends nothing, one that steps forward ends sessions early. Only a request that passes the
    whole check refreshes the last use, to the later of its own arrival and the recorded one.

@@ -7,8 +7,9 @@
 //!   signatures, a [`PublicKey`] verifies them, and the [`Signer`] trait lets a key that lives
 //!   in an operating-system store or a TPM sign without exposing its secret;
 //! - the connection proof ([`proof`]): the agent signs a transcript that names the server, the
-//!   agent and a fresh server challenge, and the server verifies it (design 6.4, 14.4).
-//!
+//!   agent and a fresh server challenge, and the server verifies it (design 6.4, 14.4);
+//! - the registration ([`registration`]): the code's one parser, the agent's proof of
+//!   possession of its key, and the server's signature over the result (ADR-463, design 6.7);
 //! - the job instruction ([`instruction`]): the server signs an instruction's payload bytes
 //!   and the agent verifies them before it parses them; the module also joins and splits the
 //!   envelope that carries the key fingerprint, the signature and the payload (ADR-461,
@@ -16,8 +17,8 @@
 //!
 //! Signing and verifying for a purpose go through [`sign_tagged`] and [`verify_tagged`], which
 //! put the purpose's own tag in front of the message, so a signature made for one purpose
-//! never verifies for another. The connection proof and the job instruction each have a tag of
-//! their own. The untagged primitive is not exported.
+//! never verifies for another. The connection proof, the job instruction, the registration
+//! request and the registration response each have a tag of their own. The untagged primitive is not exported.
 //!
 //! # Encodings
 //!
@@ -32,6 +33,7 @@
 pub mod instruction;
 mod key;
 pub mod proof;
+pub mod registration;
 
 pub use key::{
     KeyError, PublicKey, RandomError, SIGNATURE_LEN, SignError, SignErrorKind, Signature,

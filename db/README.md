@@ -5,6 +5,8 @@
 VCI profiles are installed on devices outside this software (design 9.3, ADR-228).
 `migrations/0003_instruction_keys.sql` adds `instruction_keys`, the public half of the server's job
 instruction key (design 11.1, ADR-462).
+`migrations/0004_agent_mode_device.sql` renames the agent mode `machine` to `device` in
+`agents.mode` (design 6.7, ADR-463); the column `machine_hint` keeps its name.
 
 ## How migrations are applied
 

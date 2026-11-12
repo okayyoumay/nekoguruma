@@ -186,23 +186,83 @@ paths:
   /v1/agents/register:
     post:
       tags: [agents]
-      summary: Register (one-time code or device authorization flow. 6.4)
+      summary: Register an agent with a registration code (6.4, 6.7, ADR-463)
+      description: |
+        Needs no login: the agent has no session. What authorizes the request is a single-use
+        registration code that an administrator issued with the server's `registration-code`
+        command, bound to the agent key's fingerprint and to an owner. The device authorization
+        flow is not offered.
+
+        **400** is decided on the shape of the request alone, before and without any database
+        lookup: a code whose prefix, length or alphabet is wrong, a `publicKey` that is not a
+        parsable SPKI PEM, a `proof` that is not standard padded base64 or does not decode to
+        exactly 64 bytes, a `mode` outside the enum, a missing or unknown field, or a body that is
+        not JSON.
+
+        **403** is the one uniform refusal for everything that needs the database or the
+        signature check: an unknown, expired, used or revoked code, a key other than the one the
+        code is bound to, a bad proof, a code issued under an instruction key that is no longer
+        active. The caller cannot tell these apart; the reason goes to the server's log only.
+        Refusals are limited for the whole route, not per caller: more than ten 403 responses in
+        a minute make the route answer 429 to requests that would be refused. Only 403 counts
+        toward the limit (400, 413 and 429 do not). A request that redeems successfully (valid
+        code, valid proof) succeeds even while the limit is exceeded, so the limit only slows
+        guessing and gives a guesser no oracle. The body is at most 4 KiB (413).
+
+        On success the server assigns the agent ID, stores the key and the owner, revokes earlier
+        unrevoked rows of the same key, and returns the instruction key the agent will pin with
+        its signature over what it assigned. The response is not replayed: an agent that did not
+        receive it needs a new code.
+      security: []
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [code, publicKey, capabilities]
+              additionalProperties: false
+              required: [code, publicKey, mode, proof]
               properties:
-                code: { type: string }
-                publicKey: { type: string, description: PEM or JWK }
-                capabilities: { $ref: '#/components/schemas/Capabilities' }
+                code:
+                  type: string
+                  maxLength: 64
+                  description: |
+                    The registration code: the prefix `ngr1-` and 26 Crockford base32 digits. The
+                    server reads it as the agent does (ASCII whitespace at the ends trimmed, case
+                    ignored, `I` and `L` as `1`, `O` as `0`); its canonical text is hashed.
+                publicKey:
+                  type: string
+                  maxLength: 512
+                  description: The agent key as an SPKI PEM document
+                mode: { type: string, enum: [user, device] }
+                proof:
+                  type: string
+                  maxLength: 128
+                  description: |
+                    Standard padded base64 of the 64-byte signature that the agent key makes over
+                    the registration transcript (the code's hash, the key's fingerprint, the mode
+                    and the server key ID) under its own domain tag (`shared-crypto`'s
+                    `registration` module)
       responses:
         '201':
+          description: Registered
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Agent' }
+              schema: { $ref: '#/components/schemas/AgentRegistration' }
+        '400': { $ref: '#/components/responses/Problem' }
+        '403':
+          description: Refused. The same document for every reason
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '413': { $ref: '#/components/responses/Problem' }
+        '429':
+          description: More than ten refusals in the last minute on this route
+          headers:
+            Retry-After: { schema: { type: integer }, description: Seconds to wait }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
 
   # ------------------------------------------------------------ Artifacts and extensions
   /v1/artifacts:
@@ -555,10 +615,34 @@ components:
         agentId: { type: string }
         displayName: { type: string }
         online: { type: boolean }
-        mode: { type: string, enum: [user, machine] }
+        mode: { type: string, enum: [user, device] }
         allowRemote: { type: boolean }
         preset: { type: string, enum: [personal, personalRemote, shared] }
         capabilities: { $ref: '#/components/schemas/Capabilities' }
+
+    AgentRegistration:
+      type: object
+      description: |
+        What registration returns (ADR-463). The agent stores it as its registration record after
+        it has checked that the instruction key's fingerprint equals the server key ID the operator
+        gave it and that `signature` verifies. `capabilities` are not part of registration: the agent reports them after it
+        connects (9.5).
+      required: [agentId, ownerId, preset, allowRemote, instructionKey, instructionKeyId, signature]
+      properties:
+        agentId: { type: string, description: Assigned by the server; a canonical lowercase UUID }
+        ownerId: { type: string, description: The operator ID the code named at issuance (6.6) }
+        preset: { type: string, enum: [personal, personalRemote, shared], description: Always `personal` in M3 (6.7) }
+        allowRemote: { type: boolean }
+        instructionKey: { type: string, description: The server's job instruction key as an SPKI PEM document (11.1) }
+        instructionKeyId: { type: string, description: The SHA-256 of the key's SPKI document, 64 lowercase hex digits }
+        signature:
+          type: string
+          description: |
+            Standard padded base64 of the 64-byte signature that the instruction key makes over the
+            response transcript (the code's hash, the agent key's fingerprint, `agentId`, `ownerId`,
+            `preset` and `allowRemote`) under its own domain tag (`shared-crypto`'s `registration`
+            module). The agent verifies it against `instructionKey`, after comparing that key's
+            fingerprint with the server key ID, and stores nothing when it fails
 
     Capabilities:
       type: object

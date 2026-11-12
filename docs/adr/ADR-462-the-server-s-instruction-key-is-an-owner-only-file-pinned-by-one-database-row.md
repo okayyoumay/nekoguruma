@@ -1,7 +1,7 @@
 # ADR-462: The Server's Instruction Key Is an Owner-Only File Pinned by One Database Row
 
 **Date:** 2026-11-12
-**Status:** Accepted
+**Status:** Accepted (item 8's Web API change specified by ADR-463, and the first-use consequence answered by it)
 **Affects:** design 11.1, 13.3, 16.3; `crates/server` (`instruction_key.rs`, `config.rs`, `lib.rs`), `db/migrations/0003_instruction_keys.sql`, `db/README.md`, `crates/server/docs/ngr-server.md`, `docs/glossary.md`; extends ADR-456 (Decision item 7) and ADR-458 (start order); fulfils ADR-461 Decision item 14; scopes ADR-459 Decision item 4
 
 ## Context

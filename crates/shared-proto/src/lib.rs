@@ -143,7 +143,7 @@ pub struct Platform {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AgentMode {
     User,
-    Machine,
+    Device,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

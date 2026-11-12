@@ -1,7 +1,7 @@
 # ADR-461: The Job Instruction Is Signed Bytes With a Versioned Body and an Agent-Side Gate
 
 **Date:** 2026-11-11
-**Status:** Accepted
+**Status:** Accepted (item 11's PEM is a field of the registration record, ADR-463)
 **Affects:** design 5.3, 5.6, 5.7, 11.1, 12; `crates/shared-crypto` (`instruction`), `crates/shared-proto` (`JobInstruction`), `api/asyncapi.yaml` (`JobCommand`, `commandRejected`), `api/openapi.yaml`; the agent's instruction gate, the server's instruction key, registration and the idempotent-command, start-deadline and document-delivery work built on this record; annotates ADR-454 (items 1 and 2) and ADR-395 (item 2)
 
 ## Context

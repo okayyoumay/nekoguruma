@@ -164,7 +164,7 @@
         "machineModeSupported": {
           "type": "boolean",
           "default": true,
-          "description": "Whether it runs in machine mode (as a service). false for libraries that require an interactive session"
+          "description": "Whether it runs in device mode (as a service, design 6.2). false for libraries that require an interactive session"
         },
         "signatureVerifier": {
           "type": "string",

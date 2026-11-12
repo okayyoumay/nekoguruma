@@ -1,7 +1,7 @@
 # ADR-459: The Agent Key Is ECDSA P-256 and Its Connection Proof Is Clock-Free
 
 **Date:** 2026-11-11
-**Status:** Accepted (Decision item 4's create-once rule and state directory given their form by ADR-460)
+**Status:** Accepted (Decision item 4's create-once rule and state directory given their form by ADR-460; item 5's rename done by ADR-463)
 **Affects:** design 6.2, 6.4, 6.7, 12, 14.4, 16.3; `crates/shared-crypto`; `.github/dependabot.yml`; ADR-248 (the auto-merged group); the agent's key stores and the registration and connection flows built on this record
 
 ## Context

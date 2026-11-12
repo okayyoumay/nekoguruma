@@ -31,7 +31,8 @@ fn transcript() -> ProofTranscript {
         shared_crypto::random_32().unwrap(),
         shared_crypto::random_32().unwrap(),
     );
-    ProofTranscript::new("https://ngr.example", "agent-1", challenge, nonce).unwrap()
+    let audience = shared_crypto::proof::Audience::canonicalise("https://ngr.example").unwrap();
+    ProofTranscript::new(&audience, "agent-1", challenge, nonce).unwrap()
 }
 
 fn key_bytes() -> (SigningKey, Vec<u8>) {

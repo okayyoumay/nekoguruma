@@ -296,7 +296,10 @@ paths:
         Like registration the route has a 5 second body-read bound (**408**) and answers **405**
         with `Allow` to another method. It is subject to the Host and Origin rules of 13.3. A
         challenge says nothing about any agent, so the route has no refusal of its own and the
-        limit on refusals does not apply to it.
+        limit on refusals does not apply to it. Issuing is limited on its own: a sliding-window
+        cap on the route (numbers set by the server, like registration's), then **429** with
+        `Retry-After`. A challenge dropped from the store because 1024 were outstanding shows
+        as a 401 at the session route, which the agent answers with a new challenge.
       security: []
       responses:
         '200':
@@ -311,6 +314,13 @@ paths:
             Allow: { schema: { type: string }, description: '`POST`' }
         '408': { $ref: '#/components/responses/Problem' }
         '413': { $ref: '#/components/responses/Problem' }
+        '429':
+          description: Too many challenges were issued within the window; `Retry-After` is the time to wait
+          headers:
+            Retry-After: { schema: { type: integer, minimum: 1 }, description: Seconds to wait }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '500': { $ref: '#/components/responses/Problem' }
 
   /v1/agent/session:
@@ -337,7 +347,8 @@ paths:
 
         **401** is for a challenge that is unknown, expired or already presented: the agent
         fetches a new one at once. The challenge is removed at this presentation whatever the
-        outcome, so a refusal below uses it up too.
+        outcome, so a refusal below uses it up too. A 401 is not counted by the refusal limiter
+        and is never turned into a 429.
 
         **403** is the one uniform refusal for an unknown agent, a revoked row, a bad signature
         and a wrong audience. The caller cannot tell these apart; the reason goes to the
@@ -353,7 +364,8 @@ paths:
         within that time. The agent sends it as `Authorization: Bearer <token>` on the upgrade of
         the control channel (`agentControl` in `api/asyncapi.yaml`), at `GET /api/v1/agent/control`
         with the subprotocol `ngr-control.v1`; a missing or expired token is answered 401 before
-        any upgrade. The agent takes a fresh exchange before every upgrade.
+        any upgrade (with `WWW-Authenticate: Bearer`), and an upgrade without the subprotocol is
+        answered 400. The agent takes a fresh exchange before every upgrade.
 
         **503** is returned when the database cannot be reached or a statement fails or times out
         (5 seconds); **500** for any other failure of the server. Neither counts toward the
@@ -395,6 +407,8 @@ paths:
         '400': { $ref: '#/components/responses/Problem' }
         '401':
           description: The challenge is unknown, expired or was presented before. Fetch a new one
+          headers:
+            WWW-Authenticate: { schema: { type: string }, description: '`Bearer`' }
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }

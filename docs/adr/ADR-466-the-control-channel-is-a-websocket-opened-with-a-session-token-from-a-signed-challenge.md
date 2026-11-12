@@ -44,11 +44,20 @@ fixed points constrain it:
    new one at once. One uniform 403 for an unknown agent, a revoked row, a bad signature and a
    wrong audience; the reason goes to the server's log only, rate-bounded. Refusals are limited
    as registration's are (ten within a sliding minute, then 429), and a valid proof is never
-   limited. *Rejected:* a distinct answer for a revoked key: it would be unauthenticated on the
+   limited. A 401 is never counted by that limiter and never turned into a 429: the agent
+   just fetches a new challenge. Issuing a challenge is limited too, by a sliding-window cap on
+   `POST /api/v1/agent/challenge` like registration's, answered 429 with `Retry-After` beyond
+   it; this record states the policy only, and the server work sets the numbers. *Rejected:* a
+   distinct answer for a revoked key: it would be unauthenticated on the
    local profile, and design 5.5 ties erasure of the agent's data to detected revocation, so it
    waits for the work that authenticates the server.
-4. **One canonical audience.** `scheme://host[:port]`, lower case, the scheme's default port
-   left out, no path, no trailing slash, query, fragment or user information. It is
+4. **One canonical audience.** `scheme://host[:port]` with the case of the scheme and the host
+   lowered, the scheme's default port left out, no path, no trailing slash, query, fragment or
+   user information. An IPv6 host is written through the standard address text form (brackets
+   kept); a host whose last label is numeric must parse as a dotted IPv4 address and is written
+   in that form, and anything else of that shape (leading zeros, short or hexadecimal forms) is
+   refused, not rewritten, since such a name could mean different addresses to different
+   parsers. It is
    canonicalised once, when the registration record is written (one trailing slash and an
    explicit default port are accepted there and written away), and signed byte for byte from the
    record. The server builds it from its own `pinned_origin(port)` and never reads an audience
@@ -75,17 +84,33 @@ fixed points constrain it:
    every connection, waits within `shutdown_grace_secs`, and aborts the rest before the
    database closes. *Rejected:* a client that follows redirects or resolves names (it would
    follow the 307 that ADR-456 intends as an error).
-7. **The token is an `Authorization: Bearer` header,** answered 401 before any upgrade. The
+7. **The token is an `Authorization: Bearer` header,** answered 401 (with `WWW-Authenticate:
+   Bearer`) before any upgrade; an upgrade that does not offer the subprotocol is answered
+   400. The
    request guard is unchanged: the agent sends no `Origin`, and a browser cannot set this
    header on a handshake. *Rejected:* the token in the query string (it ends up in logs) or as
    a subprotocol value (it blurs the version negotiation); an extra Origin rule for agent
    routes (the guard already refuses a foreign Origin, and nothing is gained).
 8. **Framing.** One JSON object per text frame, internally tagged `type` equal to the asyncapi
    message name, other properties camelCase. Binary frames are refused. A message is at most
-   128 KiB in both directions (a full job command is 87,512 base64 characters for a 65,633 byte
-   envelope, plus a few dozen bytes). Nothing is compressed. The version is the subprotocol
+   128 KiB in both directions (a full job command is 87,512 base64 characters, 85.5 KiB, for a
+   65,633 byte envelope, plus a few dozen bytes). Nothing is compressed. The version is the subprotocol
    `ngr-control.v1`; an upgrade without it is refused, and a message of an unknown `type`
-   closes the connection (16.3). The server's first frame is `hello {heartbeatSecs}` and the
+   closes the connection (16.3). So does a message with a property its `type` does not have, a
+   missing required property or a value out of range, as on the HTTP routes: versioning is by
+   the subprotocol, so nothing is ignored for forward compatibility, and every payload in the
+   asyncapi file is closed. One exception settles instead: a `jobCommand` that has a
+   `commandId` but no usable `signedJob` (missing, or not a string) reaches the agent's gate as
+   malformed and is answered `commandRejected`; without a `commandId` there is nothing to
+   settle and the connection closes. `heartbeatSecs` is 1 to 60 (60 seconds is the idle timeout
+   commonly met at a load balancer, which a longer interval could not keep open) and
+   `progressPermille` is 0 to 1000. The agent closes if `hello` has not arrived within 10
+   seconds. The agent-event kinds are `jobState`, `progress` and `hmiRequest`: `capture` and
+   `log` were dropped because no payload or type existed for them (communication logs and
+   captured data go through the data channel), and `capabilities` because its shape did not
+   match the Web API's; capability reporting is its own work, in that shape. The application
+   close codes are one table in the asyncapi file: 1001 the server is stopping, 1002 protocol
+   violation, 1003 binary frame, 1009 message too big, 4001 replaced, 4002 revoked, 4003 idle. The server's first frame is `hello {heartbeatSecs}` and the
    agent handles nothing before it. The wire types in `shared-proto` have explicit shapes,
    separate from the in-process `AgentEvent`. *Rejected:* serde's default externally tagged
    shape (it does not match the spec and a reader could not tell the type from the keys);
@@ -105,7 +130,8 @@ fixed points constrain it:
     intervals without any frame. The payload is empty: the device clock is untrusted, so a
     `sentAt` would carry nothing. `agents.last_seen_at` is written at connect and at
     disconnect only (design 15.1). *Rejected:* WebSocket ping frames alone (a load balancer or
-    proxy may answer them for the peer); writing the row on every heartbeat (a write per agent
+    proxy may answer a ping for the peer without the agent or the server being alive, and a
+    browser-grade WebSocket API cannot send one, so the same rule could not serve every client); writing the row on every heartbeat (a write per agent
     per interval).
 12. **One connection per agent.** A new connection replaces the old one; the server closes the
     old one with the application close code 4001. The agent holds an exclusive lock in its state
@@ -129,6 +155,10 @@ fixed points constrain it:
   exchange before every upgrade, so a restart costs one round trip.
 - A token is a bearer for its lifetime (300 seconds): a process that obtains one can open the
   channel as the agent, though it cannot issue jobs, which are signed (design 11.1).
+- Issuing challenges is limited per route, and the store holds at most 1024: a caller that
+  keeps requesting challenges pushes the oldest outstanding ones out, so an agent's pending
+  challenge can be dropped and its exchange answered 401. The agent fetches a new one at once,
+  so the cost is a retry; the cap on issuing bounds how fast it can happen.
 - The proof exchange authenticates the agent, not the server. On the local profile a process
   that holds the port could answer both routes. Server authentication must prove the server on
   the WebSocket itself (the `hello` frame and the fresh exchange are its hooks), not only on the

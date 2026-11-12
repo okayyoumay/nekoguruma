@@ -53,7 +53,7 @@ pub enum AudienceError {
     #[error("the audience must be an origin: no path, query or fragment")]
     NotAnOrigin,
     /// The host is empty or not a host name, an IPv4 address or a bracketed IPv6 address.
-    #[error("the audience's host is not valid")]
+    #[error("the audience's host is not valid, or an IP address not in its own canonical form")]
     BadHost,
     /// `localhost` is not an audience: the local profile pins an IP address (ADR-456).
     #[error("the audience must not name localhost")]
@@ -108,8 +108,7 @@ impl Audience {
             return Err(AudienceError::Userinfo);
         }
         let (host, port) = split_host_port(authority)?;
-        let host = host.to_ascii_lowercase();
-        check_host(&host)?;
+        let host = canonical_host(host)?;
         let mut out = format!("{scheme}://{host}");
         if let Some(port) = port {
             let port = parse_port(port)?;
@@ -166,20 +165,21 @@ fn split_host_port(authority: &str) -> Result<(&str, Option<&str>), AudienceErro
     }
 }
 
-fn check_host(host: &str) -> Result<(), AudienceError> {
+/// Lowers the case of `host` and checks it. An IPv6 literal is rewritten through `Ipv6Addr`'s
+/// text form (brackets kept). A host whose last label is all digits must be an IPv4 address that
+/// `Ipv4Addr` parses, which refuses leading zeros and short forms; it is refused otherwise
+/// rather than rewritten, since a number-like name could mean different addresses to different
+/// parsers.
+fn canonical_host(host: &str) -> Result<String, AudienceError> {
+    let host = host.to_ascii_lowercase();
     if let Some(inner) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
-        let ok = !inner.is_empty()
-            && inner.contains(':')
-            && inner
-                .bytes()
-                .all(|b| b.is_ascii_hexdigit() || b == b':' || b == b'.');
-        return if ok {
-            Ok(())
-        } else {
-            Err(AudienceError::BadHost)
-        };
+        let addr: std::net::Ipv6Addr = inner.parse().map_err(|_| AudienceError::BadHost)?;
+        return Ok(format!("[{addr}]"));
     }
-    let name = host.strip_suffix('.').unwrap_or(host);
+    if host.starts_with('[') {
+        return Err(AudienceError::BadHost);
+    }
+    let name = host.strip_suffix('.').unwrap_or(&host);
     if name == "localhost" || name.ends_with(".localhost") {
         return Err(AudienceError::Localhost);
     }
@@ -194,11 +194,15 @@ fn check_host(host: &str) -> Result<(), AudienceError> {
                     .bytes()
                     .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
         });
-    if labels_ok {
-        Ok(())
-    } else {
-        Err(AudienceError::BadHost)
+    if !labels_ok {
+        return Err(AudienceError::BadHost);
     }
+    let last = host.rsplit('.').next().unwrap_or("");
+    if last.bytes().all(|b| b.is_ascii_digit()) {
+        let addr: std::net::Ipv4Addr = host.parse().map_err(|_| AudienceError::BadHost)?;
+        return Ok(addr.to_string());
+    }
+    Ok(host)
 }
 
 fn parse_port(text: &str) -> Result<u16, AudienceError> {
@@ -215,10 +219,10 @@ fn parse_port(text: &str) -> Result<u16, AudienceError> {
 /// A transcript could not be built.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum TranscriptError {
-    /// The audience or agent ID is empty, or longer than [`MAX_FIELD_LEN`].
+    /// The agent ID is empty, or longer than [`MAX_FIELD_LEN`].
     #[error("{field} must be 1 to {MAX_FIELD_LEN} bytes")]
     BadField {
-        /// `audience` or `agent_id`.
+        /// `agent_id`.
         field: &'static str,
     },
 }
@@ -233,37 +237,25 @@ pub struct ProofTranscript {
 }
 
 impl ProofTranscript {
-    /// Builds a transcript. `audience` is the server's origin string as the agent was
-    /// configured with it; `agent_id` is the server-assigned agent ID.
-    pub fn new(
-        audience: &str,
-        agent_id: &str,
-        challenge: [u8; VALUE_LEN],
-        nonce: [u8; VALUE_LEN],
-    ) -> Result<Self, TranscriptError> {
-        for (field, value) in [("audience", audience), ("agent_id", agent_id)] {
-            if value.is_empty() || value.len() > MAX_FIELD_LEN {
-                return Err(TranscriptError::BadField { field });
-            }
-        }
-        Ok(Self {
-            audience: audience.to_owned(),
-            agent_id: agent_id.to_owned(),
-            challenge,
-            nonce,
-        })
-    }
-
     /// Builds a transcript for a canonical [`Audience`]. Both sides build it this way: the
     /// agent from its registration record and the server from its own pinned origin, so the
-    /// signed text is the same bytes (design 14.4, ADR-466).
-    pub fn for_audience(
+    /// signed text is the same bytes and nothing can sign an audience that is not canonical
+    /// (design 14.4, ADR-466). `agent_id` is the server-assigned agent ID.
+    pub fn new(
         audience: &Audience,
         agent_id: &str,
         challenge: [u8; VALUE_LEN],
         nonce: [u8; VALUE_LEN],
     ) -> Result<Self, TranscriptError> {
-        Self::new(audience.as_str(), agent_id, challenge, nonce)
+        if agent_id.is_empty() || agent_id.len() > MAX_FIELD_LEN {
+            return Err(TranscriptError::BadField { field: "agent_id" });
+        }
+        Ok(Self {
+            audience: audience.as_str().to_owned(),
+            agent_id: agent_id.to_owned(),
+            challenge,
+            nonce,
+        })
     }
 
     /// The body that is signed under [`DOMAIN_TAG`].
@@ -334,7 +326,11 @@ mod tests {
     }
 
     fn transcript(challenge: [u8; 32], nonce: [u8; 32]) -> ProofTranscript {
-        ProofTranscript::new(AUDIENCE, AGENT, challenge, nonce).unwrap()
+        ProofTranscript::new(&aud(AUDIENCE), AGENT, challenge, nonce).unwrap()
+    }
+
+    fn aud(text: &str) -> Audience {
+        Audience::canonicalise(text).unwrap()
     }
 
     #[test]
@@ -348,11 +344,11 @@ mod tests {
     #[test]
     fn encoding_is_the_documented_layout() {
         let (c, n) = pair();
-        let t = ProofTranscript::new("ab", "c", c, n).unwrap();
+        let t = ProofTranscript::new(&aud("http://ab"), "c", c, n).unwrap();
         let mut want = Vec::new();
         want.extend(PROTOCOL_VERSION.to_be_bytes());
-        want.extend(2u32.to_be_bytes());
-        want.extend(b"ab");
+        want.extend(9u32.to_be_bytes());
+        want.extend(b"http://ab");
         want.extend(1u32.to_be_bytes());
         want.extend(b"c");
         want.extend(c);
@@ -371,8 +367,8 @@ mod tests {
         let mut other_n = n;
         other_n[31] ^= 1;
         let cases = [
-            ProofTranscript::new("https://ngr.example.org", AGENT, c, n).unwrap(),
-            ProofTranscript::new(AUDIENCE, "other", c, n).unwrap(),
+            ProofTranscript::new(&aud("https://ngr.example.org"), AGENT, c, n).unwrap(),
+            ProofTranscript::new(&aud(AUDIENCE), "other", c, n).unwrap(),
             transcript(other_c, n),
             transcript(c, other_n),
             // Challenge and nonce swapped.
@@ -402,8 +398,8 @@ mod tests {
     fn field_boundaries_are_unambiguous() {
         // Moving a byte between audience and agent ID must change the encoding.
         let (c, n) = pair();
-        let a = ProofTranscript::new("ab", "c", c, n).unwrap();
-        let b = ProofTranscript::new("a", "bc", c, n).unwrap();
+        let a = ProofTranscript::new(&aud("http://ab"), "c", c, n).unwrap();
+        let b = ProofTranscript::new(&aud("http://a"), "bc", c, n).unwrap();
         assert_ne!(a.encode(), b.encode());
     }
 
@@ -465,19 +461,14 @@ mod tests {
     #[test]
     fn empty_or_oversized_fields_are_refused() {
         let (c, n) = pair();
-        let bad = |a: &str, g: &str| ProofTranscript::new(a, g, c, n);
+        let bad = |g: &str| ProofTranscript::new(&aud(AUDIENCE), g, c, n);
         assert_eq!(
-            bad("", AGENT),
-            Err(TranscriptError::BadField { field: "audience" })
-        );
-        assert_eq!(
-            bad(AUDIENCE, ""),
+            bad(""),
             Err(TranscriptError::BadField { field: "agent_id" })
         );
         let long = "x".repeat(MAX_FIELD_LEN + 1);
-        assert!(bad(&long, AGENT).is_err());
-        assert!(bad(AUDIENCE, &long).is_err());
-        assert!(bad(&"x".repeat(MAX_FIELD_LEN), AGENT).is_ok());
+        assert!(bad(&long).is_err());
+        assert!(bad(&"x".repeat(MAX_FIELD_LEN)).is_ok());
     }
 
     #[test]
@@ -526,6 +517,11 @@ mod tests {
                 "https://ngr.example.com:8443",
             ),
             ("http://[::1]:80", "http://[::1]"),
+            ("http://[0:0::1]", "http://[::1]"),
+            (
+                "http://[2001:DB8:0:0:0:0:0:1]:8080",
+                "http://[2001:db8::1]:8080",
+            ),
             ("http://[::1]:9000/", "http://[::1]:9000"),
             // 443 is not http's default, nor 80 https's.
             ("http://h.example:443", "http://h.example:443"),
@@ -563,6 +559,13 @@ mod tests {
             ("http://a..example", BadHost),
             ("https://ngr.example.com.", BadHost),
             ("http://a_b.example", BadHost),
+            ("http://127.000.0.1", BadHost),
+            ("http://0x7f.0.0.1", BadHost),
+            ("http://127.1", BadHost),
+            ("http://1.2.3.256", BadHost),
+            ("http://1.2.3.4.5", BadHost),
+            ("http://a.1", BadHost),
+            ("http://[fe80::1%25eth0]", BadHost),
             ("http://[]", BadHost),
             ("http://[zz]", BadHost),
             ("http://[::1", BadHost),
@@ -611,7 +614,7 @@ mod tests {
     fn an_audience_signs_as_its_canonical_bytes() {
         let (c, n) = pair();
         let a = Audience::canonicalise("http://127.0.0.1:80/").unwrap();
-        let t = ProofTranscript::for_audience(&a, AGENT, c, n).unwrap();
+        let t = ProofTranscript::new(&a, AGENT, c, n).unwrap();
         let mut want = Vec::new();
         want.extend(PROTOCOL_VERSION.to_be_bytes());
         want.extend(16u32.to_be_bytes());
@@ -623,9 +626,6 @@ mod tests {
         assert_eq!(t.encode(), want);
         // The record-write and the verifier sides meet on the same bytes.
         let other = Audience::canonicalise("http://127.0.0.1").unwrap();
-        assert_eq!(
-            t,
-            ProofTranscript::for_audience(&other, AGENT, c, n).unwrap()
-        );
+        assert_eq!(t, ProofTranscript::new(&other, AGENT, c, n).unwrap());
     }
 }

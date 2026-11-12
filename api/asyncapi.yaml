@@ -49,17 +49,26 @@ channels:
       One WebSocket per agent, opened by the agent (5.2, ADR-466).
 
       **Upgrade.** `GET` with `Authorization: Bearer <session token>` and the subprotocol
-      `ngr-control.v1`. A missing, unknown or expired token is answered 401 before any upgrade,
-      and an upgrade that does not offer the subprotocol is refused. The agent sends no
+      `ngr-control.v1`. A missing, unknown or expired token is answered 401 (with
+      `WWW-Authenticate: Bearer`) before any upgrade, and an upgrade that does not offer the
+      subprotocol is answered 400. The agent sends no
       `Origin` header. The identity of the agent is the session's: no payload carries an
       agent ID, and the server takes it from the session only.
 
       **Framing.** Text frames only, one JSON message per frame, at most 128 KiB per message in
       both directions. A binary frame closes the connection. Every message is an object whose
       `type` is the message name below, and the other properties are camelCase. A message with
-      an unknown `type` closes the connection (16.3). Compression is not negotiated.
+      an unknown `type` closes the connection (16.3). So does a message with a property its
+      `type` does not have (every payload below is closed: `additionalProperties: false`), a
+      missing required property and a value out of range: versioning is by the subprotocol, so
+      nothing is ignored for forward compatibility. One exception settles instead of closing:
+      a `jobCommand` that has a `commandId` but no usable `signedJob` (missing, or not a string)
+      reaches the agent's gate as malformed and is answered `commandRejected`; without a
+      `commandId` there is nothing to settle and the connection closes. Compression is not
+      negotiated.
 
-      **Opening.** The server's first frame is `hello`. The agent handles nothing before it.
+      **Opening.** The server's first frame is `hello`. The agent handles nothing before it,
+      and closes the connection if it has not arrived within 10 seconds of the upgrade.
 
       **Keepalive.** The agent sends `heartbeat` every `heartbeatSecs` seconds and the server
       answers each with a `heartbeat`. A side that has seen no frame of any kind for three
@@ -68,6 +77,18 @@ channels:
       **One connection per agent.** A new connection from the same agent replaces the old one,
       which the server closes with an application close code (4001, replaced). An agent that
       receives it backs off to its longest delay before it reconnects.
+
+      **Close codes.**
+
+      | Code | Sent by | Meaning |
+      |---|---|---|
+      | 1001 | server | Going away: the server is stopping (13.3) |
+      | 1002 | either | Protocol error: malformed text, unknown `type`, unknown or missing property, value out of range, `hello` not first or not received in time |
+      | 1003 | either | A binary frame |
+      | 1009 | either | A message over 128 KiB |
+      | 4001 | server | Replaced by a newer connection of the same agent |
+      | 4002 | server | The agent's key was revoked, or its session ended |
+      | 4003 | either | No frame of any kind for three heartbeat intervals |
 
       **Settlement.** `commandAck` settles the delivery of a `jobCommand`, `commandRejected`
       settles it as a refusal (5.3, ADR-466). `commandId` is unique per delivery and scoped to
@@ -168,7 +189,14 @@ operations:
   keepAlive:
     action: send
     channel: { $ref: '#/channels/agentControl' }
-    summary: Both ways. Application heartbeat (14.1)
+    summary: Agent → server. Application heartbeat (14.1)
+    messages:
+      - { $ref: '#/channels/agentControl/messages/heartbeat' }
+
+  echoHeartbeat:
+    action: receive
+    channel: { $ref: '#/channels/agentControl' }
+    summary: Server → agent. The echo of each heartbeat (14.1)
     messages:
       - { $ref: '#/channels/agentControl/messages/heartbeat' }
 
@@ -199,10 +227,11 @@ components:
         sends it once, before anything else, and the agent handles nothing before it.
       payload:
         type: object
+        additionalProperties: false
         required: [type, heartbeatSecs]
         properties:
           type: { const: hello }
-          heartbeatSecs: { type: integer, minimum: 1, description: Seconds between heartbeats; 20 by default }
+          heartbeatSecs: { type: integer, minimum: 1, maximum: 60, description: Seconds between heartbeats; 20 by default. 60 is the idle timeout commonly met at a load balancer }
       examples:
         - payload: {"type": "hello", "heartbeatSecs": 20}
 
@@ -210,7 +239,8 @@ components:
       name: jobCommand
       payload:
         type: object
-        required: [type, commandId, signedJob]
+        additionalProperties: false
+        required: [type, commandId]
         properties:
           type: { const: jobCommand }
           commandId:
@@ -221,6 +251,8 @@ components:
           signedJob:
             type: string
             description: |
+              A missing or non-string value is answered `commandRejected` with the reason
+              `malformed` (the command has its `commandId`, so it can be settled). When present,
               base64 of one envelope (11.1, ADR-461): a format byte (1), the SHA-256
               fingerprint of the signing key's SPKI (32 bytes), the signature (64 bytes, r then
               s, low-S) and the payload, a postcard `JobInstruction` of at most 64 KiB. The
@@ -237,6 +269,7 @@ components:
       description: Settles the delivery of the command (5.3, ADR-466)
       payload:
         type: object
+        additionalProperties: false
         required: [type, commandId]
         properties:
           type: { const: commandAck }
@@ -251,6 +284,7 @@ components:
         ends the job as failed by its own decision (5.3, ADR-461, ADR-466).
       payload:
         type: object
+        additionalProperties: false
         required: [type, commandId, reason]
         properties:
           type: { const: commandRejected }
@@ -269,6 +303,7 @@ components:
       name: cancelCommand
       payload:
         type: object
+        additionalProperties: false
         required: [type, jobId]
         properties:
           type: { const: cancelCommand }
@@ -280,6 +315,7 @@ components:
       name: hmiResponse
       payload:
         type: object
+        additionalProperties: false
         required: [type, jobId, requestId]
         properties:
           type: { const: hmiResponse }
@@ -296,6 +332,7 @@ components:
         S3 keep-alive continues while waiting. Not possible offline.
       payload:
         type: object
+        additionalProperties: false
         required: [type, jobId, requestId, key]
         properties:
           type: { const: seedKeyResponse }
@@ -309,36 +346,66 @@ components:
       name: agentEvent
       description: |
         The agent is the session's: the message carries no agent ID (ADR-466). `kind` selects
-        which of the other properties are present.
+        which of the other properties are present, as the `oneOf` below states. A property
+        that belongs to another kind is refused like any unknown one. Communication logs and
+        captured data travel over the data channel, not as events; reporting the agent's
+        capabilities is later work and will add its own kind.
       payload:
         type: object
         required: [type, seq, kind]
         properties:
           type: { const: agentEvent }
-          seq: { type: integer, description: Monotonically increasing per agent }
+          seq: { type: integer, minimum: 0, description: Monotonically increasing per agent }
           delivery: { type: string, enum: [guaranteed, lossy] }
-          kind:
-            type: string
-            enum: [jobState, progress, hmiRequest, capabilities]
-          jobId: { type: string }
-          state:
-            type: string
-            description: The job state's name (5.6) in camelCase, for kind jobState
-          failureCode: { type: string, description: The failure code's name in camelCase, for the states that carry one }
-          detail: { type: string, description: For the states that carry a detail }
-          progressPermille: { type: integer }
-          phase: { type: string }
-          hmiRequest:
-            type: object
-            properties:
-              requestId: { type: string }
-              templateId: { type: string, description: Record template or HMI form }
-          capabilities: { type: object, description: The agent's capabilities (9.5) }
+          kind: { type: string, enum: [jobState, progress, hmiRequest] }
           occurredAtAgent:
             type: string
             format: date-time
             description: |
               Device time is for reference only. Audit logs treat the server receive time as authoritative (16.3).
+        oneOf:
+          - type: object
+            required: [kind, jobId, state]
+            additionalProperties: false
+            properties:
+              type: true
+              seq: true
+              delivery: true
+              occurredAtAgent: true
+              kind: { const: jobState }
+              jobId: { type: string }
+              state: { type: string, description: The job state's name (5.6) in camelCase }
+              failureCode: { type: string, description: The failure code's name in camelCase, for the states that carry one }
+              detail: { type: string, description: For the states that carry a detail }
+          - type: object
+            required: [kind, jobId, progressPermille, phase]
+            additionalProperties: false
+            properties:
+              type: true
+              seq: true
+              delivery: true
+              occurredAtAgent: true
+              kind: { const: progress }
+              jobId: { type: string }
+              progressPermille: { type: integer, minimum: 0, maximum: 1000 }
+              phase: { type: string }
+          - type: object
+            required: [kind, jobId, hmiRequest]
+            additionalProperties: false
+            properties:
+              type: true
+              seq: true
+              delivery: true
+              occurredAtAgent: true
+              kind: { const: hmiRequest }
+              jobId: { type: string }
+              hmiRequest:
+                type: object
+                required: [requestId, templateId]
+                additionalProperties: false
+                properties:
+                  requestId: { type: string }
+                  templateId: { type: string, description: Record template or HMI form }
       examples:
         - payload: {"type": "agentEvent", "seq": 7, "delivery": "guaranteed", "kind": "jobState", "jobId": "j-1", "state": "running"}
         - payload: {"type": "agentEvent", "seq": 8, "delivery": "lossy", "kind": "progress", "jobId": "j-1", "progressPermille": 250, "phase": "download"}
@@ -352,6 +419,7 @@ components:
         channel does not send it.
       payload:
         type: object
+        additionalProperties: false
         required: [type, seq]
         properties:
           type: { const: eventAck }
@@ -369,6 +437,7 @@ components:
         disconnect only (15.1).
       payload:
         type: object
+        additionalProperties: false
         required: [type]
         properties:
           type: { const: heartbeat }
@@ -380,6 +449,7 @@ components:
       description: The agent is the session's; the message carries no agent ID (ADR-466)
       payload:
         type: object
+        additionalProperties: false
         required: [type, openJobs]
         properties:
           type: { const: reconcile }
@@ -388,11 +458,14 @@ components:
             description: Open jobs only. Never sends the full set
             items:
               type: object
+              additionalProperties: false
+              required: [jobId, state]
               properties:
                 jobId: { type: string }
                 state: { type: string }
                 checkpoint:
                   type: object
+                  additionalProperties: false
                   description: Summary for handover to another device (8.2.5)
                   properties:
                     section: { type: integer }

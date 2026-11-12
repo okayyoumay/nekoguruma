@@ -12,7 +12,8 @@ mod control;
 pub use control::{
     AgentEventKind, AgentEventMessage, AgentMessage, CLOSE_CODE_REPLACED, CONTROL_SUBPROTOCOL,
     Checkpoint, ControlError, DEFAULT_HEARTBEAT_SECS, Delivery, HEARTBEAT_MISSED_LIMIT,
-    HmiRequestBody, MAX_CONTROL_MESSAGE_LEN, OpenJob, ServerMessage,
+    HmiRequestBody, MAX_CONTROL_MESSAGE_LEN, MAX_HEARTBEAT_SECS, MAX_PROGRESS_PERMILLE,
+    MIN_HEARTBEAT_SECS, OpenJob, ServerMessage,
 };
 mod instruction;
 pub use instruction::{

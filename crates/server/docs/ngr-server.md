@@ -341,9 +341,9 @@ connection with hyper's `with_upgrades()`.
 
 - **The route, in this order, the first step that applies answers.** The guard (before routing);
   the method (405 with `Allow: GET` for every other method, HEAD included: the route takes every
-  method and the handler refuses them itself, so that this 405 is a problem document too); the token (401 with `WWW-Authenticate: Bearer`);
-  the WebSocket request (400); the subprotocol (400); then the 101 with
-  `Sec-WebSocket-Protocol: ngr-control.v1` and no extension. Every refusal is a problem
+  method and the handler refuses them itself, so that this 405 is a problem document too); the
+  token (401 with `WWW-Authenticate: Bearer`); the WebSocket request (400); the subprotocol
+  (400); then the 101 with `Sec-WebSocket-Protocol: ngr-control.v1` and no extension. Every refusal is a problem
   document, and a caller with no token learns nothing else about the route: a request with
   neither a token nor an upgrade is 401, and a valid token on a plain GET is 400.
 - **The token.** Exactly one `Authorization` header, visible ASCII, the scheme `Bearer` in any
@@ -365,7 +365,7 @@ connection with hyper's `with_upgrades()`.
   stop, the next message and the idle deadline. Every write is bounded by `WRITE_TIMEOUT`
   (10 seconds); one that fails or times out ends the connection with no frame.
 - **What it reads.** Text only. `heartbeat` is echoed. Another valid message is read and
-  dropped for now (a debug line, never its text). A text that does not decode closes with 1002
+  dropped (a debug line, never its text); routing it is an open item in `work/`. A text that does not decode closes with 1002
   (1009 when `decode` reports the size), a binary message with 1003, and a Close from the agent
   is answered by the stack on one more read. Both transport limits are 131072 bytes: a frame
   of 131073 bytes is refused on its header with 1009, one of 131072 is read. A read error is

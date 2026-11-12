@@ -232,7 +232,7 @@ async fn session(hub: Hub, agent: AgentId, mut socket: WebSocket) {
     } = match hub.register(&agent) {
         Ok(registration) => registration,
         Err(Stopping) => {
-            // The stop began while the upgrade was completing.
+            // The stop began after the hub adopted this session and before it registered.
             if send_close(&mut socket, CLOSE_GOING_AWAY).await {
                 drain(&mut socket).await;
             }

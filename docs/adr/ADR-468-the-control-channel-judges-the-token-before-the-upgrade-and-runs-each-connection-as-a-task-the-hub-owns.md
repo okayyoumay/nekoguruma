@@ -76,7 +76,7 @@ public sending interface: `last_seen_at`, the revocation pass, and the sending o
    a connection number and that word, and no message text.
 8. **What the connection does with what it reads.** A complete text message that decodes to
    `heartbeat` is answered with the echo within 10 seconds. Any other text that decodes is
-   handed on (the second step builds that; until then it is read and dropped). A text that does
+   handed on (not built yet, an open item in `work/`; until then it is read and dropped). A text that does
    not decode closes with 1002, or 1009 when `decode` reports the size (not reachable behind
    equal transport limits, and mapped all the same). A binary message closes with 1003. A Close
    from the agent is answered by the stack on one more read, then the task ends. Both transport
@@ -103,9 +103,9 @@ public sending interface: `last_seen_at`, the revocation pass, and the sending o
     connections or with none. A replaced connection removes nothing when it ends, because the
     entry it finds is its successor's (connections carry a generation). Whether a connection is
     "the agent's current one" is what `leave` returns. A connection ended by replacement is not a
-    disconnect for `last_seen_at` (item 13): the agent did not disconnect, and the newer
+    disconnect for `last_seen_at` (item 11): the agent did not disconnect, and the newer
     connection stamped the row at its connect.
-11. **`last_seen_at` and the revocation pass (built in the second step).** One statement stamps
+11. **`last_seen_at` and the revocation pass (not built yet: an open item in `work/`).** One statement stamps
     the row, `UPDATE agents SET last_seen_at = GREATEST(last_seen_at, now()) WHERE id = $1`
     returning whether the row is revoked, inside a transaction with the usual statement timeouts
     and a 5 second bound. It runs at the connect of a connection, after the 101 and before it
@@ -125,7 +125,7 @@ public sending interface: `last_seen_at`, the revocation pass, and the sending o
     them are not revoked, closes the others (a missing row too) with 4002 after dropping their
     tokens, and closes nobody when its read fails, since a failed read is no evidence of
     revocation. It runs as a task of the hub's set, so the stop aborts it before the pool closes.
-12. **The interface to the queue (built in the second step).** `Hub::send_job_command(agent,
+12. **The interface to the queue (not built yet: an open item in `work/`).** `Hub::send_job_command(agent,
     signed_job)` is not async and does not wait: it draws a `commandId` from a hub-wide counter
     (unique per delivery, meaningful with the connection it went to), encodes the frame outside
     the lock and queues it on the agent's current connection, whose queue holds 16 frames. It
@@ -156,7 +156,8 @@ public sending interface: `last_seen_at`, the revocation pass, and the sending o
 - A stalled consumer of the inbox makes agents reconnect instead of losing events.
 - During a database outage a connected agent stays connected and its row is stale until the next
   disconnect. The column comment in the initial migration still says the column is written in
-  batches; a merged migration cannot change (ADR-458 item 6), so `db/README.md` notes it.
+  batches; a merged migration cannot change (ADR-458 item 6), so the change that builds the stamp notes
+  this in `db/README.md`.
 - A middlebox that originates pings could hold a dead agent's connection open until the agent's
   next connection replaces it.
 - An upgrade that completes during a stop ends without a close frame.

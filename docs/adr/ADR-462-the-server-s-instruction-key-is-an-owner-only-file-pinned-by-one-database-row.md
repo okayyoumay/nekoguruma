@@ -92,8 +92,10 @@ because every registered agent pins one key.
 
 ## Consequences
 
-- A file moved between hosts without its database row, or a database restored over a lost file,
-  stops the server: the operator restores the file or follows the reset procedure.
+- A database that still pins a key whose file is gone (a restore over a lost file, a file not
+  carried to a new host) stops the server: the operator restores the file or follows the reset
+  procedure. A key file carried to a database that pins no key is accepted and pinned there; one
+  carried to a database that pins another key stops the server.
 - A server whose files differ in two directories (two hosts, one database) is refused at the
   second start, not at the first job.
 - A reset leaves jobs that were signed under the retired key: the job queue must end or refuse

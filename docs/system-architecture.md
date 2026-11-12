@@ -322,6 +322,8 @@ Channels are separated so that bulk transfers do not clog the control channel. F
 
 - Commands are idempotent. The agent ACKs receipt, records the job ID and the ownership generation (ADR-229) in the journal, and ignores duplicates: a command whose job ID it has recorded under the same or a later generation; recovery state is likewise journaled per job ID and generation, so a device that gets a job back recovers from the handover's checkpoint summary, not from its older journal
 - Jobs have a start deadline; expired commands are not executed but reported
+- A job command carries the signed job instruction (11.1), and the agent verifies it before anything else: the signature and the agent ID it names first, then the duplicate check and the journal record, then the ACK. An unverified command must never reach the journal, because a forged command for a real job ID with a high generation would otherwise get the genuine one dropped as a duplicate (ADR-461)
+- A command whose instruction fails verification is answered by a command-level rejection keyed by the command ID, with a coarse reason (malformed, unknown key, bad signature, unsupported version, not for this agent), and an operational-log entry. It creates no job and no job state (5.6)
 - Events are delivered reliably via a sequence-numbered Outbox; the server deduplicates by "agent ID + sequence number"
 - On reconnection, the state of incomplete jobs is reconciled (not everything is resent; see 15.1 for scale-specific handling). Reconnection uses exponential backoff + jitter
 - A disconnection is not treated as a job failure. The server never automatically reissues write jobs
@@ -343,6 +345,8 @@ Channels are separated so that bulk transfers do not clog the control channel. F
 **Journal protection**: The journal and local cache contain VINs and diagnostic results. They are encrypted with a key protected by the OS credential store and bound to the device when a TPM is available. Once job completion and sync completion are confirmed, the body is deleted, leaving only the job ID and a result summary. If revocation of the agent key is detected, the local cache and journal are erased.
 
 ### 5.6 Write Job State Transitions
+
+A job exists only once its job instruction has verified and names this agent (11.1, ADR-461). A command that fails verification is rejected at the command level (5.3) and never enters these states, since a forged command naming a real job would otherwise put a must-deliver terminal state in the outbox.
 
 ```mermaid
 stateDiagram-v2
@@ -403,7 +407,7 @@ Sites can have poor reception: workshop basements, inside metal structures, road
 | Operations on vehicles requiring OEM authentication | No | Gateway authentication requires an online connection |
 | Procedures with an operator form or record input (8.6) | No | Only the server relays HMI requests, and the offline local path (5.7.1) only starts jobs and reads progress (ADR-340) |
 
-**Offline job package**: While online, the signed job instruction, artifacts and IR are fetched together. The validity period is kept short; expired packages are not executed but reported (same mechanism as the start deadline in 5.3).
+**Offline job package**: While online, the signed job instruction, artifacts and IR are fetched together. The package carries the same signed envelope as an online command (11.1), and the agent opens it by the same gate. The validity period is kept short; expired packages are not executed but reported (same mechanism as the start deadline in 5.3).
 
 **Handling results**: Results of offline execution are kept in the journal and synced via the Outbox once connectivity is restored.
 
@@ -1445,7 +1449,9 @@ Each signed object differs in what is guaranteed, the basis of trust and the rev
 |---|---|---|---|---|
 | ECU flash data | OEM (provider) | Verified by the ECU itself | Authenticity of the data | OEM-managed |
 | Extension packages (IR, screen definitions, message text) | System operator's distribution key | Root key embedded in the agent | Provenance (ingested under the operator's control and not tampered with) | Agent update |
-| Job instructions | Server's instruction key | Key received at registration | Target VCI, vehicle, approval record, expiry | Re-registration |
+| Job instructions | Server's instruction key | Key received at registration | Target VCI, vehicle, documents, expiry; the approval record from a later body version (body version 1 carries none, below) | Re-registration |
+
+**Job instruction format** (ADR-461): the server signs the exact bytes of the instruction's payload and the agent verifies them before it parses them. The delivered blob is a format byte (1), the SHA-256 fingerprint of the signing key's SPKI (32 bytes), the signature (64 bytes, low-S) and the payload; the signature is made under the tag `nekoguruma job instruction`, never the connection proof's. The format byte fixes the algorithm (ECDSA P-256 with SHA-256, ADR-459). The fingerprint only selects the key: the agent trusts the one key pinned at registration and compares the fingerprint with it. The payload is a postcard struct, `JobInstruction` in `shared-proto`, at most 64 KiB, whose first field is its version. Version 1 holds the job ID (a canonical UUID), the ownership generation, the agent ID, the operator ID, the job kind, the VCI the agent reported, the optional VIN, the document hashes (sorted, without duplicates), the optional artifact hash and plan hash, the issue time and the start deadline. It carries no approval record: that arrives by a version bump with the M4 confirmation levels and M6 approvals. Anything the agent acts on is a field of the body, never a field beside it. The instruction names an identification job's documents through the plan hash, which is also the plan's signature (ADR-395). A server key that rotates means re-registration; there is no in-band key update.
 
 **Ingestion signature**: having extension authors (VCI vendors, OEMs, organizations) sign with their own keys would make the set of keys to register on agents grow without bound, breaking the key distribution principle. Therefore, extensions received from authors are verified on the server side and then **re-signed with the operator's distribution key**.
 
@@ -1484,8 +1490,8 @@ The flash artifact itself is hashed by the agent before the first instruction: t
 Everything is unified on Rust, organized as a single Cargo workspace.
 
 ```
-shared-proto     commands, events, capabilities, frame formats
-shared-crypto    the agent key (ECDSA P-256) and its connection proof, provider signature verification, ingestion signing and verification with the distribution key, root key verification, job instruction signing, hash computation
+shared-proto     commands, events, capabilities, frame formats, the signed job instruction's body (`JobInstruction`, ADR-461)
+shared-crypto    the agent key (ECDSA P-256) and its connection proof, provider signature verification, ingestion signing and verification with the distribution key, root key verification, job instruction signing and its envelope (ADR-461), hash computation
 vendor-manifest  per-vendor manifest parsers
 diag-ir          IR schema, bytecode definition, VM (shared by server and agent)
 diag-frontend    ODX/OTX parser, CSV + Starlark→IR transpiler (server only)

@@ -14,8 +14,9 @@
 //! fields are length-prefixed, so two different field sets never encode to the same bytes.
 //!
 //! The body is signed through [`sign_tagged`] under [`DOMAIN_TAG`], which names this purpose
-//! and is length-prefixed in front of the body. Job instructions will be signed with the same
-//! key primitive (design 11.1) through the same pair under a tag of their own, and a verifier
+//! and is length-prefixed in front of the body. Job instructions are signed with the same
+//! key primitive (design 11.1) through the same pair under a tag of their own
+//! ([`crate::instruction::DOMAIN_TAG`]), and a verifier
 //! of either purpose rebuilds its own message from its own tag. A proof signature therefore
 //! does not verify as a job instruction, and the reverse. A new signed purpose must pick a new
 //! tag and never reuse this one. The version lives only in the body, so a layout change bumps
@@ -122,7 +123,7 @@ pub fn verify_proof(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{SignErrorKind, SigningKey};
+    use crate::{SignErrorKind, SigningKey, instruction};
 
     const AUDIENCE: &str = "https://ngr.example.com";
     const AGENT: &str = "3f1c2a52-6a0e-4c0d-9d3e-0a1b2c3d4e5f";
@@ -251,11 +252,11 @@ mod tests {
         // What a job instruction signer would do: the same body under its own tag.
         let key = SigningKey::generate().unwrap();
         let t = transcript(c, n);
-        let other = sign_tagged(&key, b"nekoguruma job instruction", &t.encode()).unwrap();
+        let other = sign_tagged(&key, instruction::DOMAIN_TAG, &t.encode()).unwrap();
         assert!(verify_proof(&key.public_key(), &t, &other).is_err());
         verify_tagged(
             &key.public_key(),
-            b"nekoguruma job instruction",
+            instruction::DOMAIN_TAG,
             &t.encode(),
             &other,
         )
@@ -265,7 +266,7 @@ mod tests {
         assert!(
             verify_tagged(
                 &key.public_key(),
-                b"nekoguruma job instruction",
+                instruction::DOMAIN_TAG,
                 &t.encode(),
                 &proof
             )

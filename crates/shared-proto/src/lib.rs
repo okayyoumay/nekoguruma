@@ -1,11 +1,18 @@
 //! Protocol types shared by the server, agent, and worker.
 //!
-//! Design document sections: 5.1 job kinds / 5.3 handling disconnects / 9.5 capabilities
+//! Design document sections: 5.1 job kinds / 5.3 handling disconnects / 9.5 capabilities /
+//! 11.1 job instructions
 //!
 //! These types are also used for worker IPC, so only fixed-width types are used.
 //! `usize` / `isize` / `c_long` must not appear in public types (7.4).
 
 use serde::{Deserialize, Serialize};
+
+mod instruction;
+pub use instruction::{
+    INSTRUCTION_VERSION, InstructionError, InstructionRejectReason, JOB_ID_LEN, JobInstruction,
+    MAX_INSTRUCTION_LEN, MAX_STRING_LEN,
+};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
@@ -26,7 +33,11 @@ pub struct Vin(pub String);
 // ---------------------------------------------------------------- Jobs
 
 /// Job kinds from 5.1.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// The job instruction carries the kind in its postcard encoding, which numbers the variants
+/// in declaration order: a new kind is a new body version, added at the end, and the order
+/// never changes (ADR-461).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobKind {
     Acquire,
     MonitorSession,
@@ -34,43 +45,8 @@ pub enum JobKind {
     RunSequence,
     WriteSettings,
     Reprogram,
-}
-
-/// Job instruction signed and delivered by the server (layer 3 of 11.1).
-/// The signature covers the raw bytes of `payload` exactly.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SignedJob {
-    pub payload: Vec<u8>,
-    pub signature: Vec<u8>,
-    pub key_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JobSpec {
-    pub job_id: JobId,
-    pub kind: JobKind,
-    pub agent_id: AgentId,
-    pub operator_id: String,
-    pub vci: VciId,
-    /// Target vehicle. None before discovery (two-stage locking, 8.8).
-    pub vin: Option<Vin>,
-    /// Hash of the IR package to use.
-    pub ir_digest: String,
-    /// Hash of the ECU distribution artifact (write operations only).
-    pub artifact_digest: Option<String>,
-    /// Start deadline (RFC3339). If exceeded, the job is not run and Expired is reported (5.3).
-    pub start_deadline: String,
-    /// Confirmation requirement (6.3).
-    pub confirmation: Confirmation,
-    pub min_agent_version: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum Confirmation {
-    NotifyOnly,
-    GracePeriod { seconds: u32 },
-    OnSiteApproval,
-    TwoPerson { approver_id: String },
+    /// Vehicle identification (design 16.3, ADR-327).
+    Identify,
 }
 
 // ---------------------------------------------------------------- Events

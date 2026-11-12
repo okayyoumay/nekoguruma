@@ -290,16 +290,18 @@ paths:
         The first step of an agent's proof that it holds its registered key. Needs no login: the
         agent has no session, and the request has no body to trust. The body must be empty
         (a non-empty body is **400**). The server answers with 32 random bytes that it keeps in
-        memory for 60 seconds and removes at the first presentation, whatever the outcome. At
-        most 1024 challenges are outstanding; the oldest is dropped beyond that.
+        memory for 60 seconds and removes at the first presentation, whatever the outcome. The
+        store holds at most 1024 challenges and drops the oldest beyond that; the cap below keeps
+        the live count far under it, so on one server none is dropped (ADR-467).
 
         Like registration the route has a 5 second body-read bound (**408**) and answers **405**
         with `Allow` to another method. It is subject to the Host and Origin rules of 13.3. A
         challenge says nothing about any agent, so the route has no refusal of its own and the
-        limit on refusals does not apply to it. Issuing is limited on its own: a sliding-window
-        cap on the route (numbers set by the server, like registration's), then **429** with
-        `Retry-After`. A challenge dropped from the store because 1024 were outstanding shows
-        as a 401 at the session route, which the agent answers with a new challenge.
+        limit on refusals does not apply to it. Issuing is limited on its own: at most 60
+        challenges within a sliding minute on the route, then **429** with `Retry-After` (the
+        time until the oldest of the 60 is a minute old). A request answered 429 is not
+        recorded and issues nothing. A caller that uses the whole cap can deny challenges to
+        honest agents for up to a minute (ADR-467).
       security: []
       responses:
         '200':
@@ -315,9 +317,9 @@ paths:
         '408': { $ref: '#/components/responses/Problem' }
         '413': { $ref: '#/components/responses/Problem' }
         '429':
-          description: Too many challenges were issued within the window; `Retry-After` is the time to wait
+          description: 60 challenges were issued in the last minute on this route; `Retry-After` is the time until the oldest is a minute old
           headers:
-            Retry-After: { schema: { type: integer, minimum: 1 }, description: Seconds to wait }
+            Retry-After: { schema: { type: integer, minimum: 1, maximum: 60 }, description: Seconds to wait }
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
@@ -336,7 +338,8 @@ paths:
 
         The checks run in this order: the request guard (13.3), the method (**405**, with
         `Allow`), the body (read within 5 seconds, **408**; at most 4 KiB, **413**), the shape
-        (**400**), the challenge, then the key and the proof.
+        (**400**, which uses up no challenge), the challenge (**401**), the agent's row
+        (**503**, **500**), then the key and the proof (**403**, or **429**).
 
         **400** is decided on the shape of the request alone, before and without any lookup: a
         `Content-Type` other than `application/json` (parameters allowed), an `agentId` that is
@@ -368,8 +371,10 @@ paths:
         answered 400. The agent takes a fresh exchange before every upgrade.
 
         **503** is returned when the database cannot be reached or a statement fails or times out
-        (5 seconds); **500** for any other failure of the server. Neither counts toward the
-        limit.
+        (5 seconds); **500** for any other failure of the server, including a stored key that
+        does not decode. Neither counts toward the limit, and the challenge stays used up. A
+        stale or unknown challenge is answered 401 before the database is read, whatever else
+        is wrong with the request.
       security: []
       requestBody:
         required: true

@@ -506,6 +506,7 @@ async fn the_migration_reports_how_many_duplicate_rows_it_revoked() {
         .with_ansi(false)
         .with_max_level(tracing::Level::WARN)
         .finish();
+    crate::support::pin_dispatchers();
     let _guard = tracing::subscriber::set_default(subscriber);
     upgrade_from_4(
         &pg,

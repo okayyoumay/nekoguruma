@@ -48,6 +48,49 @@ pub enum DbError {
     MigrationState(sqlx::Error),
 }
 
+/// What a failed statement means to a route: the database is unavailable (503), or this code has
+/// a fault (500). The text is coarse and never the error's own, since a constraint failure's
+/// detail can name a value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Failure {
+    Unavailable(String),
+    Internal(String),
+}
+
+/// A pool, connection or database-execution failure (including a lock or statement timeout and
+/// a serialization failure) is unavailability. A fault in this code (a decode, encode, column or
+/// type mismatch, a missing row) or any other kind is internal.
+pub(crate) fn failure(error: &sqlx::Error) -> Failure {
+    match error {
+        sqlx::Error::Database(db) => Failure::Unavailable(match db.code() {
+            Some(code) => format!("database error, SQLSTATE {code}"),
+            None => "database error".to_owned(),
+        }),
+        sqlx::Error::PoolTimedOut => {
+            Failure::Unavailable("no connection available in time".to_owned())
+        }
+        sqlx::Error::PoolClosed => Failure::Unavailable("the pool is closed".to_owned()),
+        sqlx::Error::Io(_)
+        | sqlx::Error::Tls(_)
+        | sqlx::Error::Protocol(_)
+        | sqlx::Error::WorkerCrashed
+        | sqlx::Error::BeginFailed => Failure::Unavailable("connection failed".to_owned()),
+        _ => Failure::Internal("unexpected database client error".to_owned()),
+    }
+}
+
+/// Sets the lock and statement timeouts (5 seconds) for the transaction `tx`, so that a read or
+/// write that waits on a lock or runs long fails as unavailability instead of hanging a request.
+pub(crate) async fn statement_timeouts(tx: &mut sqlx::PgConnection) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "SELECT set_config('lock_timeout', '5s', true), \
+                set_config('statement_timeout', '5s', true)",
+    )
+    .execute(tx)
+    .await
+    .map(|_| ())
+}
+
 /// How the applied migrations differ from the embedded ones (see [`require_current`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum MigrationsDiffer {

@@ -27,7 +27,6 @@ use axum::response::{IntoResponse, Response};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use http_body_util::BodyExt;
-use serde::Deserialize;
 use serde::de::{self, MapAccess, Visitor};
 use shared_crypto::registration::{
     Mode, Preset, RegistrationCode, RegistrationTranscript, verify_registration,
@@ -35,6 +34,7 @@ use shared_crypto::registration::{
 use shared_crypto::{PublicKey, Signature};
 use sqlx::PgPool;
 
+use crate::db;
 use crate::health::may_log;
 use crate::instruction_key::{InstructionKey, RegistrationSignError};
 use crate::problem::Problem;
@@ -72,27 +72,52 @@ pub enum Admission {
     Limited { retry_after_secs: u64 },
 }
 
-/// A sliding window over the last [`LIMIT`] counted refusals of one router (ADR-465). The mutex
+/// A sliding window over the last `limit` admitted events of one router (ADR-465). The mutex
 /// is never held across an await, and its poisoning is ignored, as in the health route.
-#[derive(Debug, Default)]
+///
+/// Registration counts its refusals with [`LIMIT`] and [`WINDOW`] (the default); the session
+/// routes give their own numbers (ADR-467).
+#[derive(Debug)]
 pub struct Limiter {
+    limit: usize,
+    window: Duration,
     counted: Mutex<VecDeque<Instant>>,
 }
 
+impl Default for Limiter {
+    fn default() -> Limiter {
+        Limiter::new(LIMIT, WINDOW)
+    }
+}
+
 impl Limiter {
-    /// Judges one would-be refusal at `now`. With [`LIMIT`] refusals recorded and the oldest
-    /// younger than [`WINDOW`], it is limited, with the seconds until that oldest is a window
-    /// old, rounded up (1 to 60); otherwise it is recorded and counted.
+    pub fn new(limit: usize, window: Duration) -> Limiter {
+        Limiter {
+            limit,
+            window,
+            counted: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    /// Judges one would-be refusal at `now`; see [`Limiter::admit`].
     pub fn refusal(&self, now: Instant) -> Admission {
+        self.admit(now)
+    }
+
+    /// Judges one event at `now`. With `limit` events recorded and the oldest younger than the
+    /// window, it is limited, with the seconds until that oldest is a window old, rounded up
+    /// (1 to the window's seconds); otherwise it is recorded and counted.
+    pub fn admit(&self, now: Instant) -> Admission {
         let mut counted = self.counted.lock().unwrap_or_else(|e| e.into_inner());
-        if counted.len() >= LIMIT {
-            let oldest = *counted.front().expect("the window is full");
+        if counted.len() >= self.limit
+            && let Some(&oldest) = counted.front()
+        {
             let age = now.saturating_duration_since(oldest);
-            if age < WINDOW {
-                let left = WINDOW - age;
+            if age < self.window {
+                let left = self.window - age;
                 let secs = left.as_secs() + u64::from(left.subsec_nanos() > 0);
                 return Admission::Limited {
-                    retry_after_secs: secs.clamp(1, WINDOW.as_secs()),
+                    retry_after_secs: secs.clamp(1, self.window.as_secs().max(1)),
                 };
             }
             counted.pop_front();
@@ -144,53 +169,52 @@ struct Fields {
     proof: String,
 }
 
-impl<'de> Deserialize<'de> for Fields {
-    fn deserialize<D: de::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_map(FieldsVisitor)
-    }
+/// Reads a JSON object that holds each of `names` exactly once, as a string, and nothing else:
+/// an array, a missing, unknown or duplicate field, a non-string value and bytes after the
+/// value are all `None`. The values come back in the order of `names`.
+pub(crate) fn strict_strings<const N: usize>(
+    body: &[u8],
+    names: [&'static str; N],
+) -> Option<[String; N]> {
+    use serde::de::Deserializer as _;
+    let mut deserializer = serde_json::Deserializer::from_slice(body);
+    let values = deserializer.deserialize_map(StrictVisitor { names }).ok()?;
+    deserializer.end().ok()?;
+    Some(values)
 }
 
-/// Accepts a JSON object only (a derived struct would also accept an array), with each of the
-/// four fields exactly once, as a string, and no other.
-struct FieldsVisitor;
+struct StrictVisitor<const N: usize> {
+    names: [&'static str; N],
+}
 
-impl<'de> Visitor<'de> for FieldsVisitor {
-    type Value = Fields;
+impl<'de, const N: usize> Visitor<'de> for StrictVisitor<N> {
+    type Value = [String; N];
 
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("an object with the four registration fields")
+        f.write_str("an object with the expected string fields")
     }
 
-    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Fields, A::Error> {
-        let (mut code, mut public_key, mut mode, mut proof) = (None, None, None, None);
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<[String; N], A::Error> {
+        let mut slots: [Option<String>; N] = std::array::from_fn(|_| None);
         while let Some(name) = map.next_key::<String>()? {
-            let slot = match name.as_str() {
-                "code" => &mut code,
-                "publicKey" => &mut public_key,
-                "mode" => &mut mode,
-                "proof" => &mut proof,
-                _ => return Err(de::Error::custom("unknown field")),
+            let Some(index) = self.names.iter().position(|n| *n == name) else {
+                return Err(de::Error::custom("unknown field"));
             };
-            if slot.is_some() {
+            if slots[index].is_some() {
                 return Err(de::Error::custom("duplicate field"));
             }
-            *slot = Some(map.next_value::<String>()?);
+            slots[index] = Some(map.next_value::<String>()?);
         }
-        match (code, public_key, mode, proof) {
-            (Some(code), Some(public_key), Some(mode), Some(proof)) => Ok(Fields {
-                code,
-                public_key,
-                mode,
-                proof,
-            }),
-            _ => Err(de::Error::custom("missing field")),
+        if slots.iter().any(Option::is_none) {
+            return Err(de::Error::custom("missing field"));
         }
+        Ok(slots.map(Option::unwrap_or_default))
     }
 }
 
 /// True when the headers carry exactly one Content-Type whose media type is `application/json`
 /// (parameters allowed).
-fn is_json(headers: &HeaderMap) -> bool {
+pub(crate) fn is_json(headers: &HeaderMap) -> bool {
     let mut values = headers.get_all(header::CONTENT_TYPE).iter();
     let (Some(value), None) = (values.next(), values.next()) else {
         return false;
@@ -207,7 +231,14 @@ fn shape(headers: &HeaderMap, body: &[u8]) -> Result<Shaped, ShapeError> {
     if !is_json(headers) {
         return Err(ShapeError::ContentType);
     }
-    let fields: Fields = serde_json::from_slice(body).map_err(|_| ShapeError::Json)?;
+    let [code, public_key, mode, proof] =
+        strict_strings(body, ["code", "publicKey", "mode", "proof"]).ok_or(ShapeError::Json)?;
+    let fields = Fields {
+        code,
+        public_key,
+        mode,
+        proof,
+    };
     if fields.code.len() > MAX_CODE {
         return Err(ShapeError::Code);
     }
@@ -338,27 +369,11 @@ enum RedeemError {
 }
 
 impl From<sqlx::Error> for RedeemError {
-    /// A pool, connection or database-execution failure (including a lock or statement timeout
-    /// and a serialization failure) is unavailability, 503. A fault in this code (a decode,
-    /// encode, column or type mismatch, a missing row) or any other kind is internal, 500.
-    ///
-    /// Never the error's own text: a constraint failure's detail can name a value.
+    /// The mapping of [`db::failure`], shared with the session route.
     fn from(error: sqlx::Error) -> Self {
-        match &error {
-            sqlx::Error::Database(db) => RedeemError::Unavailable(match db.code() {
-                Some(code) => format!("database error, SQLSTATE {code}"),
-                None => "database error".to_owned(),
-            }),
-            sqlx::Error::PoolTimedOut => {
-                RedeemError::Unavailable("no connection available in time".to_owned())
-            }
-            sqlx::Error::PoolClosed => RedeemError::Unavailable("the pool is closed".to_owned()),
-            sqlx::Error::Io(_)
-            | sqlx::Error::Tls(_)
-            | sqlx::Error::Protocol(_)
-            | sqlx::Error::WorkerCrashed
-            | sqlx::Error::BeginFailed => RedeemError::Unavailable("connection failed".to_owned()),
-            _ => RedeemError::Internal("unexpected database client error".to_owned()),
+        match db::failure(&error) {
+            db::Failure::Unavailable(what) => RedeemError::Unavailable(what),
+            db::Failure::Internal(what) => RedeemError::Internal(what),
         }
     }
 }
@@ -377,7 +392,7 @@ struct Registered {
     signature: Signature,
 }
 
-enum BodyError {
+pub(crate) enum BodyError {
     TooLarge,
     Timeout,
     Broken,
@@ -385,7 +400,7 @@ enum BodyError {
 
 /// Reads the body in full within [`BODY_TIMEOUT`], refusing more than [`MAX_BODY`] bytes as soon
 /// as they have arrived.
-async fn read_body(body: axum::body::Body) -> Result<Vec<u8>, BodyError> {
+pub(crate) async fn read_body(body: axum::body::Body) -> Result<Vec<u8>, BodyError> {
     let read = async {
         let mut body = body;
         let mut bytes = Vec::new();
@@ -406,7 +421,7 @@ async fn read_body(body: axum::body::Body) -> Result<Vec<u8>, BodyError> {
 }
 
 /// An answer that ends the connection: the body may be unread.
-fn closing(status: StatusCode, title: &'static str) -> Response {
+pub(crate) fn closing(status: StatusCode, title: &'static str) -> Response {
     let mut response = Problem::new(status, title).into_response();
     response
         .headers_mut()
@@ -414,35 +429,39 @@ fn closing(status: StatusCode, title: &'static str) -> Response {
     response
 }
 
+/// Reads a request body within the route bounds, or the answer that ends the request: a declared
+/// length over [`MAX_BODY`] is a 413 before any byte is read, a body not complete within
+/// [`BODY_TIMEOUT`] a 408, one that grows past the limit a 413 and a broken one a 400. Each of
+/// them closes the connection. Shared by every route that takes a small body.
+pub(crate) async fn bounded_body(body: axum::body::Body) -> Result<Vec<u8>, Response> {
+    // A declared length over the limit is answered before any byte is read, so the client gets
+    // its 413. A streamed body has no declared length and is cut when it grows past the limit.
+    if body.size_hint().lower() > MAX_BODY as u64 {
+        return Err(closing(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "The request body is too large",
+        ));
+    }
+    read_body(body).await.map_err(|error| match error {
+        BodyError::Timeout => closing(
+            StatusCode::REQUEST_TIMEOUT,
+            "The request body took too long",
+        ),
+        BodyError::TooLarge => closing(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "The request body is too large",
+        ),
+        BodyError::Broken => closing(StatusCode::BAD_REQUEST, ShapeError::Json.title()),
+    })
+}
+
 /// `POST /api/v1/agents/register`.
 pub async fn register(State(registrar): State<Registrar>, request: Request) -> Response {
     let inner = &*registrar.0;
     let (parts, body) = request.into_parts();
-    // A declared length over the limit is answered before any byte is read, so the client gets
-    // its 413. A streamed body has no declared length and is cut when it grows past the limit.
-    if body.size_hint().lower() > MAX_BODY as u64 {
-        return closing(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "The request body is too large",
-        );
-    }
-    let bytes = match read_body(body).await {
+    let bytes = match bounded_body(body).await {
         Ok(bytes) => bytes,
-        Err(BodyError::Timeout) => {
-            return closing(
-                StatusCode::REQUEST_TIMEOUT,
-                "The request body took too long",
-            );
-        }
-        Err(BodyError::TooLarge) => {
-            return closing(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "The request body is too large",
-            );
-        }
-        Err(BodyError::Broken) => {
-            return closing(StatusCode::BAD_REQUEST, ShapeError::Json.title());
-        }
+        Err(response) => return response,
     };
     let shaped = match shape(&parts.headers, &bytes) {
         Ok(shaped) => shaped,
@@ -540,12 +559,7 @@ impl Inner {
             .begin_with("BEGIN ISOLATION LEVEL READ COMMITTED")
             .await?;
 
-        sqlx::query(
-            "SELECT set_config('lock_timeout', '5s', true), \
-                    set_config('statement_timeout', '5s', true)",
-        )
-        .execute(&mut *tx)
-        .await?;
+        db::statement_timeouts(&mut tx).await?;
 
         let consumed: Option<(String, String, String)> = sqlx::query_as(
             "UPDATE agent_registration_codes c SET used_at = now() \

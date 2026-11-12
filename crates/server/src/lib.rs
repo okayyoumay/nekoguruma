@@ -15,6 +15,7 @@ pub mod local_guard;
 pub mod problem;
 pub mod register;
 pub mod registration;
+pub mod session;
 
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -36,6 +37,7 @@ use tower::Layer;
 
 pub use config::{Config, ConfigError, Profile};
 pub use instruction_key::InstructionKey;
+pub use session::Sessions;
 
 /// How long a connection may take to deliver a complete request head. A client that opens a
 /// connection and sends nothing, or a head one byte at a time, is dropped after this; it also
@@ -51,6 +53,8 @@ pub struct AppState {
     pub pool: PgPool,
     /// The key that signs job instructions (ADR-462).
     pub instruction_key: Arc<InstructionKey>,
+    /// The session tokens the agent session route issues; the control channel route reads them.
+    pub sessions: Sessions,
 }
 
 /// The server's routes behind the local profile's request guard (design 13, 13.3).
@@ -65,9 +69,23 @@ pub fn router(state: AppState) -> Router {
     // The redemption route keeps its own limiter and log gates: one set per router.
     let register = Router::new()
         .route(register::PATH, post(register::register))
-        .with_state(register::Registrar::new(state.pool, state.instruction_key));
+        .with_state(register::Registrar::new(
+            state.pool.clone(),
+            state.instruction_key,
+        ));
+    // The challenge store, the two limiters and the log gates of the proof exchange are per
+    // router too; the token table is the state's, shared with the control channel route.
+    let exchange = Router::new()
+        .route(session::CHALLENGE_PATH, post(session::challenge))
+        .route(session::SESSION_PATH, post(session::session))
+        .with_state(session::Exchange::new(
+            state.pool,
+            state.port,
+            state.sessions,
+        ));
     let routes = health
         .merge(register)
+        .merge(exchange)
         .fallback(|| async { problem::Problem::new(StatusCode::NOT_FOUND, "Not found") });
     // The standard profile supplies its own ingress layer here (design 13).
     let guarded = middleware::from_fn_with_state(state.port, local_guard::guard).layer(routes);
@@ -97,6 +115,7 @@ pub struct Server {
     listener: TcpListener,
     router: Router,
     pool: PgPool,
+    sessions: Sessions,
     grace: Duration,
 }
 
@@ -144,14 +163,17 @@ impl Server {
             .local_addr()
             .map_err(|source| StartError::Bind { port, source })?
             .port();
+        let sessions = Sessions::new();
         Ok(Server {
             listener,
             router: router(AppState {
                 port: bound,
                 pool: pool.clone(),
                 instruction_key,
+                sessions: sessions.clone(),
             }),
             pool,
+            sessions,
             grace: Duration::from_secs(http.shutdown_grace_secs),
         })
     }
@@ -160,6 +182,11 @@ impl Server {
         self.listener
             .local_addr()
             .expect("a bound listener has an address")
+    }
+
+    /// The session tokens this server issues, which the control channel route will accept.
+    pub fn sessions(&self) -> Sessions {
+        self.sessions.clone()
     }
 
     /// The pinned origin this server answers on.
@@ -182,6 +209,7 @@ impl Server {
             listener,
             router,
             pool,
+            sessions: _,
             grace,
         } = self;
         let service = TowerToHyperService::new(router);

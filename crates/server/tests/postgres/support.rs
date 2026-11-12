@@ -20,6 +20,9 @@ const EXE: &str = std::env::consts::EXE_SUFFIX;
 /// A running PostgreSQL cluster that belongs to one test.
 pub struct TestPostgres {
     dir: tempfile::TempDir,
+    /// A directory for the server's instruction key file, which the server account owns (the
+    /// cluster's own directory belongs to the `postgres` account when the tests run as root).
+    key_dir: tempfile::TempDir,
     bin: PathBuf,
     port: u16,
     password: String,
@@ -47,6 +50,7 @@ impl TestPostgres {
         }
         let mut pg = TestPostgres {
             dir,
+            key_dir: tempfile::tempdir().expect("a temporary directory for the key"),
             bin,
             port: 0,
             password: random_password(),
@@ -70,6 +74,12 @@ impl TestPostgres {
             }
         }
         panic!("PostgreSQL did not start: {last}\n{}", pg.log_tail());
+    }
+
+    /// The instruction key path of a server started against this cluster: tests that start
+    /// several servers on one cluster share it, as a deployment's servers do.
+    pub fn key_path(&self) -> PathBuf {
+        self.key_dir.path().join("instruction.key")
     }
 
     fn data(&self) -> PathBuf {

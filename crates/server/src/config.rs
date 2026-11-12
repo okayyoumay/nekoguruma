@@ -128,6 +128,17 @@ impl Database {
     }
 }
 
+/// The `[instruction_key]` table (design 11.1, ADR-462): where the private key that signs job
+/// instructions is kept. There is no default path, no search and no environment variable
+/// (ADR-456 item 7). The table holds a path and never key material.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstructionKeyConfig {
+    /// An absolute path to a PKCS#8 file. The server creates it, readable by its account only,
+    /// when the file is absent and the database records no active key; the directory must exist.
+    pub path: PathBuf,
+}
+
 /// The whole configuration file.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -138,6 +149,8 @@ pub struct Config {
     pub http: Http,
     /// Required: the server does not start without its database.
     pub database: Database,
+    /// Required: the server does not start without its instruction key.
+    pub instruction_key: InstructionKeyConfig,
 }
 
 /// Why a configuration file was refused.
@@ -173,6 +186,8 @@ pub enum ConfigError {
         "invalid configuration: database.url is not a postgres://user:password@host[:port]/database URL without parameters"
     )]
     DatabaseUrl,
+    #[error("invalid configuration: instruction_key.path must be an absolute path")]
+    InstructionKeyPath,
 }
 
 fn at(line: Option<usize>, column: Option<usize>) -> String {
@@ -251,6 +266,9 @@ impl Config {
             return Err(ConfigError::ConnectTimeout);
         }
         config.database.connect_options()?;
+        if !config.instruction_key.path.is_absolute() {
+            return Err(ConfigError::InstructionKeyPath);
+        }
         Ok(config)
     }
 
@@ -264,8 +282,19 @@ impl Config {
 mod tests {
     use super::*;
 
-    /// The smallest valid file.
-    const DB: &str = "[database]\nurl = \"postgres://ngr:pw@127.0.0.1:5432/nekoguruma\"\n";
+    /// The smallest valid file. The key table comes first, so text appended to `DB` lands in
+    /// `[database]`. The path is absolute on the platform the test runs on.
+    #[cfg(unix)]
+    const DB: &str = "[instruction_key]\npath = \"/srv/nekoguruma/instruction.key\"\n\
+                      [database]\nurl = \"postgres://ngr:pw@127.0.0.1:5432/nekoguruma\"\n";
+    #[cfg(windows)]
+    const DB: &str = "[instruction_key]\npath = 'C:\\srv\\nekoguruma\\instruction.key'\n\
+                      [database]\nurl = \"postgres://ngr:pw@127.0.0.1:5432/nekoguruma\"\n";
+
+    /// The `[instruction_key]` table of `DB`.
+    fn key_table() -> &'static str {
+        &DB[..DB.find("[database]").unwrap()]
+    }
 
     /// `DB` followed by `extra` in its own table or at the end.
     fn with_db(extra: &str) -> String {
@@ -286,6 +315,34 @@ mod tests {
         assert!(Config::parse("").is_err());
         assert!(Config::parse("[http]\nport = 9001\n").is_err());
         assert!(Config::parse("[database]\nconnect_timeout_secs = 3\n").is_err());
+    }
+
+    #[test]
+    fn the_instruction_key_table_and_its_path_are_required() {
+        let db_only = "[database]\nurl = \"postgres://ngr:pw@127.0.0.1:5432/nekoguruma\"\n";
+        assert!(Config::parse(db_only).is_err());
+        assert!(Config::parse(&format!("[instruction_key]\n{db_only}")).is_err());
+        assert!(
+            Config::parse(&format!(
+                "[instruction_key]\npath = \"/k\"\nmode = 1\n{db_only}"
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn load_refuses_a_relative_instruction_key_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key.toml");
+        let text = "[instruction_key]\npath = \"keys/instruction.key\"\n\
+                    [database]\nurl = \"postgres://ngr:pw@127.0.0.1:5432/nekoguruma\"\n";
+        std::fs::write(&path, text).unwrap();
+        assert!(matches!(
+            Config::load(&path),
+            Err(ConfigError::InstructionKeyPath)
+        ));
+        std::fs::write(&path, DB).unwrap();
+        assert!(Config::load(&path).is_ok());
     }
 
     #[test]
@@ -389,7 +446,11 @@ mod tests {
             "postgres://u@h/db",
             "postgres://:s3cret-value@h/db",
         ] {
-            std::fs::write(&path, format!("[database]\nurl = \"{url}\"\n")).unwrap();
+            std::fs::write(
+                &path,
+                format!("{}[database]\nurl = \"{url}\"\n", key_table()),
+            )
+            .unwrap();
             let error = Config::load(&path).unwrap_err();
             assert!(matches!(error, ConfigError::DatabaseUrl), "{url}");
             let shown = format!("{error} / {error:?}");

@@ -3,16 +3,20 @@
 //!
 //! This build serves the local deployment profile: it listens on 127.0.0.1 only, behind the
 //! request guard of design 13.3 (ADR-456). It connects to PostgreSQL and applies the embedded
-//! migrations before it binds, so a listening port means a migrated schema (ADR-458).
+//! migrations before it binds, so a listening port means a migrated schema (ADR-458). It then
+//! reads or creates the job instruction key, so a listening port also means a usable key
+//! (ADR-462).
 
 pub mod config;
 pub mod db;
 pub mod health;
+pub mod instruction_key;
 pub mod local_guard;
 pub mod problem;
 
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
@@ -29,6 +33,7 @@ use tokio::task::JoinSet;
 use tower::Layer;
 
 pub use config::{Config, ConfigError, Profile};
+pub use instruction_key::InstructionKey;
 
 /// How long a connection may take to deliver a complete request head. A client that opens a
 /// connection and sends nothing, or a head one byte at a time, is dropped after this; it also
@@ -42,6 +47,8 @@ pub struct AppState {
     pub port: u16,
     /// The database pool.
     pub pool: PgPool,
+    /// The key that signs job instructions (ADR-462).
+    pub instruction_key: Arc<InstructionKey>,
 }
 
 /// The server's routes behind the local profile's request guard (design 13, 13.3).
@@ -64,6 +71,8 @@ pub fn router(state: AppState) -> Router {
 pub enum StartError {
     #[error(transparent)]
     Database(#[from] db::DbError),
+    #[error(transparent)]
+    InstructionKey(#[from] instruction_key::KeyError),
     #[error("cannot listen on 127.0.0.1:{port}: {source}")]
     Bind { port: u16, source: std::io::Error },
 }
@@ -85,24 +94,36 @@ pub struct Server {
 
 impl Server {
     /// Connects to the database (within the connect timeout), applies the migrations (within
-    /// [`db::MIGRATION_TIMEOUT`]), then binds `127.0.0.1:<port>`: nothing listens before the
-    /// schema is current (ADR-458). Any failure ends the start; a failed migration run is never
-    /// retried on its pool (the advisory lock is per session and counts how often it was taken, so
-    /// a retry could leave it held).
+    /// [`db::MIGRATION_TIMEOUT`]), makes the instruction key ready ([`InstructionKey::open`]),
+    /// then binds `127.0.0.1:<port>`: nothing listens before the schema is current (ADR-458) or
+    /// before the key is usable (ADR-462). Any failure ends the start; a failed migration run is
+    /// never retried on its pool (the advisory lock is per session and counts how often it was
+    /// taken, so a retry could leave it held), and neither is the key.
     pub async fn start(config: &Config) -> Result<Server, StartError> {
         let pool = db::connect(&config.database).await?;
         if let Err(error) = db::migrate(&pool).await {
             db::close(&pool).await;
             return Err(error.into());
         }
-        Server::bind(&config.http, pool).await
+        let key = match InstructionKey::open(&config.instruction_key, &pool).await {
+            Ok(key) => Arc::new(key),
+            Err(error) => {
+                db::close(&pool).await;
+                return Err(error.into());
+            }
+        };
+        Server::bind(&config.http, pool, key).await
     }
 
     /// Binds `127.0.0.1:<port>` (the address is fixed in code) and derives the pinned origin from
     /// the listener's real port, so a configured port 0 works in tests. The pool is taken as it
     /// is, without migrating it. Tests only: a deployment starts with [`Server::start`].
     #[doc(hidden)]
-    pub async fn bind(http: &config::Http, pool: PgPool) -> Result<Server, StartError> {
+    pub async fn bind(
+        http: &config::Http,
+        pool: PgPool,
+        instruction_key: Arc<InstructionKey>,
+    ) -> Result<Server, StartError> {
         let port = http.port;
         let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await {
             Ok(listener) => listener,
@@ -120,6 +141,7 @@ impl Server {
             router: router(AppState {
                 port: bound,
                 pool: pool.clone(),
+                instruction_key,
             }),
             pool,
             grace: Duration::from_secs(http.shutdown_grace_secs),

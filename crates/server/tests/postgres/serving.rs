@@ -6,13 +6,23 @@
 
 use std::time::Duration;
 
-use server::config::{Config, Database, Http, Profile};
-use server::{Server, db};
+use std::sync::Arc;
+
+use server::config::{Config, Database, Http, InstructionKeyConfig, Profile};
+use server::{InstructionKey, Server, db};
+use shared_crypto::SigningKey;
 use sqlx::postgres::{PgConnectOptions, PgSslMode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::support::{TestPostgres, free_port};
+
+/// A key made in memory, for the tests that do not start from the database.
+fn test_key() -> Arc<InstructionKey> {
+    Arc::new(InstructionKey::from_signer(Arc::new(
+        SigningKey::generate().unwrap(),
+    )))
+}
 
 struct Reply {
     status: u16,
@@ -103,13 +113,16 @@ impl Running {
                 shutdown_grace_secs: grace_secs,
             },
             database,
+            instruction_key: InstructionKeyConfig {
+                path: pg.key_path(),
+            },
         };
         let server = Server::start(&config).await.unwrap();
         Running::spawn(server)
     }
 
     async fn serve(http: Http, pool: sqlx::PgPool) -> Running {
-        Running::spawn(Server::bind(&http, pool).await.unwrap())
+        Running::spawn(Server::bind(&http, pool, test_key()).await.unwrap())
     }
 
     fn spawn(server: Server) -> Running {
@@ -497,6 +510,6 @@ async fn start_fails_when_the_port_is_taken() {
         shutdown_grace_secs: 2,
     };
     let pool = db::pool_lazy(options, Duration::from_secs(1));
-    assert!(Server::bind(&http, pool).await.is_err());
+    assert!(Server::bind(&http, pool, test_key()).await.is_err());
     s.finish().await;
 }

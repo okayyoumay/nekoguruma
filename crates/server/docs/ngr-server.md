@@ -3,7 +3,8 @@
 The server (design 3.2, 12, 13). `crates/server` is a library plus the binary `ngr-server`. This
 build serves the local deployment profile (design 13) only: it listens on loopback, uses
 PostgreSQL through sqlx and has one route, the health probe. The rules of the listener and the
-request guard are in ADR-456; the database, the migrations and the test database are in ADR-458.
+request guard are in ADR-456; the database, the migrations and the test database are in ADR-458;
+the job instruction key is in ADR-462.
 
 ## Running
 
@@ -13,7 +14,8 @@ ngr-server --config <file>
 
 `--config` is required. There is no default path, no search and no environment variable.
 Exit codes: 0 after a graceful stop, 1 when the configuration is refused or the server cannot
-start or run (including a database that cannot be reached or migrated), 2 for a usage error.
+start or run (including a database that cannot be reached or migrated and an instruction key that
+is refused), 2 for a usage error.
 
 ## Configuration
 
@@ -30,6 +32,9 @@ shutdown_grace_secs = 30     # default 30, at most 300
 [database]                   # required
 url = "postgres://ngr:<password>@127.0.0.1:5432/nekoguruma"
 connect_timeout_secs = 10    # default 10, 1-300
+
+[instruction_key]            # required
+path = "/etc/nekoguruma/instruction.key"   # absolute; Windows: use a TOML literal string
 ```
 
 - The `[database]` table is required, and the file holds the database password: make it readable
@@ -40,6 +45,13 @@ connect_timeout_secs = 10    # default 10, 1-300
   `PGPASSWORD`, `PGDATABASE`, `PGPORT` or `~/.pgpass`. One exception: sqlx reads `PGOPTIONS` and
   cannot be told not to, so that variable still applies if it is set for the service. It is never logged, and its `Debug` output is empty. An invalid
   one is reported with fixed text. The server has no TLS to the database yet (ADR-458).
+- The `[instruction_key]` table is required: `path` is an absolute path to the PKCS#8 file of the
+  key that signs job instructions (design 11.1, ADR-462). There is no default path, no search and
+  no environment variable. The table holds a path, never key material. The directory must exist,
+  belong to the server's account (or, on Unix, to root) and, on Unix, not be writable by group or
+  others; the server
+  creates only the file. Put it beside the configuration, not in the database's data directory,
+  and not in a directory that a backup of the database covers.
 - There is no bind-address key. The listener is `127.0.0.1:<port>` in code, so no configuration
   can make the local profile listen elsewhere, and `[::1]` is not bound (design 13.3).
 - There is no pinned-host key. The pinned origin is `http://127.0.0.1:<port>`. Changing the port
@@ -67,10 +79,12 @@ connect_timeout_secs = 10    # default 10, 1-300
    one left half applied refuses the start. Two servers starting together are safe: one
    applies the migrations, the other finds nothing to do. Restarting after the database is
    back is the service manager's job.
-4. Bind `127.0.0.1:<port>`, install the signal handlers, then log the pinned origin: a stop
+4. Make the instruction key ready (below). A failure ends the process with exit 1 and nothing
+   is retried.
+5. Bind `127.0.0.1:<port>`, install the signal handlers, then log the pinned origin: a stop
    signal sent once the log line appears is never lost. A listening port means a migrated
-   schema.
-5. Serve until SIGTERM or SIGINT (Unix) or Ctrl-C or Ctrl-Break (Windows). Then stop accepting,
+   schema and a usable instruction key.
+6. Serve until SIGTERM or SIGINT (Unix) or Ctrl-C or Ctrl-Break (Windows). Then stop accepting,
    let requests in flight finish for at most `shutdown_grace_secs`, and exit 0. A second signal
    during the grace period ends the wait at once (still exit 0). A connection that is still
    open then is dropped. A connection that has not delivered a complete request head is held
@@ -78,6 +92,56 @@ connect_timeout_secs = 10    # default 10, 1-300
    with packaging. A long-lived connection such as a WebSocket never finishes by itself, so the
    routes that hold one must close it when the shutdown begins. The database pool is closed
    last.
+
+## The instruction key
+
+`instruction_key.rs`; the decision and its alternatives are in ADR-462. The key is one ECDSA P-256
+key per deployment. Its private half is the PKCS#8 file at `instruction_key.path`; its public half
+is the one active row of `instruction_keys` (`db/README.md`), which is what keeps two servers of a
+deployment, or a restart with another file, from signing under two identities.
+
+| File | Active row | Start |
+|---|---|---|
+| absent | none | the file is created (mode 0600), the key is recorded, "instruction key file created" is logged |
+| valid | same key | starts |
+| valid | none | the key is recorded, starts |
+| absent | present | exit 1 |
+| unreadable, not a P-256 PKCS#8 key, or too open | any | exit 1; the file is never overwritten or regenerated |
+| valid | another key | exit 1 |
+
+- Every start logs `instruction key ready` with the key ID (64 hex digits, the SHA-256 of the SPKI
+  document, the value of `jobs.signing_key_id`). There is no endpoint and no command for the key
+  yet; registration will return the public key as SPKI PEM.
+- On Unix the server opens the file with `O_NOFOLLOW`, `O_NONBLOCK` and `O_NOCTTY` (as the agent
+  opens its lock files, ADR-262 item 6), so a symbolic link, dangling or not, is refused and a
+  FIFO never blocks the start. On the open handle it then refuses what is not a regular file,
+  what is not owned by the server's effective user, and any group or other permission bit. By
+  path it refuses a directory that is writable by group or others or owned by neither the
+  server's user nor root. On Windows the file is opened as a reparse point and refused if it is
+  one. Errors are fixed text plus the OS error kind, never
+  the path's contents or key bytes. Only the server's account should read the file; a user-mode
+  agent that runs under the same account can read it too, which design 6.6 accepts for a personal
+  installation.
+- On Windows the file is a plain file protected by the ACL of its directory, which the
+  installation sets; the code checks no ACL. DPAPI wrapping is not done.
+- Creation writes the bytes to a temporary file of a unique name in the same directory, links it
+  to the final name (which fails when the name exists, so a second creator loads the first one's
+  key), removes the temporary file and syncs the directory. The file system must support hard
+  links. A file left from a crash between the temporary file and its removal is named
+  `.instruction-key-<hex>.tmp` and may be deleted.
+- The file is in neither a database dump nor the export of design 13.3. Losing it costs the
+  agents' re-registration, not data.
+- `server::InstructionKey` is `AppState.instruction_key`: `public_key()`, `key_id()` and the
+  asynchronous `seal(&JobInstruction)`, which encodes the instruction and joins the envelope of
+  `shared_crypto::instruction`. It holds a `Signer`, so a signing service or an HSM can replace
+  the file; such a signer must cache its public key, because `seal` asks for it on every call.
+
+**Resetting the key** (a new key; every agent must then register again, and jobs signed under the
+old key are not delivered): stop the server; in the database, set `retired_at = now()` on the row
+of `instruction_keys` where it is null; remove the key file; start the server, which creates a new
+key and records it. Also remove any `.instruction-key-*.tmp` beside the key file: a crash between
+the link and the removal of the temporary file leaves a second link to the key. A file restored over a retired row is refused ("only a retired record"). A
+command that does this is not written.
 
 ## The request guard
 
@@ -158,8 +222,19 @@ a new migration file rebuilds the crate. How migrations are written and applied 
   again when another process takes it): usage and start failures, a refused database and a
   changed migration (exit 1, nothing listens, no password in the log), health over TCP, and the
   SIGTERM stops on Unix.
+  `instruction_key.rs` (database) covers the key's start outcomes: the first start creates the
+  file and records the row, a restart keeps both, a valid file without a row is recorded, a
+  removed file with a row, a file of another key and a file that is no key are refused and left as
+  they were, a retired record, one active row only, two starts with one path (both succeed, one
+  key) and two starts with different paths (exactly one succeeds). `binary.rs` also checks that a
+  refused key gives exit 1 and nothing listens. Every server test config names a key path; the
+  tests that start several servers on one cluster share it (`TestPostgres::key_path`).
 - The unit tests need no database: the guard's decision table, the configuration (including that
-  no error shows the URL), and that the embedded migrations are the files of `db/migrations`
-  and contain no carriage return.
+  no error shows the URL and that the key path is required and absolute), the key file (create,
+  reload, garbage, a directory, too-open modes and directories on Unix, sixteen threads creating at
+  one path, no secret in `Debug`), a sealed instruction that splits, verifies and decodes with
+  `shared_crypto::instruction` and `shared_proto::JobInstruction`, and that the embedded
+  migrations are the files of `db/migrations` and contain no carriage return. The tests may run as
+  root, so a refusal is provoked by mode bits or by a directory at the path, never by mode 000.
 - The HTTP/1-only test must also pass in a workspace build, where hyper's HTTP/2 is enabled:
   build with `cargo test --workspace --no-run` and run the `postgres` test binary.

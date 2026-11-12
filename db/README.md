@@ -3,6 +3,8 @@
 `migrations/0001_init.sql` is the initial schema.
 `migrations/0002_extensions_without_vci_profile.sql` removes `vciProfile` from the extension kinds:
 VCI profiles are installed on devices outside this software (design 9.3, ADR-228).
+`migrations/0003_instruction_keys.sql` adds `instruction_keys`, the public half of the server's job
+instruction key (design 11.1, ADR-462).
 
 ## How migrations are applied
 
@@ -31,6 +33,14 @@ success flag) and runs each file in one transaction.
 **Put tenant ID in every table**
 P6 (tenant and contract management) is undecided, but retrofitting tenant ID is a large migration.
 It leads the composite primary keys, which also prepares for future sharding (the XL stage in 15.1).
+
+**One instruction key per deployment (the exception to the tenant rule)**
+`instruction_keys` has no tenant ID: the server's instruction key belongs to the deployment, not
+to a tenant (ADR-461 Decision item 7), so it is an exception to the rule above (`tenants` itself has none either). `key_id` (the SHA-256
+of the SPKI, 64 lowercase hex digits, the value of `jobs.signing_key_id`) is the primary key, and a
+partial unique index allows one row with `retired_at` null, so the database decides which key is
+active when two servers start together. Retired rows stay as history. The private key is not in
+the database: it is an owner-only file (ADR-462).
 
 **Do not store raw data bodies in the DB**
 `dataset_chunks` holds only object storage keys and hashes.

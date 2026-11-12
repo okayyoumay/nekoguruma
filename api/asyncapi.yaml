@@ -50,8 +50,9 @@ channels:
 
       **Upgrade.** `GET` with `Authorization: Bearer <session token>` and the subprotocol
       `ngr-control.v1`. A missing, unknown or expired token is answered 401 (with
-      `WWW-Authenticate: Bearer`) before any upgrade, and an upgrade that does not offer the
-      subprotocol is answered 400. The agent sends no
+      `WWW-Authenticate: Bearer`) before any upgrade, and a request that is no WebSocket upgrade,
+      or does not offer the subprotocol, is answered 400. The token is judged at the upgrade only: it is not consumed,
+      and a token that expires while the connection is open does not close it. The agent sends no
       `Origin` header. The identity of the agent is the session's: no payload carries an
       agent ID, and the server takes it from the session only.
 
@@ -72,7 +73,8 @@ channels:
 
       **Keepalive.** The agent sends `heartbeat` every `heartbeatSecs` seconds and the server
       answers each with a `heartbeat`. A side that has seen no frame of any kind for three
-      intervals closes the connection (14.1).
+      intervals closes the connection (14.1); the server counts a complete message, a ping or a
+      pong, not part of a frame.
 
       **One connection per agent.** A new connection from the same agent replaces the old one,
       which the server closes with an application close code (4001, replaced). An agent that

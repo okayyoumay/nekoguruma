@@ -40,6 +40,14 @@ pub const HEARTBEAT_MISSED_LIMIT: u32 = 3;
 /// of the same agent replaced (ADR-466).
 pub const CLOSE_CODE_REPLACED: u16 = 4001;
 
+/// The application close code with which the server ends a connection of an agent whose key was
+/// revoked, or whose session ended (ADR-466 item 5, ADR-468).
+pub const CLOSE_CODE_REVOKED: u16 = 4002;
+
+/// The application close code with which either side ends a connection that has seen no frame of
+/// any kind for [`HEARTBEAT_MISSED_LIMIT`] heartbeat intervals (14.1).
+pub const CLOSE_CODE_IDLE: u16 = 4003;
+
 /// A message could not be read or written.
 #[derive(Debug, thiserror::Error)]
 pub enum ControlError {
@@ -461,7 +469,9 @@ mod tests {
         assert!(text.contains(CONTROL_SUBPROTOCOL));
         assert!(text.contains("128 KiB"));
         assert_eq!(MAX_CONTROL_MESSAGE_LEN, 128 * 1024);
-        assert!(text.contains(&CLOSE_CODE_REPLACED.to_string()));
+        for code in [CLOSE_CODE_REPLACED, CLOSE_CODE_REVOKED, CLOSE_CODE_IDLE] {
+            assert!(text.contains(&format!("| {code} |")), "{code}");
+        }
         assert!(text.contains(&format!("{DEFAULT_HEARTBEAT_SECS} by default")));
     }
 

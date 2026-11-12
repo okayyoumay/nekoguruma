@@ -92,13 +92,12 @@ path = "/etc/nekoguruma/instruction.key"   # absolute; Windows: use a TOML liter
    signal sent once the log line appears is never lost. A listening port means a migrated
    schema and a usable instruction key.
 6. Serve until SIGTERM or SIGINT (Unix) or Ctrl-C or Ctrl-Break (Windows). Then stop accepting,
-   let requests in flight finish for at most `shutdown_grace_secs`, and exit 0. A second signal
-   during the grace period ends the wait at once (still exit 0). A connection that is still
-   open then is dropped. A connection that has not delivered a complete request head is held
-   for no longer than the header-read timeout below. A Windows service stop control arrives
-   with packaging. A long-lived connection such as a WebSocket never finishes by itself, so the
-   routes that hold one must close it when the shutdown begins. The database pool is closed
-   last.
+   let requests in flight finish and close every control channel connection with 1001, for at
+   most `shutdown_grace_secs`, and exit 0. A second signal during the grace period ends the wait
+   at once (still exit 0). What is still open then is aborted: the HTTP connections first, then
+   the control channel sessions, then the database pool is closed (see "The control channel"
+   below). A connection that has not delivered a complete request head is held for no longer
+   than the header-read timeout below. A Windows service stop control arrives with packaging.
 
 ## The instruction key
 
@@ -285,6 +284,8 @@ value. The 307 carries `Cache-Control: no-store` and an absolute `Location`.
 - `POST /api/v1/agent/challenge` and `POST /api/v1/agent/session` (`api/openapi.yaml`;
   `session.rs`; ADR-466, ADR-467): the server's side of an agent's connection proof. See "The
   agent's connection proof" below.
+- `GET /api/v1/agent/control` (`api/asyncapi.yaml`, `agentControl`; `control.rs`, `hub.rs`;
+  ADR-466, ADR-468): the agent's WebSocket. See "The control channel" below.
 
 ## The agent's connection proof
 
@@ -331,6 +332,68 @@ value. The 307 carries `Cache-Control: no-store` and an absolute `Location`.
   the agent ID, once per word per minute; a wrong audience cannot be told from a bad signature
   and is `proof`. A 503, a 500 and a limited challenge have a gate of their own; a 401 logs at
   debug; a session issued logs at info. No token, challenge, nonce, proof or body is logged.
+
+## The control channel
+
+`control.rs` holds the route and the connection's task, `hub.rs` the registry of connections and
+the tasks that run them (design 5.2, 13.3, 14.1; ADR-466, ADR-468). The accept loop serves each
+connection with hyper's `with_upgrades()`.
+
+- **The route, in this order, the first step that applies answers.** The guard (before routing);
+  the method (405 with `Allow: GET` for every other method, HEAD included: the route takes every
+  method and the handler refuses them itself, so that this 405 is a problem document too); the
+  token (401 with `WWW-Authenticate: Bearer`); the WebSocket request (400); the subprotocol
+  (400); then the 101 with `Sec-WebSocket-Protocol: ngr-control.v1` and no extension. Every refusal is a problem
+  document, and a caller with no token learns nothing else about the route: a request with
+  neither a token nor an upgrade is 401, and a valid token on a plain GET is 400.
+- **The token.** Exactly one `Authorization` header, visible ASCII, the scheme `Bearer` in any
+  case, one or more spaces, a non-empty token text, which goes to `Sessions::authenticate`
+  unchanged (so a comma, a second word, another alphabet or a wrong length is a 401). One body
+  for every reason, no limiter, one gated debug line, never the token in the log. The token is
+  judged at the upgrade only: it is not consumed, not bound to the connection and not checked
+  again, so one that expires while the connection is open ends nothing, and a second upgrade
+  with the same token is accepted and replaces the first connection. A 400 after a valid token
+  leaves it usable.
+- **The subprotocol.** Every `Sec-WebSocket-Protocol` header is read, each value split at
+  commas and trimmed, then compared byte for byte with `ngr-control.v1`: a list, two headers or
+  the name twice select it; another case, quotes, another version or no header is 400. A request
+  that cannot be upgraded (HTTP/1.0, no key, a version other than 13) is 400, never 426.
+- **One task per connection,** spawned by `Hub::adopt` into the hub's own `JoinSet` (axum's
+  callback only hands the session over), with one writer, since the socket is not split. It
+  registers as the agent's current connection, writes `hello {heartbeatSecs: 20}` (there is no
+  configuration key for the interval), and then selects on the hub's close instruction, the
+  stop, the next message and the idle deadline. Every write is bounded by `WRITE_TIMEOUT`
+  (10 seconds); one that fails or times out ends the connection with no frame.
+- **What it reads.** Text only. `heartbeat` is echoed. Another valid message is read and
+  dropped (a debug line, never its text); routing it is an open item in `work/`. A text that does not decode closes with 1002
+  (1009 when `decode` reports the size), a binary message with 1003, and a Close from the agent
+  is answered by the stack on one more read. Both transport limits are 131072 bytes: a frame
+  of 131073 bytes is refused on its header with 1009, one of 131072 is read. A read error is
+  classified by the stack's own error (`tungstenite::Error`, hence the direct dependency): a
+  capacity error is 1009, invalid UTF-8 or a framing violation 1002, a reset or an I/O error
+  gets no frame. The Close reason is a fixed word per code, never anything the peer sent.
+- **Idle.** Any complete text message, ping or pong resets the clock, which starts when `hello`
+  has been written; three intervals (60 seconds) without one close with 4003. A partial frame
+  resets nothing.
+- **After a close.** The task leaves the registry first, then writes the Close frame, then
+  drains (reads and discards until the peer's reply, at most `CLOSE_WAIT`, 5 seconds). After a
+  read error the stack allows no read, so the task waits `CLOSE_WAIT` without reading (a stop
+  ends the wait) before it drops the socket: dropping at once with input unread can reset the
+  connection and lose the Close at the peer.
+- **Replacement.** `Hub::register` makes the new connection current and tells the displaced one
+  to close with 4001 under one lock; a replaced connection removes nothing when it ends, since
+  the entry it finds is its successor's.
+- **The stop.** After the accept loop ends: signal the HTTP connections (each task calls
+  hyper's `graceful_shutdown`, because hyper-util's graceful watch does not cover a connection
+  that allows upgrades), begin the hub's stop (every session closes with 1001, also one that registers
+  after the stop began; a connection whose upgrade completes after it is dropped without a
+  frame), wait for both sets
+  within `shutdown_grace_secs` or until the second signal, abort the HTTP connections (a pending
+  upgrade then fails), abort the sessions, close the pool.
+- **Logging.** One info line at the connect and one at the end, with the agent ID, a connection
+  number and a word for the end; no token and no message text.
+- **Scope.** The hub touches no database table and sends nothing but `hello`, the heartbeat
+  echo and a Close frame: every other valid message is read and dropped.
 
 Any other path answers 404 with a problem body, after the guard.
 
@@ -395,6 +458,28 @@ a new migration file rebuilds the crate. How migrations are written and applied 
   exchange are answered as before; a 503 from a locked table that is not counted; a challenge
   and a token expiring under a moved tokio clock (`pause`, `advance` and `resume` back to back
   with no request in flight); and one valid request sent twice at once giving one 200 and one 401.
+  `control.rs` (unit tests in `src/control.rs` and `src/hub.rs`) drives the control channel over
+  TCP with `tokio-tungstenite` as the client. Refusals: every way of having no valid token is
+  the same 401 (no header, another scheme, a bare scheme, two headers, 43 characters, an unknown
+  token, a lower-case scheme, nothing else valid in the request), the guard and the method answer
+  before the token (307, 403, a 405 problem document with `Allow: GET` for POST, PUT, DELETE and
+  HEAD), an expired token (a jump of
+  301 seconds) and a token sent twice are 401, and a valid token on a plain GET, with no
+  subprotocol, another case, quotes, another version, version 12, no key or over HTTP/1.0 is 400
+  and still usable. Connection: the subprotocol from a list and from two headers with `hello`
+  first and no extension, the heartbeat echo and the idle close under moved clocks (jumps of 50,
+  50, 50 and 61 seconds with a ping in between, so that the ping is shown to count), binary
+  giving 1003, 131073 bytes giving 1009 and 131072 bytes read, each malformed text giving 1002,
+  a text frame that is not UTF-8 giving 1002 (a read error),
+  valid outcomes and events read and the connection kept, a Close from the agent answered, a connection outliving its token
+  (seven heartbeats 50 seconds apart, after which the token itself is refused),
+  replacement (the old connection reads 4001, the new one is echoed). Stop: 1001 within the grace
+  period, a peer that never answers aborted at the end of the grace period, a stop ending the wait
+  after a read error, and a second signal
+  dropping the connection at once. The unit tests cover the `Authorization` table, the close for
+  each decode error, the classes of read errors, and the hub's registration, replacement and
+  stop. The plain-HTTP stop tests in `serving.rs` are the check that the loop's own watch did
+  not change that behaviour.
   `binary.rs` starts `ngr-server` as a process (on a port that was free a moment before, trying
   again when another process takes it): usage and start failures, a refused database and a
   changed migration (exit 1, nothing listens, no password in the log), health over TCP, and the

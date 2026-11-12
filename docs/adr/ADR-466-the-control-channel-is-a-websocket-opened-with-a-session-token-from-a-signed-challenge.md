@@ -1,7 +1,7 @@
 # ADR-466: The Control Channel Is a WebSocket Opened With a Session Token From a Signed Challenge
 
 **Date:** 2026-11-12
-**Status:** Accepted (Consequences on pushed-out challenges restated, and the issuing numbers set, by ADR-467)
+**Status:** Accepted (Consequences on pushed-out challenges restated, and the issuing numbers set, by ADR-467; item 5 extended, and item 6's stop detailed, by ADR-468)
 **Affects:** design 5.2, 5.3, 5.7, 6.4, 13.3, 14.1, 14.4; `api/asyncapi.yaml` (`agentControl`), `api/openapi.yaml` (`/v1/agent/challenge`, `/v1/agent/session`); `crates/shared-proto` (`control`), `crates/shared-crypto` (`proof::Audience`); the server's proof exchange, WebSocket and hub, and the agent's session library and `connect` command (later work); fixes the transport that ADR-459 item 3 left open; extends ADR-456 item 9 and ADR-461 items 9 and 10; relies on ADR-463 item 13
 
 ## Context

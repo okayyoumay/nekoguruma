@@ -2658,6 +2658,7 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "diag-ir",
+ "futures-util",
  "getrandom 0.4.3",
  "http-body-util",
  "hyper",
@@ -2672,10 +2673,12 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-tungstenite",
  "toml",
  "tower",
  "tracing",
  "tracing-subscriber",
+ "tungstenite",
  "url",
 ]
 

@@ -3,7 +3,7 @@
 //!
 //! The challenge route hands out a random value and remembers it for 60 seconds. The session
 //! route takes the agent's proof over that value and, when it holds, a bearer token that the
-//! control channel will accept for 300 seconds ([`Sessions::authenticate`]).
+//! control channel accepts for 300 seconds ([`Sessions::authenticate`]).
 //!
 //! The session route is judged in this order, and the first step that applies answers: the
 //! request guard (before routing), the method (405), the body (408, 413), the shape (400,

@@ -1,7 +1,8 @@
 //! The `ngr-agent` binary for the end-to-end tests of the worker packages, shared through
 //! `#[path]`: `crates/j2534-0404-service/tests/ngr_agent_end_to_end.rs`,
 //! `crates/iso22900-service/tests/ngr_agent_dpdu_end_to_end.rs` and
-//! `crates/iso22900-service/tests/ngr_agent_definition_end_to_end.rs`.
+//! `crates/iso22900-service/tests/ngr_agent_definition_end_to_end.rs`, and the server's
+//! `crates/server/tests/postgres/agent_register.rs`.
 //!
 //! `ngr-agent` belongs to another package, so cargo builds it only when the run builds the
 //! `agent` package's binaries (as `cargo test --workspace` and CI do), and a run of the worker

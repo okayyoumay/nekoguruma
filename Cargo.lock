@@ -7,8 +7,12 @@ name = "agent"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64 0.23.1",
  "diag-frontend",
  "diag-ir",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "j2534-0404-registry",
  "libc",
  "ngr-library-resolver",

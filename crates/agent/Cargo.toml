@@ -31,6 +31,12 @@ serde_json.workspace = true
 thiserror.workspace = true
 sha2.workspace = true
 tracing.workspace = true
+base64.workspace = true
+# The registration command's HTTP/1 client (ADR-470): hyper's client connection over a TCP stream
+# the agent opens itself, with no pool, no name resolution and no redirect handling.
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

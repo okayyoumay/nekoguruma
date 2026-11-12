@@ -1,9 +1,11 @@
 # `ngr-agent`
 
-`ngr-agent` is the binary of the `agent` crate (design 3.3). It has three commands. `run` runs the procedure of a variant's document on a VCI, and `identify` runs
+`ngr-agent` is the binary of the `agent` crate (design 3.3). It has four commands. `run` runs the procedure of a variant's document on a VCI, and `identify` runs
 an identification plan's functional presence requests, VIN reads and ECU reads; both are for local
 end-to-end runs and tests (below). `identity` creates the agent's key and prints its public key
-("`ngr-agent identity`" below). It does not connect to the server or take jobs from it. A procedure job is always a document: a bare program has no
+("`ngr-agent identity`" below), and `register` registers that key with the server and stores the
+registration record ("`ngr-agent register`" below). It runs no control channel session and takes
+no jobs from the server. A procedure job is always a document: a bare program has no
 declarations to decode with and no declared link, so `run` takes none.
 
 ## `ngr-agent run`
@@ -248,11 +250,94 @@ The release build selects no store yet: the platform stores (a DPAPI blob on Win
 | device | Unix | `/var/lib/nekoguruma` | the installation (for example systemd's `StateDirectory=`, 0700, the service account); the agent creates only sub-directories, and a missing root is an error |
 | device | Windows | the service account's own `%LOCALAPPDATA%\nekoguruma` | the agent |
 
-Each kind of state has a sub-directory of its own: `identity` holds the key's lock file and the debug store, and `journal` is for the write-job journal. A sub-directory is created readable by its account only, and on Unix one that is writable by its group or others is refused. The operational log's directory (below) keeps its own rules.
+Each kind of state has a sub-directory of its own: `identity` holds the key's lock file and the debug store, `registration` the registration record and its lock, and `journal` is for the write-job journal. A sub-directory is created readable by its account only, and on Unix one that is writable by its group or others is refused. The operational log's directory (below) keeps its own rules.
+
+## `ngr-agent register`
+
+```sh
+ngr-agent register --mode <device|user> --server <origin> --server-key <hex> \
+    [--code-file <file>] [--replace] < code.txt
+```
+
+Registers the agent key with the server (design 6.4, 6.7; ADR-463, ADR-470) and stores the result
+as the registration record. `registration.rs` holds the flow, the record and the answer's checks;
+`server_http.rs` the HTTP/1 client. The operator gets the code, and the server key ID for
+`--server-key`, from `ngr-server registration-code`, after giving it the fingerprint that
+`ngr-agent identity` prints.
+
+- **The order** (ADR-470 item 1), where the first step that fails decides:
+  1. the command line;
+  2. the agent key (`agent::identity::agent_key`), where a key this run had to create stops the
+     command with exit 1 and its fingerprint, since no code can be issued for it yet;
+  3. the code;
+  4. the lock `registration/registration.lock`, tried once;
+  5. the existing record;
+  6. the temporary file;
+  7. one `POST /api/v1/agents/register`;
+  8. the answer's checks;
+  9. the write.
+
+  Everything that can fail without the server comes before the request, so a code is spent only
+  when the agent can store what it gets back.
+- **`--server`** must canonicalise (`Audience::canonicalise`) to exactly `http://127.0.0.1:<port>`,
+  or `http://127.0.0.1` for port 80. `localhost`, another address, a host name, a path and
+  `https` are refused (exit 2), and a redirect is never followed. `--server-key` is 64
+  hexadecimal digits in either case.
+- **The code** comes from standard input or the file given with `--code-file`, never an argument:
+  - at most 256 bytes;
+  - parsed with `RegistrationCode::parse`;
+  - a terminal on standard input is exit 2, with a hint to pipe or redirect it.
+  - the `--code-file` path is taken as given, as `ngr-server` takes `--config`: a path need not
+    be UTF-8, while every other value must be.
+
+  The code, argument values and anything the server sent other than the status and
+  `Retry-After` are never printed or logged.
+- **The request** is one HTTP/1 request over a TCP stream to `127.0.0.1:<port>`: no pool, no name
+  resolution, no retry and no Origin. It has these limits:
+  - 5 seconds to connect, and 30 seconds in all from the start of the connect;
+  - a head of at most 16 KiB and 64 fields;
+  - a body of at most 4096 bytes.
+- **A 201** is read strictly (`AgentRegistration`, no other field) and checked in order:
+  1. the instruction key is a canonical P-256 SPKI PEM;
+  2. its fingerprint is `--server-key`;
+  3. the key ID matches it;
+  4. the agent ID is a canonical lowercase UUID, the owner and the preset are valid;
+  5. the signature verifies over the code's hash, the agent key's fingerprint, the agent ID, the
+     owner, the preset and remote use.
+
+  Nothing is stored when any check fails.
+- **The record** is `<state>/registration/registration.v1.json`, one snake_case JSON object:
+  - `agent_id`, `owner_id`, `preset`, `allow_remote`;
+  - `server_origin`, `instruction_key_pem`, `instruction_key_id`;
+  - `agent_key_fingerprint`.
+
+  It is written to a temporary file created before the request, synced, renamed over the final
+  name, and the directory synced; on Unix mode 0600, on Windows the profile's inherited
+  permissions. `agent::registration`'s reader refuses an unknown field. A record that exists is
+  exit 5 unless `--replace` is given, and even then it is replaced only by that final rename, once
+  the answer has passed every check.
+- **Standard output** on success is one JSON line: `agent_id`, `owner_id`, `preset`,
+  `allow_remote`, `server_origin`, `instruction_key_id`, `agent_key_fingerprint` and `replaced`.
+- **A release build** has no key store yet, so the command exits 1 there without a connection
+  and without creating any registration or identity state (the operational log's directory is
+  created at start, as for every command).
+
+| Exit status | Meaning |
+|---|---|
+| 0 | Registered and stored |
+| 1 | Cannot register as asked: no key store, a code that is not one, a key just created, a refusal (403, 429 and any other 4xx, a redirect, an unexpected status; a 421 adds that `--server` is not the server's own origin), or a 201 that is not a registration answer |
+| 2 | Invalid command line, including a terminal on standard input |
+| 3 | Unavailable or the outcome is unknown, with the local record unchanged. The text says which: nothing was sent (no connection, the lock held, the state directory unusable); the outcome is unknown (408, 5xx, no complete answer), in which case issue a new code if the same one is refused; or registered at the server but not stored, in which case a new code is needed |
+| 4 | The agent key is present and cannot be used |
+| 5 | A record exists and `--replace` was not given |
+| 6 | The answer is not authentic: the returned instruction key is not `--server-key`'s, or the signature does not verify |
+
+An honest server refuses a wrong `--server-key` with its uniform 403 (exit 1), since the
+registration proof covers the server key ID; exit 6 means another program answered on the port.
 
 ## Job instruction gate
 
-`agent::instruction::open(envelope, trusted_key, own_agent_id)` is the only way to a `VerifiedInstruction` (design 5.3, 11.1; ADR-461 Decision items 9 to 12). The envelope is the signed blob the server delivers; the trusted key is the server's instruction key, which the caller passes in (the registration will store it, and the gate reads it from no file, variable or command-line option); the agent ID is the agent's own. The gate takes no worker handle and opens no link. It checks, in this order, and stops at the first failure:
+`agent::instruction::open(envelope, trusted_key, own_agent_id)` is the only way to a `VerifiedInstruction` (design 5.3, 11.1; ADR-461 Decision items 9 to 12). The envelope is the signed blob the server delivers; the trusted key is the server's instruction key, which the caller passes in (the registration record stores it, and the gate itself reads it from no file, variable or command-line option); the agent ID is the agent's own. The gate takes no worker handle and opens no link. It checks, in this order, and stops at the first failure:
 
 | Step | Check | Refusal |
 |---|---|---|

@@ -973,7 +973,9 @@ components:
         What registration returns (ADR-463). The agent stores it as its registration record after
         it has checked that the instruction key's fingerprint equals the server key ID the operator
         gave it and that `signature` verifies. `capabilities` are not part of registration: the agent reports them after it
-        connects (9.5).
+        connects (9.5). The agent reads it strictly: a property not listed here makes the answer
+        unusable (ADR-470).
+      additionalProperties: false
       required: [agentId, ownerId, preset, allowRemote, instructionKey, instructionKeyId, signature]
       properties:
         agentId: { type: string, description: Assigned by the server; a canonical lowercase UUID }

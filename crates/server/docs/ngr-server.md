@@ -4,18 +4,24 @@ The server (design 3.2, 12, 13). `crates/server` is a library plus the binary `n
 build serves the local deployment profile (design 13) only: it listens on loopback, uses
 PostgreSQL through sqlx and has one route, the health probe. The rules of the listener and the
 request guard are in ADR-456; the database, the migrations and the test database are in ADR-458;
-the job instruction key is in ADR-462.
+the job instruction key is in ADR-462; registration codes and their command are in ADR-463 and
+ADR-465.
 
 ## Running
 
 ```sh
 ngr-server --config <file>
+ngr-server registration-code --config <file> --owner <subject> --name <display name> \
+    --agent-key <64 hex digits> [--ttl-minutes <1-60>]
 ```
 
-`--config` is required. There is no default path, no search and no environment variable.
-Exit codes: 0 after a graceful stop, 1 when the configuration is refused or the server cannot
-start or run (including a database that cannot be reached or migrated and an instruction key that
-is refused), 2 for a usage error.
+The first form serves; `--config` is required there. There is no default path, no search and no
+environment variable. The second issues a registration code ("Issuing a registration code"
+below); `registration-code` is a subcommand only as the first argument, so
+`ngr-server --config registration-code` still serves, with a configuration file of that name.
+Exit codes: 0 after a graceful stop or an issued code, 1 when the configuration is refused or the
+server cannot start or run (including a database that cannot be reached or migrated and an
+instruction key that is refused), or when a code cannot be issued, 2 for a usage error.
 
 ## Configuration
 
@@ -143,6 +149,41 @@ key and records it. Also remove any `.instruction-key-*.tmp` beside the key file
 the link and the removal of the temporary file leaves a second link to the key. A file restored over a retired row is refused ("only a retired record"). A
 command that does this is not written.
 
+## Issuing a registration code
+
+`registration.rs` and `main.rs`; the decisions are in ADR-463 and ADR-465. A code lets one agent
+register (design 6.4, 6.7): it is bound to an owner (an operator, by subject) and to the agent
+key's fingerprint, which `ngr-agent identity` prints. Whoever can read the server's configuration
+is the Administrator (design 6.8).
+
+```sh
+ngr-server registration-code --config <file> --owner alice --name "Bench PC" \
+    --agent-key <64 hex digits> [--ttl-minutes 10]
+```
+
+- The flags come in any order, each at most once, as `--flag value`. The lifetime is 10 minutes
+  unless `--ttl-minutes` gives a whole number from 1 to 60. The name is 1 to 128 characters
+  without control characters; the owner is not empty; the fingerprint is accepted in either case
+  and stored in lower case. Anything else is exit 2 with the usage text, before the database is
+  touched.
+- The flow: the configuration, the database connection (within `connect_timeout_secs`), a
+  read-only check that the applied migrations equal the embedded ones, then one transaction that
+  reads the active `instruction_keys` row, finds exactly one enabled operator with the subject and
+  inserts the row (`agent_registration_codes`). The expiry is the database's `now()` plus the
+  lifetime. The command never applies a migration and never reads or creates the instruction key
+  file: a database that was never migrated (the migrations table is not created), one behind or
+  ahead of the binary, or one with a changed or half-applied migration is exit 1, and so is a
+  server that is applying migrations at that moment (rerun it). No active key row, an owner that
+  is unknown, disabled or present in more than one tenant (the subject is unique per tenant only)
+  are exit 1 with a message each.
+- Standard output is one JSON line after the commit, for example
+  `{"code":"ngr1-...","expires_at":"2026-11-12T10:20:30Z","server_key_id":"<64 hex digits>"}`.
+  The operator gives the agent the code (standard input or a file, never an argument) and the
+  server key ID (`--server-key`). If writing the line fails, the row stays and expires unused.
+  Only the code's SHA-256 is stored; the code is never logged and appears nowhere else. Errors
+  are `ngr-server: <fixed text>` on standard error, without the database URL or the code. Two
+  commands at once make independent rows, and an earlier unused code stays valid.
+
 ## The request guard
 
 `local_guard.rs` is one middleware that wraps the whole route table as a service (`router()` in
@@ -218,6 +259,13 @@ a new migration file rebuilds the crate. How migrations are written and applied 
   serve over a pool that points at no database, the ones that need health 200 or 503 with the
   database up or down start a cluster. It also covers the stop: a request in flight finishes
   during the grace period, a stalled one is dropped at its end, a second signal ends the wait.
+  `registration.rs` covers issuance: a stored row (hash only, the database clock's expiry, the
+  exact 1 and 60 minute lifetimes), a missing or retired key, an unknown, disabled or ambiguous
+  owner, two issuances at once, and the command as a process (one JSON line that matches the row,
+  usage errors with no connection, a database never migrated and left untouched, behind, ahead,
+  changed and half-applied migrations, a database that is down, no key file read or created).
+  `migrations.rs` also upgrades a database that holds duplicate agent rows (newest kept, ties by
+  id, revoked rows untouched, cross-tenant duplicates).
   `binary.rs` starts `ngr-server` as a process (on a port that was free a moment before, trying
   again when another process takes it): usage and start failures, a refused database and a
   changed migration (exit 1, nothing listens, no password in the log), health over TCP, and the
@@ -234,7 +282,9 @@ a new migration file rebuilds the crate. How migrations are written and applied 
   reload, garbage, a directory, too-open modes and directories on Unix, sixteen threads creating at
   one path, no secret in `Debug`), a sealed instruction that splits, verifies and decodes with
   `shared_crypto::instruction` and `shared_proto::JobInstruction`, and that the embedded
-  migrations are the files of `db/migrations` and contain no carriage return. The tests may run as
+  migrations are the files of `db/migrations` and contain no carriage return, that the migrations
+  table the read-only check reads is sqlx's, the check's comparison, the command line's grammar
+  and the request validation. The tests may run as
   root, so a refusal is provoked by mode bits or by a directory at the path, never by mode 000.
 - The HTTP/1-only test must also pass in a workspace build, where hyper's HTTP/2 is enabled:
   build with `cargo test --workspace --no-run` and run the `postgres` test binary.

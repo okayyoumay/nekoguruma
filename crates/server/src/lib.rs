@@ -13,6 +13,7 @@ pub mod health;
 pub mod instruction_key;
 pub mod local_guard;
 pub mod problem;
+pub mod registration;
 
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};

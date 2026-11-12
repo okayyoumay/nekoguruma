@@ -7,6 +7,9 @@ VCI profiles are installed on devices outside this software (design 9.3, ADR-228
 instruction key (design 11.1, ADR-462).
 `migrations/0004_agent_mode_device.sql` renames the agent mode `machine` to `device` in
 `agents.mode` (design 6.7, ADR-463); the column `machine_hint` keeps its name.
+`migrations/0005_agent_registration.sql` adds `agent_registration_codes`, the nullable
+`agents.owner_id` and the unique index `agents_public_key_unrevoked` (design 6.4, 6.7, ADR-463,
+ADR-465).
 
 ## How migrations are applied
 
@@ -43,6 +46,23 @@ of the SPKI, 64 lowercase hex digits, the value of `jobs.signing_key_id`) is the
 partial unique index allows one row with `retired_at` null, so the database decides which key is
 active when two servers start together. Retired rows stay as history. The private key is not in
 the database: it is an owner-only file (ADR-462).
+
+**Registration codes are keyed by hash (another exception to the tenant rule)**
+`agent_registration_codes` has the SHA-256 of the code as its primary key and no index besides:
+a redemption knows only the code, so the tenant cannot lead the key. Only the hash is stored,
+never the code; `tenant_id` and `owner_id` say whom the code registers for, `agent_key_id` is the
+fingerprint of the agent key it is bound to, and `instruction_key_id` the server key it was issued
+under. Rows stay after use, expiry or revocation as the record of the registration. The lifetime
+bound (1 to 60 minutes) is not a CHECK: the issuing command owns it.
+
+**One unrevoked agent row per key, in the whole database**
+`agents_public_key_unrevoked` is a partial unique index on `agents (public_key) WHERE revoked_at IS
+NULL`, so it spans tenants: registering a key in one tenant revokes its row in another (only the
+key's holder can cause that). `agents.public_key` is the canonical DER SPKI of the agent key.
+Migration 0005 meets databases that already hold duplicate unrevoked rows of one key: it keeps the
+newest by `(registered_at, id)`, sets `revoked_at` on the others and reports the count as a
+warning before it creates the index. `agents.owner_id` (the operator the agent is registered to) is
+null only on rows that predate registration.
 
 **Do not store raw data bodies in the DB**
 `dataset_chunks` holds only object storage keys and hashes.

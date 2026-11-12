@@ -312,14 +312,220 @@ async fn the_agent_mode_machine_becomes_device_and_the_check_follows() {
     );
 
     // The check now allows device and user and refuses machine.
-    for (mode, ok) in [("device", true), ("user", true), ("machine", false)] {
+    // Each probe has a key of its own: one unrevoked row per key is allowed (migration 0005).
+    for (n, (mode, ok)) in [("device", true), ("user", true), ("machine", false)]
+        .into_iter()
+        .enumerate()
+    {
         let sql = format!(
             "INSERT INTO agents (id, tenant_id, display_name, mode, public_key) \
-             SELECT gen_random_uuid(), id, 'probe', '{mode}', '\\x03' FROM tenants"
+             SELECT gen_random_uuid(), id, 'probe', '{mode}', '\\x0{}' FROM tenants",
+            n + 3
         );
         let probe = pg.pool();
         let outcome = sqlx::query(sqlx::AssertSqlSafe(sql)).execute(&probe).await;
         db::close(&probe).await;
         assert_eq!(outcome.is_ok(), ok, "mode {mode}: {outcome:?}");
     }
+}
+
+/// Applies migrations 1 to 4, runs `seed` (statements of fixed text), then applies the rest, as a
+/// server upgrading a database that already holds agents does.
+async fn upgrade_from_4(pg: &TestPostgres, seed: &[&'static str]) {
+    let pool = pg.pool();
+    db::migrate_with(&pool, &migrator_up_to(4), Duration::from_secs(30))
+        .await
+        .expect("migrations 1 to 4 apply");
+    for sql in seed {
+        pg.execute(sql).await;
+    }
+    db::migrate_with(&pool, &db::MIGRATOR, Duration::from_secs(30))
+        .await
+        .expect("migration 5 applies over the seeded rows");
+    db::close(&pool).await;
+}
+
+const TWO_TENANTS: &str = "INSERT INTO tenants (id, name) VALUES \
+    ('00000000-0000-0000-0000-0000000000a1', 'first'), \
+    ('00000000-0000-0000-0000-0000000000a2', 'second')";
+
+const UNREVOKED_OF_KEY_A: &str = "SELECT string_agg(id::text, ',' ORDER BY id) FROM agents \
+    WHERE public_key = '\\x0a' AND revoked_at IS NULL";
+
+#[tokio::test]
+async fn distinct_keys_are_left_alone_and_owner_id_starts_null() {
+    let pg = TestPostgres::start();
+    upgrade_from_4(
+        &pg,
+        &[
+            TWO_TENANTS,
+            "INSERT INTO agents (id, tenant_id, display_name, mode, public_key) VALUES \
+             ('00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-0000000000a1', \
+              'one', 'user', '\\x01'), \
+             ('00000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-0000000000a2', \
+              'two', 'device', '\\x02')",
+        ],
+    )
+    .await;
+    assert_eq!(
+        pg.scalar("SELECT count(*) FROM agents WHERE revoked_at IS NULL AND owner_id IS NULL")
+            .await,
+        "2"
+    );
+    assert_eq!(
+        pg.scalar("SELECT count(*) FROM agents WHERE revoked_at IS NOT NULL")
+            .await,
+        "0"
+    );
+}
+
+#[tokio::test]
+async fn duplicate_unrevoked_rows_of_a_key_keep_only_the_newest_and_the_index_follows() {
+    let pg = TestPostgres::start();
+    // The key's rows are in two tenants; the newest is in the second.
+    upgrade_from_4(
+        &pg,
+        &[
+            TWO_TENANTS,
+            "INSERT INTO agents (id, tenant_id, display_name, mode, public_key, registered_at) \
+             VALUES \
+             ('00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-0000000000a1', \
+              'old', 'user', '\\x0a', '2026-01-01T00:00:00Z'), \
+             ('00000000-0000-0000-0000-000000000003', '00000000-0000-0000-0000-0000000000a2', \
+              'newest', 'user', '\\x0a', '2026-01-03T00:00:00Z'), \
+             ('00000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-0000000000a1', \
+              'middle', 'user', '\\x0a', '2026-01-02T00:00:00Z'), \
+             ('00000000-0000-0000-0000-000000000009', '00000000-0000-0000-0000-0000000000a1', \
+              'other key', 'user', '\\x0b', '2026-01-01T00:00:00Z')",
+        ],
+    )
+    .await;
+    assert_eq!(
+        pg.scalar(UNREVOKED_OF_KEY_A).await,
+        "00000000-0000-0000-0000-000000000003"
+    );
+    assert_eq!(
+        pg.scalar("SELECT count(*) FROM agents WHERE public_key = '\\x0b' AND revoked_at IS NULL")
+            .await,
+        "1"
+    );
+    // The index is in place and refuses a second unrevoked row, in any tenant.
+    let pool = pg.pool();
+    let second = sqlx::query(
+        "INSERT INTO agents (id, tenant_id, display_name, mode, public_key) VALUES \
+         (gen_random_uuid(), '00000000-0000-0000-0000-0000000000a1', 'again', 'user', '\\x0a')",
+    )
+    .execute(&pool)
+    .await;
+    assert!(second.is_err(), "a second unrevoked row of one key");
+    db::close(&pool).await;
+}
+
+#[tokio::test]
+async fn equal_registration_times_are_broken_by_the_larger_id() {
+    let pg = TestPostgres::start();
+    upgrade_from_4(
+        &pg,
+        &[
+            TWO_TENANTS,
+            "INSERT INTO agents (id, tenant_id, display_name, mode, public_key, registered_at) \
+             VALUES \
+             ('00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-0000000000a1', \
+              'a', 'user', '\\x0a', '2026-01-01T00:00:00Z'), \
+             ('00000000-0000-0000-0000-00000000000f', '00000000-0000-0000-0000-0000000000a1', \
+              'b', 'user', '\\x0a', '2026-01-01T00:00:00Z'), \
+             ('00000000-0000-0000-0000-000000000005', '00000000-0000-0000-0000-0000000000a1', \
+              'c', 'user', '\\x0a', '2026-01-01T00:00:00Z')",
+        ],
+    )
+    .await;
+    assert_eq!(
+        pg.scalar(UNREVOKED_OF_KEY_A).await,
+        "00000000-0000-0000-0000-00000000000f"
+    );
+}
+
+#[tokio::test]
+async fn already_revoked_duplicates_are_untouched() {
+    let pg = TestPostgres::start();
+    upgrade_from_4(
+        &pg,
+        &[
+            TWO_TENANTS,
+            "INSERT INTO agents \
+                 (id, tenant_id, display_name, mode, public_key, registered_at, revoked_at) \
+             VALUES \
+             ('00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-0000000000a1', \
+              'revoked early', 'user', '\\x0a', '2026-01-01T00:00:00Z', '2026-02-01T00:00:00Z'), \
+             ('00000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-0000000000a1', \
+              'revoked later', 'user', '\\x0a', '2026-01-02T00:00:00Z', '2026-02-02T00:00:00Z'), \
+             ('00000000-0000-0000-0000-000000000003', '00000000-0000-0000-0000-0000000000a1', \
+              'live', 'user', '\\x0a', '2026-01-03T00:00:00Z', NULL)",
+        ],
+    )
+    .await;
+    assert_eq!(
+        pg.scalar(UNREVOKED_OF_KEY_A).await,
+        "00000000-0000-0000-0000-000000000003"
+    );
+    assert_eq!(
+        pg.scalar(
+            "SELECT string_agg(revoked_at::date::text, ',' ORDER BY id) FROM agents \
+             WHERE revoked_at IS NOT NULL"
+        )
+        .await,
+        "2026-02-01,2026-02-02"
+    );
+}
+
+/// A tracing writer that keeps what it is given.
+#[derive(Clone, Default)]
+struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn the_migration_reports_how_many_duplicate_rows_it_revoked() {
+    let pg = TestPostgres::start();
+    let captured = Captured::default();
+    let writer = captured.clone();
+    // PostgreSQL's notices reach tracing from sqlx, on the target below, in the task that runs the
+    // statement; the default subscriber of this thread covers the whole test (current-thread
+    // runtime).
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    upgrade_from_4(
+        &pg,
+        &[
+            TWO_TENANTS,
+            "INSERT INTO agents (id, tenant_id, display_name, mode, public_key, registered_at) \
+             VALUES \
+             ('00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-0000000000a1', \
+              'a', 'user', '\\x0a', '2026-01-01T00:00:00Z'), \
+             ('00000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-0000000000a2', \
+              'b', 'user', '\\x0a', '2026-01-02T00:00:00Z'), \
+             ('00000000-0000-0000-0000-000000000003', '00000000-0000-0000-0000-0000000000a1', \
+              'c', 'user', '\\x0a', '2026-01-03T00:00:00Z')",
+        ],
+    )
+    .await;
+    let text = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        text.contains("sqlx::postgres::notice")
+            && text.contains("revoked 2 duplicate unrevoked agent rows"),
+        "{text}"
+    );
 }

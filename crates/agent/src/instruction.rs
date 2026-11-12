@@ -23,10 +23,20 @@ use shared_proto::{InstructionError, InstructionRejectReason, JobInstruction};
 
 /// A job instruction whose envelope passed [`open`]. It has no public constructor and is not
 /// `Clone`, so holding one means the gate verified it for this agent.
-#[derive(Debug)]
 pub struct VerifiedInstruction {
     instruction: JobInstruction,
     envelope: Vec<u8>,
+}
+
+/// Prints the job ID and the envelope's length only: the VIN, the operator, the VCI and the
+/// agent ID stay out of anything that formats the value.
+impl std::fmt::Debug for VerifiedInstruction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VerifiedInstruction")
+            .field("job_id", &self.instruction.job_id.0)
+            .field("envelope_len", &self.envelope.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl VerifiedInstruction {
@@ -98,7 +108,10 @@ fn check(
     envelope::verify(trusted_key, split.payload(), &signature).map_err(|_| Reason::BadSignature)?;
     let instruction = JobInstruction::decode(split.payload()).map_err(|error| match error {
         InstructionError::UnsupportedVersion { .. } => Reason::UnsupportedVersion,
-        _ => Reason::Malformed,
+        InstructionError::TooLong(_)
+        | InstructionError::Format(_)
+        | InstructionError::TrailingBytes(_)
+        | InstructionError::Invalid { .. } => Reason::Malformed,
     })?;
     if instruction.agent_id.0 != own_agent_id {
         return Err(Reason::NotForThisAgent.into());
@@ -142,8 +155,10 @@ mod tests {
     const AGENT: &str = "agent-under-test";
     const JOB: &str = "0193c8a0-7b1e-7c2d-9a4f-3e5d6c7b8a90";
 
-    /// Serializes the tests that call [`open`], so that the log test's subscriber is the only
-    /// one that is set while its entries are counted.
+    /// Serializes the tests that call [`open`]. A call made while no subscriber is set on any
+    /// thread caches the refusal entry's callsite as disabled, and a call racing the log
+    /// test's scoped subscriber can still see that cache, so the log test holds this lock and
+    /// no other test calls `open` meanwhile.
     static GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn gate(
@@ -370,6 +385,76 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_foreign_fingerprint_is_refused_before_the_signature_is_read() {
+        let (key, i) = setup();
+        let other = SigningKey::generate().unwrap();
+        let blob = assemble(
+            envelope::FORMAT_V1,
+            &other.public_key().fingerprint(),
+            &[0u8; SIGNATURE_LEN],
+            &i.encode().unwrap(),
+        );
+        assert_eq!(
+            gate(&blob, &key.public_key(), AGENT).unwrap_err(),
+            InstructionRejectReason::UnknownKey
+        );
+    }
+
+    /// The signer makes low-S signatures; the same signature with s negated modulo the group
+    /// order parses but is refused at the verification step.
+    #[test]
+    fn a_high_s_signature_by_the_trusted_key_is_a_bad_signature() {
+        const ORDER: [u8; 32] = [
+            0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84, 0xf3, 0xb9, 0xca, 0xc2,
+            0xfc, 0x63, 0x25, 0x51,
+        ];
+        let (key, i) = setup();
+        let payload = i.encode().unwrap();
+        let mut signature = envelope::sign(&key, &payload).unwrap().to_bytes();
+        let mut borrow = 0i16;
+        for at in (SIGNATURE_LEN / 2..SIGNATURE_LEN).rev() {
+            let n = i16::from(ORDER[at - SIGNATURE_LEN / 2]);
+            let mut d = n - i16::from(signature[at]) - borrow;
+            borrow = i16::from(d < 0);
+            if d < 0 {
+                d += 256;
+            }
+            signature[at] = u8::try_from(d).unwrap();
+        }
+        let blob = assemble(
+            envelope::FORMAT_V1,
+            &key.public_key().fingerprint(),
+            &signature,
+            &payload,
+        );
+        assert_eq!(
+            gate(&blob, &key.public_key(), AGENT).unwrap_err(),
+            InstructionRejectReason::BadSignature
+        );
+    }
+
+    #[test]
+    fn a_short_envelope_of_an_unknown_format_is_unsupported() {
+        let (key, _) = setup();
+        assert_eq!(
+            gate(&[envelope::FORMAT_V1 + 1], &key.public_key(), AGENT).unwrap_err(),
+            InstructionRejectReason::UnsupportedVersion
+        );
+    }
+
+    #[test]
+    fn the_debug_form_leaves_out_the_payload_s_fields() {
+        let (key, i) = setup();
+        let opened = gate(&sealed(&key, &i), &key.public_key(), AGENT).unwrap();
+        let text = format!("{opened:?}");
+        assert!(text.contains(JOB), "{text}");
+        for forbidden in [AGENT, "operator-1", "VIN-UNDER-TEST", "vci-a"] {
+            assert!(!text.contains(forbidden), "{forbidden} in {text}");
+        }
+    }
+
     #[derive(Clone, Default)]
     struct Captured(Arc<Mutex<Vec<u8>>>);
 
@@ -409,8 +494,7 @@ mod tests {
         let foreign = sealed(&other, &i);
         let wrong_agent = sealed(&key, &sorted(body("some-other-agent")));
         tracing::subscriber::with_default(subscriber, || {
-            // Other tests call `open` with no subscriber, which may have cached the entry's
-            // callsites as disabled.
+            // The entry's callsites may be cached as disabled by an earlier test's call.
             tracing::callsite::rebuild_interest_cache();
             open(&good, &trusted, AGENT).unwrap();
             assert!(captured.0.lock().unwrap().is_empty());

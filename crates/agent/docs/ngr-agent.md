@@ -256,10 +256,10 @@ Each kind of state has a sub-directory of its own: `identity` holds the key's lo
 
 | Step | Check | Refusal |
 |---|---|---|
-| 1 | the envelope is long enough for its header and its payload is within 64 KiB; the format byte is known | `Malformed`; `UnsupportedVersion` for an unknown format byte |
+| 1 | the format byte is known, then the envelope is long enough for its header and its payload is within 64 KiB | `Malformed`; `UnsupportedVersion` for an unknown format byte |
 | 2 | the key fingerprint is the trusted key's | `UnknownKey` |
-| 3 | the signature has a valid encoding | `Malformed` |
-| 4 | the signature verifies over the payload bytes as delivered, under the instruction's own domain tag (not the connection proof's) | `BadSignature` |
+| 3 | the signature's r and s are in range | `Malformed` |
+| 4 | the signature verifies over the payload bytes as delivered, under the instruction's own domain tag (not the connection proof's); a high-S signature is refused here | `BadSignature` |
 | 5 | the body decodes with no byte left over and within its bounds | `UnsupportedVersion` for an unknown body version, else `Malformed` |
 | 6 | the agent ID in the body is the agent's own | `NotForThisAgent` |
 

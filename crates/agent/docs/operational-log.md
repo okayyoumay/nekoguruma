@@ -83,6 +83,8 @@ throughout.
   the envelope offered (hex of a hash). It never holds a job ID, agent ID, operator, VIN or VCI
   taken from the payload: an instruction that failed verification is not the job's own word, and
   one that verified for another agent is that agent's business.
+  The gate writes one entry per refusal; the control channel that calls it bounds how many a
+  connection writes (the first per reason at `warn`, later ones counted or at `debug`).
 
 ## A crate not yet checked
 

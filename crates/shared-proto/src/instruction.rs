@@ -280,6 +280,46 @@ mod tests {
     }
 
     #[test]
+    fn the_length_bound_matches_the_envelopes() {
+        assert_eq!(
+            MAX_INSTRUCTION_LEN,
+            shared_crypto::instruction::MAX_PAYLOAD_LEN
+        );
+    }
+
+    #[test]
+    fn postcard_accepts_a_non_canonical_varint_so_nothing_may_re_encode() {
+        // The generation 3 written as a two-byte varint (0x83 0x00) decodes as 3, but encodes
+        // back as one byte: the decoded value does not reproduce the signed bytes. The agent
+        // therefore keeps and hashes the received bytes and never re-encodes.
+        let i = base();
+        let bytes = i.encode().unwrap();
+        let at = 1 + 1 + JOB_ID_LEN;
+        assert_eq!(bytes[at], 3);
+        let mut loose = bytes[..at].to_vec();
+        loose.extend([0x83, 0x00]);
+        loose.extend(&bytes[at + 1..]);
+        let back = JobInstruction::decode(&loose).unwrap();
+        assert_eq!(back, i);
+        assert_ne!(back.encode().unwrap(), loose);
+    }
+
+    #[test]
+    fn an_option_tag_other_than_0_or_1_is_refused() {
+        let mut i = base();
+        i.vin = None;
+        let mut bytes = i.encode().unwrap();
+        // The VIN tag follows the version, the job ID, the generation, three strings and the kind.
+        let at = 1 + 1 + JOB_ID_LEN + 1 + (1 + 7) + (1 + 2) + 1 + (1 + 5);
+        assert_eq!(bytes[at], 0);
+        bytes[at] = 2;
+        assert!(matches!(
+            JobInstruction::decode(&bytes),
+            Err(InstructionError::Format(_))
+        ));
+    }
+
+    #[test]
     fn trailing_bytes_are_refused() {
         let mut bytes = base().encode().unwrap();
         bytes.push(0);

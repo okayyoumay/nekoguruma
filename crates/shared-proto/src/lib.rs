@@ -35,7 +35,8 @@ pub struct Vin(pub String);
 /// Job kinds from 5.1.
 ///
 /// The job instruction carries the kind in its postcard encoding, which numbers the variants
-/// in declaration order: add a kind at the end and never reorder (ADR-461).
+/// in declaration order: a new kind is a new body version, added at the end, and the order
+/// never changes (ADR-461).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobKind {
     Acquire,

@@ -99,14 +99,17 @@ pub struct Envelope<'a> {
 }
 
 impl<'a> Envelope<'a> {
-    /// Splits an envelope by its layout: the length, the format byte and the payload bound are
-    /// checked here, nothing cryptographic.
+    /// Splits an envelope by its layout: the format byte, the length and the payload bound are
+    /// checked here, nothing cryptographic. The format byte comes first, since another format
+    /// may have another header length, so a short blob of a future format reports the format.
     pub fn split(bytes: &'a [u8]) -> Result<Self, EnvelopeError> {
+        match bytes.first() {
+            None => return Err(EnvelopeError::TooShort(0)),
+            Some(&FORMAT_V1) => {}
+            Some(&other) => return Err(EnvelopeError::UnknownFormat(other)),
+        }
         if bytes.len() < HEADER_LEN {
             return Err(EnvelopeError::TooShort(bytes.len()));
-        }
-        if bytes[0] != FORMAT_V1 {
-            return Err(EnvelopeError::UnknownFormat(bytes[0]));
         }
         let payload = &bytes[HEADER_LEN..];
         if payload.len() > MAX_PAYLOAD_LEN {
@@ -246,6 +249,11 @@ mod tests {
             Err(EnvelopeError::TooShort(HEADER_LEN - 1))
         );
         assert_eq!(Envelope::split(&[]), Err(EnvelopeError::TooShort(0)));
+        // A short blob of another format reports the format, not the length.
+        assert_eq!(
+            Envelope::split(&[2, 0, 0]),
+            Err(EnvelopeError::UnknownFormat(2))
+        );
         let mut other_format = blob.clone();
         other_format[0] = 2;
         assert_eq!(
@@ -265,6 +273,37 @@ mod tests {
             seal(&key, &payload(MAX_PAYLOAD_LEN + 1)),
             Err(SealError::Envelope(EnvelopeError::PayloadTooLong(_)))
         ));
+    }
+
+    #[test]
+    fn a_high_s_signature_is_refused() {
+        // The same signature with s replaced by n - s is a valid-looking second encoding.
+        let key = SigningKey::generate().unwrap();
+        let body = payload(16);
+        let sig = sign(&key, &body).unwrap().to_bytes();
+        const N: [u8; 32] = [
+            0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84, 0xf3, 0xb9, 0xca, 0xc2,
+            0xfc, 0x63, 0x25, 0x51,
+        ];
+        let mut flipped = sig;
+        let mut borrow = 0i16;
+        for i in (0..32).rev() {
+            let d = i16::from(N[i]) - i16::from(sig[32 + i]) - borrow;
+            borrow = i16::from(d < 0);
+            flipped[32 + i] = (d + 256) as u8;
+        }
+        let high = Signature::from_bytes(&flipped).unwrap();
+        assert_eq!(
+            verify(&key.public_key(), &body, &high),
+            Err(VerifyError::HighS)
+        );
+        verify(
+            &key.public_key(),
+            &body,
+            &Signature::from_bytes(&sig).unwrap(),
+        )
+        .unwrap();
     }
 
     #[test]

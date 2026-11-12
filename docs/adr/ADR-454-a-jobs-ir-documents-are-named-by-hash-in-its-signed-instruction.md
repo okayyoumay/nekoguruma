@@ -1,7 +1,7 @@
 # ADR-454: A Job's IR Documents Are Named by Content Hash in Its Signed Instruction
 
 **Date:** 2026-11-11
-**Status:** Accepted (items 1 and 2 given their form by ADR-461: the instruction's body lists the hashes; item 2 reads "named by the instruction, directly or through the plan it names")
+**Status:** Accepted (items 1 and 2 given their form by ADR-461: the instruction's body and envelope; item 2 reads "named by the instruction, directly or through the plan it names")
 **Affects:** design 8.2.6, 11.1; `agent` (`runner.rs` `check_job`, `document.rs`), the server's job delivery (M3)
 
 ## Context

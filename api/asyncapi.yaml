@@ -58,8 +58,9 @@ operations:
     channel: { $ref: '#/channels/agentControl' }
     summary: Server → agent. Job delivery
     description: |
-      Idempotent. The agent verifies the signed instruction first (11.1), then ACKs receipt,
-      records the job ID in its journal, and ignores duplicates (5.3). A command whose
+      Idempotent. The agent verifies the signed instruction first (11.1), then checks for a
+      duplicate and records the job ID in its journal, then ACKs receipt, and ignores
+      duplicates (5.3, ADR-461). A command whose
       instruction fails verification is answered with commandRejected (ADR-461) and creates no job. Jobs past their start deadline are not run; Expired is reported instead.
     messages:
       - { $ref: '#/channels/agentControl/messages/jobCommand' }

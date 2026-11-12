@@ -24,14 +24,14 @@ fn test_key() -> Arc<InstructionKey> {
     )))
 }
 
-struct Reply {
-    status: u16,
-    head: String,
-    body: String,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    pub(crate) head: String,
+    pub(crate) body: String,
 }
 
 impl Reply {
-    fn header(&self, name: &str) -> Option<&str> {
+    pub(crate) fn header(&self, name: &str) -> Option<&str> {
         self.head.lines().skip(1).find_map(|l| {
             let (k, v) = l.split_once(':')?;
             k.eq_ignore_ascii_case(name).then_some(v.trim())
@@ -41,7 +41,7 @@ impl Reply {
 
 /// Sends `raw` (a full request head ending in a blank line, plus any body) and reads the answer
 /// until the server closes the connection.
-async fn exchange(addr: std::net::SocketAddr, raw: &str) -> Reply {
+pub(crate) async fn exchange(addr: std::net::SocketAddr, raw: &str) -> Reply {
     let mut stream = TcpStream::connect(addr).await.unwrap();
     stream.write_all(raw.as_bytes()).await.unwrap();
     let mut buf = Vec::new();
@@ -73,8 +73,8 @@ fn request(method: &str, target: &str, headers: &[String]) -> String {
     raw
 }
 
-struct Running {
-    addr: std::net::SocketAddr,
+pub(crate) struct Running {
+    pub(crate) addr: std::net::SocketAddr,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     force: Option<tokio::sync::oneshot::Sender<()>>,
     task: tokio::task::JoinHandle<()>,
@@ -125,7 +125,7 @@ impl Running {
         Running::spawn(Server::bind(&http, pool, test_key()).await.unwrap())
     }
 
-    fn spawn(server: Server) -> Running {
+    pub(crate) fn spawn(server: Server) -> Running {
         let addr = server.local_addr();
         let (stop, stop_rx) = tokio::sync::oneshot::channel::<()>();
         let (force, force_rx) = tokio::sync::oneshot::channel::<()>();
@@ -150,7 +150,7 @@ impl Running {
         }
     }
 
-    fn host(&self) -> String {
+    pub(crate) fn host(&self) -> String {
         format!("Host: 127.0.0.1:{}", self.addr.port())
     }
 
@@ -164,7 +164,7 @@ impl Running {
         }
     }
 
-    async fn finish(mut self) {
+    pub(crate) async fn finish(mut self) {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }

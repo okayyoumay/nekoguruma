@@ -2,7 +2,8 @@
 
 The server (design 3.2, 12, 13). `crates/server` is a library plus the binary `ngr-server`. This
 build serves the local deployment profile (design 13) only: it listens on loopback, uses
-PostgreSQL through sqlx and has one route, the health probe. The rules of the listener and the
+PostgreSQL through sqlx and has two routes, the health probe and the redemption of registration
+codes. The rules of the listener and the
 request guard are in ADR-456; the database, the migrations and the test database are in ADR-458;
 the job instruction key is in ADR-462; registration codes and their command are in ADR-463 and
 ADR-465.
@@ -117,7 +118,7 @@ deployment, or a restart with another file, from signing under two identities.
 
 - Every start logs `instruction key ready` with the key ID (64 hex digits, the SHA-256 of the SPKI
   document, the value of `jobs.signing_key_id`). There is no endpoint and no command for the key
-  yet; registration will return the public key as SPKI PEM.
+  yet; registration returns the public key as SPKI PEM.
 - On Unix the server opens the file with `O_NOFOLLOW`, `O_NONBLOCK` and `O_NOCTTY` (as the agent
   opens its lock files, ADR-262 item 6), so a symbolic link, dangling or not, is refused and a
   FIFO never blocks the start. On the open handle it then refuses what is not a regular file,
@@ -184,6 +185,55 @@ ngr-server registration-code --config <file> --owner alice --name "Bench PC" \
   are `ngr-server: <fixed text>` on standard error, without the database URL or the code. Two
   commands at once make independent rows, and an earlier unused code stays valid.
 
+## Registration
+
+`register.rs` is the route that redeems a code issued by the command above (ADR-463, ADR-465
+"Redemption design", which tables every case). The steps, in order, and the first that applies
+answers:
+
+1. The request guard ("The request guard" below).
+2. A method other than POST: 405 with `Allow: POST`.
+3. The body, read within 5 seconds (408), at most 4096 bytes (413; exactly 4096 passes).
+   A declared `Content-Length` over 4096 is answered 413 before any byte is read. A streamed
+   (chunked) body has no declared length and is cut when it grows past 4096, so a client that
+   keeps sending may see the connection reset instead of the 413.
+4. `Content-Type` and shape, with no database lookup: 400 unless there is one `Content-Type` of
+   `application/json` (parameters allowed), a JSON object with `code`, `publicKey`, `mode` and
+   `proof` exactly once each as strings and no other field, a code of at most 64 characters that
+   `RegistrationCode::parse` accepts (case, `I`, `L`, `O` and outer whitespace are normalized
+   before hashing), a `publicKey` of at most 512 characters that is an SPKI PEM, a `mode` that is
+   exactly `user` or `device`, and a `proof` of at most 128 characters that is strict standard
+   padded base64 of 64 bytes.
+5. The proof, with no database access: the signature must verify over the code's hash, the key's
+   fingerprint, the mode and this server's in-memory key ID. A 64-byte value that is no signature,
+   or one made for another mode, code or server key, is a refusal.
+6. One transaction, begun explicitly at read committed whatever the database default: `lock_timeout` and `statement_timeout` of 5 seconds; one
+   conditional `UPDATE` consumes the code (unused, not revoked, not expired by the database's
+   clock, bound to this agent key and to the in-memory key ID, that key still active, the owner in
+   the code's tenant and enabled); on zero rows one `SELECT` classifies why, for the log only, and
+   the transaction rolls back. Then a transaction-scoped `pg_advisory_xact_lock` (two-integer
+   form, a fixed class and the first four bytes of the key's fingerprint) serialises registrations
+   of one key; the key's unrevoked `agents` rows in every tenant are revoked; the agent row is
+   inserted (preset `personal` and remote use off are the values that are signed); the owner's
+   `agent_allowed_operators` row is inserted; the agent ID is recorded on the code; the response is
+   signed with the instruction key; then the commit. Any failure before the commit rolls back and
+   leaves the code redeemable. No `audit_log` row is written.
+
+Answers: 201 with `agentId`, `ownerId`, `preset`, `allowRemote`, `instructionKey` (SPKI PEM),
+`instructionKeyId` and `signature` (base64); 403 for every refusal, the same bytes whatever the
+reason; 429 with `Retry-After` instead of a 403 once ten refusals were given within the last
+minute; 503 when the pool, the connection or a statement fails or times out (an unknown commit
+outcome too, after which the code is used and the agent needs a new one); 500 when the signer
+fails. Only a 403 counts toward the limit: a redemption never consults it, and 400, 405, 408, 413,
+429 and the 5xx are never counted. The limiter and the log gates belong to one `router()`, not to
+the process.
+
+Each refusal is one warning line with a fixed reason word (`proof`, `absent`, `revoked`, `used`,
+`expired`, `other_key`, `instruction_key`, `owner`, `state_changed`) and the code's redacted
+`Debug`, at most once a minute per reason; a 503 and a 500 have a gated line of their own; a
+success is one info line with the agent ID and the number of revoked rows. The code, the display
+name and the owner are never logged, and a database error is logged as its SQLSTATE only.
+
 ## The request guard
 
 `local_guard.rs` is one middleware that wraps the whole route table as a service (`router()` in
@@ -229,6 +279,9 @@ value. The 307 carries `Cache-Control: no-store` and an absolute `Location`.
   `{"status":"ok"}` when it succeeds within 2 seconds, otherwise 503 `application/problem+json`
   with no detail (the cause goes to the log, in a field named `external`). Both carry
   `Cache-Control: no-store`; no login.
+- `POST /api/v1/agents/register` (`api/openapi.yaml`; `register.rs`; ADR-463, ADR-465): redeems a
+  registration code. No login: the code and the agent key's proof authorize it. See
+  "Registration" above.
 
 Any other path answers 404 with a problem body, after the guard.
 
@@ -264,6 +317,18 @@ a new migration file rebuilds the crate. How migrations are written and applied 
   owner, two issuances at once, and the command as a process (one JSON line that matches the row,
   usage errors with no connection, a database never migrated and left untouched, behind, ahead,
   changed and half-applied migrations, a database that is down, no key file read or created).
+  `redeem.rs` covers the route over TCP. Without a database (a pool that points at nothing): a 400
+  for each shape rule, 405, 4096 and 4097 bytes, the 408 after 5 seconds, eleven bad proofs giving
+  ten identical 403s and then a 429 with `Retry-After` while 400, 405 and 413 stay as they were,
+  and valid proofs giving 503 that are never counted. With a database: the happy path's rows, the
+  signature verifying and an `audit_log` that stays empty; typed variants of a code; every refusal
+  (a bad proof, used, unknown, revoked, expired, another key, a disabled owner, an owner outside
+  the tenant, a retired key) giving the same 403 bytes and its reason in the log, with the right
+  key redeeming a code that another key was refused; a code issued under a replaced key; the same
+  key registering again, in another tenant, and another key; one code twice at once and two codes
+  for one key at once (20 rounds each on the multi-thread runtime); a statement failure from a test
+  trigger and a failing signer, each rolling back and leaving the code redeemable; and an unknown
+  code limited while a valid registration is not. No log line holds a code, a name or an owner.
   `migrations.rs` also upgrades a database that holds duplicate agent rows (newest kept, ties by
   id, revoked rows untouched, cross-tenant duplicates).
   `binary.rs` starts `ngr-server` as a process (on a port that was free a moment before, trying
@@ -284,7 +349,9 @@ a new migration file rebuilds the crate. How migrations are written and applied 
   `shared_crypto::instruction` and `shared_proto::JobInstruction`, and that the embedded
   migrations are the files of `db/migrations` and contain no carriage return, that the migrations
   table the read-only check reads is sqlx's, the check's comparison, the command line's grammar
-  and the request validation. The tests may run as
+  and the request validation; and the redemption's limiter (ten counted, the eleventh limited with
+  the exact seconds, one slot freeing at 60 seconds, 50 threads at one instant), its shape table,
+  its proof checks and its log gates. The tests may run as
   root, so a refusal is provoked by mode bits or by a directory at the path, never by mode 000.
 - The HTTP/1-only test must also pass in a workspace build, where hyper's HTTP/2 is enabled:
   build with `cargo test --workspace --no-run` and run the `postgres` test binary.

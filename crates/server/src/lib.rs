@@ -13,6 +13,7 @@ pub mod health;
 pub mod instruction_key;
 pub mod local_guard;
 pub mod problem;
+pub mod register;
 pub mod registration;
 
 use std::future::Future;
@@ -23,7 +24,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::http::StatusCode;
 use axum::middleware;
-use axum::routing::get;
+use axum::routing::{get, post};
 use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::server::graceful::GracefulShutdown;
@@ -58,10 +59,16 @@ pub struct AppState {
 /// before routing), so a request it rejects never reaches the router: no method-router answer
 /// (405 with `Allow`) and no fallback is seen for it.
 pub fn router(state: AppState) -> Router {
-    let routes = Router::new()
+    let health = Router::new()
         .route("/api/v1/health", get(health::health))
-        .fallback(|| async { problem::Problem::new(StatusCode::NOT_FOUND, "Not found") })
-        .with_state(state.pool);
+        .with_state(state.pool.clone());
+    // The redemption route keeps its own limiter and log gates: one set per router.
+    let register = Router::new()
+        .route(register::PATH, post(register::register))
+        .with_state(register::Registrar::new(state.pool, state.instruction_key));
+    let routes = health
+        .merge(register)
+        .fallback(|| async { problem::Problem::new(StatusCode::NOT_FOUND, "Not found") });
     // The standard profile supplies its own ingress layer here (design 13).
     let guarded = middleware::from_fn_with_state(state.port, local_guard::guard).layer(routes);
     Router::new().fallback_service(guarded)

@@ -25,6 +25,9 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 sqlx.workspace = true
 url.workspace = true
+base64.workspace = true
+# Reads a request body frame by frame, so the registration route can bound its size and time.
+http-body-util = "0.1"
 # The server serves HTTP/1 only (ADR-456), so it drives hyper directly instead of `axum::serve`,
 # which also accepts HTTP/2 whenever another crate in the build turns that feature on.
 hyper = { version = "1", features = ["http1", "server"] }

@@ -193,22 +193,32 @@ paths:
         command, bound to the agent key's fingerprint and to an owner. The device authorization
         flow is not offered.
 
+        The checks run in this order: the request guard (13.3), the method (**405**, with `Allow`),
+        the body (read within 5 seconds, **408**; at most 4 KiB, **413**), the shape (**400**),
+        the proof, then the database.
+
         **400** is decided on the shape of the request alone, before and without any database
-        lookup: a code whose prefix, length or alphabet is wrong, a `publicKey` that is not a
+        lookup: a `Content-Type` other than `application/json` (parameters allowed; it is 400,
+        not 415), a code whose prefix, length or alphabet is wrong, a `publicKey` that is not a
         parsable SPKI PEM, a `proof` that is not standard padded base64 or does not decode to
-        exactly 64 bytes, a `mode` outside the enum, a missing or unknown field, or a body that is
-        not JSON.
+        exactly 64 bytes, a `mode` outside the enum, a missing, unknown or duplicate field, a field
+        that is not a string, bytes after the JSON value, or a body that is not a JSON object.
 
         **403** is the one uniform refusal for everything that needs the database or the
         signature check: an unknown, expired, used or revoked code, a key other than the one the
         code is bound to, a bad proof, a code issued under an instruction key that is no longer
-        active. The caller cannot tell these apart; the reason goes to the server's log only.
+        active, an owner who was disabled since issuance. The caller cannot tell these apart; the reason goes to the server's log only.
         Refusals are limited for the whole route, not per caller: once ten 403 responses were
         given within the last minute, a request that would be refused is answered 429 until the
         oldest of those ten is a minute old. Only 403 counts
-        toward the limit (400, 413 and 429 do not). A request that redeems successfully (valid
+        toward the limit (400, 405, 408, 413, 429 and 5xx do not). A request that redeems successfully (valid
         code, valid proof) succeeds even while the limit is exceeded, so the limit only slows
         guessing and gives a guesser no oracle. The body is at most 4 KiB (413).
+
+        **503** is returned when the database cannot be reached or a statement fails or times out
+        (5 seconds); **500** when the server's signer fails. Neither counts toward the limit, and
+        the code stays redeemable, since the registration is written in one transaction that
+        commits only after the response is signed.
 
         On success the server assigns the agent ID, stores the key and the owner, revokes earlier
         unrevoked rows of the same key, and returns the instruction key the agent will pin with
@@ -256,14 +266,21 @@ paths:
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
+        '405':
+          description: A method other than POST
+          headers:
+            Allow: { schema: { type: string }, description: '`POST`' }
+        '408': { $ref: '#/components/responses/Problem' }
         '413': { $ref: '#/components/responses/Problem' }
         '429':
           description: Ten refusals were given in the last minute on this route; `Retry-After` is the time until the oldest is a minute old
           headers:
-            Retry-After: { schema: { type: integer }, description: Seconds to wait }
+            Retry-After: { schema: { type: integer, minimum: 1, maximum: 60 }, description: Seconds to wait }
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
+        '500': { $ref: '#/components/responses/Problem' }
+        '503': { $ref: '#/components/responses/Problem' }
 
   # ------------------------------------------------------------ Artifacts and extensions
   /v1/artifacts:

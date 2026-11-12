@@ -76,6 +76,14 @@ of the above:
 A new error type that is logged needs a `LogSafe` impl, unless its text is likewise NGR's own
 throughout.
 
+## Entries with a rule of their own
+
+- **A refused job instruction** (`agent::instruction::open`, ADR-461 Decision item 10): the
+  entry holds the coarse reason, the envelope's length and, for an unknown key, the fingerprint
+  the envelope offered (hex of a hash). It never holds a job ID, agent ID, operator, VIN or VCI
+  taken from the payload: an instruction that failed verification is not the job's own word, and
+  one that verified for another agent is that agent's business.
+
 ## A crate not yet checked
 
 A crate that starts to reach the agent's subscriber before its calls have been checked against

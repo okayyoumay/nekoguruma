@@ -26,7 +26,8 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 
-use shared_crypto::{PublicKey, Signer, SigningKey, Zeroizing, random_32};
+use shared_crypto::registration::{Preset, RegistrationCode, ResponseTranscript};
+use shared_crypto::{PublicKey, Signature, Signer, SigningKey, Zeroizing, random_32};
 use shared_proto::{InstructionError, JobInstruction};
 use sqlx::PgPool;
 
@@ -93,6 +94,15 @@ pub enum SealError {
     Seal(#[from] shared_crypto::instruction::SealError),
 }
 
+/// Why [`InstructionKey::sign_registration_response`] failed.
+#[derive(Debug, thiserror::Error)]
+pub enum RegistrationSignError {
+    #[error(transparent)]
+    Transcript(#[from] shared_crypto::registration::TranscriptError),
+    #[error(transparent)]
+    Sign(#[from] shared_crypto::SignError),
+}
+
 /// The key that signs job instructions. Cheap to clone behind an [`Arc`].
 ///
 /// It holds a [`Signer`], not key bytes, so that a signing service or a hardware module can
@@ -136,6 +146,26 @@ impl InstructionKey {
         Ok(shared_crypto::instruction::seal(
             self.signer.as_ref(),
             &payload,
+        )?)
+    }
+
+    /// Signs the registration response (ADR-463 item 21): the code's hash, the agent key's
+    /// fingerprint, the agent ID, the owner, the preset and whether remote use is allowed, under
+    /// the response's own domain tag. `async` for the same reason as `seal`.
+    pub async fn sign_registration_response(
+        &self,
+        code: &RegistrationCode,
+        agent_key: &PublicKey,
+        agent_id: &str,
+        owner_id: &str,
+        preset: Preset,
+        allow_remote: bool,
+    ) -> Result<Signature, RegistrationSignError> {
+        let transcript =
+            ResponseTranscript::new(code, agent_key, agent_id, owner_id, preset, allow_remote)?;
+        Ok(shared_crypto::registration::sign_response(
+            self.signer.as_ref(),
+            &transcript,
         )?)
     }
 
@@ -555,6 +585,49 @@ mod tests {
             key.seal(&body).await,
             Err(SealError::Instruction(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn the_registration_response_verifies_against_the_key_and_covers_its_values() {
+        use shared_crypto::registration::{ResponseTranscript, verify_response};
+        let key = InstructionKey::from_signer(Arc::new(SigningKey::generate().unwrap()));
+        let agent = SigningKey::generate().unwrap().public_key();
+        let code = RegistrationCode::generate().unwrap();
+        let (agent_id, owner_id) = ("agent-id", "owner-id");
+        let signature = key
+            .sign_registration_response(&code, &agent, agent_id, owner_id, Preset::Personal, false)
+            .await
+            .unwrap();
+        let transcript = |preset, remote| {
+            ResponseTranscript::new(&code, &agent, agent_id, owner_id, preset, remote).unwrap()
+        };
+        verify_response(
+            &key.public_key(),
+            &transcript(Preset::Personal, false),
+            &signature,
+        )
+        .unwrap();
+        assert!(
+            verify_response(
+                &key.public_key(),
+                &transcript(Preset::Personal, true),
+                &signature
+            )
+            .is_err()
+        );
+        let other = SigningKey::generate().unwrap().public_key();
+        assert!(verify_response(&other, &transcript(Preset::Personal, false), &signature).is_err());
+    }
+
+    #[tokio::test]
+    async fn an_empty_agent_id_is_not_signed() {
+        let key = InstructionKey::from_signer(Arc::new(SigningKey::generate().unwrap()));
+        let agent = SigningKey::generate().unwrap().public_key();
+        let code = RegistrationCode::generate().unwrap();
+        let result = key
+            .sign_registration_response(&code, &agent, "", "owner", Preset::Personal, false)
+            .await;
+        assert!(matches!(result, Err(RegistrationSignError::Transcript(_))));
     }
 
     fn hex(bytes: &[u8]) -> String {

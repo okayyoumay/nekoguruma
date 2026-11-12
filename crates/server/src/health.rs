@@ -21,7 +21,7 @@ const LOG_EVERY: Duration = Duration::from_secs(60);
 static LAST_LOGGED: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// True when a failure may be logged at `now`, and then records it.
-fn may_log(last: &Mutex<Option<Instant>>, now: Instant, every: Duration) -> bool {
+pub(crate) fn may_log(last: &Mutex<Option<Instant>>, now: Instant, every: Duration) -> bool {
     let mut last = last.lock().unwrap_or_else(|e| e.into_inner());
     match *last {
         Some(at) if now.duration_since(at) < every => false,

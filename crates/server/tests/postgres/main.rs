@@ -4,6 +4,7 @@
 mod binary;
 mod instruction_key;
 mod migrations;
+mod redeem;
 mod registration;
 mod serving;
 mod support;

@@ -152,16 +152,24 @@ fn a_taken_port_exits_1() {
 /// before the child binds it; the child then exits 1, and the start is tried again with a new
 /// port. The reply must be the server's own, so a stranger on the port cannot pass for it.
 fn start_server(dir: &Path, pg: &TestPostgres) -> (Child, u16, String) {
-    for _attempt in 0..5 {
+    for attempt in 0..5 {
         let port = free_port();
         let path = write_config(dir, port, &pg.url());
-        let mut child = server(&["--config", path.to_str().unwrap()])
-            .spawn()
-            .unwrap();
+        // The child's log goes to a file, so that a health answer counts only once this child has
+        // logged that it listens on this port: a port that was free a moment before may since
+        // belong to another test's server, whose answer would otherwise be taken for this one's.
+        let log_path = dir.join(format!("server-{attempt}.log"));
+        let log = std::fs::File::create(&log_path).unwrap();
+        let mut command = server(&["--config", path.to_str().unwrap()]);
+        command.stderr(log);
+        let mut child = command.spawn().unwrap();
+        let origin = format!("127.0.0.1:{port}");
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
+            let ours = std::fs::read_to_string(&log_path)
+                .is_ok_and(|text| text.contains("listening") && text.contains(&origin));
             let reply = get_health(port).filter(|t| t.contains(r#"{"status":"ok"}"#));
-            if let (Some(text), None) = (reply, child.try_wait().unwrap()) {
+            if let (true, Some(text), None) = (ours, reply, child.try_wait().unwrap()) {
                 return (child, port, text);
             }
             if let Some(status) = child.try_wait().unwrap() {

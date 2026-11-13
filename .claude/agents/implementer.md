@@ -29,6 +29,14 @@ Working rules:
   a neighbouring file in the same crate before inventing a pattern.
 - Write or update tests with the change, even if the brief did not say
   "test".
+- Tests also run on Windows in CI with `-D warnings`. Keep in mind the
+  differences that have failed there: a refused connect to a closed loopback
+  port takes about 2 seconds; a socket closed with unread input sends a
+  reset; the wall clock has 100 ns resolution; and a helper used only by
+  `#[cfg(unix)]` code is dead code there, so gate the helper too or use it
+  from a test that runs everywhere. A test that needs a port nothing listens
+  on keeps it bound with a socket that never listens, rather than releasing
+  it.
 - Run every new test once in isolation and confirm the test binary exits.
   When using `-- --exact`, pass the full libtest name including the module
   path (check with `cargo test -p <crate> -- --list`), and confirm the

@@ -48,6 +48,18 @@ Working rules:
     package trusted without validation.
   - **Test coverage**: behaviour changed without a test that would fail if
     the change were reverted.
+  - **Windows differences**: CI runs the tests on Windows too (`core-windows`,
+    `-D warnings`), and these have each failed a pull request there after
+    passing on Linux: a connect to a closed loopback port that takes about
+    2 seconds to be refused (a wait or grace period that it eats into); a
+    socket closed with unread input that sends a reset instead of a clean
+    close; a wall clock with 100 ns resolution (times that compare equal on
+    Linux); and a helper used only by `#[cfg(unix)]` code, which is dead
+    code under `-D warnings` on Windows.
+  - **Test ports**: a test that binds port 0, releases it and then relies on
+    nothing listening there (or on getting the same port back) races any
+    other test process that binds it meanwhile. Holding the port with a
+    socket that is bound and never listens keeps connects refused.
 - **Parity check**, when the change adds a path that builds what an existing
   path already builds (a second settlement, encoder or conversion producing
   the same entry or output). The caller names the existing path; find it

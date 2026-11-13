@@ -86,6 +86,19 @@ throughout.
   The gate writes one entry per refusal; the control channel that calls it bounds how many a
   connection writes (the first per reason at `warn`, later ones counted or at `debug`).
 
+- **The control channel session** (`agent::control`, ADR-471): the entries hold a failure
+  class, an HTTP status, a close code and the heartbeat interval. They never hold the token, the
+  challenge, the nonce or the proof, an HTTP body, a message's text, a `commandId`, or the reason
+  text of a Close the server sent. A failure class warns once until the next `hello` and is logged
+  at `debug` after that; a refusal (403, a 429 on the session route, Close 4002) warns once until
+  the server issues a session token again.
+  `tungstenite` and `tokio-tungstenite` log through the `log` crate, at `trace` and `debug`, the
+  upgrade request with its `Authorization` header, each message's text and a close's reason. The
+  agent installs its subscriber with `set_global_default`, which installs no `log` bridge, so none
+  of it reaches the operational log. tracing-subscriber's `init()` or `try_init()` would install
+  one (its default `tracing-log` feature is on), so switching to them needs a filter that keeps
+  those targets out first.
+
 ## A crate not yet checked
 
 A crate that starts to reach the agent's subscriber before its calls have been checked against

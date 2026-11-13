@@ -250,7 +250,7 @@ The release build selects no store yet: the platform stores (a DPAPI blob on Win
 | device | Unix | `/var/lib/nekoguruma` | the installation (for example systemd's `StateDirectory=`, 0700, the service account); the agent creates only sub-directories, and a missing root is an error |
 | device | Windows | the service account's own `%LOCALAPPDATA%\nekoguruma` | the agent |
 
-Each kind of state has a sub-directory of its own: `identity` holds the key's lock file and the debug store, `registration` the registration record and its lock, and `journal` is for the write-job journal. A sub-directory is created readable by its account only, and on Unix one that is writable by its group or others is refused. The operational log's directory (below) keeps its own rules.
+Each kind of state has a sub-directory of its own: `identity` holds the key's lock file and the debug store, `registration` the registration record and its lock, `control` the control channel session's connection lock, and `journal` is for the write-job journal. A sub-directory is created readable by its account only, and on Unix one that is writable by its group or others is refused. The operational log's directory (below) keeps its own rules.
 
 ## `ngr-agent register`
 
@@ -270,7 +270,9 @@ as the registration record. `registration.rs` holds the flow, the record and the
   2. the agent key (`agent::identity::agent_key`), where a key this run had to create stops the
      command with exit 1 and its fingerprint, since no code can be issued for it yet;
   3. the code;
-  4. the lock `registration/registration.lock`, tried once;
+  4. the lock `registration/registration.lock`, tried once, which a running control channel
+     session also holds ("Control channel session" below), so `register` and `register --replace`
+     both exit 3 while the agent is connected (ADR-471);
   5. the existing record;
   6. the temporary file;
   7. one `POST /api/v1/agents/register`;
@@ -327,13 +329,66 @@ as the registration record. `registration.rs` holds the flow, the record and the
 | 0 | Registered and stored |
 | 1 | Cannot register as asked: no key store, a code that is not one, a key just created, a refusal (403, 429 and any other 4xx, a redirect, an unexpected status; a 421 adds that `--server` is not the server's own origin), or a 201 that is not a registration answer |
 | 2 | Invalid command line, including a terminal on standard input |
-| 3 | Unavailable or the outcome is unknown, with the local record unchanged. The text says which: nothing was sent (no connection, the lock held, the state directory unusable); the outcome is unknown (408, 5xx, no complete answer), in which case issue a new code if the same one is refused; or registered at the server but not stored, in which case a new code is needed |
+| 3 | Unavailable or the outcome is unknown, with the local record unchanged. The text says which: nothing was sent (no connection, the lock held by another registration or a running control channel session, the state directory unusable); the outcome is unknown (408, 5xx, no complete answer), in which case issue a new code if the same one is refused; or registered at the server but not stored, in which case a new code is needed |
 | 4 | The agent key is present and cannot be used |
 | 5 | A record exists and `--replace` was not given |
 | 6 | The answer is not authentic: the returned instruction key is not `--server-key`'s, or the signature does not verify |
 
 An honest server refuses a wrong `--server-key` with its uniform 403 (exit 1), since the
 registration proof covers the server key ID; exit 6 means another program answered on the port.
+
+## Control channel session
+
+`agent::control` keeps the agent's connection to the server (design 5.3, 14.1; ADR-466, ADR-471).
+It is one task behind two steps, and it never touches the key store: the caller loads the agent
+key and passes it in.
+
+- **`open(mode)`** takes the connection lock `<state>/control/connection.lock`, then the
+  registration lock `<state>/registration/registration.lock`, each tried once, and reads the
+  registration record once with `agent::registration`'s strict reader. A held connection lock is
+  `AlreadyRunning` (also for a second `open` in the same process) and the registration lock is not
+  tried; a held registration lock is `RegistrationRunning`; a lock that cannot be taken is `Lock`;
+  no record is `NotRegistered`; a record that does not read, or whose `server_origin` is not
+  `http://127.0.0.1` or `http://127.0.0.1:<port>`, is `Record`. Nothing of the record's path or
+  content is logged. A record edited while the session runs is not read again.
+- **`Opened::start(key)`** refuses a key whose fingerprint is not the record's (`KeyMismatch`),
+  else spawns the task and returns a `Handle`: `stop()`, `stopped()` (resolves once both locks are
+  released) and `status()`, a watch of the phase, the heartbeat interval, the next delay and the
+  count of job commands left unanswered.
+- **Both locks are held from `open` until the task ends**, waits included, and released by drop
+  on every path: a stop, a dropped handle, a panic, a runtime shutdown or an `Opened` dropped
+  unstarted. The lock files are never deleted. While a session runs, `ngr-agent register` exits 3.
+- **One attempt** is the exchange (`POST /api/v1/agent/challenge`, then
+  `POST /api/v1/agent/session` with the proof), the upgrade (`GET /api/v1/agent/control` with the
+  bearer token and the `ngr-control.v1` subprotocol, no Origin and no extension; the token serves
+  this one request), the server's `hello`, and the connected state. Every HTTP call opens its own
+  TCP stream to `127.0.0.1:<port>` with the limits of `register` (5 seconds to connect, 30 in all);
+  messages and frames are limited to 131072 bytes. A first 401 on the session route takes a new
+  challenge at once; a second ends the attempt.
+- **Connected**, the agent sends `{"type":"heartbeat"}` at `hello` plus each multiple of the
+  interval the `hello` gave, and ends the connection with Close 4003 when no frame has arrived
+  for three intervals. Every frame received counts, pings and pongs included; a heartbeat it
+  sends does not. A job command is decoded and counted in `Status`, and not answered; the other
+  server messages are read and dropped. A second `hello`, text that does not decode or a job
+  command without a usable command ID is Close 1002, a binary frame 1003, a message over the limit
+  1009; after a read error the agent sends its Close and waits 5 seconds without reading.
+- **Only local facts end the task**: the `open` and `start` refusals above, and a stop. Every
+  answer of the server, a 403, a 429 and Close 4002 included, is retried, and nothing is erased.
+  The delay before the next attempt starts at 1 second and doubles after every wait, up to 60
+  seconds; 403, a 429 on the session route, and Close 4001 or 4002 set it to 60 seconds at once.
+  A 429 on the challenge route with a `Retry-After` of 1 to 60 seconds waits the longer of the two.
+  A connection that received frames for at least 60 seconds after its `hello` sets the delay back
+  to 1 second when it ends, unless it ended with 4001 or 4002. The first attempt starts at once,
+  and the delays have no jitter. All timing uses tokio's clock, never the wall clock.
+- **A stop** drops an HTTP call or an upgrade in progress, and after the 101 sends Close 1001
+  (at most 10 seconds to write it and 5 to read the answer); a stop during a heartbeat write
+  drops the connection.
+- **Logging**: one `info` line when the connection is up and one when it ends, with the close
+  code the server sent; one `warn` per failure class until the next `hello`, and one per refusal
+  until a session token is issued again, with `debug` for the repeats ("Entries with a rule of
+  their own" in `operational-log.md`). The WebSocket library turns a Close code it does not
+  accept (2000, for example) into 1002 before the agent reads it, so such a close is logged as
+  1002 at `warn`.
 
 ## Job instruction gate
 

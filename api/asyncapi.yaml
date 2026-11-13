@@ -73,8 +73,8 @@ channels:
 
       **Keepalive.** The agent sends `heartbeat` every `heartbeatSecs` seconds and the server
       answers each with a `heartbeat`. A side that has seen no frame of any kind for three
-      intervals closes the connection (14.1); the server counts a complete message, a ping or a
-      pong, not part of a frame.
+      intervals closes the connection (14.1); each side counts a complete message, a ping or a
+      pong, not part of a frame, and the agent never answers a `heartbeat` it receives.
 
       **One connection per agent.** A new connection from the same agent replaces the old one,
       which the server closes with an application close code (4001, replaced). An agent that
@@ -84,7 +84,7 @@ channels:
 
       | Code | Sent by | Meaning |
       |---|---|---|
-      | 1001 | server | Going away: the server is stopping (13.3) |
+      | 1001 | either | Going away: the sender is stopping (13.3; the agent sends it when it is stopped, unless a stalled write makes it drop the connection instead, ADR-471) |
       | 1002 | either | Protocol error: malformed text, unknown `type`, unknown or missing property, value out of range, `hello` not first or not received in time |
       | 1003 | either | A binary frame |
       | 1009 | either | A message over 128 KiB |

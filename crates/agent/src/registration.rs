@@ -57,6 +57,11 @@ const UNKNOWN: &str = "outcome unknown: if the same code is then refused, issue 
 const REFUSED: &str = "refused: the code is wrong, expired, used or issued for another key, or \
                        --server-key is not this server's";
 
+/// The text of a registration lock that is held: another `register`, or a control channel
+/// session, which holds the same lock for as long as it runs (ADR-471).
+const REGISTRATION_RUNNING: &str =
+    "another registration or a running control channel session holds the registration lock";
+
 /// The exit status of the command (the usage text lists them).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Exit {
@@ -204,7 +209,7 @@ pub fn register_in(
     let _lock = match WriterLock::at(&dir.join(LOCK_FILE)) {
         Ok(lock) => lock,
         Err(JournalError::InUse) => {
-            return Err(fail(Exit::Unavailable, "another registration is running"));
+            return Err(fail(Exit::Unavailable, REGISTRATION_RUNNING));
         }
         Err(error) => {
             return Err(fail(
@@ -360,12 +365,7 @@ fn judge(
         }
         403 => Err(fail(Exit::CannotRegister, REFUSED)),
         429 => {
-            let wait = reply
-                .retry_after
-                .as_deref()
-                .filter(|text| text.bytes().all(|b| b.is_ascii_digit()))
-                .and_then(|text| text.parse::<u32>().ok())
-                .filter(|secs| (1..=60).contains(secs));
+            let wait = server_http::retry_after_secs(reply.retry_after.as_deref());
             Err(fail(
                 Exit::CannotRegister,
                 match wait {

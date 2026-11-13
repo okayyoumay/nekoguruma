@@ -1211,17 +1211,18 @@ mod with_store {
     fn a_refused_connection_is_exit_3_with_nothing_sent() {
         let env = Env::new();
         env.fingerprint();
-        let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        // A socket that is bound and never listens holds the port for the whole test, so no
+        // other test process can take it, and every connect to it is refused.
+        let held = tokio::net::TcpSocket::new_v4().unwrap();
+        held.bind((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+        let port = held.local_addr().unwrap().port();
         let mut command = env.command();
         command.args(register_args(port, KEY));
         let output = run_with(command, code().as_str().as_bytes());
         assert_exit(&output, 3, "cannot connect to the server");
         assert!(text(&output.stderr).contains("nothing was sent"));
         assert_nothing_stored(&env);
+        drop(held);
     }
 
     const UNKNOWN: &str = "outcome unknown: if the same code is then refused, issue a new one";

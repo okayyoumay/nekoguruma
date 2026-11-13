@@ -278,9 +278,12 @@ async fn a_stop_of_the_server_closes_the_connection_and_the_agent_keeps_running(
 
     f.server.take().unwrap().finish().await;
     assert!(!f.is_connected(), "the server's stop ended the connection");
-    // The session logs its first failed attempt and retries; it does not exit.
+    // The session logs its first failed attempt and retries; it does not exit. The server's port
+    // is free after the stop, so a parallel test may bind it and answer the agent with a refusal
+    // (a warning of its own): either line shows the retry.
+    let retried = |log: &str| log.contains("attempt failed") || log.contains("refused");
     let deadline = Instant::now() + LIMIT;
-    while !agent.log_text().contains("attempt failed") {
+    while !retried(&agent.log_text()) {
         assert!(Instant::now() < deadline, "no retry:\n{}", agent.log_text());
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

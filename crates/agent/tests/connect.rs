@@ -69,8 +69,20 @@ impl Env {
         command
     }
 
+    /// The state directory the command uses: the override in a debug build, the account's own
+    /// location in a release build (which ignores the override).
+    fn state_root(&self) -> PathBuf {
+        if cfg!(debug_assertions) {
+            self.state.path().to_owned()
+        } else if cfg!(windows) {
+            self.home.path().join("local").join("nekoguruma")
+        } else {
+            self.home.path().join("xdg").join("nekoguruma")
+        }
+    }
+
     fn identity_dir(&self) -> PathBuf {
-        self.state.path().join("identity")
+        self.state_root().join("identity")
     }
 
     #[cfg(debug_assertions)]
@@ -193,7 +205,7 @@ fn a_bad_command_line_is_exit_2() {
             "a value is echoed: {stderr}"
         );
     }
-    assert!(!env.state.path().join("control").exists());
+    assert!(!env.state_root().join("control").exists());
     assert!(!env.identity_dir().exists());
 }
 
@@ -256,6 +268,7 @@ fn without_a_store_the_exit_is_1_and_nothing_connects() {
 #[cfg(debug_assertions)]
 mod with_store {
     use super::*;
+    use std::io::Write;
 
     /// The key's fingerprint, creating the key with `ngr-agent identity` when needed.
     fn fingerprint(env: &Env) -> String {
@@ -401,6 +414,44 @@ mod with_store {
         first.wait_for("session started");
         let second = run(env.connect());
         assert_exit(&second, 3, "a control channel session is already running");
+    }
+
+    /// A running session holds the registration lock too, so `ngr-agent register` is exit 3 and
+    /// does not change the record (on every platform).
+    #[test]
+    fn register_is_exit_3_while_a_session_runs() {
+        let env = Env::new();
+        let fingerprint = fingerprint(&env);
+        env.register(&fingerprint, closed_port());
+        let record = env.state.path().join("registration").join(RECORD_FILE);
+        let before = std::fs::read(&record).unwrap();
+        let first = start(&env);
+        first.wait_for("session started");
+        let mut command = env.command();
+        command
+            .args([
+                "register",
+                "--mode",
+                "user",
+                "--server",
+                "http://127.0.0.1:1",
+                "--server-key",
+                &"ab".repeat(32),
+                "--replace",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        let code = shared_crypto::registration::RegistrationCode::generate().unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let _ = input.write_all(code.as_str().as_bytes());
+        drop(input);
+        let output = finish(child);
+        let stderr = text(&output.stderr);
+        assert_eq!(output.status.code(), Some(3), "{stderr}");
+        assert!(stderr.contains("holds the registration lock"), "{stderr}");
+        assert_eq!(std::fs::read(&record).unwrap(), before);
     }
 
     /// SIGINT or SIGTERM ends a running session with 0 and frees the lock.

@@ -383,6 +383,25 @@ impl Opened {
         self.start_with(&key.public_key(), seams)
     }
 
+    /// Test seam for the caller's handling of a task that ends on its own: starts a session whose
+    /// dial panics, so the task ends without a stop.
+    #[cfg(test)]
+    pub(crate) fn start_panicking(self, key: AgentKey) -> Result<Handle, ControlError> {
+        struct PanicDial;
+        impl Dial for PanicDial {
+            fn dial(&self) -> dial::Dialled<'_> {
+                panic!("a scripted panic in the task");
+            }
+        }
+        let seams = Seams {
+            dial: Arc::new(PanicDial),
+            signer: key.signer(),
+            random: shared_crypto::random_32,
+            intake: Arc::new(LogIntake),
+        };
+        self.start_with(&key.public_key(), seams)
+    }
+
     fn origin(&self) -> Result<ServerOrigin, ControlError> {
         ServerOrigin::parse(&self.record.server_origin)
             .map_err(|_| RecordError::Field("server_origin").into())

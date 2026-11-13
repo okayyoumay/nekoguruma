@@ -188,7 +188,9 @@ pub fn register(request: &Request, source: &CodeSource) -> Result<Registered, Re
 
 fn identity_error(error: IdentityError) -> RegisterError {
     let exit = match error {
-        IdentityError::Unavailable(_) => Exit::Unavailable,
+        IdentityError::Unavailable(_)
+        | IdentityError::CreationLockBusy
+        | IdentityError::LocalFault(_) => Exit::Unavailable,
         IdentityError::KeyUnusable(_) => Exit::KeyUnusable,
         IdentityError::NoStore(_) | IdentityError::NotProvisioned | IdentityError::Random(_) => {
             Exit::CannotRegister

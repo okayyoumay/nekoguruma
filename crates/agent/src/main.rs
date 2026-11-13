@@ -78,9 +78,11 @@ connect: keeps the agent's control channel session to the server its registratio
 until SIGINT or SIGTERM (Ctrl-C or the console closing on Windows) stops it. It takes no option
 but --mode and prints nothing on stdout. Exit status: 0 stopped by a signal; 1 the agent is not
 registered, or must register again (the key was just created, is not the registered one, or the
-record does not read), or there is no key store; 2 a usage error; 3 another session or a
-registration is running, or a lock or the state directory is unusable; 4 the stored key cannot be
-used. A key store that is unavailable is retried until the signal.
+record is not valid), there is no key store, the stop handlers cannot be installed, or the session
+ended without a stop; 2 a usage error; 3 another session or a registration is running, a lock, the
+state or identity directory is unusable, or the record cannot be read; 4 the stored key cannot be
+used. A key store that is unavailable, or a creation lock held too long, is retried until the
+signal.
 
 options:
   --vci <name>         library name the worker service resolves: a J2534 library, or the
@@ -211,7 +213,13 @@ fn main() -> ExitCode {
     let outcome = match command {
         Command::Run(args) => runtime.block_on(run(args)),
         Command::Identify(args) => runtime.block_on(identify(args)),
-        Command::Connect(mode) => return runtime.block_on(connect(mode)),
+        Command::Connect(mode) => {
+            let code = runtime.block_on(connect(mode));
+            // A key load that a stop interrupted is a blocking task, which dropping the runtime
+            // would wait for; give it a moment and let the process end.
+            runtime.shutdown_timeout(std::time::Duration::from_secs(2));
+            return code;
+        }
         Command::Identity(_) | Command::Register(_) => {
             unreachable!("handled before the runtime starts")
         }
@@ -248,7 +256,9 @@ fn identity(mode: OperatingMode) -> ExitCode {
         Err(error) => {
             eprintln!("ngr-agent: identity: {error}");
             ExitCode::from(match error {
-                IdentityError::Unavailable(_) => 3,
+                IdentityError::Unavailable(_)
+                | IdentityError::CreationLockBusy
+                | IdentityError::LocalFault(_) => 3,
                 IdentityError::KeyUnusable(_) => 4,
                 IdentityError::NoStore(_)
                 | IdentityError::NotProvisioned
@@ -952,7 +962,7 @@ mod tests {
         }
     }
 
-    /// A1: the three required options in any order, with the optional two.
+    /// `connect` takes `--mode` and nothing else.
     #[test]
     fn parses_a_connect_with_its_mode_only() {
         for (mode, expected) in [
@@ -982,6 +992,7 @@ mod tests {
         }
     }
 
+    /// A1: the three required options in any order, with the optional two.
     #[test]
     fn parses_a_register_in_any_order() {
         let key = "ab".repeat(32);

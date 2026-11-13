@@ -58,6 +58,8 @@ fn kind(error: &IdentityError) -> &'static str {
     match error {
         IdentityError::NoStore(_) => "NoStore",
         IdentityError::Unavailable(_) => "Unavailable",
+        IdentityError::CreationLockBusy => "CreationLockBusy",
+        IdentityError::LocalFault(_) => "LocalFault",
         IdentityError::KeyUnusable(_) => "KeyUnusable",
         IdentityError::NotProvisioned => "NotProvisioned",
         IdentityError::Random(_) => "Random",
@@ -349,7 +351,8 @@ fn two_creators_held_at_absent_create_one_key() {
     assert_eq!(store.len(), 1);
 }
 
-/// L5: a holder stuck past the wait makes the waiter unavailable, and nothing is written.
+/// L5: a holder stuck past the wait makes the waiter report the lock busy (retryable), and nothing
+/// is written.
 #[test]
 fn a_creator_that_stays_locked_out_is_unavailable() {
     let temp = tempfile::tempdir().unwrap();
@@ -363,13 +366,14 @@ fn a_creator_that_stays_locked_out_is_unavailable() {
         Duration::from_millis(100),
     )
     .unwrap_err();
-    assert_eq!(kind(&error), "Unavailable");
+    assert_eq!(kind(&error), "CreationLockBusy");
     assert!(error.retryable());
     assert!(started.elapsed() >= Duration::from_millis(100));
     assert!(store.is_empty());
 }
 
-/// L7: a lock that cannot be opened, with the key absent, is unavailable and creates nothing. The
+/// L7: a lock that cannot be opened, with the key absent, is a local fault (no retry helps) and
+/// creates nothing. The
 /// parent being a regular file fails for every account, root included.
 #[test]
 fn a_lock_that_cannot_be_opened_is_unavailable() {
@@ -392,7 +396,8 @@ fn a_lock_that_cannot_be_opened_is_unavailable() {
     for (label, lock_dir) in cases {
         let store = MemoryStore::new();
         let error = load_or_create(&store, &name(), &*lock_dir, WAIT).unwrap_err();
-        assert_eq!(kind(&error), "Unavailable", "{label}");
+        assert_eq!(kind(&error), "LocalFault", "{label}");
+        assert!(!error.retryable(), "{label}");
         assert!(store.is_empty(), "{label}");
     }
     let store = MemoryStore::new();
@@ -403,7 +408,8 @@ fn a_lock_that_cannot_be_opened_is_unavailable() {
         )
     };
     let error = load_or_create(&store, &name(), &failing, WAIT).unwrap_err();
-    assert_eq!(kind(&error), "Unavailable");
+    assert_eq!(kind(&error), "LocalFault");
+    assert!(!error.retryable());
 }
 
 /// The directory that holds the lock file at `dir/<name>.lock` as a directory.
@@ -442,11 +448,13 @@ fn the_modes_keep_separate_keys() {
     assert_eq!(store.len(), 2);
 }
 
-/// Only an unavailable store is worth a retry.
+/// Only an unavailable store and a busy creation lock are worth a retry.
 #[test]
-fn only_unavailable_is_retryable() {
+fn only_unavailable_and_a_busy_lock_are_retryable() {
     assert!(IdentityError::Unavailable("x".into()).retryable());
+    assert!(IdentityError::CreationLockBusy.retryable());
     for error in [
+        IdentityError::LocalFault("x".into()),
         IdentityError::NoStore("x"),
         IdentityError::KeyUnusable("x"),
         IdentityError::NotProvisioned,

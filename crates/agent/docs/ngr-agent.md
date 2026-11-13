@@ -357,8 +357,8 @@ key and passes it in.
   next delay and `commands_acknowledged` and `commands_rejected`, the job commands answered
   `commandAck` and `commandRejected` over all connections (a command is counted once its answer
   is written). `intake` is the `Intake` trait object that takes every verified instruction; the
-  default, `LogIntake`, logs the job ID at `debug` and drops the instruction until the job-start
-  work exists.
+  default, `LogIntake`, is connected to no job runner: it logs the job ID at `debug` and drops the
+  instruction.
 - **Both locks are held from `open` until the task ends**, waits included, and released by drop
   on every path: a stop, a dropped handle, a panic, a runtime shutdown or an `Opened` dropped
   unstarted. The lock files are never deleted. While a session runs, `ngr-agent register` exits 3.

@@ -25,15 +25,15 @@ pub trait Intake: Send + Sync {
     fn take(&self, instruction: VerifiedInstruction);
 }
 
-/// The default intake: the job-start work is not here yet, so it logs the job ID at `debug` and
-/// drops the instruction.
+/// The default intake, connected to no job runner: it logs the job ID at `debug` and drops the
+/// instruction.
 pub struct LogIntake;
 
 impl Intake for LogIntake {
     fn take(&self, instruction: VerifiedInstruction) {
         tracing::debug!(
             job_id = %instruction.instruction().job_id.0,
-            "a verified job instruction was dropped: no job start yet"
+            "a verified job instruction was dropped: no job runner is connected"
         );
     }
 }

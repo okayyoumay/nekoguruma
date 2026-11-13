@@ -109,3 +109,6 @@ and dropping old partitions (15.1).
 - `ir_documents.source_format`: `odx` or `csv-starlark` (the proprietary format, ADR-254).
   The comment in `0001_init.sql` still names the earlier `csv-js`; the column is free text, so
   no migration is needed.
+- `agents.last_seen_at`: the control channel writes it at connect and at disconnect only (design
+  15.1, ADR-468). The comment in `0001_init.sql`, which says the column is batch-written, no
+  longer holds; a merged migration cannot change it (ADR-458 item 6).

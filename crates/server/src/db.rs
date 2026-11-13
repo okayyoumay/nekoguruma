@@ -91,6 +91,44 @@ pub(crate) async fn statement_timeouts(tx: &mut sqlx::PgConnection) -> Result<()
     .map(|_| ())
 }
 
+/// Stamps the agent's last-seen time and says whether its row is revoked (ADR-468 item 11): `None`
+/// when there is no such row. One statement in a transaction that commits, whatever the answer;
+/// the stamp never moves back. `agent_id` is an agent ID the session route accepted, so the cast
+/// cannot fail. The caller bounds the whole call in time.
+pub(crate) async fn stamp_agent(
+    pool: &PgPool,
+    agent_id: &str,
+) -> Result<Option<bool>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    statement_timeouts(&mut tx).await?;
+    let revoked: Option<(bool,)> = sqlx::query_as(
+        "UPDATE agents SET last_seen_at = GREATEST(last_seen_at, now()) WHERE id = $1::uuid \
+         RETURNING revoked_at IS NOT NULL",
+    )
+    .bind(agent_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(revoked.map(|(revoked,)| revoked))
+}
+
+/// Which of `agent_ids` have a row that is not revoked (ADR-468 item 11): one read in a
+/// transaction that is dropped, so nothing is written.
+pub(crate) async fn live_agents(
+    pool: &PgPool,
+    agent_ids: &[String],
+) -> Result<Vec<String>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    statement_timeouts(&mut tx).await?;
+    let live: Vec<(String,)> = sqlx::query_as(
+        "SELECT id::text FROM agents WHERE id = ANY($1::uuid[]) AND revoked_at IS NULL",
+    )
+    .bind(agent_ids)
+    .fetch_all(&mut *tx)
+    .await?;
+    Ok(live.into_iter().map(|(id,)| id).collect())
+}
+
 /// How the applied migrations differ from the embedded ones (see [`require_current`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum MigrationsDiffer {

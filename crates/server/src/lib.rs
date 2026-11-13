@@ -19,6 +19,7 @@ pub mod operator_session;
 pub mod problem;
 pub mod register;
 pub mod registration;
+pub(crate) mod revocation;
 pub mod session;
 
 use std::future::Future;
@@ -40,7 +41,7 @@ use tokio::task::JoinSet;
 use tower::Layer;
 
 pub use config::{Config, ConfigError, Profile};
-pub use hub::Hub;
+pub use hub::{Delivery, Hub, Inbound, SendError};
 pub use instruction_key::InstructionKey;
 pub use local_user::Hasher;
 pub use operator_session::OperatorSessions;
@@ -117,7 +118,7 @@ pub fn router(state: AppState) -> Router {
         .route(session::CHALLENGE_PATH, post(session::challenge))
         .route(session::SESSION_PATH, post(session::session))
         .with_state(session::Exchange::new(
-            state.pool,
+            state.pool.clone(),
             state.port,
             state.sessions.clone(),
         ));
@@ -125,7 +126,7 @@ pub fn router(state: AppState) -> Router {
     // It takes every method, so that its 405 is a problem document like its other refusals.
     let control = Router::new()
         .route(control::PATH, any(control::upgrade))
-        .with_state(control::Control::new(state.sessions, state.hub));
+        .with_state(control::Control::new(state.pool, state.sessions, state.hub));
     let routes = health
         .merge(operator)
         .merge(register)
@@ -238,6 +239,12 @@ impl Server {
             .expect("a bound listener has an address")
     }
 
+    /// The hub of the control channel: the way to send a job command to a connected agent and to
+    /// take what the agents send (ADR-468 item 12).
+    pub fn hub(&self) -> Hub {
+        self.hub.clone()
+    }
+
     /// The session tokens this server issues, which the control channel route accepts.
     pub fn sessions(&self) -> Sessions {
         self.sessions.clone()
@@ -271,11 +278,20 @@ impl Server {
             listener,
             router,
             pool,
-            sessions: _,
+            sessions,
             hasher: _,
             hub,
             grace,
         } = self;
+        // The revocation pass is one of the hub's tasks, so that the stop ends it before the pool
+        // closes (ADR-468 item 11).
+        hub.adopt(revocation::run(hub.clone(), sessions, hub.stopping(), {
+            let pool = pool.clone();
+            move |ids: Vec<String>| {
+                let pool = pool.clone();
+                async move { db::live_agents(&pool, &ids).await }
+            }
+        }));
         let service = TowerToHyperService::new(router);
         // hyper-util's graceful watch has no implementation for a connection that allows
         // upgrades, so each connection task watches this signal itself (ADR-468).

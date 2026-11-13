@@ -9,7 +9,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use server::config::Http;
 use server::local_guard::pinned_origin;
-use server::{Server, Sessions};
+use server::{Hub, Server, Sessions};
 use shared_crypto::proof::{Audience, ProofTranscript, sign_proof};
 use shared_crypto::{SigningKey, random_32};
 use shared_proto::AgentId;
@@ -284,9 +284,11 @@ async fn the_guard_answers_both_routes_before_they_run_and_the_cap_is_untouched(
 pub(crate) struct Up {
     pub(crate) w: World,
     agent: Agent,
-    id: String,
+    pub(crate) id: String,
     pub(crate) s: Running,
     sessions: Sessions,
+    /// The server's hub: the control channel tests send commands and take the inbox through it.
+    pub(crate) hub: Hub,
     /// The text of every challenge and nonce this test sent, for the log check.
     seen: std::sync::Mutex<Vec<String>>,
 }
@@ -305,12 +307,14 @@ impl Up {
             .await
             .unwrap();
         let sessions = server.sessions();
+        let hub = server.hub();
         Up {
             w,
             agent,
             id,
             s: Running::spawn(server),
             sessions,
+            hub,
             seen: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -320,7 +324,7 @@ impl Up {
     }
 
     /// A valid exchange for `key` as agent `id`, with a fresh challenge from the route.
-    async fn exchange_as(&self, key: &SigningKey, id: &str) -> Reply {
+    pub(crate) async fn exchange_as(&self, key: &SigningKey, id: &str) -> Reply {
         let c = self.challenge_and_nonce().await;
         let p = proof(key, &self.audience(), id, c.0, c.1);
         send_session(&self.s, &session_body(id, &c.0, &c.1, &p)).await
@@ -353,7 +357,7 @@ impl Up {
 
 impl World {
     /// Registers `agent` for the operator `alice` and returns the agent ID the server assigned.
-    async fn register(&self, agent: &Agent) -> String {
+    pub(crate) async fn register(&self, agent: &Agent) -> String {
         let (_, r) = self.redeem("alice", agent).await;
         assert_eq!(r.status, 201, "{}", r.head);
         json(&r)["agentId"].as_str().unwrap().to_owned()

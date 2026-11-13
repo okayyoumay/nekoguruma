@@ -452,12 +452,25 @@ connection with hyper's `with_upgrades()`.
   that cannot be upgraded (HTTP/1.0, no key, a version other than 13) is 400, never 426.
 - **One task per connection,** spawned by `Hub::adopt` into the hub's own `JoinSet` (axum's
   callback only hands the session over), with one writer, since the socket is not split. It
-  registers as the agent's current connection, writes `hello {heartbeatSecs: 20}` (there is no
-  configuration key for the interval), and then selects on the hub's close instruction, the
-  stop, the next message and the idle deadline. Every write is bounded by `WRITE_TIMEOUT`
-  (10 seconds); one that fails or times out ends the connection with no frame.
+  stamps `agents.last_seen_at`, registers as the agent's current connection, writes `hello
+  {heartbeatSecs: 20}` (there is no configuration key for the interval), and then selects on the
+  hub's close instruction, the stop, the frames the hub queued, the next message and the idle
+  deadline. Every write is bounded by `WRITE_TIMEOUT` (10 seconds); one that fails or times out
+  ends the connection with no frame.
+- **The stamp (ADR-468 item 11).** One statement, `UPDATE agents SET last_seen_at =
+  GREATEST(last_seen_at, now()) ... RETURNING revoked_at IS NOT NULL`, in a transaction with
+  `db::statement_timeouts`, inside a 5 second bound (`stamp` in `control.rs`, `db::stamp_agent`).
+  At connect it runs after the 101 and before the registration and `hello`, so a client that has
+  read `hello` knows it is done. A failure or timeout is one gated warning and the connection
+  goes on. A row that is revoked or missing (the stamp is committed either way) drops the agent's
+  tokens and closes with 4002 as the first frame, without registering: no earlier connection is
+  displaced and no disconnect is written. At disconnect it runs for a connection that was the
+  agent's current one (`Hub::leave` returned true), after the Close frame (after the reply to the
+  agent's own Close) and before the drain, with its result ignored and a failure one gated
+  warning. A replaced connection, one that is aborted, a heartbeat, a message, a send, the
+  revocation pass and a refused upgrade write nothing.
 - **What it reads.** Text only. `heartbeat` is echoed. Another valid message is read and
-  dropped (a debug line, never its text); routing it is an open item in `work/`. A text that does not decode closes with 1002
+  given to the hub's inbox (`Hub::inbox`, below). A text that does not decode closes with 1002
   (1009 when `decode` reports the size), a binary message with 1003, and a Close from the agent
   is answered by the stack on one more read. Both transport limits are 131072 bytes: a frame
   of 131073 bytes is refused on its header with 1009, one of 131072 is read. A read error is
@@ -466,9 +479,33 @@ connection with hyper's `with_upgrades()`.
   gets no frame. The Close reason is a fixed word per code, never anything the peer sent.
 - **Idle.** Any complete text message, ping or pong resets the clock, which starts when `hello`
   has been written; three intervals (60 seconds) without one close with 4003. A partial frame
-  resets nothing.
-- **After a close.** The task leaves the registry first, then writes the Close frame, then
-  drains (reads and discards until the peer's reply, at most `CLOSE_WAIT`, 5 seconds). After a
+  resets nothing, a command written to the agent resets nothing, and time spent waiting for a
+  full inbox is not idle time.
+- **Commands and the inbox (ADR-468 item 12).** `Hub::send_job_command(agent, signed_job)` is not
+  async: it draws a `commandId` (`c-<n>`, hub-wide, from 1; a failed call uses its number),
+  encodes the frame outside the lock and queues it on the agent's current connection, whose
+  queue holds 16 frames and which the task drains after `hello`, each write within
+  `WRITE_TIMEOUT`. `Delivery { connection, command_id }` means queued, not written;
+  `SendError::NotConnected` (no current connection, or it is closing), `Busy` and `TooLarge`
+  (the frame over 131072 bytes, judged before the connection is looked at). A frame queued on a
+  connection that has been told to close, or at a stop, is not written. `Hub::inbox()` gives its
+  receiver (256 messages) to the first caller: `commandAck`, `commandRejected`, `agentEvent`
+  and `reconcile` arrive as `Inbound { agent, connection, message }` in read order, never a
+  heartbeat. The task asks the hub per message: with no receiver (not taken yet, or dropped) the
+  message is dropped with a gated debug line, never buffered. With the inbox full the task holds
+  the message and waits, reading nothing (so the agent sees no echo), while it watches its close
+  instruction and the stop. The hub keeps no delivery table. `Hub::close_agent(agent, code)`
+  gives the current connection's close instruction once, and `Hub::connected()` lists the
+  current connections.
+- **The revocation pass (`revocation.rs`).** One task of the hub's set, spawned by
+  `Server::run`: a tick every 30 seconds (the first one 30 seconds after the start, a missed
+  tick delayed, so a long jump gives one pass), no query when nobody is connected, otherwise one
+  read-only statement (`db::live_agents`) over the connected agent IDs. An agent that is
+  connected and not returned (a missing row included) has its tokens dropped, then its
+  connection told to close with 4002, with one warn line; a failed read is one gated warning
+  and closes nobody. It ends when the stop begins, in its wait and in its read.
+- **After a close.** The task leaves the registry first, then writes the Close frame, then the
+  disconnect stamp (above), then drains (reads and discards until the peer's reply, at most `CLOSE_WAIT`, 5 seconds). After a
   read error the stack allows no read, so the task waits `CLOSE_WAIT` without reading (a stop
   ends the wait) before it drops the socket: dropping at once with input unread can reset the
   connection and lose the Close at the peer.
@@ -484,8 +521,9 @@ connection with hyper's `with_upgrades()`.
   upgrade then fails), abort the sessions, close the pool.
 - **Logging.** One info line at the connect and one at the end, with the agent ID, a connection
   number and a word for the end; no token and no message text.
-- **Scope.** The hub touches no database table and sends nothing but `hello`, the heartbeat
-  echo and a Close frame: every other valid message is read and dropped.
+- **Scope.** The hub holds no job state and writes no table of its own: the connection tasks
+  write `agents.last_seen_at` through the stamp, the revocation pass reads `agents`, and
+  everything else the agent says goes to the inbox for whoever takes it.
 
 Any other path answers 404 with a problem body, after the guard.
 
@@ -543,7 +581,7 @@ a new migration file rebuilds the crate. How migrations are written and applied 
   429, a challenge issued before it still live), each shape rule giving 400 with the challenge
   still live afterwards, unknown challenges giving 401 and never 429 or 503, and the guard's
   answers on both routes. With a database: a valid exchange (a token that authenticates twice,
-  `last_seen_at` untouched); a challenge used once whatever the outcome; every refusal (unknown
+  `last_seen_at` untouched, which the control channel alone writes); a challenge used once whatever the outcome; every refusal (unknown
   agent, revoked by SQL, revoked by registering the key again, another key, another audience,
   another challenge, another agent ID, high-S) giving the same 403 bytes, one gated log line per
   reason and no secret in the log; the eleventh refusal 429 while a 401, a 400 and a valid
@@ -568,9 +606,30 @@ a new migration file rebuilds the crate. How migrations are written and applied 
   replacement (the old connection reads 4001, the new one is echoed). Stop: 1001 within the grace
   period, a peer that never answers aborted at the end of the grace period, a stop ending the wait
   after a read error, and a second signal
-  dropping the connection at once. The unit tests cover the `Authorization` table, the close for
-  each decode error, the classes of read errors, and the hub's registration, replacement and
-  stop. The plain-HTTP stop tests in `serving.rs` are the check that the loop's own watch did
+  dropping the connection at once. Last-seen time: NULL before a connection, set when `hello`
+  is read and unchanged by three heartbeats and an event, later once the agent has gone (a
+  Close from the agent, and a dropped transport), a refused upgrade writing nothing, a revoked
+  or missing row closing with 4002 as the first frame (the stamp committed, the tokens
+  dropped, an earlier connection left alone), a failed stamp (a renamed column) giving one
+  warning each way with the connection served, a locked table delaying `hello` by about five
+  seconds with the row unchanged, a second connection stamping again and the replaced one
+  writing nothing, a stamp that never moves back, a stop during the stamp closing with 1001
+  first, the Close written while the disconnect stamp waits on a lock, a stop writing the
+  disconnect before `run` returns, and an aborted connection writing nothing. The pass: one
+  jump of 31 seconds closing a row revoked by SQL (or deleted) with 4002 and dropping its
+  tokens while a second agent is still echoed, live agents left alone, and a failed read
+  closing nobody before a normal next period. Commands and the inbox: commands read in call
+  order with the exact 131072 byte frame accepted, `TooLarge` and `NotConnected` returned,
+  the inbox giving `commandAck`, `jobState`, `commandRejected` and `reconcile` in order with the
+  agent and connection and no heartbeat, 300 events dropped while nobody takes the inbox and
+  an inbox taken later used, a full inbox holding the task (no echo, no idle close across a
+  jump of 61 seconds, handed over in order when a slot frees), and a close instruction and a stop
+  ending a task that waits; a command written to a silent agent not restarting the idle clock.
+  The unit tests cover the `Authorization` table, the close for each decode error, the
+  classes of read errors, the hub's registration, replacement, stop, queues (`Busy`, the size
+  boundary, the numbering, the close instruction) and `leave`, and the pass (`revocation.rs`
+  under a paused clock: cadence, no query for nobody, the agents that change after the
+  snapshot, a failed read, the stop in the wait and in the read). The plain-HTTP stop tests in `serving.rs` are the check that the loop's own watch did
   not change that behaviour.
   `binary.rs` starts `ngr-server` as a process (on a port that was free a moment before, trying
   again when another process takes it): usage and start failures, a refused database and a

@@ -14,8 +14,10 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use futures_util::{SinkExt, StreamExt};
+use server::hub::{INBOX_CAPACITY, Inbound};
+use server::{Delivery, SendError};
 use shared_crypto::random_32;
-use shared_proto::ServerMessage;
+use shared_proto::{AgentId, AgentMessage, ServerMessage};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -23,7 +25,7 @@ use tokio_tungstenite::tungstenite::http::{HeaderValue, Request, Response};
 use tokio_tungstenite::tungstenite::{self, Message};
 use tokio_tungstenite::{WebSocketStream, client_async};
 
-use crate::redeem::{dead, instruction_key, json};
+use crate::redeem::{Agent, capture, dead, instruction_key, json};
 use crate::serving::{Reply, exchange};
 use crate::session::Up;
 
@@ -376,7 +378,12 @@ async fn a_valid_token_without_a_proper_upgrade_is_400_and_stays_usable() {
         assert_problem(&r, 400, name);
         assert_eq!(r.header("www-authenticate"), None, "{name}");
     }
-    // None of them used the token up.
+    // A9: none of them stamped the row, and none used the token up.
+    assert_eq!(
+        last_seen(&u, &u.id).await,
+        "",
+        "a refused upgrade writes nothing"
+    );
     drop(open(u.s.addr, &t).await);
     u.finish().await;
 }
@@ -745,4 +752,772 @@ async fn a_second_stop_signal_drops_a_connection_at_once() {
     );
     drop(client);
     w.finish().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The row, the stamp and the pass (ADR-468 item 11). Case ids (A1, B3, C4, ...) are those of the
+// design notes of the hub.
+
+/// The agent's `last_seen_at` as text, empty while it is NULL.
+async fn last_seen(u: &Up, id: &str) -> String {
+    u.w.sql(&format!(
+        "SELECT last_seen_at FROM agents WHERE id = '{id}'"
+    ))
+    .await
+}
+
+/// Polls (real time, at most 3 seconds) until the row's `last_seen_at` is later than `than`.
+async fn later_than(u: &Up, id: &str, than: &str) {
+    let sql = format!("SELECT last_seen_at > '{than}'::timestamptz FROM agents WHERE id = '{id}'");
+    for _ in 0..120 {
+        if u.w.sql(&sql).await == "true" {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("last_seen_at did not move past {than}");
+}
+
+/// Holds an exclusive lock on the agents table until dropped.
+async fn lock_agents(u: &Up) -> sqlx::Transaction<'static, sqlx::Postgres> {
+    let mut tx = u.w.pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE agents IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx
+}
+
+async fn revoke_row(u: &Up, id: &str) {
+    sqlx::query("UPDATE agents SET revoked_at = now() WHERE id = $1::uuid")
+        .bind(id)
+        .execute(&u.w.pool)
+        .await
+        .unwrap();
+}
+
+/// Removes the agent's row. The rows that refer to it are not the test's concern, so the
+/// foreign keys are not enforced for this one transaction.
+async fn delete_row(u: &Up, id: &str) {
+    let mut tx = u.w.pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM agents WHERE id = $1::uuid")
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+}
+
+/// Registers a second agent and gives its token.
+async fn second_agent(u: &Up) -> (String, String) {
+    let agent = Agent::new();
+    let id = u.w.register(&agent).await;
+    let r = u.exchange_as(&agent.key, &id).await;
+    assert_eq!(r.status, 200, "{}", r.head);
+    (id, json(&r)["token"].as_str().unwrap().to_owned())
+}
+
+/// The upgrade only, with no `hello` read.
+async fn connect(addr: SocketAddr, token: &str) -> Client {
+    let request = request(addr, Some(&format!("Bearer {token}")), &[SUBPROTOCOL]);
+    let (client, response) = handshake(addr, request)
+        .await
+        .unwrap_or_else(|error| panic!("the upgrade was refused: {error}"));
+    assert_eq!(response.status(), 101);
+    client
+}
+
+/// The code of the first frame, which must be a Close, and then reads to the end.
+async fn first_frame_close_code(client: &mut Client) -> u16 {
+    let code = match frame(client).await {
+        Some(Ok(Message::Close(Some(close)))) => u16::from(close.code),
+        other => panic!("the first frame is not a Close: {other:?}"),
+    };
+    while let Some(Ok(_)) = frame(client).await {}
+    code
+}
+
+fn agent_id(u: &Up) -> AgentId {
+    AgentId(u.id.clone())
+}
+
+fn count(log: &crate::redeem::Captured, needle: &str) -> usize {
+    log.text().lines().filter(|l| l.contains(needle)).count()
+}
+
+async fn quiet_for(client: &mut Client, millis: u64) {
+    assert!(
+        tokio::time::timeout(Duration::from_millis(millis), client.next())
+            .await
+            .is_err(),
+        "a frame arrived where none is due"
+    );
+}
+
+// A1, B3, B4
+#[tokio::test]
+async fn the_connect_stamp_is_set_when_hello_is_read_and_heartbeats_do_not_move_it() {
+    let u = Up::new().await;
+    let t = token(&u).await;
+    assert_eq!(last_seen(&u, &u.id).await, "", "NULL before");
+    let mut client = open(u.s.addr, &t).await;
+    let connected = last_seen(&u, &u.id).await;
+    assert_ne!(connected, "", "set once hello is read");
+    for _ in 0..3 {
+        heartbeat(&mut client).await;
+    }
+    client
+        .send(Message::Text(
+            r#"{"type":"agentEvent","seq":1,"kind":"progress","jobId":"j","progressPermille":5,"phase":"x"}"#.into(),
+        ))
+        .await
+        .unwrap();
+    heartbeat(&mut client).await;
+    assert_eq!(
+        last_seen(&u, &u.id).await,
+        connected,
+        "equal after heartbeats and an event"
+    );
+
+    // B3: the agent closes; the server's reply is read, then the row is written.
+    client.send(Message::Close(None)).await.unwrap();
+    let mut answered = false;
+    while let Some(Ok(message)) = frame(&mut client).await {
+        answered |= matches!(message, Message::Close(_));
+    }
+    assert!(answered);
+    later_than(&u, &u.id, &connected).await;
+
+    // B4: a transport that is gone is written at once.
+    let t = token(&u).await;
+    let client = open(u.s.addr, &t).await;
+    let before = last_seen(&u, &u.id).await;
+    drop(client);
+    later_than(&u, &u.id, &before).await;
+    u.finish().await;
+}
+
+// A2
+#[tokio::test]
+async fn a_revoked_row_at_connect_closes_with_4002_first_and_displaces_nobody() {
+    let (log, _guard) = capture();
+    let u = Up::new().await;
+    let t = token(&u).await;
+    let mut earlier = open(u.s.addr, &t).await;
+    let stamped = last_seen(&u, &u.id).await;
+    revoke_row(&u, &u.id).await;
+
+    let mut refused = connect(u.s.addr, &t).await;
+    assert_eq!(first_frame_close_code(&mut refused).await, 4002);
+    // The stamp was committed, whatever the row said.
+    later_than(&u, &u.id, &stamped).await;
+    let after = last_seen(&u, &u.id).await;
+    // The earlier connection was not replaced: it is still echoed (the pass is 30 s away).
+    heartbeat(&mut earlier).await;
+    // The tokens are gone.
+    let r = exchange(
+        u.s.addr,
+        &raw(
+            &u.s.host(),
+            "HTTP/1.1",
+            &[upgrade_headers(), vec![bearer(&t)]].concat(),
+        ),
+    )
+    .await;
+    assert_problem(&r, 401, "the token of a revoked agent");
+    assert_eq!(
+        count(&log, "control channel refused: the agent is revoked"),
+        1
+    );
+    assert_eq!(
+        last_seen(&u, &u.id).await,
+        after,
+        "no disconnect write for the refused one"
+    );
+    u.finish().await;
+}
+
+// A3
+#[tokio::test]
+async fn a_missing_row_at_connect_closes_with_4002_first_and_stamps_nothing() {
+    let u = Up::new().await;
+    let t = token(&u).await;
+    delete_row(&u, &u.id).await;
+    let mut refused = connect(u.s.addr, &t).await;
+    assert_eq!(first_frame_close_code(&mut refused).await, 4002);
+    let r = exchange(
+        u.s.addr,
+        &raw(
+            &u.s.host(),
+            "HTTP/1.1",
+            &[upgrade_headers(), vec![bearer(&t)]].concat(),
+        ),
+    )
+    .await;
+    assert_problem(&r, 401, "the token of a missing agent");
+    assert_eq!(
+        u.w.sql(&format!(
+            "SELECT count(*) FROM agents WHERE id = '{}'",
+            u.id
+        ))
+        .await,
+        "0"
+    );
+    u.finish().await;
+}
+
+// A4, B12
+#[tokio::test]
+async fn a_failed_stamp_is_one_gated_warning_each_way_and_the_connection_goes_on() {
+    let (log, _guard) = capture();
+    let u = Up::new().await;
+    let t = token(&u).await;
+    u.w.pg
+        .execute("ALTER TABLE agents RENAME COLUMN last_seen_at TO last_seen_x")
+        .await;
+    let mut first = open(u.s.addr, &t).await;
+    heartbeat(&mut first).await;
+    let mut second = open(u.s.addr, &t).await;
+    heartbeat(&mut second).await;
+    assert_eq!(close_code(&mut first).await, 4001);
+    assert_eq!(
+        count(&log, "was not written at connect"),
+        1,
+        "one line for two failures"
+    );
+    second.send(Message::Close(None)).await.unwrap();
+    while let Some(Ok(_)) = frame(&mut second).await {}
+    // The drain went on after the failed write: the task ended.
+    for _ in 0..120 {
+        if count(&log, "control channel ended") == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(count(&log, "control channel ended"), 2);
+    assert_eq!(count(&log, "was not written at disconnect"), 1);
+    u.w.pg
+        .execute("ALTER TABLE agents RENAME COLUMN last_seen_x TO last_seen_at")
+        .await;
+    assert_eq!(last_seen(&u, &u.id).await, "", "the row is unchanged");
+    u.finish().await;
+}
+
+// A5 (real time)
+#[tokio::test]
+async fn a_database_that_does_not_answer_delays_hello_by_about_five_seconds_and_writes_nothing() {
+    let u = Up::new().await;
+    let t = token(&u).await;
+    let lock = lock_agents(&u).await;
+    let started = Instant::now();
+    let mut client = connect(u.s.addr, &t).await;
+    hello(&mut client).await;
+    let waited = started.elapsed();
+    assert!(
+        waited >= Duration::from_secs(4) && waited < Duration::from_secs(9),
+        "{waited:?}"
+    );
+    heartbeat(&mut client).await;
+    drop(lock);
+    assert_eq!(
+        last_seen(&u, &u.id).await,
+        "",
+        "the stamp that timed out left nothing"
+    );
+    u.finish().await;
+}
+
+// A6, B5
+#[tokio::test]
+async fn a_second_connection_stamps_again_and_the_replaced_one_writes_nothing() {
+    let u = Up::new().await;
+    let t = token(&u).await;
+    let mut old = open(u.s.addr, &t).await;
+    let first = last_seen(&u, &u.id).await;
+    let mut new = open(u.s.addr, &t).await;
+    let second = last_seen(&u, &u.id).await;
+    later_than(&u, &u.id, &first).await;
+    assert_eq!(close_code(&mut old).await, 4001);
+    // The marker: the new connection is served after the old one ended.
+    heartbeat(&mut new).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        last_seen(&u, &u.id).await,
+        second,
+        "B5: the successor's connect value"
+    );
+
+    // A stamp never moves back.
+    u.w.pg
+        .execute("UPDATE agents SET last_seen_at = now() + interval '1 hour'")
+        .await;
+    let future = last_seen(&u, &u.id).await;
+    let mut third = open(u.s.addr, &t).await;
+    heartbeat(&mut third).await;
+    assert_eq!(last_seen(&u, &u.id).await, future);
+    u.finish().await;
+}
+
+// A7
+#[tokio::test]
+async fn a_stop_during_the_stamp_is_not_raced_and_the_connection_is_closed_with_1001_first() {
+    let u = Up::new().await;
+    let t = token(&u).await;
+    let lock = lock_agents(&u).await;
+    let mut client = connect(u.s.addr, &t).await;
+    let Up { w, mut s, id, .. } = u;
+    s.signal_stop();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    drop(lock);
+    let (code, ()) = tokio::join!(first_frame_close_code(&mut client), s.joined());
+    assert_eq!(code, 1001, "no hello before it");
+    let stamped = w
+        .sql(&format!(
+            "SELECT last_seen_at IS NOT NULL FROM agents WHERE id = '{id}'"
+        ))
+        .await;
+    assert_eq!(stamped, "true", "the connect write is kept");
+    w.finish().await;
+}
+
+// B1
+#[tokio::test]
+async fn the_close_is_written_before_the_disconnect_stamp_and_the_stamp_follows_the_lock() {
+    let u = Up::new().await;
+    let t = token(&u).await;
+    let mut client = open(u.s.addr, &t).await;
+    let connected = last_seen(&u, &u.id).await;
+    let lock = lock_agents(&u).await;
+    client
+        .send(Message::Binary(vec![1u8].into()))
+        .await
+        .unwrap();
+    // The Close arrives while the stamp is still blocked.
+    match frame(&mut client).await {
+        Some(Ok(Message::Close(Some(close)))) => assert_eq!(u16::from(close.code), 1003),
+        other => panic!("not a Close frame: {other:?}"),
+    }
+    drop(lock);
+    while let Some(Ok(_)) = frame(&mut client).await {}
+    later_than(&u, &u.id, &connected).await;
+    u.finish().await;
+}
+
+// B8
+#[tokio::test]
+async fn a_stop_writes_the_disconnect_before_the_database_closes() {
+    let u = Up::new().await;
+    let t = token(&u).await;
+    let mut client = open(u.s.addr, &t).await;
+    let connected = last_seen(&u, &u.id).await;
+    let Up { w, mut s, id, .. } = u;
+    s.signal_stop();
+    let (code, ()) = tokio::join!(close_code(&mut client), s.joined());
+    assert_eq!(code, 1001);
+    // Read at once, not polled: `run` returned, so the write was made before it.
+    let later = w
+        .sql(&format!(
+            "SELECT last_seen_at > '{connected}'::timestamptz FROM agents WHERE id = '{id}'"
+        ))
+        .await;
+    assert_eq!(later, "true");
+    w.finish().await;
+}
+
+// B9 (real time)
+#[tokio::test]
+async fn a_connection_aborted_at_the_end_of_the_grace_period_writes_nothing() {
+    let u = Up::new().await;
+    let t = token(&u).await;
+    let client = open(u.s.addr, &t).await;
+    let connected = last_seen(&u, &u.id).await;
+    let lock = lock_agents(&u).await;
+    // The transport goes; the server's disconnect stamp now waits on the lock.
+    drop(client);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let Up { w, mut s, id, .. } = u;
+    s.signal_stop();
+    s.joined().await;
+    drop(lock);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let now = w
+        .sql(&format!(
+            "SELECT last_seen_at FROM agents WHERE id = '{id}'"
+        ))
+        .await;
+    assert_eq!(now, connected);
+    w.finish().await;
+}
+
+// C3 and the cadence
+#[tokio::test]
+async fn the_pass_leaves_live_agents_alone_and_runs_again_after_the_next_period() {
+    let (log, _guard) = capture();
+    let u = Up::new().await;
+    let (_other_id, other_token) = second_agent(&u).await;
+    let t = token(&u).await;
+    let mut one = open(u.s.addr, &t).await;
+    let mut two = open(u.s.addr, &other_token).await;
+    jump(31).await;
+    heartbeat(&mut one).await;
+    heartbeat(&mut two).await;
+    assert_eq!(count(&log, "its control channel is closed"), 0);
+    revoke_row(&u, &u.id).await;
+    jump(31).await;
+    assert_eq!(close_code(&mut one).await, 4002);
+    heartbeat(&mut two).await;
+    u.finish().await;
+}
+
+// C4
+#[tokio::test]
+async fn a_row_revoked_by_sql_is_closed_by_the_pass_with_its_tokens_dropped() {
+    let (log, _guard) = capture();
+    let u = Up::new().await;
+    let (_other_id, other_token) = second_agent(&u).await;
+    let t = token(&u).await;
+    let mut one = open(u.s.addr, &t).await;
+    let mut two = open(u.s.addr, &other_token).await;
+    let connected = last_seen(&u, &u.id).await;
+    revoke_row(&u, &u.id).await;
+    jump(31).await;
+    assert_eq!(close_code(&mut one).await, 4002);
+    heartbeat(&mut two).await;
+    let r = exchange(
+        u.s.addr,
+        &raw(
+            &u.s.host(),
+            "HTTP/1.1",
+            &[upgrade_headers(), vec![bearer(&t)]].concat(),
+        ),
+    )
+    .await;
+    assert_problem(&r, 401, "the token of the revoked agent");
+    let lines: Vec<String> = log
+        .text()
+        .lines()
+        .filter(|l| l.contains("its control channel is closed"))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(lines.len(), 1, "one warn line");
+    assert!(lines[0].contains(&u.id), "the line names the agent");
+    // The closed connection took the disconnect path, which stamps.
+    later_than(&u, &u.id, &connected).await;
+    u.finish().await;
+}
+
+// C5
+#[tokio::test]
+async fn a_missing_row_is_closed_by_the_pass_like_a_revoked_one() {
+    let u = Up::new().await;
+    let t = token(&u).await;
+    let mut one = open(u.s.addr, &t).await;
+    delete_row(&u, &u.id).await;
+    jump(31).await;
+    assert_eq!(close_code(&mut one).await, 4002);
+    u.finish().await;
+}
+
+// C6
+#[tokio::test]
+async fn a_failed_read_of_the_pass_closes_nobody_and_the_next_period_is_normal() {
+    let (log, _guard) = capture();
+    let u = Up::new().await;
+    let t = token(&u).await;
+    let mut one = open(u.s.addr, &t).await;
+    u.w.pg
+        .execute("ALTER TABLE agents RENAME COLUMN revoked_at TO revoked_x")
+        .await;
+    jump(31).await;
+    heartbeat(&mut one).await;
+    for _ in 0..120 {
+        if count(&log, "could not read the agents") == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(count(&log, "could not read the agents"), 1);
+    u.w.pg
+        .execute("ALTER TABLE agents RENAME COLUMN revoked_x TO revoked_at")
+        .await;
+    revoke_row(&u, &u.id).await;
+    jump(31).await;
+    assert_eq!(close_code(&mut one).await, 4002);
+    u.finish().await;
+}
+
+// D1, D2, D5, D6
+#[tokio::test]
+async fn commands_reach_the_agent_in_order_and_the_size_and_presence_errors_are_returned() {
+    let u = Up::new().await;
+    let t = token(&u).await;
+    let agent = agent_id(&u);
+    assert_eq!(
+        u.hub.send_job_command(&agent, "x".to_owned()),
+        Err(SendError::NotConnected),
+        "D2: nobody connected"
+    );
+    let mut client = open(u.s.addr, &t).await;
+    // D1: the frame's own length counts, the ID's digits included.
+    let overhead = ServerMessage::JobCommand {
+        command_id: "c-3".to_owned(),
+        signed_job: Some(String::new()),
+    }
+    .encode()
+    .unwrap()
+    .len();
+    let limit = 128 * 1024;
+    // `c-1` went to the call with nobody connected and `c-2` to this refusal; every ID that
+    // follows has the same width.
+    assert_eq!(
+        u.hub
+            .send_job_command(&agent, "x".repeat(limit - overhead + 1)),
+        Err(SendError::TooLarge)
+    );
+    let exact = "x".repeat(limit - overhead);
+    let delivery: Delivery = u.hub.send_job_command(&agent, exact.clone()).unwrap();
+    assert_eq!(delivery.command_id, "c-3");
+    let third = u.hub.send_job_command(&agent, "tail".to_owned()).unwrap();
+    assert_eq!(third.command_id, "c-4");
+    let message = ServerMessage::decode(&text(&mut client).await).unwrap();
+    assert_eq!(
+        message,
+        ServerMessage::JobCommand {
+            command_id: "c-3".to_owned(),
+            signed_job: Some(exact)
+        }
+    );
+    let message = ServerMessage::decode(&text(&mut client).await).unwrap();
+    assert_eq!(
+        message,
+        ServerMessage::JobCommand {
+            command_id: "c-4".to_owned(),
+            signed_job: Some("tail".to_owned())
+        }
+    );
+    // Written within the write limit, the connection is still served.
+    heartbeat(&mut client).await;
+    // The agent goes; the entry goes with it.
+    client.send(Message::Close(None)).await.unwrap();
+    while let Some(Ok(_)) = frame(&mut client).await {}
+    for _ in 0..120 {
+        if u.hub.connected().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        u.hub.send_job_command(&agent, "x".to_owned()),
+        Err(SendError::NotConnected)
+    );
+    u.finish().await;
+}
+
+async fn next_inbound(inbox: &mut tokio::sync::mpsc::Receiver<Inbound>) -> Inbound {
+    tokio::time::timeout(Duration::from_secs(10), inbox.recv())
+        .await
+        .expect("a message within 10 seconds")
+        .expect("the inbox is open")
+}
+
+fn progress(seq: usize) -> Message {
+    Message::Text(
+        format!(
+            r#"{{"type":"agentEvent","seq":{seq},"kind":"progress","jobId":"j","progressPermille":5,"phase":"x"}}"#
+        )
+        .into(),
+    )
+}
+
+// E5
+#[tokio::test]
+async fn the_inbox_gives_outcomes_and_events_in_read_order_with_the_agent_and_connection() {
+    let u = Up::new().await;
+    let t = token(&u).await;
+    let mut inbox = u.hub.inbox().expect("the first call");
+    let mut client = open(u.s.addr, &t).await;
+    let agent = agent_id(&u);
+    let one = u.hub.send_job_command(&agent, "a".to_owned()).unwrap();
+    let two = u.hub.send_job_command(&agent, "b".to_owned()).unwrap();
+    assert_eq!(one.connection, two.connection);
+    let first = ServerMessage::decode(&text(&mut client).await).unwrap();
+    assert!(
+        matches!(first, ServerMessage::JobCommand { ref command_id, .. } if *command_id == one.command_id)
+    );
+    let second = ServerMessage::decode(&text(&mut client).await).unwrap();
+    assert!(
+        matches!(second, ServerMessage::JobCommand { ref command_id, .. } if *command_id == two.command_id)
+    );
+
+    let bodies = [
+        format!(
+            r#"{{"type":"commandAck","commandId":"{}"}}"#,
+            one.command_id
+        ),
+        r#"{"type":"agentEvent","seq":1,"kind":"jobState","jobId":"j","state":"received"}"#
+            .to_owned(),
+        format!(
+            r#"{{"type":"commandRejected","commandId":"{}","reason":"malformed"}}"#,
+            two.command_id
+        ),
+        r#"{"type":"reconcile","openJobs":[]}"#.to_owned(),
+    ];
+    for body in &bodies {
+        client
+            .send(Message::Text(body.clone().into()))
+            .await
+            .unwrap();
+        // A heartbeat between messages is echoed and never reaches the inbox.
+        heartbeat(&mut client).await;
+    }
+    let got = [
+        next_inbound(&mut inbox).await,
+        next_inbound(&mut inbox).await,
+        next_inbound(&mut inbox).await,
+        next_inbound(&mut inbox).await,
+    ];
+    for inbound in &got {
+        assert_eq!(inbound.agent, agent);
+        assert_eq!(inbound.connection, one.connection);
+    }
+    assert!(
+        matches!(&got[0].message, AgentMessage::CommandAck { command_id } if *command_id == one.command_id)
+    );
+    assert!(matches!(&got[1].message, AgentMessage::AgentEvent(event) if event.seq == 1));
+    assert!(
+        matches!(&got[2].message, AgentMessage::CommandRejected { command_id, .. } if *command_id == two.command_id)
+    );
+    assert!(matches!(&got[3].message, AgentMessage::Reconcile { .. }));
+    assert!(inbox.try_recv().is_err(), "no heartbeat arrives");
+    u.finish().await;
+}
+
+// E2, E4
+#[tokio::test]
+async fn messages_nobody_takes_are_dropped_without_waiting_and_an_inbox_taken_later_is_used() {
+    let u = Up::new().await;
+    let t = token(&u).await;
+    let mut client = open(u.s.addr, &t).await;
+    for seq in 0..300 {
+        client.send(progress(seq)).await.unwrap();
+    }
+    heartbeat(&mut client).await;
+    let mut inbox = u.hub.inbox().expect("the first call");
+    client.send(progress(1000)).await.unwrap();
+    heartbeat(&mut client).await;
+    let got = next_inbound(&mut inbox).await;
+    assert!(matches!(got.message, AgentMessage::AgentEvent(event) if event.seq == 1000));
+    assert!(
+        inbox.try_recv().is_err(),
+        "the 300 earlier ones were not kept"
+    );
+    u.finish().await;
+}
+
+/// Takes the inbox and sends events until the inbox is full and the task holds one more.
+async fn fill_inbox(u: &Up, client: &mut Client) -> tokio::sync::mpsc::Receiver<Inbound> {
+    let inbox = u.hub.inbox().expect("the first call");
+    for seq in 1..=INBOX_CAPACITY + 1 {
+        client.send(progress(seq)).await.unwrap();
+    }
+    for _ in 0..200 {
+        if inbox.len() == INBOX_CAPACITY {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(inbox.len(), INBOX_CAPACITY, "the inbox is full");
+    // The marker is the full inbox; now nothing more is read, so no echo comes.
+    client.send(Message::Text(HEARTBEAT.into())).await.unwrap();
+    quiet_for(client, 300).await;
+    inbox
+}
+
+// E6, E3
+#[tokio::test]
+async fn a_full_inbox_holds_the_task_without_idle_time_and_a_slot_or_a_dropped_receiver_frees_it() {
+    let u = Up::new().await;
+    let t = token(&u).await;
+    let mut client = open(u.s.addr, &t).await;
+    let mut inbox = fill_inbox(&u, &mut client).await;
+    // The wait is not idle time: more than three intervals pass, and the connection lives.
+    jump(61).await;
+    quiet_for(&mut client, 200).await;
+    // A slot frees: the held message is handed over, the queued heartbeat is read and echoed.
+    let first = next_inbound(&mut inbox).await;
+    assert!(matches!(first.message, AgentMessage::AgentEvent(event) if event.seq == 1));
+    let echo = ServerMessage::decode(&text(&mut client).await).unwrap();
+    assert_eq!(echo, ServerMessage::Heartbeat);
+    // All 257 arrive in order: the held one is the last.
+    let mut last = 0;
+    for _ in 0..INBOX_CAPACITY {
+        match next_inbound(&mut inbox).await.message {
+            AgentMessage::AgentEvent(event) => last = event.seq,
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(last, u64::try_from(INBOX_CAPACITY + 1).unwrap());
+
+    // E3: a task that waits wakes when the receiver is dropped, and drops what it holds.
+    let mut client2 = open(u.s.addr, &token(&u).await).await;
+    drop(inbox);
+    for seq in 0..5 {
+        client2.send(progress(seq)).await.unwrap();
+    }
+    heartbeat(&mut client2).await;
+    u.finish().await;
+}
+
+// E7
+#[tokio::test]
+async fn a_close_instruction_ends_a_task_that_waits_on_a_full_inbox() {
+    let u = Up::new().await;
+    let t = token(&u).await;
+    let mut client = open(u.s.addr, &t).await;
+    let _inbox = fill_inbox(&u, &mut client).await;
+    assert!(u.hub.close_agent(&agent_id(&u), 4002));
+    assert_eq!(close_code(&mut client).await, 4002);
+    u.finish().await;
+}
+
+// E8
+#[tokio::test]
+async fn a_stop_ends_a_task_that_waits_on_a_full_inbox_within_the_grace_period() {
+    let u = Up::new().await;
+    let t = token(&u).await;
+    let mut client = open(u.s.addr, &t).await;
+    let _inbox = fill_inbox(&u, &mut client).await;
+    let Up { w, mut s, .. } = u;
+    let started = Instant::now();
+    s.signal_stop();
+    let (code, ()) = tokio::join!(close_code(&mut client), s.joined());
+    assert_eq!(code, 1001);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    w.finish().await;
+}
+
+// D10
+#[tokio::test]
+async fn a_command_written_to_a_silent_agent_does_not_restart_the_idle_clock() {
+    let u = Up::new().await;
+    let t = token(&u).await;
+    let mut client = open(u.s.addr, &t).await;
+    jump(40).await;
+    u.hub
+        .send_job_command(&agent_id(&u), "j".to_owned())
+        .unwrap();
+    let message = ServerMessage::decode(&text(&mut client).await).unwrap();
+    assert!(matches!(message, ServerMessage::JobCommand { .. }));
+    // 65 s after hello and 25 after the command: the command did not move the 60 s deadline.
+    jump(25).await;
+    assert_eq!(close_code(&mut client).await, 4003);
+    u.finish().await;
 }

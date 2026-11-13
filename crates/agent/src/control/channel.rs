@@ -377,6 +377,11 @@ async fn finish(socket: &mut Socket, end: End, state: &mut SessionState<'_>) -> 
 // ---------------------------------------------------------------------------------------------
 // The connection
 
+/// The reason whose word is the longest, so a `commandRejected` with it is the longest answer to a
+/// job command (`commandAck` is shorter).
+pub(super) const LONGEST_REASON: shared_proto::InstructionRejectReason =
+    shared_proto::InstructionRejectReason::UnsupportedVersion;
+
 /// Runs one connection to its end.
 pub(super) async fn serve(mut socket: Socket, state: &mut SessionState<'_>) -> Outcome {
     let end = match await_hello(&mut socket, state.stop).await {
@@ -468,6 +473,16 @@ async fn connected(
                         // connection's life is measured to here (the backoff reset rule).
                         last_frame_at = Instant::now();
                         let lived_now = lived(hello_at, last_frame_at);
+                        // A `commandId` whose longest possible answer the codec refuses (one
+                        // near the size limit) is not usable, as a missing one is not: the
+                        // gate and the intake see nothing and the connection closes with 1002.
+                        let longest = AgentMessage::CommandRejected {
+                            command_id: command_id.clone(),
+                            reason: LONGEST_REASON,
+                        };
+                        if longest.encode().is_err() {
+                            return End::close(CLOSE_CODE_PROTOCOL, "command-id", lived_now);
+                        }
                         let (rejected, verified) = match gate.admit(signed_job.as_deref()) {
                             Ok(verified) => (None, Some(verified)),
                             Err(reason) => (Some(reason), None),
@@ -476,10 +491,8 @@ async fn connected(
                             None => AgentMessage::CommandAck { command_id },
                             Some(reason) => AgentMessage::CommandRejected { command_id, reason },
                         };
-                        // A `commandId` whose answer the codec refuses (one near the size limit)
-                        // is not usable, as a missing one is not: nothing is handed over and the
-                        // connection is closed with 1002.
                         let Ok(text) = answer.encode() else {
+                            // Not reachable once the longest answer encodes.
                             return End::close(CLOSE_CODE_PROTOCOL, "command-id", lived_now);
                         };
                         // The intake has the instruction before the ack is written.

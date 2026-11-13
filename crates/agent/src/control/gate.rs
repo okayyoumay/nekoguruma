@@ -42,22 +42,37 @@ impl Intake for LogIntake {
     }
 }
 
-const REASONS: [InstructionRejectReason; 5] = [
-    InstructionRejectReason::Malformed,
-    InstructionRejectReason::UnknownKey,
-    InstructionRejectReason::BadSignature,
-    InstructionRejectReason::UnsupportedVersion,
-    InstructionRejectReason::NotForThisAgent,
-];
+/// Refusals so far on one connection, one counter per reason. A field per reason, bumped through
+/// one exhaustive `match`, so a new reason fails the build here and cannot index out of range.
+#[derive(Default)]
+struct Refused {
+    malformed: u64,
+    unknown_key: u64,
+    bad_signature: u64,
+    unsupported_version: u64,
+    not_for_this_agent: u64,
+}
 
-fn slot(reason: InstructionRejectReason) -> usize {
-    // Exhaustive, so a new reason fails the build here and in [`REASONS`].
-    match reason {
-        InstructionRejectReason::Malformed => 0,
-        InstructionRejectReason::UnknownKey => 1,
-        InstructionRejectReason::BadSignature => 2,
-        InstructionRejectReason::UnsupportedVersion => 3,
-        InstructionRejectReason::NotForThisAgent => 4,
+impl Refused {
+    /// Counts one refusal and returns how many of this reason there now are.
+    fn bump(&mut self, reason: InstructionRejectReason) -> u64 {
+        let count = match reason {
+            InstructionRejectReason::Malformed => &mut self.malformed,
+            InstructionRejectReason::UnknownKey => &mut self.unknown_key,
+            InstructionRejectReason::BadSignature => &mut self.bad_signature,
+            InstructionRejectReason::UnsupportedVersion => &mut self.unsupported_version,
+            InstructionRejectReason::NotForThisAgent => &mut self.not_for_this_agent,
+        };
+        *count += 1;
+        *count
+    }
+
+    fn none(&self) -> bool {
+        self.malformed == 0
+            && self.unknown_key == 0
+            && self.bad_signature == 0
+            && self.unsupported_version == 0
+            && self.not_for_this_agent == 0
     }
 }
 
@@ -65,8 +80,7 @@ fn slot(reason: InstructionRejectReason) -> usize {
 pub(super) struct Gate<'a> {
     key: &'a PublicKey,
     agent_id: &'a str,
-    /// Refusals so far, per reason (indexed as [`REASONS`]).
-    refused: [u64; REASONS.len()],
+    refused: Refused,
 }
 
 impl<'a> Gate<'a> {
@@ -74,7 +88,7 @@ impl<'a> Gate<'a> {
         Gate {
             key,
             agent_id,
-            refused: [0; REASONS.len()],
+            refused: Refused::default(),
         }
     }
 
@@ -99,25 +113,24 @@ impl<'a> Gate<'a> {
     /// Counts the refusal, writes its entry (a warning the first time per reason) and returns
     /// the reason.
     fn refuse(&mut self, refusal: Refusal, envelope_len: usize) -> InstructionRejectReason {
-        let count = &mut self.refused[slot(refusal.reason)];
-        *count += 1;
-        instruction::log_refusal(&refusal, envelope_len, *count == 1);
+        let count = self.refused.bump(refusal.reason);
+        instruction::log_refusal(&refusal, envelope_len, count == 1);
         refusal.reason
     }
 
     /// The end of the connection: one line with the count per reason, only if any command was
     /// refused.
     pub(super) fn finish(&self) {
-        if self.refused.iter().all(|count| *count == 0) {
+        if self.refused.none() {
             return;
         }
-        let [
+        let Refused {
             malformed,
             unknown_key,
             bad_signature,
             unsupported_version,
             not_for_this_agent,
-        ] = self.refused;
+        } = self.refused;
         tracing::info!(
             malformed,
             unknown_key,

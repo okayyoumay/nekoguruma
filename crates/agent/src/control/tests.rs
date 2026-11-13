@@ -2666,26 +2666,37 @@ async fn f10_a_job_command_without_a_usable_id_or_with_an_extra_property_closes_
     assert_eq!(env.counts(), (0, 0));
 }
 
-/// F9c: a `commandId` whose answer is too large to encode is not usable, as a missing one is not:
-/// the connection is closed with 1002, and nothing is taken or counted. One byte less is still
+/// F9c: a `commandId` whose longest possible answer (a `commandRejected` with the longest reason
+/// word) cannot be encoded is not usable, as a missing one is not: the connection is closed with
+/// 1002 before the gate, so nothing is taken, counted or logged by it. One byte less is still
 /// answered.
 #[tokio::test(start_paused = true)]
 async fn f9c_a_command_id_whose_answer_cannot_be_encoded_closes_with_1002() {
-    use shared_proto::MAX_CONTROL_MESSAGE_LEN;
-    // The longest ID whose `malformed` rejection still encodes, found from the codec itself.
-    let encodes = |len: usize| {
+    use shared_proto::{InstructionRejectReason, MAX_CONTROL_MESSAGE_LEN};
+    let encodes = |len: usize, reason: InstructionRejectReason| {
         AgentMessage::CommandRejected {
             command_id: "x".repeat(len),
-            reason: shared_proto::InstructionRejectReason::Malformed,
+            reason,
         }
         .encode()
         .is_ok()
     };
+    // The longest ID whose answer with the longest reason still encodes, found from the codec.
     let longest = (0..MAX_CONTROL_MESSAGE_LEN)
         .rev()
-        .find(|len| encodes(*len))
+        .find(|len| encodes(*len, channel::LONGEST_REASON))
         .unwrap();
-    assert!(!encodes(longest + 1));
+    assert!(!encodes(longest + 1, channel::LONGEST_REASON));
+    // No other reason's answer is longer, so the check covers every answer.
+    for reason in [
+        InstructionRejectReason::Malformed,
+        InstructionRejectReason::UnknownKey,
+        InstructionRejectReason::BadSignature,
+        InstructionRejectReason::UnsupportedVersion,
+        InstructionRejectReason::NotForThisAgent,
+    ] {
+        assert!(encodes(longest, reason), "{reason:?}");
+    }
     let command = |len: usize| {
         let text = format!(
             r#"{{"type":"jobCommand","commandId":"{}"}}"#,
@@ -2702,8 +2713,13 @@ async fn f9c_a_command_id_whose_answer_cannot_be_encoded_closes_with_1002() {
     assert_eq!(env.counts(), (0, 1));
     send(&mut ws, &command(longest + 1)).await;
     close_of(&mut ws, 1002, true).await;
+    env.wait_phase(Phase::Waiting).await;
     assert_eq!(env.counts(), (0, 1));
     assert!(env.intake.0.lock().unwrap().is_empty());
+    // The gate saw the first command only.
+    let summary = env.log.lines("refused on this connection");
+    assert_eq!(summary.len(), 1, "{summary:?}");
+    assert!(summary[0].contains("malformed=1"), "{summary:?}");
 }
 
 /// F-drain: a job command read while the agent drains its own Close (after 4003 or 1002) is
@@ -2719,22 +2735,28 @@ async fn f_drain_a_job_command_during_the_agents_own_close_is_discarded() {
         } else {
             4003
         };
+        // `finish` sets the phase before it writes the Close, and this end has not read the
+        // Close yet, so the stack is still open for writing: the command goes to the pipe while
+        // the agent drains.
+        env.wait_phase(Phase::Closing).await;
+        ws.send(Message::Text(
+            signed_command(&env.fx, "late", AGENT_ID, Tamper::None)
+                .text
+                .into(),
+        ))
+        .await
+        .expect("the command is written while the agent drains");
         let (_, got_code) = close_after_heartbeats(&mut ws, false).await;
         assert_eq!(got_code, Some(code));
-        // The stack may refuse a write after the Close; the command is behind it either way.
-        let _ = ws
-            .send(Message::Text(
-                signed_command(&env.fx, "late", AGENT_ID, Tamper::None)
-                    .text
-                    .into(),
-            ))
-            .await;
         env.wait_phase(Phase::Waiting).await;
         assert_eq!(env.counts(), (0, 0));
         assert!(env.intake.0.lock().unwrap().is_empty());
-        while let (_, Got::Text(text)) = got(&mut ws).await {
-            assert!(!text.contains("command"), "{text}");
-        }
+        // The stack stops reading at the agent's Close; whatever the agent wrote after it is
+        // still in the pipe. There must be none: the command was not answered.
+        let mut rest = Vec::new();
+        let ended = tokio::time::timeout(DEADLINE, ws.get_mut().read_to_end(&mut rest)).await;
+        assert!(matches!(ended, Ok(Ok(_))), "the agent ended the connection");
+        assert!(rest.is_empty(), "the agent wrote after its Close: {rest:?}");
     }
 }
 

@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use server::config::{Config, Database, Http, InstructionKeyConfig, Profile};
+use server::config::{Config, Database, Http, InstructionKeyConfig, Profile, StorageConfig};
 use server::db::{self, DbError};
 use server::{Server, StartError};
 use sqlx::migrate::{Migration, MigrationType, Migrator};
@@ -27,6 +27,7 @@ fn config(pg: &TestPostgres) -> Config {
         instruction_key: InstructionKeyConfig {
             path: pg.key_path(),
         },
+        storage: StorageConfig::new(pg.storage_path()),
     }
 }
 
@@ -122,9 +123,9 @@ async fn a_migration_that_was_left_half_applied_refuses_the_start() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_servers_starting_together_against_an_empty_database_both_succeed() {
     let pg = TestPostgres::start();
-    let config = config(&pg);
+    // Each server has a store directory of its own: a store's directory is locked.
     let spawn = || {
-        let config = config.clone();
+        let config = config(&pg);
         tokio::spawn(async move { Server::start(&config).await })
     };
     let (a, b) = (spawn(), spawn());
@@ -158,6 +159,7 @@ async fn a_start_against_a_database_that_is_down_fails_within_the_connect_timeou
         instruction_key: InstructionKeyConfig {
             path: std::env::temp_dir().join("never-created.key"),
         },
+        storage: StorageConfig::new(std::env::temp_dir().join("never-created-storage")),
     };
     let started = std::time::Instant::now();
     let result = tokio::time::timeout(LIMIT, Server::start(&config))

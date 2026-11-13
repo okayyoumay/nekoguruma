@@ -82,6 +82,14 @@ impl TestPostgres {
         self.key_dir.path().join("instruction.key")
     }
 
+    /// A new, absent directory for a server's object store, in the directory the server account
+    /// owns. Each call names another one: two servers cannot share a store's directory.
+    pub fn storage_path(&self) -> PathBuf {
+        self.key_dir
+            .path()
+            .join(format!("storage-{}", random_password()))
+    }
+
     fn data(&self) -> PathBuf {
         self.dir.path().join("data")
     }

@@ -14,4 +14,5 @@ mod redeem;
 mod registration;
 mod serving;
 mod session;
+mod storage;
 mod support;

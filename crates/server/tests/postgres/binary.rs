@@ -53,9 +53,16 @@ fn get_health(port: u16) -> Option<String> {
     Some(text)
 }
 
-/// A configuration whose key file is `instruction.key` in `dir`.
+/// A configuration whose key file is `instruction.key` and whose object store is `storage` in
+/// `dir`.
 fn write_config(dir: &Path, port: u16, database_url: &str) -> std::path::PathBuf {
-    write_config_with_key(dir, port, database_url, &dir.join("instruction.key"))
+    write_config_with(
+        dir,
+        port,
+        database_url,
+        &dir.join("instruction.key"),
+        &dir.join("storage"),
+    )
 }
 
 fn write_config_with_key(
@@ -64,6 +71,16 @@ fn write_config_with_key(
     database_url: &str,
     key: &Path,
 ) -> std::path::PathBuf {
+    write_config_with(dir, port, database_url, key, &dir.join("storage"))
+}
+
+fn write_config_with(
+    dir: &Path,
+    port: u16,
+    database_url: &str,
+    key: &Path,
+    storage: &Path,
+) -> std::path::PathBuf {
     let path = dir.join("ngr-server.toml");
     // A literal string: a Windows path holds backslashes.
     std::fs::write(
@@ -71,8 +88,10 @@ fn write_config_with_key(
         format!(
             "[http]\nport = {port}\nshutdown_grace_secs = 2\n\
              [instruction_key]\npath = '{}'\n\
+             [storage]\ndir = '{}'\n\
              [database]\nurl = \"{database_url}\"\nconnect_timeout_secs = 2\n",
-            key.display()
+            key.display(),
+            storage.display()
         ),
     )
     .unwrap();
@@ -331,6 +350,64 @@ fn a_refused_instruction_key_exits_1_and_never_listens() {
         );
     }
     assert_eq!(std::fs::read(&as_file).unwrap(), b"not a key");
+}
+
+/// A refused object store directory ends the start with exit 1 before anything listens: a path
+/// that is a file on every platform, and on Unix a directory that group may write.
+#[test]
+fn a_refused_storage_directory_exits_1_and_never_listens() {
+    let pg = TestPostgres::start();
+    let dir = tempfile::tempdir().unwrap();
+    let as_file = dir.path().join("storage-is-a-file");
+    std::fs::write(&as_file, b"x").unwrap();
+    let mut refused = vec![as_file];
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let open = dir.path().join("storage-group-writable");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o770)).unwrap();
+        refused.push(open);
+    }
+    for storage in refused {
+        let port = free_port();
+        let key = dir.path().join("instruction.key");
+        let path = write_config_with(dir.path(), port, &pg.url(), &key, &storage);
+        let mut command = server(&["--config", path.to_str().unwrap()]);
+        command.stderr(Stdio::piped());
+        let output = wait_output(command.spawn().unwrap(), Duration::from_secs(30));
+        assert_eq!(output.status.code(), Some(1));
+        let log = String::from_utf8_lossy(&output.stderr);
+        assert!(!log.contains("listening"), "{log}");
+        assert!(log.contains("object store"), "{log}");
+        assert!(
+            get_health(port).is_none(),
+            "something listens on the port after a refused store"
+        );
+    }
+}
+
+/// A server whose storage directory another one holds exits 1 and never listens.
+#[test]
+fn a_storage_directory_in_use_exits_1_and_never_listens() {
+    let pg = TestPostgres::start();
+    let dir = tempfile::tempdir().unwrap();
+    let (mut first, _port, _reply) = start_server(dir.path(), &pg);
+    let port = free_port();
+    let path = write_config(dir.path(), port, &pg.url());
+    let mut command = server(&["--config", path.to_str().unwrap()]);
+    command.stderr(Stdio::piped());
+    let output = wait_output(command.spawn().unwrap(), Duration::from_secs(30));
+    assert_eq!(output.status.code(), Some(1));
+    let log = String::from_utf8_lossy(&output.stderr);
+    assert!(!log.contains("listening"), "{log}");
+    assert!(
+        log.contains("another process uses the object store"),
+        "{log}"
+    );
+    assert!(get_health(port).is_none());
+    let _ = first.kill();
+    let _ = first.wait();
 }
 
 fn wait_output(child: Child, limit: Duration) -> std::process::Output {

@@ -5,11 +5,13 @@
 //! request guard of design 13.3 (ADR-456). It connects to PostgreSQL and applies the embedded
 //! migrations before it binds, so a listening port means a migrated schema (ADR-458). It then
 //! reads or creates the job instruction key, so a listening port also means a usable key
-//! (ADR-462). Local users sign in with a password and keep a cookie session (ADR-469).
+//! (ADR-462), and opens the object store (ADR-474), whose directory it locks for the process's
+//! life. Local users sign in with a password and keep a cookie session (ADR-469).
 
 pub mod config;
 pub mod control;
 pub mod db;
+pub(crate) mod fs_guard;
 pub mod health;
 pub mod hub;
 pub mod instruction_key;
@@ -21,6 +23,7 @@ pub mod register;
 pub mod registration;
 pub(crate) mod revocation;
 pub mod session;
+pub mod storage;
 
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -46,6 +49,7 @@ pub use instruction_key::InstructionKey;
 pub use local_user::Hasher;
 pub use operator_session::OperatorSessions;
 pub use session::Sessions;
+pub use storage::{LocalStore, ObjectStore, StoreError};
 
 /// How long a connection may take to deliver a complete request head. A client that opens a
 /// connection and sends nothing, or a head one byte at a time, is dropped after this; it also
@@ -145,6 +149,8 @@ pub enum StartError {
     Database(#[from] db::DbError),
     #[error(transparent)]
     InstructionKey(#[from] instruction_key::KeyError),
+    #[error(transparent)]
+    Storage(#[from] storage::StoreError),
     #[error("cannot listen on 127.0.0.1:{port}: {source}")]
     Bind { port: u16, source: std::io::Error },
 }
@@ -165,15 +171,20 @@ pub struct Server {
     hasher: Hasher,
     hub: Hub,
     grace: Duration,
+    /// The object store `start` opened; `bind` leaves it empty (tests). Held so that its
+    /// directory stays locked until `run` returns.
+    object_store: Option<Arc<LocalStore>>,
 }
 
 impl Server {
     /// Connects to the database (within the connect timeout), applies the migrations (within
     /// [`db::MIGRATION_TIMEOUT`]), makes the instruction key ready ([`InstructionKey::open`]),
-    /// then binds `127.0.0.1:<port>`: nothing listens before the schema is current (ADR-458) or
-    /// before the key is usable (ADR-462). Any failure ends the start; a failed migration run is
-    /// never retried on its pool (the advisory lock is per session and counts how often it was
-    /// taken, so a retry could leave it held), and neither is the key.
+    /// opens the object store ([`LocalStore::open`]), then binds `127.0.0.1:<port>`: nothing
+    /// listens before the schema is current (ADR-458), before the key is usable (ADR-462) or
+    /// before the store's directory is usable and locked (ADR-474). Any failure ends the start; a
+    /// failed migration run is never retried on its pool (the advisory lock is per session and
+    /// counts how often it was taken, so a retry could leave it held), and neither is the key or
+    /// the store.
     pub async fn start(config: &Config) -> Result<Server, StartError> {
         let pool = db::connect(&config.database).await?;
         if let Err(error) = db::migrate(&pool).await {
@@ -187,7 +198,23 @@ impl Server {
                 return Err(error.into());
             }
         };
-        Server::bind(&config.http, pool, key).await
+        let store = match LocalStore::open(&config.storage) {
+            Ok(store) => Arc::new(store),
+            Err(error) => {
+                db::close(&pool).await;
+                return Err(error.into());
+            }
+        };
+        let mut server = Server::bind(&config.http, pool, key).await?;
+        server.object_store = Some(store);
+        Ok(server)
+    }
+
+    /// The object store `start` opened (`None` on a server made by `bind`).
+    pub fn object_store(&self) -> Option<Arc<dyn ObjectStore>> {
+        self.object_store
+            .as_ref()
+            .map(|store| Arc::clone(store) as Arc<dyn ObjectStore>)
     }
 
     /// Binds `127.0.0.1:<port>` (the address is fixed in code) and derives the pinned origin from
@@ -230,6 +257,7 @@ impl Server {
             hasher,
             hub,
             grace: Duration::from_secs(http.shutdown_grace_secs),
+            object_store: None,
         })
     }
 
@@ -282,6 +310,7 @@ impl Server {
             hasher: _,
             hub,
             grace,
+            object_store: _object_store,
         } = self;
         // The revocation pass is one of the hub's tasks, so that the stop ends it before the pool
         // closes (ADR-468 item 11).

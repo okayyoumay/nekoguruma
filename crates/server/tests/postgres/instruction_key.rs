@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use server::config::{Config, Database, Http, InstructionKeyConfig, Profile};
+use server::config::{Config, Database, Http, InstructionKeyConfig, Profile, StorageConfig};
 use server::instruction_key::KeyError;
 use server::{Server, StartError};
 use shared_crypto::{Signer, SigningKey};
@@ -25,6 +25,7 @@ fn config(pg: &TestPostgres, key: PathBuf) -> Config {
         },
         database,
         instruction_key: InstructionKeyConfig { path: key },
+        storage: StorageConfig::new(pg.storage_path()),
     }
 }
 

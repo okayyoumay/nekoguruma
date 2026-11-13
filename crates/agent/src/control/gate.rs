@@ -16,10 +16,14 @@ use base64::engine::general_purpose::STANDARD;
 use shared_crypto::PublicKey;
 use shared_proto::InstructionRejectReason;
 
-use crate::instruction::{self, VerifiedInstruction};
+use crate::instruction::{self, Refusal, VerifiedInstruction};
 
 /// Where a verified job instruction goes. The control channel hands it over before it answers
 /// `commandAck`.
+///
+/// An intake can receive the same verified instruction twice: the hand-over succeeded, then the
+/// ack was lost (the write failed or the connection ended) and the server redelivers the command
+/// on the next connection. An implementation must therefore be idempotent on the job ID.
 pub trait Intake: Send + Sync {
     /// Takes the instruction.
     fn take(&self, instruction: VerifiedInstruction);
@@ -47,10 +51,14 @@ const REASONS: [InstructionRejectReason; 5] = [
 ];
 
 fn slot(reason: InstructionRejectReason) -> usize {
-    REASONS
-        .iter()
-        .position(|r| *r == reason)
-        .unwrap_or_default()
+    // Exhaustive, so a new reason fails the build here and in [`REASONS`].
+    match reason {
+        InstructionRejectReason::Malformed => 0,
+        InstructionRejectReason::UnknownKey => 1,
+        InstructionRejectReason::BadSignature => 2,
+        InstructionRejectReason::UnsupportedVersion => 3,
+        InstructionRejectReason::NotForThisAgent => 4,
+    }
 }
 
 /// One connection's gate.
@@ -78,57 +86,23 @@ impl<'a> Gate<'a> {
         signed_job: Option<&str>,
     ) -> Result<VerifiedInstruction, InstructionRejectReason> {
         let Some(text) = signed_job else {
-            self.malformed(0);
-            return Err(InstructionRejectReason::Malformed);
+            return Err(self.refuse(Refusal::from(InstructionRejectReason::Malformed), 0));
         };
         let Ok(bytes) = STANDARD.decode(text) else {
-            self.malformed(text.len());
-            return Err(InstructionRejectReason::Malformed);
+            let refusal = Refusal::from(InstructionRejectReason::Malformed);
+            return Err(self.refuse(refusal, text.len()));
         };
-        match instruction::open_unlogged(&bytes, self.key, self.agent_id) {
-            Ok(verified) => Ok(verified),
-            Err(refusal) => {
-                let offered = refusal.offered_hex();
-                self.refuse(refusal.reason, bytes.len(), offered.as_deref());
-                Err(refusal.reason)
-            }
-        }
+        instruction::open_unlogged(&bytes, self.key, self.agent_id)
+            .map_err(|refusal| self.refuse(refusal, bytes.len()))
     }
 
-    fn malformed(&mut self, envelope_len: usize) {
-        self.refuse(InstructionRejectReason::Malformed, envelope_len, None);
-    }
-
-    fn refuse(
-        &mut self,
-        reason: InstructionRejectReason,
-        envelope_len: usize,
-        offered_key: Option<&str>,
-    ) {
-        let count = &mut self.refused[slot(reason)];
+    /// Counts the refusal, writes its entry (a warning the first time per reason) and returns
+    /// the reason.
+    fn refuse(&mut self, refusal: Refusal, envelope_len: usize) -> InstructionRejectReason {
+        let count = &mut self.refused[slot(refusal.reason)];
         *count += 1;
-        let first = *count == 1;
-        let word = format!("{reason:?}");
-        match (first, offered_key) {
-            (true, Some(offered_key)) => tracing::warn!(
-                reason = word,
-                envelope_len,
-                offered_key,
-                "job instruction refused"
-            ),
-            (true, None) => {
-                tracing::warn!(reason = word, envelope_len, "job instruction refused");
-            }
-            (false, Some(offered_key)) => tracing::debug!(
-                reason = word,
-                envelope_len,
-                offered_key,
-                "job instruction refused"
-            ),
-            (false, None) => {
-                tracing::debug!(reason = word, envelope_len, "job instruction refused");
-            }
-        }
+        instruction::log_refusal(&refusal, envelope_len, *count == 1);
+        refusal.reason
     }
 
     /// The end of the connection: one line with the count per reason, only if any command was

@@ -464,24 +464,28 @@ async fn connected(
                         return End::close(CLOSE_CODE_PROTOCOL, "second-hello", lived_now);
                     }
                     Ok(ServerMessage::JobCommand { command_id, signed_job }) => {
-                        // The command is a received frame; its answer is not one.
+                        // The command is a received frame; its answer is not one. The
+                        // connection's life is measured to here (the backoff reset rule).
                         last_frame_at = Instant::now();
-                        let rejected = match gate.admit(signed_job.as_deref()) {
-                            Ok(verified) => {
-                                state.wiring.intake.take(verified);
-                                None
-                            }
-                            Err(reason) => Some(reason),
+                        let lived_now = lived(hello_at, last_frame_at);
+                        let (rejected, verified) = match gate.admit(signed_job.as_deref()) {
+                            Ok(verified) => (None, Some(verified)),
+                            Err(reason) => (Some(reason), None),
                         };
                         let answer = match rejected {
                             None => AgentMessage::CommandAck { command_id },
                             Some(reason) => AgentMessage::CommandRejected { command_id, reason },
                         };
-                        // A message the codec refuses (a command ID near the size limit) cannot
-                        // be answered: the connection is dropped.
+                        // A `commandId` whose answer the codec refuses (one near the size limit)
+                        // is not usable, as a missing one is not: nothing is handed over and the
+                        // connection is closed with 1002.
                         let Ok(text) = answer.encode() else {
-                            return End::dropped("write", lived_now);
+                            return End::close(CLOSE_CODE_PROTOCOL, "command-id", lived_now);
                         };
+                        // The intake has the instruction before the ack is written.
+                        if let Some(verified) = verified {
+                            state.wiring.intake.take(verified);
+                        }
                         if let Err(end) =
                             write_or_stop(socket, &text, state.stop, lived_now).await
                         {

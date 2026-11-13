@@ -26,7 +26,9 @@ a UUIDv7, needs an acknowledgement per event instead, and its order rests on the
    `agent::instruction::open`, in the same order, with the trusted key and the agent ID of the
    registration record. A refusal is answered with
    `commandRejected` and its coarse reason on the connection the command came on (ADR-466 item
-   13); a command whose `signedJob` is missing or not a string is refused as `malformed`.
+   13); a command whose `signedJob` is missing or not a string is refused as `malformed`. A `commandId`
+   too long for its answer to fit in a message is not usable: the connection closes with 1002, as
+   for a command without one, and the intake sees nothing.
 3. **The gate bounds the refusal log.** The first refusal of each reason on a connection is a
    warning and later ones are debug lines; when a connection that refused anything ends, one line gives the
    count of every reason. The gate's refusals are not logged a second time by `open`, which

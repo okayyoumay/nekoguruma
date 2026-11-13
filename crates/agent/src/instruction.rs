@@ -61,7 +61,7 @@ pub fn open(
     own_agent_id: &str,
 ) -> Result<VerifiedInstruction, InstructionRejectReason> {
     open_unlogged(envelope, trusted_key, own_agent_id).map_err(|refusal| {
-        log_refusal(&refusal, envelope.len());
+        log_refusal(&refusal, envelope.len(), true);
         refusal.reason
     })
 }
@@ -84,13 +84,6 @@ pub(crate) struct Refusal {
     pub(crate) reason: InstructionRejectReason,
     /// The fingerprint the envelope offered, kept for an unknown key only.
     pub(crate) offered: Option<[u8; envelope::FINGERPRINT_LEN]>,
-}
-
-impl Refusal {
-    /// The offered fingerprint as hex (a hash, never a key).
-    pub(crate) fn offered_hex(&self) -> Option<String> {
-        self.offered.as_ref().map(|fingerprint| hex(fingerprint))
-    }
 }
 
 impl From<InstructionRejectReason> for Refusal {
@@ -135,20 +128,28 @@ fn check(
     Ok(instruction)
 }
 
-/// The entry holds the reason, the envelope's length and, for an unknown key, the fingerprint
-/// it offered (hex of a hash, never a key). It holds no job ID, agent ID or operator taken
-/// from the payload: a refused payload is not the job's own word, and a verified one that
-/// names another agent is that agent's business.
-fn log_refusal(refusal: &Refusal, envelope_len: usize) {
+/// Writes the refusal's entry: the reason, the envelope's length and, for an unknown key, the
+/// fingerprint it offered (hex of a hash, never a key). It holds no job ID, agent ID or operator
+/// taken from the payload: a refused payload is not the job's own word, and a verified one that
+/// names another agent is that agent's business. The entry is a `warn` when `first` and a `debug`
+/// otherwise (the control channel's gate bounds its warnings that way; [`open`] always warns).
+pub(crate) fn log_refusal(refusal: &Refusal, envelope_len: usize, first: bool) {
     let reason = format!("{:?}", refusal.reason);
-    match &refusal.offered {
-        Some(fingerprint) => tracing::warn!(
+    match (&refusal.offered, first) {
+        (Some(fingerprint), true) => tracing::warn!(
             reason,
             envelope_len,
             offered_key = %hex(fingerprint),
             "job instruction refused"
         ),
-        None => tracing::warn!(reason, envelope_len, "job instruction refused"),
+        (Some(fingerprint), false) => tracing::debug!(
+            reason,
+            envelope_len,
+            offered_key = %hex(fingerprint),
+            "job instruction refused"
+        ),
+        (None, true) => tracing::warn!(reason, envelope_len, "job instruction refused"),
+        (None, false) => tracing::debug!(reason, envelope_len, "job instruction refused"),
     }
 }
 

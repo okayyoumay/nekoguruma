@@ -1691,6 +1691,7 @@ Serverless functions are not used because they are unsuited to maintaining persi
 - When containers are replaced, all connected agents are disconnected. Absorb this with exponential backoff + jitter and state reconciliation on reconnection. Allow a longer grace period before shutdown
 - Scale on connection count, not CPU
 - With multiple instances, job delivery is by default done by each instance polling the DB and delivering only to its own connections (where a delay of a few seconds is acceptable)
+- An instance hands a job command to the agent's current connection through a queue of 16 frames that never blocks the sender: a full queue, no current connection or a frame over 128 KiB is an error for the caller, and the job stays queued. The agent's answers and events reach the job queue through one bounded inbox in the order each connection read them; a full inbox stops that connection reading, so the agent reconnects and resends rather than losing an event (ADR-468, ADR-472)
 
 ### 14.2 Serving UI Assets
 

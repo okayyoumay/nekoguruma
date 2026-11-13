@@ -8,6 +8,8 @@
 //! - [`logging`]: the agent's operational log, its `tracing` subscriber (design 12.2, ADR-348)
 //! - [`control`]: the control channel session library: the exchange, the upgrade and the
 //!   keepalive loop that connect the agent to the server (design 5.2, 5.3, 14.1, ADR-466, ADR-471)
+//! - [`connect`]: the flow of `ngr-agent connect`: the record, the key and its retry, the session
+//!   until a stop signal (design 5.3, ADR-471)
 //! - [`link`]: the communication link a job runs on, set up through the worker's D-PDU API
 //!   before the procedure starts
 //! - [`host`]: [`diag_ir::DiagHost`] on top of the worker gRPC client
@@ -35,6 +37,7 @@
 pub mod artifact;
 pub mod client;
 pub mod comm_log;
+pub mod connect;
 pub mod control;
 pub mod document;
 pub mod guards;

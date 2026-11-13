@@ -1,0 +1,304 @@
+//! `ngr-agent connect` against a real local-profile server (design 5.3, 6.4, 13.3, ADR-466,
+//! ADR-468, ADR-471): the agent binary registers and connects as a process with the plain-file key
+//! store and its own state directory, and the server runs in the test's process over a throwaway
+//! PostgreSQL. The test is the server's side of the control channel: it sends signed job commands
+//! through the hub and reads the agent's answers from the hub's inbox.
+//!
+//! The agent has no job runner behind the session yet, so a verified command is acknowledged and
+//! dropped (`LogIntake`); the answers are the observable behaviour.
+//!
+//! A release agent has no plain-file store, so this module is compiled in debug builds only. The
+//! stop signal is SIGINT on Unix; elsewhere the child is killed and its exit status is not
+//! asserted.
+
+use std::process::{Child, Stdio};
+use std::time::{Duration, Instant};
+
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
+use server::config::Http;
+use server::hub::Inbound;
+use server::{Hub, Server};
+use shared_proto::{
+    AgentId, AgentMessage, INSTRUCTION_VERSION, InstructionRejectReason, JobId, JobInstruction,
+    JobKind, VciId, Vin,
+};
+use tokio::sync::mpsc::Receiver;
+
+use crate::agent_register::{AgentEnv, fingerprint, run, text};
+use crate::redeem::World;
+use crate::serving::Running;
+
+const LIMIT: Duration = Duration::from_secs(30);
+const JOB_ID: &str = "0194f0a2-7c3e-7d11-8a52-3f6f9b1c2d4f";
+
+/// A world with a registered agent, a server whose hub the test holds and the agent's surroundings.
+struct Fixture {
+    world: World,
+    server: Option<Running>,
+    hub: Hub,
+    inbox: Receiver<Inbound>,
+    env: AgentEnv,
+    agent_id: String,
+}
+
+impl Fixture {
+    async fn new() -> Fixture {
+        let world = World::new().await;
+        world.add_operator("alice").await;
+        let http = Http {
+            port: 0,
+            shutdown_grace_secs: 2,
+        };
+        let server = Server::bind(&http, world.pg.pool(), world.key.clone())
+            .await
+            .unwrap();
+        let hub = server.hub();
+        let inbox = hub.inbox().expect("the inbox is taken once");
+        let server = Running::spawn(server);
+        let env = AgentEnv::new();
+        let fingerprint = fingerprint(&env).await;
+        let request =
+            server::registration::IssueRequest::new("alice", "Bench PC", &fingerprint, None)
+                .unwrap();
+        let issued = server::registration::issue(&world.pool, &request)
+            .await
+            .unwrap();
+        let args: Vec<String> = [
+            "register",
+            "--mode",
+            "user",
+            "--server",
+            &format!("http://127.0.0.1:{}", server.addr.port()),
+            "--server-key",
+            &issued.server_key_id,
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let output = run(env.command(&args), issued.code.as_str().to_owned()).await;
+        assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+        let agent_id = world.sql("SELECT id::text FROM agents").await;
+        Fixture {
+            world,
+            server: Some(server),
+            hub,
+            inbox,
+            env,
+            agent_id,
+        }
+    }
+
+    /// Starts `ngr-agent connect`, its operational log going to a file for a failure's message.
+    fn start_agent(&self) -> Agent {
+        let log = self.env.home.path().join("connect.log");
+        let stderr = std::fs::File::create(&log).unwrap();
+        let args: Vec<String> = ["connect", "--mode", "user"].map(str::to_owned).to_vec();
+        let child = self
+            .env
+            .command(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(stderr)
+            .spawn()
+            .unwrap();
+        Agent {
+            child: Some(child),
+            log,
+        }
+    }
+
+    fn is_connected(&self) -> bool {
+        self.hub
+            .connected()
+            .iter()
+            .any(|(agent, _)| agent.0 == self.agent_id)
+    }
+
+    async fn wait_connected(&self, mut agent: Option<&mut Agent>, connected: bool) {
+        let deadline = Instant::now() + LIMIT;
+        while self.is_connected() != connected {
+            let log = agent.as_ref().map(|agent| agent.log_text());
+            assert!(
+                Instant::now() < deadline,
+                "connected should become {connected}; the agent says:\n{log:?}"
+            );
+            if let Some(agent) = agent.as_deref_mut()
+                && let Some(status) = agent.child.as_mut().unwrap().try_wait().unwrap()
+            {
+                panic!("the agent exited ({status}):\n{}", agent.log_text());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// A job command for this agent, signed by the server's instruction key; `forge` flips a byte
+    /// of the envelope after signing.
+    async fn signed_job(&self, forge: bool) -> String {
+        let instruction = JobInstruction {
+            version: INSTRUCTION_VERSION,
+            job_id: JobId(JOB_ID.to_owned()),
+            ownership_generation: 1,
+            agent_id: AgentId(self.agent_id.clone()),
+            operator_id: "operator-1".to_owned(),
+            kind: JobKind::RunSequence,
+            vci: VciId("vci-a".to_owned()),
+            vin: Some(Vin("VIN-UNDER-TEST".to_owned())),
+            document_hashes: vec![],
+            artifact_hash: None,
+            plan_hash: None,
+            issued_at: 1_000,
+            start_deadline: 2_000,
+        };
+        let mut envelope = self.world.key.seal(&instruction).await.unwrap();
+        if forge {
+            *envelope.last_mut().unwrap() ^= 1;
+        }
+        STANDARD.encode(&envelope)
+    }
+
+    async fn next(&mut self) -> Inbound {
+        tokio::time::timeout(LIMIT, self.inbox.recv())
+            .await
+            .expect("the agent answers")
+            .expect("the inbox stays open")
+    }
+}
+
+/// The `connect` process; it is killed when dropped, so a failed test leaves none behind.
+struct Agent {
+    child: Option<Child>,
+    log: std::path::PathBuf,
+}
+
+impl Agent {
+    fn log_text(&self) -> String {
+        std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    /// Asks the agent to stop (SIGINT on Unix, a kill elsewhere) and waits for it to exit. The exit
+    /// status is `None` where the stop is a kill.
+    async fn stop(&mut self) -> Option<i32> {
+        let child = self.child.as_mut().unwrap();
+        #[cfg(unix)]
+        {
+            // SAFETY: `kill` takes a process ID and a signal number and touches no memory.
+            let result = unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
+            assert_eq!(result, 0);
+        }
+        #[cfg(not(unix))]
+        child.kill().unwrap();
+        let deadline = Instant::now() + LIMIT;
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the agent did not stop:\n{}",
+                self.log_text()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        self.child = None;
+        if cfg!(unix) {
+            Some(status.code().expect("exited, not killed"))
+        } else {
+            None
+        }
+    }
+
+    fn running(&mut self) -> bool {
+        self.child
+            .as_mut()
+            .is_some_and(|child| child.try_wait().unwrap().is_none())
+    }
+}
+
+impl Drop for Agent {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// The agent registers, connects, acknowledges a signed command and rejects a forged one by its
+/// own gate, and a stop signal ends it with exit 0 and a connection the hub sees leave.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_registered_agent_connects_answers_commands_and_stops_on_a_signal() {
+    let mut f = Fixture::new().await;
+    let mut agent = f.start_agent();
+    f.wait_connected(Some(&mut agent), true).await;
+
+    let good = f.signed_job(false).await;
+    let sent = f
+        .hub
+        .send_job_command(&AgentId(f.agent_id.clone()), good)
+        .unwrap();
+    let answer = f.next().await;
+    assert_eq!(answer.agent.0, f.agent_id);
+    assert_eq!(answer.connection, sent.connection);
+    match answer.message {
+        AgentMessage::CommandAck { command_id } => assert_eq!(command_id, sent.command_id),
+        other => panic!("commandAck expected, got {other:?}"),
+    }
+
+    let forged = f.signed_job(true).await;
+    let sent = f
+        .hub
+        .send_job_command(&AgentId(f.agent_id.clone()), forged)
+        .unwrap();
+    match f.next().await.message {
+        AgentMessage::CommandRejected { command_id, reason } => {
+            assert_eq!(command_id, sent.command_id);
+            assert_eq!(reason, InstructionRejectReason::BadSignature);
+        }
+        other => panic!("commandRejected expected, got {other:?}"),
+    }
+    // The agent is still connected after a refusal.
+    assert!(f.is_connected());
+
+    let status = agent.stop().await;
+    if cfg!(unix) {
+        assert_eq!(status, Some(0), "{}", agent.log_text());
+    }
+    f.wait_connected(None, false).await;
+    f.server.take().unwrap().finish().await;
+    f.world.finish().await;
+}
+
+/// A stop of the server closes the connection; the agent stays up, retries, and stops on the
+/// signal.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_of_the_server_closes_the_connection_and_the_agent_keeps_running() {
+    let mut f = Fixture::new().await;
+    let mut agent = f.start_agent();
+    f.wait_connected(Some(&mut agent), true).await;
+
+    f.server.take().unwrap().finish().await;
+    assert!(!f.is_connected(), "the server's stop ended the connection");
+    // The session logs its first failed attempt and retries; it does not exit. The server's port
+    // is free after the stop, so a parallel test may bind it and answer the agent with a refusal
+    // (a warning of its own): either line, written after the stop, shows the retry.
+    let stopped_at = agent.log_text().len();
+    let retried = |log: &str| {
+        log.get(stopped_at..).is_some_and(|after| {
+            after.contains("control channel attempt failed")
+                || after.contains("control channel refused")
+        })
+    };
+    let deadline = Instant::now() + LIMIT;
+    while !retried(&agent.log_text()) {
+        assert!(Instant::now() < deadline, "no retry:\n{}", agent.log_text());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(agent.running(), "the agent exited:\n{}", agent.log_text());
+    assert!(!f.is_connected());
+
+    let status = agent.stop().await;
+    if cfg!(unix) {
+        assert_eq!(status, Some(0), "{}", agent.log_text());
+    }
+    f.world.finish().await;
+}

@@ -4,7 +4,8 @@
 //! functional presence requests, VIN reads and ECU reads and prints the report as JSON, and
 //! `ngr-agent identity` creates the agent's key if needed and prints its public key as JSON, and
 //! `ngr-agent register` registers the agent with the server and stores the registration record
-//! (ADR-470; `crates/agent/docs/ngr-agent.md`).
+//! (ADR-470), and `ngr-agent connect` keeps the agent's control channel session until it is
+//! stopped (ADR-471; `crates/agent/docs/ngr-agent.md`).
 
 use std::ffi::OsString;
 use std::future::Future;
@@ -37,6 +38,7 @@ usage: ngr-agent run --vci <name> --mode <device|user> --document <file> [option
        ngr-agent identity --mode <device|user>
        ngr-agent register --mode <device|user> --server <origin> --server-key <hex>
                           [--code-file <file>] [--replace]
+       ngr-agent connect --mode <device|user>
 
 run: runs the procedure of a variant's document on a J2534 v04.04 or D-PDU API VCI and prints the
 final VM state as JSON on stdout. The job takes its link from the protocol the variant
@@ -71,6 +73,16 @@ server, the state directory or a lock is unavailable, or the outcome is unknown 
 is unchanged; if the same code is then refused, issue a new one); 4 the stored key cannot be
 used; 5 a record exists and --replace was not given; 6 the answer is not authentic (its key is
 not the --server-key one, or its signature does not verify).
+
+connect: keeps the agent's control channel session to the server its registration record names,
+until SIGINT or SIGTERM (Ctrl-C or the console closing on Windows) stops it. It takes no option
+but --mode and prints nothing on stdout. Exit status: 0 stopped by a signal; 1 the agent is not
+registered, or must register again (the key was just created, is not the registered one, or the
+record is not valid), there is no key store, the stop handlers cannot be installed, or the session
+ended without a stop; 2 a usage error; 3 another session or a registration is running, a lock, the
+state or identity directory is unusable, or the record cannot be read; 4 the stored key cannot be
+used. A key store that is unavailable, or a creation lock held too long, is retried until the
+signal.
 
 options:
   --vci <name>         library name the worker service resolves: a J2534 library, or the
@@ -143,6 +155,8 @@ enum Command {
     Identity(OperatingMode),
     /// `ngr-agent register ...` (ADR-470).
     Register(RegisterArgs),
+    /// `ngr-agent connect --mode <mode>` (ADR-471).
+    Connect(OperatingMode),
 }
 
 /// What `ngr-agent register` takes, checked before any file or socket is touched.
@@ -160,6 +174,7 @@ impl Command {
             Command::Identify(args) => args.mode,
             Command::Identity(mode) => *mode,
             Command::Register(args) => args.request.mode,
+            Command::Connect(mode) => *mode,
         }
     }
 }
@@ -198,6 +213,13 @@ fn main() -> ExitCode {
     let outcome = match command {
         Command::Run(args) => runtime.block_on(run(args)),
         Command::Identify(args) => runtime.block_on(identify(args)),
+        Command::Connect(mode) => {
+            let code = runtime.block_on(connect(mode));
+            // A key load that a stop interrupted is a blocking task, which dropping the runtime
+            // would wait for; give it a moment and let the process end.
+            runtime.shutdown_timeout(std::time::Duration::from_secs(2));
+            return code;
+        }
         Command::Identity(_) | Command::Register(_) => {
             unreachable!("handled before the runtime starts")
         }
@@ -234,7 +256,9 @@ fn identity(mode: OperatingMode) -> ExitCode {
         Err(error) => {
             eprintln!("ngr-agent: identity: {error}");
             ExitCode::from(match error {
-                IdentityError::Unavailable(_) => 3,
+                IdentityError::Unavailable(_)
+                | IdentityError::CreationLockBusy
+                | IdentityError::LocalFault(_) => 3,
                 IdentityError::KeyUnusable(_) => 4,
                 IdentityError::NoStore(_)
                 | IdentityError::NotProvisioned
@@ -286,6 +310,31 @@ fn register(args: RegisterArgs) -> ExitCode {
     }
 }
 
+/// `ngr-agent connect`: runs the control channel session until a stop signal (ADR-471). Nothing
+/// the server sent and no token is printed or logged; the status lines are the errors below.
+async fn connect(mode: OperatingMode) -> ExitCode {
+    use std::io::Write;
+    // The handlers come first, so a signal while the session starts is a stop, not a kill.
+    let stop = match agent::connect::stop_signal() {
+        Ok(stop) => stop,
+        Err(error) => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "ngr-agent: connect: cannot listen for the stop signal: {error}"
+            );
+            return ExitCode::from(1);
+        }
+    };
+    match agent::connect::run(mode, stop).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            // A closed standard error keeps the documented exit status.
+            let _ = writeln!(std::io::stderr(), "ngr-agent: connect: {error}");
+            ExitCode::from(error.exit_code())
+        }
+    }
+}
+
 fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
     let mut args = args.into_iter();
     let identify = match args.next() {
@@ -293,6 +342,9 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, Strin
         Some(command) if command == "identify" => true,
         Some(command) if command == "identity" => return parse_identity(args),
         Some(command) if command == "register" => return parse_register(args),
+        Some(command) if command == "connect" => {
+            return parse_mode_only(args).map(Command::Connect);
+        }
 
         Some(command) => return Err(format!("unknown command {command:?}")),
         None => return Err("missing command".to_owned()),
@@ -409,7 +461,12 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, Strin
 }
 
 /// The options of `ngr-agent identity`: `--mode` and nothing else.
-fn parse_identity(mut args: impl Iterator<Item = OsString>) -> Result<Command, String> {
+fn parse_identity(args: impl Iterator<Item = OsString>) -> Result<Command, String> {
+    parse_mode_only(args).map(Command::Identity)
+}
+
+/// `--mode <device|user>` and nothing else, for `identity` and `connect`.
+fn parse_mode_only(mut args: impl Iterator<Item = OsString>) -> Result<OperatingMode, String> {
     let mut mode = None;
     while let Some(flag) = args.next() {
         if flag != "--mode" {
@@ -427,7 +484,7 @@ fn parse_identity(mut args: impl Iterator<Item = OsString>) -> Result<Command, S
                 .map_err(|error| format!("--mode: {error}"))?,
         );
     }
-    Ok(Command::Identity(mode.ok_or("--mode is required")?))
+    mode.ok_or_else(|| "--mode is required".to_owned())
 }
 
 /// How a flag of `register` is named in a message: only a short `--name` of letters, digits and
@@ -865,16 +922,17 @@ mod tests {
     fn parse(args: &[&str]) -> Result<RunArgs, String> {
         match parse_command(args)? {
             Command::Run(args) => Ok(args),
-            Command::Identify(_) | Command::Identity(_) | Command::Register(_) => {
-                Err("not a run".to_owned())
-            }
+            Command::Identify(_)
+            | Command::Identity(_)
+            | Command::Register(_)
+            | Command::Connect(_) => Err("not a run".to_owned()),
         }
     }
 
     fn identify_args(args: &[&str]) -> Result<IdentifyArgs, String> {
         match parse_command(args)? {
             Command::Identify(args) => Ok(args),
-            Command::Run(_) | Command::Identity(_) | Command::Register(_) => {
+            Command::Run(_) | Command::Identity(_) | Command::Register(_) | Command::Connect(_) => {
                 Err("not an identify".to_owned())
             }
         }
@@ -899,6 +957,36 @@ mod tests {
             &["identity", "--mode", "user", "--vci", "x"],
             &["identity", "--vci", "x"],
             &["identity", "extra"],
+        ] {
+            assert!(parse_command(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// `connect` takes `--mode` and nothing else.
+    #[test]
+    fn parses_a_connect_with_its_mode_only() {
+        for (mode, expected) in [
+            ("device", OperatingMode::Device),
+            ("user", OperatingMode::User),
+        ] {
+            assert_eq!(
+                parse_command(&["connect", "--mode", mode]),
+                Ok(Command::Connect(expected))
+            );
+        }
+        for bad in [
+            &["connect"][..],
+            &["connect", "--mode"],
+            &["connect", "--mode", "machine"],
+            &["connect", "--mode", "user", "--mode", "user"],
+            &[
+                "connect",
+                "--mode",
+                "user",
+                "--server",
+                "http://127.0.0.1:1",
+            ],
+            &["connect", "extra"],
         ] {
             assert!(parse_command(bad).is_err(), "{bad:?}");
         }

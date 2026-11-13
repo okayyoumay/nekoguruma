@@ -20,7 +20,7 @@ use shared_crypto::{PublicKey, Signer};
 use crate::redeem::World;
 
 #[path = "../../../agent/tests/support/ngr_agent_binary.rs"]
-mod ngr_agent_binary;
+pub(crate) mod ngr_agent_binary;
 
 /// The registration record as the agent wrote it: the strict reader is the agent's own and is
 /// tested there, so this reads the fields the test compares.
@@ -61,20 +61,20 @@ impl Record {
 }
 
 /// One agent's surroundings: its home and its state directory.
-struct AgentEnv {
-    home: tempfile::TempDir,
-    state: tempfile::TempDir,
+pub(crate) struct AgentEnv {
+    pub(crate) home: tempfile::TempDir,
+    pub(crate) state: tempfile::TempDir,
 }
 
 impl AgentEnv {
-    fn new() -> AgentEnv {
+    pub(crate) fn new() -> AgentEnv {
         AgentEnv {
             home: tempfile::tempdir().unwrap(),
             state: tempfile::tempdir().unwrap(),
         }
     }
 
-    fn command(&self, args: &[String]) -> Command {
+    pub(crate) fn command(&self, args: &[String]) -> Command {
         let mut command = Command::new(ngr_agent_binary::ngr_agent_path());
         command
             .args(args)
@@ -96,7 +96,7 @@ impl AgentEnv {
 
 /// Runs `command` on a blocking thread with `input` on its standard input, so that the server's
 /// tasks keep running while it does.
-async fn run(mut command: Command, input: String) -> Output {
+pub(crate) async fn run(mut command: Command, input: String) -> Output {
     tokio::task::spawn_blocking(move || {
         let mut child = command
             .stdin(Stdio::piped())
@@ -113,12 +113,12 @@ async fn run(mut command: Command, input: String) -> Output {
     .unwrap()
 }
 
-fn text(bytes: &[u8]) -> String {
+pub(crate) fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
 /// The agent key's fingerprint; the first call creates the key.
-async fn fingerprint(env: &AgentEnv) -> String {
+pub(crate) async fn fingerprint(env: &AgentEnv) -> String {
     let args = ["identity", "--mode", "user"].map(str::to_owned).to_vec();
     let output = run(env.command(&args), String::new()).await;
     assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
@@ -127,7 +127,7 @@ async fn fingerprint(env: &AgentEnv) -> String {
 }
 
 /// A code issued for the agent key `fingerprint`, and the server key ID it was issued under.
-async fn issue(world: &World, fingerprint: &str) -> (String, String) {
+pub(crate) async fn issue(world: &World, fingerprint: &str) -> (String, String) {
     let request = IssueRequest::new("alice", "Bench PC", fingerprint, None).unwrap();
     let issued = registration::issue(&world.pool, &request).await.unwrap();
     (issued.code.as_str().to_owned(), issued.server_key_id)

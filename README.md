@@ -19,7 +19,7 @@ Cargo workspace corresponding to the design document `docs/system-architecture.m
 | `vendor-manifest` | Manifest parser for ECU distribution packages | 11.2 |
 | `j2534-defs` | ABI-independent J2534 constants, protocol names, COMPARAM mapping | 8.5 |
 | `server` | Web API, jobs, distribution management, GW; a library plus the `ngr-server` binary (local profile: loopback listener, Host/Origin guard, PostgreSQL with embedded migrations, health, registration-code redemption, the agent connection-proof exchange, the control channel WebSocket and its hub, local users with the `user` command, login and the operator session) | 3.2 / 13.3 |
-| `agent` | Discovery, job execution, journal, agent key and state directory, registration with the server, the control channel session; library plus the `ngr-agent` binary | 3.3 |
+| `agent` | Discovery, job execution, journal, agent key and state directory, registration with the server, the control channel session and the `connect` command that runs it; library plus the `ngr-agent` binary | 3.3 |
 | `worker-host` | ABI detection from the library header, launching worker services, authenticated gRPC client | 7.3 / 7.4 |
 | `iso22900*`, `j2534-0404*`, `vci-service-*` | J2534 / D-PDU API FFI, wrappers, discovery, mocks and the gRPC worker services (`docs/worker-crates.md`) | 3.4 / 7.1.2 / 7.4 |
 | `ngr-library-resolver` | Resolves a VCI name to its vendor library, one module per standard and version (J2534 v04.04: Linux definition files, Windows registry; ISO 22900 D-PDU API: root description file, ISO 22900-2:2022 clause 8.7), and runs the 7.2 pre-load writability check (ADR-270) and signer check (ADR-278) | 7.1 / 7.1.1 / 7.2 |

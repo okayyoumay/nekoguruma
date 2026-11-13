@@ -50,20 +50,10 @@ const WAIT_MS: u32 = 4_000;
 /// The keep-alive period of the jobs that keep a session: under the ECU's 1.5 s timeout.
 const PERIOD: Duration = Duration::from_millis(500);
 
-/// `sim-vci` is a dev-dependency, so cargo builds its cdylib into the same `deps` directory
-/// as this test executable.
-fn sim_vci_path() -> PathBuf {
-    let exe = std::env::current_exe().expect("test executable path");
-    let deps = exe.parent().expect("test executable has a directory");
-    let name = format!(
-        "{}sim_vci{}",
-        std::env::consts::DLL_PREFIX,
-        std::env::consts::DLL_SUFFIX
-    );
-    let path = deps.join(&name);
-    assert!(path.is_file(), "{} should be built", path.display());
-    path
-}
+#[path = "common/artifacts.rs"]
+mod artifacts;
+
+use artifacts::sim_vci_path;
 
 /// Width of J2534 `unsigned long` in `sim-vci` on this platform.
 fn long_size() -> u8 {

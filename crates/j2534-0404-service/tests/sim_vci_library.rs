@@ -16,20 +16,10 @@ use j2534_0404::{
     ERR_DEVICE_NOT_CONNECTED, ERR_INVALID_DEVICE_ID, Error, J2534Api0404, StatusCode,
 };
 
-/// `sim-vci` is a dev-dependency, so cargo builds its cdylib into the same `deps` directory
-/// as this test executable.
-fn sim_vci_path() -> PathBuf {
-    let exe = std::env::current_exe().expect("test executable path");
-    let deps = exe.parent().expect("test executable has a directory");
-    let name = format!(
-        "{}sim_vci{}",
-        std::env::consts::DLL_PREFIX,
-        std::env::consts::DLL_SUFFIX
-    );
-    let path = deps.join(&name);
-    assert!(path.is_file(), "{} should be built", path.display());
-    path
-}
+#[path = "common/artifacts.rs"]
+mod artifacts;
+
+use artifacts::sim_vci_path;
 
 /// Removes the control directory however the test ends.
 struct TempDir(PathBuf);

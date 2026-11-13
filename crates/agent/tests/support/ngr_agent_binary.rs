@@ -11,7 +11,9 @@
 //! on what the older agent does rather than on the change.
 //!
 //! The lookup therefore checks the binary against the files it is compiled from: those the
-//! compiler's dep-info files list for the binary (`deps/ngr_agent-<hash>.d`) and for the library
+//! compiler's dep-info files list for the binary (`ngr_agent-<hash>.d` or `ngr_agent.d`,
+//! wherever under the build's profile directory cargo puts it, which differs between Cargo
+//! versions; `build_layout.rs`) and for the library
 //! of the `agent` package and of every workspace crate it depends on (its `[dependencies]`,
 //! target-specific ones and `[build-dependencies]`, followed through the crates' manifests; not
 //! its dev-dependencies, which the binary does not link), with each crate's build script. A
@@ -26,16 +28,22 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-/// The `ngr-agent` binary next to the test's `deps` directory, after checking that it is built and
+#[path = "build_layout.rs"]
+mod build_layout;
+
+/// The `ngr-agent` binary of the test's build, after checking that it is built and
 /// newer than its sources. `package` is the worker package under test, named in the failure
 /// message.
 pub fn ngr_agent_path(package: &str) -> PathBuf {
     let exe = std::env::current_exe().expect("test executable path");
-    let dir = exe
-        .parent()
-        .and_then(Path::parent)
-        .expect("the test executable is in a deps directory");
-    let path = dir.join(format!("ngr-agent{}", std::env::consts::EXE_SUFFIX));
+    let dir = build_layout::target_scope(&exe);
+    let file = format!("ngr-agent{}", std::env::consts::EXE_SUFFIX);
+    // The binary cargo uplifts into the profile directory is the one `cargo build` rewrites; any
+    // other (a layout that keeps it elsewhere) is the newest found under the directory.
+    let path = Some(dir.join(&file))
+        .filter(|path| path.is_file())
+        .or_else(|| build_layout::find_artifact(&exe, &file))
+        .unwrap_or_else(|| dir.join(&file));
     // Selecting tests with `--test` builds no binary of a package whose tests it leaves out, so
     // `-p agent` beside a `--test` of the worker package does not build it either.
     let rebuild = format!(
@@ -49,12 +57,11 @@ pub fn ngr_agent_path(package: &str) -> PathBuf {
     );
     let built = modified(&path).expect("the binary's modification time");
     let root = workspace_root();
-    let deps = exe.parent().expect("the deps directory");
-    let files = sources(&root, deps, "agent");
+    let files = sources(&root, &dir, "agent");
     assert!(
         !files.is_empty(),
-        "no dep-info file in {} lists the agent's sources: {rebuild}",
-        deps.display()
+        "no dep-info file under {} lists the agent's sources: {rebuild}",
+        dir.display()
     );
     let stale = newer_than(&files, built);
     assert!(
@@ -69,6 +76,31 @@ pub fn ngr_agent_path(package: &str) -> PathBuf {
             .join(", ")
     );
     path
+}
+
+/// The dep-info files a build of `name` may have written under `scope`, each with the hash of
+/// its build: a library's `<name>-<hash>.d` (the hash is empty for a binary's `<name>.d`),
+/// wherever under `scope` cargo puts them.
+fn dep_info_files(scope: &Path, name: &str) -> Vec<(String, PathBuf)> {
+    let hash_of = |file: &str| -> Option<String> {
+        if file == format!("{name}.d") {
+            return Some(String::new());
+        }
+        let hash = file
+            .strip_prefix(name)?
+            .strip_prefix('-')?
+            .strip_suffix(".d")?;
+        hash.chars()
+            .all(|c| c.is_ascii_hexdigit())
+            .then(|| hash.to_owned())
+    };
+    build_layout::files_in(scope, &|file| hash_of(file).is_some())
+        .into_iter()
+        .filter_map(|path| {
+            let hash = hash_of(&path.file_name()?.to_string_lossy())?;
+            Some((hash, path))
+        })
+        .collect()
 }
 
 /// The workspace's root directory, from the including package's `crates/<package>`.
@@ -109,10 +141,11 @@ fn newer_than(files: &[PathBuf], built: SystemTime) -> Vec<PathBuf> {
 }
 
 /// The files the binary `ngr-agent` and the libraries of `crates/<package>` under `root` and of
-/// the workspace crates it depends on were compiled from, by the newest dep-info of each in
-/// `deps`, with each crate's `build.rs`. A relative path is taken from `root`, where cargo runs the
+/// the workspace crates it depends on were compiled from, by the newest dep-info of each under
+/// the scope directory `scope` ([`dep_info_files`]), with each crate's
+/// `build.rs`. A relative path is taken from `root`, where cargo runs the
 /// compiler for workspace members.
-fn sources(root: &Path, deps: &Path, package: &str) -> Vec<PathBuf> {
+fn sources(root: &Path, scope: &Path, package: &str) -> Vec<PathBuf> {
     let mut files = Vec::new();
     let mut add = |listed: Vec<PathBuf>| {
         files.extend(listed.into_iter().map(|path| {
@@ -123,7 +156,7 @@ fn sources(root: &Path, deps: &Path, package: &str) -> Vec<PathBuf> {
             }
         }));
     };
-    add(newest_dep_info(deps, "ngr_agent", None));
+    add(newest_dep_info(scope, "ngr_agent", None));
     for dir in crates(root, package) {
         let build = dir.join("build.rs");
         if build.is_file() {
@@ -133,31 +166,18 @@ fn sources(root: &Path, deps: &Path, package: &str) -> Vec<PathBuf> {
             .file_name()
             .map(|name| name.to_string_lossy().replace('-', "_"))
             .unwrap_or_default();
-        add(newest_dep_info(deps, &name, Some("rlib")));
+        add(newest_dep_info(scope, &name, Some("rlib")));
     }
     files
 }
 
-/// The sources the newest `deps/<name>-<hash>.d` lists. With `artifact`, only a dep-info whose
-/// rules name `lib<name>-<hash>.<artifact>` counts: a library's, not a test build's of it.
-fn newest_dep_info(deps: &Path, name: &str, artifact: Option<&str>) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(deps) else {
-        return Vec::new();
-    };
+/// The sources the newest dep-info of `name` under `scope` lists ([`dep_info_files`]). With
+/// `artifact`, only a dep-info whose rules name `lib<name>-<hash>.<artifact>` counts: a
+/// library's, not a test build's of it.
+fn newest_dep_info(scope: &Path, name: &str, artifact: Option<&str>) -> Vec<PathBuf> {
     let mut newest: Option<(SystemTime, String)> = None;
-    for entry in entries.flatten() {
-        let file = entry.file_name().to_string_lossy().into_owned();
-        let Some(hash) = file
-            .strip_prefix(name)
-            .and_then(|rest| rest.strip_prefix('-'))
-            .and_then(|rest| rest.strip_suffix(".d"))
-        else {
-            continue;
-        };
-        if !hash.chars().all(|c| c.is_ascii_hexdigit()) {
-            continue;
-        }
-        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+    for (hash, path) in dep_info_files(scope, name) {
+        let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
         if let Some(artifact) = artifact {
@@ -166,7 +186,7 @@ fn newest_dep_info(deps: &Path, name: &str, artifact: Option<&str>) -> Vec<PathB
                 continue;
             }
         }
-        let Some(time) = modified(&entry.path()) else {
+        let Some(time) = modified(&path) else {
             continue;
         };
         if newest.as_ref().is_none_or(|(best, _)| time > *best) {
@@ -350,9 +370,37 @@ mod tests {
     }
 
     #[test]
+    fn the_newer_layouts_dep_info_files_are_read() {
+        let dir = std::env::temp_dir().join(format!("ngr-agent-layout-{}", std::process::id()));
+        let lib = dir.join("build/agent/0a/out");
+        let bin = dir.join("build/agent/1b/out");
+        std::fs::create_dir_all(&lib).expect("a temporary directory");
+        std::fs::create_dir_all(&bin).expect("a temporary directory");
+        std::fs::write(
+            lib.join("agent-0a.d"),
+            "/t/build/agent/0a/out/libagent-0a.rlib: src/lib.rs\n\nsrc/lib.rs:\n",
+        )
+        .expect("the library's dep-info");
+        std::fs::write(
+            bin.join("ngr_agent.d"),
+            "/t/build/agent/1b/out/ngr_agent: src/main.rs\n\nsrc/main.rs:\n",
+        )
+        .expect("the binary's dep-info");
+        assert_eq!(
+            newest_dep_info(&dir, "agent", Some("rlib")),
+            [PathBuf::from("src/lib.rs")]
+        );
+        assert_eq!(
+            newest_dep_info(&dir, "ngr_agent", None),
+            [PathBuf::from("src/main.rs")]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn the_binarys_sources_are_found_in_this_build() {
         let exe = std::env::current_exe().expect("test executable path");
-        let files = sources(&root(), exe.parent().unwrap(), "agent");
+        let files = sources(&root(), &build_layout::target_scope(&exe), "agent");
         assert!(
             files
                 .iter()

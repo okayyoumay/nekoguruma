@@ -36,8 +36,9 @@ Hard rules (these override anything else in your brief):
   hang.
 - **Clean up processes your own interrupted commands leave behind.** A
   killed `cargo test` can orphan test binaries under `target/debug/deps/`
-  (names with underscores plus a hash). Find them with the names from the
-  run's own `Running target/debug/deps/...` lines, kill them before
+  (or, since Rust 1.100, `target/debug/build/<package>/<hash>/out/`; names
+  with underscores plus a hash). Find them with the names from the run's own
+  `Running target/...` lines, kill them before
   re-running, and say so.
 - **Check the known flaky tests before calling a failure a regression.** The
   worker-crate backlog in `work/` has a "Known Flaky Tests" section per

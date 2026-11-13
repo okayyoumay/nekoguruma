@@ -6,7 +6,7 @@
 //!
 //! `ngr-agent` belongs to another package, so cargo builds it only when the run builds the
 //! `agent` package's binaries (as `cargo test --workspace` and CI do). It is looked up next to
-//! the test's `deps` directory and checked against its sources
+//! the test's profile directory and checked against its sources
 //! (`crates/agent/tests/support/ngr_agent_binary.rs`): build it first with
 //! `cargo build -p agent --bin ngr-agent` to run this package's tests alone.
 
@@ -24,25 +24,10 @@ const LIBRARY_NAME: &str = "sim-vci";
 /// The simulated ECU's built-in VIN (`crates/sim-vci/docs/simulated-vci.md`).
 const VIN: &[u8] = b"NGRSIMECU00000001";
 
-fn deps_dir() -> PathBuf {
-    let exe = std::env::current_exe().expect("test executable path");
-    exe.parent()
-        .expect("test executable has a directory")
-        .to_path_buf()
-}
+#[path = "common/artifacts.rs"]
+mod artifacts;
 
-/// `sim-vci` is a dev-dependency, so cargo builds its cdylib into the same `deps` directory
-/// as this test executable.
-fn sim_vci_path() -> PathBuf {
-    let name = format!(
-        "{}sim_vci{}",
-        std::env::consts::DLL_PREFIX,
-        std::env::consts::DLL_SUFFIX
-    );
-    let path = deps_dir().join(&name);
-    assert!(path.is_file(), "{} should be built", path.display());
-    path
-}
+use artifacts::sim_vci_path;
 
 #[path = "../../agent/tests/support/ngr_agent_binary.rs"]
 mod ngr_agent_binary;

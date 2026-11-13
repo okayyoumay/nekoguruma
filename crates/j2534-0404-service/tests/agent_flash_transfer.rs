@@ -67,20 +67,10 @@ const LONGEST_BLOCK: usize = 0x0100;
 const PART_NUMBER: &[u8] = b"NGR-SIM-ECU";
 const SW_VERSION: &[u8] = b"1.0.0";
 
-/// `sim-vci` is a dev-dependency, so cargo builds its cdylib into the same `deps` directory
-/// as this test executable.
-fn sim_vci_path() -> PathBuf {
-    let exe = std::env::current_exe().expect("test executable path");
-    let deps = exe.parent().expect("test executable has a directory");
-    let name = format!(
-        "{}sim_vci{}",
-        std::env::consts::DLL_PREFIX,
-        std::env::consts::DLL_SUFFIX
-    );
-    let path = deps.join(&name);
-    assert!(path.is_file(), "{} should be built", path.display());
-    path
-}
+#[path = "common/artifacts.rs"]
+mod artifacts;
+
+use artifacts::sim_vci_path;
 
 /// Width of J2534 `unsigned long` in `sim-vci` on this platform.
 fn long_size() -> u8 {

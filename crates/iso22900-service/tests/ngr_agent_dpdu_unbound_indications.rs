@@ -11,8 +11,7 @@
 //! the worker through `NGR_SIM_ECU_COMMANDS` on the spawned agent, so no test sets a variable of
 //! this process.
 //!
-//! `ngr-agent` belongs to another package: build it first with
-//! `cargo build -p agent --bin ngr-agent` to run this package's tests alone (see
+//! `ngr-agent` belongs to another package, so the test asks Cargo for it (see
 //! `ngr_agent_dpdu_end_to_end.rs`).
 
 use std::path::{Path, PathBuf};
@@ -27,7 +26,7 @@ const LIBRARY_NAME: &str = "NGR Mock D-PDU API";
 mod ngr_agent_binary;
 
 fn ngr_agent_path() -> PathBuf {
-    ngr_agent_binary::ngr_agent_path("iso22900-service")
+    ngr_agent_binary::ngr_agent_path()
 }
 
 /// A variant's document whose procedure is `procedure`: its protocol is UDS over ISO 15765 at

@@ -7098,7 +7098,8 @@ fn collect_mock_libraries(dir: &Path, found: &mut Vec<PathBuf>) {
 /// Returns the most recently modified mock library under `dir`. The target
 /// directory can hold several copies (e.g. Cargo's uplifted
 /// `target/debug/lib*.so` next to the freshly compiled artifact in
-/// `target/debug/deps/`), and the uplifted copy is not refreshed by every
+/// `target/debug/deps/`, or in `target/debug/build/<package>/<hash>/out/`
+/// since Rust 1.100), and the uplifted copy is not refreshed by every
 /// build — picking the first directory-walk hit could load a stale build
 /// whose FFI constants disagree with the code under test.
 fn search_directory(dir: &Path) -> Option<PathBuf> {

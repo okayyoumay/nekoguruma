@@ -4,10 +4,9 @@
 //! server runs in the test's process over a throwaway PostgreSQL. Codes are issued through the
 //! server's own issuance path (`registration::issue`); keys are made by the agent itself.
 //!
-//! `ngr-agent` belongs to another package, so cargo builds it only when the run builds the
-//! `agent` package's binaries (as `cargo test --workspace` and CI do). It is looked up and
-//! checked against its sources by `crates/agent/tests/support/ngr_agent_binary.rs`: build it
-//! first with `cargo build -p agent --bin ngr-agent` to run this package's tests alone.
+//! `ngr-agent` belongs to another package, so the test asks Cargo for it
+//! (`crates/agent/tests/support/ngr_agent_binary.rs`): it builds `-p agent --bin ngr-agent`, or
+//! finds it up to date, and uses the path Cargo reports.
 //!
 //! A release agent has no plain-file store, so this module is compiled in debug builds only.
 
@@ -76,7 +75,7 @@ impl AgentEnv {
     }
 
     fn command(&self, args: &[String]) -> Command {
-        let mut command = Command::new(ngr_agent_binary::ngr_agent_path("server"));
+        let mut command = Command::new(ngr_agent_binary::ngr_agent_path());
         command
             .args(args)
             .env("HOME", self.home.path())

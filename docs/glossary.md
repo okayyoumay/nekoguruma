@@ -80,9 +80,6 @@ The `Flags` argument of J2534 `PassThruConnect`, fixed for the channel's lifetim
 **Connection challenge** (design 6.4, 14.4, ADR-466)  
 The 32 random bytes that the server gives an agent from `POST /api/v1/agent/challenge`, which the agent's **Connection proof** covers. It lives 60 seconds in the server's memory and is removed at its first presentation whatever the outcome, so a proof cannot be replayed. The server keeps at most 1024 of them.
 
-**Connection lock** (design 5.2, ADR-471)  
-The agent's exclusive lock `<state>/control/connection.lock`, held with the registration record's lock for the whole run of a **Control channel** session, so one session runs per mode and state directory and `ngr-agent register` cannot replace the record under it (exit 3). It is tried once and never deleted.
-
 **Connection proof** (design 6.4, 14.4, ADR-459)  
 What an agent signs with its **Agent key** to authenticate a connection: a transcript of a purpose tag, a protocol version, the server's origin (audience), the agent ID, a 32-byte server challenge and a 32-byte agent nonce, length-prefixed and without a timestamp, because the device clock is untrusted. The server issues each challenge once. It works without TLS, so it serves the local profile too. `shared-crypto::proof` builds, signs and verifies the transcript. The purpose tag keeps a proof signature from verifying as any other signed message, such as a job instruction.
 

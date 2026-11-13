@@ -1,7 +1,7 @@
 # ADR-470: The Agent Registers in a Fixed Order That Spends the Code Last
 
 **Date:** 2026-11-12
-**Status:** Accepted (its Consequence on `register` during a session settled by ADR-471)
+**Status:** Accepted
 **Affects:** design 6.7; `crates/agent` (`registration`, the server HTTP client, `ngr-agent register`), `crates/agent/docs/ngr-agent.md`; `api/openapi.yaml` (`AgentRegistration`); `docs/glossary.md`; details ADR-463 items 13, 16, 17 and 18
 
 ## Context

@@ -858,6 +858,36 @@ async fn quiet_for(client: &mut Client, millis: u64) {
     );
 }
 
+/// How many statements of the server match `like` and are running now (not idle in a
+/// transaction), as seen from the database.
+async fn running_statements(u: &Up, like: &str) -> u32 {
+    u.w.pg
+        .scalar(&format!(
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE pid <> pg_backend_pid() AND state = 'active' AND query LIKE '{like}'"
+        ))
+        .await
+        .parse()
+        .unwrap()
+}
+
+/// Polls (real time, at most 5 seconds) until a statement matching `like` is running (`want`) or
+/// no longer is.
+async fn wait_for_statement(u: &Up, like: &str, want: bool) {
+    for _ in 0..200 {
+        if (running_statements(u, like).await > 0) == want {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("no statement like {like}: running = {want} within 5 seconds");
+}
+
+/// What the revocation pass's read looks like in the database.
+const PASS_READ: &str = "%revoked_at IS NULL%";
+/// What the connect stamp looks like in the database.
+const STAMP: &str = "UPDATE agents SET last_seen_at%";
+
 // A1, B3, B4
 #[tokio::test]
 async fn the_connect_stamp_is_set_when_hello_is_read_and_heartbeats_do_not_move_it() {
@@ -1069,9 +1099,12 @@ async fn a_stop_during_the_stamp_is_not_raced_and_the_connection_is_closed_with_
     let t = token(&u).await;
     let lock = lock_agents(&u).await;
     let mut client = connect(u.s.addr, &t).await;
+    // The marker: the session is adopted and its stamp waits on the lock, so the stop below
+    // cannot come before the adoption (which would drop the session unrun: A8).
+    wait_for_statement(&u, STAMP, true).await;
     let Up { w, mut s, id, .. } = u;
-    s.signal_stop();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Returns once the listener is closed, which is after the hub has begun its stop.
+    s.begin_stop().await;
     drop(lock);
     let (code, ()) = tokio::join!(first_frame_close_code(&mut client), s.joined());
     assert_eq!(code, 1001, "no hello before it");
@@ -1162,7 +1195,13 @@ async fn the_pass_leaves_live_agents_alone_and_runs_again_after_the_next_period(
     let t = token(&u).await;
     let mut one = open(u.s.addr, &t).await;
     let mut two = open(u.s.addr, &other_token).await;
+    // The pass's read is held on a lock until the clock has jumped, then let go: once it is
+    // seen to have finished, nobody may have been closed.
+    let lock = lock_agents(&u).await;
     jump(31).await;
+    wait_for_statement(&u, PASS_READ, true).await;
+    drop(lock);
+    wait_for_statement(&u, PASS_READ, false).await;
     heartbeat(&mut one).await;
     heartbeat(&mut two).await;
     assert_eq!(count(&log, "its control channel is closed"), 0);
@@ -1241,6 +1280,19 @@ async fn a_failed_read_of_the_pass_closes_nobody_and_the_next_period_is_normal()
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     assert_eq!(count(&log, "could not read the agents"), 1);
+    // The read has finished and failed: the agent is still open and its token still works (a
+    // valid token without an upgrade is 400, a dropped one is 401).
+    heartbeat(&mut one).await;
+    let r = exchange(
+        u.s.addr,
+        &raw(
+            &u.s.host(),
+            "HTTP/1.1",
+            &["Connection: close".to_owned(), bearer(&t)],
+        ),
+    )
+    .await;
+    assert_problem(&r, 400, "the token after a failed read");
     u.w.pg
         .execute("ALTER TABLE agents RENAME COLUMN revoked_x TO revoked_at")
         .await;
@@ -1419,7 +1471,7 @@ async fn messages_nobody_takes_are_dropped_without_waiting_and_an_inbox_taken_la
 }
 
 /// Takes the inbox and sends events until the inbox is full and the task holds one more.
-async fn fill_inbox(u: &Up, client: &mut Client) -> tokio::sync::mpsc::Receiver<Inbound> {
+async fn fill_inbox_only(u: &Up, client: &mut Client) -> tokio::sync::mpsc::Receiver<Inbound> {
     let inbox = u.hub.inbox().expect("the first call");
     for seq in 1..=INBOX_CAPACITY + 1 {
         client.send(progress(seq)).await.unwrap();
@@ -1431,7 +1483,13 @@ async fn fill_inbox(u: &Up, client: &mut Client) -> tokio::sync::mpsc::Receiver<
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     assert_eq!(inbox.len(), INBOX_CAPACITY, "the inbox is full");
-    // The marker is the full inbox; now nothing more is read, so no echo comes.
+    inbox
+}
+
+/// As [`fill_inbox_only`], then proves that nothing more is read: a heartbeat sent now is not
+/// echoed.
+async fn fill_inbox(u: &Up, client: &mut Client) -> tokio::sync::mpsc::Receiver<Inbound> {
+    let inbox = fill_inbox_only(u, client).await;
     client.send(Message::Text(HEARTBEAT.into())).await.unwrap();
     quiet_for(client, 300).await;
     inbox
@@ -1519,5 +1577,79 @@ async fn a_command_written_to_a_silent_agent_does_not_restart_the_idle_clock() {
     // 65 s after hello and 25 after the command: the command did not move the 60 s deadline.
     jump(25).await;
     assert_eq!(close_code(&mut client).await, 4003);
+    u.finish().await;
+}
+
+// E6 (the idle clock restarts on hand-over; the queue is not drained while the task waits)
+#[tokio::test]
+async fn a_hand_over_restarts_the_idle_clock_and_the_queue_waits_for_the_release() {
+    let u = Up::new().await;
+    let t = token(&u).await;
+    let mut client = open(u.s.addr, &t).await;
+    // No heartbeat is queued behind the events, so the hand-over is the only thing that can
+    // restart the idle clock.
+    let mut inbox = fill_inbox_only(&u, &mut client).await;
+    jump(61).await;
+    quiet_for(&mut client, 200).await;
+    u.hub
+        .send_job_command(&agent_id(&u), "j".to_owned())
+        .unwrap();
+    quiet_for(&mut client, 300).await;
+    // The slot frees: the frame arrives only now, and the connection is not idle although the
+    // old deadline has passed.
+    let _ = next_inbound(&mut inbox).await;
+    let message = ServerMessage::decode(&text(&mut client).await).unwrap();
+    assert!(matches!(message, ServerMessage::JobCommand { .. }));
+    // Under 60 seconds after the hand-over: open. Past it: 4003.
+    jump(40).await;
+    quiet_for(&mut client, 200).await;
+    jump(30).await;
+    assert_eq!(close_code(&mut client).await, 4003);
+    u.finish().await;
+}
+
+// D13 (a close instruction)
+#[tokio::test]
+async fn a_frame_queued_before_a_close_instruction_is_never_written() {
+    let u = Up::new().await;
+    let t = token(&u).await;
+    let agent = agent_id(&u);
+    // The test does not yield between the two calls, so the task finds both ready; it takes
+    // either at random unless the frame's arm looks at the instruction first.
+    for round in 0..16 {
+        let mut client = open(u.s.addr, &t).await;
+        u.hub.send_job_command(&agent, format!("j{round}")).unwrap();
+        assert!(u.hub.close_agent(&agent, 4002));
+        assert_eq!(
+            first_frame_close_code(&mut client).await,
+            4002,
+            "round {round}"
+        );
+    }
+    u.finish().await;
+}
+
+// D13 (the stop)
+#[tokio::test]
+async fn a_frame_queued_before_the_stop_is_never_written() {
+    let mut u = Up::new().await;
+    let mut agents = vec![(agent_id(&u), token(&u).await)];
+    for _ in 0..7 {
+        let (id, token) = second_agent(&u).await;
+        agents.push((AgentId(id), token));
+    }
+    let mut clients = Vec::new();
+    for (_, token) in &agents {
+        clients.push(open(u.s.addr, token).await);
+    }
+    // The stop is signalled and the commands are queued with no yield between, so each task
+    // finds its frame and the stop ready together.
+    u.s.signal_stop();
+    for (agent, _) in &agents {
+        u.hub.send_job_command(agent, "j".to_owned()).unwrap();
+    }
+    for client in &mut clients {
+        assert_eq!(first_frame_close_code(client).await, 1001);
+    }
     u.finish().await;
 }

@@ -20,7 +20,11 @@ use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use shared_proto::{AgentId, AgentMessage, CLOSE_CODE_REPLACED, ServerMessage};
+use shared_proto::{
+    AgentId, AgentMessage, CLOSE_CODE_BINARY, CLOSE_CODE_GOING_AWAY, CLOSE_CODE_IDLE,
+    CLOSE_CODE_PROTOCOL, CLOSE_CODE_REPLACED, CLOSE_CODE_REVOKED, CLOSE_CODE_TOO_BIG,
+    ServerMessage,
+};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
@@ -204,8 +208,22 @@ impl Hub {
 
     /// Tells `agent`'s current connection to end with `code`, and says whether it was told: the
     /// instruction is given once, and `false` means there is no current connection or it has
-    /// already been told. The entry stays until the connection's task leaves (ADR-468).
+    /// already been told. The entry stays until the connection's task leaves (ADR-468). Only the
+    /// server's own close codes are sent; any other code (such as 1005, 1006 or 1015, which are
+    /// never put on the wire) is refused with `false` and tells nobody.
     pub fn close_agent(&self, agent: &AgentId, code: u16) -> bool {
+        let own = [
+            CLOSE_CODE_GOING_AWAY,
+            CLOSE_CODE_PROTOCOL,
+            CLOSE_CODE_BINARY,
+            CLOSE_CODE_TOO_BIG,
+            CLOSE_CODE_REPLACED,
+            CLOSE_CODE_REVOKED,
+            CLOSE_CODE_IDLE,
+        ];
+        if !own.contains(&code) {
+            return false;
+        }
         let mut state = self.0.lock();
         state
             .current
@@ -572,6 +590,22 @@ mod tests {
         // A later connection is not told by the earlier instruction.
         let mut next = hub.register(&a).unwrap();
         assert!(next.close.try_recv().is_err());
+    }
+
+    #[test]
+    fn close_agent_refuses_a_code_that_is_not_the_servers_own() {
+        let hub = Hub::new();
+        let a = agent("a");
+        let mut reg = hub.register(&a).unwrap();
+        for code in [1000, 1005, 1006, 1015, 4000, 4004, 0, u16::MAX] {
+            assert!(!hub.close_agent(&a, code), "code {code}");
+        }
+        assert!(reg.close.try_recv().is_err(), "nobody was told");
+        for code in [1001, 1002, 1003, 1009, 4001, 4002, 4003] {
+            let mut reg = hub.register(&a).unwrap();
+            assert!(hub.close_agent(&a, code), "code {code}");
+            assert_eq!(reg.close.try_recv(), Ok(code));
+        }
     }
 
     // E1

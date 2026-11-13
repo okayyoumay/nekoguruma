@@ -83,6 +83,7 @@ async fn pass<F, Fut>(
             return;
         }
     };
+    let live: std::collections::HashSet<String> = live.into_iter().collect();
     // A connection that registered after the snapshot is not judged until the next pass.
     for (agent, _) in snapshot {
         if !live.contains(&agent.0) {

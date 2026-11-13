@@ -86,9 +86,12 @@ pub struct Opened {
     record: Record,
 }
 
+/// Fields drop in declaration order: the registration lock is released first and the connection
+/// lock last, so a racing `open` that finds the connection lock free never fails on a
+/// registration lock this session still holds, and one that finds it held sees `AlreadyRunning`.
 struct Locks {
-    _connection: WriterLock,
     _registration: WriterLock,
+    _connection: WriterLock,
 }
 
 impl std::fmt::Debug for Opened {
@@ -125,8 +128,8 @@ pub fn open_in(control_dir: &Path, registration_dir: &Path) -> Result<Opened, Co
     };
     Ok(Opened {
         locks: Locks {
-            _connection: connection,
             _registration: registration,
+            _connection: connection,
         },
         record,
     })
@@ -178,8 +181,15 @@ struct StatusTx(watch::Sender<Status>);
 impl StatusTx {
     fn phase(&self, phase: Phase) {
         self.0.send_if_modified(|status| {
-            let changed = status.phase != phase;
+            // The interval is shown while connected only.
+            let heartbeat = if phase == Phase::Connected {
+                status.heartbeat
+            } else {
+                None
+            };
+            let changed = status.phase != phase || status.heartbeat != heartbeat;
             status.phase = phase;
+            status.heartbeat = heartbeat;
             changed
         });
     }
@@ -432,7 +442,8 @@ async fn run(wiring: Wiring, stop: Stop, status: StatusTx) {
                     backoff.reset();
                 }
                 let wait = backoff.wait(retry_after);
-                status.waiting(backoff.delay());
+                // The wait itself, which a longer Retry-After lengthens.
+                status.waiting(wait);
                 // Never before the close handshake ended: the attempt returns after it.
                 tokio::select! {
                     biased;

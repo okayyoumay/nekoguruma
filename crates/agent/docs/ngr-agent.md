@@ -368,7 +368,7 @@ key and passes it in.
 - **Connected**, the agent sends `{"type":"heartbeat"}` at `hello` plus each multiple of the
   interval the `hello` gave, and ends the connection with Close 4003 when no frame has arrived
   for three intervals. Every frame received counts, pings and pongs included; a heartbeat it
-  sends does not. A job command is decoded and counted, and nothing is answered yet; the other
+  sends does not. A job command is decoded and counted in `Status`, and not answered; the other
   server messages are read and dropped. A second `hello`, text that does not decode or a job
   command without a usable command ID is Close 1002, a binary frame 1003, a message over the limit
   1009; after a read error the agent sends its Close and waits 5 seconds without reading.
@@ -379,15 +379,16 @@ key and passes it in.
   A 429 on the challenge route with a `Retry-After` of 1 to 60 seconds waits the longer of the two.
   A connection that received frames for at least 60 seconds after its `hello` sets the delay back
   to 1 second when it ends, unless it ended with 4001 or 4002. The first attempt starts at once,
-  and there is no jitter yet. All timing uses tokio's clock, never the wall clock.
+  and the delays have no jitter. All timing uses tokio's clock, never the wall clock.
 - **A stop** drops an HTTP call or an upgrade in progress, and after the 101 sends Close 1001
-  (at most 10 seconds to write it and 5 to read the answer).
+  (at most 10 seconds to write it and 5 to read the answer); a stop during a heartbeat write
+  drops the connection.
 - **Logging**: one `info` line when the connection is up and one when it ends, with the close
   code the server sent; one `warn` per failure class until the next `hello`, and one per refusal
-  until a session token is issued again, with `debug` for the repeats ("Entries with a rule of their own" in `operational-log.md`).
-
-The `connect` command that runs the session, the answers to job commands, reconciliation and the
-outbox come later.
+  until a session token is issued again, with `debug` for the repeats ("Entries with a rule of
+  their own" in `operational-log.md`). The WebSocket library turns a Close code it does not
+  accept (2000, for example) into 1002 before the agent reads it, so such a close is logged as
+  1002 at `warn`.
 
 ## Job instruction gate
 

@@ -92,6 +92,11 @@ throughout.
   text of a Close the server sent. A failure class warns once until the next `hello` and is logged
   at `debug` after that; a refusal (403, a 429 on the session route, Close 4002) warns once until
   the server issues a session token again.
+  `tungstenite` and `tokio-tungstenite` log through the `log` crate, at `trace` and `debug`, the
+  upgrade request with its `Authorization` header, each message's text and a close's reason. The
+  agent installs no `log` bridge, so none of it reaches the operational log; adding one (for
+  example tracing-subscriber's `tracing-log` feature through `init()`) needs a filter that keeps
+  those targets out first.
 
 ## A crate not yet checked
 

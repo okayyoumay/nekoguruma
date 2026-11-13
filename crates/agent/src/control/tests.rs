@@ -1329,6 +1329,18 @@ async fn b3_a_429_with_a_usable_retry_after_waits_the_longer_then_doubles() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn b3_the_status_shows_the_wait_a_long_retry_after_sets() {
+    let mut env = Env::new();
+    let at = env.fail_challenge(429, &[("Retry-After", "30")], b"").await;
+    env.wait_phase(Phase::Waiting).await;
+    assert_eq!(env.status().next_delay, secs(30));
+    let (next, ..) = env.request().await;
+    assert_eq!(gaps(&[at, next]), vec![30]);
+    // The wait is over: the delay it doubled to is shown.
+    assert_eq!(env.status().next_delay, secs(2));
+}
+
+#[tokio::test(start_paused = true)]
 async fn b4_a_429_without_a_usable_retry_after_is_an_ordinary_failure() {
     let mut env = Env::new();
     let variants: Vec<Vec<(&str, &str)>> = vec![
@@ -2452,6 +2464,20 @@ async fn g6_4003_is_an_end_with_a_warning() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn g8_a_close_code_the_stack_rewrites_is_seen_as_1002() {
+    // The stack replaces a received Close code it does not accept (here 2000) with 1002 before the
+    // agent sees it, so the agent logs 1002 as a protocol close at warn. That is accepted: the
+    // path is G3's, the delay is the ordinary one.
+    let mut env = Env::new();
+    let at = server_closes(&mut env, Some(2000)).await;
+    let (next, _) = env.challenge().await;
+    assert_eq!(gaps(&[at, next]), vec![1]);
+    assert_eq!(env.log.warns("server-closed-protocol"), 1);
+    assert!(env.log.contains("code=Some(1002)"));
+    assert!(!env.log.contains("code=Some(2000)"));
+}
+
+#[tokio::test(start_paused = true)]
 async fn g7_a_close_while_the_agent_drains_its_own_is_discarded() {
     let mut env = Env::new();
     let (hello_at, mut ws) = env.connected(10).await;
@@ -2555,6 +2581,40 @@ async fn h5_stop_during_the_agents_own_drain_or_linger_ends_it() {
     env.handle.stop();
     env.handle.stopped().await;
     assert_after(at, Instant::now(), 2, "the linger was cut short");
+}
+
+#[tokio::test(start_paused = true)]
+async fn h5_stop_during_a_stalled_heartbeat_write_drops_the_connection_at_once() {
+    let mut env = Env::new();
+    let (hello_at, mut ws) = env.connected(10).await;
+    env.dial.flags.stall_write.store(true, Ordering::SeqCst);
+    // The first tick starts a write that never finishes; the stop comes 2 s into it.
+    until(hello_at + secs(12)).await;
+    let at = Instant::now();
+    env.handle.stop();
+    tokio::time::timeout(DEADLINE, env.handle.stopped())
+        .await
+        .expect("the stop waited for the stalled write");
+    // Neither the 10 s write bound nor a Close's own write and drain.
+    assert_after(at, Instant::now(), 0, "no waiting");
+    assert!(env.fx.locks_are_free(), "both locks are released");
+    env.dial.flags.stall_write.store(false, Ordering::SeqCst);
+    // No Close frame was sent: the connection was dropped.
+    let (_, next) = got(&mut ws).await;
+    assert_eq!(next, Got::Eof);
+}
+
+#[tokio::test(start_paused = true)]
+async fn h7_a_stopped_session_shows_no_heartbeat_interval() {
+    let mut env = Env::new();
+    let (_, mut ws) = env.connected(10).await;
+    assert_eq!(env.status().heartbeat, Some(secs(10)));
+    env.handle.stop();
+    close_of(&mut ws, 1001, true).await;
+    env.handle.stopped().await;
+    let status = env.status();
+    assert_eq!(status.phase, Phase::Stopped);
+    assert!(status.heartbeat.is_none());
 }
 
 #[tokio::test(start_paused = true)]
@@ -2804,7 +2864,9 @@ async fn r1_over_real_loopback_an_exchange_an_upgrade_a_heartbeat_and_a_stop() {
         let mut ws = accept_ws(stream, seen.clone()).await;
         let bearer = format!("Bearer {token}");
         assert!(seen.lock().unwrap().header("authorization") == Some(bearer.as_str()));
-        ws.send(Message::Text(hello(1).into())).await.unwrap();
+        // A 5 s interval gives a 15 s idle deadline in real time: a stalled CI thread does not
+        // trip it.
+        ws.send(Message::Text(hello(5).into())).await.unwrap();
         // One heartbeat from the agent after the interval, and one echo from here.
         let message = ws.next().await.unwrap().unwrap();
         assert_eq!(message, Message::Text(HEARTBEAT.into()));
@@ -2830,11 +2892,13 @@ async fn r1_over_real_loopback_an_exchange_an_upgrade_a_heartbeat_and_a_stop() {
 
 #[tokio::test]
 async fn r1_over_real_loopback_a_refused_connection_and_then_the_server_appears() {
-    // A port that nothing listens on.
-    let port = {
-        let probe = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        probe.local_addr().unwrap().port()
-    };
+    // A bound socket that does not listen yet: connects to it are refused, and the port stays
+    // ours until `listen`.
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket
+        .bind((std::net::Ipv4Addr::LOCALHOST, 0).into())
+        .unwrap();
+    let port = socket.local_addr().unwrap().port();
     let (fx, agent, _) = real_fixture(port);
     let handle = fx.open().unwrap().start(agent).unwrap();
     tokio::time::timeout(secs(30), async {
@@ -2845,9 +2909,7 @@ async fn r1_over_real_loopback_a_refused_connection_and_then_the_server_appears(
             .await
             .unwrap();
         // The server appears; the retry reaches it.
-        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
-            .await
-            .expect("the port is still free");
+        let listener = socket.listen(16).unwrap();
         let (mut stream, _) = listener.accept().await.unwrap();
         real_challenge(&mut stream).await;
         let (mut stream, _) = listener.accept().await.unwrap();

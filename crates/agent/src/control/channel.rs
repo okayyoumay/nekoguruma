@@ -396,8 +396,17 @@ async fn connected(socket: &mut Socket, secs: u32, state: &mut SessionState<'_>)
                 return End::close(CLOSE_CODE_IDLE, "idle", lived_now);
             }
             () = tokio::time::sleep_until(hello_at + interval * tick) => {
-                if !write_text(socket, HEARTBEAT).await {
-                    return End::dropped("write", lived_now);
+                // A stop does not wait for the write. A half-written frame cannot be followed
+                // by a clean Close, so the connection is dropped (H5).
+                let written = tokio::select! {
+                    biased;
+                    () = state.stop.requested() => None,
+                    written = write_text(socket, HEARTBEAT) => Some(written),
+                };
+                match written {
+                    None => return End::new(Action::Drop, "stopped", Warn::None, false),
+                    Some(false) => return End::dropped("write", lived_now),
+                    Some(true) => {}
                 }
                 tick += 1;
                 while hello_at + interval * tick <= Instant::now() {

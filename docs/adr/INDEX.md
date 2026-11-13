@@ -460,8 +460,9 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-468](ADR-468-the-control-channel-judges-the-token-before-the-upgrade-and-runs-each-connection-as-a-task-the-hub-owns.md) | The Control Channel Judges the Token Before the Upgrade and Runs Each Connection as a Task the Hub Owns | Accepted (items 8, 11 and 12 detailed by ADR-472) | design 5.2, 13.3, 14.1, 15.1, `crates/server`, `crates/shared-proto`, `api/asyncapi.yaml`; extends ADR-466 item 5, details its item 6 and ADR-456 item 9 |
 | [ADR-469](ADR-469-local-users-log-in-with-an-argon2id-password-and-hold-an-in-memory-cookie-session.md) | Local Users Log In With an Argon2id Password and Hold an In-Memory Cookie Session | Accepted | design 6.4, 13, 13.3, `db/`, `api/openapi.yaml`, `crates/server`; answers ADR-456's CSRF and passkey questions; departs from ADR-463 item 5 for passwords |
 | [ADR-470](ADR-470-the-agent-registers-in-a-fixed-order-that-spends-the-code-last.md) | The Agent Registers in a Fixed Order That Spends the Code Last | Accepted (its Consequence on `register` during a session settled by ADR-471) | design 6.7, `crates/agent`, `api/openapi.yaml`; details ADR-463 items 13, 16, 17 and 18 |
-| [ADR-471](ADR-471-the-agents-control-channel-session-is-one-task-between-two-locks-and-no-answer-of-the-server-ends-it.md) | The Agent's Control Channel Session Is One Task Between Two Locks, and No Answer of the Server Ends It | Accepted | design 5.2, 5.3, 6.4, 14.1, `api/`, `crates/agent`, `crates/shared-proto`, `crates/server`; details ADR-466 for the agent's side; settles ADR-470's Consequence on `register` during a session |
+| [ADR-471](ADR-471-the-agents-control-channel-session-is-one-task-between-two-locks-and-no-answer-of-the-server-ends-it.md) | The Agent's Control Channel Session Is One Task Between Two Locks, and No Answer of the Server Ends It | Accepted (item 5's job command answered through the gate, ADR-473) | design 5.2, 5.3, 6.4, 14.1, `api/`, `crates/agent`, `crates/shared-proto`, `crates/server`; details ADR-466 for the agent's side; settles ADR-470's Consequence on `register` during a session |
 | [ADR-472](ADR-472-the-hub-stamps-every-end-of-a-current-connection-and-drops-what-no-consumer-takes.md) | The Hub Stamps Every End of a Current Connection and Drops What No Consumer Takes | Accepted | design 14.1, 14.4, `api/asyncapi.yaml`, `crates/server`, `db/README.md`; details ADR-468 items 8, 11 and 12 |
+| [ADR-473](ADR-473-the-agent-answers-a-verified-job-command-with-an-acknowledgement-alone-until-the-outbox-numbers-events.md) | The Agent Answers a Verified Job Command With an Acknowledgement Alone Until the Outbox Numbers Events | Accepted | design 5.3, `api/asyncapi.yaml`, `crates/agent`; details ADR-466 items 10 and 13, ADR-461 items 9 and 10 and ADR-471 item 5 for the agent's side |
 
 ## Status Legend
 
@@ -1050,5 +1051,6 @@ the predecessor repository these ADRs came from.
 - ADR-467
 - ADR-468 (items 8, 11 and 12 detailed by ADR-472)
 - ADR-470 (its Consequence on `register` during a session settled by ADR-471)
-- ADR-471
+- ADR-471 (item 5's job command answered through the gate, ADR-473)
 - ADR-472
+- ADR-473

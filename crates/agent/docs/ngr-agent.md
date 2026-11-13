@@ -351,10 +351,14 @@ key and passes it in.
   no record is `NotRegistered`; a record that does not read, or whose `server_origin` is not
   `http://127.0.0.1` or `http://127.0.0.1:<port>`, is `Record`. Nothing of the record's path or
   content is logged. A record edited while the session runs is not read again.
-- **`Opened::start(key)`** refuses a key whose fingerprint is not the record's (`KeyMismatch`),
-  else spawns the task and returns a `Handle`: `stop()`, `stopped()` (resolves once both locks are
-  released) and `status()`, a watch of the phase, the heartbeat interval, the next delay and the
-  count of job commands left unanswered.
+- **`Opened::start(key, intake)`** refuses a key whose fingerprint is not the record's
+  (`KeyMismatch`), else spawns the task and returns a `Handle`: `stop()`, `stopped()` (resolves
+  once both locks are released) and `status()`, a watch of the phase, the heartbeat interval, the
+  next delay and `commands_acknowledged` and `commands_rejected`, the job commands answered
+  `commandAck` and `commandRejected` over all connections (a command is counted once its answer
+  is written). `intake` is the `Intake` trait object that takes every verified instruction; the
+  default, `LogIntake`, is connected to no job runner: it logs the job ID at `debug` and drops the
+  instruction.
 - **Both locks are held from `open` until the task ends**, waits included, and released by drop
   on every path: a stop, a dropped handle, a panic, a runtime shutdown or an `Opened` dropped
   unstarted. The lock files are never deleted. While a session runs, `ngr-agent register` exits 3.
@@ -368,10 +372,23 @@ key and passes it in.
 - **Connected**, the agent sends `{"type":"heartbeat"}` at `hello` plus each multiple of the
   interval the `hello` gave, and ends the connection with Close 4003 when no frame has arrived
   for three intervals. Every frame received counts, pings and pongs included; a heartbeat it
-  sends does not. A job command is decoded and counted in `Status`, and not answered; the other
-  server messages are read and dropped. A second `hello`, text that does not decode or a job
-  command without a usable command ID is Close 1002, a binary frame 1003, a message over the limit
+  sends does not, and neither does an answer to a job command. The other server messages are
+  read and dropped. A second `hello`, text that does not decode or a job command without a usable
+  command ID is Close 1002, a binary frame 1003, a message over the limit
   1009; after a read error the agent sends its Close and waits 5 seconds without reading.
+- **A job command** goes to the connection's gate (`control/gate.rs`), which wraps
+  `agent::instruction` ("Job instruction gate" below) with the instruction key and the agent ID
+  from the registration record the session holds. A verified instruction is handed to the
+  `Intake` and answered `{"type":"commandAck","commandId":...}`, and nothing else is sent (no
+  job state, no event, no link). A refusal is answered
+  `{"type":"commandRejected","commandId":...,"reason":...}` on the same connection, never
+  through an outbox, with the reason the gate gives (`malformed`, `unknownKey`, `badSignature`,
+  `unsupportedVersion`, `notForThisAgent`). A `signedJob` that is missing, is not a string or is
+  not base64 is `malformed` too, so the command is settled. The answer goes through the
+  connection's one writer under the 10-second write bound of a heartbeat: a failed or stalled
+  write drops the connection, and a stop during a stalled write drops it at once, with no
+  answer. A command read after the stop was asked for, or behind the server's Close, is not
+  answered.
 - **Only local facts end the task**: the `open` and `start` refusals above, and a stop. Every
   answer of the server, a 403, a 429 and Close 4002 included, is retried, and nothing is erased.
   The delay before the next attempt starts at 1 second and doubles after every wait, up to 60
@@ -388,7 +405,9 @@ key and passes it in.
   until a session token is issued again, with `debug` for the repeats ("Entries with a rule of
   their own" in `operational-log.md`). The WebSocket library turns a Close code it does not
   accept (2000, for example) into 1002 before the agent reads it, so such a close is logged as
-  1002 at `warn`.
+  1002 at `warn`. A refused job command writes one `warn` per reason on a connection and `debug`
+  for the repeats, and when the connection ends one `info` line with the count per reason, if any
+  command was refused.
 
 ## Job instruction gate
 
@@ -403,7 +422,7 @@ key and passes it in.
 | 5 | the body decodes with no byte left over and within its bounds | `UnsupportedVersion` for an unknown body version, else `Malformed` |
 | 6 | the agent ID in the body is the agent's own | `NotForThisAgent` |
 
-Nothing reads the payload before step 4 has passed and nothing re-encodes the decoded instruction. `VerifiedInstruction` has private fields, no public constructor and no `Clone`; it gives the decoded `JobInstruction` by reference and the envelope bytes it came from, byte for byte, for the journal that will keep and re-verify them. A refusal writes one `warn` entry (reason, the envelope's length and, for `UnknownKey`, the fingerprint the envelope offered; `operational-log.md`) and returns the reason, which the control channel will send back keyed by the command's ID.
+Nothing reads the payload before step 4 has passed and nothing re-encodes the decoded instruction. `VerifiedInstruction` has private fields, no public constructor and no `Clone`; it gives the decoded `JobInstruction` by reference and the envelope bytes it came from, byte for byte, for the journal that will keep and re-verify them. A refusal writes one `warn` entry (reason, the envelope's length and, for `UnknownKey`, the fingerprint the envelope offered; `operational-log.md`) and returns the reason, which the control channel sends back keyed by the command's ID. The control channel's gate calls the variant that returns the refusal without writing the entry, and writes a bounded one itself; the free `open` keeps its own entry for one-shot callers.
 
 ## Operational log
 

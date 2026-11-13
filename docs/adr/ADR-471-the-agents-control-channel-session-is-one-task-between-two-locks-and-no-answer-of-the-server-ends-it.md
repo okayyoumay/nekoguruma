@@ -1,7 +1,7 @@
 # ADR-471: The Agent's Control Channel Session Is One Task Between Two Locks, and No Answer of the Server Ends It
 
 **Date:** 2026-11-12
-**Status:** Accepted
+**Status:** Accepted (item 5's job command answered through the gate, ADR-473)
 **Affects:** design 5.2, 5.3, 6.4, 14.1; `api/asyncapi.yaml` (`agentControl`: the 1001 row, the idle rule), `api/openapi.yaml` (`ConnectionChallenge`, `AgentSession`); `crates/agent` (`control`, `server_http`, `registration`), `crates/shared-proto` (`control`: the close codes), `crates/server` (`control`), `crates/agent/docs/ngr-agent.md`; details ADR-466 items 1 to 4 and 6 to 13 for the agent's side and settles ADR-470's Consequence on `register` during a session
 
 ## Context
@@ -52,8 +52,8 @@ is woken, which races any wait on a real socket while a timer is pending (ADR-46
    in this order, the stop, the idle deadline, the heartbeat tick and the next frame. A
    `heartbeat` the server sends is never answered and never matched to one the agent sent; any
    complete message, ping or pong counts as a frame for the agent's idle rule, as for the
-   server's (ADR-468). A job command is decoded and left unanswered, with no job state and no
-   link, until the job-command work adds the gate.
+   server's (ADR-468). A job command is answered through the gate of ADR-473, with no job state
+   and no link.
 6. **The agent's closes.** 1002, 1003, 1009 and 4003 as the close table gives them, and 1001
    when the agent is itself stopped: the table's 1001 row becomes "either side is stopping". A
    stop that comes during a stalled write drops the connection instead, since the Close would

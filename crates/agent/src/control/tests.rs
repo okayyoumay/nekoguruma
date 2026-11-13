@@ -25,7 +25,8 @@ use shared_crypto::{
     PublicKey, RandomError, SignError, SignErrorKind, Signature, Signer, SigningKey,
 };
 use shared_proto::{
-    AgentMessage, CLOSE_CODE_TOO_BIG, CONTROL_SUBPROTOCOL, MAX_CONTROL_MESSAGE_LEN, ServerMessage,
+    AgentId, AgentMessage, CLOSE_CODE_TOO_BIG, CONTROL_SUBPROTOCOL, INSTRUCTION_VERSION, JobId,
+    JobInstruction, JobKind, MAX_CONTROL_MESSAGE_LEN, ServerMessage, VciId, Vin,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 use tokio::sync::mpsc;
@@ -45,6 +46,7 @@ use super::exchange::{CHALLENGE_PATH, SESSION_PATH};
 use super::*;
 use crate::identity::load_or_create;
 use crate::identity::store::{MemoryStore, SecretName};
+use crate::instruction::VerifiedInstruction;
 use crate::registration::{Request as RegisterRequest, register_in};
 use crate::server_http::Timeouts;
 
@@ -206,10 +208,19 @@ impl Dial for FakeDial {
 struct Fixture {
     dir: tempfile::TempDir,
     key: Arc<SigningKey>,
+    /// The key whose public half the record names as the instruction key.
+    instruction: Arc<SigningKey>,
 }
 
 fn record_for(public: &PublicKey, origin: &str) -> Record {
-    let instruction = SigningKey::generate().unwrap().public_key();
+    record_with(
+        public,
+        origin,
+        &SigningKey::generate().unwrap().public_key(),
+    )
+}
+
+fn record_with(public: &PublicKey, origin: &str, instruction: &PublicKey) -> Record {
     Record {
         agent_id: AGENT_ID.to_owned(),
         owner_id: "owner-1".to_owned(),
@@ -228,8 +239,17 @@ impl Fixture {
         std::fs::create_dir(dir.path().join(DIR_NAME)).unwrap();
         std::fs::create_dir(dir.path().join(record::DIR_NAME)).unwrap();
         let key = Arc::new(SigningKey::generate().unwrap());
-        let fixture = Fixture { dir, key };
-        fixture.write(&record_for(&fixture.key.public_key(), origin));
+        let instruction = Arc::new(SigningKey::generate().unwrap());
+        let fixture = Fixture {
+            dir,
+            key,
+            instruction,
+        };
+        fixture.write(&record_with(
+            &fixture.key.public_key(),
+            origin,
+            &fixture.instruction.public_key(),
+        ));
         fixture
     }
 
@@ -332,8 +352,22 @@ impl Default for Opts {
     }
 }
 
+/// An intake that keeps what it was given: the job ID and the envelope.
+#[derive(Default)]
+struct RecordingIntake(Mutex<Vec<(String, Vec<u8>)>>);
+
+impl Intake for RecordingIntake {
+    fn take(&self, instruction: VerifiedInstruction) {
+        self.0.lock().unwrap().push((
+            instruction.instruction().job_id.0.clone(),
+            instruction.envelope().to_vec(),
+        ));
+    }
+}
+
 struct Env {
     fx: Fixture,
+    intake: Arc<RecordingIntake>,
     handle: Handle,
     conns: mpsc::UnboundedReceiver<Dialed>,
     dial: Arc<FakeDial>,
@@ -396,10 +430,12 @@ impl Env {
         } else {
             fx.key.clone()
         };
+        let intake = Arc::new(RecordingIntake::default());
         let seams = Seams {
             dial: dial.clone(),
             signer,
             random: opts.random,
+            intake: intake.clone(),
         };
         let started = Instant::now();
         let handle = fx
@@ -409,6 +445,7 @@ impl Env {
             .unwrap();
         Env {
             fx,
+            intake,
             handle,
             conns: rx,
             dial,
@@ -416,6 +453,12 @@ impl Env {
             started,
             _subscriber: guard,
         }
+    }
+
+    /// The commands answered `commandAck` and `commandRejected` so far.
+    fn counts(&self) -> (u64, u64) {
+        let status = self.status();
+        (status.commands_acknowledged, status.commands_rejected)
     }
 
     fn status(&self) -> Status {
@@ -428,14 +471,15 @@ impl Env {
         assert!(matches!(seen, Ok(Ok(_))), "the phase was not reached");
     }
 
+    /// Waits until `count` commands are answered, whichever way.
     async fn wait_commands(&self, count: u64) {
         let mut status = self.handle.status();
         let seen = tokio::time::timeout(
             DEADLINE,
-            status.wait_for(|s| s.commands_unanswered >= count),
+            status.wait_for(|s| s.commands_acknowledged + s.commands_rejected >= count),
         )
         .await;
-        assert!(matches!(seen, Ok(Ok(_))), "the commands were not counted");
+        assert!(matches!(seen, Ok(Ok(_))), "the commands were not answered");
     }
 
     /// The next dial of the loop, whatever became of it.
@@ -738,6 +782,86 @@ fn hello(secs: u32) -> String {
 
 fn job_command(id: &str) -> String {
     format!(r#"{{"type":"jobCommand","commandId":"{id}","signedJob":"c2lnbmVk"}}"#)
+}
+
+/// How a signed command is spoiled.
+#[derive(Clone, Copy)]
+enum Tamper {
+    None,
+    /// Cut to a length no envelope has.
+    Truncate,
+    /// Sealed by a key the agent does not trust.
+    ForeignKey,
+    /// A payload byte changed after signing.
+    FlipPayload,
+    /// An unknown envelope format byte.
+    Format,
+    /// The body names another agent.
+    OtherAgent,
+}
+
+/// A `jobCommand` text and the envelope inside it.
+struct Signed {
+    text: String,
+    envelope: Vec<u8>,
+}
+
+/// A job command the record's instruction key signed for `agent`, spoiled as `tamper` says.
+fn signed_command(fx: &Fixture, id: &str, agent: &str, tamper: Tamper) -> Signed {
+    use shared_crypto::instruction as envelope;
+    let body = JobInstruction {
+        version: INSTRUCTION_VERSION,
+        job_id: JobId(JOB_ID.to_owned()),
+        ownership_generation: 7,
+        agent_id: AgentId(match tamper {
+            Tamper::OtherAgent => "other-agent".to_owned(),
+            _ => agent.to_owned(),
+        }),
+        operator_id: "operator-1".to_owned(),
+        kind: JobKind::RunSequence,
+        vci: VciId("vci-a".to_owned()),
+        vin: Some(Vin("VIN-UNDER-TEST".to_owned())),
+        document_hashes: vec![],
+        artifact_hash: None,
+        plan_hash: None,
+        issued_at: 1_000,
+        start_deadline: 2_000,
+    };
+    let payload = body.encode().unwrap();
+    let foreign;
+    let key = match tamper {
+        Tamper::ForeignKey => {
+            foreign = SigningKey::generate().unwrap();
+            &foreign
+        }
+        _ => &*fx.instruction,
+    };
+    let mut bytes = envelope::seal(key, &payload).unwrap();
+    match tamper {
+        Tamper::Truncate => bytes.truncate(5),
+        Tamper::FlipPayload => *bytes.last_mut().unwrap() ^= 1,
+        Tamper::Format => bytes[0] = bytes[0].wrapping_add(1),
+        Tamper::None | Tamper::ForeignKey | Tamper::OtherAgent => {}
+    }
+    let text = format!(
+        r#"{{"type":"jobCommand","commandId":"{id}","signedJob":"{}"}}"#,
+        STANDARD.encode(&bytes)
+    );
+    Signed {
+        text,
+        envelope: bytes,
+    }
+}
+
+/// The next message from the agent, which must be an answer to a job command.
+async fn answer(ws: &mut Ws) -> (Instant, serde_json::Value) {
+    let (at, message) = got(ws).await;
+    let Got::Text(text) = message else {
+        panic!("an answer is next, got {message:?}");
+    };
+    // It is a message of the agent's protocol, too.
+    AgentMessage::decode(&text).unwrap();
+    (at, serde_json::from_str(&text).unwrap())
 }
 
 /// What the agent sent, as the fake server reads it.
@@ -1080,6 +1204,7 @@ async fn a7_a_key_with_another_fingerprint_is_a_key_mismatch() {
         }),
         signer: fx.key.clone(),
         random: shared_crypto::random_32,
+        intake: Arc::new(LogIntake),
     };
     let error = fx.open().unwrap().start_with(&other, seams).unwrap_err();
     assert!(matches!(error, ControlError::KeyMismatch));
@@ -1096,7 +1221,10 @@ async fn a9_when_everything_passes_the_first_exchange_starts_at_once_with_delay_
     let status = env.status();
     assert_eq!(status.next_delay, secs(1));
     assert_eq!(status.phase, Phase::Exchange);
-    assert_eq!(status.commands_unanswered, 0);
+    assert_eq!(
+        (status.commands_acknowledged, status.commands_rejected),
+        (0, 0)
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -1143,6 +1271,7 @@ async fn a11_a_second_open_in_the_same_process_is_already_running() {
         }),
         signer: fx.key.clone(),
         random: shared_crypto::random_32,
+        intake: Arc::new(LogIntake),
     };
     let handle = first.start_with(&fx.key.public_key(), seams).unwrap();
     assert!(matches!(fx.open(), Err(ControlError::AlreadyRunning)));
@@ -1202,6 +1331,7 @@ fn a12_runtime_shutdown_and_an_unstarted_opened_release_both_locks() {
             }),
             signer: fx.key.clone(),
             random: shared_crypto::random_32,
+            intake: Arc::new(LogIntake),
         };
         let handle = fx
             .open()
@@ -1978,7 +2108,7 @@ async fn e4_a_valid_message_that_is_not_hello_closes_with_1002_and_counts_nothin
         send(&mut ws, text).await;
         close_of(&mut ws, 1002, true).await;
     }
-    assert_eq!(env.status().commands_unanswered, 0);
+    assert_eq!(env.counts(), (0, 0));
 }
 
 #[tokio::test(start_paused = true)]
@@ -2130,6 +2260,60 @@ async fn f3_a_write_that_fails_or_takes_over_10_seconds_drops_the_connection() {
     assert_eq!(got(&mut ws).await.1, Got::Eof, "nothing was written");
 }
 
+/// F3b: a job command that is the first frame at 60 s or later after `hello` makes the connection
+/// one that lived, so the failure of its answer's write resets the delay (1 s, then the ordinary
+/// doubling), though the loop's earlier last frame was `hello` itself.
+async fn job_command_at_60_s_then_the_answer_write_goes_wrong(stall: bool) {
+    let mut env = Env::new();
+    // Three failures: the delay would be 8 s afterwards.
+    for _ in 0..3 {
+        env.fail_challenge(503, &[], b"").await;
+    }
+    // The command is the first frame received after `hello` and comes at 61 s, after the tick at
+    // 60 s (an answer is not a frame, so the last frame is the command's).
+    let (hello_at, mut ws) = env.connected(60).await;
+    until(hello_at + secs(61)).await;
+    let flag = if stall {
+        &env.dial.flags.stall_write
+    } else {
+        &env.dial.flags.fail_write
+    };
+    flag.store(true, Ordering::SeqCst);
+    send(
+        &mut ws,
+        &signed_command(&env.fx, "c", AGENT_ID, Tamper::None).text,
+    )
+    .await;
+    env.wait_phase(Phase::Waiting).await;
+    let ended = Instant::now();
+    assert_after(
+        hello_at,
+        ended,
+        if stall { 71 } else { 61 },
+        "the answer's write",
+    );
+    env.dial.flags.fail_write.store(false, Ordering::SeqCst);
+    env.dial.flags.stall_write.store(false, Ordering::SeqCst);
+    assert_eq!(env.counts(), (0, 0));
+    assert_eq!(env.intake.0.lock().unwrap().len(), 1);
+    // RST: the delay is 1 s, not 8; then ORD: the next failure doubles it.
+    let (next, mut stream, _) = env.request().await;
+    assert_eq!(gaps(&[ended, next]), vec![1], "reset to 1 s, not 8");
+    reply(&mut stream, 503, &[], b"").await;
+    let (after, ..) = env.request().await;
+    assert_eq!(gaps(&[next, after]), vec![2]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn f3b_a_job_command_at_60_s_whose_answer_write_fails_resets_the_delay() {
+    job_command_at_60_s_then_the_answer_write_goes_wrong(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn f3b_a_job_command_at_60_s_whose_answer_write_stalls_resets_the_delay() {
+    job_command_at_60_s_then_the_answer_write_goes_wrong(true).await;
+}
+
 #[tokio::test(start_paused = true)]
 async fn f4_no_frame_for_three_intervals_closes_with_4003() {
     let mut env = Env::new();
@@ -2189,44 +2373,282 @@ async fn f7_a_second_hello_closes_with_1002() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn f8_a_job_command_is_counted_and_nothing_is_sent_or_stored() {
+async fn f8_a_verified_job_command_is_answered_with_an_ack_and_the_answer_is_no_frame() {
     let mut env = Env::new();
     let (hello_at, mut ws) = env.connected(10).await;
     assert_after(hello_at, heartbeat(&mut ws).await, 10, "tick 1");
     assert_after(hello_at, heartbeat(&mut ws).await, 20, "tick 2");
     until(hello_at + secs(25)).await;
-    send(&mut ws, &job_command("cmd-1")).await;
-    send(&mut ws, &job_command("cmd-2")).await;
-    env.wait_commands(2).await;
-    assert_eq!(env.status().commands_unanswered, 2);
-    // Nothing was written in answer: the next message is the tick at 30.
-    assert_after(
-        hello_at,
-        heartbeat(&mut ws).await,
-        30,
-        "the next message is the tick",
+    let first = signed_command(&env.fx, "cmd-1", AGENT_ID, Tamper::None);
+    let second = signed_command(&env.fx, "cmd-2", AGENT_ID, Tamper::None);
+    send(&mut ws, &first.text).await;
+    send(&mut ws, &second.text).await;
+    for id in ["cmd-1", "cmd-2"] {
+        let (at, answer) = answer(&mut ws).await;
+        assert_after(hello_at, at, 25, "the answer comes at once");
+        assert_eq!(
+            answer,
+            serde_json::json!({"type": "commandAck", "commandId": id})
+        );
+    }
+    assert_eq!(env.counts(), (2, 0));
+    // The intake had both, byte for byte, before the acks.
+    assert_eq!(
+        *env.intake.0.lock().unwrap(),
+        vec![
+            (JOB_ID.to_owned(), first.envelope),
+            (JOB_ID.to_owned(), second.envelope)
+        ]
     );
-    // The last frame was at 25: the idle close is at 55.
+    // The answers did not reset the idle deadline, and the next message is the tick at 30. The
+    // last frame received was at 25: the idle close is at 55.
+    assert_after(hello_at, heartbeat(&mut ws).await, 30, "tick");
     assert_after(hello_at, heartbeat(&mut ws).await, 40, "tick");
     assert_after(hello_at, heartbeat(&mut ws).await, 50, "tick");
     let at = close_of(&mut ws, 4003, true).await;
     assert_after(hello_at, at, 55, "idle from the job command");
+    // No refusal: no end-of-connection line.
+    assert!(!env.log.contains("refused on this connection"));
+}
+
+/// Every reason the gate has is answered `commandRejected` with the command's ID and logged
+/// once, without a field of the payload.
+#[tokio::test(start_paused = true)]
+async fn f9_every_refusal_reason_is_answered_with_a_rejection_and_logged() {
+    let mut env = Env::new();
+    let (_, mut ws) = env.connected(10).await;
+    let cases = [
+        ("malformed", "Malformed", Tamper::Truncate),
+        ("unknownKey", "UnknownKey", Tamper::ForeignKey),
+        ("badSignature", "BadSignature", Tamper::FlipPayload),
+        ("unsupportedVersion", "UnsupportedVersion", Tamper::Format),
+        ("notForThisAgent", "NotForThisAgent", Tamper::OtherAgent),
+    ];
+    for (k, (wire, word, tamper)) in cases.iter().enumerate() {
+        let id = format!("cmd-{wire}");
+        send(
+            &mut ws,
+            &signed_command(&env.fx, &id, AGENT_ID, *tamper).text,
+        )
+        .await;
+        let (_, got) = answer(&mut ws).await;
+        assert_eq!(
+            got,
+            serde_json::json!({"type": "commandRejected", "commandId": id, "reason": wire})
+        );
+        assert_eq!(env.counts(), (0, k as u64 + 1));
+        assert_eq!(env.log.warns("job instruction refused"), k + 1);
+        assert!(
+            env.log
+                .lines("WARN")
+                .iter()
+                .any(|line| line.contains(&format!("reason=\"{word}\""))),
+            "{word}"
+        );
+    }
+    assert!(env.intake.0.lock().unwrap().is_empty(), "nothing was taken");
+    assert_eq!(env.status().phase, Phase::Connected);
+    // The unknown key's entry names the fingerprint it offered, which is a hash.
+    assert!(env.log.contains("offered_key="));
+    let text = env.log.text();
+    for forbidden in [
+        "cmd-",
+        JOB_ID,
+        "other-agent",
+        "operator-1",
+        "VIN-UNDER-TEST",
+    ] {
+        assert!(!text.contains(forbidden), "{forbidden} in the log");
+    }
 }
 
 #[tokio::test(start_paused = true)]
-async fn f9_a_job_command_without_a_job_is_counted_as_well() {
+async fn f9_a_job_command_without_a_job_is_answered_malformed() {
     let mut env = Env::new();
     let (_, mut ws) = env.connected(10).await;
     let texts = [
-        r#"{"type":"jobCommand","commandId":"c"}"#,
-        r#"{"type":"jobCommand","commandId":"c","signedJob":7}"#,
-        r#"{"type":"jobCommand","commandId":"c","signedJob":null}"#,
+        r#"{"type":"jobCommand","commandId":"c1"}"#,
+        r#"{"type":"jobCommand","commandId":"c2","signedJob":7}"#,
+        r#"{"type":"jobCommand","commandId":"c3","signedJob":null}"#,
+        // Text that is not base64 is the same refusal.
+        r#"{"type":"jobCommand","commandId":"c4","signedJob":"not base64!"}"#,
     ];
     for (k, text) in texts.iter().enumerate() {
         send(&mut ws, text).await;
-        env.wait_commands(k as u64 + 1).await;
+        let (_, got) = answer(&mut ws).await;
+        assert_eq!(
+            got,
+            serde_json::json!({
+                "type": "commandRejected",
+                "commandId": format!("c{}", k + 1),
+                "reason": "malformed"
+            })
+        );
     }
+    assert_eq!(env.counts(), (0, 4));
+    assert_eq!(env.log.warns("job instruction refused"), 1);
     assert_eq!(env.status().phase, Phase::Connected);
+}
+
+/// A flood of forged commands writes one warning per reason on the connection, and the end of the
+/// connection one line with the counts; the next connection starts again.
+#[tokio::test(start_paused = true)]
+async fn f9_a_flood_of_forged_commands_logs_once_per_reason_and_counts_at_the_end() {
+    let mut env = Env::new();
+    let (_, mut ws) = env.connected(10).await;
+    for k in 0..20 {
+        let id = format!("forged-{k}");
+        send(
+            &mut ws,
+            &signed_command(&env.fx, &id, AGENT_ID, Tamper::ForeignKey).text,
+        )
+        .await;
+        let _ = answer(&mut ws).await;
+    }
+    for k in 0..3 {
+        let id = format!("bad-{k}");
+        send(
+            &mut ws,
+            &signed_command(&env.fx, &id, AGENT_ID, Tamper::FlipPayload).text,
+        )
+        .await;
+        let _ = answer(&mut ws).await;
+    }
+    assert_eq!(env.counts(), (0, 23));
+    assert_eq!(env.log.warns("job instruction refused"), 2);
+    let debug = env
+        .log
+        .lines("DEBUG")
+        .iter()
+        .filter(|line| line.contains("job instruction refused"))
+        .count();
+    assert_eq!(debug, 21);
+    assert!(!env.log.contains("refused on this connection"));
+    drop(ws);
+    env.wait_phase(Phase::Waiting).await;
+    let lines: Vec<String> = env
+        .log
+        .lines("INFO")
+        .into_iter()
+        .filter(|line| line.contains("refused on this connection"))
+        .collect();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    for want in [
+        "unknown_key=20",
+        "bad_signature=3",
+        "malformed=0",
+        "unsupported_version=0",
+        "not_for_this_agent=0",
+    ] {
+        assert!(lines[0].contains(want), "{want} in {}", lines[0]);
+    }
+    assert!(!env.log.contains("forged-") && !env.log.contains("bad-"));
+    // A new connection warns again, and its counts are its own.
+    let (_, mut ws) = env.connected(10).await;
+    send(
+        &mut ws,
+        &signed_command(&env.fx, "again", AGENT_ID, Tamper::ForeignKey).text,
+    )
+    .await;
+    let _ = answer(&mut ws).await;
+    assert_eq!(env.log.warns("job instruction refused"), 3);
+    assert_eq!(env.counts(), (0, 24));
+}
+
+#[tokio::test(start_paused = true)]
+async fn f9_a_stalled_answer_is_dropped_after_10_seconds_and_counts_nothing() {
+    let mut env = Env::new();
+    let (hello_at, mut ws) = env.connected(60).await;
+    env.dial.flags.stall_write.store(true, Ordering::SeqCst);
+    let at = Instant::now();
+    send(
+        &mut ws,
+        &signed_command(&env.fx, "c", AGENT_ID, Tamper::None).text,
+    )
+    .await;
+    env.wait_phase(Phase::Waiting).await;
+    assert_after(at, Instant::now(), 10, "the write bound");
+    assert!(Instant::now() < hello_at + secs(60));
+    env.dial.flags.stall_write.store(false, Ordering::SeqCst);
+    assert_eq!(got(&mut ws).await.1, Got::Eof, "nothing was written");
+    assert_eq!(env.counts(), (0, 0));
+    // F8b: the intake took the instruction before the ack, which was lost.
+    assert_eq!(env.intake.0.lock().unwrap().len(), 1);
+    // The server redelivers it under a new commandId; the intake gets it a second time.
+    let (_, mut ws) = env.connected(60).await;
+    send(
+        &mut ws,
+        &signed_command(&env.fx, "c-again", AGENT_ID, Tamper::None).text,
+    )
+    .await;
+    let (_, got) = answer(&mut ws).await;
+    assert_eq!(
+        got,
+        serde_json::json!({"type": "commandAck", "commandId": "c-again"})
+    );
+    assert_eq!(env.counts(), (1, 0));
+    assert_eq!(env.intake.0.lock().unwrap().len(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn f9_a_stop_during_a_stalled_answer_drops_the_connection_at_once() {
+    let mut env = Env::new();
+    let (_, mut ws) = env.connected(60).await;
+    env.dial.flags.stall_write.store(true, Ordering::SeqCst);
+    send(
+        &mut ws,
+        &signed_command(&env.fx, "c", AGENT_ID, Tamper::None).text,
+    )
+    .await;
+    tokio::time::sleep(secs(2)).await;
+    let at = Instant::now();
+    env.handle.stop();
+    tokio::time::timeout(DEADLINE, env.handle.stopped())
+        .await
+        .expect("the stop waited for the stalled write");
+    assert_after(at, Instant::now(), 0, "no waiting");
+    env.dial.flags.stall_write.store(false, Ordering::SeqCst);
+    assert_eq!(got(&mut ws).await.1, Got::Eof, "no answer and no Close");
+    assert_eq!(env.counts(), (0, 0));
+    // F8b: the intake took the instruction before the ack.
+    assert_eq!(env.intake.0.lock().unwrap().len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn f9_a_command_that_comes_after_the_stop_is_not_answered() {
+    let mut env = Env::new();
+    let (_, mut ws) = env.connected(60).await;
+    env.handle.stop();
+    send(
+        &mut ws,
+        &signed_command(&env.fx, "late", AGENT_ID, Tamper::None).text,
+    )
+    .await;
+    close_of(&mut ws, 1001, true).await;
+    env.handle.stopped().await;
+    assert_eq!(env.counts(), (0, 0));
+    assert!(env.intake.0.lock().unwrap().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn f9_a_command_behind_the_peers_close_is_not_answered() {
+    let mut env = Env::new();
+    let (_, mut ws) = env.connected(60).await;
+    ws.send(close_frame(Some(1000))).await.unwrap();
+    // The stack may refuse a write after its Close; the command is behind it either way.
+    let _ = ws
+        .send(Message::Text(
+            signed_command(&env.fx, "late", AGENT_ID, Tamper::None)
+                .text
+                .into(),
+        ))
+        .await;
+    env.wait_phase(Phase::Waiting).await;
+    assert_eq!(env.counts(), (0, 0));
+    assert!(env.intake.0.lock().unwrap().is_empty());
+    while let (_, Got::Text(text)) = got(&mut ws).await {
+        assert!(!text.contains("commandAck"), "{text}");
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -2241,7 +2663,101 @@ async fn f10_a_job_command_without_a_usable_id_or_with_an_extra_property_closes_
         send(&mut ws, text).await;
         close_of(&mut ws, 1002, true).await;
     }
-    assert_eq!(env.status().commands_unanswered, 0);
+    assert_eq!(env.counts(), (0, 0));
+}
+
+/// F9c: a `commandId` whose longest possible answer (a `commandRejected` with the longest reason
+/// word) cannot be encoded is not usable, as a missing one is not: the connection is closed with
+/// 1002 before the gate, so nothing is taken, counted or logged by it. One byte less is still
+/// answered.
+#[tokio::test(start_paused = true)]
+async fn f9c_a_command_id_whose_answer_cannot_be_encoded_closes_with_1002() {
+    use shared_proto::{InstructionRejectReason, MAX_CONTROL_MESSAGE_LEN};
+    let encodes = |len: usize, reason: InstructionRejectReason| {
+        AgentMessage::CommandRejected {
+            command_id: "x".repeat(len),
+            reason,
+        }
+        .encode()
+        .is_ok()
+    };
+    // The longest ID whose answer with the longest reason still encodes, found from the codec.
+    let longest = (0..MAX_CONTROL_MESSAGE_LEN)
+        .rev()
+        .find(|len| encodes(*len, channel::LONGEST_REASON))
+        .unwrap();
+    assert!(!encodes(longest + 1, channel::LONGEST_REASON));
+    // No other reason's answer is longer, so the check covers every answer.
+    for reason in [
+        InstructionRejectReason::Malformed,
+        InstructionRejectReason::UnknownKey,
+        InstructionRejectReason::BadSignature,
+        InstructionRejectReason::UnsupportedVersion,
+        InstructionRejectReason::NotForThisAgent,
+    ] {
+        assert!(encodes(longest, reason), "{reason:?}");
+    }
+    let command = |len: usize| {
+        let text = format!(
+            r#"{{"type":"jobCommand","commandId":"{}"}}"#,
+            "x".repeat(len)
+        );
+        assert!(text.len() <= MAX_CONTROL_MESSAGE_LEN, "the command decodes");
+        text
+    };
+    let mut env = Env::new();
+    let (_, mut ws) = env.connected(10).await;
+    send(&mut ws, &command(longest)).await;
+    let (_, got) = answer(&mut ws).await;
+    assert_eq!(got["type"], "commandRejected");
+    assert_eq!(env.counts(), (0, 1));
+    send(&mut ws, &command(longest + 1)).await;
+    close_of(&mut ws, 1002, true).await;
+    env.wait_phase(Phase::Waiting).await;
+    assert_eq!(env.counts(), (0, 1));
+    assert!(env.intake.0.lock().unwrap().is_empty());
+    // The gate saw the first command only.
+    let summary = env.log.lines("refused on this connection");
+    assert_eq!(summary.len(), 1, "{summary:?}");
+    assert!(summary[0].contains("malformed=1"), "{summary:?}");
+}
+
+/// F-drain: a job command read while the agent drains its own Close (after 4003 or 1002) is
+/// discarded: no answer and no intake.
+#[tokio::test(start_paused = true)]
+async fn f_drain_a_job_command_during_the_agents_own_close_is_discarded() {
+    for second_hello in [false, true] {
+        let mut env = Env::new();
+        let (_, mut ws) = env.connected(10).await;
+        let code = if second_hello {
+            send(&mut ws, &hello(10)).await;
+            1002
+        } else {
+            4003
+        };
+        // `finish` sets the phase before it writes the Close, and this end has not read the
+        // Close yet, so the stack is still open for writing: the command goes to the pipe while
+        // the agent drains.
+        env.wait_phase(Phase::Closing).await;
+        ws.send(Message::Text(
+            signed_command(&env.fx, "late", AGENT_ID, Tamper::None)
+                .text
+                .into(),
+        ))
+        .await
+        .expect("the command is written while the agent drains");
+        let (_, got_code) = close_after_heartbeats(&mut ws, false).await;
+        assert_eq!(got_code, Some(code));
+        env.wait_phase(Phase::Waiting).await;
+        assert_eq!(env.counts(), (0, 0));
+        assert!(env.intake.0.lock().unwrap().is_empty());
+        // The stack stops reading at the agent's Close; whatever the agent wrote after it is
+        // still in the pipe. There must be none: the command was not answered.
+        let mut rest = Vec::new();
+        let ended = tokio::time::timeout(DEADLINE, ws.get_mut().read_to_end(&mut rest)).await;
+        assert!(matches!(ended, Ok(Ok(_))), "the agent ended the connection");
+        assert!(rest.is_empty(), "the agent wrote after its Close: {rest:?}");
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -2271,7 +2787,7 @@ async fn f11_other_valid_messages_are_dropped_with_a_debug_line_and_count_as_fra
     }
     let at = close_of(&mut ws, 4003, true).await;
     assert_after(hello_at, at, 55, "idle from the last of them");
-    assert_eq!(env.status().commands_unanswered, 0);
+    assert_eq!(env.counts(), (0, 0));
     let debug = env
         .log
         .lines("DEBUG")
@@ -2870,7 +3386,11 @@ async fn r1_over_real_loopback_an_exchange_an_upgrade_a_heartbeat_and_a_stop() {
         .unwrap();
     let port = listener.local_addr().unwrap().port();
     let (fx, agent, _) = real_fixture(port);
-    let handle = fx.open().unwrap().start(agent).unwrap();
+    let handle = fx
+        .open()
+        .unwrap()
+        .start(agent, Arc::new(LogIntake))
+        .unwrap();
     tokio::time::timeout(secs(30), async {
         let (mut stream, _) = listener.accept().await.unwrap();
         real_challenge(&mut stream).await;
@@ -2917,7 +3437,11 @@ async fn r1_over_real_loopback_a_refused_connection_and_then_the_server_appears(
         .unwrap();
     let port = socket.local_addr().unwrap().port();
     let (fx, agent, _) = real_fixture(port);
-    let handle = fx.open().unwrap().start(agent).unwrap();
+    let handle = fx
+        .open()
+        .unwrap()
+        .start(agent, Arc::new(LogIntake))
+        .unwrap();
     tokio::time::timeout(secs(30), async {
         // The first attempt is refused: the loop waits.
         let mut status = handle.status();

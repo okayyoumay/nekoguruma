@@ -83,8 +83,13 @@ throughout.
   the envelope offered (hex of a hash). It never holds a job ID, agent ID, operator, VIN or VCI
   taken from the payload: an instruction that failed verification is not the job's own word, and
   one that verified for another agent is that agent's business.
-  The gate writes one entry per refusal; the control channel that calls it bounds how many a
-  connection writes (the first per reason at `warn`, later ones counted or at `debug`).
+  `instruction::open` writes one entry per refusal, for a caller that opens one envelope. The
+  control channel's gate does not use that entry: it calls the variant without it and bounds what
+  a connection writes itself, the first refusal per reason at `warn`, later ones at `debug`, and
+  at the end of the connection one `info` line with the count per reason, if any. Both write the
+  entry through one function, so its fields are the same. A `signedJob` that is missing or is not
+  a string has the same entry (reason `Malformed`) with an envelope length of 0; one that is
+  text but not base64 has it with the length of that text. No `commandId` is logged.
 
 - **The control channel session** (`agent::control`, ADR-471): the entries hold a failure
   class, an HTTP status, a close code and the heartbeat interval. They never hold the token, the

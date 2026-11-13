@@ -9,14 +9,17 @@
 //! gets heartbeats at one and two intervals and the idle close at three.
 //!
 //! What ends a connection is an [`End`]: the close to send (or none), how the loop backs off and
-//! what the log says. Job commands are read and counted and answered by no one yet. Never logged:
+//! what the log says. A job command goes to the connection's [`Gate`]: a verified instruction is
+//! handed to the [`Intake`] and answered `commandAck`, a refusal is answered `commandRejected`
+//! with its reason, both on this connection through the one writer and under the write bound.
+//! Sending an answer does not reset the idle deadline; only a frame received does. Never logged:
 //! the token, a message's text, a `commandId`, a close reason the server sent.
 
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use shared_proto::{
-    CLOSE_CODE_BINARY, CLOSE_CODE_GOING_AWAY, CLOSE_CODE_IDLE, CLOSE_CODE_PROTOCOL,
+    AgentMessage, CLOSE_CODE_BINARY, CLOSE_CODE_GOING_AWAY, CLOSE_CODE_IDLE, CLOSE_CODE_PROTOCOL,
     CLOSE_CODE_REPLACED, CLOSE_CODE_REVOKED, CLOSE_CODE_TOO_BIG, CONTROL_SUBPROTOCOL,
     HEARTBEAT_MISSED_LIMIT, MAX_CONTROL_MESSAGE_LEN, ServerMessage, close_reason,
 };
@@ -29,6 +32,7 @@ use tokio_tungstenite::tungstenite::{self, ClientRequestBuilder, Message, http};
 use super::backoff::lived;
 use super::dial::{self, ConnectError, Stream};
 use super::exchange::Token;
+use super::gate::Gate;
 use super::{Fail, Outcome, Phase, SessionState, Stop, Wiring};
 use crate::server_http;
 
@@ -259,11 +263,33 @@ fn peer_close(frame: Option<CloseFrame>, lived: bool) -> End {
 // Writes and closes
 
 /// Writes one text message within [`WRITE_TIMEOUT`]; false when it failed or took too long.
-async fn write_text(socket: &mut Socket, text: &'static str) -> bool {
+async fn write_text(socket: &mut Socket, text: &str) -> bool {
     matches!(
         tokio::time::timeout(WRITE_TIMEOUT, socket.send(Message::Text(text.into()))).await,
         Ok(Ok(()))
     )
+}
+
+/// Writes one text message, unless a stop comes first. A stop does not wait for a stalled write:
+/// the transport that stalls it would stall the Close as well, so the connection is dropped (H5).
+/// The write is polled first, so one that completes at once is followed by Close 1001. `Ok` is
+/// the message written; `Err` is the end the failure or the stop decides.
+async fn write_or_stop(
+    socket: &mut Socket,
+    text: &str,
+    stop: &Stop,
+    lived_now: bool,
+) -> Result<(), End> {
+    let written = tokio::select! {
+        biased;
+        written = write_text(socket, text) => Some(written),
+        () = stop.requested() => None,
+    };
+    match written {
+        None => Err(End::stop_dropped()),
+        Some(false) => Err(End::dropped("write", lived_now)),
+        Some(true) => Ok(()),
+    }
 }
 
 async fn send_close(socket: &mut Socket, code: u16) -> bool {
@@ -351,6 +377,11 @@ async fn finish(socket: &mut Socket, end: End, state: &mut SessionState<'_>) -> 
 // ---------------------------------------------------------------------------------------------
 // The connection
 
+/// The reason whose word is the longest, so a `commandRejected` with it is the longest answer to a
+/// job command (`commandAck` is shorter).
+pub(super) const LONGEST_REASON: shared_proto::InstructionRejectReason =
+    shared_proto::InstructionRejectReason::UnsupportedVersion;
+
 /// Runs one connection to its end.
 pub(super) async fn serve(mut socket: Socket, state: &mut SessionState<'_>) -> Outcome {
     let end = match await_hello(&mut socket, state.stop).await {
@@ -359,7 +390,10 @@ pub(super) async fn serve(mut socket: Socket, state: &mut SessionState<'_>) -> O
             state.warnings.hello();
             tracing::info!(heartbeat_secs = secs, "control channel connected");
             state.status.connected(secs);
-            connected(&mut socket, secs, state).await
+            let mut gate = Gate::new(&state.wiring.instruction_key, &state.wiring.record.agent_id);
+            let end = connected(&mut socket, secs, state, &mut gate).await;
+            gate.finish();
+            end
         }
     };
     finish(&mut socket, end, state).await
@@ -397,7 +431,12 @@ async fn await_hello(socket: &mut Socket, stop: &Stop) -> Result<u32, End> {
 }
 
 /// F: after `hello`. Returns the decision that ends the connection.
-async fn connected(socket: &mut Socket, secs: u32, state: &mut SessionState<'_>) -> End {
+async fn connected(
+    socket: &mut Socket,
+    secs: u32,
+    state: &mut SessionState<'_>,
+    gate: &mut Gate<'_>,
+) -> End {
     let interval = Duration::from_secs(u64::from(secs));
     let idle = interval * HEARTBEAT_MISSED_LIMIT;
     let hello_at = Instant::now();
@@ -413,18 +452,8 @@ async fn connected(socket: &mut Socket, secs: u32, state: &mut SessionState<'_>)
                 return End::close(CLOSE_CODE_IDLE, "idle", lived_now);
             }
             () = tokio::time::sleep_until(hello_at + interval * tick) => {
-                // A stop does not wait for a stalled write: the transport that stalls it would
-                // stall the Close as well, so the connection is dropped (H5). The write is
-                // polled first, so one that completes at once is followed by Close 1001.
-                let written = tokio::select! {
-                    biased;
-                    written = write_text(socket, HEARTBEAT) => Some(written),
-                    () = state.stop.requested() => None,
-                };
-                match written {
-                    None => return End::stop_dropped(),
-                    Some(false) => return End::dropped("write", lived_now),
-                    Some(true) => {}
+                if let Err(end) = write_or_stop(socket, HEARTBEAT, state.stop, lived_now).await {
+                    return end;
                 }
                 tick += 1;
                 while hello_at + interval * tick <= Instant::now() {
@@ -439,10 +468,46 @@ async fn connected(socket: &mut Socket, secs: u32, state: &mut SessionState<'_>)
                     Ok(ServerMessage::Hello { .. }) => {
                         return End::close(CLOSE_CODE_PROTOCOL, "second-hello", lived_now);
                     }
-                    Ok(ServerMessage::JobCommand { .. }) => {
-                        // Read and counted; answered by no one yet (the job-command work).
-                        state.status.command_received();
+                    Ok(ServerMessage::JobCommand { command_id, signed_job }) => {
+                        // The command is a received frame; its answer is not one. The
+                        // connection's life is measured to here (the backoff reset rule).
                         last_frame_at = Instant::now();
+                        let lived_now = lived(hello_at, last_frame_at);
+                        // A `commandId` whose longest possible answer the codec refuses (one
+                        // near the size limit) is not usable, as a missing one is not: the
+                        // gate and the intake see nothing and the connection closes with 1002.
+                        let longest = AgentMessage::CommandRejected {
+                            command_id: command_id.clone(),
+                            reason: LONGEST_REASON,
+                        };
+                        if longest.encode().is_err() {
+                            return End::close(CLOSE_CODE_PROTOCOL, "command-id", lived_now);
+                        }
+                        let (rejected, verified) = match gate.admit(signed_job.as_deref()) {
+                            Ok(verified) => (None, Some(verified)),
+                            Err(reason) => (Some(reason), None),
+                        };
+                        let answer = match rejected {
+                            None => AgentMessage::CommandAck { command_id },
+                            Some(reason) => AgentMessage::CommandRejected { command_id, reason },
+                        };
+                        let Ok(text) = answer.encode() else {
+                            // Not reachable once the longest answer encodes.
+                            return End::close(CLOSE_CODE_PROTOCOL, "command-id", lived_now);
+                        };
+                        // The intake has the instruction before the ack is written.
+                        if let Some(verified) = verified {
+                            state.wiring.intake.take(verified);
+                        }
+                        if let Err(end) =
+                            write_or_stop(socket, &text, state.stop, lived_now).await
+                        {
+                            return end;
+                        }
+                        match rejected {
+                            None => state.status.command_acknowledged(),
+                            Some(_) => state.status.command_rejected(),
+                        }
                     }
                     Ok(
                         ServerMessage::CancelCommand { .. }

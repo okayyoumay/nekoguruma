@@ -16,7 +16,8 @@
 //! The gate takes the trusted key as a parameter and reads it from nowhere (the registration
 //! stores it, ADR-461 Decision item 11), takes no worker handle and opens no link. A refusal
 //! writes one operational log entry (`docs/operational-log.md`) and returns the coarse reason
-//! the control channel answers with (ADR-461 Decision item 10).
+//! the control channel answers with (ADR-461 Decision item 10). The control channel's gate
+//! calls [`open_unlogged`] instead and bounds the entries itself.
 
 use shared_crypto::{PublicKey, instruction as envelope};
 use shared_proto::{InstructionError, InstructionRejectReason, JobInstruction};
@@ -59,22 +60,30 @@ pub fn open(
     trusted_key: &PublicKey,
     own_agent_id: &str,
 ) -> Result<VerifiedInstruction, InstructionRejectReason> {
-    match check(envelope, trusted_key, own_agent_id) {
-        Ok(instruction) => Ok(VerifiedInstruction {
-            instruction,
-            envelope: envelope.to_vec(),
-        }),
-        Err(refusal) => {
-            log_refusal(&refusal, envelope.len());
-            Err(refusal.reason)
-        }
-    }
+    open_unlogged(envelope, trusted_key, own_agent_id).map_err(|refusal| {
+        log_refusal(&refusal, envelope.len(), true);
+        refusal.reason
+    })
 }
 
-struct Refusal {
-    reason: InstructionRejectReason,
+/// [`open`] without the log entry: the refusal is returned whole, and whoever calls this bounds
+/// and writes the entry (the control channel's gate does, once per reason per connection).
+pub(crate) fn open_unlogged(
+    envelope: &[u8],
+    trusted_key: &PublicKey,
+    own_agent_id: &str,
+) -> Result<VerifiedInstruction, Refusal> {
+    check(envelope, trusted_key, own_agent_id).map(|instruction| VerifiedInstruction {
+        instruction,
+        envelope: envelope.to_vec(),
+    })
+}
+
+/// Why an envelope was refused.
+pub(crate) struct Refusal {
+    pub(crate) reason: InstructionRejectReason,
     /// The fingerprint the envelope offered, kept for an unknown key only.
-    offered: Option<[u8; envelope::FINGERPRINT_LEN]>,
+    pub(crate) offered: Option<[u8; envelope::FINGERPRINT_LEN]>,
 }
 
 impl From<InstructionRejectReason> for Refusal {
@@ -119,20 +128,28 @@ fn check(
     Ok(instruction)
 }
 
-/// The entry holds the reason, the envelope's length and, for an unknown key, the fingerprint
-/// it offered (hex of a hash, never a key). It holds no job ID, agent ID or operator taken
-/// from the payload: a refused payload is not the job's own word, and a verified one that
-/// names another agent is that agent's business.
-fn log_refusal(refusal: &Refusal, envelope_len: usize) {
+/// Writes the refusal's entry: the reason, the envelope's length and, for an unknown key, the
+/// fingerprint it offered (hex of a hash, never a key). It holds no job ID, agent ID or operator
+/// taken from the payload: a refused payload is not the job's own word, and a verified one that
+/// names another agent is that agent's business. The entry is a `warn` when `first` and a `debug`
+/// otherwise (the control channel's gate bounds its warnings that way; [`open`] always warns).
+pub(crate) fn log_refusal(refusal: &Refusal, envelope_len: usize, first: bool) {
     let reason = format!("{:?}", refusal.reason);
-    match &refusal.offered {
-        Some(fingerprint) => tracing::warn!(
+    match (&refusal.offered, first) {
+        (Some(fingerprint), true) => tracing::warn!(
             reason,
             envelope_len,
             offered_key = %hex(fingerprint),
             "job instruction refused"
         ),
-        None => tracing::warn!(reason, envelope_len, "job instruction refused"),
+        (Some(fingerprint), false) => tracing::debug!(
+            reason,
+            envelope_len,
+            offered_key = %hex(fingerprint),
+            "job instruction refused"
+        ),
+        (None, true) => tracing::warn!(reason, envelope_len, "job instruction refused"),
+        (None, false) => tracing::debug!(reason, envelope_len, "job instruction refused"),
     }
 }
 

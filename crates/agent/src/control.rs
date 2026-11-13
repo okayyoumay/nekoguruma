@@ -1,7 +1,8 @@
 //! The control channel session library (design 5.2, 5.3, 6.4, 14.1; ADR-466, ADR-467, ADR-468,
 //! ADR-470, ADR-471; `agentControl` in `api/asyncapi.yaml`): the agent's connection to the
-//! server. It is a library with no command yet; the `connect` command and the job-command work
-//! come after it.
+//! server. It is a library with no command yet; the `connect` command comes after it. A job
+//! command is verified by the connection's gate, handed to an [`Intake`] and answered
+//! `commandAck`, or answered `commandRejected` with the reason.
 //!
 //! The API has two steps, and the library never touches the key store (the caller owns the key's
 //! creation and the store's retry):
@@ -11,7 +12,7 @@
 //!    record once with the strict reader. Each lock is tried once, and both are held until the
 //!    task ends, waits included, so `ngr-agent register` exits 3 while a session lives.
 //! 2. [`Opened::start`] compares the loaded key's fingerprint with the record's, spawns the loop
-//!    and returns a [`Handle`] that stops it and shows its [`Status`].
+//!    with the [`Intake`] verified instructions go to and returns a [`Handle`] that stops it and shows its [`Status`].
 //!
 //! The loop is exchange, upgrade, `hello`, keepalive, wait ([`exchange`], [`channel`]). It is
 //! driven only by `tokio::time`, with one writer, and stops through a `watch` signal. All socket
@@ -28,6 +29,7 @@ mod backoff;
 mod channel;
 mod dial;
 mod exchange;
+mod gate;
 #[cfg(test)]
 mod tests;
 
@@ -49,6 +51,7 @@ use crate::registration::record::{self, Record, RecordError};
 use backoff::Backoff;
 use dial::{Dial, Loopback};
 use exchange::Fail;
+pub use gate::{Intake, LogIntake};
 
 /// The sub-directory of the state directory that holds the connection lock.
 pub const DIR_NAME: &str = "control";
@@ -172,8 +175,10 @@ pub struct Status {
     /// The delay the next wait uses; while waiting, the wait in progress (a longer
     /// `Retry-After` included).
     pub next_delay: Duration,
-    /// Job commands read and not answered (the answers are the job-command work's).
-    pub commands_unanswered: u64,
+    /// Job commands answered `commandAck`, over all connections.
+    pub commands_acknowledged: u64,
+    /// Job commands answered `commandRejected`, over all connections.
+    pub commands_rejected: u64,
 }
 
 /// The sending side of [`Status`].
@@ -202,8 +207,13 @@ impl StatusTx {
         });
     }
 
-    fn command_received(&self) {
-        self.0.send_modify(|status| status.commands_unanswered += 1);
+    fn command_acknowledged(&self) {
+        self.0
+            .send_modify(|status| status.commands_acknowledged += 1);
+    }
+
+    fn command_rejected(&self) {
+        self.0.send_modify(|status| status.commands_rejected += 1);
     }
 
     fn delay(&self, delay: Duration) {
@@ -239,7 +249,7 @@ impl Handle {
         let _ = done.wait_for(|done| *done).await;
     }
 
-    /// The session's phase, heartbeat interval, next delay and unanswered job commands.
+    /// The session's phase, heartbeat interval, next delay and the counts of answered job commands.
     pub fn status(&self) -> watch::Receiver<Status> {
         self.status.clone()
     }
@@ -279,6 +289,9 @@ struct Wiring {
     signer: Arc<dyn Signer + Send + Sync>,
     random: fn() -> Result<[u8; 32], RandomError>,
     record: Record,
+    /// The record's instruction key, which the gate verifies against.
+    instruction_key: PublicKey,
+    intake: Arc<dyn Intake>,
     audience: Audience,
     /// The `Host` header's value.
     host: String,
@@ -336,6 +349,7 @@ enum Outcome {
 
 /// What a connection's loop reads and writes besides the socket.
 struct SessionState<'a> {
+    wiring: &'a Wiring,
     stop: &'a Stop,
     status: &'a StatusTx,
     warnings: &'a mut Warnings,
@@ -346,6 +360,7 @@ struct Seams {
     dial: Arc<dyn Dial>,
     signer: Arc<dyn Signer + Send + Sync>,
     random: fn() -> Result<[u8; 32], RandomError>,
+    intake: Arc<dyn Intake>,
 }
 
 impl Opened {
@@ -355,14 +370,15 @@ impl Opened {
     }
 
     /// Step 2: compares `key`'s fingerprint with the record's and starts the loop, whose first
-    /// exchange begins at once. Needs a running tokio runtime. On an error nothing was sent and
+    /// exchange begins at once; `intake` takes every instruction the gate verifies. Needs a running tokio runtime. On an error nothing was sent and
     /// both locks are released.
-    pub fn start(self, key: AgentKey) -> Result<Handle, ControlError> {
+    pub fn start(self, key: AgentKey, intake: Arc<dyn Intake>) -> Result<Handle, ControlError> {
         let port = self.origin()?.port();
         let seams = Seams {
             dial: Arc::new(Loopback { port }),
             signer: key.signer(),
             random: shared_crypto::random_32,
+            intake,
         };
         self.start_with(&key.public_key(), seams)
     }
@@ -379,10 +395,14 @@ impl Opened {
         let origin = self.origin()?;
         let audience = Audience::parse_canonical(&self.record.server_origin)
             .map_err(|_| RecordError::Field("server_origin"))?;
+        let instruction_key = PublicKey::from_spki_pem(&self.record.instruction_key_pem)
+            .map_err(|_| RecordError::Field("instruction_key_pem"))?;
         let wiring = Wiring {
             dial: seams.dial,
             signer: seams.signer,
             random: seams.random,
+            intake: seams.intake,
+            instruction_key,
             record: self.record,
             audience,
             host: origin.host_header(),
@@ -393,7 +413,8 @@ impl Opened {
             phase: Phase::Exchange,
             heartbeat: None,
             next_delay: backoff::INITIAL,
-            commands_unanswered: 0,
+            commands_acknowledged: 0,
+            commands_rejected: 0,
         });
         let (done_tx, done_rx) = watch::channel(false);
         let guard = Guard {
@@ -500,6 +521,7 @@ async fn attempt(w: &Wiring, stop: &Stop, status: &StatusTx, warnings: &mut Warn
     };
     status.phase(Phase::Hello);
     let mut state = SessionState {
+        wiring: w,
         stop,
         status,
         warnings,

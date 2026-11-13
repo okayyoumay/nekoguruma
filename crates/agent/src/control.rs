@@ -169,7 +169,8 @@ pub struct Status {
     pub phase: Phase,
     /// The interval `hello` named, while connected.
     pub heartbeat: Option<Duration>,
-    /// The delay the next wait uses.
+    /// The delay the next wait uses; while waiting, the wait in progress (a longer
+    /// `Retry-After` included).
     pub next_delay: Duration,
     /// Job commands read and not answered (the answers are the job-command work's).
     pub commands_unanswered: u64,
@@ -226,7 +227,8 @@ pub struct Handle {
 }
 
 impl Handle {
-    /// Asks the session to stop: a connection gets Close 1001. A second call does nothing more.
+    /// Asks the session to stop: a connection gets Close 1001, or is dropped when the stop comes
+    /// during a stalled write. A second call does nothing more.
     pub fn stop(&self) {
         self.stop.send_replace(true);
     }

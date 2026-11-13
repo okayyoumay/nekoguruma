@@ -154,6 +154,8 @@ pub(super) struct End {
     word: &'static str,
     /// The peer's close code, when the end is the peer's Close.
     peer_code: Option<u16>,
+    /// Whether the agent's own stop ended the connection: the task then ends, with no wait.
+    stopped: bool,
     decided_at: Instant,
 }
 
@@ -166,12 +168,25 @@ impl End {
             warn,
             word,
             peer_code: None,
+            stopped: false,
             decided_at: Instant::now(),
         }
     }
 
     fn stop() -> End {
-        End::new(Action::GoAway, "stopped", Warn::None, false)
+        End {
+            stopped: true,
+            ..End::new(Action::GoAway, "stopped", Warn::None, false)
+        }
+    }
+
+    /// A stop that came while a write was stalled: the Close would stall behind it, so the
+    /// connection is dropped.
+    fn stop_dropped() -> End {
+        End {
+            stopped: true,
+            ..End::new(Action::Drop, "stopped", Warn::None, false)
+        }
     }
 
     /// A close the agent decides on: the code goes to the peer and to the log.
@@ -321,7 +336,7 @@ async fn finish(socket: &mut Socket, end: End, state: &mut SessionState<'_>) -> 
         Warn::Refusal(class) => state.warnings.refusal(class, end.peer_code.unwrap_or(0)),
     }
     tracing::info!(end = end.word, code = ?end.peer_code, "control channel ended");
-    if end.action == Action::GoAway {
+    if end.stopped {
         return Outcome::Stopped;
     }
     Outcome::Failed {
@@ -396,15 +411,16 @@ async fn connected(socket: &mut Socket, secs: u32, state: &mut SessionState<'_>)
                 return End::close(CLOSE_CODE_IDLE, "idle", lived_now);
             }
             () = tokio::time::sleep_until(hello_at + interval * tick) => {
-                // A stop does not wait for the write. A half-written frame cannot be followed
-                // by a clean Close, so the connection is dropped (H5).
+                // A stop does not wait for a stalled write: the transport that stalls it would
+                // stall the Close as well, so the connection is dropped (H5). The write is
+                // polled first, so one that completes at once is followed by Close 1001.
                 let written = tokio::select! {
                     biased;
-                    () = state.stop.requested() => None,
                     written = write_text(socket, HEARTBEAT) => Some(written),
+                    () = state.stop.requested() => None,
                 };
                 match written {
-                    None => return End::new(Action::Drop, "stopped", Warn::None, false),
+                    None => return End::stop_dropped(),
                     Some(false) => return End::dropped("write", lived_now),
                     Some(true) => {}
                 }

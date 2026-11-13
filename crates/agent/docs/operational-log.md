@@ -94,8 +94,9 @@ throughout.
   the server issues a session token again.
   `tungstenite` and `tokio-tungstenite` log through the `log` crate, at `trace` and `debug`, the
   upgrade request with its `Authorization` header, each message's text and a close's reason. The
-  agent installs no `log` bridge, so none of it reaches the operational log; adding one (for
-  example tracing-subscriber's `tracing-log` feature through `init()`) needs a filter that keeps
+  agent installs its subscriber with `set_global_default`, which installs no `log` bridge, so none
+  of it reaches the operational log. tracing-subscriber's `init()` or `try_init()` would install
+  one (its default `tracing-log` feature is on), so switching to them needs a filter that keeps
   those targets out first.
 
 ## A crate not yet checked

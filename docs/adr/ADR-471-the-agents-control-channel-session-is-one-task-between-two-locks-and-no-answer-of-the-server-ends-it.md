@@ -55,7 +55,9 @@ is woken, which races any wait on a real socket while a timer is pending (ADR-46
    server's (ADR-468). A job command is decoded and left unanswered, with no job state and no
    link, until the job-command work adds the gate.
 6. **The agent's closes.** 1002, 1003, 1009 and 4003 as the close table gives them, and 1001
-   when the agent is itself stopped: the table's 1001 row becomes "either side is stopping".
+   when the agent is itself stopped: the table's 1001 row becomes "either side is stopping". A
+   stop that comes during a stalled write drops the connection instead, since the Close would
+   stall behind that write.
    After its Close the agent reads until the peer's answer or 5 seconds; after a read error it
    waits 5 seconds without reading, as the server does (ADR-468). The close codes and their
    reason words live in `shared_proto::control`, so both sides use one table.

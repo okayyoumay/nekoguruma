@@ -1,11 +1,13 @@
 # `ngr-agent`
 
-`ngr-agent` is the binary of the `agent` crate (design 3.3). It has four commands. `run` runs the procedure of a variant's document on a VCI, and `identify` runs
+`ngr-agent` is the binary of the `agent` crate (design 3.3). It has five commands. `run` runs the procedure of a variant's document on a VCI, and `identify` runs
 an identification plan's functional presence requests, VIN reads and ECU reads; both are for local
 end-to-end runs and tests (below). `identity` creates the agent's key and prints its public key
 ("`ngr-agent identity`" below), and `register` registers that key with the server and stores the
-registration record ("`ngr-agent register`" below). It runs no control channel session and takes
-no jobs from the server. A procedure job is always a document: a bare program has no
+registration record ("`ngr-agent register`" below), and `connect` runs the control channel session
+with that server until it is stopped ("`ngr-agent connect`" below). Its session's intake is
+`LogIntake`, connected to no job runner: a command that passes the instruction gate is
+acknowledged and dropped, so the agent runs no job the server sends. A procedure job is always a document: a bare program has no
 declarations to decode with and no declared link, so `run` takes none.
 
 ## `ngr-agent run`
@@ -337,11 +339,57 @@ as the registration record. `registration.rs` holds the flow, the record and the
 An honest server refuses a wrong `--server-key` with its uniform 403 (exit 1), since the
 registration proof covers the server key ID; exit 6 means another program answered on the port.
 
+## `ngr-agent connect`
+
+```sh
+ngr-agent connect --mode <device|user>
+```
+
+Keeps the agent's control channel session ("Control channel session" below) with the server its
+registration record names, until a stop signal (design 5.3, 6.4; ADR-466, ADR-471). `connect.rs`
+holds the flow. It takes no option but `--mode`, prints nothing on standard output, and prints and
+logs nothing the server sent and no token; its messages are fixed wording, and the connection's
+entries follow "Entries with a rule of their own" in `operational-log.md`. An origin is not
+printed, as `register` prints no argument value.
+
+- **The order**, where the first step that fails decides:
+  1. the command line;
+  2. `agent::control::open(mode)`: the connection lock, then the registration lock, then the
+     registration record. No record ends the command with "not registered" before the key store is
+     touched; a record that does not read (or whose origin is not `http://127.0.0.1[:port]`, so
+     `https` too) says to register again;
+  3. the agent key through `agent::identity::agent_key` (create once). A key this run had to
+     create cannot be the registered one, so it is "register again" (the key stays, and a code can
+     be issued for its fingerprint); a key whose fingerprint differs from the record's
+     (`KeyMismatch`, from `Opened::start`) is the same;
+  4. `Opened::start`, then the wait for a stop signal.
+- **A key store that is unavailable** (the class `identity` ends with exit 3) is tried again, with
+  the session's delays (1 second, doubling to 60, tokio's clock), until the key comes or a stop
+  signal arrives, which ends the command with exit 0. The retry logs one `warn` per try with the
+  next delay and prints nothing. Any other store error ends the command at once.
+- **A stop** is SIGINT or SIGTERM on Unix, and Ctrl-C or the console closing on Windows. The
+  command then calls `Handle::stop`, which sends Close 1001 on a live connection, waits for the
+  session's task to end (it releases both locks) and exits 0. There is no Windows service
+  integration. The handlers are installed before the record is read, so a signal during start is a
+  stop too.
+- **The locks** make a second `connect` exit 3 ("a control channel session is already running")
+  and `register` exit 3 while a session lives.
+- **A release build** has no key store yet, so the command exits 1 there without connecting
+  (after the record check: an unregistered agent says "not registered").
+
+| Exit status | Meaning |
+|---|---|
+| 0 | Stopped by a signal |
+| 1 | Not registered; register again (a key just created, a key that is not the record's, a record that does not read); no key store (a release build, a build or mode without one, wrong debug variables) |
+| 2 | Invalid command line |
+| 3 | Another session or a registration is running, a lock cannot be taken, or the state directory is unusable |
+| 4 | The agent key is present and cannot be used (it is not replaced) |
+
 ## Control channel session
 
 `agent::control` keeps the agent's connection to the server (design 5.3, 14.1; ADR-466, ADR-471).
-It is one task behind two steps, and it never touches the key store: the caller loads the agent
-key and passes it in.
+It is one task behind two steps, and it never touches the key store: the caller (`ngr-agent
+connect`, above) loads the agent key and passes it in.
 
 - **`open(mode)`** takes the connection lock `<state>/control/connection.lock`, then the
   registration lock `<state>/registration/registration.lock`, each tried once, and reads the

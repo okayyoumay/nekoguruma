@@ -1,6 +1,6 @@
 //! The control channel session library (design 5.2, 5.3, 6.4, 14.1; ADR-466, ADR-467, ADR-468,
 //! ADR-470, ADR-471; `agentControl` in `api/asyncapi.yaml`): the agent's connection to the
-//! server. It is a library with no command yet; the `connect` command comes after it. A job
+//! server. `ngr-agent connect` (`crate::connect`) runs it. A job
 //! command is verified by the connection's gate, handed to an [`Intake`] and answered
 //! `commandAck`, or answered `commandRejected` with the reason.
 //!

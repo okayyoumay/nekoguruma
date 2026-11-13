@@ -2,6 +2,8 @@
 //! test binary, so the PostgreSQL helper in `support` links once and nextest names one binary.
 
 #[cfg(debug_assertions)]
+mod agent_connect;
+#[cfg(debug_assertions)]
 mod agent_register;
 mod binary;
 mod control;

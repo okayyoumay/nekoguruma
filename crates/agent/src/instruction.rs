@@ -16,7 +16,8 @@
 //! The gate takes the trusted key as a parameter and reads it from nowhere (the registration
 //! stores it, ADR-461 Decision item 11), takes no worker handle and opens no link. A refusal
 //! writes one operational log entry (`docs/operational-log.md`) and returns the coarse reason
-//! the control channel answers with (ADR-461 Decision item 10).
+//! the control channel answers with (ADR-461 Decision item 10). The control channel's gate
+//! calls [`open_unlogged`] instead and bounds the entries itself.
 
 use shared_crypto::{PublicKey, instruction as envelope};
 use shared_proto::{InstructionError, InstructionRejectReason, JobInstruction};
@@ -59,22 +60,37 @@ pub fn open(
     trusted_key: &PublicKey,
     own_agent_id: &str,
 ) -> Result<VerifiedInstruction, InstructionRejectReason> {
-    match check(envelope, trusted_key, own_agent_id) {
-        Ok(instruction) => Ok(VerifiedInstruction {
-            instruction,
-            envelope: envelope.to_vec(),
-        }),
-        Err(refusal) => {
-            log_refusal(&refusal, envelope.len());
-            Err(refusal.reason)
-        }
-    }
+    open_unlogged(envelope, trusted_key, own_agent_id).map_err(|refusal| {
+        log_refusal(&refusal, envelope.len());
+        refusal.reason
+    })
 }
 
-struct Refusal {
-    reason: InstructionRejectReason,
+/// [`open`] without the log entry: the refusal is returned whole, and whoever calls this bounds
+/// and writes the entry (the control channel's gate does, once per reason per connection).
+pub(crate) fn open_unlogged(
+    envelope: &[u8],
+    trusted_key: &PublicKey,
+    own_agent_id: &str,
+) -> Result<VerifiedInstruction, Refusal> {
+    check(envelope, trusted_key, own_agent_id).map(|instruction| VerifiedInstruction {
+        instruction,
+        envelope: envelope.to_vec(),
+    })
+}
+
+/// Why an envelope was refused.
+pub(crate) struct Refusal {
+    pub(crate) reason: InstructionRejectReason,
     /// The fingerprint the envelope offered, kept for an unknown key only.
-    offered: Option<[u8; envelope::FINGERPRINT_LEN]>,
+    pub(crate) offered: Option<[u8; envelope::FINGERPRINT_LEN]>,
+}
+
+impl Refusal {
+    /// The offered fingerprint as hex (a hash, never a key).
+    pub(crate) fn offered_hex(&self) -> Option<String> {
+        self.offered.as_ref().map(|fingerprint| hex(fingerprint))
+    }
 }
 
 impl From<InstructionRejectReason> for Refusal {

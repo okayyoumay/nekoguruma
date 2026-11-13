@@ -51,4 +51,10 @@ it, and what the error order of a send is.
   ends it, and that disconnect write waits as long.
 - A stop with more open connections than the pool has connections may let some writes time out;
   each has its own 5 seconds, as ADR-468 item 12 accepts by rejecting a batched write.
+- Since the connect write sits between the upgrade and the registration (ADR-468 item 11),
+  two connections of one agent can register in another order than they were upgraded. When an
+  agent restarts while its old connection is still in its connect write, and the new one's
+  write finishes first, the old one registers last and replaces the new one with 4001; the old
+  socket is dead, so the agent is not connected until its capped delay ends. This needs two
+  writes in flight for one agent within the same moment and is accepted.
 - ADR-468's status gains "items 8, 11 and 12 detailed by ADR-472".

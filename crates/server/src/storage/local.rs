@@ -789,11 +789,22 @@ pub(super) mod hooks {
 
         pub(in crate::storage) fn before_file_sync(&self) -> io::Result<()> {
             if self.file_sync_fails.load(Ordering::SeqCst) {
-                let skipped =
-                    self.file_sync_skips
-                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
-                if skipped.is_err() {
-                    return Err(injected());
+                // Take one skip if any is left (a compare-and-swap loop, which works on the
+                // minimum supported Rust as on the current one).
+                let mut left = self.file_sync_skips.load(Ordering::SeqCst);
+                loop {
+                    let Some(next) = left.checked_sub(1) else {
+                        return Err(injected());
+                    };
+                    match self.file_sync_skips.compare_exchange(
+                        left,
+                        next,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    ) {
+                        Ok(_) => break,
+                        Err(current) => left = current,
+                    }
                 }
             }
             Ok(())

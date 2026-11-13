@@ -5,7 +5,7 @@
 //! on their own open handles. On Windows the directory's ACL, set when the service is installed,
 //! is the protection and the code checks no ACL.
 
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io;
 use std::path::Path;
 
@@ -16,8 +16,16 @@ pub(crate) enum DirectoryFault {
     Io(io::ErrorKind),
     NotADirectory,
     /// Owned by neither the server's account nor root (Unix).
+    #[cfg_attr(
+        not(unix),
+        expect(dead_code, reason = "only the Unix check reads the owner")
+    )]
     NotOwned,
     /// Writable by group or others (Unix).
+    #[cfg_attr(
+        not(unix),
+        expect(dead_code, reason = "only the Unix check reads the mode bits")
+    )]
     Writable,
 }
 
@@ -70,7 +78,7 @@ pub(crate) fn check_directory(dir: &Path) -> Result<(), DirectoryFault> {
 /// its entry there.
 #[cfg(unix)]
 pub(crate) fn sync_directory(dir: &Path) -> io::Result<()> {
-    File::open(dir)?.sync_all()
+    std::fs::File::open(dir)?.sync_all()
 }
 
 #[cfg(not(unix))]

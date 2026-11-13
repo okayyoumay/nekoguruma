@@ -280,8 +280,14 @@ async fn a_stop_of_the_server_closes_the_connection_and_the_agent_keeps_running(
     assert!(!f.is_connected(), "the server's stop ended the connection");
     // The session logs its first failed attempt and retries; it does not exit. The server's port
     // is free after the stop, so a parallel test may bind it and answer the agent with a refusal
-    // (a warning of its own): either line shows the retry.
-    let retried = |log: &str| log.contains("attempt failed") || log.contains("refused");
+    // (a warning of its own): either line, written after the stop, shows the retry.
+    let stopped_at = agent.log_text().len();
+    let retried = |log: &str| {
+        log.get(stopped_at..).is_some_and(|after| {
+            after.contains("control channel attempt failed")
+                || after.contains("control channel refused")
+        })
+    };
     let deadline = Instant::now() + LIMIT;
     while !retried(&agent.log_text()) {
         assert!(Instant::now() < deadline, "no retry:\n{}", agent.log_text());

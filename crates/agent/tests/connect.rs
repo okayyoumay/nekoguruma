@@ -454,6 +454,50 @@ mod with_store {
         assert_eq!(std::fs::read(&record).unwrap(), before);
     }
 
+    /// A stop while the key load waits for the identity creation lock (a blocking task) still ends
+    /// the process with 0 promptly: `main` gives the runtime a short time to shut down instead of
+    /// waiting for that task, which would hold the process for the whole lock wait.
+    #[cfg(unix)]
+    #[test]
+    fn a_signal_during_the_creation_lock_wait_exits_0_promptly() {
+        let env = Env::new();
+        // A record whose key does not exist, so the load needs the creation lock.
+        env.register(&"ab".repeat(32), closed_port());
+        let dir = env.identity_dir();
+        make_private_dir(&dir);
+        let holder = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join("nekoguruma-agent-key.user.v1.lock"))
+            .unwrap();
+        holder.try_lock().unwrap();
+        let mut running = start(&env);
+        // The load polls for the lock for 10 seconds; let the command get into that wait.
+        std::thread::sleep(Duration::from_secs(1));
+        assert!(
+            running
+                .child
+                .as_mut()
+                .unwrap()
+                .try_wait()
+                .unwrap()
+                .is_none(),
+            "the command ended before the stop"
+        );
+        let sent = Instant::now();
+        signal(running.child.as_ref().unwrap(), libc::SIGTERM);
+        let output = finish(running.child.take().unwrap());
+        assert_eq!(output.status.code(), Some(0));
+        // The runtime gives the key load 2 seconds; the creation lock's own wait is 10. Between
+        // the two, 6 seconds leaves room for a slow runner and still fails without the timeout.
+        assert!(
+            sent.elapsed() < Duration::from_secs(6),
+            "the stop took {:?}",
+            sent.elapsed()
+        );
+    }
+
     /// SIGINT or SIGTERM ends a running session with 0 and frees the lock.
     #[cfg(unix)]
     #[test]

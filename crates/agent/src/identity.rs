@@ -77,10 +77,21 @@ impl IdentityError {
     /// ([`IdentityError::Unavailable`]) and a creation lock held past its wait
     /// ([`IdentityError::CreationLockBusy`]).
     pub fn retryable(&self) -> bool {
-        matches!(
-            self,
-            IdentityError::Unavailable(_) | IdentityError::CreationLockBusy
-        )
+        self.retry_class().is_some()
+    }
+
+    /// The fixed class a retry's warning names, or `None` for an error no retry fixes. The one
+    /// exhaustive match on the variants: a new variant must choose here.
+    pub fn retry_class(&self) -> Option<&'static str> {
+        match self {
+            IdentityError::Unavailable(_) => Some("key store"),
+            IdentityError::CreationLockBusy => Some("creation lock"),
+            IdentityError::NoStore(_)
+            | IdentityError::LocalFault(_)
+            | IdentityError::KeyUnusable(_)
+            | IdentityError::NotProvisioned
+            | IdentityError::Random(_) => None,
+        }
     }
 }
 

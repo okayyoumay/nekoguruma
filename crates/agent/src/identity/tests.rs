@@ -354,7 +354,7 @@ fn two_creators_held_at_absent_create_one_key() {
 /// L5: a holder stuck past the wait makes the waiter report the lock busy (retryable), and nothing
 /// is written.
 #[test]
-fn a_creator_that_stays_locked_out_is_unavailable() {
+fn a_creator_that_stays_locked_out_is_creation_lock_busy() {
     let temp = tempfile::tempdir().unwrap();
     let _holder = WriterLock::at(&temp.path().join(format!("{}.lock", name()))).unwrap();
     let store = MemoryStore::new();
@@ -376,7 +376,7 @@ fn a_creator_that_stays_locked_out_is_unavailable() {
 /// creates nothing. The
 /// parent being a regular file fails for every account, root included.
 #[test]
-fn a_lock_that_cannot_be_opened_is_unavailable() {
+fn a_lock_that_cannot_be_opened_is_a_local_fault() {
     let temp = tempfile::tempdir().unwrap();
     let file = temp.path().join("file");
     std::fs::write(&file, b"x").unwrap();

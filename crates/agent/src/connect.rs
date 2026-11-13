@@ -38,7 +38,10 @@ const RETRY_CAP: Duration = Duration::from_secs(60);
 pub enum Exit {
     /// 1: the agent cannot connect as it is: not registered, register again, no key store.
     CannotConnect,
-    /// 3: a session or a registration is running, or a lock or the state directory is unusable.
+    /// 3: a session or a registration is running, or something local is unusable for now: a lock
+    /// or the state directory, the identity directory, the identity creation lock (it cannot be
+    /// opened, or stays held past its wait), the key store, or a registration record that cannot
+    /// be read for an I/O reason.
     Unavailable,
     /// 4: the key is present and unusable.
     KeyUnusable,
@@ -125,7 +128,7 @@ fn control_error(error: &ControlError) -> ConnectError {
 }
 
 /// The exit and the text of a key error that ends the load, as `register` reports it. The retried
-/// errors ([`retry_class`]) never get here.
+/// errors ([`IdentityError::retry_class`]) never get here.
 fn identity_error(error: &IdentityError) -> ConnectError {
     let exit = match error {
         IdentityError::Unavailable(_)
@@ -137,15 +140,6 @@ fn identity_error(error: &IdentityError) -> ConnectError {
         }
     };
     fail(exit, error.to_string())
-}
-
-/// The fixed class the retry's warning names, or `None` for an error no retry fixes.
-fn retry_class(error: &IdentityError) -> Option<&'static str> {
-    match error {
-        IdentityError::Unavailable(_) => Some("key store"),
-        IdentityError::CreationLockBusy => Some("creation lock"),
-        _ => None,
-    }
 }
 
 /// Runs the session of `mode` until `stop` resolves. `Ok` is a stop by the signal.
@@ -225,7 +219,7 @@ async fn load_key_retrying(
         match result {
             Ok(key) => return Ok(Some(key)),
             Err(error) => {
-                let Some(class) = retry_class(&error) else {
+                let Some(class) = error.retry_class() else {
                     return Err(identity_error(&error));
                 };
                 tracing::warn!(

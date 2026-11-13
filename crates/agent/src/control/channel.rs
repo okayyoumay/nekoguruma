@@ -288,8 +288,8 @@ async fn drain(socket: &mut Socket) {
     }
 }
 
-/// Carries out the end's close. A stop interrupts it, except for the agent's own stop (`stop` is
-/// `None`), which is the reason for the close.
+/// Carries out the end's close. A stop interrupts it, except when a stop decided the end (`stop`
+/// is `None`).
 async fn close_out(socket: &mut Socket, action: Action, stop: Option<&Stop>) {
     let run = async {
         match action {
@@ -328,7 +328,7 @@ async fn close_out(socket: &mut Socket, action: Action, stop: Option<&Stop>) {
 /// Carries out `end`, writes its log lines and returns what the loop does next.
 async fn finish(socket: &mut Socket, end: End, state: &mut SessionState<'_>) -> Outcome {
     state.status.phase(Phase::Closing);
-    let stop = (end.action != Action::GoAway).then_some(state.stop);
+    let stop = (!end.stopped).then_some(state.stop);
     close_out(socket, end.action, stop).await;
     match end.warn {
         Warn::None => {}
@@ -336,7 +336,9 @@ async fn finish(socket: &mut Socket, end: End, state: &mut SessionState<'_>) -> 
         Warn::Refusal(class) => state.warnings.refusal(class, end.peer_code.unwrap_or(0)),
     }
     tracing::info!(end = end.word, code = ?end.peer_code, "control channel ended");
-    if end.stopped {
+    // A stop that came while the end was carried out (a write that failed as the stop came, a
+    // close the stop cut short) ends the task as a stop does: no wait comes first.
+    if end.stopped || state.stop.is_set() {
         return Outcome::Stopped;
     }
     Outcome::Failed {

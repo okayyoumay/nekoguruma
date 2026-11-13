@@ -266,6 +266,11 @@ impl Stop {
         let mut stop = self.0.clone();
         let _ = stop.wait_for(|stop| *stop).await;
     }
+
+    /// Whether a stop has been asked for, or the handle is gone, without waiting.
+    fn is_set(&self) -> bool {
+        *self.0.borrow() || self.0.has_changed().is_err()
+    }
 }
 
 /// What the loop is wired to: the dial, the key and the record. The seams are what tests replace.

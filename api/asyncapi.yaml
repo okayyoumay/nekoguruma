@@ -84,7 +84,7 @@ channels:
 
       | Code | Sent by | Meaning |
       |---|---|---|
-      | 1001 | either | Going away: the sender is stopping (13.3; the agent sends it when it is stopped, ADR-471) |
+      | 1001 | either | Going away: the sender is stopping (13.3; the agent sends it when it is stopped, unless a stalled write makes it drop the connection instead, ADR-471) |
       | 1002 | either | Protocol error: malformed text, unknown `type`, unknown or missing property, value out of range, `hello` not first or not received in time |
       | 1003 | either | A binary frame |
       | 1009 | either | A message over 128 KiB |

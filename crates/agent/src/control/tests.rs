@@ -2605,6 +2605,23 @@ async fn h5_stop_during_a_stalled_heartbeat_write_drops_the_connection_at_once()
 }
 
 #[tokio::test(start_paused = true)]
+async fn h5_a_heartbeat_write_that_completes_as_the_stop_comes_is_followed_by_close_1001() {
+    let mut env = Env::new();
+    let (hello_at, mut ws) = env.connected(10).await;
+    env.dial.flags.stall_write.store(true, Ordering::SeqCst);
+    until(hello_at + secs(12)).await;
+    // The transport can write again, and the stop is what wakes the session: the write is
+    // polled before the stop, so it completes and the stop then sends Close 1001.
+    env.dial.flags.stall_write.store(false, Ordering::SeqCst);
+    env.handle.stop();
+    let (_, first) = got(&mut ws).await;
+    assert_eq!(first, Got::Text(r#"{"type":"heartbeat"}"#.to_owned()));
+    close_of(&mut ws, 1001, true).await;
+    env.handle.stopped().await;
+    assert_eq!(env.status().phase, Phase::Stopped);
+}
+
+#[tokio::test(start_paused = true)]
 async fn h7_a_stopped_session_shows_no_heartbeat_interval() {
     let mut env = Env::new();
     let (_, mut ws) = env.connected(10).await;

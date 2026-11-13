@@ -89,7 +89,7 @@ channels:
       | 1003 | either | A binary frame |
       | 1009 | either | A message over 128 KiB |
       | 4001 | server | Replaced by a newer connection of the same agent |
-      | 4002 | server | The agent's key was revoked, or its session ended |
+      | 4002 | server | The agent's key was revoked, or its session ended. Sent as the first frame when the row is revoked or missing at connect (nothing else precedes it, and no earlier connection is replaced), or later by the server's 30 second pass |
       | 4003 | either | No frame of any kind for three heartbeat intervals |
 
       **Settlement.** `commandAck` settles the delivery of a `jobCommand`, `commandRejected`

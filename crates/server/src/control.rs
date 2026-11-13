@@ -7,9 +7,11 @@
 //! the server's problem document. The token is judged here and nowhere else: it is not consumed
 //! by the upgrade, not bound to the connection and not looked at again.
 //!
-//! Each accepted socket runs as one task that [`Hub`] spawns and owns. The task writes `hello`,
-//! reads complete messages, echoes `heartbeat`, and ends by the close table of the asyncapi
-//! file. All writes come from that one task, so the socket is not split.
+//! Each accepted socket runs as one task that [`Hub`] spawns and owns. The task stamps the
+//! agent's `last_seen_at` (ADR-468 item 11), registers with the hub, writes `hello`, reads complete
+//! messages, echoes `heartbeat`, hands every other valid message to the hub's inbox, writes the job
+//! commands the hub queued, and ends by the close table of the asyncapi file. All writes come
+//! from that one task, so the socket is not split.
 //!
 //! Never logged: a token, or the text of a message.
 
@@ -22,15 +24,17 @@ use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use shared_proto::{
     AgentId, AgentMessage, CLOSE_CODE_BINARY, CLOSE_CODE_GOING_AWAY, CLOSE_CODE_IDLE,
-    CLOSE_CODE_PROTOCOL, CLOSE_CODE_TOO_BIG, CONTROL_SUBPROTOCOL, ControlError,
+    CLOSE_CODE_PROTOCOL, CLOSE_CODE_REVOKED, CLOSE_CODE_TOO_BIG, CONTROL_SUBPROTOCOL, ControlError,
     DEFAULT_HEARTBEAT_SECS, HEARTBEAT_MISSED_LIMIT, MAX_CONTROL_MESSAGE_LEN, ServerMessage,
     close_reason,
 };
+use sqlx::PgPool;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{oneshot, watch};
 use tokio::time::Instant;
 
 use crate::health::may_log;
-use crate::hub::{ConnectionId, Hub, Registration, Stopping};
+use crate::hub::{ConnectionId, Hub, Inbound, Registration, Stopping};
 use crate::problem::Problem;
 use crate::session::{Sessions, now};
 
@@ -43,27 +47,48 @@ pub(crate) const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// (when no further read is possible), how long it keeps the connection open so that the Close
 /// frame is not lost to a reset.
 pub(crate) const CLOSE_WAIT: Duration = Duration::from_secs(5);
-/// The refusal at the upgrade is logged at most this often.
+/// How long the stamp of `last_seen_at` may take, connection and statement together.
+pub(crate) const STAMP_TIMEOUT: Duration = Duration::from_secs(5);
+/// The refusal at the upgrade, and each failure of the stamp, is logged at most this often.
 const LOG_EVERY: Duration = Duration::from_secs(60);
 
 /// The echo of a heartbeat: the text `ServerMessage::Heartbeat` encodes to, written without
 /// building it each time (a test keeps the two equal).
 const HEARTBEAT_ECHO: &str = r#"{"type":"heartbeat"}"#;
 
-/// The state of the route: the token table, the hub, and the log gate of the 401.
+type Gate = Mutex<Option<std::time::Instant>>;
+
+/// The log gates of the connections' own events, one each so that a flood of one cannot silence
+/// another.
+#[derive(Default)]
+struct Gates {
+    /// A failed stamp at connect.
+    connect: Gate,
+    /// A failed stamp at disconnect.
+    disconnect: Gate,
+    /// A message dropped because nobody takes the inbox.
+    dropped: Gate,
+}
+
+/// The state of the route: the pool, the token table, the hub, the log gate of the 401 and the
+/// gates of the connections.
 #[derive(Clone)]
 pub struct Control {
+    pool: PgPool,
     sessions: Sessions,
     hub: Hub,
-    gate: Arc<Mutex<Option<std::time::Instant>>>,
+    gate: Arc<Gate>,
+    gates: Arc<Gates>,
 }
 
 impl Control {
-    pub fn new(sessions: Sessions, hub: Hub) -> Control {
+    pub fn new(pool: PgPool, sessions: Sessions, hub: Hub) -> Control {
         Control {
+            pool,
             sessions,
             hub,
             gate: Arc::new(Mutex::new(None)),
+            gates: Arc::default(),
         }
     }
 }
@@ -126,7 +151,7 @@ pub async fn upgrade(State(control): State<Control>, request: Request) -> Respon
         )
         .into_response();
     }
-    let hub = control.hub;
+    let hub = control.hub.clone();
     // Both limits equal the message limit: the stack refuses an oversized frame on its header,
     // before it reads the payload.
     ws.max_message_size(MAX_CONTROL_MESSAGE_LEN)
@@ -134,8 +159,7 @@ pub async fn upgrade(State(control): State<Control>, request: Request) -> Respon
         .on_failed_upgrade(|error| tracing::debug!(%error, "control channel upgrade failed"))
         .on_upgrade(move |socket| async move {
             // axum runs this callback on a task it detaches; the session runs on the hub's.
-            let owner = hub.clone();
-            owner.adopt(session(hub, agent, socket));
+            hub.adopt(session(control, agent, socket));
         })
 }
 
@@ -199,13 +223,42 @@ impl Drop for Leave {
     }
 }
 
+/// Stamps the agent's `last_seen_at` and says whether its row is revoked (`None`: there is no
+/// row), within [`STAMP_TIMEOUT`]. The error is a fixed word, never the database's text. The
+/// transaction is dropped, and so rolled back, when the time is up.
+async fn stamp(pool: &PgPool, agent: &AgentId) -> Result<Option<bool>, &'static str> {
+    match tokio::time::timeout(STAMP_TIMEOUT, crate::db::stamp_agent(pool, &agent.0)).await {
+        Ok(Ok(revoked)) => Ok(revoked),
+        Ok(Err(error)) => Err(match crate::db::failure(&error) {
+            crate::db::Failure::Unavailable(_) => "the database is unavailable",
+            crate::db::Failure::Internal(_) => "the statement failed",
+        }),
+        Err(_) => Err("the database did not answer in time"),
+    }
+}
+
 /// The whole life of one connection.
-async fn session(hub: Hub, agent: AgentId, mut socket: WebSocket) {
-    let Registration {
-        id,
-        mut close,
-        mut stopping,
-    } = match hub.register(&agent) {
+async fn session(control: Control, agent: AgentId, mut socket: WebSocket) {
+    // The stamp comes first, so that a client that has read `hello` knows it is done, and so
+    // that a revoked agent displaces nobody (ADR-468 item 11). A stop that begins meanwhile is
+    // not raced: the registration below refuses it.
+    match stamp(&control.pool, &agent).await {
+        Ok(Some(false)) => {}
+        Ok(_) => {
+            control.sessions.revoke_agent(&agent);
+            tracing::warn!(agent_id = %agent.0, "control channel refused: the agent is revoked or unknown");
+            if send_close(&mut socket, CLOSE_CODE_REVOKED).await {
+                drain(&mut socket).await;
+            }
+            return;
+        }
+        Err(what) => {
+            if may_log(&control.gates.connect, now(), LOG_EVERY) {
+                tracing::warn!(agent_id = %agent.0, what, "control channel: last_seen_at was not written at connect");
+            }
+        }
+    }
+    let mut registration = match control.hub.register(&agent) {
         Ok(registration) => registration,
         Err(Stopping) => {
             // The stop began after the hub adopted this session and before it registered.
@@ -215,13 +268,29 @@ async fn session(hub: Hub, agent: AgentId, mut socket: WebSocket) {
             return;
         }
     };
-    let leave = Leave { hub, agent, id };
+    let id = registration.id;
+    let leave = Leave {
+        hub: control.hub.clone(),
+        agent,
+        id,
+    };
     tracing::info!(agent_id = %leave.agent.0, connection = %id, "control channel connected");
-    let end = run(&mut socket, &mut close, &mut stopping).await;
+    let end = run(&mut socket, &mut registration, &control, &leave.agent).await;
     // The hub stops routing to this connection before anything is written to it. The guard's
-    // own drop leaves again, which removes nothing.
-    leave.hub.leave(&leave.agent, id);
-    finish(&mut socket, &end, &mut stopping).await;
+    // own drop leaves again, which removes nothing. Only the agent's current connection is a
+    // disconnect of the agent: a replaced one is not.
+    let current = leave.hub.leave(&leave.agent, id);
+    finish(
+        &mut socket,
+        &end,
+        &mut registration.stopping,
+        Disconnect {
+            control: &control,
+            agent: &leave.agent,
+            current,
+        },
+    )
+    .await;
     tracing::info!(
         agent_id = %leave.agent.0,
         connection = %id,
@@ -233,9 +302,16 @@ async fn session(hub: Hub, agent: AgentId, mut socket: WebSocket) {
 /// The connection's loop: `hello`, then messages until something ends it.
 async fn run(
     socket: &mut WebSocket,
-    close: &mut oneshot::Receiver<u16>,
-    stopping: &mut watch::Receiver<bool>,
+    registration: &mut Registration,
+    control: &Control,
+    agent: &AgentId,
 ) -> Finish {
+    let Registration {
+        id,
+        close,
+        stopping,
+        outbound,
+    } = registration;
     let hello = ServerMessage::Hello {
         heartbeat_secs: DEFAULT_HEARTBEAT_SECS,
     };
@@ -247,7 +323,7 @@ async fn run(
     }
     let idle = Duration::from_secs(u64::from(DEFAULT_HEARTBEAT_SECS * HEARTBEAT_MISSED_LIMIT));
     // The idle clock starts once `hello` is written, and restarts after every complete message,
-    // ping or pong has been handled.
+    // ping or pong has been handled. A command written to the agent does not restart it.
     let mut deadline = Instant::now() + idle;
     loop {
         tokio::select! {
@@ -258,6 +334,20 @@ async fn run(
                 };
             }
             () = stopped(stopping) => return Finish::Close(CLOSE_CODE_GOING_AWAY),
+            // `None` means the hub let go of the queue (the entry was replaced): the close
+            // instruction is then on its way, so this arm is simply not taken.
+            Some(frame) = outbound.recv() => {
+                // A frame queued before an instruction or a stop is not written after it.
+                if let Ok(code) = close.try_recv() {
+                    return Finish::Close(code);
+                }
+                if *stopping.borrow() {
+                    return Finish::Close(CLOSE_CODE_GOING_AWAY);
+                }
+                if !write(socket, Message::Text(frame.into())).await {
+                    return Finish::Drop("write");
+                }
+            }
             received = socket.recv() => {
                 let message = match received {
                     None => return Finish::Drop("closed"),
@@ -271,7 +361,13 @@ async fn run(
                                 return Finish::Drop("write");
                             }
                         }
-                        Ok(_) => tracing::debug!("a control message was read and not routed"),
+                        Ok(message) => {
+                            if let Some(end) =
+                                deliver(control, agent, *id, message, close, stopping).await
+                            {
+                                return end;
+                            }
+                        }
                         Err(error) => return finish_for(&error),
                     },
                     Message::Binary(_) => return Finish::Close(CLOSE_CODE_BINARY),
@@ -283,6 +379,55 @@ async fn run(
             }
             () = tokio::time::sleep_until(deadline) => return Finish::Close(CLOSE_CODE_IDLE),
         }
+    }
+}
+
+/// Hands a message to the hub's inbox. With nobody holding the inbox the message is dropped. With
+/// a full inbox the task holds the message and waits, reading nothing, while it still watches its
+/// close instruction and the stop; the wait is not idle time, because the caller restarts the
+/// idle clock after this returns. `Some` ends the connection.
+async fn deliver(
+    control: &Control,
+    agent: &AgentId,
+    connection: ConnectionId,
+    message: AgentMessage,
+    close: &mut oneshot::Receiver<u16>,
+    stopping: &mut watch::Receiver<bool>,
+) -> Option<Finish> {
+    // Asked per message, so that an inbox taken after the connection registered is used.
+    let Some(inbox) = control.hub.inbox_sender() else {
+        if may_log(&control.gates.dropped, now(), LOG_EVERY) {
+            tracing::debug!("a control message was read and nobody takes the inbox; dropped");
+        }
+        return None;
+    };
+    let inbound = Inbound {
+        agent: agent.clone(),
+        connection,
+        message,
+    };
+    let inbound = match inbox.try_send(inbound) {
+        Ok(()) => return None,
+        Err(TrySendError::Closed(_)) => {
+            if may_log(&control.gates.dropped, now(), LOG_EVERY) {
+                tracing::debug!("a control message was read and the inbox is gone; dropped");
+            }
+            return None;
+        }
+        Err(TrySendError::Full(inbound)) => inbound,
+    };
+    tokio::select! {
+        sent = inbox.send(inbound) => {
+            if sent.is_err() && may_log(&control.gates.dropped, now(), LOG_EVERY) {
+                tracing::debug!("a control message was held and the inbox went away; dropped");
+            }
+            None
+        }
+        instruction = &mut *close => Some(match instruction {
+            Ok(code) => Finish::Close(code),
+            Err(_) => Finish::Drop("unregistered"),
+        }),
+        () = stopped(stopping) => Some(Finish::Close(CLOSE_CODE_GOING_AWAY)),
     }
 }
 
@@ -314,16 +459,48 @@ async fn drain(socket: &mut WebSocket) {
     while let Ok(Some(Ok(_))) = tokio::time::timeout_at(deadline, socket.recv()).await {}
 }
 
-/// What follows the end of the loop.
-async fn finish(socket: &mut WebSocket, end: &Finish, stopping: &mut watch::Receiver<bool>) {
+/// What the end of a connection owes the database: the stamp of the agent's disconnect, written
+/// when the connection was the agent's current one (ADR-468 item 11).
+struct Disconnect<'a> {
+    control: &'a Control,
+    agent: &'a AgentId,
+    current: bool,
+}
+
+impl Disconnect<'_> {
+    /// Stamps the row and ignores the answer; a failure is logged through its gate.
+    async fn write(&self) {
+        if !self.current {
+            return;
+        }
+        if let Err(what) = stamp(&self.control.pool, self.agent).await
+            && may_log(&self.control.gates.disconnect, now(), LOG_EVERY)
+        {
+            tracing::warn!(agent_id = %self.agent.0, what, "control channel: last_seen_at was not written at disconnect");
+        }
+    }
+}
+
+/// What follows the end of the loop. The stamp of the disconnect comes after the Close frame (or
+/// after the reply to the peer's own Close) and before the wait for the peer.
+async fn finish(
+    socket: &mut WebSocket,
+    end: &Finish,
+    stopping: &mut watch::Receiver<bool>,
+    disconnect: Disconnect<'_>,
+) {
     match end {
         Finish::Close(code) => {
-            if send_close(socket, *code).await {
+            let sent = send_close(socket, *code).await;
+            disconnect.write().await;
+            if sent {
                 drain(socket).await;
             }
         }
         Finish::CloseThenWait(code) => {
-            if send_close(socket, *code).await {
+            let sent = send_close(socket, *code).await;
+            disconnect.write().await;
+            if sent {
                 // No read is possible after a read error. Dropping at once with input unread
                 // can reset the connection and lose the Close at the peer, so wait; a stop ends
                 // the wait.
@@ -335,8 +512,9 @@ async fn finish(socket: &mut WebSocket, end: &Finish, stopping: &mut watch::Rece
         }
         Finish::PeerClosed => {
             let _ = tokio::time::timeout(CLOSE_WAIT, socket.recv()).await;
+            disconnect.write().await;
         }
-        Finish::Drop(_) => {}
+        Finish::Drop(_) => disconnect.write().await,
     }
 }
 

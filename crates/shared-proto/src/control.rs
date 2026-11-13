@@ -56,6 +56,17 @@ pub const CLOSE_CODE_REVOKED: u16 = 4002;
 /// any kind for [`HEARTBEAT_MISSED_LIMIT`] heartbeat intervals (14.1).
 pub const CLOSE_CODE_IDLE: u16 = 4003;
 
+/// Every close code the server itself sends, each with its own reason word in [`close_reason`].
+pub const CLOSE_CODES: [u16; 7] = [
+    CLOSE_CODE_GOING_AWAY,
+    CLOSE_CODE_PROTOCOL,
+    CLOSE_CODE_BINARY,
+    CLOSE_CODE_TOO_BIG,
+    CLOSE_CODE_REPLACED,
+    CLOSE_CODE_REVOKED,
+    CLOSE_CODE_IDLE,
+];
+
 /// The reason text a Close frame carries for `code`: one fixed word per code, never anything the
 /// peer sent. Both sides use this table, so a reason says the same thing in either direction. A
 /// code the table does not know gets `closed`.
@@ -710,15 +721,7 @@ mod tests {
 
     #[test]
     fn every_close_code_has_its_own_reason_word() {
-        let codes = [
-            CLOSE_CODE_GOING_AWAY,
-            CLOSE_CODE_PROTOCOL,
-            CLOSE_CODE_BINARY,
-            CLOSE_CODE_TOO_BIG,
-            CLOSE_CODE_REPLACED,
-            CLOSE_CODE_REVOKED,
-            CLOSE_CODE_IDLE,
-        ];
+        let codes = CLOSE_CODES;
         let words: Vec<&str> = codes.iter().map(|code| close_reason(*code)).collect();
         let mut unique = words.clone();
         unique.sort_unstable();

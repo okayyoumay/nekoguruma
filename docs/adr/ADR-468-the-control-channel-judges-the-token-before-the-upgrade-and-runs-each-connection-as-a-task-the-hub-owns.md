@@ -1,7 +1,7 @@
 # ADR-468: The Control Channel Judges the Token Before the Upgrade and Runs Each Connection as a Task the Hub Owns
 
 **Date:** 2026-11-12
-**Status:** Accepted
+**Status:** Accepted (items 8, 11 and 12 detailed by ADR-472)
 **Affects:** design 5.2, 13.3, 14.1, 15.1; `api/asyncapi.yaml` (`agentControl`); `crates/server` (`lib`, `control`, `hub`), `crates/shared-proto` (`control`), `crates/server/docs/ngr-server.md`; settles what ADR-466 left to the server work and extends its items 5 and 6; details ADR-456 item 9's graceful stop for upgraded connections
 
 ## Context
@@ -76,7 +76,7 @@ public sending interface: `last_seen_at`, the revocation pass, and the sending o
    a connection number and that word, and no message text.
 8. **What the connection does with what it reads.** A complete text message that decodes to
    `heartbeat` is answered with the echo within 10 seconds. Any other text that decodes is
-   handed on (not built yet, an open item in `work/`; until then it is read and dropped). A text that does
+   handed on to the inbox (item 12). A text that does
    not decode closes with 1002, or 1009 when `decode` reports the size (not reachable behind
    equal transport limits, and mapped all the same). A binary message closes with 1003. A Close
    from the agent is answered by the stack on one more read, then the task ends. Both transport
@@ -105,7 +105,7 @@ public sending interface: `last_seen_at`, the revocation pass, and the sending o
     "the agent's current one" is what `leave` returns. A connection ended by replacement is not a
     disconnect for `last_seen_at` (item 11): the agent did not disconnect, and the newer
     connection stamped the row at its connect.
-11. **`last_seen_at` and the revocation pass (not built yet: an open item in `work/`).** One statement stamps
+11. **`last_seen_at` and the revocation pass.** One statement stamps
     the row, `UPDATE agents SET last_seen_at = GREATEST(last_seen_at, now()) WHERE id = $1`
     returning whether the row is revoked, inside a transaction with the usual statement timeouts
     and a 5 second bound. It runs at the connect of a connection, after the 101 and before it
@@ -125,7 +125,7 @@ public sending interface: `last_seen_at`, the revocation pass, and the sending o
     them are not revoked, closes the others (a missing row too) with 4002 after dropping their
     tokens, and closes nobody when its read fails, since a failed read is no evidence of
     revocation. It runs as a task of the hub's set, so the stop aborts it before the pool closes.
-12. **The interface to the queue (not built yet: an open item in `work/`).** `Hub::send_job_command(agent,
+12. **The interface to the queue.** `Hub::send_job_command(agent,
     signed_job)` is not async and does not wait: it draws a `commandId` from a hub-wide counter
     (unique per delivery, meaningful with the connection it went to), encodes the frame outside
     the lock and queues it on the agent's current connection, whose queue holds 16 frames. It
@@ -133,7 +133,8 @@ public sending interface: `last_seen_at`, the revocation pass, and the sending o
     agent's answer settles a delivery. Its errors are `NotConnected` (no current connection, or
     it is closing; the job stays queued, design 14.1), `Busy` (16 frames wait, so one slow agent
     never blocks the caller) and `TooLarge` (over 128 KiB; the connection is untouched). The
-    outcomes and events the agent sends (`commandAck`, `commandRejected`, `agentEvent`) go to one
+    outcomes and events the agent sends (`commandAck`, `commandRejected`, `agentEvent`, and
+    `reconcile`, ADR-472) go to one
     bounded inbox of 256 that the queue's work takes the receiver of once, in the order they were
     read, with the agent and the connection that sent them. When it is full the connection's
     task waits (still watching its close instruction and the stop) and reads nothing, so the

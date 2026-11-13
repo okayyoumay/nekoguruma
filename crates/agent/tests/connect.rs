@@ -389,21 +389,30 @@ mod with_store {
         assert_eq!(result, 0);
     }
 
-    /// A running session holds the connection lock, so a second command is exit 3, and SIGINT or
-    /// SIGTERM ends it with 0 and frees the lock.
+    /// A running session holds the connection lock, so a second command is exit 3 (on every
+    /// platform; the first is killed when the test ends).
+    #[test]
+    fn a_running_session_holds_its_lock() {
+        let env = Env::new();
+        let fingerprint = fingerprint(&env);
+        // Nothing listens: the session retries until it is stopped.
+        env.register(&fingerprint, closed_port());
+        let first = start(&env);
+        first.wait_for("session started");
+        let second = run(env.connect());
+        assert_exit(&second, 3, "a control channel session is already running");
+    }
+
+    /// SIGINT or SIGTERM ends a running session with 0 and frees the lock.
     #[cfg(unix)]
     #[test]
-    fn a_running_session_holds_its_lock_and_a_signal_stops_it_with_exit_0() {
+    fn a_signal_stops_a_running_session_with_exit_0() {
         for stop in [libc::SIGINT, libc::SIGTERM] {
             let env = Env::new();
             let fingerprint = fingerprint(&env);
-            // Nothing listens: the session retries until it is stopped.
             env.register(&fingerprint, closed_port());
             let mut first = start(&env);
             first.wait_for("session started");
-
-            let second = run(env.connect());
-            assert_exit(&second, 3, "a control channel session is already running");
             signal(first.child.as_ref().unwrap(), stop);
             let output = finish(first.child.take().unwrap());
             assert_eq!(output.status.code(), Some(0), "signal {stop}");

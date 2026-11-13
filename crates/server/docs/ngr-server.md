@@ -175,10 +175,10 @@ command that does this is not written.
 
 `storage.rs` (the `ObjectStore` trait and its types) and `storage/local.rs` (`LocalStore`); the
 decision is in ADR-474. The store holds the large bodies that the database refers to by key (the
-`storage_key` columns, `db/README.md`): the local profile keeps them as files, and an
-S3-compatible store for the standard profile implements the same trait later (design 13). The
+`storage_key` columns, `db/README.md`): the local profile keeps them as files; `LocalStore` is the only
+implementation, and the standard profile's S3-compatible store is not written (design 13). The
 trait's futures are boxed by hand, so `Arc<dyn ObjectStore>` works, and `Server::object_store()`
-returns the store `Server::start` opened. Nothing in the server calls it yet.
+returns the store `Server::start` opened. No route or task of the server uses the store.
 
 A write is a resumable upload by offset:
 

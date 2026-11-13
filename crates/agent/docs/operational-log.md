@@ -86,6 +86,13 @@ throughout.
   The gate writes one entry per refusal; the control channel that calls it bounds how many a
   connection writes (the first per reason at `warn`, later ones counted or at `debug`).
 
+- **The control channel session** (`agent::control`, ADR-471): the entries hold a failure
+  class, an HTTP status, a close code and the heartbeat interval. They never hold the token, the
+  challenge, the nonce or the proof, an HTTP body, a message's text, a `commandId`, or the reason
+  text of a Close the server sent. A failure class warns once until the next `hello` and is logged
+  at `debug` after that; a refusal (403, a 429 on the session route, Close 4002) warns once until
+  the server issues a session token again.
+
 ## A crate not yet checked
 
 A crate that starts to reach the agent's subscriber before its calls have been checked against

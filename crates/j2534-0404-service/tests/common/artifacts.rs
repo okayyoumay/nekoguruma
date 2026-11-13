@@ -1,25 +1,14 @@
 //! Locates build artifacts of other packages (the `sim-vci` cdylib) for the tests of this
-//! package, shared through `#[path]`. The lookup assumes no build-directory layout: it searches
-//! the test executable's target directory (`crates/agent/tests/support/build_layout.rs`).
+//! package, shared through `#[path]`. Cargo is asked for the path
+//! (`crates/agent/tests/support/cargo_artifact.rs`), so no target-directory layout is assumed.
 
 use std::path::PathBuf;
 
-#[path = "../../../agent/tests/support/build_layout.rs"]
-mod build_layout;
+#[path = "../../../agent/tests/support/cargo_artifact.rs"]
+mod cargo_artifact;
 
-/// The `sim-vci` cdylib built for this test run. `sim-vci` is a dev-dependency, so it is a
-/// product of the same build as the test executable.
+/// The `sim-vci` cdylib, up to date, built with the test's profile and target. `sim-vci` is a
+/// dev-dependency that asks for no features, so the nested build needs none either.
 pub fn sim_vci_path() -> PathBuf {
-    let exe = std::env::current_exe().expect("test executable path");
-    let name = format!(
-        "{}sim_vci{}",
-        std::env::consts::DLL_PREFIX,
-        std::env::consts::DLL_SUFFIX
-    );
-    build_layout::find_artifact(&exe, &name).unwrap_or_else(|| {
-        panic!(
-            "{name} should be built (not found under {})",
-            build_layout::target_scope(&exe).display()
-        )
-    })
+    cargo_artifact::build_artifact("sim-vci", cargo_artifact::Artifact::Cdylib)
 }

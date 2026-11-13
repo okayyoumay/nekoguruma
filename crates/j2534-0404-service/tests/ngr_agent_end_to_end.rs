@@ -4,11 +4,10 @@
 //! `j2534-0404-service` build for its ABI from a workers directory, launches it and runs the
 //! procedure of a variant's document on the simulated ECU behind it.
 //!
-//! `ngr-agent` belongs to another package, so cargo builds it only when the run builds the
-//! `agent` package's binaries (as `cargo test --workspace` and CI do). It is looked up next to
-//! the test's profile directory and checked against its sources
-//! (`crates/agent/tests/support/ngr_agent_binary.rs`): build it first with
-//! `cargo build -p agent --bin ngr-agent` to run this package's tests alone.
+//! `ngr-agent` belongs to another package, so the test asks Cargo for it
+//! (`crates/agent/tests/support/ngr_agent_binary.rs`): it builds `-p agent --bin ngr-agent`, or
+//! finds it up to date, and uses the path Cargo reports, so a run of this package's tests alone
+//! runs the current agent.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -24,16 +23,18 @@ const LIBRARY_NAME: &str = "sim-vci";
 /// The simulated ECU's built-in VIN (`crates/sim-vci/docs/simulated-vci.md`).
 const VIN: &[u8] = b"NGRSIMECU00000001";
 
-#[path = "common/artifacts.rs"]
-mod artifacts;
-
-use artifacts::sim_vci_path;
-
 #[path = "../../agent/tests/support/ngr_agent_binary.rs"]
 mod ngr_agent_binary;
 
+/// `sim-vci`'s library, through the Cargo lookup `ngr_agent_binary` already includes (one copy of
+/// it per test binary; `common/artifacts.rs` would load it a second time).
+fn sim_vci_path() -> PathBuf {
+    use ngr_agent_binary::cargo_artifact::{Artifact, build_artifact};
+    build_artifact("sim-vci", Artifact::Cdylib)
+}
+
 fn ngr_agent_path() -> PathBuf {
-    ngr_agent_binary::ngr_agent_path("j2534-0404-service")
+    ngr_agent_binary::ngr_agent_path()
 }
 
 /// Removes the temporary directory however the test ends.

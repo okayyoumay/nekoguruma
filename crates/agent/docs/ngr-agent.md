@@ -226,7 +226,7 @@ Loads the agent key (design 6.4, ADR-459) from the key store of the build and mo
 | 0 | The key was found or created | The JSON line |
 | 1 | This build or mode has no key store (every release build until the platform stores land), the store holds no key and cannot create one (an administrator provisions it), randomness is unavailable, or the debug variables are wrong | The reason on stderr |
 | 2 | Invalid command line | The error and the usage on stderr |
-| 3 | The store, the creation lock or the state directory is unavailable; nothing changed and a retry may work | The reason on stderr |
+| 3 | The store, the creation lock or the state directory is unavailable or cannot be used; nothing changed. A store that is unavailable or a creation lock held by another process may pass on a retry; a state directory or lock file that cannot be used needs its cause fixed first | The reason on stderr |
 | 4 | A key is present and cannot be used (the store cannot decrypt it, or it is not a P-256 private key); the store is untouched, and registering again needs an explicit reset | The reason on stderr |
 
 ### Agent key

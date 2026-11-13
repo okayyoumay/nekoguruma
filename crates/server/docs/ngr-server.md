@@ -495,7 +495,8 @@ connection with hyper's `with_upgrades()`.
   message is dropped with a gated debug line, never buffered. With the inbox full the task holds
   the message and waits, reading nothing (so the agent sees no echo), while it watches its close
   instruction and the stop. The hub keeps no delivery table. `Hub::close_agent(agent, code)`
-  gives the current connection's close instruction once, and `Hub::connected()` lists the
+  gives the current connection's close instruction once (a code that is not one of the server's
+  own close codes is refused with `false`), and `Hub::connected()` lists the
   current connections.
 - **The revocation pass (`revocation.rs`).** One task of the hub's set, spawned by
   `Server::run`: a tick every 30 seconds (the first one 30 seconds after the start, a missed

@@ -884,7 +884,7 @@ async fn wait_for_statement(u: &Up, like: &str, want: bool) {
 }
 
 /// What the revocation pass's read looks like in the database.
-const PASS_READ: &str = "%revoked_at IS NULL%";
+const PASS_READ: &str = "%ANY($1::uuid[]) AND revoked_at IS NULL%";
 /// What the connect stamp looks like in the database.
 const STAMP: &str = "UPDATE agents SET last_seen_at%";
 
@@ -1095,7 +1095,10 @@ async fn a_second_connection_stamps_again_and_the_replaced_one_writes_nothing() 
 // A7
 #[tokio::test]
 async fn a_stop_during_the_stamp_is_not_raced_and_the_connection_is_closed_with_1001_first() {
-    let u = Up::new().await;
+    // A grace period well beyond the stop's own probe (on Windows `begin_stop` returns only after
+    // a refused connect, about 2 seconds): the test does not time the stop, and the session must
+    // not be aborted before the lock is released.
+    let u = Up::with_grace(10).await;
     let t = token(&u).await;
     let lock = lock_agents(&u).await;
     let mut client = connect(u.s.addr, &t).await;
@@ -1643,7 +1646,9 @@ async fn a_frame_queued_before_the_stop_is_never_written() {
         clients.push(open(u.s.addr, token).await);
     }
     // The stop is signalled and the commands are queued with no yield between, so each task
-    // finds its frame and the stop ready together.
+    // finds its frame and the stop ready together. This relies on tokio's current-thread run
+    // queue being FIFO: the run task wakes before the connection tasks, so `begin_stop` happens
+    // first.
     u.s.signal_stop();
     for (agent, _) in &agents {
         u.hub.send_job_command(agent, "j".to_owned()).unwrap();

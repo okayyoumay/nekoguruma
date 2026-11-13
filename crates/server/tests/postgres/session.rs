@@ -295,13 +295,18 @@ pub(crate) struct Up {
 
 impl Up {
     pub(crate) async fn new() -> Up {
+        Up::with_grace(2).await
+    }
+
+    /// Like [`Up::new`], with a shutdown grace period of `grace_secs` seconds.
+    pub(crate) async fn with_grace(grace_secs: u64) -> Up {
         let w = World::new().await;
         w.add_operator("alice").await;
         let agent = Agent::new();
         let id = w.register(&agent).await;
         let http = Http {
             port: 0,
-            shutdown_grace_secs: 2,
+            shutdown_grace_secs: grace_secs,
         };
         let server = Server::bind(&http, w.pg.pool(), w.key.clone())
             .await

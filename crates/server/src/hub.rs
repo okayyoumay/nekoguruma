@@ -20,11 +20,7 @@ use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use shared_proto::{
-    AgentId, AgentMessage, CLOSE_CODE_BINARY, CLOSE_CODE_GOING_AWAY, CLOSE_CODE_IDLE,
-    CLOSE_CODE_PROTOCOL, CLOSE_CODE_REPLACED, CLOSE_CODE_REVOKED, CLOSE_CODE_TOO_BIG,
-    ServerMessage,
-};
+use shared_proto::{AgentId, AgentMessage, CLOSE_CODE_REPLACED, CLOSE_CODES, ServerMessage};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
@@ -212,16 +208,7 @@ impl Hub {
     /// server's own close codes are sent; any other code (such as 1005, 1006 or 1015, which are
     /// never put on the wire) is refused with `false` and tells nobody.
     pub fn close_agent(&self, agent: &AgentId, code: u16) -> bool {
-        let own = [
-            CLOSE_CODE_GOING_AWAY,
-            CLOSE_CODE_PROTOCOL,
-            CLOSE_CODE_BINARY,
-            CLOSE_CODE_TOO_BIG,
-            CLOSE_CODE_REPLACED,
-            CLOSE_CODE_REVOKED,
-            CLOSE_CODE_IDLE,
-        ];
-        if !own.contains(&code) {
+        if !CLOSE_CODES.contains(&code) {
             return false;
         }
         let mut state = self.0.lock();

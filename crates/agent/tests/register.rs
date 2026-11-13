@@ -1043,7 +1043,11 @@ mod with_store {
 
         let other = silent();
         let second = register(&env, &other, &key_id(&server), code.as_str(), &[]);
-        assert_exit(&second, 3, "another registration is running");
+        assert_exit(
+            &second,
+            3,
+            "another registration or a running control channel session",
+        );
         assert!(other.finish().is_none());
 
         go_tx.send(()).unwrap();

@@ -21,6 +21,7 @@ use hyper::client::conn::http1;
 use hyper::header::{CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, RETRY_AFTER};
 use hyper::{HeaderMap, Method};
 use hyper_util::rt::TokioIo;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -133,23 +134,50 @@ pub async fn post(
         Ok(Err(error)) => return Err(PostError::NotSent(error.kind())),
         Ok(Ok(stream)) => stream,
     };
+    post_over(stream, request, body_status, deadline).await
+}
+
+/// Sends `request` over `stream`, which the caller opened, and returns the answer, with
+/// everything done by `deadline` (the control channel's dial seam, ADR-471; [`post`] is this
+/// over a TCP stream it opens). `request.port` is not used: the stream is already connected.
+pub async fn post_over<S>(
+    stream: S,
+    request: &PostRequest<'_>,
+    body_status: u16,
+    deadline: Instant,
+) -> Result<Reply, PostError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     tokio::time::timeout_at(deadline, exchange(stream, request, body_status))
         .await
         .unwrap_or(Err(PostError::Unknown))
 }
 
+/// The usable value of a `Retry-After` header: digits only, from 1 to 60 seconds (the range the
+/// server's routes use, ADR-467). Registration and the control channel's exchange share this
+/// rule; any other text is no usable value.
+pub fn retry_after_secs(text: Option<&str>) -> Option<u32> {
+    text.filter(|text| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|text| text.parse::<u32>().ok())
+        .filter(|secs| (1..=60).contains(secs))
+}
+
 /// When the connect must be done and when the whole call must be, from `start`. The connect limit
 /// never passes the total.
-fn deadlines(start: Instant, timeouts: Timeouts) -> (Instant, Instant) {
+pub(crate) fn deadlines(start: Instant, timeouts: Timeouts) -> (Instant, Instant) {
     let deadline = start + timeouts.total;
     ((start + timeouts.connect).min(deadline), deadline)
 }
 
-async fn exchange(
-    stream: TcpStream,
+async fn exchange<S>(
+    stream: S,
     request: &PostRequest<'_>,
     body_status: u16,
-) -> Result<Reply, PostError> {
+) -> Result<Reply, PostError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let (mut sender, connection) = http1::Builder::new()
         .max_buf_size(MAX_HEAD)
         .max_headers(MAX_HEADERS)
@@ -376,6 +404,28 @@ mod tests {
             assert_eq!(run(port, 201, timeouts).unwrap_err(), PostError::Unknown);
             assert!(started.elapsed() < Duration::from_secs(2));
         }
+    }
+
+    #[test]
+    fn a_retry_after_is_usable_from_1_to_60_in_digits() {
+        for (text, secs) in [("1", 1), ("17", 17), ("60", 60), ("007", 7)] {
+            assert_eq!(retry_after_secs(Some(text)), Some(secs), "{text}");
+        }
+        for text in [
+            "",
+            "0",
+            "61",
+            "-1",
+            "+5",
+            "1.5",
+            " 5",
+            "5 ",
+            "abc",
+            "99999999999999999999",
+        ] {
+            assert_eq!(retry_after_secs(Some(text)), None, "{text:?}");
+        }
+        assert_eq!(retry_after_secs(None), None);
     }
 
     #[test]

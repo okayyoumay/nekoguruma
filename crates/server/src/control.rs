@@ -21,9 +21,10 @@ use axum::extract::{FromRequestParts, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use shared_proto::{
-    AgentId, AgentMessage, CLOSE_CODE_IDLE, CLOSE_CODE_REPLACED, CLOSE_CODE_REVOKED,
-    CONTROL_SUBPROTOCOL, ControlError, DEFAULT_HEARTBEAT_SECS, HEARTBEAT_MISSED_LIMIT,
-    MAX_CONTROL_MESSAGE_LEN, ServerMessage,
+    AgentId, AgentMessage, CLOSE_CODE_BINARY, CLOSE_CODE_GOING_AWAY, CLOSE_CODE_IDLE,
+    CLOSE_CODE_PROTOCOL, CLOSE_CODE_TOO_BIG, CONTROL_SUBPROTOCOL, ControlError,
+    DEFAULT_HEARTBEAT_SECS, HEARTBEAT_MISSED_LIMIT, MAX_CONTROL_MESSAGE_LEN, ServerMessage,
+    close_reason,
 };
 use tokio::sync::{oneshot, watch};
 use tokio::time::Instant;
@@ -44,12 +45,6 @@ pub(crate) const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const CLOSE_WAIT: Duration = Duration::from_secs(5);
 /// The refusal at the upgrade is logged at most this often.
 const LOG_EVERY: Duration = Duration::from_secs(60);
-
-/// The standard close codes the server sends (RFC 6455 section 7.4.1).
-const CLOSE_GOING_AWAY: u16 = 1001;
-const CLOSE_PROTOCOL: u16 = 1002;
-const CLOSE_BINARY: u16 = 1003;
-const CLOSE_TOO_BIG: u16 = 1009;
 
 /// The echo of a heartbeat: the text `ServerMessage::Heartbeat` encodes to, written without
 /// building it each time (a test keeps the two equal).
@@ -164,35 +159,16 @@ impl Finish {
     /// The fixed word the log and the close reason use; never anything the peer sent.
     fn word(&self) -> &'static str {
         match self {
-            Finish::Close(code) | Finish::CloseThenWait(code) => reason(*code),
+            Finish::Close(code) | Finish::CloseThenWait(code) => close_reason(*code),
             Finish::PeerClosed => "peer closed",
             Finish::Drop(word) => word,
         }
     }
 }
 
-/// The reason text of a close code.
-fn reason(code: u16) -> &'static str {
-    match code {
-        CLOSE_GOING_AWAY => "stopping",
-        CLOSE_PROTOCOL => "protocol",
-        CLOSE_BINARY => "binary",
-        CLOSE_TOO_BIG => "too big",
-        CLOSE_CODE_REPLACED => "replaced",
-        CLOSE_CODE_REVOKED => "revoked",
-        CLOSE_CODE_IDLE => "idle",
-        _ => "closed",
-    }
-}
-
-/// The close for a message that did not decode.
+/// The close for a message that did not decode: the code is the shared table's (ADR-471).
 fn finish_for(error: &ControlError) -> Finish {
-    match error {
-        ControlError::TooLarge => Finish::Close(CLOSE_TOO_BIG),
-        ControlError::Malformed(_) | ControlError::Refused(_) | ControlError::OutOfRange(_) => {
-            Finish::Close(CLOSE_PROTOCOL)
-        }
-    }
+    Finish::Close(error.close_code())
 }
 
 /// The end for a read error. A message over the limit is 1009; invalid UTF-8 and a framing
@@ -202,9 +178,9 @@ fn finish_for_read_error(error: axum::Error) -> Finish {
     use tungstenite::Error;
     use tungstenite::error::ProtocolError;
     match error.into_inner().downcast::<Error>().map(|e| *e) {
-        Ok(Error::Capacity(_)) => Finish::CloseThenWait(CLOSE_TOO_BIG),
+        Ok(Error::Capacity(_)) => Finish::CloseThenWait(CLOSE_CODE_TOO_BIG),
         Ok(Error::Protocol(ProtocolError::ResetWithoutClosingHandshake)) => Finish::Drop("reset"),
-        Ok(Error::Utf8(_) | Error::Protocol(_)) => Finish::CloseThenWait(CLOSE_PROTOCOL),
+        Ok(Error::Utf8(_) | Error::Protocol(_)) => Finish::CloseThenWait(CLOSE_CODE_PROTOCOL),
         _ => Finish::Drop("transport"),
     }
 }
@@ -233,7 +209,7 @@ async fn session(hub: Hub, agent: AgentId, mut socket: WebSocket) {
         Ok(registration) => registration,
         Err(Stopping) => {
             // The stop began after the hub adopted this session and before it registered.
-            if send_close(&mut socket, CLOSE_GOING_AWAY).await {
+            if send_close(&mut socket, CLOSE_CODE_GOING_AWAY).await {
                 drain(&mut socket).await;
             }
             return;
@@ -281,7 +257,7 @@ async fn run(
                     Err(_) => Finish::Drop("unregistered"),
                 };
             }
-            () = stopped(stopping) => return Finish::Close(CLOSE_GOING_AWAY),
+            () = stopped(stopping) => return Finish::Close(CLOSE_CODE_GOING_AWAY),
             received = socket.recv() => {
                 let message = match received {
                     None => return Finish::Drop("closed"),
@@ -298,7 +274,7 @@ async fn run(
                         Ok(_) => tracing::debug!("a control message was read and not routed"),
                         Err(error) => return finish_for(&error),
                     },
-                    Message::Binary(_) => return Finish::Close(CLOSE_BINARY),
+                    Message::Binary(_) => return Finish::Close(CLOSE_CODE_BINARY),
                     // The stack answers a ping itself; both count as a sign of life.
                     Message::Ping(_) | Message::Pong(_) => {}
                     Message::Close(_) => return Finish::PeerClosed,
@@ -326,7 +302,7 @@ async fn write(socket: &mut WebSocket, message: Message) -> bool {
 async fn send_close(socket: &mut WebSocket, code: u16) -> bool {
     let frame = CloseFrame {
         code,
-        reason: reason(code).into(),
+        reason: close_reason(code).into(),
     };
     write(socket, Message::Close(Some(frame))).await
 }
@@ -480,16 +456,5 @@ mod tests {
             finish_for_read_error(axum::Error::new(std::io::Error::other("x"))),
             Finish::Drop("transport")
         );
-    }
-
-    #[test]
-    fn every_close_code_has_its_own_reason_word() {
-        let codes = [1001, 1002, 1003, 1009, 4001, 4002, 4003];
-        let words: Vec<&str> = codes.iter().map(|code| reason(*code)).collect();
-        let mut unique = words.clone();
-        unique.sort_unstable();
-        unique.dedup();
-        assert_eq!(unique.len(), codes.len(), "{words:?}");
-        assert!(!words.contains(&"closed"));
     }
 }

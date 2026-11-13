@@ -36,6 +36,14 @@ pub const MAX_PROGRESS_PERMILLE: u16 = 1000;
 /// How many intervals without any frame a side waits before it closes the connection (14.1).
 pub const HEARTBEAT_MISSED_LIMIT: u32 = 3;
 
+/// The standard close codes the two sides send (RFC 6455 section 7.4.1): the sender is stopping,
+/// a protocol violation, a frame of a kind the channel does not take, and a message over the
+/// limit (ADR-466, ADR-471).
+pub const CLOSE_CODE_GOING_AWAY: u16 = 1001;
+pub const CLOSE_CODE_PROTOCOL: u16 = 1002;
+pub const CLOSE_CODE_BINARY: u16 = 1003;
+pub const CLOSE_CODE_TOO_BIG: u16 = 1009;
+
 /// The application close code with which the server ends a connection that a newer connection
 /// of the same agent replaced (ADR-466).
 pub const CLOSE_CODE_REPLACED: u16 = 4001;
@@ -47,6 +55,22 @@ pub const CLOSE_CODE_REVOKED: u16 = 4002;
 /// The application close code with which either side ends a connection that has seen no frame of
 /// any kind for [`HEARTBEAT_MISSED_LIMIT`] heartbeat intervals (14.1).
 pub const CLOSE_CODE_IDLE: u16 = 4003;
+
+/// The reason text a Close frame carries for `code`: one fixed word per code, never anything the
+/// peer sent. Both sides use this table, so a reason says the same thing in either direction. A
+/// code the table does not know gets `closed`.
+pub fn close_reason(code: u16) -> &'static str {
+    match code {
+        CLOSE_CODE_GOING_AWAY => "stopping",
+        CLOSE_CODE_PROTOCOL => "protocol",
+        CLOSE_CODE_BINARY => "binary",
+        CLOSE_CODE_TOO_BIG => "too big",
+        CLOSE_CODE_REPLACED => "replaced",
+        CLOSE_CODE_REVOKED => "revoked",
+        CLOSE_CODE_IDLE => "idle",
+        _ => "closed",
+    }
+}
 
 /// A message could not be read or written.
 #[derive(Debug, thiserror::Error)]
@@ -66,6 +90,19 @@ pub enum ControlError {
     /// A number is outside the range its property allows.
     #[error("{0} is out of range")]
     OutOfRange(&'static str),
+}
+
+impl ControlError {
+    /// The close code with which a side ends a connection whose text did not decode: 1009 for a
+    /// message over the limit, 1002 for anything else (ADR-466, ADR-471).
+    pub fn close_code(&self) -> u16 {
+        match self {
+            ControlError::TooLarge => CLOSE_CODE_TOO_BIG,
+            ControlError::Malformed(_) | ControlError::Refused(_) | ControlError::OutOfRange(_) => {
+                CLOSE_CODE_PROTOCOL
+            }
+        }
+    }
 }
 
 /// A message the server sends to the agent.
@@ -669,5 +706,55 @@ mod tests {
             signed_job: Some("A".repeat(87_512)),
         };
         assert!(full.encode().is_ok());
+    }
+
+    #[test]
+    fn every_close_code_has_its_own_reason_word() {
+        let codes = [
+            CLOSE_CODE_GOING_AWAY,
+            CLOSE_CODE_PROTOCOL,
+            CLOSE_CODE_BINARY,
+            CLOSE_CODE_TOO_BIG,
+            CLOSE_CODE_REPLACED,
+            CLOSE_CODE_REVOKED,
+            CLOSE_CODE_IDLE,
+        ];
+        let words: Vec<&str> = codes.iter().map(|code| close_reason(*code)).collect();
+        let mut unique = words.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), codes.len(), "{words:?}");
+        assert!(!words.contains(&"closed"));
+        assert_eq!(close_reason(1000), "closed");
+    }
+
+    #[test]
+    fn a_message_that_does_not_decode_closes_with_1002_or_1009() {
+        for text in [
+            "not json",
+            "[]",
+            "{}",
+            r#"{"type":"nope"}"#,
+            r#"{"type":"hello"}"#,
+            r#"{"type":"hello","heartbeatSecs":0}"#,
+            r#"{"type":"hello","heartbeatSecs":20,"x":1}"#,
+            r#"{"type":"jobCommand"}"#,
+        ] {
+            let error = ServerMessage::decode(text).unwrap_err();
+            assert_eq!(error.close_code(), CLOSE_CODE_PROTOCOL, "{text}");
+        }
+        for text in [
+            r#"{"type":"hello","heartbeatSecs":20}"#,
+            r#"{"type":"commandAck"}"#,
+        ] {
+            let error = AgentMessage::decode(text).unwrap_err();
+            assert_eq!(error.close_code(), CLOSE_CODE_PROTOCOL, "{text}");
+        }
+        let long = format!(
+            r#"{{"type":"commandAck","commandId":"{}"}}"#,
+            "x".repeat(MAX_CONTROL_MESSAGE_LEN)
+        );
+        let error = AgentMessage::decode(&long).unwrap_err();
+        assert_eq!(error.close_code(), CLOSE_CODE_TOO_BIG);
     }
 }

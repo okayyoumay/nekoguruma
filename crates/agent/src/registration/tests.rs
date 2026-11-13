@@ -187,7 +187,7 @@ fn a_held_lock_is_exit_3_and_sends_nothing() {
     let stub = Stub::start(201);
     let error = run(&stub.request(false), &existing_key(), &code(), dir.path()).unwrap_err();
     assert_eq!(error.exit_code(), 3);
-    assert_eq!(error.to_string(), "another registration is running");
+    assert_eq!(error.to_string(), REGISTRATION_RUNNING);
     assert!(
         std::fs::read_dir(dir.path()).unwrap().count() == 1,
         "only the lock file"

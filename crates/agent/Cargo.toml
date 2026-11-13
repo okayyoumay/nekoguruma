@@ -37,11 +37,18 @@ base64.workspace = true
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
+# The control channel session library's WebSocket client (ADR-466, ADR-471): the handshake and the
+# framing over a stream the agent opens itself, with no TLS, no name resolution and no
+# redirects. `futures-util` is the stream and sink traits the WebSocket type is used through.
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]
+# The control channel's loop tests run on a paused clock (ADR-471).
+tokio = { workspace = true, features = ["test-util"] }
 diag-frontend = { path = "../diag-frontend" }
 sim-ecu.workspace = true
 tempfile = "3"

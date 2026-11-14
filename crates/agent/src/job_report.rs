@@ -18,10 +18,13 @@ use std::path::Path;
 use diag_ir::{IdentityKind, Program, VmState};
 use shared_proto::{FailureCode, JobState, MAX_PROCEDURE_CODE_LEN};
 
-use crate::journal::{JobKey, Journal, JournalError, JournalState, MAX_FAILURE_DETAIL_LEN};
+use crate::host::HostError;
+use crate::journal::{
+    JobKey, Journal, JournalError, JournalState, MAX_FAILURE_DETAIL_LEN, StoppedRun,
+};
 use crate::oplog::LogSafe;
 use crate::restart::{NotResumableCause, OnSiteReason, RestartDecision, classify};
-use crate::runner::{JobError, truncated};
+use crate::runner::{JobError, stopped_error, truncated};
 
 // The procedure's code reaches the wire as the journal holds it.
 const _: () = assert!(MAX_PROCEDURE_CODE_LEN == diag_ir::MAX_FAILURE_CODE_LEN);
@@ -39,11 +42,23 @@ pub enum JournalStanding {
     Resumable,
     /// The journal holds a terminal decision (a procedure failure, an identity abort or a run's
     /// stop, ADR-280, ADR-286, ADR-288): a resume would end as it says without sending anything.
-    /// The runs that end that way are terminal as their own result.
-    Decided,
+    /// The job ends as the journal says, whatever the run's own error (a pre-run check can refuse
+    /// before the journal is read).
+    Decided(JournalVerdict),
     /// A resume would end in on-site intervention for this reason, which includes a journal
     /// that is missing where one is due and one that cannot be read back.
     OnSite(OnSiteReason),
+}
+
+/// The terminal decision a journal holds, as `classify` reads it (ADR-475 item 1).
+#[derive(Debug, Clone, PartialEq)]
+pub enum JournalVerdict {
+    /// The procedure ended itself as failed (ADR-280).
+    Failed { code: String, detail: String },
+    /// A resume ended on a failed identity check (ADR-286).
+    Aborted { identity: IdentityKind },
+    /// A run stopped on the step limit or on an instruction the VM refused (ADR-288).
+    Stopped(StoppedRun),
 }
 
 impl JournalStanding {
@@ -68,9 +83,13 @@ impl JournalStanding {
             RestartDecision::Restart(_) | RestartDecision::ResumeFromCheckpoint(_) => {
                 Self::Resumable
             }
-            RestartDecision::Failed { .. }
-            | RestartDecision::Aborted { .. }
-            | RestartDecision::Stopped(_) => Self::Decided,
+            RestartDecision::Failed { code, detail, .. } => {
+                Self::Decided(JournalVerdict::Failed { code, detail })
+            }
+            RestartDecision::Aborted { identity } => {
+                Self::Decided(JournalVerdict::Aborted { identity })
+            }
+            RestartDecision::Stopped(stopped) => Self::Decided(JournalVerdict::Stopped(stopped)),
         }
     }
 
@@ -97,10 +116,14 @@ pub enum JobOutcome {
 /// The outcome of a run that ended with `result`. `first_run` says the run was the job's first
 /// (no earlier run of it on this agent); `standing` is the journal's after the run.
 ///
+/// Another run's job (`Journal(InUse)`, `Journal(AlreadyExists)`) reports nothing. Otherwise a
+/// decided standing is the job's end at once, whatever the error: the journal's own verdict is
+/// reported, since a pre-run check may refuse before the journal is read.
+///
 /// A procedure's own verdict, an identity mismatch, an on-site ending and a stop the VM or the
-/// step limit made are terminal whatever the standing: the runner journals them, so a resume
-/// would end the same way (a VM error only while no resume would go on from the journal). For every other ending the standing decides (ADR-475 item 1):
-/// - decided, the open job's resume reports what the journal holds;
+/// step limit made are terminal whatever the other standings: the runner journals them, so a
+/// resume would end the same way (a VM error only while the journal is clean). For every other
+/// ending the standing decides (ADR-475 item 1):
 /// - on-site, the next resume would end in on-site intervention, so the job does: terminal at
 ///   once, whatever the error;
 /// - resumable, a refusal that every resume would repeat ends in on-site intervention, since
@@ -121,43 +144,36 @@ pub fn outcome(
         detail: detail(error),
         procedure_code: None,
     };
-    // Terminal whatever the standing.
+    // Another run owns the journal: that run reports the job.
+    if matches!(
+        error,
+        JobError::Journal(JournalError::InUse | JournalError::AlreadyExists)
+    ) {
+        return JobOutcome::None;
+    }
+    // The journal's decision is what a resume would report, and the pre-run checks refuse before
+    // it is read, so it ends the job whatever the error.
+    if let JournalStanding::Decided(verdict) = standing {
+        return JobOutcome::Terminal(verdict_state(verdict));
+    }
+    // Terminal whatever the other standings.
     match error {
         JobError::ProcedureFailed {
             code, detail: text, ..
-        } => {
-            return JobOutcome::Terminal(JobState::Failed {
-                code: FailureCode::Procedure,
-                detail: truncated(text.clone(), MAX_FAILURE_DETAIL_LEN),
-                procedure_code: Some(truncated(code.clone(), MAX_PROCEDURE_CODE_LEN))
-                    .filter(|code| !code.is_empty()),
-            });
-        }
+        } => return JobOutcome::Terminal(procedure_failed(code, text)),
         JobError::IdentityMismatch { identity } => {
-            return JobOutcome::Terminal(failed(match identity {
-                IdentityKind::Vin => FailureCode::VinMismatch,
-                IdentityKind::HardwarePartNumber => FailureCode::VariantMismatch,
-                // The runner does not end a run on this one today; the code claims no more
-                // than the job's own expectation failed.
-                IdentityKind::SoftwareVersion => FailureCode::Other,
-            }));
+            return JobOutcome::Terminal(identity_mismatch(*identity));
         }
         JobError::StepLimit(_) => {
             return JobOutcome::Terminal(failed(FailureCode::ProcedureError));
         }
         // The runner journals a stop its run made, so the standing is then `Decided`; a VM error
         // of a check before the run on a journal a resume would go on from is not a stop.
-        JobError::Vm { .. }
-            if matches!(standing, JournalStanding::Clean | JournalStanding::Decided) =>
-        {
+        JobError::Vm { .. } if matches!(standing, JournalStanding::Clean) => {
             return JobOutcome::Terminal(failed(FailureCode::ProcedureError));
         }
         JobError::OnSiteInterventionRequired(reason) => {
             return JobOutcome::Terminal(on_site(reason));
-        }
-        // Another run owns the journal: that run reports the job.
-        JobError::Journal(JournalError::InUse | JournalError::AlreadyExists) => {
-            return JobOutcome::None;
         }
         _ => {}
     }
@@ -172,8 +188,8 @@ pub fn outcome(
                 JobOutcome::Open
             };
         }
-        // The resume would end as the journal says: the open job reports it then.
-        JournalStanding::Decided => return JobOutcome::Open,
+        // Returned above.
+        JournalStanding::Decided(_) => unreachable!("decided before the standing"),
         JournalStanding::Clean => {}
     }
     // A refusal or failure that precedes everything the run sends is a precondition failure on a
@@ -226,6 +242,45 @@ pub fn outcome(
     })
 }
 
+/// The failed state of a procedure's own verdict: its code apart from the agent's, and its
+/// detail cut to the bound.
+fn procedure_failed(code: &str, detail: &str) -> JobState {
+    JobState::Failed {
+        code: FailureCode::Procedure,
+        detail: truncated(detail.to_owned(), MAX_FAILURE_DETAIL_LEN),
+        procedure_code: Some(truncated(code.to_owned(), MAX_PROCEDURE_CODE_LEN))
+            .filter(|code| !code.is_empty()),
+    }
+}
+
+/// The failed state of an identity mismatch; the detail names the kind only.
+fn identity_mismatch(identity: IdentityKind) -> JobState {
+    JobState::Failed {
+        code: match identity {
+            IdentityKind::Vin => FailureCode::VinMismatch,
+            IdentityKind::HardwarePartNumber => FailureCode::VariantMismatch,
+            // The runner does not end a run on this one today; the code claims no more
+            // than the job's own expectation failed.
+            IdentityKind::SoftwareVersion => FailureCode::Other,
+        },
+        detail: detail(&JobError::IdentityMismatch { identity }),
+        procedure_code: None,
+    }
+}
+
+/// The state the journal's own verdict gives: what the run that wrote it reported.
+fn verdict_state(verdict: &JournalVerdict) -> JobState {
+    match verdict {
+        JournalVerdict::Failed { code, detail } => procedure_failed(code, detail),
+        JournalVerdict::Aborted { identity } => identity_mismatch(*identity),
+        JournalVerdict::Stopped(stopped) => JobState::Failed {
+            code: FailureCode::ProcedureError,
+            detail: detail(&stopped_error(stopped)),
+            procedure_code: None,
+        },
+    }
+}
+
 /// The state of a job that needs on-site intervention for `reason`.
 fn on_site(reason: &OnSiteReason) -> JobState {
     JobState::NeedsOnSiteRecovery {
@@ -253,6 +308,9 @@ fn repeats_on_every_resume(error: &JobError) -> bool {
         | JobError::NoCommLogDir
         | JobError::CurrentThreadRuntime
         | JobError::GuardsMissing => true,
+        // The link's configuration is not the document's, or names an unknown or clashing
+        // parameter: the same on every resume.
+        JobError::Link(HostError::DeclaredLink(_) | HostError::Setup(_)) => true,
         // A failed exchange, a lock or link held for now, a fault that need not recur and an
         // interruption: the next resume may go through.
         JobError::Link(_)
@@ -394,7 +452,6 @@ pub(crate) fn on_site_text(reason: &OnSiteReason) -> String {
 mod tests {
     use super::*;
     use crate::guards::GuardError;
-    use crate::host::HostError;
     use crate::inputs::TableError;
     use crate::journal::StepRef;
     use diag_ir::{Idempotency, Interruptible, Op, Section, Vm, VmError, WaitingOn};
@@ -454,7 +511,15 @@ mod tests {
         })
     }
 
-    use JournalStanding::{Clean, Decided, Resumable};
+    use JournalStanding::{Clean, Resumable};
+
+    /// A decided standing, for a test that needs any decision.
+    fn decided() -> JournalStanding {
+        JournalStanding::Decided(JournalVerdict::Failed {
+            code: "c".to_owned(),
+            detail: "d".to_owned(),
+        })
+    }
 
     /// A refusal every resume would meet again: one of each variant that `repeats_on_every_resume`
     /// takes.
@@ -545,7 +610,7 @@ mod tests {
     fn a_procedure_failure_carries_its_own_code_and_detail_and_never_an_agent_code() {
         // A procedure may name its code after an agent's; it stays the procedure's.
         for code in ["internal", "VinMismatch", "linkNotOpened", "x"] {
-            for standing in [Clean, Resumable, Decided, on_site_standing()] {
+            for standing in [Clean, Resumable, on_site_standing()] {
                 let error = JobError::ProcedureFailed {
                     pc: 3,
                     code: code.to_owned(),
@@ -608,23 +673,22 @@ mod tests {
 
     #[test]
     fn a_stop_the_vm_made_is_a_procedure_error_whatever_the_journal() {
-        for standing in [Clean, Resumable, Decided, on_site_standing()] {
+        for standing in [Clean, Resumable, on_site_standing()] {
             let s = state(JobError::StepLimit(9), true, standing);
             assert_eq!(code_of(&s), &FailureCode::ProcedureError);
         }
-        // A VM error is the run's own stop once the journal holds it (or holds nothing).
-        for standing in [Clean, Decided] {
-            let s = state(
-                JobError::Vm {
-                    pc: 2,
-                    source: VmError::StackUnderflow,
-                },
-                true,
-                standing,
-            );
-            assert_eq!(code_of(&s), &FailureCode::ProcedureError);
-            assert!(matches!(s, JobState::Failed { .. }));
-        }
+        // A VM error is the run's own stop while the journal holds nothing; once it holds the
+        // stop, the journal's verdict is reported (see the decided-standing tests).
+        let s = state(
+            JobError::Vm {
+                pc: 2,
+                source: VmError::StackUnderflow,
+            },
+            true,
+            Clean,
+        );
+        assert_eq!(code_of(&s), &FailureCode::ProcedureError);
+        assert!(matches!(s, JobState::Failed { .. }));
     }
 
     #[test]
@@ -846,13 +910,11 @@ mod tests {
                 assert_eq!(run(error, first_run, Resumable), JobOutcome::Open, "{name}");
             }
         }
-        // A journal that holds a decision ends the resume as it says: the run stays open.
-        assert_eq!(run(JobError::Cancelled, false, Decided), JobOutcome::Open);
     }
 
     #[test]
     fn a_job_another_run_owns_reports_nothing() {
-        for standing in [Clean, Resumable, Decided, on_site_standing()] {
+        for standing in [Clean, Resumable, decided(), on_site_standing()] {
             for first_run in [true, false] {
                 assert_eq!(
                     run(
@@ -933,7 +995,7 @@ mod tests {
             [
                 Clean,
                 Resumable,
-                Decided,
+                decided(),
                 JournalStanding::OnSite(OnSiteReason::UnreadableJournal(MARKER.to_owned())),
                 JournalStanding::OnSite(OnSiteReason::InvalidEntryState(MARKER.to_owned())),
             ]
@@ -1092,7 +1154,228 @@ mod tests {
             .unwrap();
         assert_eq!(
             JournalStanding::read(dir.path(), &key(), &program, false),
-            Decided
+            JournalStanding::Decided(JournalVerdict::Failed {
+                code: "c".to_owned(),
+                detail: "detail".to_owned(),
+            })
+        );
+    }
+
+    /// The standing of a fresh journal that `fill` wrote to.
+    fn standing_after(program: &Program, fill: impl FnOnce(&mut Journal)) -> JournalStanding {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = Journal::create(dir.path(), &key(), None, None, None).unwrap();
+        fill(&mut journal);
+        JournalStanding::read(dir.path(), &key(), program, false)
+    }
+
+    /// A refusal every resume meets again and a transient error, each with its own constructor.
+    fn errors_of_both_kinds() -> [fn() -> JobError; 2] {
+        [
+            || {
+                JobError::Sources(TableError::Duplicate {
+                    service_id: 1,
+                    field_id: 2,
+                })
+            },
+            || JobError::Link(HostError::NoResponse),
+        ]
+    }
+
+    /// The journal's verdict ends the job at once, whatever the run's error, on a first run and
+    /// on a resume (a pre-run check refuses before the journal is read).
+    fn assert_verdict(standing: &JournalStanding, expected: &JobState) {
+        let mut errors: Vec<fn() -> JobError> = errors_of_both_kinds().to_vec();
+        errors.push(|| JobError::Cancelled);
+        errors.push(|| JobError::Panicked);
+        errors.push(|| JobError::Vm {
+            pc: 2,
+            source: VmError::StackUnderflow,
+        });
+        for error in errors {
+            for first_run in [true, false] {
+                let error = error();
+                let name = format!("{error:?}");
+                assert_eq!(
+                    run(error, first_run, standing.clone()),
+                    JobOutcome::Terminal(expected.clone()),
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_journal_that_holds_a_procedure_failure_reports_it_whatever_the_error() {
+        let standing = standing_after(&request_program(), |journal| {
+            journal.commit_request(at(1)).unwrap();
+            journal
+                .commit_procedure_failed(at(1), "E42", "the check failed")
+                .unwrap();
+        });
+        let expected = JobState::Failed {
+            code: FailureCode::Procedure,
+            detail: "the check failed".to_owned(),
+            procedure_code: Some("E42".to_owned()),
+        };
+        assert_verdict(&standing, &expected);
+        // An empty code (no journal holds one) is left out, as for the run's own error.
+        let standing = JournalStanding::Decided(JournalVerdict::Failed {
+            code: String::new(),
+            detail: "x".to_owned(),
+        });
+        let s = state(JobError::Cancelled, false, standing);
+        assert!(
+            matches!(
+                &s,
+                JobState::Failed {
+                    procedure_code: None,
+                    ..
+                }
+            ),
+            "{s:?}"
+        );
+    }
+
+    #[test]
+    fn a_journal_that_holds_an_identity_abort_reports_the_kind() {
+        for (identity, code) in [
+            (IdentityKind::Vin, FailureCode::VinMismatch),
+            (
+                IdentityKind::HardwarePartNumber,
+                FailureCode::VariantMismatch,
+            ),
+        ] {
+            let standing = standing_after(&program(), |journal| {
+                journal.commit_identity_mismatch(identity).unwrap();
+            });
+            assert!(
+                matches!(standing, JournalStanding::Decided(_)),
+                "{standing:?}"
+            );
+            let expected = state(JobError::IdentityMismatch { identity }, false, Clean);
+            assert_eq!(code_of(&expected), &code);
+            assert_verdict(&standing, &expected);
+            assert!(detail_of(&expected).contains(&format!("{identity:?}")));
+        }
+        // Any other kind claims no more than the job's expectation failed.
+        let standing = JournalStanding::Decided(JournalVerdict::Aborted {
+            identity: IdentityKind::SoftwareVersion,
+        });
+        let s = state(JobError::Cancelled, false, standing);
+        assert_eq!(code_of(&s), &FailureCode::Other);
+    }
+
+    #[test]
+    fn a_journal_that_holds_a_stop_reports_what_the_run_that_stopped_reported() {
+        use crate::journal::RunStop;
+        let stop = StepRef { pc: 3, steps: 9 };
+        let standing = standing_after(&program(), |journal| {
+            journal
+                .commit_run_stopped(stop, RunStop::StepLimit)
+                .unwrap();
+        });
+        let expected = state(JobError::StepLimit(9), false, Clean);
+        assert_eq!(code_of(&expected), &FailureCode::ProcedureError);
+        assert_verdict(&standing, &expected);
+        let standing = standing_after(&program(), |journal| {
+            journal
+                .commit_run_stopped(stop, RunStop::Vm(VmError::StackUnderflow))
+                .unwrap();
+        });
+        let expected = state(
+            JobError::Vm {
+                pc: 3,
+                source: VmError::StackUnderflow,
+            },
+            false,
+            Clean,
+        );
+        assert_eq!(code_of(&expected), &FailureCode::ProcedureError);
+        assert_verdict(&standing, &expected);
+    }
+
+    /// A verdict's text is cut as the run's own error's is.
+    #[test]
+    fn a_verdict_s_detail_is_cut_to_the_bound() {
+        let standing = JournalStanding::Decided(JournalVerdict::Failed {
+            code: "c".to_owned(),
+            detail: "é".repeat(MAX_FAILURE_DETAIL_LEN),
+        });
+        let s = state(JobError::Cancelled, false, standing);
+        assert_eq!(detail_of(&s).len(), MAX_FAILURE_DETAIL_LEN);
+    }
+
+    /// Three requests, each under a section that is safe to repeat and may be interrupted, and a
+    /// VIN source: a checkpoint after the first is a point to resume from.
+    fn resumable_program() -> Program {
+        let mut program = program();
+        for service in [0x22, 0x10, 0x3E] {
+            program
+                .code
+                .extend([Op::PushBytes(0), Op::ServiceRequest { service }, Op::Pop]);
+        }
+        program.constants = vec![vec![1]];
+        program.sections = (0..3)
+            .map(|index| Section {
+                start_pc: index * 3,
+                end_pc: index * 3 + 3,
+                interruptible: Interruptible::Yes,
+                idempotency: Idempotency::Safe,
+                expected_millis: 0,
+            })
+            .collect();
+        program.identity.vin = Some(diag_ir::Source::EcuService {
+            target: 0,
+            service_id: 1,
+            field_id: 3,
+        });
+        program
+    }
+
+    #[test]
+    fn a_journal_a_resume_goes_on_from_is_resumable() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = resumable_program();
+        let state_bytes = |pc: u32, steps: u64| {
+            let mut state = Vm::new(&program).state;
+            state.pc = pc;
+            state.steps = steps;
+            postcard::to_allocvec(&state).unwrap()
+        };
+        let vin = crate::journal::Vin::new("WDB12345678901234".to_owned());
+        let mut journal = Journal::create(dir.path(), &key(), Some(&vin), None, None).unwrap();
+        journal.commit_run_start(at(0), &state_bytes(0, 0)).unwrap();
+        journal.commit_request(StepRef { pc: 1, steps: 1 }).unwrap();
+        journal
+            .commit_checkpoint(StepRef { pc: 1, steps: 1 }, &state_bytes(2, 2))
+            .unwrap();
+        let standing = JournalStanding::read(dir.path(), &key(), &program, false);
+        assert_eq!(standing, Resumable);
+        // The same journal standing decides the run's end: a transient error leaves the job
+        // open, a refusal every resume repeats ends it.
+        assert_eq!(
+            run(JobError::Cancelled, false, standing.clone()),
+            JobOutcome::Open
+        );
+        let s = state(JobError::NoDeclarations, false, standing);
+        assert!(matches!(s, JobState::NeedsOnSiteRecovery { .. }), "{s:?}");
+    }
+
+    #[test]
+    fn a_link_the_document_or_the_configuration_refuses_repeats_on_every_resume() {
+        for source in [
+            HostError::DeclaredLink("x".to_owned()),
+            HostError::Setup("an unknown parameter"),
+        ] {
+            let s = state(JobError::Link(source), false, Resumable);
+            assert!(matches!(s, JobState::NeedsOnSiteRecovery { .. }), "{s:?}");
+            assert!(!detail_of(&s).is_empty());
+        }
+        // A link that did not open for the moment is one more interruption.
+        assert_eq!(
+            run(JobError::Link(HostError::NoResponse), false, Resumable),
+            JobOutcome::Open
         );
     }
 }

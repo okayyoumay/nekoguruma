@@ -124,6 +124,7 @@ impl crate::oplog::LogSafe for GuardError {
             GuardError::UnsafeDir(path)
             | GuardError::UnlistableDir(path)
             | GuardError::NotAFile(path) => Some(crate::oplog::external(path.display())),
+            GuardError::Io(error) => Some(crate::oplog::external(error)),
             _ => None,
         }
     }

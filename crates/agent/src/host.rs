@@ -3954,6 +3954,11 @@ impl crate::oplog::LogSafe for HostError {
             HostError::WorkerStart { reason, .. } if !reason.is_empty() => {
                 Some(crate::oplog::external(reason))
             }
+            // The reason is the document's text (see `log_text`).
+            HostError::DeclaredLink(reason) if !reason.is_empty() => {
+                Some(crate::oplog::external(reason))
+            }
+            HostError::StreamFailedBeforeSend(inner) => inner.log_external(),
             _ => None,
         }
     }

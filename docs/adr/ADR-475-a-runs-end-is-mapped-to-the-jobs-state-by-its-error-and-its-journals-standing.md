@@ -27,16 +27,25 @@ ADR-288 left the reported state of a procedure failure and of a stopped run open
    - **On-site standing:** the job ends in `needsOnSiteRecovery` at once, whatever the error (a
      cancel and a transient error included), the detail the reason's name and plain numeric
      fields.
+   - **Decided standing:** the journal's own verdict ends the job at once, whatever the run's
+     error (only `Journal(InUse)` and `Journal(AlreadyExists)` stay none, item 6): the pre-run
+     checks of a resume refuse before the journal is read, so the run's error need not be the
+     journal's. A procedure failure is `failed` with `procedure` and the journal's code and
+     detail as item 4 has them; an identity abort is `vinMismatch` for the VIN,
+     `variantMismatch` for the hardware part number and `other` for any other kind, the detail
+     naming the kind only; a stop is `failed` with `procedureError` and the detail of the error
+     the stopped run returned (item 3).
    - **Resumable standing:** a refusal that every resume would meet again (`Program`, `Vm`,
      `SeveralTargets`, `Undeclared`, `NoDeclarations`, `Sources`, `Refused`, `NoArtifact`,
      `ArtifactMismatch`, `SegmentOutsideArtifact`, `ArtifactDiffersFromJournal`,
-     `CommLogMismatch`, `NoCommLogDir`, `CurrentThreadRuntime`, `GuardsMissing`) ends the job in
-     `needsOnSiteRecovery`, since leaving it open would repeat it until the resume limit. Any
-     other error (`Link`, `Host`, `IdentityRead`, `IdentityUnreadable`, `NoReprogrammingSlot`,
+     `CommLogMismatch`, `NoCommLogDir`, `CurrentThreadRuntime`, `GuardsMissing`, and a `Link`
+     error that is the document's link refused or a link setup refused: the configuration is not
+     the document's link, an unknown or clashing parameter, an invalid link configuration) ends
+     the job in `needsOnSiteRecovery`, since leaving it open would repeat it until the resume
+     limit. Any other error (`Link` otherwise, `Host`, `IdentityRead`, `IdentityUnreadable`, `NoReprogrammingSlot`,
      `VehicleLock`, `LinkUnconfirmed`, `Journal`, `Panicked`, `Cancelled`, `Unanswerable`)
      leaves the outcome open: no terminal state is reported and the job is resumed as after a
      crash; the resume limits end it in `needsOnSiteRecovery` (ADR-335 item 6).
-   - **Decided standing:** open; the resume reports what the journal holds.
 2. **A first run's refusal before anything is sent is a precondition failure.** The static
    checks (`Program`, `SeveralTargets`, `Undeclared`, `NoDeclarations`, `Sources`, `Refused`,
    `NoArtifact`, `ArtifactMismatch`, `SegmentOutsideArtifact`) give `preconditionFailed` with
@@ -53,7 +62,8 @@ ADR-288 left the reported state of a procedure failure and of a stopped run open
    (`vinMismatch` for the VIN, `variantMismatch` for the hardware part number; any other
    identity, which no run ends on today, `other`), a step limit (`failed`, `procedureError`)
    and an on-site ending (`needsOnSiteRecovery`). A VM error is the same while the standing is
-   clean or decided; on a resumable journal it is a pre-run check's refusal (item 1).
+   clean; on a resumable journal it is a pre-run check's refusal (item 1), and a decided
+   standing reports the journal's verdict instead (item 1).
 4. **The procedure's code travels apart.** `failed` and `jobState` gain an optional
    `procedureCode` (1 to 128 bytes of UTF-8; the byte count is the rule, which a schema's
    character-counting `maxLength` only approximates), set with `procedure` only; `detail` is the
@@ -64,11 +74,12 @@ ADR-288 left the reported state of a procedure failure and of a stopped run open
    asserts the latter, and design 8.11 and ADR-375 leave the attribution of an exchange to the
    communication log. `ArtifactDiffersFromJournal` is `jobRefused` and `Unanswerable` is `other`.
 6. **Another run's job reports nothing.** `Journal(InUse)` and `Journal(AlreadyExists)` mean
-   another run owns the job (ADR-255), so the outcome is none.
+   another run owns the job (ADR-255), so the outcome is none, whatever the standing.
 7. **A detail is `LogSafe::log_text` cut to 1024 bytes**, never `Display` or `log_external`
    (ADR-348 items 6 and 8, design 16.2); `log_text` carries no operating-system text (the I/O
    error of a journal or a guard's lock file shows its kind only), no document text and no job
-   ID, and an empty detail is left out of the event. An on-site reason is written by hand as its name and
+   ID, and an empty detail is left out of the event. The text `log_text` leaves out (the
+   operating system's, the document's reason, the job ID) is in `log_external`. An on-site reason is written by hand as its name and
    plain numeric fields, never `Debug`: the strings it holds and the voltage the VCI read stay
    out, as do the nested teardown outcomes.
 8. **The agent module and the wire.** `agent::job_report::outcome` takes the result, whether

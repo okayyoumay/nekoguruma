@@ -455,6 +455,11 @@ impl crate::oplog::LogSafe for JobError {
             | JobError::Refused { source, .. }
             | JobError::IdentityRead { source, .. } => source.log_external(),
             JobError::VehicleLock(source) => source.log_external(),
+            JobError::Journal(JournalError::Io(error)) => Some(crate::oplog::external(error)),
+            JobError::Journal(JournalError::InvalidJobId(id)) => Some(crate::oplog::external(id)),
+            JobError::Sources(crate::inputs::TableError::Document { reason, .. }) => {
+                Some(crate::oplog::external(reason))
+            }
             _ => None,
         }
     }
@@ -471,7 +476,7 @@ fn failure_error(failure: &crate::journal::ProcedureFailure) -> JobError {
 
 /// The job's error for the run's stop its journal records (ADR-288): the one the stopped run
 /// returned.
-fn stopped_error(stopped: &StoppedRun) -> JobError {
+pub(crate) fn stopped_error(stopped: &StoppedRun) -> JobError {
     match &stopped.reason {
         RunStop::StepLimit => JobError::StepLimit(stopped.at.steps),
         RunStop::Vm(source) => JobError::Vm {

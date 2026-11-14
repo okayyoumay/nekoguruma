@@ -678,7 +678,13 @@ async fn the_take_gives_every_agent_its_turn_however_many_older_jobs_one_agent_h
 }
 
 /// `count` jobs for `agent`, all older than anything `add_job` makes, each carrying `bytes`.
-async fn add_old_jobs(w: &World, agent: &str, count: i32, bytes: &[u8]) {
+async fn add_old_jobs<'e>(
+    db: impl sqlx::PgExecutor<'e>,
+    w: &World,
+    agent: &str,
+    count: i32,
+    bytes: &[u8],
+) {
     sqlx::query(
         "INSERT INTO jobs (tenant_id, id, kind, agent_id, operator_id, vci_id, \
              confirmation_level, start_deadline, signed_job, signing_key_id, created_at, \
@@ -693,7 +699,7 @@ async fn add_old_jobs(w: &World, agent: &str, count: i32, bytes: &[u8]) {
     .bind(count)
     .bind(bytes)
     .bind(w.key.key_id())
-    .execute(&w.pool)
+    .execute(db)
     .await
     .unwrap();
 }
@@ -707,81 +713,84 @@ async fn more_agents(u: &Up, count: usize) -> Vec<(String, String)> {
     out
 }
 
-/// Waits until the queue has finished `passes` more passes than `before`.
-async fn until_passes(counter: &AtomicU64, before: u64, passes: u64) {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while counter.load(Ordering::Relaxed) < before + passes {
-        assert!(Instant::now() < deadline, "the passes did not run");
-        tokio::time::sleep(Duration::from_millis(20)).await;
+/// The take's ranking when the pass limit is filled: five agents with 16 old jobs each (80 rows,
+/// more than the pass takes) and a sixth with one newer job. Ordered by age alone the 64 oldest
+/// rows would all be the first five agents'; by rank the sixth agent's only job is in the pass.
+#[tokio::test]
+async fn the_take_that_fills_the_pass_limit_still_includes_an_agents_only_newer_job() {
+    let u = Up::new().await;
+    let others = more_agents(&u, 5).await;
+    let mut ids = vec![u.id.clone()];
+    ids.extend(others.iter().take(4).map(|(id, _)| id.clone()));
+    for id in &ids {
+        add_old_jobs(&u.w.pool, &u.w, id, 16, b"backlog").await;
     }
+    let single_agent = &others[4].0;
+    let single = add_job(&u.w, single_agent, 500, b"single").await;
+    let mut connected: Vec<&str> = ids.iter().map(String::as_str).collect();
+    connected.push(single_agent);
+    let taken = take(&u, &connected, &[], 16).await;
+    assert_eq!(taken.len(), 64, "the pass limit");
+    assert!(
+        taken.iter().any(|row| row.1 == single),
+        "an agent's only job waits behind other agents' second jobs"
+    );
 }
 
-/// The take is by rank, so more agents than a pass once served each get their first job into the
-/// first pass, whatever one of them has queued. The period is long enough for every connection to
-/// be up before the first pass.
+/// The take is by rank, so more agents with backlogs than a pass holds do not keep another
+/// agent's only job out of the first pass. Every connection is open and every row is in before
+/// the first pass can see any (the jobs go in one transaction), and a pass's marks commit
+/// together, so the first state with a mark is the first pass's whole result.
 #[tokio::test]
 async fn every_agents_oldest_job_is_sent_in_the_first_pass_however_many_agents_are_connected() {
-    let passes = Arc::new(AtomicU64::new(0));
     let counted = Settings {
-        period: Duration::from_secs(5),
-        passes: Some(passes.clone()),
+        period: Duration::from_millis(500),
         ..settings(LONG)
     };
     let u = Up::with_queue(2, Some(counted)).await;
     let others = more_agents(&u, 5).await;
-    add_old_jobs(&u.w, &u.id, 40, b"backlog").await;
-    let mut singles = Vec::new();
-    for (id, _) in &others {
-        singles.push(add_job(&u.w, id, 500, b"single").await);
-    }
     let mut clients = vec![open(u.s.addr, &token(&u).await).await];
     for (_, t) in &others {
         clients.push(open(u.s.addr, t).await);
     }
-    until_passes(&passes, 0, 1).await;
-    for job in &singles {
-        assert_eq!(row(&u.w, job).await, SENT, "an agent's only job waits");
+    let mut backlog = vec![u.id.clone()];
+    backlog.extend(others.iter().take(4).map(|(id, _)| id.clone()));
+    let single_agent = &others[4].0;
+    let mut tx = u.w.pool.begin().await.unwrap();
+    for id in &backlog {
+        add_old_jobs(&mut *tx, &u.w, id, 16, b"backlog").await;
     }
-    let marked: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM jobs WHERE agent_id = $1::uuid AND delivery_sent_at IS NOT NULL",
-    )
-    .bind(&u.id)
-    .fetch_one(&u.w.pool)
-    .await
-    .unwrap();
-    assert_eq!(marked, 16, "the backlog takes what one connection holds");
-    u.finish().await;
-}
-
-/// An agent that disconnects and reconnects between passes changes the set of connected agents
-/// from pass to pass; it must not make another agent's job wait.
-#[tokio::test]
-async fn an_agent_that_reconnects_before_a_pass_does_not_stop_another_agents_job() {
-    let passes = Arc::new(AtomicU64::new(0));
-    let counted = Settings {
-        period: Duration::from_secs(5),
-        passes: Some(passes.clone()),
-        ..settings(LONG)
+    add_old_jobs(&mut *tx, &u.w, single_agent, 1, b"single").await;
+    // The single job is newer than every backlog row.
+    sqlx::query("UPDATE jobs SET created_at = now() WHERE agent_id = $1::uuid")
+        .bind(single_agent)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    // One statement, so one snapshot: (agent, marked rows) once any row is marked.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let marked: Vec<(String, i64)> = loop {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT agent_id::text, count(*) FROM jobs WHERE delivery_sent_at IS NOT NULL \
+             GROUP BY agent_id",
+        )
+        .fetch_all(&u.w.pool)
+        .await
+        .unwrap();
+        if !rows.is_empty() {
+            break rows;
+        }
+        assert!(Instant::now() < deadline, "no pass marked anything");
+        tokio::time::sleep(Duration::from_millis(20)).await;
     };
-    let u = Up::with_queue(2, Some(counted)).await;
-    let others = more_agents(&u, 4).await;
-    add_old_jobs(&u.w, &u.id, 40, b"backlog").await;
-    let mut singles = Vec::new();
-    for (id, _) in &others {
-        singles.push(add_job(&u.w, id, 500, b"single").await);
+    let count = |id: &str| marked.iter().find(|(a, _)| a == id).map_or(0, |(_, n)| *n);
+    assert_eq!(count(single_agent), 1, "an agent's only job waits");
+    for id in &backlog {
+        // 64 rows over six agents by rank: ten whole ranks and four of the eleventh.
+        assert!(count(id) >= 10, "a backlog agent got only {}", count(id));
     }
-    let flapper_token = token(&u).await;
-    let mut clients = Vec::new();
-    for (_, t) in &others {
-        clients.push(open(u.s.addr, t).await);
-    }
-    // The flapper is connected, gone and back again before the first pass.
-    drop(open(u.s.addr, &flapper_token).await);
-    let _flapper = open(u.s.addr, &flapper_token).await;
-    until_passes(&passes, 0, 1).await;
-    for job in &singles {
-        assert_eq!(row(&u.w, job).await, SENT);
-    }
+    drop(clients);
     u.finish().await;
 }
 

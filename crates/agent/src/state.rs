@@ -14,7 +14,7 @@
 //! make. Each kind of state has a sub-directory of its own ([`private_subdir`]): `identity`
 //! (the agent key's lock and, in a debug build, its test store), `registration` (the registration
 //! record and its lock, ADR-470), `control` (the control channel session's connection lock,
-//! ADR-471) and `journal` (the write-job journal, which a later change wires in).
+//! ADR-471) and `journal` (the write-job journal, [`crate::journal::journal_dir`]).
 //!
 //! A debug build reads `NGR_AGENT_STATE_DIR`, an absolute directory that replaces the root for
 //! both modes, so tests keep their state in a temporary directory. A release build never reads
@@ -41,7 +41,7 @@ const DEVICE_ROOT: &str = "/var/lib/nekoguruma";
 pub struct StateDirError(String);
 
 impl StateDirError {
-    fn new(why: impl Into<String>) -> Self {
+    pub(crate) fn new(why: impl Into<String>) -> Self {
         Self(why.into())
     }
 }
@@ -104,13 +104,13 @@ fn root_from(
 }
 
 /// Whether the agent makes the root of `mode` itself: not where the installation does.
-fn agent_creates_root(mode: OperatingMode) -> bool {
-    !(cfg!(unix) && mode == OperatingMode::Device) || cfg!(debug_assertions) && override_set()
+fn agent_creates_root(mode: OperatingMode, var: &dyn Fn(&str) -> Option<OsString>) -> bool {
+    !(cfg!(unix) && mode == OperatingMode::Device) || cfg!(debug_assertions) && override_set(var)
 }
 
 /// Whether the debug override names the root. A release build has no override.
-fn override_set() -> bool {
-    cfg!(debug_assertions) && std::env::var_os(STATE_DIR_VAR).is_some()
+fn override_set(var: &dyn Fn(&str) -> Option<OsString>) -> bool {
+    cfg!(debug_assertions) && var(STATE_DIR_VAR).is_some()
 }
 
 /// The sub-directory `name` of `mode`'s state root, created when missing with permissions only
@@ -118,8 +118,17 @@ fn override_set() -> bool {
 /// or others. The root is created too, except where the installation makes it (Unix device
 /// mode), where a missing root is an error.
 pub fn private_subdir(mode: OperatingMode, name: &str) -> Result<PathBuf, StateDirError> {
-    let root = state_root(mode)?;
-    prepare_subdir(&root, agent_creates_root(mode), name)
+    private_subdir_from(mode, &|name| std::env::var_os(name), name)
+}
+
+/// [`private_subdir`] for the environment `var` reads.
+pub(crate) fn private_subdir_from(
+    mode: OperatingMode,
+    var: &dyn Fn(&str) -> Option<OsString>,
+    name: &str,
+) -> Result<PathBuf, StateDirError> {
+    let root = root_from(mode, var)?;
+    prepare_subdir(&root, agent_creates_root(mode, var), name)
 }
 
 /// [`private_subdir`] for a given root.

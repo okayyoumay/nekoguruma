@@ -53,14 +53,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use diag_ir::{
     DiagHost, FlashRecovery, IdentityKind, NoApplication, Op, Program, RecoveryRequired, VmState,
 };
+use worker_host::service::OperatingMode;
 
 use crate::host::{HostError, TransferProgress};
 use crate::inputs::{FieldBytes, ServiceSources, read_identity_bytes};
 use crate::journal::{
     FileStore, JobKey, Journal, JournalError, JournalState, RunStop, StageId, StepRef, Store, Vin,
+    journal_dir,
 };
 use crate::restart::{in_section_outside_plans, needs_request_marker};
 use crate::runner::JobError;
+use crate::state::StateDirError;
 
 /// Where a job keeps its journal, under which key, and how it reads the ECU's identity.
 #[derive(Debug, Clone)]
@@ -82,6 +85,27 @@ pub struct JournalSetup {
     /// raw bytes). A first run records it right after the target VIN in the creating write, and
     /// a resume must name the same one, none included (ADR-268). `None` when the job names none.
     pub intended_software_version: Option<Vec<u8>>,
+}
+
+impl JournalSetup {
+    /// A setup whose directory is the journal directory of `mode` ([`journal_dir`]), the one
+    /// place a job's journal belongs. A directory that cannot be had, or whose file system has
+    /// no hard links, is refused here, before the job starts.
+    pub fn in_mode_dir(
+        mode: OperatingMode,
+        key: JobKey,
+        sources: ServiceSources,
+        vin: Option<Vin>,
+        intended_software_version: Option<Vec<u8>>,
+    ) -> Result<Self, StateDirError> {
+        Ok(Self {
+            dir: journal_dir(mode)?,
+            key,
+            sources,
+            vin,
+            intended_software_version,
+        })
+    }
 }
 
 /// A job's open journal and what it needs to commit at the plan's boundaries.

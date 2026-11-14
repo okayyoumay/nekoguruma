@@ -14,6 +14,7 @@
 //! The journal only records. Committing a marker before the request it guards, and ending the
 //! job when a commit fails, are the runner's duties (ADR-244).
 
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -22,6 +23,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use diag_ir::{IdentityKind, VmError};
 use serde::{Deserialize, Serialize};
 use shared_proto::JobId;
+use worker_host::service::OperatingMode;
+
+use crate::state::StateDirError;
 
 /// The journal format this build writes and reads.
 pub const FORMAT_VERSION: u32 = 1;
@@ -1211,6 +1215,69 @@ pub(crate) fn create_linked(
     // Where the directory cannot be synced, the file's own sync covers its entry.
     file.sync_all().map_err(CreateLinkedError::Io)?;
     Ok(file)
+}
+
+/// The write-job journal's directory for `mode`: the `journal` sub-directory of the state root,
+/// private to the agent's account (ADR-460), checked once for hard-link support. The journal is
+/// linked into place (`create_linked`), which FAT and exFAT cannot do, so a directory on such a
+/// file system is refused here and not at the first job. The error names the reason, no path.
+pub fn journal_dir(mode: OperatingMode) -> Result<PathBuf, StateDirError> {
+    journal_dir_from(mode, &|name| std::env::var_os(name), &|from, to| {
+        fs::hard_link(from, to)
+    })
+}
+
+/// [`journal_dir`] for the environment `var` reads, with `link` as the hard-link operation the
+/// probe uses (a test makes it fail).
+pub(crate) fn journal_dir_from(
+    mode: OperatingMode,
+    var: &dyn Fn(&str) -> Option<OsString>,
+    link: &dyn Fn(&Path, &Path) -> io::Result<()>,
+) -> Result<PathBuf, StateDirError> {
+    let dir = crate::state::private_subdir_from(mode, var, JOURNAL_DIR_NAME)?;
+    probe_hard_links(&dir, link)?;
+    Ok(dir)
+}
+
+/// The state sub-directory the journals live in.
+const JOURNAL_DIR_NAME: &str = "journal";
+
+/// Creates a file in `dir`, hard-links it and removes both, so a probe of an earlier run that
+/// crashed is removed first and none stays behind. A name that is not a journal's, so the
+/// journals' own files never clash with it.
+fn probe_hard_links(
+    dir: &Path,
+    link: &dyn Fn(&Path, &Path) -> io::Result<()>,
+) -> Result<(), StateDirError> {
+    let source = dir.join(".link-probe");
+    let target = dir.join(".link-probe.linked");
+    let refuse = |what: &str, error: &io::Error| {
+        StateDirError::new(format!(
+            "cannot {what} in the journal directory: {:?}",
+            error.kind()
+        ))
+    };
+    for path in [&source, &target] {
+        match fs::remove_file(path) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => {
+                return Err(refuse("remove an earlier link probe", &error));
+            }
+            _ => {}
+        }
+    }
+    let result = File::create_new(&source)
+        .map_err(|error| refuse("create the link probe", &error))
+        .and_then(|_| {
+            link(&source, &target).map_err(|error| {
+                StateDirError::new(format!(
+                    "the journal directory's file system does not support hard links: {:?}",
+                    error.kind()
+                ))
+            })
+        });
+    let _ = fs::remove_file(&target);
+    let _ = fs::remove_file(&source);
+    result
 }
 
 /// Makes a new directory entry durable. NTFS logs the entry with the file's metadata, which
@@ -3471,5 +3538,70 @@ mod tests {
                 "{identity:?}"
             );
         }
+    }
+
+    #[cfg(debug_assertions)]
+    fn env_of(dir: &Path) -> impl Fn(&str) -> Option<OsString> + use<> {
+        let dir = dir.as_os_str().to_owned();
+        move |name: &str| (name == crate::state::STATE_DIR_VAR).then(|| dir.clone())
+    }
+
+    #[cfg(debug_assertions)]
+    fn real_link(from: &Path, to: &Path) -> io::Result<()> {
+        fs::hard_link(from, to)
+    }
+
+    /// The journal directory is the `journal` sub-directory of each mode's root, created private,
+    /// and the probe leaves nothing in it; a second call succeeds.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_journal_directory_is_private_per_mode_and_found_again() {
+        for mode in [OperatingMode::User, OperatingMode::Device] {
+            let temp = TempDir::new();
+            let root = temp.0.join("state");
+            let var = env_of(&root);
+            let dir = journal_dir_from(mode, &var, &real_link).unwrap();
+            assert_eq!(dir, root.join("journal"));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+                    0o700
+                );
+            }
+            assert_eq!(journal_dir_from(mode, &var, &real_link).unwrap(), dir);
+            assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+        }
+    }
+
+    /// A probe of an earlier run that crashed does not stop the next one.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_stale_probe_is_cleared() {
+        let temp = TempDir::new();
+        let var = env_of(&temp.0.join("state"));
+        let dir = journal_dir_from(OperatingMode::User, &var, &real_link).unwrap();
+        fs::write(dir.join(".link-probe"), b"x").unwrap();
+        fs::write(dir.join(".link-probe.linked"), b"x").unwrap();
+        journal_dir_from(OperatingMode::User, &var, &real_link).unwrap();
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+    }
+
+    /// A file system without hard links is refused with the reason, no path, and the probe's
+    /// file is removed.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_file_system_without_hard_links_is_refused() {
+        let temp = TempDir::new();
+        let root = temp.0.join("state");
+        let var = env_of(&root);
+        let no_links = |_: &Path, _: &Path| Err(io::Error::from(io::ErrorKind::Unsupported));
+        let error = journal_dir_from(OperatingMode::User, &var, &no_links).unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("hard links"), "{text}");
+        assert!(text.contains("Unsupported"), "{text}");
+        assert!(!text.contains(root.to_str().unwrap()), "{text}");
+        assert_eq!(fs::read_dir(root.join("journal")).unwrap().count(), 0);
     }
 }

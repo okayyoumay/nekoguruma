@@ -152,8 +152,15 @@ pub fn outcome(
         return JobOutcome::None;
     }
     // The journal's decision is what a resume would report, and the pre-run checks refuse before
-    // it is read, so it ends the job whatever the error.
-    if let JournalStanding::Decided(verdict) = standing {
+    // it is read, so it ends the job whatever the error; except a journal fault, after which the
+    // decision read back may not be durable (a failed sync can drop it), so the job stays open
+    // and the resume reports what the journal holds then.
+    if let JournalStanding::Decided(verdict) = standing
+        && !matches!(
+            error,
+            JobError::Journal(JournalError::Io(_) | JournalError::Poisoned)
+        )
+    {
         return JobOutcome::Terminal(verdict_state(verdict));
     }
     // Terminal whatever the other standings.
@@ -188,8 +195,9 @@ pub fn outcome(
                 JobOutcome::Open
             };
         }
-        // Returned above.
-        JournalStanding::Decided(_) => unreachable!("decided before the standing"),
+        // Only a journal fault reaches here: the decision may not be durable, so the resume
+        // reports what the journal then holds.
+        JournalStanding::Decided(_) => return JobOutcome::Open,
         JournalStanding::Clean => {}
     }
     // A refusal or failure that precedes everything the run sends is a precondition failure on a
@@ -309,8 +317,10 @@ fn repeats_on_every_resume(error: &JobError) -> bool {
         | JobError::CurrentThreadRuntime
         | JobError::GuardsMissing => true,
         // The link's configuration is not the document's, or names an unknown or clashing
-        // parameter: the same on every resume.
-        JobError::Link(HostError::DeclaredLink(_) | HostError::Setup(_)) => true,
+        // parameter: the same on every resume. `Setup` is not here: it also carries what the
+        // worker answered at the open (no module yet, no resource), which a later resume may not
+        // meet.
+        JobError::Link(HostError::DeclaredLink(_)) => true,
         // A failed exchange, a lock or link held for now, a fault that need not recur and an
         // interruption: the next resume may go through.
         JobError::Link(_)
@@ -1363,19 +1373,36 @@ mod tests {
     }
 
     #[test]
-    fn a_link_the_document_or_the_configuration_refuses_repeats_on_every_resume() {
-        for source in [
-            HostError::DeclaredLink("x".to_owned()),
-            HostError::Setup("an unknown parameter"),
-        ] {
-            let s = state(JobError::Link(source), false, Resumable);
-            assert!(matches!(s, JobState::NeedsOnSiteRecovery { .. }), "{s:?}");
-            assert!(!detail_of(&s).is_empty());
-        }
-        // A link that did not open for the moment is one more interruption.
-        assert_eq!(
-            run(JobError::Link(HostError::NoResponse), false, Resumable),
-            JobOutcome::Open
+    fn a_link_the_document_refuses_repeats_on_every_resume() {
+        let s = state(
+            JobError::Link(HostError::DeclaredLink("x".to_owned())),
+            false,
+            Resumable,
         );
+        assert!(matches!(s, JobState::NeedsOnSiteRecovery { .. }), "{s:?}");
+        assert!(!detail_of(&s).is_empty());
+        // A link that did not open for the moment, or a setup the worker refused (its module
+        // not listed yet), is one more interruption.
+        for source in [
+            HostError::NoResponse,
+            HostError::Setup("the worker reports no module"),
+        ] {
+            assert_eq!(
+                run(JobError::Link(source), false, Resumable),
+                JobOutcome::Open
+            );
+        }
+    }
+
+    /// A journal fault after the journal read back a decision leaves the job open: the
+    /// decision may not be durable.
+    #[test]
+    fn a_journal_fault_on_a_decided_journal_leaves_the_job_open() {
+        for error in [
+            JobError::Journal(JournalError::Io(std::io::Error::other("x"))),
+            JobError::Journal(JournalError::Poisoned),
+        ] {
+            assert_eq!(run(error, true, decided()), JobOutcome::Open);
+        }
     }
 }

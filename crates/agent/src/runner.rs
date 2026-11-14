@@ -460,6 +460,9 @@ impl crate::oplog::LogSafe for JobError {
             JobError::Sources(crate::inputs::TableError::Document { reason, .. }) => {
                 Some(crate::oplog::external(reason))
             }
+            JobError::OnSiteInterventionRequired(
+                OnSiteReason::UnreadableJournal(why) | OnSiteReason::InvalidEntryState(why),
+            ) => Some(crate::oplog::external(why)),
             _ => None,
         }
     }

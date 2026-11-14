@@ -210,6 +210,12 @@ mod tests {
                 field_id: 2,
                 reason: REASON.to_owned(),
             }),
+            JobError::OnSiteInterventionRequired(crate::restart::OnSiteReason::UnreadableJournal(
+                REASON.to_owned(),
+            )),
+            JobError::OnSiteInterventionRequired(crate::restart::OnSiteReason::InvalidEntryState(
+                REASON.to_owned(),
+            )),
         ];
         for error in errors {
             assert!(!error.log_text().contains(REASON), "{error:?}");

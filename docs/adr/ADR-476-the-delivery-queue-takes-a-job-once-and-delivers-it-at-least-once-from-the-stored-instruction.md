@@ -2,7 +2,7 @@
 
 **Date:** 2026-11-14
 **Status:** Accepted
-**Affects:** design 5.3, 12, 14.1; `db/migrations/0007_job_delivery.sql`, `db/README.md`; `api/asyncapi.yaml` (`failureCode`); `crates/server` (`job_queue`, `lib`), `crates/server/docs/ngr-server.md`; `crates/shared-proto` (`FailureCode`); details ADR-466 items 10 and 13, ADR-468 item 12 and ADR-472 item 4 for the server's side, and ADR-461 item 8 and ADR-462 for a retired key
+**Affects:** design 5.3, 12, 14.1; `db/migrations/0007_job_delivery.sql`, `db/README.md`; `api/asyncapi.yaml` (`failureCode`); `crates/server` (`job_queue`, `hub`, `lib`), `crates/server/docs/ngr-server.md`; `crates/shared-proto` (`FailureCode`); details ADR-466 items 10 and 13, ADR-468 item 12 and ADR-472 item 4 for the server's side, and ADR-461 item 8 and ADR-462 for a retired key
 
 ## Context
 
@@ -24,23 +24,29 @@ does to the job, and how the pieces are tested.
    connection is not current, then runs the pass if a tick is due. The stop ends the task in its
    wait and in the pass's read; a pass that has queued a frame finishes its mark.
 2. **A pass is one transaction, and the take is exactly once.** It ends the jobs of a retired key
-   (item 6), then selects, in creation order, the rows `FOR UPDATE OF j SKIP LOCKED` of agents
-   that are connected to this instance and not revoked (a join to `agents`, so that the planner
-   reaches the rows through `jobs_pending`), whose state is `received`, which are neither
+   (item 6; it skips the rows another pass holds), then selects, for each agent that is
+   connected to this instance and not revoked (a lateral select from `agents`, so that the planner
+   reaches the rows through `jobs_pending`), at most the outbound queue's 16 rows in creation
+   order, `FOR UPDATE SKIP LOCKED`, so that an agent whose queue stays full cannot hold back the
+   others; the rows are those whose state is `received`, which are neither
    finished nor delivered, whose start deadline has not passed, whose key is the active one and
    which have no mark or an expired one. It queues a frame for each through the hub while
-   holding the row lock, and marks the rows it queued in the same transaction. Two instances
-   therefore never queue one row. A row that cannot be queued stays unmarked for the next pass:
+   holding the row lock, and marks the rows it queued in the same transaction, with the time of
+   the mark statement (not of the transaction), which is returned and kept with the delivery.
+   Two instances therefore never hold one row at once; if a mark's commit fails after the frame
+   was queued, the row is unmarked and can be sent again (item 4). A row that cannot be queued stays unmarked for the next pass:
    an agent whose queue is full or which has left gets nothing more in this pass, so its later
    jobs keep their order. A frame over the limit can never be sent and ends the job as failed
-   with `internal`.
+   with `internal` (the server is part of the diagnostic system); whether a frame fits is judged
+   with the widest command ID the counter can produce, so that it does not depend on the
+   counter's value.
 3. **Three columns record the delivery; `state` stays the 5.6 state.** `delivery_attempts`,
    `delivery_sent_at` and `delivered_at` (migration 0007). A job is `received` until the agent
    reports a state, whatever its delivery. An acknowledgement sets `delivered_at`, and the job is
    never sent again. A job whose start deadline has passed is not taken; ending it is not the
    queue's decision.
 4. **Delivery is at least once.** A mark that is not acknowledged is released (conditional on the
-   attempt number and on no acknowledgement) when its connection is no longer current, so the
+   attempt number, the mark's time and no acknowledgement) when its connection is no longer current, so the
    next connection gets the job, and expires after a lease of 90 seconds, so a job whose server
    went away is taken by another. A stop of the server releases nothing. A resend carries the
    same stored bytes under a new command ID with the attempt number raised; the agent's intake
@@ -50,7 +56,11 @@ does to the job, and how the pieces are tested.
    snapshot by a connection that has since been replaced matches nothing and costs one duplicate,
    which the agent's tolerance of a repeated job accepts (design 5.3).
 5. **An answer settles with conditional writes.** An acknowledgement, a rejection or a release
-   writes only while the job is neither finished nor delivered, so an answer for a job that is
+   writes only while the job is neither finished nor delivered and the row carries the mark of
+   the delivery the answer is about (an acknowledgement or a rejection also settles a row that
+   has no mark, which is what a failed commit leaves; a release needs the attempt number and the
+   mark's time to match), so that the answer of a delivery whose commit failed cannot clear or
+   end the live delivery of another instance. So an answer for a job that is
    already finished or delivered writes nothing, and an answer is matched by the connection and
    the command ID of the agent it came from; an unknown, repeated or foreign one is ignored. A
    rejection (whatever its coarse reason) ends the job as failed with the new code
@@ -64,7 +74,11 @@ does to the job, and how the pieces are tested.
    with the new code `instructionKeyRetired`, connected agent or not, and is never re-signed
    (ADR-462, ADR-461 item 8). With no active row nothing is ended and nothing is taken.
 7. **Failures are quiet and retried.** A failed pass sends nothing, logs one gated warning (at
-   most one a minute) and is retried at the next tick; the inbox is drained either way.
+   most one a minute) and is retried at the next tick; the inbox is drained either way, and also
+   while the pass or a write waits for the database (the messages are buffered, up to 4096, and
+   applied after it), so that the database never fills the inbox. A write of answers that fails
+   keeps its step, which is written again at the next iteration, and the take leaves those jobs
+   out meanwhile.
 8. **Testing.** The dispatch (full queue, no connection, frame too large, the stop between two
    sends) and the settling of answers (snapshot before drain, unknown, repeated and foreign
    answers, a flight whose commit failed) are functions that need no database and are unit

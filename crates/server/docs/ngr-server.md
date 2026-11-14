@@ -586,7 +586,7 @@ connection with hyper's `with_upgrades()`.
   queue holds 16 frames and which the task drains after `hello`, each write within
   `WRITE_TIMEOUT`. `Delivery { connection, command_id }` means queued, not written;
   `SendError::NotConnected` (no current connection, or it is closing), `Busy` and `TooLarge`
-  (the frame over 131072 bytes, judged before the connection is looked at). A frame queued on a
+  (the frame over 131072 bytes with the widest command ID, `c-` and the 20 digits of `u64::MAX`, so that the verdict does not depend on the counter; judged before the connection is looked at). A frame queued on a
   connection that has been told to close, or at a stop, is not written. `Hub::inbox()` gives its
   receiver (256 messages) to the first caller: `commandAck`, `commandRejected`, `agentEvent`
   and `reconcile` arrive as `Inbound { agent, connection, message }` in read order, never a
@@ -612,10 +612,18 @@ connection with hyper's `with_upgrades()`.
   current, then, on a tick, runs a pass: one transaction that ends the jobs of a retired key
   (`failed`, `instructionKeyRetired`), takes the `received` rows of the connected, unrevoked
   agents `FOR UPDATE SKIP LOCKED`, queues each stored instruction (base64 of the stored bytes)
-  through `Hub::send_job_command` and marks the rows queued (`delivery_attempts`,
-  `delivery_sent_at`). An acknowledgement sets `delivered_at`; a rejection ends the job
-  (`failed`, `instructionRejected`, the agent's reason as the detail); both write only while the
-  job is neither finished nor delivered. `agentEvent` and `reconcile` messages are dropped with a
+  through `Hub::send_job_command` and marks the rows queued (`delivery_attempts`, and `delivery_sent_at`
+  as the time of the mark statement, which the flight keeps as the token of that delivery). The
+  take is one lateral select for each connected agent, limited to the outbound queue's 16 rows, so
+  an agent that takes nothing cannot starve the others; the sweep skips rows another pass holds.
+  While a pass or a write waits for the database the task keeps reading the inbox into a buffer
+  (4096 messages at most, applied by the next iteration), and an answer that could not be
+  written is kept and written again. Two instances never hold one row at once; a commit that
+  fails after a frame was queued leaves the row unmarked, so it can be sent again. An
+  acknowledgement sets `delivered_at`; a rejection ends the job
+  (`failed`, `instructionRejected`, the agent's reason as the detail); both, and a release, write only while the
+  job is neither finished nor delivered and still carries no mark or the mark of that delivery
+  (a release: exactly that mark and attempt number). `agentEvent` and `reconcile` messages are dropped with a
   debug line. A failed pass sends nothing and is one gated warning (60 seconds). The task ends
   when the stop begins, in its wait and in its read.
 - **After a close.** The task leaves the registry first, then writes the Close frame, then the

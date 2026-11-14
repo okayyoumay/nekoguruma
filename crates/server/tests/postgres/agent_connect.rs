@@ -65,6 +65,7 @@ impl Fixture {
             let settings = Settings {
                 period: Duration::from_millis(50),
                 lease: LIMIT,
+                passes: None,
             };
             (server.with_job_queue(settings), None)
         } else {

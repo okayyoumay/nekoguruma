@@ -7,6 +7,8 @@
 //! come, a row that must not change) is asserted only after something positive that comes later
 //! in the same order has been seen.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -37,6 +39,7 @@ fn settings(lease: Duration) -> Settings {
     Settings {
         period: PERIOD,
         lease,
+        passes: None,
     }
 }
 
@@ -197,6 +200,9 @@ async fn two_servers_on_one_database_send_every_job_on_exactly_one_socket() {
     let u = up(LONG).await;
     let s2 = second_server(&u, LONG).await;
     let (t1, t2) = (token(&u).await, session_token(u.valid_on(&s2).await).await);
+    // The agent is connected to both servers before the jobs exist, so both passes see each row.
+    let mut c1 = open(u.s.addr, &t1).await;
+    let mut c2 = open(s2.addr, &t2).await;
     let jobs = [
         add_job(&u.w, &u.id, 1, b"j1").await,
         add_job(&u.w, &u.id, 2, b"j2").await,
@@ -204,8 +210,6 @@ async fn two_servers_on_one_database_send_every_job_on_exactly_one_socket() {
         add_job(&u.w, &u.id, 4, b"j4").await,
         add_job(&u.w, &u.id, 5, b"j5").await,
     ];
-    let mut c1 = open(u.s.addr, &t1).await;
-    let mut c2 = open(s2.addr, &t2).await;
     let mut got: Vec<Vec<u8>> = Vec::new();
     while got.len() < jobs.len() {
         let (on_first, (id, bytes)) = tokio::select! {
@@ -334,7 +338,7 @@ async fn a_take_that_is_dropped_before_the_send_marks_nothing_and_the_next_pass_
 // Case 9
 #[tokio::test]
 async fn an_unanswered_delivery_outlives_its_server_and_is_resent_after_the_lease() {
-    let lease = Duration::from_secs(1);
+    let lease = Duration::from_secs(2);
     let u = up(lease).await;
     let s2 = second_server(&u, lease).await;
     let (t1, t2) = (token(&u).await, session_token(u.valid_on(&s2).await).await);
@@ -348,17 +352,20 @@ async fn an_unanswered_delivery_outlives_its_server_and_is_resent_after_the_leas
             .fetch_one(&u.w.pool)
             .await
             .unwrap();
-    // The first server stops without an answer; its stop releases nothing.
+    // The first server stops without an answer; its stop releases nothing. The first socket is
+    // read, so that it answers the Close and the stop is quick, well inside the lease.
     let Up { w, s, .. } = u;
-    s.finish().await;
+    let (_, ()) = tokio::join!(close_code(&mut c1), s.finish());
     assert_eq!(row(&w, &job).await, SENT);
     let mut c2 = open(s2.addr, &t2).await;
     assert_eq!(command(&mut c2).await.1, b"survivor");
-    let waited: bool = sqlx::query_scalar("SELECT now() - $1::timestamptz >= interval '1 second'")
-        .bind(&marked)
-        .fetch_one(&w.pool)
-        .await
-        .unwrap();
+    let waited: bool =
+        sqlx::query_scalar("SELECT now() - $1::timestamptz >= $2::float8 * interval '1 second'")
+            .bind(&marked)
+            .bind(lease.as_secs_f64())
+            .fetch_one(&w.pool)
+            .await
+            .unwrap();
     assert!(waited, "the job was sent again before its lease ran out");
     until_row(&w, &job, "received|2|true|false|||false").await;
     s2.finish().await;
@@ -489,7 +496,12 @@ async fn a_job_of_a_retired_key_is_ended_connected_or_not_and_an_active_one_is_d
 // Case 16b
 #[tokio::test]
 async fn with_no_active_key_nothing_is_ended_or_taken_until_one_is_active_again() {
-    let u = up(LONG).await;
+    let passes = Arc::new(AtomicU64::new(0));
+    let counted = Settings {
+        passes: Some(passes.clone()),
+        ..settings(LONG)
+    };
+    let u = Up::with_queue(2, Some(counted)).await;
     sqlx::query("UPDATE instruction_keys SET retired_at = now()")
         .execute(&u.w.pool)
         .await
@@ -497,8 +509,13 @@ async fn with_no_active_key_nothing_is_ended_or_taken_until_one_is_active_again(
     let stale = add_job_with(&u.w, &u.id, 1, b"stale", &"0".repeat(64), 3600).await;
     let fresh = add_job(&u.w, &u.id, 2, b"fresh").await;
     let mut client = open(u.s.addr, &token(&u).await).await;
-    // Several passes run in this time; the rows stay as they are.
-    tokio::time::sleep(PERIOD * 8).await;
+    // Several passes complete after the rows exist; the rows stay as they are.
+    let before = passes.load(Ordering::Relaxed);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while passes.load(Ordering::Relaxed) < before + 5 {
+        assert!(Instant::now() < deadline, "no passes ran");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     assert_eq!(row(&u.w, &stale).await, FRESH);
     assert_eq!(row(&u.w, &fresh).await, FRESH);
     sqlx::query("UPDATE instruction_keys SET retired_at = NULL")
@@ -560,6 +577,7 @@ async fn a_stop_while_the_queue_waits_for_its_tick_ends_it_at_once() {
     let long_period = Settings {
         period: Duration::from_secs(3600),
         lease: LONG,
+        passes: None,
     };
     let u = Up::with_queue(2, Some(long_period)).await;
     let Up { w, s, .. } = u;
@@ -610,6 +628,254 @@ async fn a_failed_pass_sends_nothing_warns_once_keeps_draining_and_the_next_tick
         .await;
     assert_eq!(command(&mut client).await.1, b"a");
     until_row(&u.w, &a, SENT).await;
+    u.finish().await;
+}
+
+/// A row as the take returns it.
+type Taken = (String, String, String, Vec<u8>, i32);
+
+async fn take(u: &Up, agents: &[&str], in_flight: &[&String], limit: i64) -> Vec<Taken> {
+    sqlx::query_as::<_, Taken>(TAKE_SQL)
+        .bind(agents.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>())
+        .bind(60.0_f64)
+        .bind(in_flight.iter().map(|j| (*j).clone()).collect::<Vec<_>>())
+        .bind(limit)
+        .fetch_all(&u.w.pool)
+        .await
+        .unwrap()
+}
+
+/// The text of a job's mark.
+async fn mark_of(w: &World, job: &str) -> String {
+    sqlx::query_scalar("SELECT coalesce(delivery_sent_at::text, '') FROM jobs WHERE id = $1::uuid")
+        .bind(job)
+        .fetch_one(&w.pool)
+        .await
+        .unwrap()
+}
+
+// Head of line, in the take
+#[tokio::test]
+async fn the_take_gives_every_agent_its_turn_however_many_older_jobs_one_agent_has() {
+    let u = Up::new().await;
+    let (other_id, _) = second_agent(&u).await;
+    for n in 0..80 {
+        add_job(&u.w, &u.id, n, b"x").await;
+    }
+    let newer = add_job(&u.w, &other_id, 500, b"y").await;
+    let taken = take(&u, &[&u.id, &other_id], &[], 16).await;
+    assert_eq!(
+        taken.len(),
+        17,
+        "16 of the first agent's and the other's one"
+    );
+    assert!(taken.iter().any(|row| row.1 == newer));
+    assert_eq!(taken.iter().filter(|row| row.2 == u.id).count(), 16);
+}
+
+#[tokio::test]
+async fn an_agent_that_reads_nothing_does_not_hold_back_another_agents_job() {
+    let u = up(LONG).await;
+    let (other_id, other_token) = second_agent(&u).await;
+    // Frames of about 120 KiB, more than the socket can hold: the first agent's queue stays full.
+    let big = vec![7_u8; 90_000];
+    for n in 0..80 {
+        add_job(&u.w, &u.id, n, &big).await;
+    }
+    let _silent = open(u.s.addr, &token(&u).await).await;
+    add_job(&u.w, &other_id, 500, b"later").await;
+    let mut other = open(u.s.addr, &other_token).await;
+    assert_eq!(command(&mut other).await.1, b"later");
+    u.finish().await;
+}
+
+// The take's in-flight exclusion
+#[tokio::test]
+async fn the_take_leaves_out_the_jobs_that_are_in_flight_in_the_process() {
+    let u = Up::new().await;
+    let a = add_job(&u.w, &u.id, 1, b"a").await;
+    let b = add_job(&u.w, &u.id, 2, b"b").await;
+    assert_eq!(take(&u, &[&u.id], &[], 16).await.len(), 2);
+    let taken = take(&u, &[&u.id], &[&a], 16).await;
+    assert_eq!(taken.len(), 1);
+    assert_eq!(taken[0].1, b);
+    u.finish().await;
+}
+
+// The sweep's outstanding-mark clause
+#[tokio::test]
+async fn the_sweep_leaves_a_job_with_an_outstanding_mark_and_ends_one_whose_mark_expired() {
+    let u = up(LONG).await;
+    let (other_id, _) = second_agent(&u).await;
+    let stale = "0".repeat(64);
+    // The rows are made stale by one statement once their marks are written, so that no pass
+    // sees them half made.
+    let unmarked = add_job(&u.w, &other_id, 1, b"u").await;
+    let outstanding = add_job(&u.w, &other_id, 2, b"o").await;
+    let expired = add_job(&u.w, &other_id, 3, b"e").await;
+    sqlx::query(
+        "UPDATE jobs SET delivery_attempts = 1, delivery_sent_at = now() WHERE id = $1::uuid",
+    )
+    .bind(&outstanding)
+    .execute(&u.w.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE jobs SET delivery_attempts = 1, delivery_sent_at = now() - interval '1 hour' \
+         WHERE id = $1::uuid",
+    )
+    .bind(&expired)
+    .execute(&u.w.pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE jobs SET signing_key_id = $1 WHERE id = ANY($2::uuid[])")
+        .bind(&stale)
+        .bind(vec![unmarked.clone(), outstanding.clone(), expired.clone()])
+        .execute(&u.w.pool)
+        .await
+        .unwrap();
+    // One statement ends the stale rows, so the unmarked one shows that the pass ran.
+    until_row(&u.w, &unmarked, RETIRED).await;
+    assert_eq!(
+        row(&u.w, &expired).await,
+        "failed|1|true|false|instructionKeyRetired|the instruction was signed by a key that is no longer active|true"
+    );
+    assert_eq!(row(&u.w, &outstanding).await, SENT);
+    u.finish().await;
+}
+
+// The release's guard on the attempt number and the mark
+#[tokio::test]
+async fn a_stale_flights_release_does_not_clear_a_newer_mark() {
+    let u = up(LONG).await;
+    let t = token(&u).await;
+    let newer = add_job(&u.w, &u.id, 1, b"newer").await;
+    let bumped = add_job(&u.w, &u.id, 2, b"bumped").await;
+    let mut client = open(u.s.addr, &t).await;
+    command(&mut client).await;
+    command(&mut client).await;
+    until_row(&u.w, &newer, SENT).await;
+    until_row(&u.w, &bumped, SENT).await;
+    // Another instance took the rows since (the first mark's commit had failed): the same
+    // attempt number under a later mark, and a later attempt under the same mark.
+    sqlx::query(
+        "UPDATE jobs SET delivery_sent_at = now() + interval '1 minute' WHERE id = $1::uuid",
+    )
+    .bind(&newer)
+    .execute(&u.w.pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE jobs SET delivery_attempts = 2 WHERE id = $1::uuid")
+        .bind(&bumped)
+        .execute(&u.w.pool)
+        .await
+        .unwrap();
+    let newer_mark = mark_of(&u.w, &newer).await;
+    // The connection leaves, which releases its flights; the job after it is delivered on the
+    // next connection only once that has been done.
+    drop(client);
+    add_job(&u.w, &u.id, 3, b"marker").await;
+    let mut client = open(u.s.addr, &t).await;
+    assert_eq!(command(&mut client).await.1, b"marker");
+    assert_eq!(row(&u.w, &newer).await, SENT);
+    assert_eq!(mark_of(&u.w, &newer).await, newer_mark);
+    assert_eq!(row(&u.w, &bumped).await, "received|2|true|false|||false");
+    u.finish().await;
+}
+
+// The rejection's and the acknowledgement's guard on the mark
+#[tokio::test]
+async fn a_stale_flights_rejection_and_acknowledgement_do_not_touch_a_newer_mark() {
+    let u = up(LONG).await;
+    let rejected = add_job(&u.w, &u.id, 1, b"r").await;
+    let acked = add_job(&u.w, &u.id, 2, b"a").await;
+    let marker = add_job(&u.w, &u.id, 3, b"m").await;
+    let mut client = open(u.s.addr, &token(&u).await).await;
+    let (r_id, _) = command(&mut client).await;
+    let (a_id, _) = command(&mut client).await;
+    let (m_id, _) = command(&mut client).await;
+    for job in [&rejected, &acked, &marker] {
+        until_row(&u.w, job, SENT).await;
+    }
+    for job in [&rejected, &acked] {
+        sqlx::query(
+            "UPDATE jobs SET delivery_sent_at = now() + interval '1 minute' WHERE id = $1::uuid",
+        )
+        .bind(job)
+        .execute(&u.w.pool)
+        .await
+        .unwrap();
+    }
+    reject(&mut client, &r_id, "badSignature").await;
+    ack(&mut client, &a_id).await;
+    ack(&mut client, &m_id).await;
+    until_row(&u.w, &marker, DELIVERED).await;
+    assert_eq!(row(&u.w, &rejected).await, SENT);
+    assert_eq!(row(&u.w, &acked).await, SENT);
+    u.finish().await;
+}
+
+// The acknowledgement's raising of the attempts
+#[tokio::test]
+async fn an_acknowledgement_after_a_mark_that_was_not_committed_raises_the_attempts() {
+    let u = up(LONG).await;
+    let job = add_job(&u.w, &u.id, 1, b"a").await;
+    let mut client = open(u.s.addr, &token(&u).await).await;
+    let (id, _) = command(&mut client).await;
+    until_row(&u.w, &job, SENT).await;
+    // As if the mark's commit had failed after the frame was queued.
+    sqlx::query(
+        "UPDATE jobs SET delivery_attempts = 0, delivery_sent_at = NULL WHERE id = $1::uuid",
+    )
+    .bind(&job)
+    .execute(&u.w.pool)
+    .await
+    .unwrap();
+    ack(&mut client, &id).await;
+    until_row(&u.w, &job, "received|1|false|true|||false").await;
+    u.finish().await;
+}
+
+// The inbox is read while the pass waits for the database
+#[tokio::test]
+async fn the_inbox_is_still_read_while_a_pass_waits_for_a_lock_on_the_jobs_table() {
+    let u = up(LONG).await;
+    let t = token(&u).await;
+    let mut lock = u.w.pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE jobs IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    // A pass is blocked on the lock (the database's lock timeout is 5 seconds, so it is blocked
+    // for the rest of this test's reads).
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let waiting =
+            u.w.pg
+                .scalar(
+                    "SELECT count(*) FROM pg_stat_activity WHERE pid <> pg_backend_pid() \
+                 AND wait_event_type = 'Lock' AND query LIKE 'UPDATE jobs SET state%'",
+                )
+                .await;
+        if waiting != "0" {
+            break;
+        }
+        assert!(Instant::now() < deadline, "no pass is waiting");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut client = open(u.s.addr, &t).await;
+    // More events than the inbox holds, then a heartbeat: the connection keeps reading only if the
+    // queue keeps taking from the inbox while it waits.
+    for seq in 0..300 {
+        client.send(progress(seq)).await.unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(3), heartbeat(&mut client))
+        .await
+        .expect("the heartbeat is echoed while the pass is still blocked");
+    lock.rollback().await.unwrap();
+    let job = add_job(&u.w, &u.id, 1, b"after").await;
+    assert_eq!(command(&mut client).await.1, b"after");
+    until_row(&u.w, &job, SENT).await;
     u.finish().await;
 }
 

@@ -1317,17 +1317,16 @@ async fn commands_reach_the_agent_in_order_and_the_size_and_presence_errors_are_
         "D2: nobody connected"
     );
     let mut client = open(u.s.addr, &t).await;
-    // D1: the frame's own length counts, the ID's digits included.
+    // D1: the frame's own length counts, judged with the widest command ID the counter can make.
     let overhead = ServerMessage::JobCommand {
-        command_id: "c-3".to_owned(),
+        command_id: format!("c-{}", u64::MAX),
         signed_job: Some(String::new()),
     }
     .encode()
     .unwrap()
     .len();
     let limit = 128 * 1024;
-    // `c-1` went to the call with nobody connected and `c-2` to this refusal; every ID that
-    // follows has the same width.
+    // `c-1` went to the call with nobody connected and `c-2` to this refusal.
     assert_eq!(
         u.hub
             .send_job_command(&agent, "x".repeat(limit - overhead + 1)),

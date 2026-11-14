@@ -18,7 +18,8 @@ a UUIDv7, needs an acknowledgement per event instead, and its order rests on the
 
 ## Decision
 
-1. **A verified command gets `commandAck` alone.** No `agentEvent` is sent for it. The
+1. **A verified command gets `commandAck` alone.** (Superseded by ADR-478 item 5: a `received`
+   event is recorded before the acknowledgement.) No `agentEvent` is sent for it. The
    `received` event, and how events are numbered and acknowledged (a persisted counter with no
    gaps and a cumulative acknowledgement, or a unique identifier acknowledged per event), are
    decided by the outbox work.

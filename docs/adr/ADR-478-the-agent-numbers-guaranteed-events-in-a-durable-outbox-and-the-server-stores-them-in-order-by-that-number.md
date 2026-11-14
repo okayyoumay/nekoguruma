@@ -59,8 +59,8 @@ backwards under one agent ID, since the server would drop the repeated number as
    command and before the channel sends `commandAck`, the channel appends a `received` event on a
    blocking task raced with the session's stop. A failed append withholds the acknowledgement, so
    the server delivers the job again after its lease, which the intake already has to expect
-   (ADR-473 item 4). Until the intake is idempotent on the job ID, a redelivery appends a second
-   `received` event. The append is tried once per command, after the hand-over to the intake; a
+   (ADR-473 item 4). An intake that is not idempotent on the job ID appends a second `received`
+   event on a redelivery. The append is tried once per command, after the hand-over to the intake; a
    stop that comes first ends the connection as a stop, and the append, if it began, finishes
    unobserved. A failure warns once per class since `hello` and counts nothing.
 6. **The server stores guaranteed events in order, in the transaction that moves the cursor.** A

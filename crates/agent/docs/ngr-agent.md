@@ -450,7 +450,7 @@ connect`, above) loads the agent key and passes it in.
   command counts as neither acknowledged nor rejected, the server delivers the job again after
   its lease, and a `warn` per failure class (`outbox-full`, `outbox-poisoned`, `outbox-write`,
   `outbox-event`) is written until the next `hello`, `debug` after that. The append is tried once
-  per command. The intake has the instruction by then, and until it is idempotent on the job ID a
+  per command. The intake has the instruction by then, and the intake is not idempotent on the job ID, so a
   redelivery appends a second `received` event. A stop that comes during the append ends the
   connection as a stop with no acknowledgement written; the append, if it began, finishes. The
   event itself is sent by the connection's sender (next item), after the acknowledgement. A refusal is answered
@@ -476,8 +476,8 @@ connect`, above) loads the agent key and passes it in.
   changes nothing, and one above the highest number assigned closes with 1002 (the class
   `event-ack`) and drops nothing. After an acknowledgement whose rewrite failed, the connection
   holds the later ones back for 10 seconds and applies the highest of them together, so the owed
-  rewrite is tried about once per pause. Until the server reads events it acknowledges none, so
-  every connection sends the whole outbox again.
+  rewrite is tried about once per pause. The server does not read events and acknowledges none,
+  so every connection sends the whole outbox again.
 - **Only local facts end the task**: the `open` and `start` refusals above, and a stop. Every
   answer of the server, a 403, a 429 and Close 4002 included, is retried, and nothing is erased.
   The delay before the next attempt starts at 1 second and doubles after every wait, up to 60

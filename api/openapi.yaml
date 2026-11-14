@@ -62,17 +62,46 @@ paths:
   /v1/jobs:
     post:
       tags: [jobs]
-      summary: Issue a job
+      summary: Create a job (5.1, ADR-477)
       description: |
-        The server checks permissions (6.8) and compatibility, generates a signed job instruction
-        (one envelope of a key fingerprint, a signature and a postcard payload that names the
-        job's documents by hash, 11.1, ADR-461), and delivers it to the target agent. Operations requiring seed-key or OEM authentication
-        must be online (5.7).
+        Creates a job on the server, which makes its ID (UUIDv7) and answers **202**. The server
+        checks that the caller holds the role `worker` with no scope, that the agent belongs to the
+        caller's tenant, is not revoked and lists the caller among its allowed operators (6.8), and
+        that its own instruction key is the active one; then it signs the job instruction (one
+        envelope of a key fingerprint, a signature and a postcard payload that names the job's
+        documents by hash, 11.1, ADR-461), stores it with the job and leaves its delivery to the
+        queue (5.3, ADR-476). The request's start deadline is 15 minutes after the instruction is
+        issued. A `writeSettings` job's `gracePeriod` confirmation level is recorded and not
+        enforced. Operations requiring seed-key or OEM authentication must be online (5.7).
+
+        The local deployment accepts `kind` `acquire` and `writeSettings` only. Other kinds, a
+        `remote` of `true`, a non-empty `parameters`, an `executionWindow`, a `startDeadline` and an
+        `onSiteContact` are **400**; `remote: false` and an empty `parameters` count as absent.
+        `irDigests` is required (1 to 128 entries of 64 lowercase hex digits, in any order, repeats
+        allowed). `agentId` is a lowercase UUID, `vciId` 1 to 1024 bytes of UTF-8 without a
+        control character, and `vin`, when given, a well-formed VIN. The body is one JSON object of the
+        names below, each at most once and none null, in at most 16384 bytes.
+
+        `Idempotency-Key` (1 to 128 visible ASCII characters, compared as bytes) names the job for
+        the client and is kept as long as the job. The same operator repeating the same request
+        gets **202** with the stored job and its current state, whatever the caller's permission
+        has become. Any other request that uses the key is **422** with no data of the job, also
+        for a job another operator created. A request whose key no job uses is permission-checked
+        before anything is written.
+
+        Like every operator route the request needs a live session and, as a POST, the pinned
+        Origin (**403**) before the cookie is read (**401**). The body is read within 5 seconds
+        (**408**); a body over the limit is **413**; each of them closes the connection.
+        An unreadable or invalid request is **400**. A database failure, a lock wait over 5 seconds
+        or an instruction key that is not the active one is **503**; a fault of the server's own,
+        such as a failing signer, is **500**.
+      security:
+        - operatorSession: []
       parameters:
         - name: Idempotency-Key
           in: header
           required: true
-          schema: { type: string }
+          schema: { type: string, minLength: 1, maxLength: 128 }
       requestBody:
         required: true
         content:
@@ -80,16 +109,50 @@ paths:
             schema: { $ref: '#/components/schemas/JobRequest' }
       responses:
         '202':
-          description: Accepted (delivery is asynchronous)
+          description: Accepted (delivery is asynchronous); not cached. A replay answers the stored job with its current state
+          headers:
+            Cache-Control: { schema: { type: string }, description: '`no-store`' }
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Job' }
-        '403': { $ref: '#/components/responses/Problem' }
-        '409':
-          description: Target VCI or vehicle is in use (soft lock, 8.8)
+        '400':
+          description: The Content-Type, the idempotency key, the body or a value is invalid, or the request asks for something the server does not support
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
+        '401':
+          description: No live session; a presented `ngr_session` is cleared
+          headers:
+            WWW-Authenticate: { schema: { type: string }, description: '`Ngr-Session`' }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '403':
+          description: The Origin is not the pinned one, or the caller may not create this job (one document for every reason)
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '405':
+          description: A method other than POST
+          headers:
+            Allow: { schema: { type: string }, description: '`POST`' }
+        '408':
+          description: The body did not arrive within 5 seconds; the connection is closed
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '413':
+          description: The body is over 16384 bytes; the connection is closed
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '422':
+          description: The idempotency key belongs to another request or operator; the answer holds no data of the job
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '500': { $ref: '#/components/responses/Problem' }
+        '503': { $ref: '#/components/responses/Problem' }
 
   /v1/jobs/{jobId}:
     get:
@@ -881,22 +944,29 @@ components:
 
     JobRequest:
       type: object
-      required: [kind, agentId, vciId]
+      additionalProperties: false
+      required: [kind, agentId, vciId, irDigests]
+      description: |
+        What `POST /v1/jobs` of the local deployment accepts: `kind` is `acquire` or
+        `writeSettings`, and `startDeadline`, `executionWindow`, `onSiteContact`, a `parameters`
+        that is not empty and a `remote` of `true` are refused (400): the server gives them no meaning.
       properties:
         kind:
           type: string
           enum: [acquire, monitorSession, monitorCapture, runSequence, writeSettings, reprogram, identify]
-        agentId: { type: string }
-        vciId: { type: string }
-        vin: { type: string }
+        agentId: { type: string, description: The target agent; a lowercase UUID }
+        vciId: { type: string, minLength: 1, description: The VCI as the agent reported it; 1 to 1024 bytes of UTF-8 (the route counts bytes), no control characters }
+        vin: { type: string, description: A well-formed VIN (17 characters, no I, O or Q) }
         irDigests:
           type: array
-          items: { type: string }
+          minItems: 1
+          maxItems: 128
+          items: { type: string, pattern: '^[0-9a-f]{64}$' }
           description: |
             SHA-256 of each IR document of the job. The server writes them, sorted and without
             duplicates, into the signed instruction's `document_hashes` (ADR-454, ADR-461); an
             identification job names its documents through the plan instead.
-        artifactDigest: { type: string, description: Written into the signed instruction's `artifact_hash` }
+        artifactDigest: { type: string, pattern: '^[0-9a-f]{64}$', description: Written into the signed instruction's `artifact_hash` }
         parameters:
           type: object
           additionalProperties: true

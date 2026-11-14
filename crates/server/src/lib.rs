@@ -16,6 +16,7 @@ pub mod health;
 pub mod hub;
 pub mod instruction_key;
 pub mod job_queue;
+pub mod jobs;
 pub mod local_guard;
 pub mod local_user;
 pub mod operator_session;
@@ -102,6 +103,19 @@ pub fn router(state: AppState) -> Router {
             operator_session::require_session,
         )),
     );
+    // The job route takes the same layer and has its own state.
+    let jobs = Router::new()
+        .route(
+            jobs::PATH,
+            post(jobs::create).route_layer(middleware::from_fn_with_state(
+                auth.clone(),
+                operator_session::require_session,
+            )),
+        )
+        .with_state(jobs::Jobs::new(
+            state.pool.clone(),
+            Arc::clone(&state.instruction_key),
+        ));
     let operator = Router::new()
         .route(operator_session::LOGIN_PATH, post(operator_session::login))
         .route(
@@ -134,6 +148,7 @@ pub fn router(state: AppState) -> Router {
         .with_state(control::Control::new(state.pool, state.sessions, state.hub));
     let routes = health
         .merge(operator)
+        .merge(jobs)
         .merge(register)
         .merge(exchange)
         .merge(control)

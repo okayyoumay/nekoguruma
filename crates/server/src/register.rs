@@ -409,16 +409,16 @@ pub(crate) enum BodyError {
     Broken,
 }
 
-/// Reads the body in full within [`BODY_TIMEOUT`], refusing more than [`MAX_BODY`] bytes as soon
-/// as they have arrived.
-pub(crate) async fn read_body(body: axum::body::Body) -> Result<Vec<u8>, BodyError> {
+/// Reads the body in full within [`BODY_TIMEOUT`], refusing more than `limit` bytes as soon as
+/// they have arrived.
+async fn read_body(body: axum::body::Body, limit: usize) -> Result<Vec<u8>, BodyError> {
     let read = async {
         let mut body = body;
         let mut bytes = Vec::new();
         while let Some(frame) = body.frame().await {
             let frame = frame.map_err(|_| BodyError::Broken)?;
             if let Ok(data) = frame.into_data() {
-                if bytes.len() + data.len() > MAX_BODY {
+                if bytes.len() + data.len() > limit {
                     return Err(BodyError::TooLarge);
                 }
                 bytes.extend_from_slice(&data);
@@ -445,15 +445,23 @@ pub(crate) fn closing(status: StatusCode, title: &'static str) -> Response {
 /// [`BODY_TIMEOUT`] a 408, one that grows past the limit a 413 and a broken one a 400. Each of
 /// them closes the connection. Shared by every route that takes a small body.
 pub(crate) async fn bounded_body(body: axum::body::Body) -> Result<Vec<u8>, Response> {
+    bounded_body_within(body, MAX_BODY).await
+}
+
+/// [`bounded_body`] with the route's own limit in bytes; the time bound is [`BODY_TIMEOUT`].
+pub(crate) async fn bounded_body_within(
+    body: axum::body::Body,
+    limit: usize,
+) -> Result<Vec<u8>, Response> {
     // A declared length over the limit is answered before any byte is read, so the client gets
     // its 413. A streamed body has no declared length and is cut when it grows past the limit.
-    if body.size_hint().lower() > MAX_BODY as u64 {
+    if body.size_hint().lower() > limit as u64 {
         return Err(closing(
             StatusCode::PAYLOAD_TOO_LARGE,
             "The request body is too large",
         ));
     }
-    read_body(body).await.map_err(|error| match error {
+    read_body(body, limit).await.map_err(|error| match error {
         BodyError::Timeout => closing(
             StatusCode::REQUEST_TIMEOUT,
             "The request body took too long",

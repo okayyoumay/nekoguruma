@@ -39,6 +39,16 @@ pub struct VciId(pub String); // Stable identifier from discovery results
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Vin(pub String);
 
+/// Whether `text` is a well-formed VIN: 17 characters, each an ASCII digit or upper-case letter
+/// other than I, O and Q. The agent's guards and the server's job creation apply this one rule
+/// (ADR-261, ADR-262).
+pub fn is_well_formed_vin(text: &str) -> bool {
+    text.len() == 17
+        && text.bytes().all(|b| {
+            b.is_ascii_digit() || (b.is_ascii_uppercase() && !matches!(b, b'I' | b'O' | b'Q'))
+        })
+}
+
 // ---------------------------------------------------------------- Jobs
 
 /// Job kinds from 5.1.
@@ -312,4 +322,27 @@ pub enum SignatureVerifier {
     Library,
     Adapter,
     EcuOnly,
+}
+
+#[cfg(test)]
+mod vin_tests {
+    use super::is_well_formed_vin;
+
+    #[test]
+    fn a_vin_is_17_digits_or_upper_case_letters_without_i_o_and_q() {
+        assert!(is_well_formed_vin("1HGCM82633A004352"));
+        for bad in [
+            "",
+            "1HGCM82633A00435",
+            "1HGCM82633A0043521",
+            "1hgcm82633a004352",
+            "1HGCM82633A00435I",
+            "1HGCM82633A00435O",
+            "1HGCM82633A00435Q",
+            "1HGCM82633A00435-",
+            "1HGCM82633A00435\u{e9}",
+        ] {
+            assert!(!is_well_formed_vin(bad), "{bad:?}");
+        }
+    }
 }

@@ -532,3 +532,123 @@ async fn the_migration_reports_how_many_duplicate_rows_it_revoked() {
         "{text}"
     );
 }
+
+/// A job row of kind `kind` (fixed text, from the test) for the agent and operator the seed made,
+/// with `extra` columns and their values appended.
+fn job_insert(kind: &str, extra_columns: &str, extra_values: &str) -> String {
+    format!(
+        "INSERT INTO jobs (tenant_id, id, kind, agent_id, operator_id, vci_id, \
+             confirmation_level, start_deadline, signed_job, signing_key_id, idempotency_key{extra_columns}) \
+         SELECT a.tenant_id, gen_random_uuid(), '{kind}', a.id, o.id, 'v', 'notifyOnly', now(), \
+             '\\x01', 'k', gen_random_uuid()::text{extra_values} \
+         FROM agents a JOIN operators o ON o.tenant_id = a.tenant_id"
+    )
+}
+
+#[tokio::test]
+async fn job_creation_columns_replace_the_digest_and_the_kind_check_allows_identify() {
+    // M1 of ADR-477: a job row that exists before the migration survives it.
+    let pg = TestPostgres::start();
+    let pool = pg.pool();
+    db::migrate_with(&pool, &migrator_up_to(7), Duration::from_secs(30))
+        .await
+        .expect("migrations 1 to 7 apply");
+    pg.execute("INSERT INTO tenants (id, name) VALUES (gen_random_uuid(), 'jobs')")
+        .await;
+    pg.execute(
+        "INSERT INTO operators (id, tenant_id, subject, display_name) \
+         SELECT gen_random_uuid(), id, 'op', 'op' FROM tenants",
+    )
+    .await;
+    pg.execute(
+        "INSERT INTO agents (id, tenant_id, display_name, mode, public_key) \
+         SELECT gen_random_uuid(), id, 'agent', 'user', '\\x01' FROM tenants",
+    )
+    .await;
+    sqlx::query(sqlx::AssertSqlSafe(job_insert(
+        "acquire",
+        ", ir_digest",
+        ", 'old'",
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+    db::migrate_with(&pool, &db::MIGRATOR, Duration::from_secs(30))
+        .await
+        .expect("migration 8 applies over the existing row");
+
+    assert_eq!(
+        pg.scalar("SELECT concat_ws('|', ir_digests::text, request_hash IS NULL) FROM jobs")
+            .await,
+        "{}|t"
+    );
+    assert_eq!(
+        pg.scalar(
+            "SELECT count(*) FROM information_schema.columns \
+             WHERE table_name = 'jobs' AND column_name = 'ir_digest'"
+        )
+        .await,
+        "0"
+    );
+
+    // Each job kind of the protocol is accepted; a name outside it is not.
+    for kind in [
+        "acquire",
+        "monitorSession",
+        "monitorCapture",
+        "runSequence",
+        "writeSettings",
+        "reprogram",
+        "identify",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(job_insert(kind, "", "")))
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("{kind}: {e}"));
+    }
+    let unknown = sqlx::query(sqlx::AssertSqlSafe(job_insert("bogus", "", "")))
+        .execute(&pool)
+        .await;
+    assert_eq!(
+        sqlstate(&unknown),
+        Some("23514".to_owned()),
+        "an unknown kind: {unknown:?}"
+    );
+
+    // The request hash is 32 bytes or absent.
+    for (bytes, ok) in [(32, true), (31, false), (33, false), (0, false)] {
+        let outcome = sqlx::query(sqlx::AssertSqlSafe(job_insert(
+            "acquire",
+            ", request_hash",
+            &format!(", decode(repeat('ab', {bytes}), 'hex')"),
+        )))
+        .execute(&pool)
+        .await;
+        assert_eq!(outcome.is_ok(), ok, "{bytes} bytes: {outcome:?}");
+        if !ok {
+            assert_eq!(
+                sqlstate(&outcome),
+                Some("23514".to_owned()),
+                "{bytes} bytes"
+            );
+        }
+    }
+
+    // The column that holds the job's ID says who makes it.
+    let comment = pg
+        .scalar(
+            "SELECT col_description('jobs'::regclass, attnum) FROM pg_attribute \
+             WHERE attrelid = 'jobs'::regclass AND attname = 'id'",
+        )
+        .await;
+    assert!(comment.contains("server"), "{comment}");
+    db::close(&pool).await;
+}
+
+/// The SQLSTATE of a failed statement.
+fn sqlstate<T>(outcome: &Result<T, sqlx::Error>) -> Option<String> {
+    match outcome {
+        Err(sqlx::Error::Database(e)) => e.code().map(|c| c.into_owned()),
+        _ => None,
+    }
+}

@@ -9,6 +9,7 @@ mod binary;
 mod control;
 mod instruction_key;
 mod job_queue;
+mod jobs;
 mod local_users;
 mod migrations;
 mod redeem;

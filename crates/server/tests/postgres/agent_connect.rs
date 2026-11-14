@@ -27,6 +27,7 @@ use shared_proto::{
 use tokio::sync::mpsc::Receiver;
 
 use crate::agent_register::{AgentEnv, fingerprint, run, text};
+use crate::jobs::{add_user, login, password, post_to};
 use crate::redeem::World;
 use crate::serving::Running;
 
@@ -51,8 +52,26 @@ impl Fixture {
 
     /// With `queue` the server's delivery queue is on and the test takes no inbox.
     async fn with_queue(queue: bool) -> Fixture {
+        Fixture::build(queue, false).await
+    }
+
+    /// With the delivery queue on, and `alice` a local user with the role worker, who can sign in
+    /// and create jobs.
+    async fn with_local_user() -> Fixture {
+        Fixture::build(true, true).await
+    }
+
+    async fn build(queue: bool, local_user: bool) -> Fixture {
         let world = World::new().await;
-        world.add_operator("alice").await;
+        if local_user {
+            let hash = server::local_user::Hasher::new()
+                .hash(password().to_owned())
+                .await
+                .unwrap();
+            add_user(&world.pool, "alice", &["worker"], &hash).await;
+        } else {
+            world.add_operator("alice").await;
+        }
         let http = Http {
             port: 0,
             shutdown_grace_secs: 2,
@@ -392,6 +411,36 @@ async fn a_forged_stored_command_is_rejected_by_the_agent_and_ends_the_job_and_t
     f.until_job(NEXT_ID, "received|||true").await;
     f.until_job(JOB_ID, "failed|instructionRejected|badSignature|false")
         .await;
+    agent.stop().await;
+    f.server.take().unwrap().finish().await;
+    f.world.finish().await;
+}
+
+/// A job an operator creates through `POST /api/v1/jobs` reaches the real agent through the
+/// queue: the agent's own gate accepts the stored envelope and acknowledges it, and the delivery
+/// is recorded (design 5.3, 12; ADR-476, ADR-477).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_job_created_through_the_route_is_accepted_and_acknowledged_by_the_agent() {
+    let mut f = Fixture::with_local_user().await;
+    let mut agent = f.start_agent();
+    f.wait_connected(Some(&mut agent), true).await;
+    let addr = f.server.as_ref().unwrap().addr;
+    let cookie = login(addr, "alice").await;
+    let body = serde_json::json!({
+        "kind": "acquire",
+        "agentId": f.agent_id,
+        "vciId": "vci-a",
+        "irDigests": ["aa".repeat(32)],
+    })
+    .to_string();
+    let reply = post_to(addr, &cookie, "e2", &body).await;
+    assert_eq!(reply.status, 202, "{} {}", reply.head, reply.body);
+    let id = crate::redeem::json(&reply)["jobId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    f.until_job(&id, "received|||true").await;
+    assert!(f.is_connected(), "{}", agent.log_text());
     agent.stop().await;
     f.server.take().unwrap().finish().await;
     f.world.finish().await;

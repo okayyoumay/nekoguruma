@@ -94,7 +94,9 @@ rename, directory sync) and an append-only log of records.
   entry (NTFS logs the entry with the file's metadata). The crash tests end the process, which
   checks the format's recovery, not the storage under a power loss.
 - Creating a journal needs hard links (ext4, NTFS); a file system without them (FAT, exFAT)
-  fails the creation.
+  fails the creation. The agent's journal directory (`agent::journal::journal_dir`) is probed
+  for hard links the first time a process resolves it, so such a directory is refused before a
+  job starts.
 - Nothing locks the file (a lock in `std` needs a newer Rust than the workspace's minimum): one
   writer per job and generation is the job scheduler's duty, and a second writer cutting a
   frame the first is still writing would lose it.

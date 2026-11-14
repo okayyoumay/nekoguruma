@@ -102,8 +102,9 @@ pub enum OutboxError {
     Full,
     #[error("the event text is longer than a control message")]
     TooLarge,
-    /// An earlier write failed; open the outbox again.
-    #[error("an earlier write to the outbox failed")]
+    /// A write to the outbox failed (an append, or a rewrite, in this call or an earlier one; the
+    /// cause is logged by its kind); open the outbox again.
+    #[error("a write to the outbox failed")]
     Poisoned,
     /// An acknowledgement above the highest number assigned.
     #[error("acknowledged {acked}, but the highest event is {highest}")]
@@ -145,8 +146,9 @@ pub struct Outbox {
     file_len: u64,
     /// The bytes of acknowledged events still in the file.
     acked_bytes: u64,
-    /// A rewrite that an acknowledgement called for has failed and is not done yet: the file
-    /// still holds acknowledged events. Any acknowledgement, and an append about to answer
+    /// A rewrite that an acknowledgement called for has failed and is not done yet. When it failed
+    /// before the rename the file still holds acknowledged events; when it failed after, the
+    /// outbox is poisoned and the flag no longer matters. Any acknowledgement, and an append about to answer
     /// [`OutboxError::Full`], tries it again.
     rewrite_owed: bool,
     poisoned: bool,
@@ -248,7 +250,9 @@ impl Outbox {
     /// Gives the event the next number, asks `text` for the exact text of its control frame with
     /// that number in it, and makes it durable. Blocking (a file sync): the channel calls it on a
     /// blocking task. Returns the number; the event is pending from then on. A refusal
-    /// ([`OutboxError::Full`], [`OutboxError::TooLarge`]) writes nothing and uses no number.
+    /// ([`OutboxError::Full`], [`OutboxError::TooLarge`]) writes no event and uses no number;
+    /// before answering `Full` it retries an owed rewrite, which writes the rewritten file and
+    /// answers [`OutboxError::Poisoned`] if that rewrite poisons the outbox (its cause is logged).
     pub fn append(
         &mut self,
         kind: Kind,

@@ -20,6 +20,9 @@ pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 /// The longest connect timeout the file may ask for; a longer one is refused.
 pub const MAX_CONNECT_TIMEOUT_SECS: u64 = 300;
 
+/// The largest object the local store accepts unless the file says otherwise: 4 GiB.
+pub const DEFAULT_MAX_OBJECT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
 /// The deployment profile (design 13). This build serves the local profile only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -139,6 +142,32 @@ pub struct InstructionKeyConfig {
     pub path: PathBuf,
 }
 
+/// The `[storage]` table (design 13, 14.3; ADR-474): the local profile's object store, a
+/// directory of files. There is no default path (ADR-456 item 7).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageConfig {
+    /// An absolute path. The server creates the directory (mode 0700 on Unix) when it is absent
+    /// and its parent exists.
+    pub dir: PathBuf,
+    /// The most bytes one object may hold; an append past it is refused. Not 0.
+    #[serde(default = "default_max_object_bytes")]
+    pub max_object_bytes: u64,
+}
+
+fn default_max_object_bytes() -> u64 {
+    DEFAULT_MAX_OBJECT_BYTES
+}
+
+impl StorageConfig {
+    pub fn new(dir: impl Into<PathBuf>) -> StorageConfig {
+        StorageConfig {
+            dir: dir.into(),
+            max_object_bytes: DEFAULT_MAX_OBJECT_BYTES,
+        }
+    }
+}
+
 /// The whole configuration file.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -151,6 +180,8 @@ pub struct Config {
     pub database: Database,
     /// Required: the server does not start without its instruction key.
     pub instruction_key: InstructionKeyConfig,
+    /// Required: the server does not start without its object store.
+    pub storage: StorageConfig,
 }
 
 /// Why a configuration file was refused.
@@ -188,6 +219,10 @@ pub enum ConfigError {
     DatabaseUrl,
     #[error("invalid configuration: instruction_key.path must be an absolute path")]
     InstructionKeyPath,
+    #[error("invalid configuration: storage.dir must be an absolute path")]
+    StorageDir,
+    #[error("invalid configuration: storage.max_object_bytes must not be 0")]
+    StorageMaxObjectBytes,
 }
 
 fn at(line: Option<usize>, column: Option<usize>) -> String {
@@ -269,6 +304,12 @@ impl Config {
         if !config.instruction_key.path.is_absolute() {
             return Err(ConfigError::InstructionKeyPath);
         }
+        if !config.storage.dir.is_absolute() {
+            return Err(ConfigError::StorageDir);
+        }
+        if config.storage.max_object_bytes == 0 {
+            return Err(ConfigError::StorageMaxObjectBytes);
+        }
         Ok(config)
     }
 
@@ -286,12 +327,14 @@ mod tests {
     /// `[database]`. The path is absolute on the platform the test runs on.
     #[cfg(unix)]
     const DB: &str = "[instruction_key]\npath = \"/srv/nekoguruma/instruction.key\"\n\
+                      [storage]\ndir = \"/srv/nekoguruma/objects\"\n\
                       [database]\nurl = \"postgres://ngr:pw@127.0.0.1:5432/nekoguruma\"\n";
     #[cfg(windows)]
     const DB: &str = "[instruction_key]\npath = 'C:\\srv\\nekoguruma\\instruction.key'\n\
+                      [storage]\ndir = 'C:\\srv\\nekoguruma\\objects'\n\
                       [database]\nurl = \"postgres://ngr:pw@127.0.0.1:5432/nekoguruma\"\n";
 
-    /// The `[instruction_key]` table of `DB`.
+    /// The `[instruction_key]` and `[storage]` tables of `DB`.
     fn key_table() -> &'static str {
         &DB[..DB.find("[database]").unwrap()]
     }
@@ -319,8 +362,11 @@ mod tests {
 
     #[test]
     fn the_instruction_key_table_and_its_path_are_required() {
-        let db_only = "[database]\nurl = \"postgres://ngr:pw@127.0.0.1:5432/nekoguruma\"\n";
-        assert!(Config::parse(db_only).is_err());
+        let db_only = format!(
+            "{}[database]\nurl = \"postgres://ngr:pw@127.0.0.1:5432/nekoguruma\"\n",
+            storage_table()
+        );
+        assert!(Config::parse(&db_only).is_err());
         assert!(Config::parse(&format!("[instruction_key]\n{db_only}")).is_err());
         assert!(
             Config::parse(&format!(
@@ -328,6 +374,7 @@ mod tests {
             ))
             .is_err()
         );
+        assert!(Config::parse(&format!("[instruction_key]\npath = \"/k\"\n{db_only}")).is_ok());
     }
 
     #[test]
@@ -335,11 +382,61 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("key.toml");
         let text = "[instruction_key]\npath = \"keys/instruction.key\"\n\
+                    [storage]\ndir = \"/srv/objects\"\n\
                     [database]\nurl = \"postgres://ngr:pw@127.0.0.1:5432/nekoguruma\"\n";
         std::fs::write(&path, text).unwrap();
         assert!(matches!(
             Config::load(&path),
             Err(ConfigError::InstructionKeyPath)
+        ));
+        std::fs::write(&path, DB).unwrap();
+        assert!(Config::load(&path).is_ok());
+    }
+
+    // T15: the `[storage]` table.
+    #[test]
+    fn the_storage_table_and_its_dir_are_required() {
+        let without = DB.replace(&storage_table(), "");
+        assert!(Config::parse(&without).is_err());
+        let empty = DB.replace(&storage_table(), "[storage]\n");
+        assert!(Config::parse(&empty).is_err());
+        let unknown = format!("{}extra = 1\n", storage_table());
+        assert!(Config::parse(&DB.replace(&storage_table(), &unknown)).is_err());
+    }
+
+    /// The `[storage]` table of `DB`, with its key line.
+    fn storage_table() -> String {
+        let from = DB.find("[storage]").unwrap();
+        let to = DB.find("[database]").unwrap();
+        DB[from..to].to_owned()
+    }
+
+    #[test]
+    fn the_object_size_limit_defaults_to_4_gib() {
+        let c = Config::parse(DB).unwrap();
+        assert_eq!(c.storage.max_object_bytes, 4 * 1024 * 1024 * 1024);
+        let set = DB.replace(
+            &storage_table(),
+            &format!("{}max_object_bytes = 16\n", storage_table()),
+        );
+        assert_eq!(Config::parse(&set).unwrap().storage.max_object_bytes, 16);
+    }
+
+    #[test]
+    fn load_refuses_a_relative_storage_dir_and_a_zero_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("storage.toml");
+        let relative = DB.replace(&storage_table(), "[storage]\ndir = \"objects\"\n");
+        std::fs::write(&path, relative).unwrap();
+        assert!(matches!(Config::load(&path), Err(ConfigError::StorageDir)));
+        let zero = DB.replace(
+            &storage_table(),
+            &format!("{}max_object_bytes = 0\n", storage_table()),
+        );
+        std::fs::write(&path, zero).unwrap();
+        assert!(matches!(
+            Config::load(&path),
+            Err(ConfigError::StorageMaxObjectBytes)
         ));
         std::fs::write(&path, DB).unwrap();
         assert!(Config::load(&path).is_ok());

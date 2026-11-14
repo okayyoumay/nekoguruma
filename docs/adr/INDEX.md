@@ -447,7 +447,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-455](ADR-455-the-communication-log-goes-to-the-server-only-by-explicit-user-action.md) | The Agent's Communication Log Goes to the Server Only by Explicit User Action | Accepted | design 8.11 / 16.2, `agent` communication log; ADR-237, ADR-346 |
 | [ADR-456](ADR-456-the-local-profile-server-serves-one-pinned-origin-behind-a-request-guard.md) | The Local-Profile Server Serves One Pinned Origin Behind a Request Guard | Accepted (items 7 and 8 extended by ADR-458: the database, the migrations and the health check; item 7 extended by ADR-462: the instruction key's path; item 9's graceful stop extended by ADR-466 to upgraded connections; the CSRF and passkey Consequences answered by ADR-469) | design 13.3, `crates/server`, `api/openapi.yaml` health path |
 | [ADR-457](ADR-457-the-workspace-s-minimum-rust-version-is-1-94.md) | The Workspace's Minimum Rust Version Is 1.94 | Accepted | `Cargo.toml` (`rust-version`), ADR-255 (item 7's MSRV bullet); `.cargo/config.toml`, `msrv` job |
-| [ADR-458](ADR-458-the-server-migrates-before-it-binds-and-its-tests-start-a-throwaway-postgresql.md) | The Server Applies Embedded Migrations Before It Binds, and Its Tests Start a Throwaway PostgreSQL | Accepted (the start order extended by ADR-462: the instruction key is made ready after the migrations and before the bind) | design 12, 13.3, `crates/server`, `db/migrations`, `db/README.md`, `.github/workflows/ci.yml`; extends ADR-456 items 7 and 8 |
+| [ADR-458](ADR-458-the-server-migrates-before-it-binds-and-its-tests-start-a-throwaway-postgresql.md) | The Server Applies Embedded Migrations Before It Binds, and Its Tests Start a Throwaway PostgreSQL | Accepted (the start order extended by ADR-462: the instruction key is made ready after the migrations and before the bind; and by ADR-474: the object store opens after the instruction key and before the bind) | design 12, 13.3, `crates/server`, `db/migrations`, `db/README.md`, `.github/workflows/ci.yml`; extends ADR-456 items 7 and 8 |
 | [ADR-459](ADR-459-the-agent-key-is-ecdsa-p-256-and-its-connection-proof-is-clock-free.md) | The Agent Key Is ECDSA P-256 and Its Connection Proof Is Clock-Free | Accepted (Decision item 4's create-once rule and state directory given their form by ADR-460; item 5's rename done by ADR-463; item 3's transport given its form by ADR-466) | design 6.2, 6.4, 6.7, 12, 14.4, 16.3, `crates/shared-crypto`, `.github/dependabot.yml`; annotates ADR-248 |
 | [ADR-460](ADR-460-the-agent-key-is-created-once-under-a-bounded-lock-in-a-per-mode-state-directory.md) | The Agent Key Is Created Once Under a Bounded Lock in a Per-Mode State Directory | Accepted | design 6.2, 6.4, `crates/agent` (`state`, `identity`, `ngr-agent identity`); annotates ADR-459 |
 | [ADR-461](ADR-461-the-job-instruction-is-signed-bytes-with-a-versioned-body-and-an-agent-side-gate.md) | The Job Instruction Is Signed Bytes With a Versioned Body and an Agent-Side Gate | Accepted (item 11's PEM is a field of the registration record, ADR-463; items 9 and 10 extended by ADR-466: the rejection settles the delivery) | design 5.3, 5.6, 5.7, 11.1, 12, `crates/shared-crypto`, `crates/shared-proto`, `api/`; annotates ADR-454, ADR-395 |
@@ -463,6 +463,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-471](ADR-471-the-agents-control-channel-session-is-one-task-between-two-locks-and-no-answer-of-the-server-ends-it.md) | The Agent's Control Channel Session Is One Task Between Two Locks, and No Answer of the Server Ends It | Accepted (item 5's job command answered through the gate, ADR-473) | design 5.2, 5.3, 6.4, 14.1, `api/`, `crates/agent`, `crates/shared-proto`, `crates/server`; details ADR-466 for the agent's side; settles ADR-470's Consequence on `register` during a session |
 | [ADR-472](ADR-472-the-hub-stamps-every-end-of-a-current-connection-and-drops-what-no-consumer-takes.md) | The Hub Stamps Every End of a Current Connection and Drops What No Consumer Takes | Accepted | design 14.1, 14.4, `api/asyncapi.yaml`, `crates/server`, `db/README.md`; details ADR-468 items 8, 11 and 12 |
 | [ADR-473](ADR-473-the-agent-answers-a-verified-job-command-with-an-acknowledgement-alone-until-the-outbox-numbers-events.md) | The Agent Answers a Verified Job Command With an Acknowledgement Alone Until the Outbox Numbers Events | Accepted | design 5.3, `api/asyncapi.yaml`, `crates/agent`; details ADR-466 items 10 and 13, ADR-461 items 9 and 10 and ADR-471 item 5 for the agent's side |
+| [ADR-474](ADR-474-the-local-object-store-appends-by-offset-shows-only-finished-objects-and-issues-its-keys.md) | The Local Object Store Appends by Offset, Shows Only Finished Objects and Issues Its Keys | Accepted | design 13, `crates/server`, `db/README.md` |
 
 ## Status Legend
 
@@ -775,9 +776,10 @@ the predecessor repository these ADRs came from.
 - ADR-284
 - ADR-415
 - ADR-456 (items 7 and 8 extended by ADR-458: the database, the migrations and the health check; item 7 extended by ADR-462: the instruction key's path; item 9's graceful stop extended by ADR-466 to upgraded connections; the CSRF and passkey Consequences answered by ADR-469)
-- ADR-458 (the start order extended by ADR-462)
+- ADR-458 (the start order extended by ADR-462 and ADR-474)
 - ADR-462 (item 8's Web API change specified by ADR-463, and the first-use consequence answered by it)
 - ADR-469
+- ADR-474
 
 ### vci-service-manager Process Startup
 - ADR-073

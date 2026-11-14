@@ -1492,8 +1492,10 @@ mod command {
             &path,
             format!(
                 "[instruction_key]\npath = '{}'\n\
+                 [storage]\ndir = '{}'\n\
                  [database]\nurl = \"{database_url}\"\nconnect_timeout_secs = 2\n",
-                dir.join("instruction.key").display()
+                dir.join("instruction.key").display(),
+                dir.join("storage").display()
             ),
         )
         .unwrap();
@@ -1853,6 +1855,7 @@ mod command {
         assert_eq!(s.count("operator_roles").await, "2");
         // The command never applied a migration nor touched the key file.
         assert!(!s.dir.path().join("instruction.key").exists());
+        assert!(!s.dir.path().join("storage").exists());
     }
 
     #[tokio::test]

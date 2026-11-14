@@ -32,6 +32,9 @@ use shared_proto::{InstructionError, JobInstruction};
 use sqlx::PgPool;
 
 use crate::config::InstructionKeyConfig;
+#[cfg(unix)]
+use crate::fs_guard::euid;
+use crate::fs_guard::{self, DirectoryFault, check_directory, sync_directory};
 
 /// The most bytes read from the key file; a P-256 PKCS#8 document is about a hundred.
 const MAX_KEY_FILE_LEN: u64 = 4096;
@@ -274,40 +277,17 @@ fn io_error(op: &'static str) -> impl FnOnce(io::Error) -> KeyError {
     }
 }
 
-/// The effective user ID of the process.
-#[cfg(unix)]
-fn euid() -> u32 {
-    // SAFETY: geteuid has no preconditions and cannot fail.
-    unsafe { libc::geteuid() }
-}
-
-/// Refuses a directory that group or others can write to, or that belongs to neither the
-/// server's account nor root (Unix; judged by path, and the file inside is judged on its own
-/// handle). On Windows the directory's ACL, set when the service is installed, is the
-/// protection.
-#[cfg(unix)]
-fn check_directory(dir: &Path) -> Result<(), KeyError> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    let meta = std::fs::metadata(dir).map_err(io_error("inspect the directory of"))?;
-    if !meta.is_dir() {
-        return Err(KeyError::Path);
+/// The instruction key's error for a directory the shared check refused.
+fn directory_error(fault: DirectoryFault) -> KeyError {
+    match fault {
+        DirectoryFault::Io(kind) => KeyError::Io {
+            op: "inspect the directory of",
+            kind,
+        },
+        DirectoryFault::NotADirectory => KeyError::Path,
+        DirectoryFault::NotOwned => KeyError::DirectoryNotOwned,
+        DirectoryFault::Writable => KeyError::DirectoryWritable,
     }
-    if meta.uid() != euid() && meta.uid() != 0 {
-        return Err(KeyError::DirectoryNotOwned);
-    }
-    if meta.permissions().mode() & 0o022 != 0 {
-        return Err(KeyError::DirectoryWritable);
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn check_directory(dir: &Path) -> Result<(), KeyError> {
-    let meta = std::fs::metadata(dir).map_err(io_error("inspect the directory of"))?;
-    if !meta.is_dir() {
-        return Err(KeyError::Path);
-    }
-    Ok(())
 }
 
 /// Refuses an opened file that is not a regular file or, on Unix, that is not the server
@@ -330,9 +310,7 @@ fn check_file(meta: &std::fs::Metadata) -> Result<(), KeyError> {
 
 #[cfg(windows)]
 fn check_file(meta: &std::fs::Metadata) -> Result<(), KeyError> {
-    use std::os::windows::fs::MetadataExt;
-    // FILE_ATTRIBUTE_REPARSE_POINT
-    if !meta.is_file() || meta.file_attributes() & 0x400 != 0 {
+    if !fs_guard::is_plain_file(meta) {
         return Err(KeyError::NotRegularFile);
     }
     Ok(())
@@ -350,33 +328,9 @@ fn check_file(meta: &std::fs::Metadata) -> Result<(), KeyError> {
 /// FIFO (the same open as the agent's lock files, ADR-262 item 6); [`check_file`] then requires
 /// a regular file. A link, dangling or not, is refused.
 fn open_key_file(path: &Path) -> Result<File, KeyError> {
-    #[cfg(unix)]
-    let options = {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut options = OpenOptions::new();
-        options
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY);
-        options
-    };
-    #[cfg(windows)]
-    let options = {
-        use std::os::windows::fs::OpenOptionsExt;
-        let mut options = OpenOptions::new();
-        // FILE_FLAG_OPEN_REPARSE_POINT: open a reparse point itself, not its target.
-        options.read(true).custom_flags(0x0020_0000);
-        options
-    };
-    #[cfg(not(any(unix, windows)))]
-    let options = {
-        let mut options = OpenOptions::new();
-        options.read(true);
-        options
-    };
-    match options.open(path) {
+    match fs_guard::no_follow(OpenOptions::new().read(true)).open(path) {
         Ok(file) => Ok(file),
-        #[cfg(unix)]
-        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => Err(KeyError::NotRegularFile),
+        Err(error) if fs_guard::is_link_refusal(&error) => Err(KeyError::NotRegularFile),
         Err(error) => Err(io_error("open")(error)),
     }
 }
@@ -384,7 +338,7 @@ fn open_key_file(path: &Path) -> Result<File, KeyError> {
 /// Reads the key file: `None` when it is absent. Anything else that stops a read is an error;
 /// a file is never overwritten here.
 pub(crate) fn read_key(path: &Path) -> Result<Option<SigningKey>, KeyError> {
-    check_directory(directory(path)?)?;
+    check_directory(directory(path)?).map_err(directory_error)?;
     let file = match open_key_file(path) {
         Ok(file) => file,
         Err(KeyError::Io {
@@ -413,7 +367,7 @@ pub(crate) fn read_key(path: &Path) -> Result<Option<SigningKey>, KeyError> {
 /// wins and the others load its key.
 pub(crate) fn create_or_load(path: &Path) -> Result<(SigningKey, bool), KeyError> {
     let dir = directory(path)?;
-    check_directory(dir)?;
+    check_directory(dir).map_err(directory_error)?;
     let key = SigningKey::generate().map_err(|_| KeyError::Random)?;
     let bytes = key.to_pkcs8_der();
     let suffix: String = random_32()
@@ -473,18 +427,6 @@ pub(crate) fn create_or_load(path: &Path) -> Result<(SigningKey, bool), KeyError
         }
         Err(error) => Err(io_error("link")(error)),
     }
-}
-
-/// Makes the new directory entry durable. Windows cannot sync a directory; the file's own sync
-/// covers its entry there.
-#[cfg(unix)]
-fn sync_directory(dir: &Path) -> io::Result<()> {
-    File::open(dir)?.sync_all()
-}
-
-#[cfg(not(unix))]
-fn sync_directory(_dir: &Path) -> io::Result<()> {
-    Ok(())
 }
 
 #[cfg(test)]

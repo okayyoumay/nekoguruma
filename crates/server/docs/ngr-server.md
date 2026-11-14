@@ -6,7 +6,8 @@ PostgreSQL through sqlx and serves the health probe, the redemption of registrat
 agent's connection proof and control channel, and the local users' login. The rules of the listener and the
 request guard are in ADR-456; the database, the migrations and the test database are in ADR-458;
 the job instruction key is in ADR-462; registration codes and their command are in ADR-463 and
-ADR-465; local users, their command and the operator session are in ADR-469.
+ADR-465; local users, their command and the operator session are in ADR-469; the object store is in
+ADR-474.
 
 ## Running
 
@@ -26,7 +27,7 @@ below); `registration-code` is a subcommand only as the first argument, so
 The `user` forms manage local users ("Local users" below), with the same rule for `user`.
 Exit codes: 0 after a graceful stop, an issued code or a user change, 1 when the configuration is refused or the
 server cannot start or run (including a database that cannot be reached or migrated and an
-instruction key that is refused), or when a code cannot be issued or a user changed, 2 for a
+instruction key or an object store directory that is refused), or when a code cannot be issued or a user changed, 2 for a
 usage error (for `user add` and `set-password`, also a terminal on standard input).
 
 ## Configuration
@@ -47,6 +48,10 @@ connect_timeout_secs = 10    # default 10, 1-300
 
 [instruction_key]            # required
 path = "/etc/nekoguruma/instruction.key"   # absolute; Windows: use a TOML literal string
+
+[storage]                    # required
+dir = "/var/lib/nekoguruma/objects"        # absolute; created when absent
+max_object_bytes = 4294967296              # default 4 GiB, at least 1
 ```
 
 - The `[database]` table is required, and the file holds the database password: make it readable
@@ -64,6 +69,14 @@ path = "/etc/nekoguruma/instruction.key"   # absolute; Windows: use a TOML liter
   others; the server
   creates only the file. Put it beside the configuration, not in the database's data directory,
   and not in a directory that a backup of the database covers.
+- The `[storage]` table is required: `dir` is the absolute path of the object store's directory
+  ("The object store" below, ADR-474), and `max_object_bytes` (default 4 GiB, not 0) is the
+  most one object may hold. There is no default path. The server creates the directory (mode
+  0700 on Unix) when it is absent and its parent exists; it never creates the parent. The
+  directory, and the `staging` and `objects` directories inside it, must belong to the server's
+  account (or, on Unix, to root) and, on Unix, not be writable by group or others; a symbolic
+  link to such a directory is accepted. Put it on one file system, apart from the database's
+  data directory and from the instruction key.
 - There is no bind-address key. The listener is `127.0.0.1:<port>` in code, so no configuration
   can make the local profile listen elsewhere, and `[::1]` is not bound (design 13.3).
 - There is no pinned-host key. The pinned origin is `http://127.0.0.1:<port>`. Changing the port
@@ -93,10 +106,14 @@ path = "/etc/nekoguruma/instruction.key"   # absolute; Windows: use a TOML liter
    back is the service manager's job.
 4. Make the instruction key ready (below). A failure ends the process with exit 1 and nothing
    is retried.
-5. Bind `127.0.0.1:<port>`, install the signal handlers, then log the pinned origin: a stop
+5. Open the object store (below): create what is missing in `storage.dir`, check it and lock it
+   for the life of the process. A failure closes the database pool and ends the process with
+   exit 1; nothing is retried. The commands `registration-code` and `user` never open, create
+   or lock the store.
+6. Bind `127.0.0.1:<port>`, install the signal handlers, then log the pinned origin: a stop
    signal sent once the log line appears is never lost. A listening port means a migrated
-   schema and a usable instruction key.
-6. Serve until SIGTERM or SIGINT (Unix) or Ctrl-C or Ctrl-Break (Windows). Then stop accepting,
+   schema, a usable instruction key and a usable, locked object store.
+7. Serve until SIGTERM or SIGINT (Unix) or Ctrl-C or Ctrl-Break (Windows). Then stop accepting,
    let requests in flight finish and close every control channel connection with 1001, for at
    most `shutdown_grace_secs`, and exit 0. A second signal during the grace period ends the wait
    at once (still exit 0). What is still open then is aborted: the HTTP connections first, then
@@ -153,6 +170,88 @@ of `instruction_keys` where it is null; remove the key file; start the server, w
 key and records it. Also remove any `.instruction-key-*.tmp` beside the key file: a crash between
 the link and the removal of the temporary file leaves a second link to the key. A file restored over a retired row is refused ("only a retired record"). A
 command that does this is not written.
+
+## The object store
+
+`storage.rs` (the `ObjectStore` trait and its types) and `storage/local.rs` (`LocalStore`); the
+decision is in ADR-474. The store holds the large bodies that the database refers to by key (the
+`storage_key` columns, `db/README.md`): the local profile keeps them as files; `LocalStore` is the only
+implementation, and the standard profile's S3-compatible store is not written (design 13). The
+trait's futures are boxed by hand, so `Arc<dyn ObjectStore>` works, and `Server::object_store()`
+returns the store `Server::start` opened. No route or task of the server uses the store.
+
+A write is a resumable upload by offset:
+
+- `begin()` issues the key, a version 4 UUID in lowercase text, and an empty unfinished object.
+  The caller records the key in its `storage_key` column. A key of any other form is
+  `InvalidKey`, before any file is touched: no path is built from caller text but a validated
+  key.
+- `append(key, offset, bytes)` writes only when `offset` is the stored length, syncs the file and
+  returns the new length. Any other offset is `OffsetMismatch` carrying the stored length and
+  writes nothing, so a writer cut off mid-chunk, or one whose answer was lost, resumes from the
+  length in the refusal or from `status`. An append that would pass `max_object_bytes` is
+  `TooLarge` and writes nothing (exactly the limit is accepted); appending nothing at the stored
+  length returns it. An append never creates an object (`NotFound`), and a finished one is
+  `AlreadyFinished`.
+- `finish(key, sha256, length)` checks the length against the stored length, then the SHA-256 of
+  the whole content, and moves the file from the staging area to the finished area (rename, then
+  both directories synced). A mismatch (`LengthMismatch`, `HashMismatch`) leaves the object
+  unfinished and writable. A finished object is immutable: no append, no second finish. A
+  zero-length object can be finished. The size limit is not applied at finish.
+- `get(key)` opens a finished object and returns its length and an `AsyncRead`; an unfinished
+  object is `NotFinished`. A read that began before a `delete` stays complete on Unix; on Windows std unlinks with
+  POSIX delete semantics where the file system has them (the name is freed at once), and
+  elsewhere the name may persist until the reader closes, so the key may read finished or an
+  I/O error until then (not special-cased).
+- `delete(key)` removes an object, finished or not (`NotFound` when there is none). A key in
+  both areas loses both copies before the directories are synced: the staging copy first, and
+  the first failed unlink stops the delete with an I/O error and nothing else removed. An I/O
+  error after the unlink (the directory sync) leaves the object gone: the retry syncs both
+  areas before it answers `NotFound`, so that answer is durable and means it is gone. The key's
+  failed-sync mark is cleared whenever no unlink failed.
+- `list_unfinished()` returns each unfinished object's key, stored length and last write time,
+  for a caller that cleans up abandoned uploads. Names in the staging area that are not keys are
+  ignored; an entry that is not a regular file is skipped with a warning. An object that is
+  also finished (a hand-made copy) is not listed.
+
+The directory holds `staging/<key>`, `objects/<key>` and `.lock`, flat, on one file system. The
+rules the implementation keeps:
+
+- The stored length is the length of the staging file after one `sync_all`, read under the key's
+  lock by the one function every operation uses. It is not recorded anywhere, so after a crash
+  it is what reached the disk, and a chunk cut part way leaves a prefix that the writer resumes
+  after. Nothing truncates, preallocates or repairs a file.
+- A key whose `sync_all` failed answers an I/O error to everything but `delete` until the process
+  restarts, because a failed sync can drop data the operating system had accepted.
+- A key is finished if `objects/<key>` exists (it wins when the key is in both areas, and
+  `delete` removes both), else unfinished if `staging/<key>` exists, else not found. If the
+  directory or an area is gone, the answer is `Unavailable`, never not found (a missing key is
+  answered only after the areas are checked again, so an area removed during the call counts),
+  and nothing is recreated until the server restarts.
+- A staging or object file is judged on its open handle like the instruction key's file: a
+  non-regular file is `NotRegularFile`; on Unix a file owned by another account or open to
+  group or others is an I/O error for that key (`PermissionDenied`). The same rule applies to
+  `.lock` at start: a file system that fakes owners or mode bits makes the start fail (exit 1)
+  with that error, instead of refusing every key later. The listing skips such a
+  key, and one whose sync fails, with a warning.
+- Calls on one key are serialised by a per-key mutex whose guard moves into the one blocking task
+  that does the work, so a caller that drops its future does not free the key while its write
+  runs. Different keys run concurrently. File I/O runs on the blocking pool.
+- Every call is durable before it answers: `begin` syncs the file and the staging directory,
+  `append` the file, `finish` the directories of the rename, `delete` the directory it removed
+  from, and the start both areas. A rename across devices fails with an I/O error and leaves the
+  object unfinished; the file is never copied and deleted. A failed directory sync after the
+  rename is an I/O error, and the object is finished.
+- One process per directory: the store holds an exclusive lock on `.lock` for its life; a second
+  server on the directory (or a second `LocalStore` in the process) is refused with `InUse` and
+  exits 1. The file is never deleted. The operating system drops the lock when the process dies.
+- Files are created mode 0600 and opened with `O_NOFOLLOW` and `O_NONBLOCK` (a link or a FIFO in
+  the directory is refused, as for the instruction key's file), and the open handle must be a
+  regular file. Windows opens staging files for read and write, because a sync may be refused on
+  a read-only handle; it locks only `.lock`, and checks no ACL and syncs no directory.
+- The directory checks (ownership, group and other write bits, a path that is a directory) are
+  the instruction key's, in `fs_guard.rs`, which both call.
+- Errors are fixed text plus the `ErrorKind` of a failed file operation, never a path.
 
 ## Issuing a registration code
 
@@ -641,10 +740,36 @@ a new migration file rebuilds the crate. How migrations are written and applied 
   removed file with a row, a file of another key and a file that is no key are refused and left as
   they were, a retired record, one active row only, two starts with one path (both succeed, one
   key) and two starts with different paths (exactly one succeeds). `binary.rs` also checks that a
-  refused key gives exit 1 and nothing listens. Every server test config names a key path; the
-  tests that start several servers on one cluster share it (`TestPostgres::key_path`).
+  refused key gives exit 1 and nothing listens. Every server test config names a key path and a
+  storage directory; the tests that start several servers on one cluster share the key path
+  (`TestPostgres::key_path`) and each take a storage directory of their own
+  (`TestPostgres::storage_path`), since a store's directory is locked.
+- `storage.rs` (database) covers the store at start: the first start creates the directory (mode
+  0700 on Unix), its areas and the lock file and binds, the store from `Server::object_store`
+  writes and finishes an object that a restart still finds, a group-writable directory and a
+  missing parent refuse the start and leave the directory as it was, and a second server on one
+  directory is refused until the first has stopped. `binary.rs` also checks that a refused
+  storage directory (a file; on Unix, a group-writable directory) and one in use give exit 1
+  with nothing listening, and `registration.rs` and `local_users.rs` that their commands create
+  no storage directory.
+- The object store's unit tests (`storage/local/tests.rs`) need no database and run on every
+  platform, the Unix-only ones gated by `cfg(unix)`. They cover every operation on a key nobody
+  issued, an unfinished, a finished and a deleted object; the key syntax table; the size limit
+  (exactly the limit, one past it, a limit lowered across a restart, finish unaffected); the
+  resumed write (a cut after zero, one, some and all bytes of the second chunk, resent from the
+  old offset and finished, read back byte for byte); a lost answer; an orphan from a `begin`
+  that was cut; injected failures (a write failing part way, a failed sync poisoning the key
+  until a restart with delete still working, a failed directory sync after the rename, a failed
+  rename); a caller that drops its future mid-append (the key stays held and the second append is
+  refused with the new length); directories built by hand (no areas, one area, both areas, a key
+  in both); the open's refusals (relative, missing parent, a file); the directory checks by mode
+  bits and by owner (Unix); a link as the lock file or a staging file (Unix); sixteen appends at
+  one offset, two finishes, and append, finish and delete in pairs; a read that outlives a
+  delete (Unix); two stores on one directory, also while a call is still running; a directory
+  removed under a live store; a retried delete that syncs before `NotFound`; a failed unlink; a `.lock` or staging file of another account (Unix; the second as root); and the listing with sizes and times.
 - The unit tests need no database: the guard's decision table, the configuration (including that
-  no error shows the URL and that the key path is required and absolute), the key file (create,
+  no error shows the URL, that the key path is required and absolute, and that the storage
+  directory is required and absolute and its limit defaults to 4 GiB and is not 0), the key file (create,
   reload, garbage, a directory, too-open modes and directories on Unix, sixteen threads creating at
   one path, no secret in `Debug`), a sealed instruction that splits, verifies and decodes with
   `shared_crypto::instruction` and `shared_proto::JobInstruction`, and that the embedded

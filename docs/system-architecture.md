@@ -1578,6 +1578,8 @@ The same code is switched by configuration. Profile differences are limited to s
 | TURN | coturn as needed | Not required |
 | Distribution form | Container | OS service |
 
+On the local deployment the object store is a directory the server's configuration names (`[storage]`, ADR-474). An object is begun, appended to at the offset the store holds, and finished with its whole length and SHA-256, and only then can it be read; the store issues each object's key, which the row that names the object records as its `storage_key`, and one server process holds the directory. How design 14.3's direct upload fits this contract on the standard deployment is decided with the data channel.
+
 ### 13.1 Functional Limitations of the Personal Deployment
 
 | | Details |

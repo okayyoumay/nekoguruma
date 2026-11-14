@@ -273,8 +273,10 @@ fn write_config(dir: &Path, database_url: &str) -> PathBuf {
         &path,
         format!(
             "[instruction_key]\npath = '{}'\n\
+             [storage]\ndir = '{}'\n\
              [database]\nurl = \"{database_url}\"\nconnect_timeout_secs = 2\n",
-            dir.join("instruction.key").display()
+            dir.join("instruction.key").display(),
+            dir.join("storage").display()
         ),
     )
     .unwrap();
@@ -351,6 +353,7 @@ async fn the_command_prints_one_json_line_that_matches_the_stored_row() {
     assert_eq!(f.rows().await, "1");
     // The command checks the database's key row only: the key file is neither read nor created.
     assert!(!dir.path().join("instruction.key").exists());
+    assert!(!dir.path().join("storage").exists());
 }
 
 #[tokio::test]
@@ -456,6 +459,7 @@ async fn without_an_active_key_row_the_command_exits_1_and_writes_nothing() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("no active instruction key"));
     assert_eq!(f.rows().await, "0");
     assert!(!dir.path().join("instruction.key").exists());
+    assert!(!dir.path().join("storage").exists());
 }
 
 #[tokio::test]

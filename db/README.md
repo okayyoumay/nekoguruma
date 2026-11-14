@@ -75,6 +75,8 @@ sessions of the old one; `updated_at` is for the administrator and is compared w
 
 **Do not store raw data bodies in the DB**
 `dataset_chunks` holds only object storage keys and hashes.
+A `storage_key` column holds the key the object store issued (`begin()`), a lowercase version 4
+UUID, not a path.
 `chunk_format` carries a format version. The first version, `records/1`, stores the
 responses received from the vehicle with their timestamps (ADR-236); a columnar format for
 longer recordings can be added later as a new version without migrating existing chunks.

@@ -54,6 +54,7 @@ pub mod launch;
 pub mod link;
 pub mod logging;
 mod oplog;
+pub mod outbox;
 pub mod policy;
 pub mod registration;
 pub mod restart;

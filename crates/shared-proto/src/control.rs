@@ -156,7 +156,7 @@ pub enum ServerMessage {
         /// base64.
         key: String,
     },
-    /// Every event up to and including `seq` is stored. Reserved for the outbox work.
+    /// Every event up to and including `seq` is stored (5.3, ADR-478).
     EventAck {
         seq: u64,
     },
@@ -195,27 +195,20 @@ pub enum AgentMessage {
     },
 }
 
-/// An event with its place in the agent's outbox (5.3). The properties of the [`AgentEventKind`]
-/// sit beside `seq` in the same object.
+/// An event, with its place in the agent's outbox when it is one that must be delivered (5.3,
+/// ADR-478). The properties of the [`AgentEventKind`] sit beside `seq` in the same object.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentEventMessage {
-    /// Increases monotonically per agent.
-    pub seq: u64,
+    /// The event's number in the agent's outbox: at least 1 and contiguous per agent ID. Present
+    /// on `jobState` and `hmiRequest`, absent on `progress`, which is never stored or resent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub delivery: Option<Delivery>,
+    pub seq: Option<u64>,
     /// Device time, for reference only (16.3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub occurred_at_agent: Option<String>,
     #[serde(flatten)]
     pub event: AgentEventKind,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum Delivery {
-    Guaranteed,
-    Lossy,
 }
 
 /// What happened, selected by the object's `kind`.
@@ -296,7 +289,7 @@ fn allowed(direction: Direction, ty: &str) -> Option<&'static [&'static str]> {
         (ToServer, "reconcile") => &["openJobs"],
         (_, "heartbeat") => &[],
         // The properties of `agentEvent` depend on its `kind`; see `check_keys`.
-        (ToServer, "agentEvent") => &["seq", "delivery", "occurredAtAgent", "kind"],
+        (ToServer, "agentEvent") => &["seq", "occurredAtAgent", "kind"],
         _ => return None,
     })
 }
@@ -420,12 +413,24 @@ impl AgentMessage {
     fn check(&self) -> Result<(), ControlError> {
         match self {
             Self::AgentEvent(AgentEventMessage {
+                seq,
                 event:
                     AgentEventKind::Progress {
                         progress_permille, ..
                     },
                 ..
-            }) => check_permille(*progress_permille),
+            }) => {
+                // A progress event is never stored, so it has no place in the outbox.
+                if seq.is_some() {
+                    return Err(ControlError::Refused("progress has no seq"));
+                }
+                check_permille(*progress_permille)
+            }
+            Self::AgentEvent(AgentEventMessage { seq, .. }) => match seq {
+                Some(0) => Err(ControlError::OutOfRange("seq")),
+                Some(_) => Ok(()),
+                None => Err(ControlError::Refused("no seq")),
+            },
             _ => Ok(()),
         }
     }
@@ -551,8 +556,7 @@ mod tests {
             procedure_code: Some("flash.verify".to_owned()),
         };
         let event = AgentMessage::AgentEvent(AgentEventMessage {
-            seq: 3,
-            delivery: Some(Delivery::Guaranteed),
+            seq: Some(3),
             occurred_at_agent: None,
             event: state.to_event_kind(JobId("j-1".to_owned())),
         });
@@ -651,7 +655,7 @@ mod tests {
             r#"{"type":"reconcile","openJobs":[],"agentId":"a"}"#,
             // A property of another kind of event.
             r#"{"type":"agentEvent","seq":1,"kind":"jobState","jobId":"j","state":"running","progressPermille":5}"#,
-            r#"{"type":"agentEvent","seq":1,"kind":"progress","jobId":"j","progressPermille":5,"phase":"p","state":"x"}"#,
+            r#"{"type":"agentEvent","kind":"progress","jobId":"j","progressPermille":5,"phase":"p","state":"x"}"#,
             r#"{"type":"agentEvent","seq":1,"kind":"jobState","jobId":"j","state":"running","agentId":"a"}"#,
         ] {
             assert!(
@@ -670,6 +674,51 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    #[test]
+    fn a_guaranteed_event_has_a_seq_of_at_least_one_and_a_progress_event_has_none() {
+        let state = |seq: &str| {
+            format!(
+                r#"{{"type":"agentEvent"{seq},"kind":"jobState","jobId":"j","state":"running"}}"#
+            )
+        };
+        let hmi = r#"{"type":"agentEvent","seq":2,"kind":"hmiRequest","jobId":"j","hmiRequest":{"requestId":"r","templateId":"t"}}"#;
+        let progress = |seq: &str| {
+            format!(
+                r#"{{"type":"agentEvent"{seq},"kind":"progress","jobId":"j","progressPermille":5,"phase":"x"}}"#
+            )
+        };
+        assert!(AgentMessage::decode(&state(r#","seq":1"#)).is_ok());
+        assert!(AgentMessage::decode(hmi).is_ok());
+        assert!(AgentMessage::decode(&progress("")).is_ok());
+        // A guaranteed event without a number, or with 0, and a progress event with one.
+        assert!(matches!(
+            AgentMessage::decode(&state("")),
+            Err(ControlError::Refused(_))
+        ));
+        assert!(matches!(
+            AgentMessage::decode(&state(r#","seq":0"#)),
+            Err(ControlError::OutOfRange("seq"))
+        ));
+        assert!(matches!(
+            AgentMessage::decode(&progress(r#","seq":1"#)),
+            Err(ControlError::Refused(_))
+        ));
+        assert!(AgentMessage::decode(&state(r#","seq":-1"#)).is_err());
+        // The old delivery property is gone.
+        assert!(matches!(
+            AgentMessage::decode(&state(r#","seq":1,"delivery":"guaranteed""#)),
+            Err(ControlError::Refused(_))
+        ));
+        // The write side holds the same rule.
+        let AgentMessage::AgentEvent(mut event) =
+            AgentMessage::decode(&state(r#","seq":1"#)).unwrap()
+        else {
+            panic!("not an event");
+        };
+        event.seq = None;
+        assert!(AgentMessage::AgentEvent(event).encode().is_err());
     }
 
     #[test]
@@ -748,7 +797,7 @@ mod tests {
     fn progress_is_at_most_a_thousand_permille() {
         let progress = |p: u32| {
             format!(
-                r#"{{"type":"agentEvent","seq":1,"kind":"progress","jobId":"j","progressPermille":{p},"phase":"x"}}"#
+                r#"{{"type":"agentEvent","kind":"progress","jobId":"j","progressPermille":{p},"phase":"x"}}"#
             )
         };
         for ok in [0, 1, 1000] {

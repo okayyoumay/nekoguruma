@@ -593,7 +593,7 @@ async fn each_malformed_text_closes_with_1002() {
         ("a missing property", r#"{"type":"commandAck"}"#),
         (
             "a value out of range",
-            r#"{"type":"agentEvent","seq":1,"kind":"progress","jobId":"j","progressPermille":1001,"phase":"x"}"#,
+            r#"{"type":"agentEvent","kind":"progress","jobId":"j","progressPermille":1001,"phase":"x"}"#,
         ),
     ];
     for (name, body) in cases {
@@ -655,7 +655,7 @@ async fn valid_outcomes_and_events_are_read_and_the_connection_stays_open() {
     for body in [
         r#"{"type":"commandAck","commandId":"c-1"}"#,
         r#"{"type":"commandRejected","commandId":"c-2","reason":"malformed"}"#,
-        r#"{"type":"agentEvent","seq":1,"kind":"progress","jobId":"j","progressPermille":5,"phase":"x"}"#,
+        r#"{"type":"agentEvent","kind":"progress","jobId":"j","progressPermille":5,"phase":"x"}"#,
     ] {
         client.send(Message::Text(body.into())).await.unwrap();
         heartbeat(&mut client).await;
@@ -902,7 +902,7 @@ async fn the_connect_stamp_is_set_when_hello_is_read_and_heartbeats_do_not_move_
     }
     client
         .send(Message::Text(
-            r#"{"type":"agentEvent","seq":1,"kind":"progress","jobId":"j","progressPermille":5,"phase":"x"}"#.into(),
+            r#"{"type":"agentEvent","kind":"progress","jobId":"j","progressPermille":5,"phase":"x"}"#.into(),
         ))
         .await
         .unwrap();
@@ -1378,10 +1378,13 @@ async fn next_inbound(inbox: &mut tokio::sync::mpsc::Receiver<Inbound>) -> Inbou
         .expect("the inbox is open")
 }
 
-pub(crate) fn progress(seq: usize) -> Message {
+/// A numbered event (a `progress` event has no number, ADR-478); `0` is sent as 1, since a
+/// number is at least 1.
+pub(crate) fn numbered_event(seq: usize) -> Message {
+    let seq = seq.max(1);
     Message::Text(
         format!(
-            r#"{{"type":"agentEvent","seq":{seq},"kind":"progress","jobId":"j","progressPermille":5,"phase":"x"}}"#
+            r#"{{"type":"agentEvent","seq":{seq},"kind":"jobState","jobId":"j","state":"running"}}"#
         )
         .into(),
     )
@@ -1441,7 +1444,7 @@ async fn the_inbox_gives_outcomes_and_events_in_read_order_with_the_agent_and_co
     assert!(
         matches!(&got[0].message, AgentMessage::CommandAck { command_id } if *command_id == one.command_id)
     );
-    assert!(matches!(&got[1].message, AgentMessage::AgentEvent(event) if event.seq == 1));
+    assert!(matches!(&got[1].message, AgentMessage::AgentEvent(event) if event.seq == Some(1)));
     assert!(
         matches!(&got[2].message, AgentMessage::CommandRejected { command_id, .. } if *command_id == two.command_id)
     );
@@ -1457,14 +1460,14 @@ async fn messages_nobody_takes_are_dropped_without_waiting_and_an_inbox_taken_la
     let t = token(&u).await;
     let mut client = open(u.s.addr, &t).await;
     for seq in 0..300 {
-        client.send(progress(seq)).await.unwrap();
+        client.send(numbered_event(seq)).await.unwrap();
     }
     heartbeat(&mut client).await;
     let mut inbox = u.hub.inbox().expect("the first call");
-    client.send(progress(1000)).await.unwrap();
+    client.send(numbered_event(1000)).await.unwrap();
     heartbeat(&mut client).await;
     let got = next_inbound(&mut inbox).await;
-    assert!(matches!(got.message, AgentMessage::AgentEvent(event) if event.seq == 1000));
+    assert!(matches!(got.message, AgentMessage::AgentEvent(event) if event.seq == Some(1000)));
     assert!(
         inbox.try_recv().is_err(),
         "the 300 earlier ones were not kept"
@@ -1476,7 +1479,7 @@ async fn messages_nobody_takes_are_dropped_without_waiting_and_an_inbox_taken_la
 async fn fill_inbox_only(u: &Up, client: &mut Client) -> tokio::sync::mpsc::Receiver<Inbound> {
     let inbox = u.hub.inbox().expect("the first call");
     for seq in 1..=INBOX_CAPACITY + 1 {
-        client.send(progress(seq)).await.unwrap();
+        client.send(numbered_event(seq)).await.unwrap();
     }
     for _ in 0..200 {
         if inbox.len() == INBOX_CAPACITY {
@@ -1509,14 +1512,14 @@ async fn a_full_inbox_holds_the_task_without_idle_time_and_a_slot_or_a_dropped_r
     quiet_for(&mut client, 200).await;
     // A slot frees: the held message is handed over, the queued heartbeat is read and echoed.
     let first = next_inbound(&mut inbox).await;
-    assert!(matches!(first.message, AgentMessage::AgentEvent(event) if event.seq == 1));
+    assert!(matches!(first.message, AgentMessage::AgentEvent(event) if event.seq == Some(1)));
     let echo = ServerMessage::decode(&text(&mut client).await).unwrap();
     assert_eq!(echo, ServerMessage::Heartbeat);
     // All 257 arrive in order: the held one is the last.
     let mut last = 0;
     for _ in 0..INBOX_CAPACITY {
         match next_inbound(&mut inbox).await.message {
-            AgentMessage::AgentEvent(event) => last = event.seq,
+            AgentMessage::AgentEvent(event) => last = event.seq.unwrap(),
             other => panic!("{other:?}"),
         }
     }
@@ -1526,7 +1529,7 @@ async fn a_full_inbox_holds_the_task_without_idle_time_and_a_slot_or_a_dropped_r
     let mut client2 = open(u.s.addr, &token(&u).await).await;
     drop(inbox);
     for seq in 0..5 {
-        client2.send(progress(seq)).await.unwrap();
+        client2.send(numbered_event(seq)).await.unwrap();
     }
     heartbeat(&mut client2).await;
     u.finish().await;

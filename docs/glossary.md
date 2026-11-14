@@ -333,6 +333,9 @@ The `tracing` log each NGR process keeps for the developers and maintainers of N
 **Operator session** (design 6.4, 13.3, ADR-469)  
 The browser session of a **Local user**: the cookie `ngr_session` that `POST /api/v1/login` sets, whose 32 random bytes the server keeps only as a SHA-256 in memory. It ends 8 hours after login or 30 minutes after its last use, measured on both the monotonic and the wall clock, at a logout or a restart, and at the next request after the operator is disabled or its password set again. It is not the agents' **Session token**, which is a bearer header.
 
+**Outbox** (agent, design 5.3, ADR-478)  
+The agent's durable queue of events for the server, one file per agent ID. Each guaranteed event (`jobState`, `hmiRequest`) gets a `seq` of at least 1, contiguous under the agent ID, inside the synced append, and stays until the server's cumulative `eventAck` covers it; `progress` events are not in it. The server stores events in order by `seq` and deduplicates by agent ID and `seq`.
+
 ---
 
 ## P–R

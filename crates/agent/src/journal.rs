@@ -43,7 +43,7 @@ const MAGIC: [u8; 8] = *b"NGRJRNL\0";
 /// Magic and format version.
 const PREAMBLE: usize = MAGIC.len() + 4;
 /// Length and CRC in front of each payload.
-const FRAME_HEADER: usize = 8;
+pub(crate) const FRAME_HEADER: usize = 8;
 
 /// The journal of one job under one ownership generation (ADR-229: a device that gets a job
 /// back starts a new journal for the new generation).
@@ -1339,7 +1339,7 @@ fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, JournalError> {
     postcard::to_allocvec(value).map_err(|_| JournalError::TooLarge)
 }
 
-fn push_frame(out: &mut Vec<u8>, payload: &[u8]) -> Result<(), JournalError> {
+pub(crate) fn push_frame(out: &mut Vec<u8>, payload: &[u8]) -> Result<(), JournalError> {
     let len = u32::try_from(payload.len())
         .ok()
         .filter(|len| *len <= MAX_FRAME)
@@ -1351,7 +1351,7 @@ fn push_frame(out: &mut Vec<u8>, payload: &[u8]) -> Result<(), JournalError> {
 }
 
 /// How a frame at some offset reads.
-enum FrameRead<'a> {
+pub(crate) enum FrameRead<'a> {
     Ok {
         payload: &'a [u8],
         next: usize,
@@ -1365,7 +1365,7 @@ enum FrameRead<'a> {
     Bad,
 }
 
-fn read_frame(bytes: &[u8], offset: usize) -> FrameRead<'_> {
+pub(crate) fn read_frame(bytes: &[u8], offset: usize) -> FrameRead<'_> {
     let rest = &bytes[offset..];
     let Some((head, body)) = rest.split_first_chunk::<FRAME_HEADER>() else {
         return FrameRead::Torn;

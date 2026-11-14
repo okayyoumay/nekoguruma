@@ -1,7 +1,7 @@
 # ADR-473: The Agent Answers a Verified Job Command With an Acknowledgement Alone Until the Outbox Numbers Events
 
 **Date:** 2026-11-13
-**Status:** Accepted
+**Status:** Accepted (item 1 detailed by ADR-478)
 **Affects:** design 5.3; `api/asyncapi.yaml` (`agentControl`); `crates/agent` (`control`, `instruction`), `crates/agent/docs/ngr-agent.md`, `crates/agent/docs/operational-log.md`; details ADR-466 items 10 and 13 and ADR-461 items 9 and 10 for the agent's side, and ADR-471 item 5's job command
 
 ## Context

@@ -20,7 +20,7 @@ use server::job_queue::{Settings, TAKE_SQL};
 use shared_proto::ServerMessage;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::control::{Client, close_code, heartbeat, open, progress, quiet_for, revoke_row};
+use crate::control::{Client, close_code, heartbeat, numbered_event, open, quiet_for, revoke_row};
 use crate::control::{second_agent, text, token};
 use crate::redeem::{World, capture, instruction_key, json};
 use crate::serving::Running;
@@ -620,7 +620,7 @@ async fn a_failed_pass_sends_nothing_warns_once_keeps_draining_and_the_next_tick
     // More ticks pass, the warning is not repeated, nothing is sent, and the inbox is still read:
     // more events than it holds are taken in and the heartbeat after them is echoed.
     for seq in 0..300 {
-        client.send(progress(seq)).await.unwrap();
+        client.send(numbered_event(seq)).await.unwrap();
     }
     heartbeat(&mut client).await;
     tokio::time::sleep(PERIOD * 4).await;
@@ -1190,7 +1190,7 @@ async fn the_inbox_is_still_read_while_a_pass_waits_for_a_lock_on_the_jobs_table
     // More events than the inbox holds, then a heartbeat: the connection keeps reading only if the
     // queue keeps taking from the inbox while it waits.
     for seq in 0..300 {
-        client.send(progress(seq)).await.unwrap();
+        client.send(numbered_event(seq)).await.unwrap();
     }
     tokio::time::timeout(Duration::from_secs(3), heartbeat(&mut client))
         .await

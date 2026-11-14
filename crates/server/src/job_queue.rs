@@ -1057,8 +1057,7 @@ mod tests {
         let mut queue = Queue::default();
         let (_reg, delivery) = one_flight(&hub, &mut queue, &a);
         let event = AgentMessage::AgentEvent(AgentEventMessage {
-            seq: 1,
-            delivery: None,
+            seq: None,
             occurred_at_agent: None,
             event: AgentEventKind::Progress {
                 job_id: shared_proto::JobId("j".to_owned()),

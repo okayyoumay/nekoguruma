@@ -95,7 +95,8 @@ channels:
 
       **Settlement.** `commandAck` settles the delivery of a `jobCommand`, `commandRejected`
       settles it as a refusal (5.3, ADR-466). `commandId` is unique per delivery and scoped to
-      the connection; it is never the job ID. `eventAck` is reserved for the outbox work.
+      the connection; it is never the job ID. `eventAck` confirms stored events by their `seq`
+      (5.3, ADR-478).
     messages:
       hello: { $ref: '#/components/messages/Hello' }
       commandAck: { $ref: '#/components/messages/CommandAck' }
@@ -173,21 +174,22 @@ operations:
     channel: { $ref: '#/channels/agentControl' }
     summary: Agent → server. Sequence-numbered outbox
     description: |
-      Must-deliver events (completed, failed) are retained until ACKed.
-      Progress may be thinned; only the latest value is sent (5.4).
-      The server deduplicates by "agent ID + sequence number", the agent ID being the
-      session's.
+      Must-deliver events (`jobState`, `hmiRequest`) carry a `seq` and are retained until
+      acknowledged. `progress` carries none: it is never stored, acknowledged or resent, and
+      may be thinned (5.4). The server deduplicates by "agent ID + sequence number", the agent
+      ID being the session's (5.3, ADR-478).
     messages:
       - { $ref: '#/channels/agentControl/messages/agentEvent' }
 
   ackEvents:
     action: receive
     channel: { $ref: '#/channels/agentControl' }
-    summary: Server → agent. Events stored up to a sequence number (reserved)
+    summary: Server → agent. Events stored up to a sequence number
     description: |
       Cumulative: every event with a sequence number up to `seq` is stored and may leave the
-      outbox. Reserved for the outbox work; this version of the channel does not send it and an
-      agent does not need to handle it (ADR-466).
+      outbox. A number the agent has already seen acknowledged changes nothing; a number above
+      the highest the agent has assigned is a protocol violation and the agent closes the
+      connection with 1002 without dropping anything (5.3, ADR-478).
     messages:
       - { $ref: '#/channels/agentControl/messages/eventAck' }
 
@@ -358,11 +360,16 @@ components:
         capabilities is later work and will add its own kind.
       payload:
         type: object
-        required: [type, seq, kind]
+        required: [type, kind]
         properties:
           type: { const: agentEvent }
-          seq: { type: integer, minimum: 0, description: Monotonically increasing per agent }
-          delivery: { type: string, enum: [guaranteed, lossy] }
+          seq:
+            type: integer
+            minimum: 1
+            description: |
+              Present on jobState and hmiRequest, absent on progress. The number is at least 1 and
+              contiguous per agent ID: the first event of an agent ID is 1 and each later one is
+              the previous number plus one, so a gap means an event was lost (5.3, ADR-478).
           kind: { type: string, enum: [jobState, progress, hmiRequest] }
           occurredAtAgent:
             type: string
@@ -371,12 +378,11 @@ components:
               Device time is for reference only. Audit logs treat the server receive time as authoritative (16.3).
         oneOf:
           - type: object
-            required: [kind, jobId, state]
+            required: [kind, jobId, state, seq]
             additionalProperties: false
             properties:
               type: true
               seq: true
-              delivery: true
               occurredAtAgent: true
               kind: { const: jobState }
               jobId: { type: string }
@@ -411,20 +417,17 @@ components:
             additionalProperties: false
             properties:
               type: true
-              seq: true
-              delivery: true
               occurredAtAgent: true
               kind: { const: progress }
               jobId: { type: string }
               progressPermille: { type: integer, minimum: 0, maximum: 1000 }
               phase: { type: string }
           - type: object
-            required: [kind, jobId, hmiRequest]
+            required: [kind, jobId, hmiRequest, seq]
             additionalProperties: false
             properties:
               type: true
               seq: true
-              delivery: true
               occurredAtAgent: true
               kind: { const: hmiRequest }
               jobId: { type: string }
@@ -436,18 +439,20 @@ components:
                   requestId: { type: string }
                   templateId: { type: string, description: Record template or HMI form }
       examples:
-        - payload: {"type": "agentEvent", "seq": 7, "delivery": "guaranteed", "kind": "jobState", "jobId": "j-1", "state": "running"}
-        - payload: {"type": "agentEvent", "seq": 10, "delivery": "guaranteed", "kind": "jobState", "jobId": "j-1", "state": "failed", "failureCode": "procedure", "procedureCode": "flash.verify", "detail": "image check failed"}
-        - payload: {"type": "agentEvent", "seq": 11, "delivery": "guaranteed", "kind": "jobState", "jobId": "j-2", "state": "preconditionFailed", "failureCode": "jobRefused", "detail": "the job names no artifact"}
-        - payload: {"type": "agentEvent", "seq": 8, "delivery": "lossy", "kind": "progress", "jobId": "j-1", "progressPermille": 250, "phase": "download"}
-        - payload: {"type": "agentEvent", "seq": 9, "delivery": "guaranteed", "kind": "hmiRequest", "jobId": "j-1", "hmiRequest": {"requestId": "r-1", "templateId": "confirm"}}
+        - payload: {"type": "agentEvent", "seq": 7, "kind": "jobState", "jobId": "j-1", "state": "running"}
+        - payload: {"type": "agentEvent", "seq": 9, "kind": "jobState", "jobId": "j-1", "state": "failed", "failureCode": "procedure", "procedureCode": "flash.verify", "detail": "image check failed"}
+        - payload: {"type": "agentEvent", "seq": 10, "kind": "jobState", "jobId": "j-2", "state": "preconditionFailed", "failureCode": "jobRefused", "detail": "the job names no artifact"}
+        - payload: {"type": "agentEvent", "kind": "progress", "jobId": "j-1", "progressPermille": 250, "phase": "download"}
+        - payload: {"type": "agentEvent", "seq": 8, "kind": "hmiRequest", "jobId": "j-1", "hmiRequest": {"requestId": "r-1", "templateId": "confirm"}}
 
     EventAck:
       name: eventAck
-      summary: Server → agent. Events stored up to a sequence number (reserved)
+      summary: Server → agent. Events stored up to a sequence number
       description: |
-        Cumulative. Reserved for the outbox work (5.3, ADR-466); the first version of the
-        channel does not send it.
+        Cumulative (5.3, ADR-478). The server sends the highest number it has stored in order,
+        also in answer to an event whose number it already holds. An agent ignores a number
+        at or below the one it already saw acknowledged and closes the connection with 1002 on a
+        number above the highest it assigned, dropping nothing.
       payload:
         type: object
         additionalProperties: false

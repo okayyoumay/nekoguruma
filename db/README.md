@@ -97,9 +97,9 @@ the stored instruction was put on a connection, when the latest mark was made an
 acknowledged one. A job is `received` until the agent reports a state, whatever its delivery.
 The server's queue takes a job with `FOR UPDATE SKIP LOCKED`, joined to its agent (not revoked),
 and marks it in the transaction that queued the frame; an instance takes only the jobs of agents
-connected to it, a share for each agent, and two instances never hold one row at once (a commit
-that fails after the frame was queued leaves the row unmarked, so it can be sent again). `delivery_sent_at`
-is the time of the mark statement; the answer's writes and a release match the row against it. A mark that is not acknowledged is released when its connection is no longer
+connected to it, a share for each agent and a bounded number of agents in a pass, and two instances never hold one row at once (a commit
+that fails after the frame was queued leaves the row as it was before the send, so it can be sent again). `delivery_sent_at`
+is the time of the mark statement; the answer's writes and a release match the row against the mark the delivery expects (its own, or the earlier value when its commit failed). A mark that is not acknowledged is released when its connection is no longer
 current, and a mark older than the lease (90 seconds) makes the job takeable again: delivery is
 at least once, and a resend carries the same stored bytes under a new command ID.
 

@@ -3,15 +3,17 @@
 //! and the only consumer of [`Hub::inbox`].
 //!
 //! A pass is one transaction: it ends the jobs signed by a key that is no longer active, takes the
-//! rows of the agents connected to this instance with `FOR UPDATE SKIP LOCKED` (at most one
-//! connection's worth per agent, so that an agent that takes nothing cannot hold back the others),
+//! rows of some of the agents connected to this instance with `FOR UPDATE SKIP LOCKED` (at most one
+//! connection's worth per agent, so that an agent that takes nothing cannot hold back the others,
+//! and at most [`PASS_LIMIT`] rows in all, the agents taking turns from one pass to the next),
 //! queues a frame for each through the hub (which never waits) and marks the rows it queued, so
 //! that two instances never hold one row at once. A mark that is not acknowledged is released when
 //! its connection is no longer current, and expires after the lease: delivery is at least once (a
-//! commit that fails after the frame was queued leaves the row unmarked, so it can be sent again),
-//! and a resend carries the same stored bytes under a new command ID. The agent's answers settle a
-//! delivery by connection and command ID, and write only while the row still carries the mark of
-//! that delivery; a rejection ends the job, and nothing is resent after it.
+//! commit that fails after the frame was queued leaves the row as it was before the send, so it can
+//! be sent again), and a resend carries the same stored bytes under a new command ID. The agent's
+//! answers settle a delivery by connection and command ID, and write only while the row still
+//! carries the mark token the delivery expects (the new mark once its commit is known, else the
+//! one the row had when it was taken); a rejection ends the job, and nothing is resent after it.
 //!
 //! The task ends when the stop begins, in its waits and in the pass's read; once a frame has been
 //! queued the pass finishes its mark. While a pass or a write waits on the database the inbox is
@@ -41,6 +43,12 @@ use crate::session::now;
 const LOG_EVERY: Duration = Duration::from_secs(60);
 /// How many rows one pass takes for one agent: what the agent's outbound queue holds.
 const PER_AGENT_LIMIT: i64 = OUTBOUND_CAPACITY as i64;
+/// How many rows one pass takes in all, so that its transaction stays short.
+const PASS_LIMIT: usize = 64;
+/// How many agents one pass serves: the rows it can take for them fit in [`PASS_LIMIT`].
+const AGENTS_PER_PASS: usize = PASS_LIMIT / OUTBOUND_CAPACITY;
+/// How many times an iteration applies what was buffered during a write before it goes on.
+const APPLY_ROUNDS: usize = 4;
 /// How many messages are buffered while the database is waited for; past this the inbox fills and
 /// the connections stop reading, as they do for any slow consumer.
 const HELD_LIMIT: usize = 4096;
@@ -71,13 +79,15 @@ impl Default for Settings {
 /// The take: `$1` the connected agents (`text[]`), `$2` the lease in seconds, `$3` the jobs that
 /// are in flight in this process, `$4` the limit for each agent. Each agent gets its own lateral
 /// take, so an agent whose queue is full, with many old jobs, cannot hold back the others. The
-/// join to the agents lets the planner reach the rows through `jobs_pending`.
+/// join to the agents lets the planner reach the rows through `jobs_pending`. The last column is
+/// the row's mark before the send (null, or an expired one), the token a delivery whose mark does
+/// not commit still expects.
 #[doc(hidden)]
 pub const TAKE_SQL: &str = "\
-SELECT j.tenant_id, j.id, j.agent_id, j.signed_job, j.delivery_attempts \
+SELECT j.tenant_id, j.id, j.agent_id, j.signed_job, j.delivery_attempts, j.sent_at \
 FROM agents a CROSS JOIN LATERAL ( \
   SELECT t.tenant_id::text AS tenant_id, t.id::text AS id, t.agent_id::text AS agent_id, \
-         t.signed_job, t.delivery_attempts, t.created_at \
+         t.signed_job, t.delivery_attempts, t.delivery_sent_at::text AS sent_at, t.created_at \
   FROM jobs t \
   WHERE t.tenant_id = a.tenant_id AND t.agent_id = a.id \
     AND t.state = 'received' AND t.finished_at IS NULL AND t.delivered_at IS NULL \
@@ -107,8 +117,8 @@ WHERE (tenant_id, id) IN ( \
   FOR UPDATE SKIP LOCKED)";
 
 /// The mark is the time of the statement, not of the transaction, so that the lease counts from
-/// the moment the frame was queued; it is returned and kept in the flight as the token the
-/// answer's writes check.
+/// the moment the frame was queued; it is returned, and kept in the flight as the token the
+/// answer's writes check once the commit has succeeded.
 const MARK_SQL: &str = "\
 UPDATE jobs SET delivery_attempts = delivery_attempts + 1, delivery_sent_at = statement_timestamp() \
 WHERE tenant_id = $1::uuid AND id = $2::uuid \
@@ -120,26 +130,30 @@ UPDATE jobs SET state = 'failed', failure_code = 'internal', \
 WHERE tenant_id = $1::uuid AND id = $2::uuid";
 
 /// The attempts are raised to the answered delivery's, in case its mark's commit failed. `$4` is
-/// the delivery's mark: a row with no mark (that commit failed) or with that mark is settled; a
-/// row another delivery has marked since is not touched.
+/// the mark token the delivery expects on the row (null for none): a row that carries it is
+/// settled, which is the delivery's own mark or, when that commit failed, what the row had before;
+/// a row another delivery has marked since is not touched.
 const DELIVERED_SQL: &str = "\
 UPDATE jobs SET delivered_at = now(), delivery_attempts = GREATEST(delivery_attempts, $3) \
 WHERE tenant_id = $1::uuid AND id = $2::uuid AND finished_at IS NULL AND delivered_at IS NULL \
-  AND (delivery_sent_at IS NULL OR delivery_sent_at = $4::timestamptz)";
+  AND delivery_sent_at IS NOT DISTINCT FROM $4::timestamptz";
 
 const REJECTED_SQL: &str = "\
 UPDATE jobs SET state = 'failed', failure_code = 'instructionRejected', failure_detail = $3, \
     finished_at = now() \
 WHERE tenant_id = $1::uuid AND id = $2::uuid AND state = 'received' \
   AND finished_at IS NULL AND delivered_at IS NULL \
-  AND (delivery_sent_at IS NULL OR delivery_sent_at = $4::timestamptz)";
+  AND delivery_sent_at IS NOT DISTINCT FROM $4::timestamptz";
 
-/// Clears the mark only while it is still this delivery's (attempt number and time).
+/// Clears the mark only while it is still this delivery's (attempt number and token).
 const RELEASE_SQL: &str = "\
 UPDATE jobs SET delivery_sent_at = NULL \
 WHERE tenant_id = $1::uuid AND id = $2::uuid AND delivery_attempts = $3 \
-  AND delivery_sent_at = $4::timestamptz \
+  AND delivery_sent_at IS NOT DISTINCT FROM $4::timestamptz \
   AND delivered_at IS NULL AND finished_at IS NULL";
+
+/// A row as the take returns it.
+type TakenRow = (String, String, String, Vec<u8>, i32, Option<String>);
 
 /// A row the take returned.
 #[derive(Debug)]
@@ -150,6 +164,8 @@ struct Taken {
     signed_job: Vec<u8>,
     /// The attempts recorded before this one.
     attempts: i32,
+    /// The row's mark (text) when it was taken: null, or an expired one.
+    prior_mark: Option<String>,
 }
 
 /// What [`dispatch`] did with the taken rows.
@@ -192,9 +208,10 @@ struct Flight {
     /// The attempt number this delivery recorded.
     attempts: i32,
     sent_at: std::time::Instant,
-    /// The mark the database gave the row (its text), once the mark statement has run; the
-    /// answer's writes match the row against it.
-    mark: Option<String>,
+    /// The mark token (text) the row is expected to carry: what it had when it was taken, until
+    /// the mark's commit is known, then the mark the database gave. The answer's writes match
+    /// the row against it.
+    expected: Option<String>,
 }
 
 /// What an answer or a departure asks the database to write.
@@ -237,7 +254,7 @@ struct Queue {
 
 impl Queue {
     /// Remembers what a pass queued, before its mark is committed: a commit that fails leaves
-    /// the row unmarked, and the entry keeps it from being taken again here.
+    /// the row as it was, and the entry keeps it from being taken again here.
     fn register(&mut self, sent: &[(Taken, Delivery)], at: std::time::Instant) {
         for (job, delivery) in sent {
             self.flights.insert(
@@ -248,20 +265,20 @@ impl Queue {
                     agent: job.agent.clone(),
                     attempts: job.attempts + 1,
                     sent_at: at,
-                    mark: None,
+                    expected: job.prior_mark.clone(),
                 },
             );
         }
     }
 
-    /// Records the marks the database gave (job, attempt number, mark).
+    /// Records the marks the database gave and committed (job, attempt number, mark).
     fn set_marks(&mut self, marks: &[(String, i32, String)]) {
         for flight in self.flights.values_mut() {
             if let Some((_, _, mark)) = marks
                 .iter()
                 .find(|(id, attempts, _)| *id == flight.id && *attempts == flight.attempts)
             {
-                flight.mark = Some(mark.clone());
+                flight.expected = Some(mark.clone());
             }
         }
     }
@@ -354,6 +371,26 @@ async fn draining<T>(
     }
 }
 
+/// The agents one pass serves: at most [`AGENTS_PER_PASS`] of the connected ones, in the order of
+/// their IDs, starting at `cursor`, which moves past them so that the next pass starts with the
+/// agents after these and every agent gets its turn.
+fn window(
+    connected: &[(AgentId, ConnectionId)],
+    cursor: &mut usize,
+) -> Vec<(AgentId, ConnectionId)> {
+    if connected.is_empty() {
+        return Vec::new();
+    }
+    let mut sorted = connected.to_vec();
+    sorted.sort_by(|a, b| a.0.0.cmp(&b.0.0));
+    let start = *cursor % sorted.len();
+    let count = sorted.len().min(AGENTS_PER_PASS);
+    *cursor = start + count;
+    (0..count)
+        .map(|n| sorted[(start + n) % sorted.len()].clone())
+        .collect()
+}
+
 /// Runs the queue until the stop, with the receiver of the hub's inbox.
 pub(crate) async fn run(
     hub: Hub,
@@ -370,6 +407,9 @@ pub(crate) async fn run(
     // The messages read while the database was waited for, and what has not been written yet.
     let mut held: Vec<Inbound> = Vec::new();
     let mut carry = Step::default();
+    // The last write failed: it is retried on the tick, not on every message.
+    let mut failed = false;
+    let mut cursor = 0_usize;
     let mut marks: Vec<(String, i32, String)> = Vec::new();
     loop {
         let due = tokio::select! {
@@ -385,26 +425,42 @@ pub(crate) async fn run(
             },
         };
         // The connections first, then the inbox: an answer read before its connection left is
-        // in the inbox (or already held) by then, so it is applied before the release.
-        let snapshot = hub.connected();
-        while let Ok(item) = inbox.try_recv() {
-            held.push(item);
-        }
-        carry.append(queue.step(&snapshot, std::mem::take(&mut held), now(), settings.lease));
-        if !carry.is_empty() {
-            // A write that fails keeps the step, and the next iteration writes it again.
+        // in the inbox (or already held) by then, so it is applied before the release. What is
+        // buffered while a write waits is applied at once, without waiting for the next tick.
+        let mut snapshot = Vec::new();
+        for _ in 0..APPLY_ROUNDS {
+            snapshot = hub.connected();
+            while let Ok(item) = inbox.try_recv() {
+                held.push(item);
+            }
+            carry.append(queue.step(&snapshot, std::mem::take(&mut held), now(), settings.lease));
+            if carry.is_empty() || (failed && !due) {
+                break;
+            }
+            // A write that fails keeps the step, and the next tick writes it again.
             match draining(&mut inbox, &mut held, write(&pool, &carry)).await {
-                Ok(()) => carry = Step::default(),
-                Err(error) => warn(&gate, &error, "the delivery queue could not record answers"),
+                Ok(()) => {
+                    carry = Step::default();
+                    failed = false;
+                }
+                Err(error) => {
+                    failed = true;
+                    warn(&gate, &error, "the delivery queue could not record answers");
+                    break;
+                }
+            }
+            if held.is_empty() {
+                break;
             }
         }
         if !due {
             continue;
         }
         let skip: Vec<String> = queue.in_flight().into_iter().chain(carry.ids()).collect();
+        let served = window(&snapshot, &mut cursor);
         let read = tokio::select! {
             () = stopped(&mut stopping) => return,
-            read = draining(&mut inbox, &mut held, read(&pool, &snapshot, skip, settings.lease)) => read,
+            read = draining(&mut inbox, &mut held, read(&pool, &served, skip, settings.lease)) => read,
         };
         match read {
             Ok((tx, taken)) => {
@@ -414,9 +470,10 @@ pub(crate) async fn run(
                 marks.clear();
                 let marked =
                     draining(&mut inbox, &mut held, mark(tx, &dispatched, &mut marks)).await;
-                queue.set_marks(&marks);
                 match marked {
                     Ok(()) => {
+                        // The marks count only once their commit is known.
+                        queue.set_marks(&marks);
                         if let Some(passes) = &settings.passes {
                             passes.fetch_add(1, Ordering::Relaxed);
                         }
@@ -440,11 +497,11 @@ fn warn(gate: &Mutex<Option<std::time::Instant>>, error: &sqlx::Error, what: &st
     }
 }
 
-/// The first half of a pass: ends the jobs of a retired key and takes the rows. The transaction
-/// stays open, holding the locks.
+/// The first half of a pass: ends the jobs of a retired key and takes the rows of the agents it
+/// serves. The transaction stays open, holding the locks.
 async fn read(
     pool: &PgPool,
-    snapshot: &[(AgentId, ConnectionId)],
+    served: &[(AgentId, ConnectionId)],
     skip: Vec<String>,
     lease: Duration,
 ) -> Result<(sqlx::Transaction<'static, sqlx::Postgres>, Vec<Taken>), sqlx::Error> {
@@ -458,11 +515,11 @@ async fn read(
     if ended > 0 {
         tracing::info!(jobs = ended, "jobs signed by a retired key were ended");
     }
-    if snapshot.is_empty() {
+    if served.is_empty() {
         return Ok((tx, Vec::new()));
     }
-    let agents: Vec<String> = snapshot.iter().map(|(agent, _)| agent.0.clone()).collect();
-    let rows: Vec<(String, String, String, Vec<u8>, i32)> = sqlx::query_as(TAKE_SQL)
+    let agents: Vec<String> = served.iter().map(|(agent, _)| agent.0.clone()).collect();
+    let rows: Vec<TakenRow> = sqlx::query_as(TAKE_SQL)
         .bind(agents)
         .bind(lease.as_secs_f64())
         .bind(skip)
@@ -471,20 +528,23 @@ async fn read(
         .await?;
     let taken = rows
         .into_iter()
-        .map(|(tenant, id, agent, signed_job, attempts)| Taken {
-            tenant,
-            id,
-            agent: AgentId(agent),
-            signed_job,
-            attempts,
-        })
+        .map(
+            |(tenant, id, agent, signed_job, attempts, prior_mark)| Taken {
+                tenant,
+                id,
+                agent: AgentId(agent),
+                signed_job,
+                attempts,
+                prior_mark,
+            },
+        )
         .collect();
     Ok((tx, taken))
 }
 
 /// The second half of a pass: marks what was queued, ends what could not be, commits. The marks
-/// the database gave are added to `marks` as they come, also when a later statement or the commit
-/// fails.
+/// the database gave are added to `marks` as they come; the caller uses them only when the commit
+/// succeeded.
 async fn mark(
     mut tx: sqlx::Transaction<'static, sqlx::Postgres>,
     dispatched: &Dispatched,
@@ -523,7 +583,7 @@ async fn write(pool: &PgPool, step: &Step) -> Result<(), sqlx::Error> {
             .bind(&flight.tenant)
             .bind(&flight.id)
             .bind(flight.attempts)
-            .bind(&flight.mark)
+            .bind(&flight.expected)
             .execute(&mut *conn)
             .await?;
     }
@@ -532,7 +592,7 @@ async fn write(pool: &PgPool, step: &Step) -> Result<(), sqlx::Error> {
             .bind(&flight.tenant)
             .bind(&flight.id)
             .bind(reason)
-            .bind(&flight.mark)
+            .bind(&flight.expected)
             .execute(&mut *conn)
             .await?;
     }
@@ -541,7 +601,7 @@ async fn write(pool: &PgPool, step: &Step) -> Result<(), sqlx::Error> {
             .bind(&flight.tenant)
             .bind(&flight.id)
             .bind(flight.attempts)
-            .bind(&flight.mark)
+            .bind(&flight.expected)
             .execute(&mut *conn)
             .await?;
     }
@@ -566,6 +626,7 @@ mod tests {
             agent: agent(agent_name),
             signed_job: vec![n as u8; 4],
             attempts: 0,
+            prior_mark: None,
         }
     }
 
@@ -813,7 +874,12 @@ mod tests {
         });
         let mut held = Vec::new();
         // The stalled "database" ends only after the producer has sent all of its messages.
-        let out = draining(&mut inbox, &mut held, async { wait.await.unwrap() }).await;
+        let out = tokio::time::timeout(
+            Duration::from_secs(10),
+            draining(&mut inbox, &mut held, async { wait.await.unwrap() }),
+        )
+        .await
+        .expect("the inbox is read while the work waits");
         producer.await.unwrap();
         assert_eq!(out, 7);
         // What is still in the inbox when the work ends is read by the next iteration.
@@ -825,6 +891,30 @@ mod tests {
             &held[39].message,
             AgentMessage::CommandAck { command_id } if command_id == "c-39"
         ));
+    }
+
+    #[test]
+    fn the_agents_take_turns_in_windows_that_cover_every_agent() {
+        let hub = Hub::new();
+        let names = ["a", "b", "c", "d", "e", "f"];
+        let _regs: Vec<_> = names
+            .iter()
+            .map(|n| hub.register(&agent(n)).unwrap())
+            .collect();
+        let connected = hub.connected();
+        let mut cursor = 0;
+        let first = window(&connected, &mut cursor);
+        let second = window(&connected, &mut cursor);
+        let third = window(&connected, &mut cursor);
+        let who =
+            |w: &[(AgentId, ConnectionId)]| w.iter().map(|(a, _)| a.0.clone()).collect::<Vec<_>>();
+        assert_eq!(who(&first), ["a", "b", "c", "d"]);
+        assert_eq!(who(&second), ["e", "f", "a", "b"]);
+        assert_eq!(who(&third), ["c", "d", "e", "f"]);
+        // Fewer agents than a window: all of them, every time.
+        let mut cursor = 5;
+        assert_eq!(window(&connected[..2], &mut cursor).len(), 2);
+        assert!(window(&[], &mut cursor).is_empty());
     }
 
     #[tokio::test]
@@ -853,7 +943,12 @@ mod tests {
             release.send(()).unwrap();
         });
         let mut held = Vec::new();
-        draining(&mut inbox, &mut held, async { wait.await.unwrap() }).await;
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            draining(&mut inbox, &mut held, async { wait.await.unwrap() }),
+        )
+        .await
+        .expect("the work ends once the producer releases it");
         producer.await.unwrap();
         assert_eq!(held.len(), HELD_LIMIT);
     }
@@ -881,7 +976,7 @@ mod tests {
         let (_reg, delivery) = one_flight(&hub, &mut queue, &a);
         queue.set_marks(&[("job-a-1".to_owned(), 1, "m".to_owned())]);
         let step = queue.step(&hub.connected(), vec![ack(&a, &delivery)], at(), LEASE);
-        assert_eq!(step.delivered[0].mark.as_deref(), Some("m"));
+        assert_eq!(step.delivered[0].expected.as_deref(), Some("m"));
     }
 
     // Case 22

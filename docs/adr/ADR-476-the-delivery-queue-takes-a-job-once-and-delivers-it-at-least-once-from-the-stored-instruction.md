@@ -27,16 +27,20 @@ does to the job, and how the pieces are tested.
    (item 6; it skips the rows another pass holds), then selects, for each agent that is
    connected to this instance and not revoked (a lateral select from `agents`, so that the planner
    reaches the rows through `jobs_pending`), at most the outbound queue's 16 rows in creation
-   order, `FOR UPDATE SKIP LOCKED`, so that an agent whose queue stays full cannot hold back the
+   order (a pass serves at most four agents, so 64 rows, in the order of their IDs from a cursor
+   that moves on with each pass, so that every agent gets its turn and the transaction stays short), `FOR UPDATE SKIP LOCKED`, so that an agent whose queue stays full cannot hold back the
    others; the rows are those whose state is `received`, which are neither
    finished nor delivered, whose start deadline has not passed, whose key is the active one and
    which have no mark or an expired one. It queues a frame for each through the hub while
    holding the row lock, and marks the rows it queued in the same transaction, with the time of
    the mark statement (not of the transaction), which is returned and kept with the delivery.
    Two instances therefore never hold one row at once; if a mark's commit fails after the frame
-   was queued, the row is unmarked and can be sent again (item 4). A row that cannot be queued stays unmarked for the next pass:
+   was queued, the row is as it was before the send (no mark, or an expired one) and can be sent again
+   (item 4); the take returns that mark as the token the delivery expects until its own mark's
+   commit is known. A row that cannot be queued (full queue, no connection) stays as it was for the next pass:
    an agent whose queue is full or which has left gets nothing more in this pass, so its later
-   jobs keep their order. A frame over the limit can never be sent and ends the job as failed
+   jobs keep their order. A frame over the limit can never be sent, unlike a full queue or a missing
+   connection, which retry: it ends the job as failed
    with `internal` (the server is part of the diagnostic system); whether a frame fits is judged
    with the widest command ID the counter can produce, so that it does not depend on the
    counter's value.
@@ -57,9 +61,9 @@ does to the job, and how the pieces are tested.
    which the agent's tolerance of a repeated job accepts (design 5.3).
 5. **An answer settles with conditional writes.** An acknowledgement, a rejection or a release
    writes only while the job is neither finished nor delivered and the row carries the mark of
-   the delivery the answer is about (an acknowledgement or a rejection also settles a row that
-   has no mark, which is what a failed commit leaves; a release needs the attempt number and the
-   mark's time to match), so that the answer of a delivery whose commit failed cannot clear or
+   the delivery the answer is about (the delivery expects its own mark once that commit is known, else the mark the row had when it
+   was taken, which is what a failed commit leaves, null or an expired one; the comparison treats
+   null as equal to null; a release also needs the attempt number to match), so that the answer of a delivery whose commit failed cannot clear or
    end the live delivery of another instance. So an answer for a job that is
    already finished or delivered writes nothing, and an answer is matched by the connection and
    the command ID of the agent it came from; an unknown, repeated or foreign one is ignored. A
@@ -77,8 +81,9 @@ does to the job, and how the pieces are tested.
    most one a minute) and is retried at the next tick; the inbox is drained either way, and also
    while the pass or a write waits for the database (the messages are buffered, up to 4096, and
    applied after it), so that the database never fills the inbox. A write of answers that fails
-   keeps its step, which is written again at the next iteration, and the take leaves those jobs
-   out meanwhile.
+   keeps its step, which is written again at the next tick (a backoff: not on every message), and
+   the take leaves those jobs out meanwhile; what was buffered during a write is applied right after
+   it.
 8. **Testing.** The dispatch (full queue, no connection, frame too large, the stop between two
    sends) and the settling of answers (snapshot before drain, unknown, repeated and foreign
    answers, a flight whose commit failed) are functions that need no database and are unit

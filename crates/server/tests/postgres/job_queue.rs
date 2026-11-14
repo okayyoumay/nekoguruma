@@ -238,7 +238,7 @@ async fn a_take_skips_the_rows_another_take_holds_and_a_marked_row_is_not_taken_
     for n in 0..8 {
         add_job(&u.w, &u.id, n, b"x").await;
     }
-    type Row = (String, String, String, Vec<u8>, i32);
+    type Row = (String, String, String, Vec<u8>, i32, Option<String>);
     let take = |limit: i64| {
         sqlx::query_as::<_, Row>(TAKE_SQL)
             .bind(vec![u.id.clone()])
@@ -315,7 +315,7 @@ async fn a_take_that_is_dropped_before_the_send_marks_nothing_and_the_next_pass_
     let held = add_job(&u.w, &u.id, 1, b"held").await;
     let free = add_job(&u.w, &u.id, 2, b"free").await;
     let mut tx = u.w.pool.begin().await.unwrap();
-    let taken: Vec<(String, String, String, Vec<u8>, i32)> = sqlx::query_as(TAKE_SQL)
+    let taken: Vec<Taken> = sqlx::query_as(TAKE_SQL)
         .bind(vec![u.id.clone()])
         .bind(60.0_f64)
         .bind(vec![free.clone()])
@@ -632,7 +632,7 @@ async fn a_failed_pass_sends_nothing_warns_once_keeps_draining_and_the_next_tick
 }
 
 /// A row as the take returns it.
-type Taken = (String, String, String, Vec<u8>, i32);
+type Taken = (String, String, String, Vec<u8>, i32, Option<String>);
 
 async fn take(u: &Up, agents: &[&str], in_flight: &[&String], limit: i64) -> Vec<Taken> {
     sqlx::query_as::<_, Taken>(TAKE_SQL)
@@ -673,18 +673,52 @@ async fn the_take_gives_every_agent_its_turn_however_many_older_jobs_one_agent_h
     assert_eq!(taken.iter().filter(|row| row.2 == u.id).count(), 16);
 }
 
+/// `count` jobs for `agent`, all older than anything `add_job` makes, each carrying `bytes`.
+async fn add_old_jobs(w: &World, agent: &str, count: i32, bytes: &[u8]) {
+    sqlx::query(
+        "INSERT INTO jobs (tenant_id, id, kind, agent_id, operator_id, vci_id, \
+             confirmation_level, start_deadline, signed_job, signing_key_id, created_at, \
+             idempotency_key) \
+         SELECT a.tenant_id, gen_random_uuid(), 'runSequence', a.id, o.id, 'vci', 'notifyOnly', \
+             now() + interval '1 hour', $3, $4, \
+             now() - interval '2 hours' + n * interval '1 millisecond', gen_random_uuid()::text \
+         FROM agents a JOIN operators o ON o.tenant_id = a.tenant_id, generate_series(1, $2) n \
+         WHERE a.id = $1::uuid",
+    )
+    .bind(agent)
+    .bind(count)
+    .bind(bytes)
+    .bind(w.key.key_id())
+    .execute(&w.pool)
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn an_agent_that_reads_nothing_does_not_hold_back_another_agents_job() {
-    let u = up(LONG).await;
+    let passes = Arc::new(AtomicU64::new(0));
+    let counted = Settings {
+        passes: Some(passes.clone()),
+        ..settings(LONG)
+    };
+    let u = Up::with_queue(2, Some(counted)).await;
     let (other_id, other_token) = second_agent(&u).await;
-    // Frames of about 120 KiB, more than the socket can hold: the first agent's queue stays full.
+    // Frames of about 120 KiB, and more of them than the sockets' buffers and the pass's whole
+    // take can hold: the silent agent's older jobs stay at the head of the line for good.
     let big = vec![7_u8; 90_000];
-    for n in 0..80 {
-        add_job(&u.w, &u.id, n, &big).await;
-    }
+    add_old_jobs(&u.w, &u.id, 700, &big).await;
     let _silent = open(u.s.addr, &token(&u).await).await;
-    add_job(&u.w, &other_id, 500, b"later").await;
+    let later = add_job(&u.w, &other_id, 500, b"later").await;
+    let before = passes.load(Ordering::Relaxed);
     let mut other = open(u.s.addr, &other_token).await;
+    // A few passes after the other agent connected must have served it, whatever the silent
+    // agent's backlog; a take that fills its limit with the silent agent's rows never does.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while passes.load(Ordering::Relaxed) < before + 6 {
+        assert!(Instant::now() < deadline, "no passes ran");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(row(&u.w, &later).await, SENT);
     assert_eq!(command(&mut other).await.1, b"later");
     u.finish().await;
 }
@@ -815,24 +849,153 @@ async fn a_stale_flights_rejection_and_acknowledgement_do_not_touch_a_newer_mark
     u.finish().await;
 }
 
+/// Makes the commit of a transaction that changes a job's mark fail, as a lost connection would.
+async fn refuse_marks(u: &Up) {
+    u.w.pg
+        .execute(
+            "CREATE OR REPLACE FUNCTION test_commit_refused() RETURNS trigger LANGUAGE plpgsql \
+             AS $$ BEGIN RAISE EXCEPTION 'test: commit refused'; END $$",
+        )
+        .await;
+    u.w.pg
+        .execute(
+            "CREATE CONSTRAINT TRIGGER test_marks_refused AFTER UPDATE ON jobs DEFERRABLE \
+             INITIALLY DEFERRED FOR EACH ROW \
+             WHEN (NEW.delivery_sent_at IS DISTINCT FROM OLD.delivery_sent_at) \
+             EXECUTE FUNCTION test_commit_refused()",
+        )
+        .await;
+}
+
+/// Makes the commit of a transaction that settles a job's delivery fail.
+async fn refuse_answers(u: &Up) {
+    u.w.pg
+        .execute(
+            "CREATE OR REPLACE FUNCTION test_commit_refused() RETURNS trigger LANGUAGE plpgsql \
+             AS $$ BEGIN RAISE EXCEPTION 'test: commit refused'; END $$",
+        )
+        .await;
+    u.w.pg
+        .execute(
+            "CREATE CONSTRAINT TRIGGER test_answers_refused AFTER UPDATE ON jobs DEFERRABLE \
+             INITIALLY DEFERRED FOR EACH ROW \
+             WHEN (NEW.delivered_at IS DISTINCT FROM OLD.delivered_at) \
+             EXECUTE FUNCTION test_commit_refused()",
+        )
+        .await;
+}
+
+async fn until_logged(log: &crate::redeem::Captured, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !log.text().contains(what) {
+        assert!(Instant::now() < deadline, "not logged: {what}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A delivery whose mark's commit failed after the frame was queued, then the agent's answer. The
+/// row had no mark before (`old` false) or an expired one from an earlier delivery.
+async fn answer_after_an_uncommitted_mark(old: bool, rejection: bool) {
+    let u = up(LONG).await;
+    let (log, _guard) = capture();
+    let job = add_job(&u.w, &u.id, 1, b"a").await;
+    if old {
+        sqlx::query(
+            "UPDATE jobs SET delivery_attempts = 1, delivery_sent_at = now() - interval '1 hour' \
+             WHERE id = $1::uuid",
+        )
+        .bind(&job)
+        .execute(&u.w.pool)
+        .await
+        .unwrap();
+    }
+    let before = mark_of(&u.w, &job).await;
+    refuse_marks(&u).await;
+    let mut client = open(u.s.addr, &token(&u).await).await;
+    let (id, _) = command(&mut client).await;
+    until_logged(&log, "could not mark deliveries").await;
+    u.w.pg
+        .execute("DROP TRIGGER test_marks_refused ON jobs")
+        .await;
+    // The row is as it was before the send.
+    assert_eq!(mark_of(&u.w, &job).await, before);
+    if rejection {
+        reject(&mut client, &id, "badSignature").await;
+        let attempts = u32::from(old);
+        let sent = old;
+        let expected =
+            format!("failed|{attempts}|{sent}|false|instructionRejected|badSignature|true");
+        until_row(&u.w, &job, &expected).await;
+    } else {
+        ack(&mut client, &id).await;
+        let expected = if old {
+            "received|2|true|true|||false"
+        } else {
+            "received|1|false|true|||false"
+        };
+        until_row(&u.w, &job, expected).await;
+    }
+    u.finish().await;
+}
+
 // The acknowledgement's raising of the attempts
 #[tokio::test]
 async fn an_acknowledgement_after_a_mark_that_was_not_committed_raises_the_attempts() {
-    let u = up(LONG).await;
+    answer_after_an_uncommitted_mark(false, false).await;
+}
+
+#[tokio::test]
+async fn an_acknowledgement_after_a_mark_that_was_not_committed_settles_a_row_with_an_old_mark() {
+    answer_after_an_uncommitted_mark(true, false).await;
+}
+
+#[tokio::test]
+async fn a_rejection_after_a_mark_that_was_not_committed_ends_a_row_with_no_mark() {
+    answer_after_an_uncommitted_mark(false, true).await;
+}
+
+#[tokio::test]
+async fn a_rejection_after_a_mark_that_was_not_committed_ends_a_row_with_an_old_mark() {
+    answer_after_an_uncommitted_mark(true, true).await;
+}
+
+// The carry: an answer that could not be written is kept, retried, and its job stays out of the take
+#[tokio::test]
+async fn an_answer_that_could_not_be_written_is_retried_and_its_job_is_not_sent_again_meanwhile() {
+    // A lease that runs out while the answer is unwritten: only the take's exclusion of the carried
+    // job keeps the expired mark from being taken again.
+    let lease = Duration::from_secs(1);
+    let passes = Arc::new(AtomicU64::new(0));
+    let counted = Settings {
+        passes: Some(passes.clone()),
+        ..settings(lease)
+    };
+    let u = Up::with_queue(2, Some(counted)).await;
+    let (log, _guard) = capture();
     let job = add_job(&u.w, &u.id, 1, b"a").await;
     let mut client = open(u.s.addr, &token(&u).await).await;
     let (id, _) = command(&mut client).await;
     until_row(&u.w, &job, SENT).await;
-    // As if the mark's commit had failed after the frame was queued.
-    sqlx::query(
-        "UPDATE jobs SET delivery_attempts = 0, delivery_sent_at = NULL WHERE id = $1::uuid",
-    )
-    .bind(&job)
-    .execute(&u.w.pool)
-    .await
-    .unwrap();
+    refuse_answers(&u).await;
     ack(&mut client, &id).await;
-    until_row(&u.w, &job, "received|1|false|true|||false").await;
+    until_logged(&log, "could not record answers").await;
+    // Passes keep running for longer than the lease, the write keeps failing, and the job is
+    // neither sent again nor settled.
+    tokio::time::sleep(lease + lease / 2).await;
+    let before = passes.load(Ordering::Relaxed);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while passes.load(Ordering::Relaxed) < before + 5 {
+        assert!(Instant::now() < deadline, "no passes ran");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    quiet_for(&mut client, 100).await;
+    assert_eq!(row(&u.w, &job).await, SENT);
+    // The database accepts the write again: the kept answer is written without another ack.
+    u.w.pg
+        .execute("DROP TRIGGER test_answers_refused ON jobs")
+        .await;
+    until_row(&u.w, &job, DELIVERED).await;
+    quiet_for(&mut client, 100).await;
     u.finish().await;
 }
 

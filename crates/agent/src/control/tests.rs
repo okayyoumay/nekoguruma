@@ -4061,8 +4061,8 @@ async fn outbox_c18_a_server_that_never_acks_events_gets_them_again_and_commands
     assert_eq!(env.counts(), (2, 0));
 }
 
-/// Acknowledgements that follow a failed rewrite are held back, so the owed rewrite is tried
-/// once per pause and not once per acknowledgement.
+/// Acknowledgements that follow a failed rewrite do not try it again during the pause, so the
+/// owed rewrite is tried once per pause and not once per acknowledgement.
 #[tokio::test(start_paused = true)]
 async fn an_owed_rewrite_is_tried_once_per_pause() {
     let fail = Arc::new(AtomicBool::new(false));
@@ -4094,7 +4094,7 @@ async fn an_owed_rewrite_is_tried_once_per_pause() {
     assert_eq!(
         attempts.load(Ordering::SeqCst),
         1,
-        "the others were held back"
+        "the others did not try it"
     );
     until(hello_at + secs(35)).await;
     send(&mut ws, &ack(3)).await;
@@ -4113,6 +4113,72 @@ async fn an_owed_rewrite_is_tried_once_per_pause() {
     env.restart().await;
     let (_, mut ws) = env.connected(30).await;
     quiet(&mut ws, 5).await;
+}
+
+/// An acknowledgement taken during the pause after a failed rewrite moves the window at once,
+/// also when it covers events this connection has not sent: the server only heartbeats, and
+/// every event after the acknowledged one still comes.
+#[tokio::test(start_paused = true)]
+async fn an_acknowledgement_during_the_pause_moves_the_window() {
+    let fail = Arc::new(AtomicBool::new(false));
+    let probe_flag = fail.clone();
+    let mut env = Env::with(Opts {
+        probe: Some(Box::new(move |step| {
+            if step == crate::outbox::Step::BeforeRename && probe_flag.load(Ordering::SeqCst) {
+                return Err(io::Error::other("a scripted rename failure"));
+            }
+            Ok(())
+        })),
+        ..Opts::default()
+    });
+    for _ in 0..100 {
+        env.outbox()
+            .append(Kind::Other, big_event_text)
+            .await
+            .unwrap();
+    }
+    let (_, mut ws) = env.connected(30).await;
+    for seq in 1..=64 {
+        let (_, m) = got(&mut ws).await;
+        let Got::Text(text) = m else { panic!("{m:?}") };
+        assert!(text.contains(&format!(r#""seq":{seq}"#)), "{text}");
+    }
+    fail.store(true, Ordering::SeqCst);
+    // Event 1 is over 64 KiB: the rewrite is due, fails and starts the pause.
+    send(&mut ws, &ack(1)).await;
+    let (_, m) = got(&mut ws).await;
+    let Got::Text(text) = m else { panic!("{m:?}") };
+    assert!(text.contains(r#""seq":65"#), "{text}");
+    // During the pause, an acknowledgement past what was sent: 66 to 70 are skipped.
+    send(&mut ws, &ack(70)).await;
+    let mut seqs = Vec::new();
+    let collect = async {
+        while seqs.len() < 30 {
+            send(&mut ws, r#"{"type":"heartbeat"}"#).await;
+            loop {
+                let (_, m) = got(&mut ws).await;
+                match m {
+                    Got::Text(text) if text.contains("agentEvent") => {
+                        let start = text.find(r#""seq":"#).unwrap() + 6;
+                        let digits: String = text[start..]
+                            .chars()
+                            .take_while(char::is_ascii_digit)
+                            .collect();
+                        seqs.push(digits.parse::<u64>().unwrap());
+                        if seqs.len() == 30 {
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+        }
+    };
+    // Without the fix the window stays shut and only heartbeats come.
+    tokio::time::timeout(secs(300), collect)
+        .await
+        .expect("every event after the acknowledged one comes");
+    assert_eq!(seqs, (71..=100).collect::<Vec<_>>());
 }
 
 // ---------------------------------------------------------------------------------------------

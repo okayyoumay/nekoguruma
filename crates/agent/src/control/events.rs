@@ -23,8 +23,8 @@ use crate::outbox::{Kind, Outbox, OutboxError};
 
 /// How many events may be on the wire past the highest number the server has acknowledged.
 pub(super) const SEND_WINDOW: u64 = 64;
-/// How long acknowledgements are held back after one whose rewrite of the file failed: the outbox
-/// tries the owed rewrite again at every acknowledgement and has no delay of its own.
+/// How long acknowledgements are taken in memory only after one whose rewrite of the file failed:
+/// the outbox tries the owed rewrite again at every acknowledgement and has no delay of its own.
 pub(super) const OWED_PAUSE: Duration = Duration::from_secs(10);
 
 /// The open outbox, shared by the control channel and whoever produces events. Cloning is cheap.
@@ -104,9 +104,8 @@ pub(super) struct Sender {
     outbox: SharedOutbox,
     /// The highest number written on this connection.
     sent: u64,
-    /// The highest acknowledgement held back while the pause lasts.
-    held: u64,
-    /// While set and in the future, acknowledgements only advance `held`.
+    /// While set and in the future, acknowledgements are taken in memory and the owed rewrite
+    /// is not tried.
     paused_until: Option<Instant>,
 }
 
@@ -115,7 +114,6 @@ impl Sender {
         Sender {
             outbox: outbox.clone(),
             sent: 0,
-            held: 0,
             paused_until: None,
         }
     }
@@ -132,31 +130,25 @@ impl Sender {
     }
 
     /// Applies the server's cumulative acknowledgement on a blocking task: the events leave the
-    /// pending ones, and the file is rewritten when the outbox says so. After a rewrite failed,
-    /// further acknowledgements are held back for [`OWED_PAUSE`] and applied together, so the
+    /// pending ones at once, and the file is rewritten when the outbox says so. After a rewrite
+    /// failed, the acknowledgements of the next [`OWED_PAUSE`] are taken in memory only, so the
     /// owed rewrite is tried once per pause and not once per acknowledgement.
     pub(super) async fn ack(&mut self, n: u64) -> Acked {
         let paused = self
             .paused_until
             .is_some_and(|until| Instant::now() < until);
         let inner = self.outbox.inner.clone();
-        let up_to = n.max(self.held);
         let result = tokio::task::spawn_blocking(move || {
             let mut outbox = inner.outbox.blocking_lock();
             if paused {
-                // Only the range is checked; the rewrite is not tried.
-                return (n <= outbox.highest()).then_some(None);
+                return outbox.ack_without_rewrite(n).ok().map(|()| None);
             }
-            outbox.ack(up_to).ok().map(|()| Some(outbox.rewrite_owed()))
+            outbox.ack(n).ok().map(|()| Some(outbox.rewrite_owed()))
         })
         .await;
         match result {
-            Ok(Some(None)) => {
-                self.held = up_to;
-                Acked::Taken
-            }
+            Ok(Some(None)) => Acked::Taken,
             Ok(Some(Some(owed))) => {
-                self.held = 0;
                 self.paused_until = owed.then(|| Instant::now() + OWED_PAUSE);
                 Acked::Taken
             }

@@ -84,8 +84,9 @@ backwards under one agent ID, since the server would drop the repeated number as
    `eventAck` is one. What a connection sent and the server did not acknowledge is sent again by
    the next connection, byte for byte. An acknowledgement that covers events this connection has
    not sent yet skips them. After an acknowledgement whose rewrite of the file failed, the
-   connection holds the later ones back for 10 seconds and applies them together, so the owed
-   rewrite is tried about once per pause and not once per acknowledgement.
+   connection takes the later ones at once, in memory, and tries the owed rewrite only with the
+   first one after a 10-second pause, so the rewrite is tried about once per pause and not once
+   per acknowledgement, while the window and the skip above move with every acknowledgement.
 
 ## Rejected
 

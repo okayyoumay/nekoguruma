@@ -345,6 +345,24 @@ impl Outbox {
     /// any later acknowledgement (a repeated one too) and an append that would find the file
     /// full try it again.
     pub fn ack(&mut self, n: u64) -> Result<(), OutboxError> {
+        let advanced = self.take_ack(n)?;
+        let due = self.rewrite_owed
+            || (advanced && (self.pending.is_empty() || self.acked_bytes >= REWRITE_BYTES));
+        if due && !self.poisoned {
+            self.rewrite();
+        }
+        Ok(())
+    }
+
+    /// Takes the acknowledgement as [`Outbox::ack`] does, in memory only: neither a rewrite the
+    /// acknowledgement would start nor one that is owed is tried. The caller paces the retries of
+    /// an owed rewrite with it; a later [`Outbox::ack`] tries the rewrite again.
+    pub fn ack_without_rewrite(&mut self, n: u64) -> Result<(), OutboxError> {
+        self.take_ack(n).map(|_| ())
+    }
+
+    /// Drops the events up to `n` from memory; whether the acknowledged number advanced.
+    fn take_ack(&mut self, n: u64) -> Result<bool, OutboxError> {
         if n > self.last {
             return Err(OutboxError::OutOfRange {
                 acked: n,
@@ -360,12 +378,7 @@ impl Outbox {
             }
             self.acked = n;
         }
-        let due = self.rewrite_owed
-            || (advanced && (self.pending.is_empty() || self.acked_bytes >= REWRITE_BYTES));
-        if due && !self.poisoned {
-            self.rewrite();
-        }
-        Ok(())
+        Ok(advanced)
     }
 
     /// Rewrites the file without the acknowledged prefix; a failure is logged and owed.

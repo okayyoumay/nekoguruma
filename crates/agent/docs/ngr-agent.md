@@ -475,8 +475,9 @@ connect`, above) loads the agent key and passes it in.
   say), those not yet sent by this connection are skipped, one at or below what is acknowledged
   changes nothing, and one above the highest number assigned closes with 1002 (the class
   `event-ack`) and drops nothing. After an acknowledgement whose rewrite failed, the connection
-  holds the later ones back for 10 seconds and applies the highest of them together, so the owed
-  rewrite is tried about once per pause. The server does not read events and acknowledges none,
+  takes the later ones at once, in memory, and tries the owed rewrite again only with the first
+  one after a 10-second pause, so the rewrite is tried about once per pause and the window keeps
+  moving. The server does not read events and acknowledges none,
   so every connection sends the whole outbox again.
 - **Only local facts end the task**: the `open` and `start` refusals above, and a stop. Every
   answer of the server, a 403, a 429 and Close 4002 included, is retried, and nothing is erased.

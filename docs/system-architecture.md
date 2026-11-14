@@ -268,7 +268,7 @@ Work record field definitions are embedded in neither IR nor screen definitions,
 ### 4.4 Synchronization
 
 - The server is the source of truth; local storage is treated as "cache + outgoing queue"
-- Outbox pattern. IDs are client-generated (UUIDv7), with idempotency keys attached
+- Outbox pattern. IDs of records are client-generated (UUIDv7), with idempotency keys attached. A job's ID is the exception: the server makes it (UUIDv7) when it creates the job, and the client's token for the job is the idempotency key of its creation request (5.1, ADR-477)
 - Three-way merge using per-field versions. Applies only to work records and annotations (values acquired from the vehicle are non-editable. 4.3). The user resolves only on conflict
 - `navigator.storage.persist()`, a single sync-owner tab via Web Locks, and a leave warning when unsynced
 
@@ -304,6 +304,8 @@ Monitoring frames before capture are not treated as records and are not synchron
 | Procedure execution (inspection, routines) | Operator | With grace period | Yes (to the extent preconditions are met) | Depends on procedure attributes |
 | Configuration value write | Operator | With grace period | Conditionally (5.7) | Use caution |
 | ECU reprogramming | Reprogrammer | On-site approval | Conditionally (not when seed-key / OEM authentication is required; 5.7) | Decide after checking state |
+
+**Creating a job.** `POST /api/v1/jobs` creates the job on the server (ADR-477). The local deployment creates acquisition and configuration value write jobs; the other kinds are refused as not supported until their own requirements (the plan of an identification job, the sequence of a procedure, the approvals of reprogramming) are built. The caller needs the role `worker` (the table's Operator) with no scope, the target agent must belong to the caller's tenant, be unrevoked and list the caller among its allowed operators (6.8), and the server's instruction key must be the active one. The request names the agent, the VCI, the target VIN when known, the IR documents by SHA-256 (at least one) and an ECU artifact by SHA-256 when there is one; the server writes them into the signed instruction (11.1) and stores the instruction with the row, and the delivery queue sends it (5.3). The server makes the job's ID. The request's `Idempotency-Key` header is required and is the job's identity for the client: the same operator repeating the same request gets the stored job back, with its current state, and any other use of the key is refused with no data of the job. A start deadline is set 15 minutes after the instruction is issued; a request cannot yet set it, ask for a time window, remote execution, an on-site contact or parameters, and is refused when it tries. The confirmation level is recorded at creation (notification only for acquisition, with grace period for a configuration write); the grace period is not enforced until the agent's confirmation flow exists. Creating a job does not yet take the vehicle lock (8.8) and does not yet write an audit record.
 
 Section 6.3 is authoritative for confirmation level definitions and defaults; this table is a per-job-type summary for reference. Remote execution requires both the Remote Operator role and remote permission on the agent side (6.8). ECU reprogramming on unattended devices additionally requires two-person approval.
 
@@ -1531,6 +1533,7 @@ Signature verification is needed on both server and agent, and is consolidated i
 |---|---|
 | Web framework | axum |
 | DB | PostgreSQL (sqlx). Also bundled for personal deployments, for uniformity. The server embeds the migrations of `db/migrations` and applies them at start, before it listens; a database whose migrations differ from the binary's refuses the start (ADR-458) |
+| Job creation | `POST /api/v1/jobs` behind the operator session; one transaction reads the idempotency key's row, judges permission, signs the instruction with the active key and inserts the job, so that a concurrent request for the same key replays or conflicts instead of creating a second job (5.1, ADR-477) |
 | Job queue | PostgreSQL `SELECT ... FOR UPDATE SKIP LOCKED`; one task of the server polls the `jobs` table and delivers to its own connections (5.3, 14.1, ADR-476) |
 | Object storage | S3-compatible storage abstracted behind a trait, swappable with a local file implementation |
 | Authentication | OIDC (`openidconnect`). Personal deployments use bundled simple authentication |

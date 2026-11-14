@@ -3,11 +3,11 @@
 The server (design 3.2, 12, 13). `crates/server` is a library plus the binary `ngr-server`. This
 build serves the local deployment profile (design 13) only: it listens on loopback, uses
 PostgreSQL through sqlx and serves the health probe, the redemption of registration codes, the
-agent's connection proof and control channel, and the local users' login. The rules of the listener and the
+agent's connection proof and control channel, the local users' login and the creation of jobs. The rules of the listener and the
 request guard are in ADR-456; the database, the migrations and the test database are in ADR-458;
 the job instruction key is in ADR-462; registration codes and their command are in ADR-463 and
 ADR-465; local users, their command and the operator session are in ADR-469; the object store is in
-ADR-474.
+ADR-474; job creation is in ADR-477.
 
 ## Running
 
@@ -460,6 +460,55 @@ ngr-server user disable --config <file> --username alice
   another. The password, the typed username of a failed login, the
   cookie, the token and the hashes are never logged.
 
+## Creating a job
+
+`jobs.rs`; the decisions are in ADR-477.
+
+- **`POST /api/v1/jobs`, in this order, the first step that applies answers.** The guard; the
+  method (405 with `Allow: POST`); the session layer of "Logging in" (403 for the Origin, 401,
+  503, 500), which answers before the body is read; the body (16384 bytes within 5 seconds: 413,
+  408, 400, each closing the connection); exactly one `Content-Type` of `application/json` (400);
+  exactly one `Idempotency-Key` of 1 to 128 bytes, each a visible ASCII character, compared as
+  bytes (400); the JSON (one object of the eleven `JobRequest` names, each at most once, none
+  null, of the right type, nothing after it: 400); the values (400); then one transaction.
+- **The values.** `kind` is `acquire` or `writeSettings` (the other five kinds are 400 "not
+  supported"); `agentId` a lowercase hyphenated UUID; `vciId` 1 to 1024 bytes without a control
+  character; `vin`, when present, well-formed (the agent's rule, `shared_proto::is_well_formed_vin`);
+  `irDigests` 1 to 128 entries of 64 lowercase hex digits, in any order and with repeats (stored
+  sorted and unique); `artifactDigest`, when present, 64 lowercase hex digits. `remote: true`, a
+  non-empty `parameters`, an `executionWindow`, a `startDeadline` and an `onSiteContact` are 400
+  "not supported"; `remote: false` and `parameters: {}` count as absent. A 400 means the request
+  can never be valid; a 422 only that the key is another request's.
+- **The transaction** (read committed, 5 second lock and statement timeouts). (a) The row of
+  `(tenant, key)`: when it exists, the same operator with an equal request hash is answered with
+  the stored job (202), any other request with 422 and no data of the job, whatever the
+  caller's permission (the key is judged before the permission). (b) One read of the permission:
+  the role `worker` with an empty scope, an agent row of the session's tenant that is unrevoked,
+  an allow-list row, and whether the process's key is the active `instruction_keys` row, with
+  the database's clock. A refusal is one 403 document; the reason (`not_worker`, `agent_unknown`,
+  `agent_revoked`, `not_allowed`) goes to the log through its own gate. A key that is not the
+  active one is 503 and one logged error. (c) The ID (UUIDv7 from the database's milliseconds
+  and ten random bytes) and the instruction (version 1, generation 1, the session's operator, the
+  sorted unique hashes, no plan, issued at the database's second, start deadline 900 seconds
+  later) are sealed; a signer's failure is 500 and nothing is written. (d) `INSERT ... ON
+  CONFLICT (tenant_id, idempotency_key) DO NOTHING RETURNING`; a returned row commits and is the
+  202. (e) No row means another request inserted the key first: the row is read again and
+  decided as in (a); a row that is gone again is 503. A lock wait past 5 seconds, for example on
+  an uncommitted insert of the same key, is 503.
+- **The row and the answer.** The row holds the signed bytes, the key's ID, the sorted hashes as
+  hex (`ir_digests`), the confirmation level (`notifyOnly` for `acquire`, `gracePeriod` for
+  `writeSettings`, recorded and not enforced yet) and `request_hash`: SHA-256 over a tagged,
+  length-prefixed encoding of the normalized request (kind, agent, VCI, VIN, hashes, artifact),
+  with the operator left out (the row's operator is compared). The 202 body is the `Job`
+  (`jobId`, `kind`, `state`, `progressPermille`, `confirmation.level`), built by one function
+  from the row for a creation and a replay, which shows the current state; `Cache-Control:
+  no-store`, no `Location`. The delivery queue sends the stored bytes (ADR-476).
+- **Not done here.** The vehicle lock, the audit record and the start deadline in the request
+  are not part of creation yet.
+- **Logging.** `job created` at info with the job and operator IDs; each refusal reason, a
+  key that is not the active one, a 503 and a 500 have their own gate, once a minute. The body,
+  the idempotency key, the VCI ID and the VIN are never logged.
+
 ## Routes
 
 - `GET /api/v1/health` (`api/openapi.yaml`): runs `SELECT 1` on the pool. 200
@@ -477,6 +526,8 @@ ngr-server user disable --config <file> --username alice
 - `POST /api/v1/login`, `POST /api/v1/logout` and `GET /api/v1/me` (`api/openapi.yaml`;
   `operator_session.rs`; ADR-469): the local users' login and the operator session. See "Logging
   in" above.
+- `POST /api/v1/jobs` (`api/openapi.yaml`; `jobs.rs`; ADR-477): creates an acquisition or a
+  configuration write job behind the operator session. See "Creating a job" above.
 
 ## The agent's connection proof
 
@@ -733,7 +784,16 @@ a new migration file rebuilds the crate. How migrations are written and applied 
   `jobs_pending`), a dropped take, a server that goes away and the lease, a dropped socket and a
   replacement, a rejection, answers that write nothing, a retired or missing key, a revoked
   agent, a past deadline, the stop, a failing pass, and `Server::start` turning the queue on. The
-  agent binary's refusal of a forged stored command is in `agent_connect.rs`.
+  agent binary's refusal of a forged stored command, and its acceptance of a job created through
+  the route, are in `agent_connect.rs`.
+  `jobs.rs` (unit tests in `src/jobs.rs` for the shape rules, the request hash, the job ID, the
+  largest request and the pure decisions) covers `POST /api/v1/jobs` over PostgreSQL: the layer
+  and the body bounds, creation and its row, the stored instruction verifying under the key, the
+  idempotency key (replay, conflict, a key of another tenant, a replay after delivery, the key
+  judged before the permission), concurrent requests (two at once, two servers, a key held by an
+  uncommitted insert that then commits or rolls back, a lock wait of 5 seconds), each refusal of
+  permission, a key that is not active, a failing signer, a locked table, and delivery to a fake
+  agent. The migration is checked in `migrations.rs`.
   `control.rs` (unit tests in `src/control.rs` and `src/hub.rs`) drives the control channel over
   TCP with `tokio-tungstenite` as the client. Refusals: every way of having no valid token is
   the same 401 (no header, another scheme, a bare scheme, two headers, 43 characters, an unknown

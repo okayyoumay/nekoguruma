@@ -27,15 +27,15 @@ use crate::serving::Running;
 use crate::session::Up;
 use crate::support::TestPostgres;
 
-const PERIOD: Duration = Duration::from_millis(50);
+pub(crate) const PERIOD: Duration = Duration::from_millis(50);
 /// A lease no test waits for.
-const LONG: Duration = Duration::from_secs(600);
+pub(crate) const LONG: Duration = Duration::from_secs(600);
 const FRESH: &str = "received|0|false|false|||false";
 const SENT: &str = "received|1|true|false|||false";
-const DELIVERED: &str = "received|1|true|true|||false";
+pub(crate) const DELIVERED: &str = "received|1|true|true|||false";
 const RETIRED: &str = "failed|0|false|false|instructionKeyRetired|the instruction was signed by a key that is no longer active|true";
 
-fn settings(lease: Duration) -> Settings {
+pub(crate) fn settings(lease: Duration) -> Settings {
     Settings {
         period: PERIOD,
         lease,
@@ -82,7 +82,7 @@ async fn add_job(w: &World, agent: &str, order: i64, bytes: &[u8]) -> String {
 }
 
 /// The delivery columns and the end of the job, as one line.
-async fn row(w: &World, job: &str) -> String {
+pub(crate) async fn row(w: &World, job: &str) -> String {
     sqlx::query_scalar(
         "SELECT concat_ws('|', state, delivery_attempts, \
              (delivery_sent_at IS NOT NULL)::text, (delivered_at IS NOT NULL)::text, \
@@ -95,7 +95,7 @@ async fn row(w: &World, job: &str) -> String {
     .unwrap()
 }
 
-async fn until_row(w: &World, job: &str, expected: &str) {
+pub(crate) async fn until_row(w: &World, job: &str, expected: &str) {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let now = row(w, job).await;
@@ -111,7 +111,7 @@ async fn until_row(w: &World, job: &str, expected: &str) {
 }
 
 /// The next job command: its command ID and the stored bytes it carries.
-async fn command(client: &mut Client) -> (String, Vec<u8>) {
+pub(crate) async fn command(client: &mut Client) -> (String, Vec<u8>) {
     match ServerMessage::decode(&text(client).await).unwrap() {
         ServerMessage::JobCommand {
             command_id,
@@ -125,7 +125,7 @@ async fn answer(client: &mut Client, body: String) {
     client.send(Message::Text(body.into())).await.unwrap();
 }
 
-async fn ack(client: &mut Client, command_id: &str) {
+pub(crate) async fn ack(client: &mut Client, command_id: &str) {
     answer(
         client,
         format!(r#"{{"type":"commandAck","commandId":"{command_id}"}}"#),

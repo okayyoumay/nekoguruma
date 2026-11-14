@@ -205,7 +205,7 @@ impl World {
         World::with_key(instruction_key()).await
     }
 
-    async fn with_key(key: Arc<InstructionKey>) -> World {
+    pub(crate) async fn with_key(key: Arc<InstructionKey>) -> World {
         let pg = TestPostgres::start();
         let pool = pg.pool();
         db::migrate_with(&pool, &db::MIGRATOR, LIMIT).await.unwrap();
@@ -1059,9 +1059,9 @@ async fn a_statement_failure_rolls_everything_back_and_the_same_code_redeems_aft
 }
 
 /// A signer that fails while `fail` is set.
-struct Flaky {
-    key: SigningKey,
-    fail: Arc<AtomicBool>,
+pub(crate) struct Flaky {
+    pub(crate) key: SigningKey,
+    pub(crate) fail: Arc<AtomicBool>,
 }
 
 impl Signer for Flaky {

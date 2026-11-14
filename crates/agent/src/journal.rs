@@ -91,10 +91,7 @@ impl Vin {
 
     /// Whether `text` is a well-formed VIN (see [`Vin::is_well_formed`]).
     pub fn is_well_formed_text(text: &str) -> bool {
-        text.len() == 17
-            && text.bytes().all(|b| {
-                b.is_ascii_digit() || (b.is_ascii_uppercase() && !matches!(b, b'I' | b'O' | b'Q'))
-            })
+        shared_proto::is_well_formed_vin(text)
     }
 }
 

@@ -37,7 +37,7 @@ async fn ask_challenge(s: &Running) -> Reply {
     exchange(s.addr, &post(&s.host(), CHALLENGE, None, "")).await
 }
 
-async fn send_session(s: &Running, body: &str) -> Reply {
+pub(crate) async fn send_session(s: &Running, body: &str) -> Reply {
     exchange(
         s.addr,
         &post(&s.host(), SESSION, Some("application/json"), body),
@@ -46,14 +46,19 @@ async fn send_session(s: &Running, body: &str) -> Reply {
 }
 
 /// A challenge from the route, as the bytes it stands for.
-async fn get_challenge(s: &Running) -> [u8; 32] {
+pub(crate) async fn get_challenge(s: &Running) -> [u8; 32] {
     let r = ask_challenge(s).await;
     assert_eq!(r.status, 200, "{}", r.head);
     let text = json(&r)["challenge"].as_str().unwrap().to_owned();
     STANDARD.decode(text).unwrap().try_into().unwrap()
 }
 
-fn session_body(id: &str, challenge: &[u8; 32], nonce: &[u8; 32], proof: &[u8]) -> String {
+pub(crate) fn session_body(
+    id: &str,
+    challenge: &[u8; 32],
+    nonce: &[u8; 32],
+    proof: &[u8],
+) -> String {
     serde_json::json!({
         "agentId": id,
         "challenge": STANDARD.encode(challenge),
@@ -63,7 +68,7 @@ fn session_body(id: &str, challenge: &[u8; 32], nonce: &[u8; 32], proof: &[u8]) 
     .to_string()
 }
 
-fn audience_of(port: u16) -> Audience {
+pub(crate) fn audience_of(port: u16) -> Audience {
     Audience::parse_canonical(&pinned_origin(port)).unwrap()
 }
 
@@ -72,7 +77,7 @@ fn other_port(port: u16) -> u16 {
     if port < u16::MAX { port + 1 } else { port - 1 }
 }
 
-fn proof(
+pub(crate) fn proof(
     key: &SigningKey,
     audience: &Audience,
     id: &str,

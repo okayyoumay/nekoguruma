@@ -466,6 +466,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-474](ADR-474-the-local-object-store-appends-by-offset-shows-only-finished-objects-and-issues-its-keys.md) | The Local Object Store Appends by Offset, Shows Only Finished Objects and Issues Its Keys | Accepted | design 13, `crates/server`, `db/README.md` |
 | [ADR-475](ADR-475-a-runs-end-is-mapped-to-the-jobs-state-by-its-error-and-its-journals-standing.md) | A Run's End Is Mapped to the Job's Reported State by Its Error and Its Journal's Standing | Accepted | design 5.6, `api/asyncapi.yaml`, `crates/agent`, `crates/shared-proto`; annotates ADR-280, ADR-288 |
 | [ADR-476](ADR-476-the-delivery-queue-takes-a-job-once-and-delivers-it-at-least-once-from-the-stored-instruction.md) | The Delivery Queue Takes a Job Once and Delivers It at Least Once, From the Stored Instruction | Accepted | design 5.3, 12, 14.1, `db/migrations`, `db/README.md`, `api/asyncapi.yaml`, `crates/server`, `crates/shared-proto`; details ADR-466 items 10 and 13, ADR-468 item 12 and ADR-472 item 4 |
+| [ADR-477](ADR-477-a-job-is-created-once-per-idempotency-key-with-the-key-judged-before-permission-and-the-server-making-the-id.md) | A Job Is Created Once per Idempotency Key, With the Key Judged Before Permission and the Server Making the ID | Accepted | design 4.4, 5.1, 12, `db/migrations`, `db/README.md`, `api/openapi.yaml`, `crates/server`, `crates/shared-proto`, `crates/agent`; details ADR-461 and ADR-476 |
 
 ## Status Legend
 
@@ -1060,3 +1061,4 @@ the predecessor repository these ADRs came from.
 - ADR-472
 - ADR-473
 - ADR-476
+- ADR-477

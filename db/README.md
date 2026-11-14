@@ -14,6 +14,8 @@ ADR-465).
 local users (design 13.3, ADR-469).
 `migrations/0007_job_delivery.sql` adds the three delivery columns of `jobs` (design 5.3, 14.1,
 ADR-476).
+`migrations/0008_job_creation.sql` adds `jobs.request_hash`, replaces `jobs.ir_digest` with
+`ir_digests`, lets `jobs.kind` be `identify` and comments `jobs.id` (design 4.4, 5.1, ADR-477).
 
 ## How migrations are applied
 
@@ -74,6 +76,18 @@ local user's password (ADR-469). Like the registration codes it is an exception 
 rule: the operator row it references already carries the tenant, and every read goes through the
 operator. A login session remembers the SHA-256 of the stored string, so a new password ends the
 sessions of the old one; `updated_at` is for the administrator and is compared with nothing.
+
+**A job's ID is the server's, and its idempotency key is the client's**
+The job's ID (`jobs.id`, UUIDv7) is made by the server when it creates the job; the first schema's
+comment called it client-generated, and the column's comment now says the server makes it (design
+4.4). The client's token for a job is `idempotency_key`, unique per tenant and kept for the row's
+life. `request_hash` is the SHA-256 of the normalized request that created the job (32 bytes, a
+CHECK; null for a row inserted by other means, which no request replays): a request that finds its
+key taken replays the stored job only for the same operator with an equal hash (ADR-477).
+`ir_digests` holds the job's IR documents as lowercase hex SHA-256, ascending and without
+duplicates, the list the signed instruction's document hashes were made from; it replaces the
+single `ir_digest`, which nothing wrote or read. `jobs_kind_check` also allows `identify`, a kind
+the protocol has (design 16.3).
 
 **Do not store raw data bodies in the DB**
 `dataset_chunks` holds only object storage keys and hashes.

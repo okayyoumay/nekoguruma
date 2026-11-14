@@ -550,9 +550,20 @@ async fn connected(
                             () = state.stop.requested() => return End::stop(),
                             acked = sender.ack(seq) => acked,
                         };
-                        if acked == Acked::OutOfRange {
-                            let lived_now = lived(hello_at, last_frame_at);
-                            return End::close(CLOSE_CODE_PROTOCOL, "event-ack", lived_now);
+                        match acked {
+                            Acked::Taken => {}
+                            Acked::OutOfRange => {
+                                let lived_now = lived(hello_at, last_frame_at);
+                                return End::close(CLOSE_CODE_PROTOCOL, "event-ack", lived_now);
+                            }
+                            Acked::Poisoned => {
+                                let lived_now = lived(hello_at, last_frame_at);
+                                return End::close(
+                                    CLOSE_CODE_INTERNAL,
+                                    "outbox-poisoned",
+                                    lived_now,
+                                );
+                            }
                         }
                     }
                     Ok(

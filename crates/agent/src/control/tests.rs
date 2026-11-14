@@ -3945,6 +3945,41 @@ async fn outbox_reopen_a_write_failure_closes_with_1011_and_the_next_connection_
     assert_eq!(env.counts(), (1, 0));
 }
 
+/// An acknowledgement whose rewrite poisons the outbox (the sync after the rename fails) closes the
+/// connection with 1011, and the next connection reopens it: appends work again.
+#[tokio::test(start_paused = true)]
+async fn outbox_reopen_an_acknowledgement_that_poisons_closes_with_1011() {
+    let fail = Arc::new(AtomicBool::new(false));
+    let probe_flag = fail.clone();
+    let mut env = Env::with(Opts {
+        probe: Some(Box::new(move |step| {
+            if step == crate::outbox::Step::AfterRename && probe_flag.load(Ordering::SeqCst) {
+                return Err(io::Error::other("a scripted sync failure"));
+            }
+            Ok(())
+        })),
+        ..Opts::default()
+    });
+    env.outbox()
+        .append(Kind::Other, big_event_text)
+        .await
+        .unwrap();
+    let (_, mut ws) = env.connected(60).await;
+    assert_eq!(events(&mut ws, 1).await, [1]);
+    fail.store(true, Ordering::SeqCst);
+    // Nothing is pending after it: the rewrite is due, renames and fails its sync.
+    send(&mut ws, &ack(1)).await;
+    close_of(&mut ws, 1011, true).await;
+    assert!(env.outbox().is_poisoned_for_test().await);
+    fail.store(false, Ordering::SeqCst);
+    let (_, mut ws) = env.connected(60).await;
+    assert!(!env.outbox().is_poisoned_for_test().await, "reopened");
+    send(&mut ws, &verified(&env, "a")).await;
+    let (_, answered) = answer(&mut ws).await;
+    assert_eq!(answered["type"], "commandAck");
+    assert_eq!(events(&mut ws, 1).await, [2]);
+}
+
 /// A reopen that fails with an I/O error keeps the session reconnecting: a command that finds the
 /// outbox still poisoned closes the connection with 1011, and once the fault clears the next
 /// connection reopens it and the command is acknowledged.

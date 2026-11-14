@@ -222,22 +222,39 @@ impl Outbox {
     /// releases its file handle and its writer lock, then repeats the open, so a torn tail is
     /// cut off, the counter continues from the file and the pending events are read back. This
     /// is the way out of [`OutboxError::Poisoned`]. On failure the outbox is poisoned (it
-    /// answers [`OutboxError::Poisoned`]), holds neither the file nor the lock, and may be
-    /// reopened again. Blocking.
+    /// answers [`OutboxError::Poisoned`]), holds neither the file nor the lock, keeps the events
+    /// it had in memory, so a connection still sends them, and may be reopened again. Blocking.
     pub fn reopen(&mut self) -> Result<(), OutboxError> {
         self.poisoned = true;
         self.file = None;
         self.lock = None;
+        let kept = (
+            self.acked,
+            self.last,
+            std::mem::take(&mut self.pending),
+            self.file_len,
+            self.acked_bytes,
+            self.rewrite_owed,
+        );
         self.acked = 0;
         self.last = 0;
-        self.pending.clear();
         self.file_len = 0;
         self.acked_bytes = 0;
         self.rewrite_owed = false;
-        self.open_state().inspect_err(|_| {
+        if let Err(error) = self.open_state() {
             self.file = None;
             self.lock = None;
-        })?;
+            self.poisoned = true;
+            (
+                self.acked,
+                self.last,
+                self.pending,
+                self.file_len,
+                self.acked_bytes,
+                self.rewrite_owed,
+            ) = kept;
+            return Err(error);
+        }
         self.poisoned = false;
         Ok(())
     }
@@ -396,7 +413,12 @@ impl Outbox {
     /// acknowledgement would start nor one that is owed is tried. The caller paces the retries of
     /// an owed rewrite with it; a later [`Outbox::ack`] tries the rewrite again.
     pub fn ack_without_rewrite(&mut self, n: u64) -> Result<(), OutboxError> {
-        self.take_ack(n).map(|_| ())
+        let advanced = self.take_ack(n)?;
+        if advanced && (self.pending.is_empty() || self.acked_bytes >= REWRITE_BYTES) {
+            // Skipped, not forgotten: a later acknowledgement or a full append tries it.
+            self.rewrite_owed = true;
+        }
+        Ok(())
     }
 
     /// Drops the events up to `n` from memory; whether the acknowledged number advanced.
@@ -823,6 +845,54 @@ mod tests {
         failing.store(false, Ordering::SeqCst);
         outbox.reopen().unwrap();
         assert_eq!(outbox.append(Kind::Other, text).unwrap(), 3);
+    }
+
+    #[test]
+    fn a_failed_reopen_keeps_the_pending_events_in_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut outbox = Outbox::open_in(dir.path(), ID).unwrap();
+        put(&mut outbox, 3);
+        outbox.ack(1).unwrap();
+        outbox.poisoned = true;
+        outbox.probe = Box::new(|step| {
+            if step == Step::AfterRename {
+                Err(io::Error::other("injected"))
+            } else {
+                Ok(())
+            }
+        });
+        // The file is gone, so the reopen creates it, and the creation's sync fails.
+        fs::remove_file(file_of(dir.path())).unwrap();
+        assert!(outbox.reopen().is_err());
+        assert!(outbox.is_poisoned(), "a failed reopen leaves it poisoned");
+        assert_eq!(outbox.pending().map(|(s, _)| s).collect::<Vec<_>>(), [2, 3]);
+        assert_eq!((outbox.acked(), outbox.highest()), (1, 3));
+        assert!(matches!(
+            outbox.append(Kind::Other, text),
+            Err(OutboxError::Poisoned)
+        ));
+    }
+
+    #[test]
+    fn a_rewrite_skipped_during_a_pause_is_owed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut outbox = Outbox::open_in(dir.path(), ID).unwrap();
+        put(&mut outbox, 2);
+        let file = fs::read(file_of(dir.path())).unwrap();
+        outbox.ack_without_rewrite(2).unwrap();
+        assert_eq!(
+            fs::read(file_of(dir.path())).unwrap(),
+            file,
+            "no rewrite yet"
+        );
+        assert!(
+            outbox.rewrite_owed(),
+            "nothing pending: the rewrite is owed"
+        );
+        // A repeated acknowledgement tries it.
+        outbox.ack(2).unwrap();
+        assert!(!outbox.rewrite_owed());
+        assert_ne!(fs::read(file_of(dir.path())).unwrap(), file);
     }
 
     #[test]

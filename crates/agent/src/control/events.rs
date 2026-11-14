@@ -118,6 +118,9 @@ pub(super) enum Acked {
     Taken,
     /// Above the highest number assigned: nothing changed.
     OutOfRange,
+    /// Taken, but the rewrite it started poisoned the outbox: the connection closes so that the
+    /// next one reopens it.
+    Poisoned,
 }
 
 /// One connection's view of the outbox.
@@ -164,12 +167,17 @@ impl Sender {
             if paused {
                 return outbox.ack_without_rewrite(n).ok().map(|()| None);
             }
-            outbox.ack(n).ok().map(|()| Some(outbox.rewrite_owed()))
+            let was_poisoned = outbox.is_poisoned();
+            outbox
+                .ack(n)
+                .ok()
+                .map(|()| Some((outbox.rewrite_owed(), !was_poisoned && outbox.is_poisoned())))
         })
         .await;
         match result {
             Ok(Some(None)) => Acked::Taken,
-            Ok(Some(Some(owed))) => {
+            Ok(Some(Some((_, true)))) => Acked::Poisoned,
+            Ok(Some(Some((owed, false)))) => {
                 self.paused_until = owed.then(|| Instant::now() + OWED_PAUSE);
                 Acked::Taken
             }

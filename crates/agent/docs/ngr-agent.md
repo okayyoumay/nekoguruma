@@ -452,7 +452,8 @@ connect`, above) loads the agent key and passes it in.
   `outbox-event`) is written until the next `hello`, `debug` after that. `Full` and an event the
   codec refuses (`outbox-event`) keep the connection; `Poisoned` and a write error
   (`outbox-poisoned`, `outbox-write`) close it with 1011, because the outbox takes no event
-  until it is opened again, which the session does before its next connection (below). The append is tried once
+  until it is opened again, which the session does before its next connection (below). An
+  `eventAck` whose rewrite poisons the outbox closes the connection with 1011 for the same reason. The append is tried once
   per command. The intake has the instruction by then, and the intake is not idempotent on the job ID, so a
   redelivery appends a second `received` event. A stop that comes during the append ends the
   connection as a stop with no acknowledgement written; the append, if it began, finishes. The

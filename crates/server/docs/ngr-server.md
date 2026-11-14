@@ -487,16 +487,19 @@ ngr-server user disable --config <file> --username alice
   an allow-list row, and whether the process's key is the active `instruction_keys` row, with
   the database's clock (the second is rounded down). A refusal is one 403 document; the reason (`not_worker`, `agent_unknown`,
   `agent_revoked`, `not_allowed`) goes to the log through its own gate. A key that is not the
-  active one is 503 and one logged error. Before the insert the active key's row and the agent's unrevoked row are locked `FOR SHARE`, so
-  a retirement or a revocation waits for the insert; a row gone at that point is the 503 for a
-  key that is not active, or the 403 `agent_revoked`. (c) The ID (UUIDv7 from the database's milliseconds
+  active one is 503 and one logged error. (c) The ID (UUIDv7 from the database's milliseconds
   and ten random bytes) and the instruction (version 1, generation 1, the session's operator, the
   sorted unique hashes, no plan, issued at the database's second, start deadline 900 seconds
   later) are sealed; a signer's failure is 500 and nothing is written. (d) `INSERT ... ON
-  CONFLICT (tenant_id, idempotency_key) DO NOTHING RETURNING`; a returned row commits and is the
-  202. (e) No row means another request inserted the key first: the row is read again and
-  decided as in (a); a row that is gone again is 503. A lock wait past 5 seconds, for example on
-  an uncommitted insert of the same key, is 503.
+  CONFLICT (tenant_id, idempotency_key) DO NOTHING RETURNING`. On a returned row, and only
+  then, the agent's unrevoked row and then the active key's row are locked `FOR SHARE` before
+  the commit, so a revocation or a retirement waits for it or is seen; a row gone is a rollback
+  and the 403 `agent_revoked` or the 503 for a key that is not active. The commit is the 202.
+  The locks come after the insert so that an insert waiting behind another insert of the key
+  holds neither row and does not block the agent's connect stamp. (e) No row means another request inserted the key first: the row is read again and
+  decided as in (a); a row that is gone again is 503. The conflict path takes no lock. Each lock wait is bounded by the 5 second `lock_timeout`
+  (per wait, not per request); one past it, for example on an uncommitted insert of the same
+  key, is 503.
 - **The row and the answer.** The row holds the signed bytes, the key's ID, the sorted hashes as
   hex (`ir_digests`), the confirmation level (`notifyOnly` for `acquire`, `gracePeriod` for
   `writeSettings`, recorded and not enforced) and `request_hash`: SHA-256 over a tagged,

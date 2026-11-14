@@ -690,29 +690,6 @@ impl Inner {
             .await
             .map_err(|e| JobError::Internal(e.to_string()))?;
 
-        // Hold the active key's row and the agent's row shared until the commit: a retirement or a
-        // revocation then waits for this insert, or has committed before it, and is seen here.
-        let key_locked: Option<(i32,)> = sqlx::query_as(
-            "SELECT 1 FROM instruction_keys WHERE key_id = $1 AND retired_at IS NULL FOR SHARE",
-        )
-        .bind(&key_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if key_locked.is_none() {
-            return Ok(Outcome::KeyNotActive);
-        }
-        let agent_locked: Option<(i32,)> = sqlx::query_as(
-            "SELECT 1 FROM agents WHERE id = $1::uuid AND tenant_id = $2::uuid \
-               AND revoked_at IS NULL FOR SHARE",
-        )
-        .bind(&spec.agent_id)
-        .bind(&operator.tenant_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if agent_locked.is_none() {
-            return Ok(Outcome::Denied(Denial::AgentRevoked));
-        }
-
         let digests: Vec<String> = spec.hashes.iter().map(|h| hex(h)).collect();
         let inserted: Option<StoredRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "INSERT INTO jobs (tenant_id, id, kind, agent_id, operator_id, vci_id, vin, \
@@ -740,6 +717,31 @@ impl Inner {
         .fetch_optional(&mut *tx)
         .await?;
         if let Some(row) = inserted {
+            // Hold the agent's row and the active key's row shared until the commit, taken after
+            // the insert so that an insert waiting behind another insert of the same key holds
+            // neither: a revocation or a retirement then waits for this commit, or has committed
+            // before these reads, and is seen here. The agent is locked first, then the key.
+            let agent_locked: Option<(i32,)> = sqlx::query_as(
+                "SELECT 1 FROM agents WHERE id = $1::uuid AND tenant_id = $2::uuid \
+                   AND revoked_at IS NULL FOR SHARE",
+            )
+            .bind(&spec.agent_id)
+            .bind(&operator.tenant_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if agent_locked.is_none() {
+                return Ok(Outcome::Denied(Denial::AgentRevoked));
+            }
+            let key_locked: Option<(i32,)> = sqlx::query_as(
+                "SELECT 1 FROM instruction_keys WHERE key_id = $1 AND retired_at IS NULL \
+                 FOR SHARE",
+            )
+            .bind(&key_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if key_locked.is_none() {
+                return Ok(Outcome::KeyNotActive);
+            }
             tx.commit().await?;
             return Ok(Outcome::Created(row.into()));
         }

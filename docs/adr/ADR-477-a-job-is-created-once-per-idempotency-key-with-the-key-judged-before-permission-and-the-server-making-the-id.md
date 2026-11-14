@@ -47,12 +47,16 @@ concurrent insert of one key ends without a second job or a broken transaction.
    request has it, so earlier hashes stay valid.
 7. **One transaction at read committed, in a fixed order.** Read the key's row; if there is none,
    read the permission and the active key in one statement; build and sign the instruction with the
-   database's second (rounded down) as its issue time; lock the active key's row and the agent's
-   unrevoked row `FOR SHARE`, so a retirement or a revocation waits for the insert (a row gone at
-   that point is the key-not-active 503 or the revoked 403); `INSERT ... ON CONFLICT (tenant_id, idempotency_key) DO
-   NOTHING RETURNING`. A returned row commits and answers 202. No row means a concurrent insert won:
+   database's second (rounded down) as its issue time; `INSERT ... ON CONFLICT (tenant_id,
+   idempotency_key) DO NOTHING RETURNING`. A returned row is the path that inserted: only there,
+   before the commit, lock the agent's unrevoked row `FOR SHARE` and then the active key's row
+   `FOR SHARE`, so a revocation or a retirement waits for this commit or is seen here (a row gone
+   is a rollback and the revoked 403 or the key-not-active 503); then commit and answer 202. The
+   locks come after the insert so that an insert waiting behind an uncommitted insert of the same
+   key holds neither row, and the agent's connect stamp is not blocked by it. No row means a
+   concurrent insert won, and no lock is taken:
    the row is read again, with a new statement's snapshot, and decided as in item 4; a row that is
-   gone again is 503. A lock wait is bounded by the 5 second `lock_timeout` (503). One function
+   gone again is 503. Each lock wait is bounded by the 5 second `lock_timeout` (503), per wait and not per request. One function
    builds the `Job` answer from a row for a creation and a replay, with `Cache-Control: no-store`
    and no `Location` (the route has no `GET /v1/jobs/{jobId}` to point to).
 8. **The schema changes in migration 0008:** `request_hash`; `ir_digests text[] NOT NULL DEFAULT '{}'`

@@ -339,24 +339,27 @@ async fn hold_key(
     (tx, id)
 }
 
-/// Waits until a statement that inserts a job waits for a lock, as the database reports it.
-async fn wait_for_insert_lock(lab: &Lab) {
+/// Waits until a statement whose text starts with `prefix` waits for a lock, as the database
+/// reports it.
+async fn wait_for_lock(lab: &Lab, prefix: &str) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while lab
         .w
-        .sql(
+        .sql(&format!(
             "SELECT count(*) FROM pg_stat_activity \
-             WHERE wait_event_type = 'Lock' AND query LIKE 'INSERT INTO jobs%'",
-        )
+             WHERE wait_event_type = 'Lock' AND query LIKE '{prefix}%'"
+        ))
         .await
         == "0"
     {
-        assert!(
-            Instant::now() < deadline,
-            "no insert waits for the key's lock"
-        );
+        assert!(Instant::now() < deadline, "no `{prefix}` waits for a lock");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+/// Waits until a statement that inserts a job waits for a lock, as the database reports it.
+async fn wait_for_insert_lock(lab: &Lab) {
+    wait_for_lock(lab, "INSERT INTO jobs").await;
 }
 
 fn spawn_post(
@@ -946,6 +949,51 @@ async fn the_replay_after_a_lost_insert_works_whatever_the_database_default_isol
     assert_eq!(r.status, 202, "{} {}", r.head, r.body);
     assert_eq!(job_id(&r), held);
     lab.assert_jobs(1, "replay").await;
+    lab.finish().await;
+}
+
+#[tokio::test]
+async fn a_creation_waiting_on_a_held_key_does_not_block_the_agent_stamp() {
+    // The agent's row is locked only after the insert, so the wait on the key holds nothing.
+    let lab = Lab::new().await;
+    let cookie = lab.login("alice").await;
+    let body = lab.body(json!({}));
+    let pool = lab.w.pg.pool();
+    let (tx, _held) = hold_key(&pool, &lab.agent_id, "k", None).await;
+    let waiting = spawn_post(lab.addr(), &cookie, "k", &body);
+    wait_for_insert_lock(&lab).await;
+    let stamp = format!(
+        "UPDATE agents SET last_seen_at = now() WHERE id = '{}'::uuid",
+        lab.agent_id
+    );
+    tokio::time::timeout(Duration::from_secs(2), lab.exec(&stamp))
+        .await
+        .expect("the stamp waits behind the creation");
+    assert!(!waiting.is_finished(), "the creation ended early");
+    tx.rollback().await.unwrap();
+    assert_eq!(waiting.await.unwrap().status, 202);
+    lab.finish().await;
+}
+
+#[tokio::test]
+async fn a_revocation_held_uncommitted_is_seen_by_the_agent_lock_and_the_job_is_refused() {
+    let lab = Lab::new().await;
+    let cookie = lab.login("alice").await;
+    let body = lab.body(json!({}));
+    let pool = lab.w.pg.pool();
+    let mut revoke = pool.begin().await.unwrap();
+    sqlx::query("UPDATE agents SET revoked_at = now() WHERE id = $1::uuid")
+        .bind(&lab.agent_id)
+        .execute(&mut *revoke)
+        .await
+        .unwrap();
+    // The permission read does not see the uncommitted revocation; the lock waits for it.
+    let waiting = spawn_post(lab.addr(), &cookie, "k", &body);
+    wait_for_lock(&lab, "SELECT 1 FROM agents").await;
+    revoke.commit().await.unwrap();
+    let r = waiting.await.unwrap();
+    assert_problem(&r, 403, "revoked while creating");
+    lab.assert_jobs(0, "revoked while creating").await;
     lab.finish().await;
 }
 

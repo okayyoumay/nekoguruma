@@ -208,7 +208,21 @@ every pull request that `fuzz/Cargo.lock` is current (`cargo metadata --locked`)
 seeds depend on this workspace's crates. On pull requests that change only documentation, `work/` or `.claude/`, the
 `changes` job in `ci.yml` skips the build jobs, which then count as passed required checks;
 `repo-checks.yml` always runs. CodeQL (`codeql.yml`, ADR-283) skips the same changes. Do not run cross-target builds locally unless asked; CI covers
-them.
+them. One exception: before pushing a change to `cfg(unix)`, `cfg(windows)` or other
+platform-specific code, type-check the workspace for Windows, which needs no linker, mingw or
+wine and catches the dead code and unused `mut` that only a Windows build sees:
+
+```sh
+rustup update stable                            # once per session: CI uses the latest stable
+rustup target add x86_64-pc-windows-gnullvm     # once per session, about 264 MB
+RUSTFLAGS="-D warnings" CARGO_INCREMENTAL=0 cargo check --locked --workspace --tests \
+  --target x86_64-pc-windows-gnullvm
+```
+
+It checks every crate, `j2534-0404-service` included (its bindings for the target are committed),
+adds a few hundred MB to `target/`, and takes about a minute once warm; say in the PR's test plan
+that you ran it.
+Release builds, linking and running tests for Windows (under wine or otherwise) stay with CI.
 
 The real-hardware checks (design 13.5, ADR-275) are `#[ignore]`d `hw_` tests that CI never runs.
 Run them by hand with a hardware profile:

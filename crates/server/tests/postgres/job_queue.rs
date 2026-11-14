@@ -245,6 +245,7 @@ async fn a_take_skips_the_rows_another_take_holds_and_a_marked_row_is_not_taken_
             .bind(60.0_f64)
             .bind(Vec::<String>::new())
             .bind(limit)
+            .bind(1000_i64)
     };
     let mark =
         "UPDATE jobs SET delivery_attempts = 1, delivery_sent_at = now() WHERE id = $1::uuid";
@@ -299,6 +300,7 @@ async fn a_take_skips_the_rows_another_take_holds_and_a_marked_row_is_not_taken_
         .bind(60.0_f64)
         .bind(Vec::<String>::new())
         .bind(10_i64)
+        .bind(64_i64)
         .fetch_all(&mut *tx)
         .await
         .unwrap();
@@ -320,6 +322,7 @@ async fn a_take_that_is_dropped_before_the_send_marks_nothing_and_the_next_pass_
         .bind(60.0_f64)
         .bind(vec![free.clone()])
         .bind(1_i64)
+        .bind(64_i64)
         .fetch_all(&mut *tx)
         .await
         .unwrap();
@@ -640,6 +643,7 @@ async fn take(u: &Up, agents: &[&str], in_flight: &[&String], limit: i64) -> Vec
         .bind(60.0_f64)
         .bind(in_flight.iter().map(|j| (*j).clone()).collect::<Vec<_>>())
         .bind(limit)
+        .bind(64_i64)
         .fetch_all(&u.w.pool)
         .await
         .unwrap()
@@ -694,32 +698,90 @@ async fn add_old_jobs(w: &World, agent: &str, count: i32, bytes: &[u8]) {
     .unwrap();
 }
 
+/// `count` agents besides the one `Up` registers: (agent ID, token).
+async fn more_agents(u: &Up, count: usize) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for _ in 0..count {
+        out.push(second_agent(u).await);
+    }
+    out
+}
+
+/// Waits until the queue has finished `passes` more passes than `before`.
+async fn until_passes(counter: &AtomicU64, before: u64, passes: u64) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while counter.load(Ordering::Relaxed) < before + passes {
+        assert!(Instant::now() < deadline, "the passes did not run");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The take is by rank, so more agents than a pass once served each get their first job into the
+/// first pass, whatever one of them has queued. The period is long enough for every connection to
+/// be up before the first pass.
 #[tokio::test]
-async fn an_agent_that_reads_nothing_does_not_hold_back_another_agents_job() {
+async fn every_agents_oldest_job_is_sent_in_the_first_pass_however_many_agents_are_connected() {
     let passes = Arc::new(AtomicU64::new(0));
     let counted = Settings {
+        period: Duration::from_secs(5),
         passes: Some(passes.clone()),
         ..settings(LONG)
     };
     let u = Up::with_queue(2, Some(counted)).await;
-    let (other_id, other_token) = second_agent(&u).await;
-    // Frames of about 120 KiB, and more of them than the sockets' buffers and the pass's whole
-    // take can hold: the silent agent's older jobs stay at the head of the line for good.
-    let big = vec![7_u8; 90_000];
-    add_old_jobs(&u.w, &u.id, 700, &big).await;
-    let _silent = open(u.s.addr, &token(&u).await).await;
-    let later = add_job(&u.w, &other_id, 500, b"later").await;
-    let before = passes.load(Ordering::Relaxed);
-    let mut other = open(u.s.addr, &other_token).await;
-    // A few passes after the other agent connected must have served it, whatever the silent
-    // agent's backlog; a take that fills its limit with the silent agent's rows never does.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while passes.load(Ordering::Relaxed) < before + 6 {
-        assert!(Instant::now() < deadline, "no passes ran");
-        tokio::time::sleep(Duration::from_millis(20)).await;
+    let others = more_agents(&u, 5).await;
+    add_old_jobs(&u.w, &u.id, 40, b"backlog").await;
+    let mut singles = Vec::new();
+    for (id, _) in &others {
+        singles.push(add_job(&u.w, id, 500, b"single").await);
     }
-    assert_eq!(row(&u.w, &later).await, SENT);
-    assert_eq!(command(&mut other).await.1, b"later");
+    let mut clients = vec![open(u.s.addr, &token(&u).await).await];
+    for (_, t) in &others {
+        clients.push(open(u.s.addr, t).await);
+    }
+    until_passes(&passes, 0, 1).await;
+    for job in &singles {
+        assert_eq!(row(&u.w, job).await, SENT, "an agent's only job waits");
+    }
+    let marked: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM jobs WHERE agent_id = $1::uuid AND delivery_sent_at IS NOT NULL",
+    )
+    .bind(&u.id)
+    .fetch_one(&u.w.pool)
+    .await
+    .unwrap();
+    assert_eq!(marked, 16, "the backlog takes what one connection holds");
+    u.finish().await;
+}
+
+/// An agent that disconnects and reconnects between passes changes the set of connected agents
+/// from pass to pass; it must not make another agent's job wait.
+#[tokio::test]
+async fn an_agent_that_reconnects_before_a_pass_does_not_stop_another_agents_job() {
+    let passes = Arc::new(AtomicU64::new(0));
+    let counted = Settings {
+        period: Duration::from_secs(5),
+        passes: Some(passes.clone()),
+        ..settings(LONG)
+    };
+    let u = Up::with_queue(2, Some(counted)).await;
+    let others = more_agents(&u, 4).await;
+    add_old_jobs(&u.w, &u.id, 40, b"backlog").await;
+    let mut singles = Vec::new();
+    for (id, _) in &others {
+        singles.push(add_job(&u.w, id, 500, b"single").await);
+    }
+    let flapper_token = token(&u).await;
+    let mut clients = Vec::new();
+    for (_, t) in &others {
+        clients.push(open(u.s.addr, t).await);
+    }
+    // The flapper is connected, gone and back again before the first pass.
+    drop(open(u.s.addr, &flapper_token).await);
+    let _flapper = open(u.s.addr, &flapper_token).await;
+    until_passes(&passes, 0, 1).await;
+    for job in &singles {
+        assert_eq!(row(&u.w, job).await, SENT);
+    }
     u.finish().await;
 }
 
@@ -957,6 +1019,95 @@ async fn a_rejection_after_a_mark_that_was_not_committed_ends_a_row_with_no_mark
 #[tokio::test]
 async fn a_rejection_after_a_mark_that_was_not_committed_ends_a_row_with_an_old_mark() {
     answer_after_an_uncommitted_mark(true, true).await;
+}
+
+/// Like [`refuse_marks`], and the refused mark's time is kept in a sequence (which a rollback does
+/// not undo), so that a test can stage the row as a commit that went through though it was
+/// reported as failed would have left it.
+async fn refuse_marks_keeping_the_stamp(u: &Up) {
+    u.w.pg
+        .execute("CREATE SEQUENCE test_mark_stamp MINVALUE 0")
+        .await;
+    u.w.pg
+        .execute(
+            "CREATE OR REPLACE FUNCTION test_commit_refused() RETURNS trigger LANGUAGE plpgsql \
+             AS $$ BEGIN \
+               PERFORM setval('test_mark_stamp', \
+                 (extract(epoch FROM NEW.delivery_sent_at)::numeric * 1000000)::bigint); \
+               RAISE EXCEPTION 'test: commit refused'; END $$",
+        )
+        .await;
+    u.w.pg
+        .execute(
+            "CREATE CONSTRAINT TRIGGER test_marks_refused AFTER UPDATE ON jobs DEFERRABLE \
+             INITIALLY DEFERRED FOR EACH ROW \
+             WHEN (NEW.delivery_sent_at IS DISTINCT FROM OLD.delivery_sent_at) \
+             EXECUTE FUNCTION test_commit_refused()",
+        )
+        .await;
+}
+
+/// A delivery whose mark's commit was reported as failed, though it went through: the row carries
+/// the mark the database returned, and one more attempt, when the agent's answer comes. The row
+/// had no mark before (`old` false) or an expired one.
+async fn answer_after_a_mark_that_was_reported_failed(old: bool, rejection: bool) {
+    let u = up(LONG).await;
+    let (log, _guard) = capture();
+    let job = add_job(&u.w, &u.id, 1, b"a").await;
+    if old {
+        sqlx::query(
+            "UPDATE jobs SET delivery_attempts = 1, delivery_sent_at = now() - interval '1 hour' \
+             WHERE id = $1::uuid",
+        )
+        .bind(&job)
+        .execute(&u.w.pool)
+        .await
+        .unwrap();
+    }
+    refuse_marks_keeping_the_stamp(&u).await;
+    let mut client = open(u.s.addr, &token(&u).await).await;
+    let (id, _) = command(&mut client).await;
+    until_logged(&log, "could not mark deliveries").await;
+    u.w.pg
+        .execute("DROP TRIGGER test_marks_refused ON jobs")
+        .await;
+    // The commit "went through": the row carries the returned mark and the next attempt.
+    sqlx::query(
+        "UPDATE jobs SET delivery_attempts = delivery_attempts + 1, \
+             delivery_sent_at = 'epoch'::timestamptz \
+                 + (SELECT last_value FROM test_mark_stamp) * interval '1 microsecond' \
+         WHERE id = $1::uuid",
+    )
+    .bind(&job)
+    .execute(&u.w.pool)
+    .await
+    .unwrap();
+    let attempts = if old { 2 } else { 1 };
+    if rejection {
+        reject(&mut client, &id, "badSignature").await;
+        let expected =
+            format!("failed|{attempts}|true|false|instructionRejected|badSignature|true");
+        until_row(&u.w, &job, &expected).await;
+    } else {
+        ack(&mut client, &id).await;
+        until_row(
+            &u.w,
+            &job,
+            &format!("received|{attempts}|true|true|||false"),
+        )
+        .await;
+    }
+    u.finish().await;
+}
+
+#[tokio::test]
+async fn an_acknowledgement_settles_a_row_that_carries_the_mark_of_a_commit_reported_as_failed() {
+    answer_after_a_mark_that_was_reported_failed(false, false).await;
+}
+
+#[tokio::test]
+async fn a_rejection_ends_a_row_that_carries_the_mark_of_a_commit_reported_as_failed_and_old() {
+    answer_after_a_mark_that_was_reported_failed(true, true).await;
 }
 
 // The carry: an answer that could not be written is kept, retried, and its job stays out of the take

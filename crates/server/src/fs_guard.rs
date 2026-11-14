@@ -130,3 +130,26 @@ pub(crate) fn is_plain_file(meta: &std::fs::Metadata) -> bool {
         meta.is_file()
     }
 }
+
+/// Whether an opened file is one the server may not trust: on Unix, owned by another account
+/// or open to group or others; never on Windows, where the directory's ACL protects the files.
+/// The same rule as the instruction key's file, applied to the object store's files.
+pub(crate) fn is_foreign_file(meta: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        is_foreign_file_meta(meta.uid(), meta.permissions().mode())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        false
+    }
+}
+
+/// The decision of [`is_foreign_file`] on what the metadata says, so that a test can judge an
+/// owner it cannot create.
+#[cfg(unix)]
+pub(crate) fn is_foreign_file_meta(uid: u32, mode: u32) -> bool {
+    uid != euid() || mode & 0o077 != 0
+}

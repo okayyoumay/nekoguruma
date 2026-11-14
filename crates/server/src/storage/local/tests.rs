@@ -1173,3 +1173,170 @@ async fn the_listing_has_each_unfinished_object_with_its_length_and_time() {
     let age = now.duration_since(find(&c).modified).unwrap_or_default();
     assert!(age < Duration::from_secs(60), "{age:?}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_key_whose_sync_fails_is_skipped_by_the_listing_not_fatal_to_it() {
+    let root = tempfile::tempdir().unwrap();
+    let store = open_at(&root);
+    let a = store.begin().await.unwrap();
+    let b = store.begin().await.unwrap();
+    store
+        .inner
+        .hooks
+        .file_sync_fails
+        .store(true, Ordering::SeqCst);
+    assert!(store.list_unfinished().await.unwrap().is_empty());
+    store
+        .inner
+        .hooks
+        .file_sync_fails
+        .store(false, Ordering::SeqCst);
+    // Both keys are marked failed now, as a failed sync does; they answer Io until deleted.
+    for key in [&a, &b] {
+        assert!(matches!(
+            expect(store.status(key).await),
+            StoreError::Io { .. }
+        ));
+    }
+    store.delete(&a).await.unwrap();
+    let listed = store.list_unfinished().await.unwrap();
+    assert!(listed.is_empty(), "{listed:?}");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_area_removed_during_a_call_makes_a_missing_key_unavailable_not_not_found() {
+    for delete in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let store = open_at(&root);
+        let key = finished(&store, b"done").await;
+        let objects = store_dir(&root).join("objects");
+        // The areas pass, then the finished area vanishes before the key is looked up.
+        *store.inner.hooks.after_area_check.lock().unwrap() = Some(Box::new(move || {
+            std::fs::remove_dir_all(objects).unwrap();
+        }));
+        let result = if delete {
+            store.delete(&key).await
+        } else {
+            store.status(&key).await.map(|_| ())
+        };
+        // Delete found the staging side empty too; status found no key. Neither says NotFound.
+        assert!(
+            matches!(expect(result), StoreError::Unavailable),
+            "delete={delete}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delete_whose_directory_sync_fails_reports_io_and_the_key_is_gone() {
+    let root = tempfile::tempdir().unwrap();
+    let store = open_at(&root);
+    let key = store.begin().await.unwrap();
+    store.append(&key, 0, b"abc".to_vec()).await.unwrap();
+    // A hand-made finished copy as well, so that the key is in both areas.
+    std::fs::copy(staging_file(&root, &key), object_file(&root, &key)).unwrap();
+    // Mark the key as failed: the sync after the write fails once the length sync has passed.
+    let other = store.begin().await.unwrap();
+    store.inner.hooks.file_sync_skips.store(1, Ordering::SeqCst);
+    store
+        .inner
+        .hooks
+        .file_sync_fails
+        .store(true, Ordering::SeqCst);
+    assert!(matches!(
+        expect(store.append(&other, 0, b"x".to_vec()).await),
+        StoreError::Io { .. }
+    ));
+    store
+        .inner
+        .hooks
+        .file_sync_fails
+        .store(false, Ordering::SeqCst);
+    for target in [&key, &other] {
+        store
+            .inner
+            .hooks
+            .directory_sync_after_delete_fails
+            .store(true, Ordering::SeqCst);
+        assert!(matches!(
+            expect(store.delete(target).await),
+            StoreError::Io { .. }
+        ));
+        store
+            .inner
+            .hooks
+            .directory_sync_after_delete_fails
+            .store(false, Ordering::SeqCst);
+        // Both copies are gone, and the failed-sync mark with them: a plain NotFound.
+        assert!(!staging_file(&root, target).exists());
+        assert!(!object_file(&root, target).exists());
+        assert!(matches!(
+            expect(store.status(target).await),
+            StoreError::NotFound
+        ));
+        assert!(matches!(
+            expect(store.delete(target).await),
+            StoreError::NotFound
+        ));
+    }
+}
+
+#[cfg(unix)]
+mod foreign_files {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    fn chmod(path: &Path, mode: u32) {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn the_file_rule_is_owner_and_no_group_or_other_bits() {
+        let me = fs_guard::euid();
+        assert!(!fs_guard::is_foreign_file_meta(me, 0o100600));
+        assert!(!fs_guard::is_foreign_file_meta(me, 0o100400));
+        for mode in [0o100640, 0o100604, 0o100660, 0o100644] {
+            assert!(fs_guard::is_foreign_file_meta(me, mode), "{mode:o}");
+        }
+        // Another account's file is refused whatever its mode.
+        assert!(fs_guard::is_foreign_file_meta(me.wrapping_add(1), 0o100600));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_staging_or_object_file_open_to_others_is_refused_for_that_key_and_skipped_by_the_listing()
+     {
+        let root = tempfile::tempdir().unwrap();
+        let store = open_at(&root);
+        let good = store.begin().await.unwrap();
+        let open = store.begin().await.unwrap();
+        let done = finished(&store, b"done").await;
+        chmod(&staging_file(&root, &open), 0o644);
+        chmod(&object_file(&root, &done), 0o644);
+        for result in [
+            store.append(&open, 0, b"x".to_vec()).await.map(|_| ()),
+            store.status(&open).await.map(|_| ()),
+            store.finish(&open, sha(b""), 0).await,
+            store.get(&done).await.map(|_| ()),
+        ] {
+            assert!(
+                matches!(
+                    expect(result),
+                    StoreError::Io {
+                        kind: io::ErrorKind::PermissionDenied,
+                        ..
+                    }
+                ),
+                "an open file is refused with Io"
+            );
+        }
+        let listed = store.list_unfinished().await.unwrap();
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].key, good);
+        // The refusal is for that key only, and delete still removes the file.
+        assert_eq!(store.append(&good, 0, b"x".to_vec()).await.unwrap(), 1);
+        store.delete(&open).await.unwrap();
+        store.delete(&done).await.unwrap();
+    }
+}

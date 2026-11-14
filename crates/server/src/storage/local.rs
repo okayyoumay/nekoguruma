@@ -19,6 +19,10 @@
 //! - The state of a key is one function ([`Inner::state`]): finished if `objects/<key>` exists,
 //!   else unfinished if `staging/<key>` exists, else not found. A missing area directory is
 //!   [`StoreError::Unavailable`], never not found, and nothing is recreated while running.
+//! - A missing key is answered only after the areas are checked again, so an area removed during
+//!   the call is `Unavailable`, not not-found (`state`, `delete`). A staging or object file that
+//!   another account owns or that group or others can access is refused with an I/O error for
+//!   that key, as the instruction key's file is; the listing skips it with a warning.
 //! - Every call takes the key's own async mutex, then reads the state, then acts. The guard moves
 //!   into the one blocking task that does the work, so a dropped caller cannot free the key while
 //!   its write runs.
@@ -293,15 +297,36 @@ impl Inner {
 
     /// The state of `key` (the third rule). The areas are checked first, so that a removed area
     /// is never read as an absent key.
+    /// A missing key is answered only after the areas are checked again, since an area removed
+    /// in between would otherwise make a finished key read as absent.
     fn state(&self, key: &ObjectKey) -> Result<State, StoreError> {
         self.areas()?;
+        #[cfg(test)]
+        self.hooks.after_area_check();
         if Inner::exists(&self.object_path(key))? {
             Ok(State::Finished)
         } else if Inner::exists(&self.staging_path(key))? {
             Ok(State::Unfinished)
         } else {
+            self.areas()?;
             Ok(State::NotFound)
         }
+    }
+
+    /// Refuses an opened object file that is not a plain file ([`StoreError::NotRegularFile`]) or
+    /// that another account owns or others can read or write (an I/O error, the instruction key's
+    /// rule).
+    fn check_object_file(meta: &std::fs::Metadata) -> Result<(), StoreError> {
+        if !fs_guard::is_plain_file(meta) {
+            return Err(StoreError::NotRegularFile);
+        }
+        if fs_guard::is_foreign_file(meta) {
+            return Err(StoreError::Io {
+                op: "trust an object file",
+                kind: io::ErrorKind::PermissionDenied,
+            });
+        }
+        Ok(())
     }
 
     /// The error for a failed open: a vanished directory is unavailable, a vanished file is not
@@ -326,9 +351,7 @@ impl Inner {
             .open(self.staging_path(key))
             .map_err(|error| self.open_error("open an object", error))?;
         let meta = file.metadata().map_err(io_error("inspect an object"))?;
-        if !fs_guard::is_plain_file(&meta) {
-            return Err(StoreError::NotRegularFile);
-        }
+        Inner::check_object_file(&meta)?;
         Ok(file)
     }
 
@@ -507,34 +530,49 @@ impl Inner {
             .open(self.object_path(key))
             .map_err(|error| self.open_error("open an object", error))?;
         let meta = file.metadata().map_err(io_error("inspect an object"))?;
-        if !fs_guard::is_plain_file(&meta) {
-            return Err(StoreError::NotRegularFile);
-        }
+        Inner::check_object_file(&meta)?;
         Ok((file, meta.len()))
     }
 
+    /// Removes both copies of the key before syncing, so that a key in both areas does not come
+    /// back as its other copy. An I/O error after the unlink (the directory sync) leaves the key
+    /// gone: the retry answers [`StoreError::NotFound`], and the key's failed-sync mark is cleared
+    /// whenever no unlink failed.
     fn delete(&self, key: &ObjectKey) -> Result<(), StoreError> {
         self.areas()?;
-        let mut removed = false;
+        #[cfg(test)]
+        self.hooks.after_area_check();
+        let mut removed = Vec::new();
+        let mut failure = None;
         for area in [&self.objects, &self.staging] {
             match std::fs::remove_file(area.join(key.as_str())) {
-                Ok(()) => {
-                    removed = true;
-                    sync_directory(area).map_err(io_error("sync a directory"))?;
-                }
+                Ok(()) => removed.push(area),
                 Err(error) if is_missing(&error) => {}
-                Err(error) => return Err(io_error("remove an object")(error)),
+                Err(error) => {
+                    failure.get_or_insert(io_error("remove an object")(error));
+                }
             }
         }
-        self.failed
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(key);
-        if removed {
-            Ok(())
-        } else {
-            Err(StoreError::NotFound)
+        let mut sync_failure = None;
+        for area in &removed {
+            if let Err(error) = self.sync_directory_after_delete(area) {
+                sync_failure.get_or_insert(io_error("sync a directory")(error));
+            }
         }
+        if failure.is_none() {
+            self.failed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(key);
+        }
+        if let Some(error) = failure.or(sync_failure) {
+            return Err(error);
+        }
+        if removed.is_empty() {
+            self.areas()?;
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
     }
 
     /// The names in the staging area that are keys, in order. A name that is not a key is
@@ -586,13 +624,25 @@ impl Inner {
                 return Ok(None);
             }
             Err(StoreError::NotFound) => return Ok(None),
+            Err(error @ StoreError::Io { .. }) => {
+                tracing::warn!(%key, %error, "an object that cannot be used is not listed");
+                return Ok(None);
+            }
             Err(error) => return Err(error),
         };
-        let stored = self.stored_length(key, &file)?;
-        let modified = file
-            .metadata()
-            .and_then(|meta| meta.modified())
-            .map_err(io_error("inspect an object"))?;
+        // A failed sync poisons the key and skips it, as an already poisoned key is skipped.
+        let (stored, modified) = match self.stored_length(key, &file).and_then(|stored| {
+            file.metadata()
+                .and_then(|meta| meta.modified())
+                .map(|modified| (stored, modified))
+                .map_err(io_error("inspect an object"))
+        }) {
+            Ok(found) => found,
+            Err(error) => {
+                tracing::warn!(%key, %error, "an object that cannot be read is not listed");
+                return Ok(None);
+            }
+        };
         Ok(Some(UnfinishedObject {
             key: key.clone(),
             stored,
@@ -600,7 +650,7 @@ impl Inner {
         }))
     }
 
-    // The next four are the points a test can make fail or hold (see `hooks`).
+    // The next five are the points a test can make fail or hold (see `hooks`).
 
     fn write_chunk(&self, file: &mut File, bytes: &[u8]) -> io::Result<()> {
         #[cfg(test)]
@@ -618,6 +668,12 @@ impl Inner {
         #[cfg(test)]
         self.hooks.before_rename()?;
         std::fs::rename(from, to)
+    }
+
+    fn sync_directory_after_delete(&self, dir: &Path) -> io::Result<()> {
+        #[cfg(test)]
+        self.hooks.before_delete_sync()?;
+        sync_directory(dir)
     }
 
     fn sync_directory_after_rename(&self, dir: &Path) -> io::Result<()> {
@@ -708,6 +764,9 @@ pub(super) mod hooks {
         pub file_sync_skips: AtomicUsize,
         pub rename_fails: AtomicBool,
         pub directory_sync_after_rename_fails: AtomicBool,
+        pub directory_sync_after_delete_fails: AtomicBool,
+        /// Runs once, right after the next state or delete has checked the areas.
+        pub after_area_check: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         /// The next write waits here before it writes anything.
         pub park: Mutex<Option<Arc<Parker>>>,
     }
@@ -812,6 +871,27 @@ pub(super) mod hooks {
 
         pub(in crate::storage) fn before_rename(&self) -> io::Result<()> {
             if self.rename_fails.load(Ordering::SeqCst) {
+                return Err(injected());
+            }
+            Ok(())
+        }
+
+        pub(in crate::storage) fn after_area_check(&self) {
+            let action = self
+                .after_area_check
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            if let Some(action) = action {
+                action();
+            }
+        }
+
+        pub(in crate::storage) fn before_delete_sync(&self) -> io::Result<()> {
+            if self
+                .directory_sync_after_delete_fails
+                .load(Ordering::SeqCst)
+            {
                 return Err(injected());
             }
             Ok(())

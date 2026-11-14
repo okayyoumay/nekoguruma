@@ -199,8 +199,14 @@ A write is a resumable upload by offset:
   unfinished and writable. A finished object is immutable: no append, no second finish. A
   zero-length object can be finished. The size limit is not applied at finish.
 - `get(key)` opens a finished object and returns its length and an `AsyncRead`; an unfinished
-  object is `NotFinished`. A read that began before a `delete` stays complete on Unix.
-- `delete(key)` removes an object, finished or not (`NotFound` when there is none).
+  object is `NotFinished`. A read that began before a `delete` stays complete on Unix; on Windows std unlinks with
+  POSIX delete semantics where the file system has them (the name is freed at once), and
+  elsewhere the name may persist until the reader closes, so the key may read finished or an
+  I/O error until then (not special-cased).
+- `delete(key)` removes an object, finished or not (`NotFound` when there is none). A key in
+  both areas loses both copies before the directories are synced. An I/O error after the unlink
+  (the directory sync) leaves the object gone: the retry answers `NotFound`, which then means
+  it is gone, and the key's failed-sync mark is cleared.
 - `list_unfinished()` returns each unfinished object's key, stored length and last write time,
   for a caller that cleans up abandoned uploads. Names in the staging area that are not keys are
   ignored; an entry that is not a regular file is skipped with a warning. An object that is
@@ -217,8 +223,13 @@ rules the implementation keeps:
   restarts, because a failed sync can drop data the operating system had accepted.
 - A key is finished if `objects/<key>` exists (it wins when the key is in both areas, and
   `delete` removes both), else unfinished if `staging/<key>` exists, else not found. If the
-  directory or an area is gone, the answer is `Unavailable`, never not found, and nothing is
-  recreated until the server restarts.
+  directory or an area is gone, the answer is `Unavailable`, never not found (a missing key is
+  answered only after the areas are checked again, so an area removed during the call counts),
+  and nothing is recreated until the server restarts.
+- A staging or object file is judged on its open handle like the instruction key's file: a
+  non-regular file is `NotRegularFile`; on Unix a file owned by another account or open to
+  group or others is an I/O error for that key (`PermissionDenied`). The listing skips such a
+  key, and one whose sync fails, with a warning.
 - Calls on one key are serialised by a per-key mutex whose guard moves into the one blocking task
   that does the work, so a caller that drops its future does not free the key while its write
   runs. Different keys run concurrently. File I/O runs on the blocking pool.

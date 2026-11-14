@@ -33,7 +33,7 @@ how it relates to this contract is left to the data channel work.
 4. **The local store.** A required setting names an absolute directory, created owner-only if
    its parent exists; a directory others can write is refused by the same check the instruction
    key's directory uses. One process holds the directory, by an exclusive lock on a file in it.
-   An append past the configured size limit (4 GiB by default) is refused whole.
+   An append past the configured size limit (4 GiB by default) is refused whole. A staging or finished file that is not a plain file of the server's account, owner-only, is not trusted, as the instruction key's file is not (Unix).
 5. **A failed sync makes that object answer an error to everything but its deletion until the
    process restarts**, as the agent's journal does, since its durable length is unknown.
 
@@ -44,5 +44,7 @@ how it relates to this contract is left to the data channel work.
   the only way out is to delete and upload again.
 - Unfinished objects that nobody finishes stay until they are deleted; they can be listed.
 - The store keeps no digest after finishing; the caller records it.
+- A delete that removed the object but could not sync the directory answers an error; a retry
+  then finds nothing, which means the object is gone.
 - The S3 implementation and design 14.3's direct upload must be fitted to this trait or the trait
   extended; S3 multipart's minimum part size does not take appends at any offset directly.

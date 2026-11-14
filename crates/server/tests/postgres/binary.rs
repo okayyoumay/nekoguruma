@@ -335,8 +335,7 @@ fn a_refused_instruction_key_exits_1_and_never_listens() {
         std::fs::set_permissions(&as_file, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
     for key in [as_dir, as_file.clone()] {
-        let port = free_port();
-        let path = write_config_with_key(dir.path(), port, &pg.url(), &key);
+        let path = write_config_with_key(dir.path(), free_port(), &pg.url(), &key);
         let mut command = server(&["--config", path.to_str().unwrap()]);
         command.stderr(Stdio::piped());
         let output = wait_output(command.spawn().unwrap(), Duration::from_secs(30));
@@ -344,10 +343,8 @@ fn a_refused_instruction_key_exits_1_and_never_listens() {
         let log = String::from_utf8_lossy(&output.stderr);
         assert!(!log.contains("listening"), "{log}");
         assert!(log.contains("instruction key"), "{log}");
-        assert!(
-            get_health(port).is_none(),
-            "something listens on the port after a refused key"
-        );
+        // The process has exited, so nothing of it listens; the port is not probed, since a
+        // port that was free a moment ago may belong to another test's server.
     }
     assert_eq!(std::fs::read(&as_file).unwrap(), b"not a key");
 }
@@ -360,19 +357,12 @@ fn a_refused_storage_directory_exits_1_and_never_listens() {
     let dir = tempfile::tempdir().unwrap();
     let as_file = dir.path().join("storage-is-a-file");
     std::fs::write(&as_file, b"x").unwrap();
-    let mut refused = vec![as_file];
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let open = dir.path().join("storage-group-writable");
-        std::fs::create_dir(&open).unwrap();
-        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o770)).unwrap();
-        refused.push(open);
-    }
+    let refused = [Some(as_file), group_writable_directory(dir.path())]
+        .into_iter()
+        .flatten();
     for storage in refused {
-        let port = free_port();
         let key = dir.path().join("instruction.key");
-        let path = write_config_with(dir.path(), port, &pg.url(), &key, &storage);
+        let path = write_config_with(dir.path(), free_port(), &pg.url(), &key, &storage);
         let mut command = server(&["--config", path.to_str().unwrap()]);
         command.stderr(Stdio::piped());
         let output = wait_output(command.spawn().unwrap(), Duration::from_secs(30));
@@ -380,10 +370,33 @@ fn a_refused_storage_directory_exits_1_and_never_listens() {
         let log = String::from_utf8_lossy(&output.stderr);
         assert!(!log.contains("listening"), "{log}");
         assert!(log.contains("object store"), "{log}");
-        assert!(
-            get_health(port).is_none(),
-            "something listens on the port after a refused store"
-        );
+    }
+}
+
+/// A directory that group may write, which the store refuses (Unix only; none elsewhere).
+fn group_writable_directory(dir: &Path) -> Option<std::path::PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let open = dir.join("storage-group-writable");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o770)).unwrap();
+        Some(open)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        None
+    }
+}
+
+/// Kills and reaps the server when dropped, so that a failed assertion leaves none running.
+struct KillOnDrop(Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
 }
 
@@ -392,9 +405,9 @@ fn a_refused_storage_directory_exits_1_and_never_listens() {
 fn a_storage_directory_in_use_exits_1_and_never_listens() {
     let pg = TestPostgres::start();
     let dir = tempfile::tempdir().unwrap();
-    let (mut first, _port, _reply) = start_server(dir.path(), &pg);
-    let port = free_port();
-    let path = write_config(dir.path(), port, &pg.url());
+    let (first, _port, _reply) = start_server(dir.path(), &pg);
+    let _first = KillOnDrop(first);
+    let path = write_config(dir.path(), free_port(), &pg.url());
     let mut command = server(&["--config", path.to_str().unwrap()]);
     command.stderr(Stdio::piped());
     let output = wait_output(command.spawn().unwrap(), Duration::from_secs(30));
@@ -405,9 +418,6 @@ fn a_storage_directory_in_use_exits_1_and_never_listens() {
         log.contains("another process uses the object store"),
         "{log}"
     );
-    assert!(get_health(port).is_none());
-    let _ = first.kill();
-    let _ = first.wait();
 }
 
 fn wait_output(child: Child, limit: Duration) -> std::process::Output {

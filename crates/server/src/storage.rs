@@ -113,7 +113,11 @@ pub struct UnfinishedObject {
 pub struct ObjectBody {
     /// The object's length in bytes.
     pub length: u64,
-    /// The content. It stays complete if the object is deleted while it is read (Unix).
+    /// The content. It stays complete if the object is deleted while it is read (Unix). On
+    /// Windows, std's removal asks for POSIX delete semantics where the file system has them
+    /// (NTFS), which also frees the name at once, but on a file system without them the name
+    /// may persist until the reader's handle closes, and `status` of the key may then answer
+    /// finished or an I/O error until then. The store does not special-case that state.
     pub reader: Pin<Box<dyn AsyncRead + Send>>,
 }
 
@@ -208,7 +212,9 @@ pub trait ObjectStore: Send + Sync {
     /// Opens a finished object for reading.
     fn get<'a>(&'a self, key: &'a ObjectKey) -> StoreFuture<'a, ObjectBody>;
 
-    /// Removes an object, finished or not.
+    /// Removes an object, finished or not; a key in both areas loses both copies. An I/O error
+    /// that comes after the unlink (the directory sync) leaves the object gone, so a retry
+    /// answers `NotFound`, which then means it is gone.
     fn delete<'a>(&'a self, key: &'a ObjectKey) -> StoreFuture<'a, ()>;
 
     /// The unfinished objects.

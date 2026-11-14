@@ -424,6 +424,26 @@ impl crate::oplog::LogSafe for JobError {
                     source.log_text()
                 )
             }
+            // The I/O error's text is the operating system's, not NGR's.
+            JobError::Journal(JournalError::Io(_)) => "journal: journal I/O failed".to_owned(),
+            // The job ID is the server's text.
+            JobError::Journal(JournalError::InvalidJobId(_)) => {
+                "journal: the job ID cannot name a journal file".to_owned()
+            }
+            // The reason is the document's text.
+            JobError::Sources(crate::inputs::TableError::Document {
+                service_id,
+                field_id,
+                ..
+            }) => format!(
+                "the job's document does not declare a readable source: service {service_id} \
+                 field {field_id}: the document's declaration cannot be read"
+            ),
+            // A `Debug` rendering would carry the journal's text and the VCI's voltage.
+            JobError::OnSiteInterventionRequired(reason) => format!(
+                "the job needs on-site intervention: {}",
+                crate::job_report::on_site_text(reason)
+            ),
             other => other.to_string(),
         }
     }
@@ -435,6 +455,14 @@ impl crate::oplog::LogSafe for JobError {
             | JobError::Refused { source, .. }
             | JobError::IdentityRead { source, .. } => source.log_external(),
             JobError::VehicleLock(source) => source.log_external(),
+            JobError::Journal(JournalError::Io(error)) => Some(crate::oplog::external(error)),
+            JobError::Journal(JournalError::InvalidJobId(id)) => Some(crate::oplog::external(id)),
+            JobError::Sources(crate::inputs::TableError::Document { reason, .. }) => {
+                Some(crate::oplog::external(reason))
+            }
+            JobError::OnSiteInterventionRequired(
+                OnSiteReason::UnreadableJournal(why) | OnSiteReason::InvalidEntryState(why),
+            ) => Some(crate::oplog::external(why)),
             _ => None,
         }
     }
@@ -451,7 +479,7 @@ fn failure_error(failure: &crate::journal::ProcedureFailure) -> JobError {
 
 /// The job's error for the run's stop its journal records (ADR-288): the one the stopped run
 /// returned.
-fn stopped_error(stopped: &StoppedRun) -> JobError {
+pub(crate) fn stopped_error(stopped: &StoppedRun) -> JobError {
     match &stopped.reason {
         RunStop::StepLimit => JobError::StepLimit(stopped.at.steps),
         RunStop::Vm(source) => JobError::Vm {
@@ -505,7 +533,7 @@ fn journal_identity_abort<S: Store>(journal: &mut Journal<S>, error: JobError) -
 }
 
 /// `text` cut to at most `max` bytes, on a character boundary.
-fn truncated(mut text: String, max: usize) -> String {
+pub(crate) fn truncated(mut text: String, max: usize) -> String {
     if text.len() > max {
         let mut end = max;
         while !text.is_char_boundary(end) {

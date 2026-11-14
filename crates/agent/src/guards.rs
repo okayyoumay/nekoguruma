@@ -112,6 +112,8 @@ impl crate::oplog::LogSafe for GuardError {
                 "the lock directory may be written but not listed by other users".to_owned()
             }
             GuardError::NotAFile(_) => "a lock file is not a regular file".to_owned(),
+            // The I/O error's text is the operating system's, not NGR's.
+            GuardError::Io(error) => format!("a guard's lock file failed: {:?}", error.kind()),
             other => other.to_string(),
         }
     }
@@ -122,6 +124,7 @@ impl crate::oplog::LogSafe for GuardError {
             GuardError::UnsafeDir(path)
             | GuardError::UnlistableDir(path)
             | GuardError::NotAFile(path) => Some(crate::oplog::external(path.display())),
+            GuardError::Io(error) => Some(crate::oplog::external(error)),
             _ => None,
         }
     }

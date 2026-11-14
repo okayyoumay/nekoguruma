@@ -256,6 +256,9 @@ A generic mechanism in both D-PDU API and J2534 for hardware-specific commands (
 **Job instruction** (design 11.1, ADR-461)  
 What the server sends an agent to start one job: a postcard body (`shared_proto::JobInstruction`: job ID, ownership generation, agent ID, operator ID, job kind, VCI, VIN, the hashes of the documents, artifact and plan, issue time, start deadline) signed as exact bytes with the **instruction key** and delivered in an envelope (format byte, key fingerprint, signature, payload). The agent verifies the bytes before it parses them and answers a command that fails with a command-level rejection. See **Identification plan**.
 
+**Journal standing** (design 5.6, ADR-475)  
+What a write job's journal says about the job after a run ends, as the next resume would judge it (`restart::classify`): clean (a plain start: nothing sent that a new start could not repeat), resumable, already decided (a journaled failure, identity abort or stop), or needing on-site recovery. A run that ends in a transient error with a resumable journal reports no terminal state (an **open outcome**); one that ends in a refusal that would repeat on every resume, or with a journal that needs on-site recovery, reports needing on-site recovery.
+
 **J2534**  
 SAE J2534 ("PassThru") standard for vehicle interface adapters. The worker supports v04.04 (DEC2004), implemented as a gRPC adapter (`j2534-0404-service`). v05.00 is not supported.
 
@@ -314,6 +317,9 @@ Governs a COP's receive phase: `0` = no response required at all — the cycle c
 
 **Object store** (design 13, ADR-474)  
 The server's storage of large objects behind one trait: S3-compatible on the standard deployment, a directory on the local one. A writer begins an object, which gives it the key the store issued, appends at the offset the store holds (a resume after a cut continues there) and finishes it with its length and SHA-256; an unfinished object cannot be read, and a finished one cannot change. Callers record the key as the `storage_key` of the row that names the object.
+
+**Open outcome** (design 5.6, ADR-475)  
+The end of a run that does not end its job: the agent reports no terminal state, and the job is resumed as after a crash until it completes or its resume limits end it as needing on-site recovery. See **Journal standing**.
 
 **Operational log** (agent, workers, server; design 12.2, ADR-348)  
 The `tracing` log each NGR process keeps for the developers and maintainers of NGR, to find out why NGR itself misbehaved. JSON Lines when written to a file, rotated by size with a cap, fetched by the server on request or with a failed job's result, never streamed. Its own text holds no VIN, secrets, personal data or diagnostic payloads; text taken from vendor libraries, workers or file paths, and names that may identify a person or a device, sit in a separate `external` field that leaves the device only on the device user's explicit action; and it is never evidence: not the audit log (design 8.2.3) and not the **Communication log** (design 8.11).

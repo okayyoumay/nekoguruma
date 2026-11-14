@@ -180,6 +180,65 @@ mod tests {
         );
     }
 
+    /// The document's, the system's and the server's text that `log_text` leaves out is in
+    /// `external`.
+    #[test]
+    fn text_left_out_of_a_job_error_s_log_text_is_external() {
+        use crate::guards::GuardError;
+        use crate::journal::JournalError;
+        use crate::runner::JobError;
+        const REASON: &str = "REASON-text";
+        let declared = || crate::HostError::DeclaredLink(REASON.to_owned());
+        let errors = [
+            JobError::Link(declared()),
+            JobError::Host {
+                pc: 1,
+                source: declared(),
+            },
+            JobError::Refused {
+                pc: 1,
+                source: declared(),
+            },
+            JobError::Link(crate::HostError::StreamFailedBeforeSend(Box::new(
+                declared(),
+            ))),
+            JobError::VehicleLock(GuardError::Io(std::io::Error::other(REASON))),
+            JobError::Journal(JournalError::Io(std::io::Error::other(REASON))),
+            JobError::Journal(JournalError::InvalidJobId(REASON.to_owned())),
+            JobError::Sources(crate::inputs::TableError::Document {
+                service_id: 1,
+                field_id: 2,
+                reason: REASON.to_owned(),
+            }),
+            JobError::OnSiteInterventionRequired(crate::restart::OnSiteReason::UnreadableJournal(
+                REASON.to_owned(),
+            )),
+            JobError::OnSiteInterventionRequired(crate::restart::OnSiteReason::InvalidEntryState(
+                REASON.to_owned(),
+            )),
+        ];
+        for error in errors {
+            assert!(!error.log_text().contains(REASON), "{error:?}");
+            let external = error.log_external().map(|e| e.to_string());
+            assert!(
+                external.as_deref().is_some_and(|e| e.contains(REASON)),
+                "{error:?}: {external:?}"
+            );
+        }
+        // The host's and the guard's own errors as well.
+        assert!(!declared().log_text().contains(REASON));
+        assert_eq!(
+            declared().log_external().map(|e| e.to_string()).as_deref(),
+            Some(REASON)
+        );
+        let io = GuardError::Io(std::io::Error::other(REASON));
+        assert!(!io.log_text().contains(REASON));
+        assert!(
+            io.log_external()
+                .is_some_and(|e| e.to_string().contains(REASON))
+        );
+    }
+
     #[test]
     fn an_external_field_is_escaped() {
         assert_eq!(external("a\nb\u{7}").to_string(), r"a\nb\u{7}");

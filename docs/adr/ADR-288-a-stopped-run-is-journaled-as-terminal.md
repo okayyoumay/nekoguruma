@@ -1,7 +1,7 @@
 # ADR-288: A Run Stopped on the Step Limit or a VM Error Is Journaled as a Terminal Record
 
 **Date:** 2026-10-13
-**Status:** Accepted
+**Status:** Accepted (the state reported for a stopped run decided by ADR-475)
 **Affects:** `agent` (`src/journal.rs`, `src/journaling.rs`, `src/restart.rs`, `src/runner.rs`,
 `docs/ngr-agent.md`), `diag-ir` (`VmError`), `docs/system-architecture.md` 5.6; ADR-244, ADR-280,
 ADR-286, ADR-287

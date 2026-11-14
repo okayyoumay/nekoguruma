@@ -336,6 +336,10 @@ fn check_keys(direction: Direction, text: &str) -> Result<serde_json::Value, Con
             return Err(ControlError::Refused("unknown property"));
         }
     }
+    // An absent number is the only way to say "none"; a null would read as absent.
+    if object.get("seq").is_some_and(|seq| seq.is_null()) {
+        return Err(ControlError::Refused("seq is null"));
+    }
     Ok(value)
 }
 
@@ -706,6 +710,15 @@ mod tests {
             Err(ControlError::Refused(_))
         ));
         assert!(AgentMessage::decode(&state(r#","seq":-1"#)).is_err());
+        // A null number is refused on both kinds: the key is absent or it is a number.
+        assert!(matches!(
+            AgentMessage::decode(&progress(r#","seq":null"#)),
+            Err(ControlError::Refused(_))
+        ));
+        assert!(matches!(
+            AgentMessage::decode(&state(r#","seq":null"#)),
+            Err(ControlError::Refused(_))
+        ));
         // The old delivery property is gone.
         assert!(matches!(
             AgentMessage::decode(&state(r#","seq":1,"delivery":"guaranteed""#)),

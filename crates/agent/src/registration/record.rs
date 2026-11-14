@@ -177,10 +177,12 @@ impl PendingRecord {
         drop(file);
         fs::rename(self.dir.join(TEMP_FILE), self.dir.join(RECORD_FILE))?;
         self.armed = false;
-        Ok(match sync_after_rename(&self.dir) {
-            Ok(()) => Durability::Synced,
-            Err(_) => Durability::DirectoryNotSynced,
-        })
+        Ok(
+            match crate::journal::sync_after_rename(&self.dir, &self.dir.join(RECORD_FILE)) {
+                Ok(()) => Durability::Synced,
+                Err(_) => Durability::DirectoryNotSynced,
+            },
+        )
     }
 }
 
@@ -206,19 +208,6 @@ fn create_private(path: &Path) -> io::Result<File> {
 #[cfg(not(unix))]
 fn create_private(path: &Path) -> io::Result<File> {
     OpenOptions::new().write(true).create_new(true).open(path)
-}
-
-#[cfg(unix)]
-fn sync_after_rename(dir: &Path) -> io::Result<()> {
-    crate::journal::sync_dir(dir)
-}
-
-#[cfg(not(unix))]
-fn sync_after_rename(dir: &Path) -> io::Result<()> {
-    OpenOptions::new()
-        .write(true)
-        .open(dir.join(RECORD_FILE))?
-        .sync_all()
 }
 
 #[cfg(test)]

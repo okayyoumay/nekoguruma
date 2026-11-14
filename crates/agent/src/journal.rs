@@ -1329,6 +1329,22 @@ pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Makes a rename durable once it has happened: on Unix the directory is synced; on Windows,
+/// where a directory cannot be synced, the final file is reopened and synced, which covers its
+/// entry too. `final_path` is the new name of the renamed file.
+pub(crate) fn sync_after_rename(dir: &Path, final_path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let _ = final_path;
+        sync_dir(dir)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        OpenOptions::new().write(true).open(final_path)?.sync_all()
+    }
+}
+
 fn unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1423,6 +1439,7 @@ fn load(bytes: &[u8], key: &JobKey) -> Result<Loaded, JournalError> {
         latest_checkpoint: None,
         records: 0,
     };
+    let entry_seq = |payload: &[u8]| postcard::from_bytes::<Entry>(payload).ok().map(|e| e.seq);
     let mut offset = next;
     while offset < bytes.len() {
         let (payload, next) = match read_frame(bytes, offset) {
@@ -1430,7 +1447,7 @@ fn load(bytes: &[u8], key: &JobKey) -> Result<Loaded, JournalError> {
             // One unfinished commit leaves at most one frame, and no record after it.
             FrameRead::Torn
                 if bytes.len() - offset <= FRAME_HEADER + MAX_FRAME as usize
-                    && !record_follows(bytes, offset, state.records) =>
+                    && !record_follows(bytes, offset, state.records, entry_seq) =>
             {
                 break;
             }
@@ -1468,7 +1485,15 @@ fn load(bytes: &[u8], key: &JobKey) -> Result<Loaded, JournalError> {
 /// exactly at the end of the file, which a write cut inside a payload does not leave unless it
 /// stops exactly on a nested frame's end. Beyond that extent, a run counts however it ends, so
 /// a newest commit torn after earlier damage does not hide the records in between.
-fn record_follows(bytes: &[u8], torn: usize, records: u64) -> bool {
+///
+/// `number` reads a frame's record number from its payload, `None` when the payload is not a
+/// record; the journal and the outbox store the number differently.
+pub(crate) fn record_follows(
+    bytes: &[u8],
+    torn: usize,
+    records: u64,
+    number: impl Fn(&[u8]) -> Option<u64>,
+) -> bool {
     let claimed_end = bytes[torn..]
         .first_chunk::<4>()
         .map(|len| u32::from_le_bytes(*len))
@@ -1478,13 +1503,13 @@ fn record_follows(bytes: &[u8], torn: usize, records: u64) -> bool {
         let mut offset = start;
         let mut expected = None;
         while let FrameRead::Ok { payload, next } = read_frame(bytes, offset) {
-            let Ok(entry) = postcard::from_bytes::<Entry>(payload) else {
+            let Some(seq) = number(payload) else {
                 break;
             };
-            if entry.seq < records || expected.is_some_and(|seq| entry.seq != seq) {
+            if seq < records || expected.is_some_and(|expected| seq != expected) {
                 break;
             }
-            let Some(following) = entry.seq.checked_add(1) else {
+            let Some(following) = seq.checked_add(1) else {
                 break;
             };
             expected = Some(following);

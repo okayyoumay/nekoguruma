@@ -34,7 +34,8 @@ use shared_proto::MAX_CONTROL_MESSAGE_LEN;
 use worker_host::service::OperatingMode;
 
 use crate::journal::{
-    FRAME_HEADER, FrameRead, JournalError, WriterLock, push_frame, read_frame, sync_dir,
+    FRAME_HEADER, FrameRead, JournalError, WriterLock, push_frame, read_frame, record_follows,
+    sync_after_rename,
 };
 use crate::state::{StateDirError, private_subdir};
 
@@ -210,15 +211,21 @@ impl Outbox {
                 "the outbox ends in a frame its append did not finish; cutting it off"
             );
             file.set_len(len as u64)?;
-            file.sync_all()?;
         }
+        // A frame that landed after a failed sync may be only in the OS's cache; syncing here,
+        // before the frames count as pending, narrows the window in which a restart sends an
+        // event that a power loss would still take back. It also makes the cut durable.
+        file.sync_all()?;
         match fs::remove_file(self.tmp_path()) {
             Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error.into()),
             _ => {}
         }
         self.file = Some(file);
         self.acked = floor;
-        self.last = floor + events.len() as u64;
+        self.last = u64::try_from(events.len())
+            .ok()
+            .and_then(|count| floor.checked_add(count))
+            .ok_or(OutboxError::Corrupt("the event counter overflows"))?;
         self.pending = events.into();
         self.file_len = len as u64;
         Ok(())
@@ -240,7 +247,10 @@ impl Outbox {
         if self.poisoned {
             return Err(OutboxError::Poisoned);
         }
-        let seq = self.last + 1;
+        let seq = self
+            .last
+            .checked_add(1)
+            .ok_or(OutboxError::Corrupt("the event counter overflows"))?;
         let text = text(seq);
         if text.len() > MAX_EVENT_TEXT {
             return Err(OutboxError::TooLarge);
@@ -324,7 +334,10 @@ impl Outbox {
     /// Writes the file whole (header with the floor `acked`, then the pending events) under a
     /// temporary name, syncs it and renames it over the outbox's file; the same routine creates
     /// the file. The old handle is closed before the rename, which Windows needs. A failure
-    /// before the rename leaves the old file as it was.
+    /// before the rename leaves the old file as it was. After the rename the outbox is poisoned
+    /// when the handle cannot be reopened (the same holds if the rename itself failed and the
+    /// old file cannot be reopened) or when the sync after the rename fails (a rewrite only; the
+    /// creation of the file returns the error and the open fails).
     fn install(&mut self) -> io::Result<()> {
         let tmp = self.tmp_path();
         let bytes = encode_file(&self.agent_id, self.acked, self.pending.iter())?;
@@ -352,9 +365,7 @@ impl Outbox {
             return Err(error);
         }
         let _ = (self.probe)(Step::AfterRename);
-        if let Err(error) = sync_dir(&self.dir) {
-            tracing::warn!(kind = ?error.kind(), "the outbox directory did not sync after a rewrite");
-        }
+        let synced = sync_after_rename(&self.dir, &self.path);
         self.file_len = bytes.len() as u64;
         self.acked_bytes = 0;
         match open_rw(&self.path) {
@@ -363,6 +374,12 @@ impl Outbox {
                 self.poisoned = true;
                 return Err(error);
             }
+        }
+        if let Err(error) = synced {
+            // The new file is in place but may not survive a power loss. Creating the file fails
+            // the open; after a rewrite the outbox refuses appends until it is opened again.
+            self.poisoned = had_file;
+            return Err(error);
         }
         Ok(())
     }
@@ -433,8 +450,16 @@ fn parse(bytes: &[u8], agent_id: &str) -> Result<(u64, Vec<Event>, usize), Outbo
     if header.protection != 0 {
         return Err(corrupt("unknown protection"));
     }
+    let seq_of = |payload: &[u8]| {
+        payload
+            .first_chunk::<SEQ_LEN>()
+            .map(|seq| u64::from_le_bytes(*seq))
+    };
     let mut events = Vec::new();
-    let mut expected = header.floor + 1;
+    let mut expected = header
+        .floor
+        .checked_add(1)
+        .ok_or(corrupt("the event counter overflows"))?;
     let mut offset = next;
     while offset < bytes.len() {
         match read_frame(bytes, offset) {
@@ -451,10 +476,19 @@ fn parse(bytes: &[u8], agent_id: &str) -> Result<(u64, Vec<Event>, usize), Outbo
                     seq: expected,
                     text,
                 });
-                expected += 1;
+                expected = expected
+                    .checked_add(1)
+                    .ok_or(corrupt("the event counter overflows"))?;
                 offset = next;
             }
-            FrameRead::Torn if bytes.len() - offset <= MAX_TORN => break,
+            // One unfinished append leaves at most one frame and no event after it; a damaged
+            // length field or a zeroed block followed by whole events is damage.
+            FrameRead::Torn
+                if bytes.len() - offset <= MAX_TORN
+                    && !record_follows(bytes, offset, expected, seq_of) =>
+            {
+                break;
+            }
             FrameRead::Torn => return Err(corrupt("an event does not read back")),
             FrameRead::Bad => return Err(corrupt("an event fails its checksum")),
         }
@@ -582,6 +616,16 @@ mod tests {
                 .set_len(len - cut)
                 .unwrap();
             let mut outbox = Outbox::open_in(dir.path(), ID).unwrap();
+            let cut_len = fs::metadata(&path).unwrap().len();
+            assert_eq!(
+                cut_len,
+                len - Event {
+                    seq: 3,
+                    text: text(3)
+                }
+                .frame_len(),
+                "cut {cut}"
+            );
             assert_eq!(outbox.pending().map(|(s, _)| s).collect::<Vec<_>>(), [1, 2]);
             assert_eq!(outbox.append(Kind::Other, text).unwrap(), 3);
             drop(outbox);
@@ -879,7 +923,17 @@ mod tests {
             + FRAME_HEADER
             + 9;
         flipped[at] ^= 0xFF;
+        // A damaged length field in the middle, with whole events after it, is not a torn tail.
+        let mut damaged = good.clone();
+        let second = PREAMBLE
+            + FRAME_HEADER
+            + postcard::to_allocvec(&header(ID, 0)).unwrap().len()
+            + FRAME_HEADER
+            + SEQ_LEN
+            + text(1).len();
+        damaged[second..second + 4].copy_from_slice(&u32::MAX.to_le_bytes());
         let cases = [
+            ("damaged length", damaged),
             ("another ID", build(1, &header(OTHER, 0), &[event(1)])),
             ("version", build(2, &header(ID, 0), &[event(1)])),
             ("protection", build(1, &header(ID, 1), &[event(1)])),

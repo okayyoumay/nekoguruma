@@ -45,7 +45,9 @@ backwards under one agent ID, since the server would drop the repeated number as
    reports it later, and a `received` event is refused above 8 MiB so that the events that finish
    accepted jobs keep room. An event text over 128 KiB (a control message's limit) is refused. A
    failed write poisons the outbox until it is opened again, since a failed sync may lose data
-   the OS accepted. A file that does not read back (another agent ID in its header, an unknown
+   the OS accepted; so does a rewrite whose new file cannot be reopened, or whose sync after
+   the rename fails (on Unix the directory sync, on Windows a sync of the reopened final file).
+   When the file is being created, those two fail the open instead. A file that does not read back (another agent ID in its header, an unknown
    version or protection, a bad checksum before the last frame, numbers that are not contiguous)
    is corrupt: it is not repaired or set aside, `connect` exits with an error and the owner
    registers the agent again.
@@ -89,6 +91,8 @@ backwards under one agent ID, since the server would drop the repeated number as
 
 - An outbox that is lost or corrupt under one agent ID needs a re-registration; the counter must
   never go backwards under an ID.
+- A complete last frame with a bad checksum is cut as torn, as in the journal, so its number can
+  be reused; damage followed by a whole event is corrupt, not torn.
 - A `received` event repeats with every redelivery until the intake is idempotent on the job ID.
 - The server needs a table with retention and VIN deletion before it stores events.
 - An event that is acknowledged on a live connection can only be sent again after a

@@ -69,6 +69,9 @@ how a writing session works, and a diff cannot show whether they were followed.
   conventional upper-case files such as `README.md`.
 - **Temporary-file references**: a file outside `work/` naming a specific file inside `work/`
   (the folder itself and `work/README.md` are fine). Open items belong in `work/`.
+- **Windows type check missing**: a pull request that changes `cfg(unix)`, `cfg(windows)` or
+  other platform-specific code whose test plan does not say the local Windows type check
+  (`cargo check ... --target x86_64-pc-windows-gnullvm`, `CLAUDE.md` "Building and testing") ran.
 - **Tests weakened**: a test skipped, ignored, deleted or loosened to pass CI, or `#[serial]`
   removed from a test sharing process-global state. A real-hardware check (design 13.5, ADR-275)
   is the exception: it is a test named `hw_...`, `#[ignore]`d with a reason naming design 13.5,

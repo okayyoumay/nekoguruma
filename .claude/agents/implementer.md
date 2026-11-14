@@ -48,7 +48,13 @@ Working rules:
   `cargo-runner`.
 - Never run cross-target builds (`--target`, `cargo zigbuild`) or
   `--features bindgen` unless the brief explicitly states the user approved
-  it and lists the exact commands.
+  it and lists the exact commands. One exception, which needs no approval:
+  when the change touches `cfg(unix)`, `cfg(windows)` or other
+  platform-specific code, run CLAUDE.md's Windows type check before you
+  report (`rustup update stable` and `rustup target add
+  x86_64-pc-windows-gnullvm` once per session, then the `cargo check
+  ... --target x86_64-pc-windows-gnullvm` command given there) and report
+  its result.
 - Update documents only as the brief directs, but do report any document
   you noticed the change makes stale (CLAUDE.md's documentation-sync
   table).

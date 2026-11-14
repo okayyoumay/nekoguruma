@@ -56,7 +56,11 @@ Hard rules (these override anything else in your brief):
   frees it the same way. A run scoped with `-p` needs no check.
 - **Never start cross-target or bindgen builds** (`--target <triple>`,
   `--features bindgen`, `cargo zigbuild`) unless the brief explicitly asks
-  for that exact command. A bindgen build rewrites committed files in
+  for that exact command. The exception is CLAUDE.md's Windows type check
+  (`cargo check ... --target x86_64-pc-windows-gnullvm`, after `rustup update
+  stable` and `rustup target add x86_64-pc-windows-gnullvm` once per
+  session), which you run when the brief's change touches `cfg(unix)`,
+  `cfg(windows)` or other platform-specific code. A bindgen build rewrites committed files in
   `crates/*-sys/src/bindings/`, which conflicts with the first rule; report
   back instead.
 

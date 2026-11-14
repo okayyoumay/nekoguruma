@@ -46,7 +46,9 @@ backwards under one agent ID, since the server would drop the repeated number as
    reports it later, and a `received` event is refused above 8 MiB so that the events that finish
    accepted jobs keep room. An event text over 128 KiB (a control message's limit) is refused. A
    failed write poisons the outbox until it is opened again, since a failed sync may lose data
-   the OS accepted; so does a rewrite whose new file cannot be reopened, or whose sync after
+   the OS accepted (the agent opens a poisoned outbox again before its next connection: a
+   `received` append that finds it poisoned, or whose write fails, closes the connection with
+   1011, and a reopen that finds the file corrupt ends the session with exit 1); so does a rewrite whose new file cannot be reopened, or whose sync after
    the rename fails (on Unix the directory sync, on Windows a sync of the reopened final file).
    When the file is being created, those two fail the open instead. An open syncs the file and
    then the rename (the directory on Unix) before it accepts appends, so a rename that never

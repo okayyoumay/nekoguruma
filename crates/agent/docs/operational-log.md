@@ -109,7 +109,11 @@ throughout.
   class (`outbox-full`, `outbox-poisoned`, `outbox-write`, `outbox-event`, `event-ack`) and the
   `OutboxError`'s own text; never an event's text, a job ID or a `commandId`. A failed
   `received` append warns once per class until the next `hello` and is `debug` after that. A
-  failed rewrite of the outbox file logs the kind of the I/O error, as `Outbox` does.
+  failed rewrite of the outbox file logs the kind of the I/O error, as `Outbox` does. A poisoned
+  outbox is opened again before each connection attempt: a success is `info`; a failure other
+  than a corrupt file warns once per `hello` cycle with the class `outbox-reopen` and is `debug`
+  after that, and the reopen is tried again before the next attempt; a corrupt file is an `error`
+  line and ends the session.
 
 ## A crate not yet checked
 

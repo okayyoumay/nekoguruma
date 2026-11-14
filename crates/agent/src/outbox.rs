@@ -136,7 +136,8 @@ pub struct Outbox {
     agent_id: String,
     /// `None` only while the file is being replaced, or after a failure to reopen it.
     file: Option<File>,
-    _lock: WriterLock,
+    /// The writer lock; `None` only while the outbox is being opened or after a failed reopen.
+    lock: Option<WriterLock>,
     /// The highest number acknowledged; the header's floor after a rewrite.
     acked: u64,
     /// The highest number assigned.
@@ -172,26 +173,12 @@ impl Outbox {
         if !valid_id(agent_id) {
             return Err(OutboxError::BadAgentId);
         }
-        let lock = match WriterLock::at(&dir.join(LOCK_FILE)) {
-            Ok(lock) => lock,
-            Err(JournalError::InUse) => return Err(OutboxError::InUse),
-            Err(JournalError::Io(error)) => return Err(error.into()),
-            Err(other) => return Err(io::Error::other(other.to_string()).into()),
-        };
-        let path = dir.join(format!("{agent_id}{EXTENSION}"));
-        let others = other_outboxes(dir, &path);
-        if others > 0 {
-            tracing::warn!(
-                count = others,
-                "the outbox directory holds outboxes of other agent IDs; leaving them alone"
-            );
-        }
         let mut outbox = Self {
             dir: dir.to_owned(),
-            path,
+            path: dir.join(format!("{agent_id}{EXTENSION}")),
             agent_id: agent_id.to_owned(),
             file: None,
-            _lock: lock,
+            lock: None,
             acked: 0,
             last: 0,
             pending: VecDeque::new(),
@@ -201,12 +188,58 @@ impl Outbox {
             poisoned: false,
             probe,
         };
-        match fs::read(&outbox.path) {
-            Ok(bytes) => outbox.load(&bytes)?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => outbox.install()?,
+        outbox.open_state()?;
+        Ok(outbox)
+    }
+
+    /// Takes the writer lock, then loads the file (creating it when missing): the steps of an
+    /// open, which [`Outbox::reopen`] repeats. The lock and the file are taken only here, in
+    /// this order.
+    fn open_state(&mut self) -> Result<(), OutboxError> {
+        let lock = match WriterLock::at(&self.dir.join(LOCK_FILE)) {
+            Ok(lock) => lock,
+            Err(JournalError::InUse) => return Err(OutboxError::InUse),
+            Err(JournalError::Io(error)) => return Err(error.into()),
+            Err(other) => return Err(io::Error::other(other.to_string()).into()),
+        };
+        self.lock = Some(lock);
+        let others = other_outboxes(&self.dir, &self.path);
+        if others > 0 {
+            tracing::warn!(
+                count = others,
+                "the outbox directory holds outboxes of other agent IDs; leaving them alone"
+            );
+        }
+        match fs::read(&self.path) {
+            Ok(bytes) => self.load(&bytes)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => self.install()?,
             Err(error) => return Err(error.into()),
         }
-        Ok(outbox)
+        Ok(())
+    }
+
+    /// Opens the outbox again with what it was opened with (directory, agent ID, probe): it
+    /// releases its file handle and its writer lock, then repeats the open, so a torn tail is
+    /// cut off, the counter continues from the file and the pending events are read back. This
+    /// is the way out of [`OutboxError::Poisoned`]. On failure the outbox is poisoned (it
+    /// answers [`OutboxError::Poisoned`]), holds neither the file nor the lock, and may be
+    /// reopened again. Blocking.
+    pub fn reopen(&mut self) -> Result<(), OutboxError> {
+        self.poisoned = true;
+        self.file = None;
+        self.lock = None;
+        self.acked = 0;
+        self.last = 0;
+        self.pending.clear();
+        self.file_len = 0;
+        self.acked_bytes = 0;
+        self.rewrite_owed = false;
+        self.open_state().inspect_err(|_| {
+            self.file = None;
+            self.lock = None;
+        })?;
+        self.poisoned = false;
+        Ok(())
     }
 
     fn load(&mut self, bytes: &[u8]) -> Result<(), OutboxError> {
@@ -314,6 +347,11 @@ impl Outbox {
         (self.probe)(Step::AfterWrite)?;
         file.sync_all()?;
         (self.probe)(Step::AfterSync)
+    }
+
+    /// Whether the outbox refuses appends until [`Outbox::reopen`] succeeds.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
     }
 
     /// The events not yet acknowledged, in order, each with its number and its exact text.
@@ -723,6 +761,82 @@ mod tests {
             let outbox = Outbox::open_in(dir.path(), ID).unwrap();
             assert_eq!(outbox.highest(), if lands { 2 } else { 1 }, "{step:?}");
         }
+    }
+
+    #[test]
+    fn a_poisoned_outbox_reopens_and_continues_with_its_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let armed = Arc::new(AtomicBool::new(false));
+        let mut outbox =
+            Outbox::open_with(dir.path(), ID, failing_at(Step::AfterSync, &armed)).unwrap();
+        put(&mut outbox, 2);
+        armed.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            outbox.append(Kind::Other, text),
+            Err(OutboxError::Io(_))
+        ));
+        armed.store(false, Ordering::SeqCst);
+        assert!(matches!(
+            outbox.append(Kind::Other, text),
+            Err(OutboxError::Poisoned)
+        ));
+        outbox.reopen().unwrap();
+        // The frame that landed before the failed sync is pending, and the counter continues.
+        assert_eq!(outbox.highest(), 3);
+        assert_eq!(pending(&outbox).len(), 3);
+        assert_eq!(outbox.append(Kind::Other, text).unwrap(), 4);
+        assert_eq!(pending(&outbox)[0], (1, text(1)));
+    }
+
+    #[test]
+    fn a_failed_reopen_leaves_the_outbox_poisoned_and_a_later_one_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let armed = Arc::new(AtomicBool::new(false));
+        let mut outbox =
+            Outbox::open_with(dir.path(), ID, failing_at(Step::AfterWrite, &armed)).unwrap();
+        put(&mut outbox, 1);
+        armed.store(true, Ordering::SeqCst);
+        assert!(outbox.append(Kind::Other, text).is_err());
+        // The open's own durability step fails through the probe.
+        let failing = Arc::new(AtomicBool::new(true));
+        let flag = Arc::clone(&failing);
+        outbox.probe = Box::new(move |step| {
+            if step == Step::AfterRename && flag.load(Ordering::SeqCst) {
+                Err(io::Error::other("injected"))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(outbox.reopen(), Err(OutboxError::Io(_))));
+        assert!(matches!(
+            outbox.append(Kind::Other, text),
+            Err(OutboxError::Poisoned)
+        ));
+        // Another opener holds the lock while this one has released it.
+        let other = Outbox::open_in(dir.path(), ID).unwrap();
+        assert!(matches!(outbox.reopen(), Err(OutboxError::InUse)));
+        drop(other);
+        assert!(matches!(
+            outbox.append(Kind::Other, text),
+            Err(OutboxError::Poisoned)
+        ));
+        failing.store(false, Ordering::SeqCst);
+        outbox.reopen().unwrap();
+        assert_eq!(outbox.append(Kind::Other, text).unwrap(), 3);
+    }
+
+    #[test]
+    fn a_reopen_that_finds_the_file_corrupt_says_so_and_stays_poisoned() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut outbox = Outbox::open_in(dir.path(), ID).unwrap();
+        put(&mut outbox, 1);
+        outbox.poisoned = true;
+        fs::write(file_of(dir.path()), b"not an outbox").unwrap();
+        assert!(matches!(outbox.reopen(), Err(OutboxError::Corrupt(_))));
+        assert!(matches!(
+            outbox.append(Kind::Other, text),
+            Err(OutboxError::Poisoned)
+        ));
     }
 
     // S6, S7, S8

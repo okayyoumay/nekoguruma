@@ -15,7 +15,8 @@
 //!    lock that cannot be opened) ends the command at once. A key this run had to create, or one
 //!    that is not the record's, means registering again.
 //! 4. [`crate::control::Opened::start`], then a wait for the stop signal or for the task to end
-//!    (a task that ends alone is an error), then [`crate::control::Handle::stop`] (Close 1001)
+//!    (a task that ends alone is an error: exit 1 when its outbox, poisoned and opened again,
+//!    was corrupt, otherwise the same exit with a generic text), then [`crate::control::Handle::stop`] (Close 1001)
 //!    and a wait for the task to end.
 //!
 //! The command prints and logs nothing the server sent and no token; its messages are fixed
@@ -211,6 +212,9 @@ async fn run_opened(
         biased;
         () = stop.as_mut() => {}
         () = handle.stopped() => {
+            if handle.ended() == Some(control::Ended::OutboxUnusable) {
+                return Err(outbox_error(&OutboxError::Corrupt("reopen")));
+            }
             return Err(fail(
                 Exit::CannotConnect,
                 "the control channel session ended unexpectedly",

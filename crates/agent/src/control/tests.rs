@@ -3884,10 +3884,10 @@ async fn outbox_c12_the_received_event_is_a_job_state_event_of_the_job() {
     AgentMessage::decode(&text).unwrap();
 }
 
-/// C13: a `received` append that fails withholds the ack, keeps the connection, warns once per
-/// class since `hello` and counts nothing.
+/// C13: a `received` append whose write fails withholds the ack and closes the connection with
+/// 1011 (the session reopens the outbox before the next one); it warns once and counts nothing.
 #[tokio::test(start_paused = true)]
-async fn outbox_c13_a_failed_append_withholds_the_ack_and_warns_once_per_class() {
+async fn outbox_c13_a_failed_append_withholds_the_ack_and_closes_with_1011() {
     let fail = Arc::new(AtomicBool::new(false));
     let probe_flag = fail.clone();
     let mut env = Env::with(Opts {
@@ -3899,23 +3899,129 @@ async fn outbox_c13_a_failed_append_withholds_the_ack_and_warns_once_per_class()
         })),
         ..Opts::default()
     });
-    let (hello_at, mut ws) = env.connected(60).await;
+    let (_, mut ws) = env.connected(60).await;
     fail.store(true, Ordering::SeqCst);
-    for id in ["a", "b", "c"] {
-        send(&mut ws, &verified(&env, id)).await;
-    }
-    // No ack, no close: the next message is the heartbeat on its tick.
-    assert_after(hello_at, heartbeat(&mut ws).await, 60, "tick");
+    send(&mut ws, &verified(&env, "a")).await;
+    // No ack: the close is the next thing the agent writes.
+    close_of(&mut ws, 1011, true).await;
     assert_eq!(env.counts(), (0, 0));
     assert_eq!(
         env.intake.0.lock().unwrap().len(),
-        3,
+        1,
         "handed over before the append"
     );
-    // The first failure is the write's, the others find the outbox poisoned.
     assert_eq!(env.log.warns("outbox-write"), 1);
-    assert_eq!(env.log.warns("outbox-poisoned"), 1);
     assert!(!env.log.contains("commandId"));
+}
+
+/// A write failure on the `received` append ends the connection; the next one reopens the
+/// outbox, the redelivered command is recorded and acknowledged, and the event is sent.
+#[tokio::test(start_paused = true)]
+async fn outbox_reopen_a_write_failure_closes_with_1011_and_the_next_connection_reopens() {
+    let fail = Arc::new(AtomicBool::new(false));
+    let probe_flag = fail.clone();
+    let mut env = Env::with(Opts {
+        probe: Some(Box::new(move |step| {
+            if step == crate::outbox::Step::BeforeWrite && probe_flag.load(Ordering::SeqCst) {
+                return Err(io::Error::other("a scripted write failure"));
+            }
+            Ok(())
+        })),
+        ..Opts::default()
+    });
+    let (_, mut ws) = env.connected(60).await;
+    fail.store(true, Ordering::SeqCst);
+    send(&mut ws, &verified(&env, "a")).await;
+    close_of(&mut ws, 1011, true).await;
+    assert!(env.outbox().is_poisoned_for_test().await);
+    fail.store(false, Ordering::SeqCst);
+    let (_, mut ws) = env.connected(60).await;
+    assert!(!env.outbox().is_poisoned_for_test().await, "reopened");
+    send(&mut ws, &verified(&env, "a")).await;
+    let (_, answered) = answer(&mut ws).await;
+    assert_eq!(answered["type"], "commandAck");
+    let (_, seq, state) = event(&mut ws).await;
+    assert_eq!((seq, state.as_str()), (1, "received"));
+    assert_eq!(env.counts(), (1, 0));
+}
+
+/// A reopen that fails with an I/O error keeps the session reconnecting: a command that finds the
+/// outbox still poisoned closes the connection with 1011, and once the fault clears the next
+/// connection reopens it and the command is acknowledged.
+#[tokio::test(start_paused = true)]
+async fn outbox_reopen_an_io_failure_keeps_the_session_reconnecting_until_it_clears() {
+    let write_fails = Arc::new(AtomicBool::new(false));
+    let open_fails = Arc::new(AtomicBool::new(false));
+    let (write_flag, open_flag) = (write_fails.clone(), open_fails.clone());
+    let mut env = Env::with(Opts {
+        probe: Some(Box::new(move |step| {
+            let failing = match step {
+                crate::outbox::Step::BeforeWrite => write_flag.load(Ordering::SeqCst),
+                crate::outbox::Step::AfterRename => open_flag.load(Ordering::SeqCst),
+                _ => false,
+            };
+            if failing {
+                return Err(io::Error::other("a scripted failure"));
+            }
+            Ok(())
+        })),
+        ..Opts::default()
+    });
+    let (_, mut ws) = env.connected(60).await;
+    write_fails.store(true, Ordering::SeqCst);
+    open_fails.store(true, Ordering::SeqCst);
+    send(&mut ws, &verified(&env, "a")).await;
+    close_of(&mut ws, 1011, true).await;
+    // The reopen fails before this connection: the command finds the outbox poisoned.
+    let (_, mut ws) = env.connected(60).await;
+    send(&mut ws, &verified(&env, "a")).await;
+    close_of(&mut ws, 1011, true).await;
+    assert_eq!(env.counts(), (0, 0));
+    assert!(env.log.warns("outbox-reopen") >= 1);
+    assert_eq!(env.log.warns("outbox-poisoned"), 1);
+    write_fails.store(false, Ordering::SeqCst);
+    open_fails.store(false, Ordering::SeqCst);
+    let (_, mut ws) = env.connected(60).await;
+    send(&mut ws, &verified(&env, "a")).await;
+    let (_, answered) = answer(&mut ws).await;
+    assert_eq!(answered["type"], "commandAck");
+    assert_eq!(events(&mut ws, 1).await, [1]);
+    assert_eq!(env.counts(), (1, 0));
+}
+
+/// A reopen that finds the file corrupt ends the session as a local fact: no more connections,
+/// and the handle says why (`ngr-agent connect` exits 1).
+#[tokio::test(start_paused = true)]
+async fn outbox_reopen_a_corrupt_file_ends_the_session() {
+    let fail = Arc::new(AtomicBool::new(false));
+    let probe_flag = fail.clone();
+    let mut env = Env::with(Opts {
+        probe: Some(Box::new(move |step| {
+            if step == crate::outbox::Step::BeforeWrite && probe_flag.load(Ordering::SeqCst) {
+                return Err(io::Error::other("a scripted write failure"));
+            }
+            Ok(())
+        })),
+        ..Opts::default()
+    });
+    let (_, mut ws) = env.connected(60).await;
+    fail.store(true, Ordering::SeqCst);
+    send(&mut ws, &verified(&env, "a")).await;
+    close_of(&mut ws, 1011, true).await;
+    // The agent waits out its delay before it reopens, so this lands first.
+    let path = env
+        .fx
+        .dir
+        .path()
+        .join("outbox")
+        .join(format!("{AGENT_ID}.outbox"));
+    std::fs::write(path, b"not an outbox").unwrap();
+    tokio::time::timeout(DEADLINE, env.handle.stopped())
+        .await
+        .expect("the session ended by itself");
+    assert_eq!(env.handle.ended(), Some(Ended::OutboxUnusable));
+    assert_eq!(env.status().phase, Phase::Stopped);
+    assert!(env.conns.try_recv().is_err(), "no connection was made");
 }
 
 #[tokio::test(start_paused = true)]

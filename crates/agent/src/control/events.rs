@@ -69,6 +69,27 @@ impl SharedOutbox {
         appended.unwrap_or_else(|_| Err(task_failed()))
     }
 
+    /// Reopens the outbox on a blocking task when it is poisoned (see [`Outbox::reopen`]);
+    /// `Ok(true)` when it did, `Ok(false)` when it was not poisoned. The session calls it before
+    /// each connection attempt, so the reconnect delay paces the retries.
+    pub(super) async fn reopen_if_poisoned(&self) -> Result<bool, OutboxError> {
+        let inner = self.inner.clone();
+        let reopened = tokio::task::spawn_blocking(move || {
+            let mut outbox = inner.outbox.blocking_lock();
+            if !outbox.is_poisoned() {
+                return Ok(false);
+            }
+            outbox.reopen().map(|()| true)
+        })
+        .await;
+        reopened.unwrap_or_else(|_| Err(task_failed()))
+    }
+
+    #[cfg(test)]
+    pub(super) async fn is_poisoned_for_test(&self) -> bool {
+        self.inner.outbox.lock().await.is_poisoned()
+    }
+
     /// The next event to send after number `sent`, once there is one within the window. Not
     /// cancel-unsafe: it only reads.
     async fn next_event(&self, sent: u64) -> (u64, String) {

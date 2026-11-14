@@ -16,7 +16,9 @@
 //! What ends a connection is an [`End`]: the close to send (or none), how the loop backs off and
 //! what the log says. A job command goes to the connection's [`Gate`]: a verified instruction is
 //! handed to the [`Intake`], recorded as a `received` event in the outbox and then answered
-//! `commandAck` (an append that fails withholds the answer); a refusal is answered
+//! `commandAck` (an append that fails withholds the answer, and one that finds the outbox
+//! poisoned or fails to write closes the connection with 1011: the session reopens the outbox
+//! before its next connection); a refusal is answered
 //! `commandRejected` with its reason and records nothing. Answers are written on this connection
 //! through the one writer and under the write bound.
 //! Sending an answer does not reset the idle deadline; only a frame received does. Never logged:
@@ -45,6 +47,10 @@ use super::gate::Gate;
 use super::{Fail, Outcome, Phase, SessionState, Stop, Wiring};
 use crate::outbox::{Kind, OutboxError};
 use crate::server_http;
+
+/// The standard close code (RFC 6455 section 7.4.1) for an endpoint that cannot go on because of
+/// a fault of its own: the agent's outbox cannot take events.
+const CLOSE_CODE_INTERNAL: u16 = 1011;
 
 /// The upgrade route.
 pub(super) const CONTROL_PATH: &str = "/api/v1/agent/control";
@@ -517,6 +523,12 @@ async fn connected(
                                 Recorded::Stopped => return End::stop(),
                                 Recorded::Failed(class, error) => {
                                     state.warnings.event_failure(class, &error);
+                                    // A poisoned outbox cannot take any event until it is
+                                    // reopened, which the session does before its next
+                                    // connection (ADR-478 item 4): end this one.
+                                    if matches!(class, "outbox-poisoned" | "outbox-write") {
+                                        return End::close(CLOSE_CODE_INTERNAL, class, lived_now);
+                                    }
                                     continue;
                                 }
                             }

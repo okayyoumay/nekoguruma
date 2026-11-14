@@ -1203,7 +1203,6 @@ async fn a_key_whose_sync_fails_is_skipped_by_the_listing_not_fatal_to_it() {
     assert!(listed.is_empty(), "{listed:?}");
 }
 
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_area_removed_during_a_call_makes_a_missing_key_unavailable_not_not_found() {
     for delete in [false, true] {
@@ -1275,11 +1274,90 @@ async fn a_delete_whose_directory_sync_fails_reports_io_and_the_key_is_gone() {
             expect(store.status(target).await),
             StoreError::NotFound
         ));
+        // The retry syncs both areas before it answers, so the NotFound is durable.
+        let syncs = store.inner.hooks.delete_syncs.load(Ordering::SeqCst);
         assert!(matches!(
             expect(store.delete(target).await),
             StoreError::NotFound
         ));
+        assert_eq!(
+            store.inner.hooks.delete_syncs.load(Ordering::SeqCst) - syncs,
+            2
+        );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retried_delete_answers_not_found_only_after_its_syncs_pass() {
+    let root = tempfile::tempdir().unwrap();
+    let store = open_at(&root);
+    let key = store.begin().await.unwrap();
+    let hooks = &store.inner.hooks;
+    hooks
+        .directory_sync_after_delete_fails
+        .store(true, Ordering::SeqCst);
+    assert!(matches!(
+        expect(store.delete(&key).await),
+        StoreError::Io { .. }
+    ));
+    // Gone, but the sync still fails: the retry cannot say NotFound yet.
+    assert!(matches!(
+        expect(store.delete(&key).await),
+        StoreError::Io { .. }
+    ));
+    hooks
+        .directory_sync_after_delete_fails
+        .store(false, Ordering::SeqCst);
+    assert!(matches!(
+        expect(store.delete(&key).await),
+        StoreError::NotFound
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_unlink_answers_io_and_leaves_the_state_and_the_failed_mark() {
+    let root = tempfile::tempdir().unwrap();
+    let store = open_at(&root);
+    let hooks = &store.inner.hooks;
+    // A key in both areas: the staging unlink fails first and the object stays too.
+    let both = store.begin().await.unwrap();
+    store.append(&both, 0, b"abc".to_vec()).await.unwrap();
+    std::fs::copy(staging_file(&root, &both), object_file(&root, &both)).unwrap();
+    *hooks.unlink_fails_for.lock().unwrap() = Some(staging_file(&root, &both));
+    assert!(matches!(
+        expect(store.delete(&both).await),
+        StoreError::Io { .. }
+    ));
+    assert!(staging_file(&root, &both).exists());
+    assert!(object_file(&root, &both).exists());
+    // A key whose sync failed stays marked when its unlink fails.
+    let marked = store.begin().await.unwrap();
+    hooks.file_sync_fails.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        expect(store.append(&marked, 0, b"x".to_vec()).await),
+        StoreError::Io { .. }
+    ));
+    hooks.file_sync_fails.store(false, Ordering::SeqCst);
+    *hooks.unlink_fails_for.lock().unwrap() = Some(staging_file(&root, &marked));
+    assert!(matches!(
+        expect(store.delete(&marked).await),
+        StoreError::Io { .. }
+    ));
+    assert!(staging_file(&root, &marked).exists());
+    *hooks.unlink_fails_for.lock().unwrap() = None;
+    // Still marked: the file is there, but the key is refused, not served as unfinished.
+    assert!(matches!(
+        expect(store.append(&marked, 0, b"y".to_vec()).await),
+        StoreError::Io { .. }
+    ));
+    // The retry removes it and clears the mark.
+    store.delete(&marked).await.unwrap();
+    assert!(matches!(
+        expect(store.status(&marked).await),
+        StoreError::NotFound
+    ));
+    store.delete(&both).await.unwrap();
+    assert!(!object_file(&root, &both).exists());
 }
 
 #[cfg(unix)]
@@ -1302,6 +1380,41 @@ mod foreign_files {
         }
         // Another account's file is refused whatever its mode.
         assert!(fs_guard::is_foreign_file_meta(me.wrapping_add(1), 0o100600));
+    }
+
+    #[test]
+    fn a_lock_file_open_to_others_refuses_the_open() {
+        let root = tempfile::tempdir().unwrap();
+        drop(open_at(&root));
+        chmod(&store_dir(&root).join(".lock"), 0o640);
+        assert!(matches!(
+            LocalStore::open(&config(&store_dir(&root), 1024)),
+            Err(StoreError::Io {
+                kind: io::ErrorKind::PermissionDenied,
+                ..
+            })
+        ));
+        chmod(&store_dir(&root).join(".lock"), 0o600);
+        drop(open_at(&root));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_staging_file_of_another_account_is_refused() {
+        if fs_guard::euid() != 0 {
+            return; // chown to another account needs root
+        }
+        let root = tempfile::tempdir().unwrap();
+        let store = open_at(&root);
+        let key = store.begin().await.unwrap();
+        std::os::unix::fs::chown(staging_file(&root, &key), Some(4_242_424), None).unwrap();
+        assert!(matches!(
+            expect(store.append(&key, 0, b"x".to_vec()).await),
+            StoreError::Io {
+                kind: io::ErrorKind::PermissionDenied,
+                ..
+            }
+        ));
+        store.delete(&key).await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

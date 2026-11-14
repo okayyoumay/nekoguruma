@@ -204,9 +204,11 @@ A write is a resumable upload by offset:
   elsewhere the name may persist until the reader closes, so the key may read finished or an
   I/O error until then (not special-cased).
 - `delete(key)` removes an object, finished or not (`NotFound` when there is none). A key in
-  both areas loses both copies before the directories are synced. An I/O error after the unlink
-  (the directory sync) leaves the object gone: the retry answers `NotFound`, which then means
-  it is gone, and the key's failed-sync mark is cleared.
+  both areas loses both copies before the directories are synced: the staging copy first, and
+  the first failed unlink stops the delete with an I/O error and nothing else removed. An I/O
+  error after the unlink (the directory sync) leaves the object gone: the retry syncs both
+  areas before it answers `NotFound`, so that answer is durable and means it is gone. The key's
+  failed-sync mark is cleared whenever no unlink failed.
 - `list_unfinished()` returns each unfinished object's key, stored length and last write time,
   for a caller that cleans up abandoned uploads. Names in the staging area that are not keys are
   ignored; an entry that is not a regular file is skipped with a warning. An object that is
@@ -228,7 +230,9 @@ rules the implementation keeps:
   and nothing is recreated until the server restarts.
 - A staging or object file is judged on its open handle like the instruction key's file: a
   non-regular file is `NotRegularFile`; on Unix a file owned by another account or open to
-  group or others is an I/O error for that key (`PermissionDenied`). The listing skips such a
+  group or others is an I/O error for that key (`PermissionDenied`). The same rule applies to
+  `.lock` at start: a file system that fakes owners or mode bits makes the start fail (exit 1)
+  with that error, instead of refusing every key later. The listing skips such a
   key, and one whose sync fails, with a warning.
 - Calls on one key are serialised by a per-key mutex whose guard moves into the one blocking task
   that does the work, so a caller that drops its future does not free the key while its write
@@ -762,7 +766,7 @@ a new migration file rebuilds the crate. How migrations are written and applied 
   bits and by owner (Unix); a link as the lock file or a staging file (Unix); sixteen appends at
   one offset, two finishes, and append, finish and delete in pairs; a read that outlives a
   delete (Unix); two stores on one directory, also while a call is still running; a directory
-  removed under a live store (Unix); and the listing with sizes and times.
+  removed under a live store; a retried delete that syncs before `NotFound`; a failed unlink; a `.lock` or staging file of another account (Unix; the second as root); and the listing with sizes and times.
 - The unit tests need no database: the guard's decision table, the configuration (including that
   no error shows the URL, that the key path is required and absolute, and that the storage
   directory is required and absolute and its limit defaults to 4 GiB and is not 0), the key file (create,

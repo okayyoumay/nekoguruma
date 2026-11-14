@@ -154,6 +154,14 @@ fn take_process_lock(path: &Path) -> Result<ProcessLock, StoreError> {
     if !fs_guard::is_plain_file(&meta) {
         return Err(StoreError::NotRegularFile);
     }
+    // The same rule as the object files: a file system that fakes owners or mode bits fails here,
+    // at start, not on every key later.
+    if fs_guard::is_foreign_file(&meta) {
+        return Err(StoreError::Io {
+            op: "trust the lock file",
+            kind: io::ErrorKind::PermissionDenied,
+        });
+    }
     match file.try_lock() {
         Ok(()) => Ok(ProcessLock(file)),
         Err(std::fs::TryLockError::WouldBlock) => Err(StoreError::InUse),
@@ -535,21 +543,24 @@ impl Inner {
     }
 
     /// Removes both copies of the key before syncing, so that a key in both areas does not come
-    /// back as its other copy. An I/O error after the unlink (the directory sync) leaves the key
-    /// gone: the retry answers [`StoreError::NotFound`], and the key's failed-sync mark is cleared
-    /// whenever no unlink failed.
+    /// back as its other copy. The staging copy goes first and the first failed unlink stops the
+    /// delete with nothing else removed, so a finished copy is never left to fall back to an
+    /// unfinished one. An I/O error after the unlink (the directory sync) leaves the key gone;
+    /// the retry syncs both areas before it answers [`StoreError::NotFound`], so that answer is
+    /// durable. The key's failed-sync mark is cleared whenever no unlink failed.
     fn delete(&self, key: &ObjectKey) -> Result<(), StoreError> {
         self.areas()?;
         #[cfg(test)]
         self.hooks.after_area_check();
         let mut removed = Vec::new();
         let mut failure = None;
-        for area in [&self.objects, &self.staging] {
-            match std::fs::remove_file(area.join(key.as_str())) {
+        for area in [&self.staging, &self.objects] {
+            match self.unlink(&area.join(key.as_str())) {
                 Ok(()) => removed.push(area),
                 Err(error) if is_missing(&error) => {}
                 Err(error) => {
-                    failure.get_or_insert(io_error("remove an object")(error));
+                    failure = Some(io_error("remove an object")(error));
+                    break;
                 }
             }
         }
@@ -569,6 +580,13 @@ impl Inner {
             return Err(error);
         }
         if removed.is_empty() {
+            // An earlier delete may have unlinked the key and failed its sync: make that durable
+            // before saying the key is gone. An area gone meanwhile is `Unavailable` first.
+            self.areas()?;
+            for area in [&self.staging, &self.objects] {
+                self.sync_directory_after_delete(area)
+                    .map_err(io_error("sync a directory"))?;
+            }
             self.areas()?;
             return Err(StoreError::NotFound);
         }
@@ -650,7 +668,7 @@ impl Inner {
         }))
     }
 
-    // The next five are the points a test can make fail or hold (see `hooks`).
+    // The next six are the points a test can make fail or hold (see `hooks`).
 
     fn write_chunk(&self, file: &mut File, bytes: &[u8]) -> io::Result<()> {
         #[cfg(test)]
@@ -668,6 +686,12 @@ impl Inner {
         #[cfg(test)]
         self.hooks.before_rename()?;
         std::fs::rename(from, to)
+    }
+
+    fn unlink(&self, path: &Path) -> io::Result<()> {
+        #[cfg(test)]
+        self.hooks.before_unlink(path)?;
+        std::fs::remove_file(path)
     }
 
     fn sync_directory_after_delete(&self, dir: &Path) -> io::Result<()> {
@@ -765,6 +789,10 @@ pub(super) mod hooks {
         pub rename_fails: AtomicBool,
         pub directory_sync_after_rename_fails: AtomicBool,
         pub directory_sync_after_delete_fails: AtomicBool,
+        /// How many directory syncs after a delete were asked for.
+        pub delete_syncs: AtomicUsize,
+        /// An unlink of this path fails.
+        pub unlink_fails_for: Mutex<Option<std::path::PathBuf>>,
         /// Runs once, right after the next state or delete has checked the areas.
         pub after_area_check: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         /// The next write waits here before it writes anything.
@@ -887,7 +915,19 @@ pub(super) mod hooks {
             }
         }
 
+        pub(in crate::storage) fn before_unlink(&self, path: &std::path::Path) -> io::Result<()> {
+            let target = self
+                .unlink_fails_for
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if target.as_deref() == Some(path) {
+                return Err(injected());
+            }
+            Ok(())
+        }
+
         pub(in crate::storage) fn before_delete_sync(&self) -> io::Result<()> {
+            self.delete_syncs.fetch_add(1, Ordering::SeqCst);
             if self
                 .directory_sync_after_delete_fails
                 .load(Ordering::SeqCst)

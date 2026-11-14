@@ -424,6 +424,8 @@ impl crate::oplog::LogSafe for JobError {
                     source.log_text()
                 )
             }
+            // The I/O error's text is the operating system's, not NGR's.
+            JobError::Journal(JournalError::Io(_)) => "journal: journal I/O failed".to_owned(),
             other => other.to_string(),
         }
     }
@@ -505,7 +507,7 @@ fn journal_identity_abort<S: Store>(journal: &mut Journal<S>, error: JobError) -
 }
 
 /// `text` cut to at most `max` bytes, on a character boundary.
-fn truncated(mut text: String, max: usize) -> String {
+pub(crate) fn truncated(mut text: String, max: usize) -> String {
     if text.len() > max {
         let mut end = max;
         while !text.is_char_boundary(end) {

@@ -232,6 +232,9 @@ pub enum AgentEventKind {
         state: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         failure_code: Option<String>,
+        /// The procedure's own code, with failure code `procedure` (5.6, ADR-475).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        procedure_code: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
     },
@@ -299,7 +302,10 @@ fn allowed(direction: Direction, ty: &str) -> Option<&'static [&'static str]> {
 }
 
 const EVENT_KIND_KEYS: [(&str, &[&str]); 3] = [
-    ("jobState", &["jobId", "state", "failureCode", "detail"]),
+    (
+        "jobState",
+        &["jobId", "state", "failureCode", "procedureCode", "detail"],
+    ),
     ("progress", &["jobId", "progressPermille", "phase"]),
     ("hmiRequest", &["jobId", "hmiRequest"]),
 ];
@@ -521,6 +527,49 @@ mod tests {
             assert!(text.contains(&format!("| {code} |")), "{code}");
         }
         assert!(text.contains(&format!("{DEFAULT_HEARTBEAT_SECS} by default")));
+    }
+
+    #[test]
+    fn a_failed_job_state_carries_the_procedures_code_apart_from_the_agents() {
+        use crate::{FailureCode, JobId, JobState};
+        let state = JobState::Failed {
+            code: FailureCode::Procedure,
+            detail: "why".to_owned(),
+            procedure_code: Some("flash.verify".to_owned()),
+        };
+        let event = AgentMessage::AgentEvent(AgentEventMessage {
+            seq: 3,
+            delivery: Some(Delivery::Guaranteed),
+            occurred_at_agent: None,
+            event: state.to_event_kind(JobId("j-1".to_owned())),
+        });
+        let text = event.encode().unwrap();
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["state"], "failed");
+        assert_eq!(value["failureCode"], "procedure");
+        assert_eq!(value["procedureCode"], "flash.verify");
+        assert_eq!(value["detail"], "why");
+        assert!(AgentMessage::decode(&text).is_ok());
+        // A refusal carries its detail, and no procedure code.
+        let kind = JobState::PreconditionFailed {
+            code: FailureCode::JobRefused,
+            detail: "d".to_owned(),
+        }
+        .to_event_kind(JobId("j".to_owned()));
+        let AgentEventKind::JobState {
+            state,
+            failure_code,
+            procedure_code,
+            detail,
+            ..
+        } = kind
+        else {
+            panic!("not a job state");
+        };
+        assert_eq!(state, "preconditionFailed");
+        assert_eq!(failure_code.as_deref(), Some("jobRefused"));
+        assert_eq!(procedure_code, None);
+        assert_eq!(detail.as_deref(), Some("d"));
     }
 
     #[test]

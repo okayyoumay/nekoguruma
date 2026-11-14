@@ -46,6 +46,7 @@ pub mod identification;
 pub mod identity;
 pub mod inputs;
 pub mod instruction;
+pub mod job_report;
 pub mod journal;
 mod journaling;
 mod keep_alive;

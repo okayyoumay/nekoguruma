@@ -381,8 +381,24 @@ components:
               kind: { const: jobState }
               jobId: { type: string }
               state: { type: string, description: The job state's name (5.6) in camelCase }
-              failureCode: { type: string, description: The failure code's name in camelCase, for the states that carry one }
-              detail: { type: string, description: For the states that carry a detail }
+              failureCode:
+                type: string
+                description: |
+                  The failure code's name in camelCase, for failed and preconditionFailed. The names are
+                  deviceLocked, vehicleLocked, vinMismatch, variantMismatch, powerCondition, signatureInvalid,
+                  libraryLoadFailed, unsupportedAbi, runtime32BitMissing, cpuOrKernelNo32Bit,
+                  gatewayAuthExpired, ticketExpired, procedure, procedureError, jobRefused, linkNotOpened,
+                  exchangeFailed, internal and other. Only internal asserts a fault of the diagnostic system;
+                  exchangeFailed asserts neither a fault of the vehicle nor of the system, which the
+                  communication log tells apart (8.11).
+              procedureCode:
+                type: string
+                minLength: 1
+                maxLength: 128
+                description: |
+                  With failureCode procedure only: the code the procedure gave when it ended itself as failed
+                  (1 to 128 bytes of UTF-8). It is the procedure's own and never one of the codes above (5.6).
+              detail: { type: string, maxLength: 1024, description: For failed, preconditionFailed and needsOnSiteRecovery: text the agent writes, cut to 1024 bytes; for a procedure's failure, the procedure's own detail (5.6) }
           - type: object
             required: [kind, jobId, progressPermille, phase]
             additionalProperties: false
@@ -414,6 +430,8 @@ components:
                   templateId: { type: string, description: Record template or HMI form }
       examples:
         - payload: {"type": "agentEvent", "seq": 7, "delivery": "guaranteed", "kind": "jobState", "jobId": "j-1", "state": "running"}
+        - payload: {"type": "agentEvent", "seq": 10, "delivery": "guaranteed", "kind": "jobState", "jobId": "j-1", "state": "failed", "failureCode": "procedure", "procedureCode": "flash.verify", "detail": "image check failed"}
+        - payload: {"type": "agentEvent", "seq": 11, "delivery": "guaranteed", "kind": "jobState", "jobId": "j-2", "state": "preconditionFailed", "failureCode": "jobRefused", "detail": "the job names no artifact"}
         - payload: {"type": "agentEvent", "seq": 8, "delivery": "lossy", "kind": "progress", "jobId": "j-1", "progressPermille": 250, "phase": "download"}
         - payload: {"type": "agentEvent", "seq": 9, "delivery": "guaranteed", "kind": "hmiRequest", "jobId": "j-1", "hmiRequest": {"requestId": "r-1", "templateId": "confirm"}}
 

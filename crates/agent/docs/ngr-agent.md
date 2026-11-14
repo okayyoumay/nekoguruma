@@ -660,6 +660,16 @@ the journal exists, instead of running the program again.
 
 The restart's use of the records is the classification of a plain procedure, below.
 
+## Reporting a run's end
+
+`agent::job_report::outcome` maps a run's `Result<VmState, JobError>`, whether it was the job's first run and the journal's standing to a `JobOutcome` (design 5.6, ADR-475): `Terminal(JobState)`, `Open` (report no terminal state; the job is resumed as after a crash) or `None` (`JobError::Journal(InUse)` or `AlreadyExists`: another run owns the job, ADR-255). The match on `JobError` has no wildcard arm, so a new variant must be placed, and it reads no worker kind, API or vendor code.
+
+The standing is `JournalStanding::Clean` when the job has no journal, or its journal has not reached a flash plan (`restart::reached_flash_plan`) and holds no request marker; `MayHaveChanged` otherwise, a journal that cannot be read back included. `JournalStanding::read` computes it after the run with `Journal::read`, which takes no lock and does not change the file, so it works while the journal's writer is still open.
+
+The procedure's failure, an identity mismatch, a step limit or VM error and an on-site ending are terminal whatever the standing (the runner journals them). Any other error is `Open` while the standing is `MayHaveChanged`. With a clean journal a first run's refusal (`Program`, `SeveralTargets`, `Undeclared`, `NoDeclarations`, `Sources`, `Refused`, `NoArtifact`, `ArtifactMismatch`, `SegmentOutsideArtifact`), `Link` and `LinkUnconfirmed`, and the agent's own faults (`NoReprogrammingSlot`, `CurrentThreadRuntime`, `CommLogMismatch`, `NoCommLogDir`, `GuardsMissing`, `Panicked`, a journal fault) are `PreconditionFailed` with `jobRefused`, `linkNotOpened`, `deviceLocked` and `internal`; on a resume they are `Failed` with the same codes, except `Link`, which is `exchangeFailed`. `Host`, `IdentityRead`, `IdentityUnreadable` and `VehicleLock` are `Failed` with `exchangeFailed`, `ArtifactDiffersFromJournal` with `jobRefused` and `Unanswerable` with `other`. A pre-run check's `Vm` error is the run's `Vm` variant and so is reported as `procedureError`.
+
+A detail is `LogSafe::log_text` cut to 1024 bytes, and an on-site reason is written as its name and plain numeric fields by hand (strings, the supply voltage and the nested teardown outcomes stay out). `on_job_thread` ends a job as `Cancelled` when the runtime shuts down before its thread starts, so whatever sends the outcome must send nothing terminal while the agent shuts down.
+
 ## Communication log
 
 The communication log (design 8.11, ADR-346) records a job's exchanges for a reader who must

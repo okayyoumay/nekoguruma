@@ -91,7 +91,7 @@ pub enum EventBody {
 }
 
 /// Corresponds to the state transitions in 5.6.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobState {
     Received,
     Precheck,
@@ -101,14 +101,75 @@ pub enum JobState {
     AwaitingHmi,
     CancelRequested,
     Completed,
-    Failed { code: FailureCode, detail: String },
+    /// `procedure_code` is the code the procedure gave when it ended itself as failed, with
+    /// `code` [`FailureCode::Procedure`]: the procedure's code travels apart from the agent's
+    /// own, so it never reads as one (5.6, ADR-475). It is 1 to [`MAX_PROCEDURE_CODE_LEN`]
+    /// bytes of UTF-8 and is `None` for every other failure.
+    Failed {
+        code: FailureCode,
+        detail: String,
+        procedure_code: Option<String>,
+    },
     Cancelled,
     Expired,
-    PreconditionFailed { code: FailureCode },
-    NeedsOnSiteRecovery { detail: String },
+    PreconditionFailed {
+        code: FailureCode,
+        detail: String,
+    },
+    NeedsOnSiteRecovery {
+        detail: String,
+    },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// The longest procedure code a `jobState` event carries (5.6): the bound `diag.fail`'s code
+/// has in the IR.
+pub const MAX_PROCEDURE_CODE_LEN: usize = 128;
+
+impl JobState {
+    /// The state's name in camelCase, as the control channel's `jobState` event spells it (5.2).
+    pub fn wire_name(&self) -> &'static str {
+        match self {
+            JobState::Received => "received",
+            JobState::Precheck => "precheck",
+            JobState::Ready => "ready",
+            JobState::Running => "running",
+            JobState::Verifying => "verifying",
+            JobState::AwaitingHmi => "awaitingHmi",
+            JobState::CancelRequested => "cancelRequested",
+            JobState::Completed => "completed",
+            JobState::Failed { .. } => "failed",
+            JobState::Cancelled => "cancelled",
+            JobState::Expired => "expired",
+            JobState::PreconditionFailed { .. } => "preconditionFailed",
+            JobState::NeedsOnSiteRecovery { .. } => "needsOnSiteRecovery",
+        }
+    }
+
+    /// The state as a `jobState` event of `job_id` for the control channel (5.2, 5.6).
+    pub fn to_event_kind(&self, job_id: JobId) -> AgentEventKind {
+        let (failure_code, procedure_code, detail) = match self {
+            JobState::Failed {
+                code,
+                detail,
+                procedure_code,
+            } => (Some(code), procedure_code.clone(), Some(detail.clone())),
+            JobState::PreconditionFailed { code, detail } => {
+                (Some(code), None, Some(detail.clone()))
+            }
+            JobState::NeedsOnSiteRecovery { detail } => (None, None, Some(detail.clone())),
+            _ => (None, None, None),
+        };
+        AgentEventKind::JobState {
+            job_id,
+            state: self.wire_name().to_owned(),
+            failure_code: failure_code.map(|code| code.wire_name().to_owned()),
+            procedure_code,
+            detail,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FailureCode {
     DeviceLocked,
     VehicleLocked,
@@ -122,7 +183,50 @@ pub enum FailureCode {
     CpuOrKernelNo32Bit,
     GatewayAuthExpired,
     TicketExpired,
+    /// The procedure ended itself as failed (`diag.fail`); its own code is the `Failed`
+    /// state's `procedure_code` (5.6, ADR-475).
+    Procedure,
+    /// The procedure ran into an error of its own: the VM refused an instruction, or the run
+    /// reached its step limit (5.6, ADR-475).
+    ProcedureError,
+    /// The agent refused the job's data or program before sending anything (5.6, ADR-475).
+    JobRefused,
+    /// The link to the vehicle could not be opened (5.6, ADR-475).
+    LinkNotOpened,
+    /// An exchange with the vehicle failed. Asserts neither a fault of the vehicle nor of the
+    /// diagnostic system; the communication log tells which (8.11, ADR-375, ADR-475).
+    ExchangeFailed,
+    /// A fault in the agent itself. The only code that asserts one on the diagnostic system's
+    /// side (5.6, ADR-475).
+    Internal,
     Other,
+}
+
+impl FailureCode {
+    /// The code's name in camelCase, as the control channel's `failureCode` spells it (5.2).
+    pub fn wire_name(&self) -> &'static str {
+        match self {
+            FailureCode::DeviceLocked => "deviceLocked",
+            FailureCode::VehicleLocked => "vehicleLocked",
+            FailureCode::VinMismatch => "vinMismatch",
+            FailureCode::VariantMismatch => "variantMismatch",
+            FailureCode::PowerCondition => "powerCondition",
+            FailureCode::SignatureInvalid => "signatureInvalid",
+            FailureCode::LibraryLoadFailed => "libraryLoadFailed",
+            FailureCode::UnsupportedAbi => "unsupportedAbi",
+            FailureCode::Runtime32BitMissing => "runtime32BitMissing",
+            FailureCode::CpuOrKernelNo32Bit => "cpuOrKernelNo32Bit",
+            FailureCode::GatewayAuthExpired => "gatewayAuthExpired",
+            FailureCode::TicketExpired => "ticketExpired",
+            FailureCode::Procedure => "procedure",
+            FailureCode::ProcedureError => "procedureError",
+            FailureCode::JobRefused => "jobRefused",
+            FailureCode::LinkNotOpened => "linkNotOpened",
+            FailureCode::ExchangeFailed => "exchangeFailed",
+            FailureCode::Internal => "internal",
+            FailureCode::Other => "other",
+        }
+    }
 }
 
 // ---------------------------------------------------------------- capabilities

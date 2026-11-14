@@ -14,6 +14,7 @@ use tracing_subscriber::fmt::MakeWriter;
 use super::*;
 use crate::identity::load_or_create;
 use crate::identity::store::{MemoryStore, SecretName};
+use crate::outbox::{Outbox, OutboxError};
 use crate::registration::record::{self, Record, RecordError};
 
 const AGENT_ID: &str = "0194f0a2-7c3e-7d11-8a52-3f6f9b1c2d4e";
@@ -91,6 +92,13 @@ impl Dirs {
             &self.dir.path().join("registration"),
         )
     }
+}
+
+/// The outbox of the record's agent in `dir`, as `run` opens it.
+fn outbox_in(dir: &std::path::Path) -> control::SharedOutbox {
+    let dir = dir.join("outbox");
+    std::fs::create_dir_all(&dir).unwrap();
+    control::SharedOutbox::new(Outbox::open_in(&dir, AGENT_ID).unwrap())
 }
 
 fn unavailable() -> IdentityError {
@@ -298,7 +306,7 @@ async fn a_session_that_ends_on_its_own_is_exit_1() {
     let result = run_opened(
         opened,
         move || Ok(slot.lock().unwrap().take().unwrap()),
-        |opened, key| opened.start_panicking(key),
+        |opened, key| opened.start_panicking(key, outbox_in(dirs.dir.path())),
         std::future::pending::<()>(),
     )
     .await;
@@ -347,4 +355,52 @@ fn every_control_error_has_the_documented_exit() {
             .to_string()
             .contains("register again")
     );
+}
+
+/// ADR-478: an outbox that does not read back is exit 1 with the advice to register again; the
+/// other failures to open it are exit 3, and none names a path.
+#[test]
+fn every_outbox_error_has_the_documented_exit() {
+    for (error, exit) in [
+        (OutboxError::Corrupt("a bad frame"), 1),
+        (OutboxError::BadAgentId, 1),
+        (OutboxError::InUse, 3),
+        (
+            OutboxError::Io(io::Error::from(io::ErrorKind::PermissionDenied)),
+            3,
+        ),
+        (OutboxError::Poisoned, 3),
+    ] {
+        let mapped = outbox_error(&error);
+        assert_eq!(mapped.exit_code(), exit, "{mapped}");
+    }
+    assert!(
+        outbox_error(&OutboxError::Corrupt("x"))
+            .to_string()
+            .contains("register again")
+    );
+}
+
+/// A corrupt outbox file ends `connect` with exit 1 before any key is loaded, and both locks are
+/// released. The real `run` is not used (it reads the state directory of the mode), so the same
+/// two steps are run here.
+#[test]
+fn a_corrupt_outbox_file_does_not_open_and_maps_to_exit_1() {
+    let key = existing_key();
+    let dirs = Dirs::new(&key);
+    let outbox_dir = dirs.dir.path().join("outbox");
+    std::fs::create_dir_all(&outbox_dir).unwrap();
+    std::fs::write(
+        outbox_dir.join(format!("{AGENT_ID}.outbox")),
+        b"not an outbox",
+    )
+    .unwrap();
+    let opened = dirs.open().unwrap();
+    let error = Outbox::open_in(&outbox_dir, &opened.record().agent_id)
+        .err()
+        .expect("a corrupt file does not open");
+    assert!(matches!(error, OutboxError::Corrupt(_)), "{error}");
+    assert_eq!(outbox_error(&error).exit_code(), 1);
+    drop(opened);
+    dirs.open().expect("the locks are free");
 }

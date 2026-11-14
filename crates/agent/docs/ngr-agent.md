@@ -361,11 +361,15 @@ printed, as `register` prints no argument value.
      so `https` too) says to register again; a record that cannot be read for an I/O reason
      (permission, a device error) is exit 3 with the error kind, since registering again would not
      help;
-  3. the agent key through `agent::identity::agent_key` (create once). A key this run had to
+  3. the outbox of the record's agent ID (`Outbox::open`, below), created when missing. A file that
+     does not read back is corrupt and ends the command with exit 1 and the advice to register
+     again (`register --replace` gives a new agent ID and a new outbox); an outbox open in another
+     process, or a directory that cannot be used, is exit 3;
+  4. the agent key through `agent::identity::agent_key` (create once). A key this run had to
      create cannot be the registered one, so it is "register again" (the key stays, and a code can
      be issued for its fingerprint); a key whose fingerprint differs from the record's
      (`KeyMismatch`, from `Opened::start`) is the same;
-  4. `Opened::start`, then the wait for a stop signal.
+  5. `Opened::start`, then the wait for a stop signal.
 - **The key's retry** covers two classes, each logged as one `warn` per try with a fixed class
   name (`key store` or `creation lock`) and the next delay: a key store that is unavailable, and
   the creation lock held by another process past its 10-second wait. The delays are the session's
@@ -392,9 +396,9 @@ printed, as `register` prints no argument value.
 | Exit status | Meaning |
 |---|---|
 | 0 | Stopped by a signal |
-| 1 | Not registered; register again (a key just created, a key that is not the record's, a record that reads but is not valid); no key store (a release build, a build or mode without one, wrong debug variables); the stop handlers cannot be installed; the session ended without a stop |
+| 1 | Not registered; register again (a key just created, a key that is not the record's, a record that reads but is not valid, an outbox file that is corrupt); no key store (a release build, a build or mode without one, wrong debug variables); the stop handlers cannot be installed; the session ended without a stop |
 | 2 | Invalid command line |
-| 3 | Another session or a registration is running, a lock cannot be taken, the state directory or the identity directory is unusable, the creation lock cannot be opened, or the registration record cannot be read for an I/O reason |
+| 3 | Another session or a registration is running, a lock cannot be taken, the state directory or the identity directory is unusable, the creation lock cannot be opened, the registration record cannot be read for an I/O reason, or the outbox is open elsewhere or cannot be opened |
 | 4 | The agent key is present and cannot be used (it is not replaced) |
 
 ## Control channel session
@@ -411,14 +415,15 @@ connect`, above) loads the agent key and passes it in.
   no record is `NotRegistered`; a record that does not read, or whose `server_origin` is not
   `http://127.0.0.1` or `http://127.0.0.1:<port>`, is `Record`. Nothing of the record's path or
   content is logged. A record edited while the session runs is not read again.
-- **`Opened::start(key, intake)`** refuses a key whose fingerprint is not the record's
+- **`Opened::start(key, intake, outbox)`** refuses a key whose fingerprint is not the record's
   (`KeyMismatch`), else spawns the task and returns a `Handle`: `stop()`, `stopped()` (resolves
   once both locks are released) and `status()`, a watch of the phase, the heartbeat interval, the
   next delay and `commands_acknowledged` and `commands_rejected`, the job commands answered
   `commandAck` and `commandRejected` over all connections (a command is counted once its answer
   is written). `intake` is the `Intake` trait object that takes every verified instruction; the
   default, `LogIntake`, is connected to no job runner: it logs the job ID at `debug` and drops the
-  instruction.
+  instruction. `outbox` is the `SharedOutbox` around the open `Outbox` of the record's agent ID
+  (below); the caller opens it, and the connections send its events.
 - **Both locks are held from `open` until the task ends**, waits included, and released by drop
   on every path: a stop, a dropped handle, a panic, a runtime shutdown or an `Opened` dropped
   unstarted. The lock files are never deleted. While a session runs, `ngr-agent register` exits 3.
@@ -439,8 +444,16 @@ connect`, above) loads the agent key and passes it in.
 - **A job command** goes to the connection's gate (`control/gate.rs`), which wraps
   `agent::instruction` ("Job instruction gate" below) with the instruction key and the agent ID
   from the registration record the session holds. A verified instruction is handed to the
-  `Intake` and answered `{"type":"commandAck","commandId":...}`, and nothing else is sent (no
-  job state, no event, no link). A refusal is answered
+  `Intake`; the channel then appends a `received` event for the job to the outbox, on a blocking
+  task raced with the stop, and answers `{"type":"commandAck","commandId":...}`. A failed append
+  (`Full`, `Poisoned`, a write error) withholds the acknowledgement and closes nothing: the
+  command counts as neither acknowledged nor rejected, the server delivers the job again after
+  its lease, and a `warn` per failure class (`outbox-full`, `outbox-poisoned`, `outbox-write`,
+  `outbox-event`) is written until the next `hello`, `debug` after that. The append is tried once
+  per command. The intake has the instruction by then, and until it is idempotent on the job ID a
+  redelivery appends a second `received` event. A stop that comes during the append ends the
+  connection as a stop with no acknowledgement written; the append, if it began, finishes. The
+  event itself is sent by the connection's sender (next item), after the acknowledgement. A refusal is answered
   `{"type":"commandRejected","commandId":...,"reason":...}` on the same connection, never
   through an outbox, with the reason the gate gives (`malformed`, `unknownKey`, `badSignature`,
   `unsupportedVersion`, `notForThisAgent`). A `signedJob` that is missing, is not a string or is
@@ -449,6 +462,22 @@ connect`, above) loads the agent key and passes it in.
   write drops the connection, and a stop during a stalled write drops it at once, with no
   answer. A command read after the stop was asked for, or behind the server's Close, is not
   answered.
+- **The outbox is sent** on every connection (design 5.3, ADR-478). After `hello` the connection
+  writes the pending events in order from the oldest, one `agentEvent` text each, byte for byte
+  as stored, and an event appended later at once; it never has more than 64 numbers on the wire
+  past the highest acknowledged. The loop's order is stop, idle deadline, heartbeat tick, read,
+  outbox, so a backlog delays neither a heartbeat nor a read. A sent event is not a received
+  frame: it does not move the idle deadline. A failed or stalled event write drops the connection
+  as the heartbeat's does (the class `transport`, the word `write`), and the event stays. What a
+  connection sent and the server did not acknowledge is sent again by the next, from the oldest
+  pending event. `eventAck` is cumulative and counts as a received frame: the events up to its
+  number leave the pending ones (on a blocking task; the file is rewritten as the outbox's rules
+  say), those not yet sent by this connection are skipped, one at or below what is acknowledged
+  changes nothing, and one above the highest number assigned closes with 1002 (the class
+  `event-ack`) and drops nothing. After an acknowledgement whose rewrite failed, the connection
+  holds the later ones back for 10 seconds and applies the highest of them together, so the owed
+  rewrite is tried about once per pause. Until the server reads events it acknowledges none, so
+  every connection sends the whole outbox again.
 - **Only local facts end the task**: the `open` and `start` refusals above, and a stop. Every
   answer of the server, a 403, a 429 and Close 4002 included, is retried, and nothing is erased.
   The delay before the next attempt starts at 1 second and doubles after every wait, up to 60
@@ -665,6 +694,8 @@ The restart's use of the records is the classification of a plain procedure, bel
 The `agent` library's `outbox` module keeps the events the server has not confirmed (design 5.3, ADR-478): one file per agent ID, `<state>/outbox/<agent-id>.outbox`, in the journal's frame format (length, CRC-32, payload). A header frame holds the format version, the agent ID, a protection field that is 0 and the floor, the number of the last event the file no longer holds; each event frame is its number followed by the exact text of the control frame that carries it, so a resend is byte-identical. `Outbox::open(mode, agent_id)` takes an exclusive lock on the sidecar `outbox.lock` of the directory (a second opener gets `InUse`), creates the file whole when it is missing, cuts a frame that a crash left unfinished (the last frame, also when it is complete but fails its checksum, as in the journal; a damaged length field or zeroed block followed by a whole event is not torn but `Corrupt`), syncs the file, then the rename (the directory on Unix, the final file on Windows; a failure fails the open), once before its frames count as pending, removes a stale temporary file, and leaves the files of other agent IDs alone with one warning that counts them. A file whose header names another agent ID, whose format version or protection is unknown, whose frame fails its checksum before the last one or whose numbers are not contiguous is `Corrupt`: it is not repaired, replaced or set aside, and the owner registers the agent again.
 
 `append(kind, text)` is blocking (a file sync). It numbers the event with the highest assigned plus one, asks `text` for the frame's text with that number in it, writes and syncs the frame, and only then returns the number and lists the event in `pending()`; a text over 128 KiB is `TooLarge` and a full file is `Full`, both before the event is written and without using a number; before answering `Full` an append retries a rewrite an earlier acknowledgement owes, and answers `Poisoned` if that rewrite poisons the outbox. The file may grow to 16 MiB; a `Kind::Received` event is refused above 8 MiB so that the events that finish accepted jobs keep room. Nothing is dropped for room: the producer keeps the fact in its own journal and reports it later. The outbox poisons (`Poisoned` until it is opened again) in exactly these cases: an append whose write or sync fails; a rewrite whose handle cannot be reopened, after a failed or a successful rename; and a rewrite whose sync after the rename fails (the directory on Unix, the reopened final file on Windows). While the file is being created the last two fail the open instead. A counter that would give `u64::MAX` is `Corrupt` (the highest number given is one below, so the file reads back). `ack(n)` is cumulative and changes memory only: a number at or below the last acknowledged one drops nothing and one above the highest assigned is `OutOfRange`. The acknowledged prefix leaves the file by a rewrite (a temporary file, synced, renamed over the old one, directory synced) when nothing is pending or 64 KiB are acknowledged; the header's floor keeps the counter across an empty file. The old handle is closed before the rename, which Windows needs. A rewrite that fails keeps the old file and is owed: any later acknowledgement, a repeated one too, and an `append` that would answer `Full` try it again first. After a restart an acknowledged event that was not rewritten away is pending again and is sent again.
+
+`control::SharedOutbox` shares the open outbox between the control channel and the producers of events: `append(kind, text).await` runs `Outbox::append` on a blocking task and wakes the connection that waits for events (a wake-up that finds nobody waiting is kept, so the next wait ends at once). `Outbox::acked()` and `Outbox::rewrite_owed()` give the acknowledged number and whether a rewrite is owed; the channel reads them to apply its window and its pause. The channel sends the events and applies `eventAck` ("Control channel session" above).
 
 ## Reporting a run's end
 

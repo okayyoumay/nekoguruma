@@ -5,7 +5,9 @@
 //! through the hub and reads the agent's answers from the hub's inbox.
 //!
 //! The agent has no job runner behind the session yet, so a verified command is acknowledged and
-//! dropped (`LogIntake`); the answers are the observable behaviour.
+//! dropped (`LogIntake`); the answers are the observable behaviour. After `commandAck` the agent
+//! sends the `received` event it recorded in its outbox (design 5.3, ADR-478); the server does not
+//! read events yet, so it acknowledges none and the agent sends them again at every connection.
 //!
 //! A release agent has no plain-file store, so this module is compiled in debug builds only. The
 //! stop signal is SIGINT on Unix; elsewhere the child is killed and its exit status is not
@@ -21,8 +23,8 @@ use server::hub::Inbound;
 use server::job_queue::Settings;
 use server::{Hub, Server};
 use shared_proto::{
-    AgentId, AgentMessage, INSTRUCTION_VERSION, InstructionRejectReason, JobId, JobInstruction,
-    JobKind, VciId, Vin,
+    AgentEventKind, AgentEventMessage, AgentId, AgentMessage, INSTRUCTION_VERSION,
+    InstructionRejectReason, JobId, JobInstruction, JobKind, VciId, Vin,
 };
 use tokio::sync::mpsc::Receiver;
 
@@ -241,6 +243,23 @@ impl Fixture {
         }
     }
 
+    /// The next message must be the agent's `received` event of `JOB_ID` with number `seq`.
+    async fn expect_received(&mut self, seq: u64) {
+        match self.next().await.message {
+            AgentMessage::AgentEvent(AgentEventMessage {
+                seq: Some(got),
+                event: AgentEventKind::JobState { job_id, state, .. },
+                ..
+            }) => {
+                assert_eq!(
+                    (got, job_id.0.as_str(), state.as_str()),
+                    (seq, JOB_ID, "received")
+                );
+            }
+            other => panic!("the received event {seq} expected, got {other:?}"),
+        }
+    }
+
     async fn next(&mut self) -> Inbound {
         tokio::time::timeout(
             LIMIT,
@@ -334,6 +353,8 @@ async fn a_registered_agent_connects_answers_commands_and_stops_on_a_signal() {
         AgentMessage::CommandAck { command_id } => assert_eq!(command_id, sent.command_id),
         other => panic!("commandAck expected, got {other:?}"),
     }
+    // The agent recorded the command before it acknowledged it, and now sends the event.
+    f.expect_received(1).await;
 
     let forged = f.signed_job(true).await;
     let sent = f
@@ -355,6 +376,45 @@ async fn a_registered_agent_connects_answers_commands_and_stops_on_a_signal() {
         assert_eq!(status, Some(0), "{}", agent.log_text());
     }
     f.wait_connected(None, false).await;
+    f.server.take().unwrap().finish().await;
+    f.world.finish().await;
+}
+
+/// The agent's `received` event follows `commandAck` with its outbox number, and the server, which
+/// acknowledges no event yet, gets it again after a reconnection, before the next command's
+/// answer and event (design 5.3, ADR-478).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_received_event_follows_the_ack_and_is_sent_again_after_a_reconnect() {
+    let mut f = Fixture::new().await;
+    let mut agent = f.start_agent();
+    f.wait_connected(Some(&mut agent), true).await;
+    let id = AgentId(f.agent_id.clone());
+    let sent = f
+        .hub
+        .send_job_command(&id, f.signed_job(false).await)
+        .unwrap();
+    match f.next().await.message {
+        AgentMessage::CommandAck { command_id } => assert_eq!(command_id, sent.command_id),
+        other => panic!("commandAck expected, got {other:?}"),
+    }
+    f.expect_received(1).await;
+
+    // The connection ends; the agent connects again and sends the event that was not acknowledged.
+    assert!(f.hub.close_agent(&id, shared_proto::CLOSE_CODE_GOING_AWAY));
+    f.wait_connected(Some(&mut agent), false).await;
+    f.wait_connected(Some(&mut agent), true).await;
+    f.expect_received(1).await;
+    let sent = f
+        .hub
+        .send_job_command(&id, f.signed_job(false).await)
+        .unwrap();
+    match f.next().await.message {
+        AgentMessage::CommandAck { command_id } => assert_eq!(command_id, sent.command_id),
+        other => panic!("commandAck expected, got {other:?}"),
+    }
+    f.expect_received(2).await;
+
+    agent.stop().await;
     f.server.take().unwrap().finish().await;
     f.world.finish().await;
 }

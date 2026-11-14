@@ -12,7 +12,8 @@
 //!    record once with the strict reader. Each lock is tried once, and both are held until the
 //!    task ends, waits included, so `ngr-agent register` exits 3 while a session lives.
 //! 2. [`Opened::start`] compares the loaded key's fingerprint with the record's, spawns the loop
-//!    with the [`Intake`] verified instructions go to and returns a [`Handle`] that stops it and shows its [`Status`].
+//!    with the [`Intake`] verified instructions go to and the [`SharedOutbox`] the loop sends and
+//!    returns a [`Handle`] that stops it and shows its [`Status`].
 //!
 //! The loop is exchange, upgrade, `hello`, keepalive, wait ([`exchange`], [`channel`]). It is
 //! driven only by `tokio::time`, with one writer, and stops through a `watch` signal. All socket
@@ -22,12 +23,16 @@
 //! forever, one warning per failure class since the last `hello` and debug after that. The delay
 //! is [`backoff`]'s.
 //!
+//! The loop sends the outbox's events and applies the server's `eventAck` ([`events`], design 5.3,
+//! ADR-478), and appends a `received` event before it answers a verified command.
+//!
 //! Never logged: the token, a challenge, a nonce, a proof, a body, a message's text, a
 //! `commandId`, the text of a close reason, the record's path or content.
 
 mod backoff;
 mod channel;
 mod dial;
+mod events;
 mod exchange;
 mod gate;
 #[cfg(test)]
@@ -50,6 +55,7 @@ use crate::registration::origin::ServerOrigin;
 use crate::registration::record::{self, Record, RecordError};
 use backoff::Backoff;
 use dial::{Dial, Loopback};
+pub use events::SharedOutbox;
 use exchange::Fail;
 pub use gate::{Intake, LogIntake};
 
@@ -292,6 +298,7 @@ struct Wiring {
     /// The record's instruction key, which the gate verifies against.
     instruction_key: PublicKey,
     intake: Arc<dyn Intake>,
+    outbox: SharedOutbox,
     audience: Audience,
     /// The `Host` header's value.
     host: String,
@@ -321,6 +328,16 @@ impl Warnings {
         } else {
             self.refused = true;
             tracing::warn!(class, status, "control channel refused");
+        }
+    }
+
+    /// An event could not be appended to the outbox: one warning per class since `hello`, debug
+    /// after that. The error's text is NGR's own (`operational-log.md`).
+    fn event_failure(&mut self, class: &'static str, error: &crate::outbox::OutboxError) {
+        if self.seen.insert(class) {
+            tracing::warn!(class, %error, "an event could not be recorded; the command is not acknowledged");
+        } else {
+            tracing::debug!(class, %error, "an event could not be recorded; the command is not acknowledged");
         }
     }
 
@@ -361,6 +378,7 @@ struct Seams {
     signer: Arc<dyn Signer + Send + Sync>,
     random: fn() -> Result<[u8; 32], RandomError>,
     intake: Arc<dyn Intake>,
+    outbox: SharedOutbox,
 }
 
 impl Opened {
@@ -370,15 +388,22 @@ impl Opened {
     }
 
     /// Step 2: compares `key`'s fingerprint with the record's and starts the loop, whose first
-    /// exchange begins at once; `intake` takes every instruction the gate verifies. Needs a running tokio runtime. On an error nothing was sent and
-    /// both locks are released.
-    pub fn start(self, key: AgentKey, intake: Arc<dyn Intake>) -> Result<Handle, ControlError> {
+    /// exchange begins at once; `intake` takes every instruction the gate verifies and `outbox`
+    /// is the open outbox of the record's agent ID, whose events each connection sends. Needs a
+    /// running tokio runtime. On an error nothing was sent and both locks are released.
+    pub fn start(
+        self,
+        key: AgentKey,
+        intake: Arc<dyn Intake>,
+        outbox: SharedOutbox,
+    ) -> Result<Handle, ControlError> {
         let port = self.origin()?.port();
         let seams = Seams {
             dial: Arc::new(Loopback { port }),
             signer: key.signer(),
             random: shared_crypto::random_32,
             intake,
+            outbox,
         };
         self.start_with(&key.public_key(), seams)
     }
@@ -386,7 +411,11 @@ impl Opened {
     /// Test seam for the caller's handling of a task that ends on its own: starts a session whose
     /// dial panics, so the task ends without a stop.
     #[cfg(test)]
-    pub(crate) fn start_panicking(self, key: AgentKey) -> Result<Handle, ControlError> {
+    pub(crate) fn start_panicking(
+        self,
+        key: AgentKey,
+        outbox: SharedOutbox,
+    ) -> Result<Handle, ControlError> {
         struct PanicDial;
         impl Dial for PanicDial {
             fn dial(&self) -> dial::Dialled<'_> {
@@ -398,6 +427,7 @@ impl Opened {
             signer: key.signer(),
             random: shared_crypto::random_32,
             intake: Arc::new(LogIntake),
+            outbox,
         };
         self.start_with(&key.public_key(), seams)
     }
@@ -421,6 +451,7 @@ impl Opened {
             signer: seams.signer,
             random: seams.random,
             intake: seams.intake,
+            outbox: seams.outbox,
             instruction_key,
             record: self.record,
             audience,

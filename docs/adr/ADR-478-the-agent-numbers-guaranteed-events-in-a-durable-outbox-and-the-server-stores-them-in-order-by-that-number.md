@@ -2,7 +2,7 @@
 
 **Date:** 2026-11-14
 **Status:** Accepted
-**Affects:** design 5.3, 5.4; `api/asyncapi.yaml` (`agentEvent`, `eventAck`); `crates/shared-proto` (`control`); `crates/agent` (`outbox`, `state`, `control`), `crates/agent/docs/ngr-agent.md`; the server's event storage and `db/migrations`; details ADR-466 item 10 and ADR-473 item 1
+**Affects:** design 5.3, 5.4; `api/asyncapi.yaml` (`agentEvent`, `eventAck`); `crates/shared-proto` (`control`); `crates/agent` (`outbox`, `state`, `control`), `crates/agent/docs/ngr-agent.md`; the server's event storage and `db/migrations`; details ADR-466 item 10 and supersedes ADR-473 item 1
 
 ## Context
 
@@ -60,7 +60,9 @@ backwards under one agent ID, since the server would drop the repeated number as
    blocking task raced with the session's stop. A failed append withholds the acknowledgement, so
    the server delivers the job again after its lease, which the intake already has to expect
    (ADR-473 item 4). Until the intake is idempotent on the job ID, a redelivery appends a second
-   `received` event.
+   `received` event. The append is tried once per command, after the hand-over to the intake; a
+   stop that comes first ends the connection as a stop, and the append, if it began, finishes
+   unobserved. A failure warns once per class since `hello` and counts nothing.
 6. **The server stores guaranteed events in order, in the transaction that moves the cursor.** A
    new table holds one row per event (tenant, agent, `seq`, kind, job ID, body, the device time as
    reference, the receive time as authority). For an event of agent `a` with cursor `c`: `seq <= c`
@@ -73,6 +75,17 @@ backwards under one agent ID, since the server would drop the repeated number as
    agent has seen acknowledged changes nothing. One above the highest number the agent has
    assigned is a protocol violation: the agent closes the connection with 1002 and drops
    nothing.
+
+8. **The channel sends the outbox, a window ahead of the acknowledgement.** After `hello` a
+   connection sends the pending events in order, from the oldest, and an event appended later at
+   once, never more than 64 numbers past the highest acknowledged. The connected loop's order is
+   stop, idle deadline, heartbeat tick, read, outbox, so a backlog delays neither a heartbeat nor a
+   read. A sent event is not a received frame and does not move the idle deadline; an
+   `eventAck` is one. What a connection sent and the server did not acknowledge is sent again by
+   the next connection, byte for byte. An acknowledgement that covers events this connection has
+   not sent yet skips them. After an acknowledgement whose rewrite of the file failed, the
+   connection holds the later ones back for 10 seconds and applies them together, so the owed
+   rewrite is tried about once per pause and not once per acknowledgement.
 
 ## Rejected
 
@@ -103,6 +116,6 @@ backwards under one agent ID, since the server would drop the repeated number as
   reconnection; a single lost frame on an open connection is repaired at the next connect.
 - A forged `eventAck` from an unauthenticated server (the local profile) makes the agent
   forget events the real server never stored; it is bounded by the range rule only.
-- Work after this decision: the agent's sender and acknowledgement handling and the `received`
-  append (the channel); the server's migration, the planner for the cases of item 6, the
-  acknowledgement and the retention of the table; thinning of `progress`.
+- Work after this decision: the server's migration, the planner for the cases of item 6, the
+  acknowledgement and the retention of the table; thinning of `progress`. Until the server reads
+  events, none is acknowledged and every connection sends the whole outbox again.

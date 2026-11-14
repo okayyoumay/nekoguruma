@@ -462,12 +462,12 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-470](ADR-470-the-agent-registers-in-a-fixed-order-that-spends-the-code-last.md) | The Agent Registers in a Fixed Order That Spends the Code Last | Accepted (its Consequence on `register` during a session settled by ADR-471) | design 6.7, `crates/agent`, `api/openapi.yaml`; details ADR-463 items 13, 16, 17 and 18 |
 | [ADR-471](ADR-471-the-agents-control-channel-session-is-one-task-between-two-locks-and-no-answer-of-the-server-ends-it.md) | The Agent's Control Channel Session Is One Task Between Two Locks, and No Answer of the Server Ends It | Accepted (item 5's job command answered through the gate, ADR-473) | design 5.2, 5.3, 6.4, 14.1, `api/`, `crates/agent`, `crates/shared-proto`, `crates/server`; details ADR-466 for the agent's side; settles ADR-470's Consequence on `register` during a session |
 | [ADR-472](ADR-472-the-hub-stamps-every-end-of-a-current-connection-and-drops-what-no-consumer-takes.md) | The Hub Stamps Every End of a Current Connection and Drops What No Consumer Takes | Accepted | design 14.1, 14.4, `api/asyncapi.yaml`, `crates/server`, `db/README.md`; details ADR-468 items 8, 11 and 12 |
-| [ADR-473](ADR-473-the-agent-answers-a-verified-job-command-with-an-acknowledgement-alone-until-the-outbox-numbers-events.md) | The Agent Answers a Verified Job Command With an Acknowledgement Alone Until the Outbox Numbers Events | Accepted (item 1 detailed by ADR-478) | design 5.3, `api/asyncapi.yaml`, `crates/agent`; details ADR-466 items 10 and 13, ADR-461 items 9 and 10 and ADR-471 item 5 for the agent's side |
+| [ADR-473](ADR-473-the-agent-answers-a-verified-job-command-with-an-acknowledgement-alone-until-the-outbox-numbers-events.md) | The Agent Answers a Verified Job Command With an Acknowledgement Alone Until the Outbox Numbers Events | Accepted (item 1 superseded by ADR-478 item 5) | design 5.3, `api/asyncapi.yaml`, `crates/agent`; details ADR-466 items 10 and 13, ADR-461 items 9 and 10 and ADR-471 item 5 for the agent's side |
 | [ADR-474](ADR-474-the-local-object-store-appends-by-offset-shows-only-finished-objects-and-issues-its-keys.md) | The Local Object Store Appends by Offset, Shows Only Finished Objects and Issues Its Keys | Accepted | design 13, `crates/server`, `db/README.md` |
 | [ADR-475](ADR-475-a-runs-end-is-mapped-to-the-jobs-state-by-its-error-and-its-journals-standing.md) | A Run's End Is Mapped to the Job's Reported State by Its Error and Its Journal's Standing | Accepted | design 5.6, `api/asyncapi.yaml`, `crates/agent`, `crates/shared-proto`; annotates ADR-280, ADR-288 |
 | [ADR-476](ADR-476-the-delivery-queue-takes-a-job-once-and-delivers-it-at-least-once-from-the-stored-instruction.md) | The Delivery Queue Takes a Job Once and Delivers It at Least Once, From the Stored Instruction | Accepted | design 5.3, 12, 14.1, `db/migrations`, `db/README.md`, `api/asyncapi.yaml`, `crates/server`, `crates/shared-proto`; details ADR-466 items 10 and 13, ADR-468 item 12 and ADR-472 item 4 |
 | [ADR-477](ADR-477-a-job-is-created-once-per-idempotency-key-with-the-key-judged-before-permission-and-the-server-making-the-id.md) | A Job Is Created Once per Idempotency Key, With the Key Judged Before Permission and the Server Making the ID | Accepted | design 4.4, 5.1, 12, `db/migrations`, `db/README.md`, `api/openapi.yaml`, `crates/server`, `crates/shared-proto`, `crates/agent`; details ADR-461 and ADR-476 |
-| [ADR-478](ADR-478-the-agent-numbers-guaranteed-events-in-a-durable-outbox-and-the-server-stores-them-in-order-by-that-number.md) | The Agent Numbers Guaranteed Events in a Durable Outbox, and the Server Stores Them in Order by That Number | Accepted | design 5.3, 5.4, `api/asyncapi.yaml`, `crates/shared-proto`, `crates/agent`, `db/migrations`; details ADR-466 item 10 and ADR-473 item 1 |
+| [ADR-478](ADR-478-the-agent-numbers-guaranteed-events-in-a-durable-outbox-and-the-server-stores-them-in-order-by-that-number.md) | The Agent Numbers Guaranteed Events in a Durable Outbox, and the Server Stores Them in Order by That Number | Accepted | design 5.3, 5.4, `api/asyncapi.yaml`, `crates/shared-proto`, `crates/agent`, `db/migrations`; details ADR-466 item 10 and supersedes ADR-473 item 1 |
 
 ## Status Legend
 
@@ -1060,7 +1060,7 @@ the predecessor repository these ADRs came from.
 - ADR-470 (its Consequence on `register` during a session settled by ADR-471)
 - ADR-471 (item 5's job command answered through the gate, ADR-473)
 - ADR-472
-- ADR-473 (item 1 detailed by ADR-478)
+- ADR-473 (item 1 superseded by ADR-478 item 5)
 - ADR-476
 - ADR-477
 - ADR-478

@@ -326,6 +326,17 @@ impl Outbox {
         self.last
     }
 
+    /// The highest number acknowledged, 0 when none has been.
+    pub fn acked(&self) -> u64 {
+        self.acked
+    }
+
+    /// Whether a rewrite that failed is still owed (the sender paces the acknowledgements that
+    /// would retry it).
+    pub fn rewrite_owed(&self) -> bool {
+        self.rewrite_owed
+    }
+
     /// Takes the server's cumulative acknowledgement of every event up to `n`: they leave the
     /// pending events. A number at or below the one already acknowledged drops nothing; one
     /// above [`Outbox::highest`] is [`OutboxError::OutOfRange`] and drops nothing. The file is

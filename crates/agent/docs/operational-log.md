@@ -71,6 +71,7 @@ of the above:
 
 - `std::io::Error`: the OS's message and code, never a path;
 - `JournalError`;
+- `OutboxError`;
 - `CommLogIncomplete`.
 
 A new error type that is logged needs a `LogSafe` impl, unless its text is likewise NGR's own
@@ -103,6 +104,12 @@ throughout.
   of it reaches the operational log. tracing-subscriber's `init()` or `try_init()` would install
   one (its default `tracing-log` feature is on), so switching to them needs a filter that keeps
   those targets out first.
+
+- **The outbox on the control channel** (`agent::control`, ADR-478): the entries hold a failure
+  class (`outbox-full`, `outbox-poisoned`, `outbox-write`, `outbox-event`, `event-ack`) and the
+  `OutboxError`'s own text; never an event's text, a job ID or a `commandId`. A failed
+  `received` append warns once per class until the next `hello` and is `debug` after that. A
+  failed rewrite of the outbox file logs the kind of the I/O error, as `Outbox` does.
 
 ## A crate not yet checked
 

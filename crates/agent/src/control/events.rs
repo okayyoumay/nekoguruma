@@ -1,0 +1,168 @@
+//! The outbox as the control channel uses it (design 5.3, 5.4; ADR-478): [`SharedOutbox`], the
+//! open outbox that the channel and the producers of events share, and [`Sender`], one
+//! connection's cursor over it.
+//!
+//! An event is pending in the outbox once its append has returned; the connection sends the
+//! pending events in order after `hello`, at most [`SEND_WINDOW`] past the number the server has
+//! acknowledged, and sends a later append at once. What was sent on a connection that ended before
+//! its acknowledgement is sent again by the next connection from the oldest pending event, with
+//! the same text. An acknowledgement is cumulative; one above the highest number assigned is a
+//! protocol violation ([`Acked::OutOfRange`]).
+//!
+//! The outbox's file operations block, so they run on blocking tasks; the connection's loop only
+//! ever awaits them.
+
+use std::io;
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::sync::{Mutex, Notify};
+use tokio::time::Instant;
+
+use crate::outbox::{Kind, Outbox, OutboxError};
+
+/// How many events may be on the wire past the highest number the server has acknowledged.
+pub(super) const SEND_WINDOW: u64 = 64;
+/// How long acknowledgements are held back after one whose rewrite of the file failed: the outbox
+/// tries the owed rewrite again at every acknowledgement and has no delay of its own.
+pub(super) const OWED_PAUSE: Duration = Duration::from_secs(10);
+
+/// The open outbox, shared by the control channel and whoever produces events. Cloning is cheap.
+#[derive(Clone)]
+pub struct SharedOutbox {
+    inner: Arc<Inner>,
+}
+
+struct Inner {
+    outbox: Mutex<Outbox>,
+    /// An event was appended: the connected loop looks for something to send.
+    added: Notify,
+}
+
+impl SharedOutbox {
+    pub fn new(outbox: Outbox) -> SharedOutbox {
+        SharedOutbox {
+            inner: Arc::new(Inner {
+                outbox: Mutex::new(outbox),
+                added: Notify::new(),
+            }),
+        }
+    }
+
+    /// Appends an event on a blocking task (see [`Outbox::append`]) and wakes the connection that
+    /// is waiting for events. The append goes on if this future is dropped.
+    pub async fn append(
+        &self,
+        kind: Kind,
+        text: impl FnOnce(u64) -> String + Send + 'static,
+    ) -> Result<u64, OutboxError> {
+        let inner = self.inner.clone();
+        let appended = tokio::task::spawn_blocking(move || {
+            let result = inner.outbox.blocking_lock().append(kind, text);
+            if result.is_ok() {
+                // One permit is kept when nobody waits, so the next wait ends at once.
+                inner.added.notify_one();
+            }
+            result
+        })
+        .await;
+        appended.unwrap_or_else(|_| Err(task_failed()))
+    }
+
+    /// The next event to send after number `sent`, once there is one within the window. Not
+    /// cancel-unsafe: it only reads.
+    async fn next_event(&self, sent: u64) -> (u64, String) {
+        loop {
+            let notified = self.inner.added.notified();
+            {
+                let outbox = self.inner.outbox.lock().await;
+                let limit = outbox.acked().saturating_add(SEND_WINDOW);
+                let next = outbox.pending().find(|(seq, _)| *seq > sent);
+                if let Some((seq, text)) = next.filter(|(seq, _)| *seq <= limit) {
+                    return (seq, text.to_owned());
+                }
+            }
+            notified.await;
+        }
+    }
+}
+
+fn task_failed() -> OutboxError {
+    OutboxError::Io(io::Error::other("the outbox task failed"))
+}
+
+/// What an acknowledgement did.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Acked {
+    Taken,
+    /// Above the highest number assigned: nothing changed.
+    OutOfRange,
+}
+
+/// One connection's view of the outbox.
+pub(super) struct Sender {
+    outbox: SharedOutbox,
+    /// The highest number written on this connection.
+    sent: u64,
+    /// The highest acknowledgement held back while the pause lasts.
+    held: u64,
+    /// While set and in the future, acknowledgements only advance `held`.
+    paused_until: Option<Instant>,
+}
+
+impl Sender {
+    pub(super) fn new(outbox: &SharedOutbox) -> Sender {
+        Sender {
+            outbox: outbox.clone(),
+            sent: 0,
+            held: 0,
+            paused_until: None,
+        }
+    }
+
+    /// Waits for the next event to write: the oldest pending one this connection has not sent,
+    /// within the window. Call [`Sender::wrote`] once it is written.
+    pub(super) async fn next(&self) -> (u64, String) {
+        self.outbox.next_event(self.sent).await
+    }
+
+    /// The event `seq` was written.
+    pub(super) fn wrote(&mut self, seq: u64) {
+        self.sent = seq;
+    }
+
+    /// Applies the server's cumulative acknowledgement on a blocking task: the events leave the
+    /// pending ones, and the file is rewritten when the outbox says so. After a rewrite failed,
+    /// further acknowledgements are held back for [`OWED_PAUSE`] and applied together, so the
+    /// owed rewrite is tried once per pause and not once per acknowledgement.
+    pub(super) async fn ack(&mut self, n: u64) -> Acked {
+        let paused = self
+            .paused_until
+            .is_some_and(|until| Instant::now() < until);
+        let inner = self.outbox.inner.clone();
+        let up_to = n.max(self.held);
+        let result = tokio::task::spawn_blocking(move || {
+            let mut outbox = inner.outbox.blocking_lock();
+            if paused {
+                // Only the range is checked; the rewrite is not tried.
+                return (n <= outbox.highest()).then_some(None);
+            }
+            outbox.ack(up_to).ok().map(|()| Some(outbox.rewrite_owed()))
+        })
+        .await;
+        match result {
+            Ok(Some(None)) => {
+                self.held = up_to;
+                Acked::Taken
+            }
+            Ok(Some(Some(owed))) => {
+                self.held = 0;
+                self.paused_until = owed.then(|| Instant::now() + OWED_PAUSE);
+                Acked::Taken
+            }
+            // `ack` fails only with `OutOfRange`; a task that failed is treated alike, since
+            // closing the connection is the safe side.
+            Ok(None) | Err(_) => Acked::OutOfRange,
+        }
+    }
+}

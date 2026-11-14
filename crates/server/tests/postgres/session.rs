@@ -8,6 +8,7 @@ use std::time::Duration;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use server::config::Http;
+use server::job_queue::Settings;
 use server::local_guard::pinned_origin;
 use server::{Hub, Server, Sessions};
 use shared_crypto::proof::{Audience, ProofTranscript, sign_proof};
@@ -300,6 +301,11 @@ impl Up {
 
     /// Like [`Up::new`], with a shutdown grace period of `grace_secs` seconds.
     pub(crate) async fn with_grace(grace_secs: u64) -> Up {
+        Up::with_queue(grace_secs, None).await
+    }
+
+    /// Like [`Up::with_grace`], with the delivery queue on when `queue` has its settings.
+    pub(crate) async fn with_queue(grace_secs: u64, queue: Option<Settings>) -> Up {
         let w = World::new().await;
         w.add_operator("alice").await;
         let agent = Agent::new();
@@ -311,6 +317,10 @@ impl Up {
         let server = Server::bind(&http, w.pg.pool(), w.key.clone())
             .await
             .unwrap();
+        let server = match queue {
+            Some(settings) => server.with_job_queue(settings),
+            None => server,
+        };
         let sessions = server.sessions();
         let hub = server.hub();
         Up {
@@ -342,6 +352,19 @@ impl Up {
         seen.push(STANDARD.encode(pair.1));
         drop(seen);
         pair
+    }
+
+    /// A valid exchange of this agent with another server `s` than this one's.
+    pub(crate) async fn valid_on(&self, s: &Running) -> Reply {
+        let (challenge, nonce) = (get_challenge(s).await, random_32().unwrap());
+        let p = proof(
+            &self.agent.key,
+            &audience_of(s.addr.port()),
+            &self.id,
+            challenge,
+            nonce,
+        );
+        send_session(s, &session_body(&self.id, &challenge, &nonce, &p)).await
     }
 
     pub(crate) async fn valid(&self) -> Reply {

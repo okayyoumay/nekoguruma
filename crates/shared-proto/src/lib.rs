@@ -198,9 +198,16 @@ pub enum FailureCode {
     /// An exchange with the vehicle failed. Asserts neither a fault of the vehicle nor of the
     /// diagnostic system; the communication log tells which (8.11, ADR-375, ADR-475).
     ExchangeFailed,
-    /// A fault in the agent itself. The only code that asserts one on the diagnostic system's
-    /// side (5.6, ADR-475).
+    /// A fault in the agent itself, or in the server for a job it ends itself (an instruction
+    /// too large to send, ADR-476). The only code that asserts a fault on the diagnostic
+    /// system's side (5.6, ADR-475).
     Internal,
+    /// The agent refused the delivered command (5.3, ADR-476); the failure's detail is the agent's
+    /// coarse reason.
+    InstructionRejected,
+    /// The job's instruction was signed by a key that is no longer the server's active one, so
+    /// it is never sent (5.3, ADR-462, ADR-476).
+    InstructionKeyRetired,
     Other,
 }
 
@@ -226,6 +233,8 @@ impl FailureCode {
             FailureCode::LinkNotOpened => "linkNotOpened",
             FailureCode::ExchangeFailed => "exchangeFailed",
             FailureCode::Internal => "internal",
+            FailureCode::InstructionRejected => "instructionRejected",
+            FailureCode::InstructionKeyRetired => "instructionKeyRetired",
             FailureCode::Other => "other",
         }
     }

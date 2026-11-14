@@ -20,7 +20,9 @@ use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use shared_proto::{AgentId, AgentMessage, CLOSE_CODE_REPLACED, CLOSE_CODES, ServerMessage};
+use shared_proto::{
+    AgentId, AgentMessage, CLOSE_CODE_REPLACED, CLOSE_CODES, MAX_CONTROL_MESSAGE_LEN, ServerMessage,
+};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
@@ -29,6 +31,9 @@ use tokio::task::JoinSet;
 pub const OUTBOUND_CAPACITY: usize = 16;
 /// How many messages wait in the inbox.
 pub const INBOX_CAPACITY: usize = 256;
+
+/// The length of the widest command ID: `c-` and the digits of `u64::MAX`.
+const WIDEST_COMMAND_ID_LEN: usize = 2 + 20;
 
 /// The generation of one connection of an agent: a later connection of the same agent has a
 /// larger value, so a connection that ends late cannot remove its successor's entry.
@@ -221,7 +226,9 @@ impl Hub {
 
     /// Queues a signed job on `agent`'s current connection. It does not wait and writes nothing
     /// itself: the connection's task writes the frame, after its `hello`, in the order of the
-    /// calls. A call that fails still used its `commandId` number.
+    /// calls. A call that fails still used its `commandId` number. Whether a frame is too large is
+    /// judged as if the command ID had the widest number the counter can produce, so that a job
+    /// that fits does not stop fitting as the counter grows.
     pub fn send_job_command(
         &self,
         agent: &AgentId,
@@ -237,6 +244,11 @@ impl Hub {
         .encode()
         // Serializing two strings fails only by the size limit; any other error is refused alike.
         .map_err(|_| SendError::TooLarge)?;
+        if frame.len() + WIDEST_COMMAND_ID_LEN.saturating_sub(command_id.len())
+            > MAX_CONTROL_MESSAGE_LEN
+        {
+            return Err(SendError::TooLarge);
+        }
         let state = self.0.lock();
         if state.tasks.is_none() {
             return Err(SendError::NotConnected);
@@ -410,18 +422,35 @@ mod tests {
 
     // D1
     #[test]
-    fn a_frame_of_exactly_128_kib_is_queued_and_one_byte_more_is_too_large_before_the_connection() {
-        let overhead = frame_len("");
-        let fits = "x".repeat(MAX_CONTROL_MESSAGE_LEN - overhead);
-        assert_eq!(frame_len(&fits), MAX_CONTROL_MESSAGE_LEN);
+    fn a_frame_is_judged_with_the_widest_command_id_so_the_counter_does_not_change_the_verdict() {
+        // The frame that is exactly 128 KiB with the widest ID (`c-` and the 20 digits of
+        // `u64::MAX`) is the longest one accepted, however small the counter is.
+        let widest = format!("c-{}", u64::MAX);
+        assert_eq!(widest.len(), WIDEST_COMMAND_ID_LEN);
+        let with_widest = |signed_job: &str| {
+            ServerMessage::JobCommand {
+                command_id: widest.clone(),
+                signed_job: Some(signed_job.to_owned()),
+            }
+            .encode()
+            .unwrap()
+            .len()
+        };
+        let fits = "x".repeat(MAX_CONTROL_MESSAGE_LEN - with_widest(""));
+        assert_eq!(with_widest(&fits), MAX_CONTROL_MESSAGE_LEN);
+        assert_eq!(
+            frame_len(&fits),
+            MAX_CONTROL_MESSAGE_LEN - (widest.len() - "c-1".len())
+        );
         let hub = Hub::new();
         let a = agent("a");
-        // Nobody is connected: the size is judged first. The first call has the ID `c-1`.
+        // Nobody is connected: the size is judged first. The first call has the ID `c-1`, and
+        // one byte more is too large although that frame would fit with this ID.
+        assert!(frame_len(&format!("{fits}xxxxx")) <= MAX_CONTROL_MESSAGE_LEN);
         assert_eq!(
             hub.send_job_command(&a, format!("{fits}x")),
             Err(SendError::TooLarge)
         );
-        // The ID `c-2` has the same width, so the boundary holds for it.
         assert_eq!(
             hub.send_job_command(&a, fits.clone()),
             Err(SendError::NotConnected)
@@ -438,7 +467,7 @@ mod tests {
         assert!(hub.send_job_command(&a, fits).is_ok());
         assert_eq!(
             reg.outbound.try_recv().unwrap().len(),
-            MAX_CONTROL_MESSAGE_LEN
+            MAX_CONTROL_MESSAGE_LEN - (widest.len() - "c-4".len())
         );
     }
 

@@ -33,7 +33,7 @@ const PATH: &str = "/api/v1/agent/control";
 const SUBPROTOCOL: &str = "ngr-control.v1";
 const HEARTBEAT: &str = r#"{"type":"heartbeat"}"#;
 
-type Client = WebSocketStream<TcpStream>;
+pub(crate) type Client = WebSocketStream<TcpStream>;
 
 // ---------------------------------------------------------------------------------------------
 // Raw requests, for the refusals
@@ -121,7 +121,7 @@ async fn handshake(
 }
 
 /// Opens a connection with `token` and reads its `hello`.
-async fn open(addr: SocketAddr, token: &str) -> Client {
+pub(crate) async fn open(addr: SocketAddr, token: &str) -> Client {
     let request = request(addr, Some(&format!("Bearer {token}")), &[SUBPROTOCOL]);
     let (mut client, response) = handshake(addr, request)
         .await
@@ -139,7 +139,7 @@ async fn frame(client: &mut Client) -> Option<Result<Message, tungstenite::Error
 }
 
 /// The next text frame; pings and pongs are skipped.
-async fn text(client: &mut Client) -> String {
+pub(crate) async fn text(client: &mut Client) -> String {
     loop {
         match frame(client).await.expect("the stream ended") {
             Ok(Message::Text(text)) => return text.as_str().to_owned(),
@@ -161,12 +161,12 @@ async fn heartbeat_with(client: &mut Client, body: String) {
     assert_eq!(echo, ServerMessage::Heartbeat);
 }
 
-async fn heartbeat(client: &mut Client) {
+pub(crate) async fn heartbeat(client: &mut Client) {
     heartbeat_with(client, HEARTBEAT.to_owned()).await;
 }
 
 /// Reads until the connection ends and returns the code of the Close frame it carried.
-async fn close_code(client: &mut Client) -> u16 {
+pub(crate) async fn close_code(client: &mut Client) -> u16 {
     let mut code = None;
     loop {
         match frame(client).await {
@@ -179,7 +179,7 @@ async fn close_code(client: &mut Client) -> u16 {
     code.expect("a Close frame before the end")
 }
 
-async fn token(u: &Up) -> String {
+pub(crate) async fn token(u: &Up) -> String {
     let r = u.valid().await;
     assert_eq!(r.status, 200, "{}", r.head);
     json(&r)["token"].as_str().unwrap().to_owned()
@@ -788,7 +788,7 @@ async fn lock_agents(u: &Up) -> sqlx::Transaction<'static, sqlx::Postgres> {
     tx
 }
 
-async fn revoke_row(u: &Up, id: &str) {
+pub(crate) async fn revoke_row(u: &Up, id: &str) {
     sqlx::query("UPDATE agents SET revoked_at = now() WHERE id = $1::uuid")
         .bind(id)
         .execute(&u.w.pool)
@@ -813,7 +813,7 @@ async fn delete_row(u: &Up, id: &str) {
 }
 
 /// Registers a second agent and gives its token.
-async fn second_agent(u: &Up) -> (String, String) {
+pub(crate) async fn second_agent(u: &Up) -> (String, String) {
     let agent = Agent::new();
     let id = u.w.register(&agent).await;
     let r = u.exchange_as(&agent.key, &id).await;
@@ -841,7 +841,7 @@ async fn first_frame_close_code(client: &mut Client) -> u16 {
     code
 }
 
-fn agent_id(u: &Up) -> AgentId {
+pub(crate) fn agent_id(u: &Up) -> AgentId {
     AgentId(u.id.clone())
 }
 
@@ -849,7 +849,7 @@ fn count(log: &crate::redeem::Captured, needle: &str) -> usize {
     log.text().lines().filter(|l| l.contains(needle)).count()
 }
 
-async fn quiet_for(client: &mut Client, millis: u64) {
+pub(crate) async fn quiet_for(client: &mut Client, millis: u64) {
     assert!(
         tokio::time::timeout(Duration::from_millis(millis), client.next())
             .await
@@ -1317,17 +1317,16 @@ async fn commands_reach_the_agent_in_order_and_the_size_and_presence_errors_are_
         "D2: nobody connected"
     );
     let mut client = open(u.s.addr, &t).await;
-    // D1: the frame's own length counts, the ID's digits included.
+    // D1: the frame's own length counts, judged with the widest command ID the counter can make.
     let overhead = ServerMessage::JobCommand {
-        command_id: "c-3".to_owned(),
+        command_id: format!("c-{}", u64::MAX),
         signed_job: Some(String::new()),
     }
     .encode()
     .unwrap()
     .len();
     let limit = 128 * 1024;
-    // `c-1` went to the call with nobody connected and `c-2` to this refusal; every ID that
-    // follows has the same width.
+    // `c-1` went to the call with nobody connected and `c-2` to this refusal.
     assert_eq!(
         u.hub
             .send_job_command(&agent, "x".repeat(limit - overhead + 1)),
@@ -1379,7 +1378,7 @@ async fn next_inbound(inbox: &mut tokio::sync::mpsc::Receiver<Inbound>) -> Inbou
         .expect("the inbox is open")
 }
 
-fn progress(seq: usize) -> Message {
+pub(crate) fn progress(seq: usize) -> Message {
     Message::Text(
         format!(
             r#"{{"type":"agentEvent","seq":{seq},"kind":"progress","jobId":"j","progressPermille":5,"phase":"x"}}"#

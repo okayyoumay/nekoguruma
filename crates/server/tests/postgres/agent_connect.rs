@@ -18,6 +18,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use server::config::Http;
 use server::hub::Inbound;
+use server::job_queue::Settings;
 use server::{Hub, Server};
 use shared_proto::{
     AgentId, AgentMessage, INSTRUCTION_VERSION, InstructionRejectReason, JobId, JobInstruction,
@@ -37,13 +38,19 @@ struct Fixture {
     world: World,
     server: Option<Running>,
     hub: Hub,
-    inbox: Receiver<Inbound>,
+    /// The test's side of the inbox; `None` when the delivery queue holds it.
+    inbox: Option<Receiver<Inbound>>,
     env: AgentEnv,
     agent_id: String,
 }
 
 impl Fixture {
     async fn new() -> Fixture {
+        Fixture::with_queue(false).await
+    }
+
+    /// With `queue` the server's delivery queue is on and the test takes no inbox.
+    async fn with_queue(queue: bool) -> Fixture {
         let world = World::new().await;
         world.add_operator("alice").await;
         let http = Http {
@@ -54,7 +61,16 @@ impl Fixture {
             .await
             .unwrap();
         let hub = server.hub();
-        let inbox = hub.inbox().expect("the inbox is taken once");
+        let (server, inbox) = if queue {
+            let settings = Settings {
+                period: Duration::from_millis(50),
+                lease: LIMIT,
+                passes: None,
+            };
+            (server.with_job_queue(settings), None)
+        } else {
+            (server, Some(hub.inbox().expect("the inbox is taken once")))
+        };
         let server = Running::spawn(server);
         let env = AgentEnv::new();
         let fingerprint = fingerprint(&env).await;
@@ -134,9 +150,14 @@ impl Fixture {
     /// A job command for this agent, signed by the server's instruction key; `forge` flips a byte
     /// of the envelope after signing.
     async fn signed_job(&self, forge: bool) -> String {
+        STANDARD.encode(self.envelope(JOB_ID, forge).await)
+    }
+
+    /// The envelope of the instruction of job `job_id`; `forge` flips its last byte.
+    async fn envelope(&self, job_id: &str, forge: bool) -> Vec<u8> {
         let instruction = JobInstruction {
             version: INSTRUCTION_VERSION,
-            job_id: JobId(JOB_ID.to_owned()),
+            job_id: JobId(job_id.to_owned()),
             ownership_generation: 1,
             agent_id: AgentId(self.agent_id.clone()),
             operator_id: "operator-1".to_owned(),
@@ -153,14 +174,65 @@ impl Fixture {
         if forge {
             *envelope.last_mut().unwrap() ^= 1;
         }
-        STANDARD.encode(&envelope)
+        envelope
+    }
+
+    /// A job row for this agent holding `envelope`, signed under the server's active key.
+    async fn add_job(&self, id: &str, order: i64, envelope: &[u8]) {
+        sqlx::query(
+            "INSERT INTO jobs (tenant_id, id, kind, agent_id, operator_id, vci_id, \
+                 confirmation_level, start_deadline, signed_job, signing_key_id, created_at, \
+                 idempotency_key) \
+             SELECT a.tenant_id, $2::uuid, 'runSequence', a.id, o.id, 'vci-a', 'notifyOnly', \
+                 now() + interval '1 hour', $4, $5, now() - interval '1 hour' + $3 * interval '1 second', \
+                 $2 \
+             FROM agents a JOIN operators o ON o.tenant_id = a.tenant_id WHERE a.id = $1::uuid",
+        )
+        .bind(&self.agent_id)
+        .bind(id)
+        .bind(order)
+        .bind(envelope)
+        .bind(self.world.key.key_id())
+        .execute(&self.world.pool)
+        .await
+        .unwrap();
+    }
+
+    /// Waits until the job's row reads `expected`: state, failure code, detail, delivered.
+    async fn until_job(&self, id: &str, expected: &str) {
+        let deadline = Instant::now() + LIMIT;
+        loop {
+            let now: String = sqlx::query_scalar(
+                "SELECT concat_ws('|', state, coalesce(failure_code, ''), \
+                     coalesce(failure_detail, ''), (delivered_at IS NOT NULL)::text) \
+                 FROM jobs WHERE id = $1::uuid",
+            )
+            .bind(id)
+            .fetch_one(&self.world.pool)
+            .await
+            .unwrap();
+            if now == expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the job reads {now}, not {expected}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     async fn next(&mut self) -> Inbound {
-        tokio::time::timeout(LIMIT, self.inbox.recv())
-            .await
-            .expect("the agent answers")
-            .expect("the inbox stays open")
+        tokio::time::timeout(
+            LIMIT,
+            self.inbox
+                .as_mut()
+                .expect("the test holds the inbox")
+                .recv(),
+        )
+        .await
+        .expect("the agent answers")
+        .expect("the inbox stays open")
     }
 }
 
@@ -300,5 +372,27 @@ async fn a_stop_of_the_server_closes_the_connection_and_the_agent_keeps_running(
     if cfg!(unix) {
         assert_eq!(status, Some(0), "{}", agent.log_text());
     }
+    f.world.finish().await;
+}
+
+/// A stored envelope with one flipped byte is delivered by the queue; the agent's own gate refuses
+/// it with the bad-signature reason, which ends the job as failed with the server's code for a
+/// rejection, and the agent's next job is delivered and acknowledged (design 5.3, ADR-476).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forged_stored_command_is_rejected_by_the_agent_and_ends_the_job_and_the_next_is_delivered()
+ {
+    const NEXT_ID: &str = "0194f0a2-7c3e-7d11-8a52-3f6f9b1c2d50";
+    let mut f = Fixture::with_queue(true).await;
+    let forged = f.envelope(JOB_ID, true).await;
+    f.add_job(JOB_ID, 1, &forged).await;
+    let good = f.envelope(NEXT_ID, false).await;
+    f.add_job(NEXT_ID, 2, &good).await;
+    let mut agent = f.start_agent();
+    f.wait_connected(Some(&mut agent), true).await;
+    f.until_job(NEXT_ID, "received|||true").await;
+    f.until_job(JOB_ID, "failed|instructionRejected|badSignature|false")
+        .await;
+    agent.stop().await;
+    f.server.take().unwrap().finish().await;
     f.world.finish().await;
 }

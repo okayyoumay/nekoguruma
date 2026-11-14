@@ -586,7 +586,7 @@ connection with hyper's `with_upgrades()`.
   queue holds 16 frames and which the task drains after `hello`, each write within
   `WRITE_TIMEOUT`. `Delivery { connection, command_id }` means queued, not written;
   `SendError::NotConnected` (no current connection, or it is closing), `Busy` and `TooLarge`
-  (the frame over 131072 bytes, judged before the connection is looked at). A frame queued on a
+  (the frame over 131072 bytes with the widest command ID, `c-` and the 20 digits of `u64::MAX`, so that the verdict does not depend on the counter; judged before the connection is looked at). A frame queued on a
   connection that has been told to close, or at a stop, is not written. `Hub::inbox()` gives its
   receiver (256 messages) to the first caller: `commandAck`, `commandRejected`, `agentEvent`
   and `reconcile` arrive as `Inbound { agent, connection, message }` in read order, never a
@@ -604,6 +604,42 @@ connection with hyper's `with_upgrades()`.
   connected and not returned (a missing row included) has its tokens dropped, then its
   connection told to close with 4002, with one warn line; a failed read is one gated warning
   and closes nobody. It ends when the stop begins, in its wait and in its read.
+- **The delivery queue (`job_queue.rs`, ADR-476).** One task of the hub's set, spawned by
+  `Server::run` when the queue is on (`Server::start` turns it on with a 2 second period and a 90
+  second lease; `Server::bind` leaves it off, and a test turns it on with `with_job_queue`), and
+  the only consumer of the hub's inbox. Each iteration takes the connection snapshot, drains the
+  inbox, settles what it holds and releases the deliveries of connections that are no longer
+  current, then, on a tick, runs a pass: one transaction that ends the jobs of a retired key
+  (`failed`, `instructionKeyRetired`), takes the `received` rows of the connected, unrevoked
+  agents `FOR UPDATE SKIP LOCKED`, queues each stored instruction (base64 of the stored bytes)
+  through `Hub::send_job_command` and marks the rows queued (`delivery_attempts`, and `delivery_sent_at`
+  as the time of the mark statement, which the flight keeps as the token of that delivery). The
+  take reads, for each connected agent, a lateral select of its oldest rows (at most the outbound
+  queue's 16), ranks them within the agent and keeps the first 64 of all by (rank, creation time,
+  ID): every agent with work gets its oldest job into the pass before any agent gets its second,
+  an idle agent takes no place, the transaction stays short and no state is kept between passes.
+  Those two steps lock nothing (a window function cannot be combined with `FOR UPDATE`, and locking
+  before the limit would hold rows the limit drops); a last step locks the chosen rows `FOR UPDATE
+  SKIP LOCKED` and checks their conditions again, so a row another pass holds is skipped and
+  becomes free when that pass commits. The sweep skips rows another pass holds too. The take
+  also returns the row's mark as it was (null or an expired one): a flight keeps that mark
+  (`prior`) and the mark its own statement returned (`returned`); after a commit that succeeded
+  only `returned` counts, after one that failed either does, as a failure can be reported for a
+  commit that happened. The answer's writes compare the row's mark and attempts with them: `prior`
+  goes with n attempts and `returned` with n + 1.
+  A frame over the limit (`SendError::TooLarge`) is not like a full queue or a missing connection
+  (`Busy`, `NotConnected`: the job stays queued): it can never be sent, so the job is ended as `failed`
+  with `internal`.
+  While a pass or a write waits for the database the task keeps reading the inbox into a buffer
+  (4096 messages at most, applied by the next iteration), and an answer that could not be
+  written is kept and written again on the next tick (not on every message); what was buffered during a write is applied right after it, and at the latest on the next tick. Two instances never hold one row at once; a commit that
+  fails after a frame was queued leaves the row as it was before the send (or, if it went through though it was reported as failed, at the new mark), so it can be sent again. An
+  acknowledgement sets `delivered_at`; a rejection ends the job
+  (`failed`, `instructionRejected`, the agent's reason as the detail); both, and a release, write only while the
+  job is neither finished nor delivered and still carries a mark that delivery expects (see above)
+  with the attempts that go with it. `agentEvent` and `reconcile` messages are dropped with a
+  debug line. A failed pass sends nothing and is one gated warning (60 seconds). The task ends
+  when the stop begins, in its wait and in its read.
 - **After a close.** The task leaves the registry first, then writes the Close frame, then the
   disconnect stamp (above), then drains (reads and discards until the peer's reply, at most `CLOSE_WAIT`, 5 seconds). After a
   read error the stack allows no read, so the task waits `CLOSE_WAIT` without reading (a stop
@@ -622,8 +658,9 @@ connection with hyper's `with_upgrades()`.
 - **Logging.** One info line at the connect and one at the end, with the agent ID, a connection
   number and a word for the end; no token and no message text.
 - **Scope.** The hub holds no job state and writes no table of its own: the connection tasks
-  write `agents.last_seen_at` through the stamp, the revocation pass reads `agents`, and
-  everything else the agent says goes to the inbox for whoever takes it.
+  write `agents.last_seen_at` through the stamp, the revocation pass reads `agents`, the delivery
+  queue reads and marks `jobs`, and everything else the agent says goes to the inbox, which the
+  queue takes.
 
 Any other path answers 404 with a problem body, after the guard.
 
@@ -688,6 +725,15 @@ a new migration file rebuilds the crate. How migrations are written and applied 
   exchange are answered as before; a 503 from a locked table that is not counted; a challenge
   and a token expiring under a moved tokio clock (`pause`, `advance` and `resume` back to back
   with no request in flight); and one valid request sent twice at once giving one 200 and one 401.
+  `job_queue.rs` (unit tests in `src/job_queue.rs`) covers the queue: unit tests for the dispatch
+  (a full queue, no connection, a frame over the limit, a stop between two sends) and for the
+  settling of answers; over PostgreSQL, fake agents on WebSocket and rows the test inserts:
+  delivery with the stored bytes and the acknowledgement, an agent that is not connected, two
+  servers on one database (every job on one socket, the take skipping held rows, the plan using
+  `jobs_pending`), a dropped take, a server that goes away and the lease, a dropped socket and a
+  replacement, a rejection, answers that write nothing, a retired or missing key, a revoked
+  agent, a past deadline, the stop, a failing pass, and `Server::start` turning the queue on. The
+  agent binary's refusal of a forged stored command is in `agent_connect.rs`.
   `control.rs` (unit tests in `src/control.rs` and `src/hub.rs`) drives the control channel over
   TCP with `tokio-tungstenite` as the client. Refusals: every way of having no valid token is
   the same 401 (no header, another scheme, a bare scheme, two headers, 43 characters, an unknown

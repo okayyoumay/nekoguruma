@@ -145,6 +145,10 @@ pub struct Outbox {
     file_len: u64,
     /// The bytes of acknowledged events still in the file.
     acked_bytes: u64,
+    /// A rewrite that an acknowledgement called for has failed and is not done yet: the file
+    /// still holds acknowledged events. Any acknowledgement, and an append about to answer
+    /// [`OutboxError::Full`], tries it again.
+    rewrite_owed: bool,
     poisoned: bool,
     probe: Probe,
 }
@@ -191,6 +195,7 @@ impl Outbox {
             pending: VecDeque::new(),
             file_len: 0,
             acked_bytes: 0,
+            rewrite_owed: false,
             poisoned: false,
             probe,
         };
@@ -216,6 +221,11 @@ impl Outbox {
         // before the frames count as pending, narrows the window in which a restart sends an
         // event that a power loss would still take back. It also makes the cut durable.
         file.sync_all()?;
+        // The file may be one that a rewrite renamed into place whose directory entry never
+        // reached the disk (a crash, or a failed sync after the rename); making it durable
+        // here, before the open accepts appends, closes that gap. A failure fails the open.
+        (self.probe)(Step::AfterRename)?;
+        sync_after_rename(&self.dir, &self.path)?;
         match fs::remove_file(self.tmp_path()) {
             Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error.into()),
             _ => {}
@@ -247,9 +257,12 @@ impl Outbox {
         if self.poisoned {
             return Err(OutboxError::Poisoned);
         }
+        // The number after the last event must stay representable, since `parse` computes it;
+        // so the highest number ever given is `u64::MAX - 1`.
         let seq = self
             .last
             .checked_add(1)
+            .filter(|seq| *seq < u64::MAX)
             .ok_or(OutboxError::Corrupt("the event counter overflows"))?;
         let text = text(seq);
         if text.len() > MAX_EVENT_TEXT {
@@ -265,7 +278,16 @@ impl Outbox {
             Kind::Other => MAX_OUTBOX_BYTES,
         };
         if self.file_len + frame.len() as u64 > limit {
-            return Err(OutboxError::Full);
+            // Acknowledged events a failed rewrite left behind may be what fills the file.
+            if self.rewrite_owed && !self.poisoned {
+                self.rewrite();
+            }
+            if self.poisoned {
+                return Err(OutboxError::Poisoned);
+            }
+            if self.file_len + frame.len() as u64 > limit {
+                return Err(OutboxError::Full);
+            }
         }
         if let Err(error) = self.write(&frame) {
             self.poisoned = true;
@@ -301,11 +323,12 @@ impl Outbox {
     }
 
     /// Takes the server's cumulative acknowledgement of every event up to `n`: they leave the
-    /// pending events. A number at or below the one already acknowledged changes nothing; one
+    /// pending events. A number at or below the one already acknowledged drops nothing; one
     /// above [`Outbox::highest`] is [`OutboxError::OutOfRange`] and drops nothing. The file is
     /// rewritten without the acknowledged prefix when nothing is pending or 64 KiB are
-    /// acknowledged; a rewrite that fails leaves the old file in place, is logged and is tried
-    /// again at a later acknowledgement.
+    /// acknowledged; a rewrite that fails leaves the old file in place, is logged and is owed:
+    /// any later acknowledgement (a repeated one too) and an append that would find the file
+    /// full try it again.
     pub fn ack(&mut self, n: u64) -> Result<(), OutboxError> {
         if n > self.last {
             return Err(OutboxError::OutOfRange {
@@ -313,22 +336,32 @@ impl Outbox {
                 highest: self.last,
             });
         }
-        if n <= self.acked {
-            return Ok(());
-        }
-        while self.pending.front().is_some_and(|event| event.seq <= n) {
-            if let Some(event) = self.pending.pop_front() {
-                self.acked_bytes += event.frame_len();
+        let advanced = n > self.acked;
+        if advanced {
+            while self.pending.front().is_some_and(|event| event.seq <= n) {
+                if let Some(event) = self.pending.pop_front() {
+                    self.acked_bytes += event.frame_len();
+                }
             }
+            self.acked = n;
         }
-        self.acked = n;
-        if !self.poisoned
-            && (self.pending.is_empty() || self.acked_bytes >= REWRITE_BYTES)
-            && let Err(error) = self.install()
-        {
-            tracing::warn!(kind = ?error.kind(), "rewriting the outbox failed; keeping the old file");
+        let due = self.rewrite_owed
+            || (advanced && (self.pending.is_empty() || self.acked_bytes >= REWRITE_BYTES));
+        if due && !self.poisoned {
+            self.rewrite();
         }
         Ok(())
+    }
+
+    /// Rewrites the file without the acknowledged prefix; a failure is logged and owed.
+    fn rewrite(&mut self) {
+        match self.install() {
+            Ok(()) => self.rewrite_owed = false,
+            Err(error) => {
+                self.rewrite_owed = true;
+                tracing::warn!(kind = ?error.kind(), "rewriting the outbox failed; keeping the old file");
+            }
+        }
     }
 
     /// Writes the file whole (header with the floor `acked`, then the pending events) under a
@@ -364,8 +397,8 @@ impl Outbox {
             }
             return Err(error);
         }
-        let _ = (self.probe)(Step::AfterRename);
-        let synced = sync_after_rename(&self.dir, &self.path);
+        let synced =
+            (self.probe)(Step::AfterRename).and_then(|()| sync_after_rename(&self.dir, &self.path));
         self.file_len = bytes.len() as u64;
         self.acked_bytes = 0;
         match open_rw(&self.path) {
@@ -428,6 +461,13 @@ fn encode_file<'a>(
     Ok(out)
 }
 
+/// An event frame's payload: its number (8 bytes, little endian) and its UTF-8 text. `None` when
+/// either is missing; `parse` and the torn-tail check read events by this one rule.
+fn decode_event(payload: &[u8]) -> Option<(u64, &str)> {
+    let (seq, text) = payload.split_first_chunk::<SEQ_LEN>()?;
+    Some((u64::from_le_bytes(*seq), std::str::from_utf8(text).ok()?))
+}
+
 /// Reads a whole file: the floor, the events, and the length up to the end of the last whole
 /// frame. Anything that is not one unfinished append at the end is corrupt.
 fn parse(bytes: &[u8], agent_id: &str) -> Result<(u64, Vec<Event>, usize), OutboxError> {
@@ -450,11 +490,7 @@ fn parse(bytes: &[u8], agent_id: &str) -> Result<(u64, Vec<Event>, usize), Outbo
     if header.protection != 0 {
         return Err(corrupt("unknown protection"));
     }
-    let seq_of = |payload: &[u8]| {
-        payload
-            .first_chunk::<SEQ_LEN>()
-            .map(|seq| u64::from_le_bytes(*seq))
-    };
+    let seq_of = |payload: &[u8]| decode_event(payload).map(|(seq, _)| seq);
     let mut events = Vec::new();
     let mut expected = header
         .floor
@@ -464,17 +500,14 @@ fn parse(bytes: &[u8], agent_id: &str) -> Result<(u64, Vec<Event>, usize), Outbo
     while offset < bytes.len() {
         match read_frame(bytes, offset) {
             FrameRead::Ok { payload, next } => {
-                let (seq, text) = payload
-                    .split_first_chunk::<SEQ_LEN>()
-                    .ok_or(corrupt("an event has no number"))?;
-                if u64::from_le_bytes(*seq) != expected {
+                let (seq, text) =
+                    decode_event(payload).ok_or(corrupt("an event does not decode"))?;
+                if seq != expected {
                     return Err(corrupt("event numbers are not contiguous"));
                 }
-                let text = String::from_utf8(text.to_vec())
-                    .map_err(|_| corrupt("an event text is not UTF-8"))?;
                 events.push(Event {
-                    seq: expected,
-                    text,
+                    seq,
+                    text: text.to_owned(),
                 });
                 expected = expected
                     .checked_add(1)
@@ -750,6 +783,147 @@ mod tests {
         let mut outbox = Outbox::open_in(dir.path(), ID).unwrap();
         assert_eq!(outbox.pending().count(), 0);
         assert_eq!(outbox.append(Kind::Other, text).unwrap(), 5);
+    }
+
+    // S10
+    #[test]
+    fn a_rewrite_owed_is_tried_again_by_a_repeated_acknowledgement() {
+        let dir = tempfile::tempdir().unwrap();
+        let armed = Arc::new(AtomicBool::new(false));
+        let mut outbox =
+            Outbox::open_with(dir.path(), ID, failing_at(Step::BeforeRename, &armed)).unwrap();
+        put(&mut outbox, 3);
+        armed.store(true, Ordering::SeqCst);
+        outbox.ack(3).unwrap();
+        assert!(outbox.rewrite_owed);
+        let owing = fs::metadata(file_of(dir.path())).unwrap().len();
+        armed.store(false, Ordering::SeqCst);
+        // The same number again changes no acknowledgement, but the rewrite is retried.
+        outbox.ack(3).unwrap();
+        assert!(!outbox.rewrite_owed);
+        assert!(fs::metadata(file_of(dir.path())).unwrap().len() < owing);
+        assert_eq!(outbox.pending().count(), 0);
+    }
+
+    // S10, S13
+    #[test]
+    fn an_append_retries_an_owed_rewrite_before_it_answers_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let armed = Arc::new(AtomicBool::new(false));
+        let mut outbox =
+            Outbox::open_with(dir.path(), ID, failing_at(Step::BeforeRename, &armed)).unwrap();
+        let chunk = MAX_EVENT_TEXT - 20;
+        while outbox.file_len + (FRAME_HEADER + SEQ_LEN + chunk + 8) as u64 <= ADMISSION_BYTES {
+            outbox
+                .append(Kind::Received, |seq| big(seq, chunk))
+                .unwrap();
+        }
+        let highest = outbox.highest();
+        armed.store(true, Ordering::SeqCst);
+        outbox.ack(highest).unwrap();
+        assert!(outbox.rewrite_owed);
+        // Still failing: the append is refused and writes nothing.
+        assert!(matches!(
+            outbox.append(Kind::Received, |seq| big(seq, chunk)),
+            Err(OutboxError::Full)
+        ));
+        assert_eq!(outbox.highest(), highest);
+        armed.store(false, Ordering::SeqCst);
+        assert_eq!(
+            outbox
+                .append(Kind::Received, |seq| big(seq, chunk))
+                .unwrap(),
+            highest + 1
+        );
+        assert!(!outbox.rewrite_owed);
+        drop(outbox);
+        let outbox = Outbox::open_in(dir.path(), ID).unwrap();
+        assert_eq!(pending(&outbox).len(), 1);
+    }
+
+    /// A probe that fails the sync after a rename (`Step::AfterRename`) while `armed` is set.
+    fn failing_sync(armed: &Arc<AtomicBool>, seen: &Arc<Mutex<u32>>) -> Probe {
+        let (armed, seen) = (armed.clone(), seen.clone());
+        Box::new(move |at| {
+            if at == Step::AfterRename {
+                *seen.lock().unwrap() += 1;
+                if armed.load(Ordering::SeqCst) {
+                    return Err(io::Error::other("injected"));
+                }
+            }
+            Ok(())
+        })
+    }
+
+    // S10
+    #[test]
+    fn a_failed_sync_after_the_rename_of_a_rewrite_poisons_the_outbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let (armed, seen) = (Arc::new(AtomicBool::new(false)), Arc::new(Mutex::new(0)));
+        let mut outbox = Outbox::open_with(dir.path(), ID, failing_sync(&armed, &seen)).unwrap();
+        put(&mut outbox, 2);
+        armed.store(true, Ordering::SeqCst);
+        outbox.ack(2).unwrap();
+        assert!(matches!(
+            outbox.append(Kind::Other, text),
+            Err(OutboxError::Poisoned)
+        ));
+    }
+
+    // S10
+    #[test]
+    fn a_failed_sync_after_the_rename_that_creates_the_file_fails_the_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let (armed, seen) = (Arc::new(AtomicBool::new(true)), Arc::new(Mutex::new(0)));
+        let result = Outbox::open_with(dir.path(), ID, failing_sync(&armed, &seen));
+        assert!(matches!(result, Err(OutboxError::Io(_))));
+    }
+
+    // S10
+    #[test]
+    fn the_next_open_syncs_the_directory_and_fails_when_that_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(Outbox::open_in(dir.path(), ID).unwrap());
+        let (armed, seen) = (Arc::new(AtomicBool::new(false)), Arc::new(Mutex::new(0)));
+        drop(Outbox::open_with(dir.path(), ID, failing_sync(&armed, &seen)).unwrap());
+        assert_eq!(*seen.lock().unwrap(), 1, "the open syncs the rename");
+        armed.store(true, Ordering::SeqCst);
+        let result = Outbox::open_with(dir.path(), ID, failing_sync(&armed, &seen));
+        assert!(matches!(result, Err(OutboxError::Io(_))));
+    }
+
+    // S9
+    #[test]
+    fn the_counter_stops_below_the_largest_number_the_file_can_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let header = Header {
+            agent_id: ID.to_owned(),
+            protection: 0,
+            floor: u64::MAX - 3,
+        };
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&MAGIC);
+        bytes.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        push_frame(&mut bytes, &postcard::to_allocvec(&header).unwrap()).unwrap();
+        fs::write(file_of(dir.path()), &bytes).unwrap();
+        let mut outbox = Outbox::open_in(dir.path(), ID).unwrap();
+        assert_eq!(outbox.append(Kind::Other, text).unwrap(), u64::MAX - 2);
+        assert_eq!(outbox.append(Kind::Other, text).unwrap(), u64::MAX - 1);
+        assert!(matches!(
+            outbox.append(Kind::Other, text),
+            Err(OutboxError::Corrupt(_))
+        ));
+        // The file, whole and after a rewrite, still reads back.
+        drop(outbox);
+        let mut outbox = Outbox::open_in(dir.path(), ID).unwrap();
+        assert_eq!(outbox.highest(), u64::MAX - 1);
+        outbox.ack(u64::MAX - 1).unwrap();
+        drop(outbox);
+        let outbox = Outbox::open_in(dir.path(), ID).unwrap();
+        assert_eq!(
+            (outbox.highest(), outbox.pending().count()),
+            (u64::MAX - 1, 0)
+        );
     }
 
     // S10

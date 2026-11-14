@@ -713,11 +713,11 @@ mod tests {
         // A null number is refused on both kinds: the key is absent or it is a number.
         assert!(matches!(
             AgentMessage::decode(&progress(r#","seq":null"#)),
-            Err(ControlError::Refused(_))
+            Err(ControlError::Refused("seq is null"))
         ));
         assert!(matches!(
             AgentMessage::decode(&state(r#","seq":null"#)),
-            Err(ControlError::Refused(_))
+            Err(ControlError::Refused("seq is null"))
         ));
         // The old delivery property is gone.
         assert!(matches!(

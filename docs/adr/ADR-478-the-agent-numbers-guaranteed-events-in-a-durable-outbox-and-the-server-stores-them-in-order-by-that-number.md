@@ -39,7 +39,8 @@ backwards under one agent ID, since the server would drop the repeated number as
    file, the directory synced; the same routine creates the file) when nothing is pending or
    64 KiB are acknowledged, and the header's floor keeps the counter across an empty file. After a
    restart an acknowledged event not yet rewritten away is pending again and is sent again; the
-   server deduplicates. Files of other agent IDs are never opened and cost one warning with their count.
+   server deduplicates. A rewrite that fails is owed: any later acknowledgement, a repeated one
+   too, and an append that would otherwise find the file full try it again before answering. Files of other agent IDs are never opened and cost one warning with their count.
 4. **Bounds and failure.** The file is capped at 16 MiB. Nothing is dropped for room: an append
    that would pass the cap is refused (`Full`), the producer keeps the fact in its journal and
    reports it later, and a `received` event is refused above 8 MiB so that the events that finish
@@ -47,7 +48,10 @@ backwards under one agent ID, since the server would drop the repeated number as
    failed write poisons the outbox until it is opened again, since a failed sync may lose data
    the OS accepted; so does a rewrite whose new file cannot be reopened, or whose sync after
    the rename fails (on Unix the directory sync, on Windows a sync of the reopened final file).
-   When the file is being created, those two fail the open instead. A file that does not read back (another agent ID in its header, an unknown
+   When the file is being created, those two fail the open instead. An open syncs the file and
+   then the rename (the directory on Unix) before it accepts appends, so a rename that never
+   became durable is not trusted after a restart; a failure fails the open. The highest number
+   the counter gives is one below `u64::MAX`, so the file always reads back. A file that does not read back (another agent ID in its header, an unknown
    version or protection, a bad checksum before the last frame, numbers that are not contiguous)
    is corrupt: it is not repaired or set aside, `connect` exits with an error and the owner
    registers the agent again.

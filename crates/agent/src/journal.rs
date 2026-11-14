@@ -14,6 +14,7 @@
 //! The journal only records. Committing a marker before the request it guards, and ending the
 //! job when a commit fails, are the runner's duties (ADR-244).
 
+#[cfg(test)]
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -1218,17 +1219,27 @@ pub(crate) fn create_linked(
 }
 
 /// The write-job journal's directory for `mode`: the `journal` sub-directory of the state root,
-/// private to the agent's account (ADR-460), checked once for hard-link support. The journal is
-/// linked into place (`create_linked`), which FAT and exFAT cannot do, so a directory on such a
-/// file system is refused here and not at the first job. The error names the reason, no path.
+/// private to the agent's account (ADR-460), checked for hard-link support the first time this
+/// process resolves it. The journal is linked into place (`create_linked`), which FAT and exFAT
+/// cannot do, so a directory on such a file system is refused when it is resolved and not
+/// halfway into a job's first record. The error names the reason, no path.
 pub fn journal_dir(mode: OperatingMode) -> Result<PathBuf, StateDirError> {
-    journal_dir_from(mode, &|name| std::env::var_os(name), &|from, to| {
-        fs::hard_link(from, to)
-    })
+    static PROBED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+    let dir = crate::state::private_subdir(mode, JOURNAL_DIR_NAME)?;
+    // Held across the probe, so this process probes each directory once.
+    let mut probed = PROBED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !probed.contains(&dir) {
+        probe_hard_links(&dir, &|from, to| fs::hard_link(from, to))?;
+        probed.push(dir.clone());
+    }
+    Ok(dir)
 }
 
 /// [`journal_dir`] for the environment `var` reads, with `link` as the hard-link operation the
-/// probe uses (a test makes it fail).
+/// probe uses (a test makes it fail). It probes on every call.
+#[cfg(test)]
 pub(crate) fn journal_dir_from(
     mode: OperatingMode,
     var: &dyn Fn(&str) -> Option<OsString>,
@@ -1242,40 +1253,36 @@ pub(crate) fn journal_dir_from(
 /// The state sub-directory the journals live in.
 const JOURNAL_DIR_NAME: &str = "journal";
 
-/// Creates a file in `dir`, hard-links it and removes both, so a probe of an earlier run that
-/// crashed is removed first and none stays behind. A name that is not a journal's, so the
-/// journals' own files never clash with it.
+/// Creates a file in `dir`, hard-links it and removes both. The names carry the process ID and
+/// a per-process count, so probes running at once (two agent processes sharing a root, or two
+/// threads) never touch each other's files, and they never look like a journal's. A probe is
+/// left behind only when the process dies between creating and removing it: an empty file
+/// nothing reads.
 fn probe_hard_links(
     dir: &Path,
     link: &dyn Fn(&Path, &Path) -> io::Result<()>,
 ) -> Result<(), StateDirError> {
-    let source = dir.join(".link-probe");
-    let target = dir.join(".link-probe.linked");
-    let refuse = |what: &str, error: &io::Error| {
+    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let stem = format!(".link-probe-{}-{n}", std::process::id());
+    let source = dir.join(&stem);
+    let target = dir.join(format!("{stem}.linked"));
+    File::create_new(&source).map_err(|error| {
         StateDirError::new(format!(
-            "cannot {what} in the journal directory: {:?}",
+            "cannot create the link probe in the journal directory: {:?}",
             error.kind()
         ))
-    };
-    for path in [&source, &target] {
-        match fs::remove_file(path) {
-            Err(error) if error.kind() != io::ErrorKind::NotFound => {
-                return Err(refuse("remove an earlier link probe", &error));
-            }
-            _ => {}
-        }
+    })?;
+    let result = link(&source, &target).map_err(|error| {
+        StateDirError::new(format!(
+            "cannot hard-link in the journal directory, which the journal needs \
+             (FAT and exFAT have no hard links): {:?}",
+            error.kind()
+        ))
+    });
+    if result.is_ok() {
+        let _ = fs::remove_file(&target);
     }
-    let result = File::create_new(&source)
-        .map_err(|error| refuse("create the link probe", &error))
-        .and_then(|_| {
-            link(&source, &target).map_err(|error| {
-                StateDirError::new(format!(
-                    "the journal directory's file system does not support hard links: {:?}",
-                    error.kind()
-                ))
-            })
-        });
-    let _ = fs::remove_file(&target);
     let _ = fs::remove_file(&source);
     result
 }
@@ -3540,68 +3547,103 @@ mod tests {
         }
     }
 
-    #[cfg(debug_assertions)]
-    fn env_of(dir: &Path) -> impl Fn(&str) -> Option<OsString> + use<> {
-        let dir = dir.as_os_str().to_owned();
-        move |name: &str| (name == crate::state::STATE_DIR_VAR).then(|| dir.clone())
+    /// An environment whose user state directory is `base` on either platform, so the tests run
+    /// in a release build too, where the debug override does not exist.
+    fn user_env(base: &Path) -> impl Fn(&str) -> Option<OsString> + use<> {
+        let base = base.as_os_str().to_owned();
+        move |name: &str| matches!(name, "XDG_STATE_HOME" | "LOCALAPPDATA").then(|| base.clone())
     }
 
-    #[cfg(debug_assertions)]
     fn real_link(from: &Path, to: &Path) -> io::Result<()> {
         fs::hard_link(from, to)
     }
 
-    /// The journal directory is the `journal` sub-directory of each mode's root, created private,
+    /// The journal directory is the `journal` sub-directory of the state root, created private,
     /// and the probe leaves nothing in it; a second call succeeds.
+    #[test]
+    fn the_journal_directory_is_private_and_found_again() {
+        let temp = TempDir::new();
+        let var = user_env(&temp.0);
+        let dir = journal_dir_from(OperatingMode::User, &var, &real_link).unwrap();
+        assert_eq!(dir, temp.0.join("nekoguruma").join("journal"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        assert_eq!(
+            journal_dir_from(OperatingMode::User, &var, &real_link).unwrap(),
+            dir
+        );
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+    }
+
+    /// Each mode has its own journal directory under its own root (here the debug override, the
+    /// only way a test reaches the device root).
     #[cfg(debug_assertions)]
     #[test]
-    fn the_journal_directory_is_private_per_mode_and_found_again() {
+    fn each_mode_has_its_journal_directory() {
         for mode in [OperatingMode::User, OperatingMode::Device] {
             let temp = TempDir::new();
-            let root = temp.0.join("state");
-            let var = env_of(&root);
+            let root = temp.0.join(format!("{mode:?}"));
+            let value = root.as_os_str().to_owned();
+            let var =
+                move |name: &str| (name == crate::state::STATE_DIR_VAR).then(|| value.clone());
             let dir = journal_dir_from(mode, &var, &real_link).unwrap();
             assert_eq!(dir, root.join("journal"));
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                assert_eq!(
-                    fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
-                    0o700
-                );
-            }
-            assert_eq!(journal_dir_from(mode, &var, &real_link).unwrap(), dir);
             assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
         }
     }
 
-    /// A probe of an earlier run that crashed does not stop the next one.
-    #[cfg(debug_assertions)]
+    /// Probes running at once in one directory do not disturb each other.
     #[test]
-    fn a_stale_probe_is_cleared() {
+    fn probes_running_at_once_all_succeed() {
         let temp = TempDir::new();
-        let var = env_of(&temp.0.join("state"));
-        let dir = journal_dir_from(OperatingMode::User, &var, &real_link).unwrap();
-        fs::write(dir.join(".link-probe"), b"x").unwrap();
-        fs::write(dir.join(".link-probe.linked"), b"x").unwrap();
-        journal_dir_from(OperatingMode::User, &var, &real_link).unwrap();
+        let base = temp.0.clone();
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let base = base.clone();
+                std::thread::spawn(move || {
+                    let var = user_env(&base);
+                    for _ in 0..200 {
+                        journal_dir_from(OperatingMode::User, &var, &real_link).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let dir = base.join("nekoguruma").join("journal");
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+    }
+
+    /// A probe another process left behind is no obstacle.
+    #[test]
+    fn a_leftover_probe_does_not_stop_the_next() {
+        let temp = TempDir::new();
+        let var = user_env(&temp.0);
+        let dir = journal_dir_from(OperatingMode::User, &var, &real_link).unwrap();
+        fs::write(dir.join(".link-probe-1-0"), b"").unwrap();
+        journal_dir_from(OperatingMode::User, &var, &real_link).unwrap();
     }
 
     /// A file system without hard links is refused with the reason, no path, and the probe's
     /// file is removed.
-    #[cfg(debug_assertions)]
     #[test]
     fn a_file_system_without_hard_links_is_refused() {
         let temp = TempDir::new();
-        let root = temp.0.join("state");
-        let var = env_of(&root);
+        let var = user_env(&temp.0);
         let no_links = |_: &Path, _: &Path| Err(io::Error::from(io::ErrorKind::Unsupported));
         let error = journal_dir_from(OperatingMode::User, &var, &no_links).unwrap_err();
         let text = error.to_string();
-        assert!(text.contains("hard links"), "{text}");
+        assert!(text.contains("hard-link"), "{text}");
         assert!(text.contains("Unsupported"), "{text}");
-        assert!(!text.contains(root.to_str().unwrap()), "{text}");
-        assert_eq!(fs::read_dir(root.join("journal")).unwrap().count(), 0);
+        assert!(!text.contains(temp.0.to_str().unwrap()), "{text}");
+        let dir = temp.0.join("nekoguruma").join("journal");
+        assert_eq!(fs::read_dir(dir).unwrap().count(), 0);
     }
 }

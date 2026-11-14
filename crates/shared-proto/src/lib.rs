@@ -201,6 +201,12 @@ pub enum FailureCode {
     /// A fault in the agent itself. The only code that asserts one on the diagnostic system's
     /// side (5.6, ADR-475).
     Internal,
+    /// The agent refused the delivered command (5.3, ADR-476); the failure's detail is the agent's
+    /// coarse reason.
+    InstructionRejected,
+    /// The job's instruction was signed by a key that is no longer the server's active one, so
+    /// it is never sent (5.3, ADR-462, ADR-476).
+    InstructionKeyRetired,
     Other,
 }
 
@@ -226,6 +232,8 @@ impl FailureCode {
             FailureCode::LinkNotOpened => "linkNotOpened",
             FailureCode::ExchangeFailed => "exchangeFailed",
             FailureCode::Internal => "internal",
+            FailureCode::InstructionRejected => "instructionRejected",
+            FailureCode::InstructionKeyRetired => "instructionKeyRetired",
             FailureCode::Other => "other",
         }
     }

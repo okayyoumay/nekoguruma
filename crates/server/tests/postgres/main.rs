@@ -8,6 +8,7 @@ mod agent_register;
 mod binary;
 mod control;
 mod instruction_key;
+mod job_queue;
 mod local_users;
 mod migrations;
 mod redeem;

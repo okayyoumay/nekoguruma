@@ -12,6 +12,8 @@ instruction key (design 11.1, ADR-462).
 ADR-465).
 `migrations/0006_local_users.sql` adds `operator_credentials`, the Argon2id password hashes of the
 local users (design 13.3, ADR-469).
+`migrations/0007_job_delivery.sql` adds the three delivery columns of `jobs` (design 5.3, 14.1,
+ADR-476).
 
 ## How migrations are applied
 
@@ -88,6 +90,16 @@ agent-side duplicate detection (5.3) simple.
 **Build queues from partial indexes**
 `jobs_pending` and `jobs_open` are partial indexes. They find delivery targets and
 reconciliation targets on reconnection without scanning all jobs (15.1).
+
+**Delivery is recorded in three columns of jobs, and `state` stays the 5.6 state**
+`delivery_attempts`, `delivery_sent_at` and `delivered_at` (migration 0007, ADR-476) say how often
+the stored instruction was put on a connection, when the latest mark was made and when the agent
+acknowledged one. A job is `received` until the agent reports a state, whatever its delivery.
+The server's queue takes a job with `FOR UPDATE SKIP LOCKED`, joined to its agent (not revoked),
+and marks it in the transaction that queued the frame; an instance takes only the jobs of agents
+connected to it. A mark that is not acknowledged is released when its connection is no longer
+current, and a mark older than the lease (90 seconds) makes the job takeable again: delivery is
+at least once, and a resend carries the same stored bytes under a new command ID.
 
 **Version work records per item**
 The unit of 3-way merge (4.4) is the item, so `work_record_items.version` exists.

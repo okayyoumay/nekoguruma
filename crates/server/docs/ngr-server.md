@@ -604,6 +604,20 @@ connection with hyper's `with_upgrades()`.
   connected and not returned (a missing row included) has its tokens dropped, then its
   connection told to close with 4002, with one warn line; a failed read is one gated warning
   and closes nobody. It ends when the stop begins, in its wait and in its read.
+- **The delivery queue (`job_queue.rs`, ADR-476).** One task of the hub's set, spawned by
+  `Server::run` when the queue is on (`Server::start` turns it on with a 2 second period and a 90
+  second lease; `Server::bind` leaves it off, and a test turns it on with `with_job_queue`), and
+  the only consumer of the hub's inbox. Each iteration takes the connection snapshot, drains the
+  inbox, settles what it holds and releases the deliveries of connections that are no longer
+  current, then, on a tick, runs a pass: one transaction that ends the jobs of a retired key
+  (`failed`, `instructionKeyRetired`), takes the `received` rows of the connected, unrevoked
+  agents `FOR UPDATE SKIP LOCKED`, queues each stored instruction (base64 of the stored bytes)
+  through `Hub::send_job_command` and marks the rows queued (`delivery_attempts`,
+  `delivery_sent_at`). An acknowledgement sets `delivered_at`; a rejection ends the job
+  (`failed`, `instructionRejected`, the agent's reason as the detail); both write only while the
+  job is neither finished nor delivered. `agentEvent` and `reconcile` messages are dropped with a
+  debug line. A failed pass sends nothing and is one gated warning (60 seconds). The task ends
+  when the stop begins, in its wait and in its read.
 - **After a close.** The task leaves the registry first, then writes the Close frame, then the
   disconnect stamp (above), then drains (reads and discards until the peer's reply, at most `CLOSE_WAIT`, 5 seconds). After a
   read error the stack allows no read, so the task waits `CLOSE_WAIT` without reading (a stop
@@ -622,8 +636,9 @@ connection with hyper's `with_upgrades()`.
 - **Logging.** One info line at the connect and one at the end, with the agent ID, a connection
   number and a word for the end; no token and no message text.
 - **Scope.** The hub holds no job state and writes no table of its own: the connection tasks
-  write `agents.last_seen_at` through the stamp, the revocation pass reads `agents`, and
-  everything else the agent says goes to the inbox for whoever takes it.
+  write `agents.last_seen_at` through the stamp, the revocation pass reads `agents`, the delivery
+  queue reads and marks `jobs`, and everything else the agent says goes to the inbox, which the
+  queue takes.
 
 Any other path answers 404 with a problem body, after the guard.
 
@@ -688,6 +703,15 @@ a new migration file rebuilds the crate. How migrations are written and applied 
   exchange are answered as before; a 503 from a locked table that is not counted; a challenge
   and a token expiring under a moved tokio clock (`pause`, `advance` and `resume` back to back
   with no request in flight); and one valid request sent twice at once giving one 200 and one 401.
+  `job_queue.rs` (unit tests in `src/job_queue.rs`) covers the queue: unit tests for the dispatch
+  (a full queue, no connection, a frame over the limit, a stop between two sends) and for the
+  settling of answers; over PostgreSQL, fake agents on WebSocket and rows the test inserts:
+  delivery with the stored bytes and the acknowledgement, an agent that is not connected, two
+  servers on one database (every job on one socket, the take skipping held rows, the plan using
+  `jobs_pending`), a dropped take, a server that goes away and the lease, a dropped socket and a
+  replacement, a rejection, answers that write nothing, a retired or missing key, a revoked
+  agent, a past deadline, the stop, a failing pass, and `Server::start` turning the queue on. The
+  agent binary's refusal of a forged stored command is in `agent_connect.rs`.
   `control.rs` (unit tests in `src/control.rs` and `src/hub.rs`) drives the control channel over
   TCP with `tokio-tungstenite` as the client. Refusals: every way of having no valid token is
   the same 401 (no header, another scheme, a bare scheme, two headers, 43 characters, an unknown

@@ -465,6 +465,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-473](ADR-473-the-agent-answers-a-verified-job-command-with-an-acknowledgement-alone-until-the-outbox-numbers-events.md) | The Agent Answers a Verified Job Command With an Acknowledgement Alone Until the Outbox Numbers Events | Accepted | design 5.3, `api/asyncapi.yaml`, `crates/agent`; details ADR-466 items 10 and 13, ADR-461 items 9 and 10 and ADR-471 item 5 for the agent's side |
 | [ADR-474](ADR-474-the-local-object-store-appends-by-offset-shows-only-finished-objects-and-issues-its-keys.md) | The Local Object Store Appends by Offset, Shows Only Finished Objects and Issues Its Keys | Accepted | design 13, `crates/server`, `db/README.md` |
 | [ADR-475](ADR-475-a-runs-end-is-mapped-to-the-jobs-state-by-its-error-and-its-journals-standing.md) | A Run's End Is Mapped to the Job's Reported State by Its Error and Its Journal's Standing | Accepted | design 5.6, `api/asyncapi.yaml`, `crates/agent`, `crates/shared-proto`; annotates ADR-280, ADR-288 |
+| [ADR-476](ADR-476-the-delivery-queue-takes-a-job-once-and-delivers-it-at-least-once-from-the-stored-instruction.md) | The Delivery Queue Takes a Job Once and Delivers It at Least Once, From the Stored Instruction | Accepted | design 5.3, 12, 14.1, `db/migrations`, `db/README.md`, `api/asyncapi.yaml`, `crates/server`, `crates/shared-proto`; details ADR-466 items 10 and 13, ADR-468 item 12 and ADR-472 item 4 |
 
 ## Status Legend
 
@@ -1058,3 +1059,4 @@ the predecessor repository these ADRs came from.
 - ADR-471 (item 5's job command answered through the gate, ADR-473)
 - ADR-472
 - ADR-473
+- ADR-476

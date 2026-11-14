@@ -15,6 +15,7 @@ pub(crate) mod fs_guard;
 pub mod health;
 pub mod hub;
 pub mod instruction_key;
+pub mod job_queue;
 pub mod local_guard;
 pub mod local_user;
 pub mod operator_session;
@@ -174,6 +175,8 @@ pub struct Server {
     /// The object store `start` opened; `bind` leaves it empty (tests). Held so that its
     /// directory stays locked until `run` returns.
     object_store: Option<Arc<LocalStore>>,
+    /// The delivery queue's settings; `None` leaves the queue off (`bind`, which tests use).
+    job_queue: Option<job_queue::Settings>,
 }
 
 impl Server {
@@ -207,7 +210,14 @@ impl Server {
         };
         let mut server = Server::bind(&config.http, pool, key).await?;
         server.object_store = Some(store);
+        server.job_queue = Some(job_queue::Settings::default());
         Ok(server)
+    }
+
+    /// Whether the delivery queue is on. Tests only.
+    #[doc(hidden)]
+    pub fn job_queue_enabled(&self) -> bool {
+        self.job_queue.is_some()
     }
 
     /// The object store `start` opened (`None` on a server made by `bind`).
@@ -258,7 +268,16 @@ impl Server {
             hub,
             grace: Duration::from_secs(http.shutdown_grace_secs),
             object_store: None,
+            job_queue: None,
         })
+    }
+
+    /// Turns the delivery queue on with `settings` (ADR-476); `start` does so with the defaults.
+    /// The queue takes the hub's inbox when the server runs. Tests only.
+    #[doc(hidden)]
+    pub fn with_job_queue(mut self, settings: job_queue::Settings) -> Server {
+        self.job_queue = Some(settings);
+        self
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -311,6 +330,7 @@ impl Server {
             hub,
             grace,
             object_store: _object_store,
+            job_queue,
         } = self;
         // The revocation pass is one of the hub's tasks, so that the stop ends it before the pool
         // closes (ADR-468 item 11).
@@ -321,6 +341,20 @@ impl Server {
                 async move { db::live_agents(&pool, &ids).await }
             }
         }));
+        // The delivery queue is another of them, and the only consumer of the hub's inbox
+        // (ADR-476).
+        if let Some(settings) = job_queue {
+            match hub.inbox() {
+                Some(inbox) => hub.adopt(job_queue::run(
+                    hub.clone(),
+                    pool.clone(),
+                    inbox,
+                    hub.stopping(),
+                    settings,
+                )),
+                None => tracing::warn!("the hub's inbox is taken; no job is delivered"),
+            }
+        }
         let service = TowerToHyperService::new(router);
         // hyper-util's graceful watch has no implementation for a connection that allows
         // upgrades, so each connection task watches this signal itself (ADR-468).

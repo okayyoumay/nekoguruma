@@ -530,6 +530,19 @@ mod tests {
     }
 
     #[test]
+    fn the_servers_own_failure_codes_have_their_wire_names() {
+        use crate::FailureCode;
+        assert_eq!(
+            FailureCode::InstructionRejected.wire_name(),
+            "instructionRejected"
+        );
+        assert_eq!(
+            FailureCode::InstructionKeyRetired.wire_name(),
+            "instructionKeyRetired"
+        );
+    }
+
+    #[test]
     fn a_failed_job_state_carries_the_procedures_code_apart_from_the_agents() {
         use crate::{FailureCode, JobId, JobState};
         let state = JobState::Failed {

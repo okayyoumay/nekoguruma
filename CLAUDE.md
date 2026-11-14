@@ -216,11 +216,12 @@ wine and catches the dead code and unused `mut` that only a Windows build sees:
 rustup update stable                            # once per session: CI uses the latest stable
 rustup target add x86_64-pc-windows-gnullvm     # once per session, about 264 MB
 RUSTFLAGS="-D warnings" CARGO_INCREMENTAL=0 cargo check --locked --workspace --tests \
-  --exclude j2534-0404-service --target x86_64-pc-windows-gnullvm
+  --target x86_64-pc-windows-gnullvm
 ```
 
-It leaves out `j2534-0404-service` as `core-windows` does on pull requests, adds about 190 MB to
-`target/`, and takes well under a minute once warm; say in the PR's test plan that you ran it.
+It checks every crate, `j2534-0404-service` included (its bindings for the target are committed),
+adds a few hundred MB to `target/`, and takes about a minute once warm; say in the PR's test plan
+that you ran it.
 Release builds, linking and running tests for Windows (under wine or otherwise) stay with CI.
 
 The real-hardware checks (design 13.5, ADR-275) are `#[ignore]`d `hw_` tests that CI never runs.

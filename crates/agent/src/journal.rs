@@ -19,6 +19,7 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use diag_ir::{IdentityKind, VmError};
@@ -1225,16 +1226,29 @@ pub(crate) fn create_linked(
 /// halfway into a job's first record. The error names the reason, no path.
 pub fn journal_dir(mode: OperatingMode) -> Result<PathBuf, StateDirError> {
     static PROBED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+    static COUNT: AtomicU64 = AtomicU64::new(0);
     let dir = crate::state::private_subdir(mode, JOURNAL_DIR_NAME)?;
-    // Held across the probe, so this process probes each directory once.
-    let mut probed = PROBED
+    probe_once(&PROBED, &dir, &COUNT, &|from, to| fs::hard_link(from, to))?;
+    Ok(dir)
+}
+
+/// Probes `dir` unless `probed` already lists it, and lists it once a probe succeeds. The lock
+/// is held across the probe, so one process probes each directory once; a failed probe is not
+/// listed, so the next call probes again.
+fn probe_once(
+    probed: &std::sync::Mutex<Vec<PathBuf>>,
+    dir: &Path,
+    count: &AtomicU64,
+    link: &dyn Fn(&Path, &Path) -> io::Result<()>,
+) -> Result<(), StateDirError> {
+    let mut probed = probed
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if !probed.contains(&dir) {
-        probe_hard_links(&dir, &|from, to| fs::hard_link(from, to))?;
-        probed.push(dir.clone());
+    if !probed.iter().any(|known| known == dir) {
+        probe_hard_links(dir, count, link)?;
+        probed.push(dir.to_path_buf());
     }
-    Ok(dir)
+    Ok(())
 }
 
 /// [`journal_dir`] for the environment `var` reads, with `link` as the hard-link operation the
@@ -1245,8 +1259,9 @@ pub(crate) fn journal_dir_from(
     var: &dyn Fn(&str) -> Option<OsString>,
     link: &dyn Fn(&Path, &Path) -> io::Result<()>,
 ) -> Result<PathBuf, StateDirError> {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
     let dir = crate::state::private_subdir_from(mode, var, JOURNAL_DIR_NAME)?;
-    probe_hard_links(&dir, link)?;
+    probe_hard_links(&dir, &COUNT, link)?;
     Ok(dir)
 }
 
@@ -1254,38 +1269,58 @@ pub(crate) fn journal_dir_from(
 const JOURNAL_DIR_NAME: &str = "journal";
 
 /// Creates a file in `dir`, hard-links it and removes both. The names carry the process ID and
-/// a per-process count, so probes running at once (two agent processes sharing a root, or two
-/// threads) never touch each other's files, and they never look like a journal's. A probe is
-/// left behind only when the process dies between creating and removing it: an empty file
-/// nothing reads.
+/// the next value of `count`, so probes running at once never remove each other's files, and
+/// they never look like a journal's. A name already taken (a probe a crashed process left, its
+/// ID since reused, or a process of another PID namespace sharing the root) is skipped for the
+/// next count, up to [`PROBE_ATTEMPTS`] names. A probe is left behind only when the process dies
+/// between creating and removing it: an empty file nothing reads.
 fn probe_hard_links(
     dir: &Path,
+    count: &AtomicU64,
     link: &dyn Fn(&Path, &Path) -> io::Result<()>,
 ) -> Result<(), StateDirError> {
-    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let stem = format!(".link-probe-{}-{n}", std::process::id());
-    let source = dir.join(&stem);
-    let target = dir.join(format!("{stem}.linked"));
-    File::create_new(&source).map_err(|error| {
-        StateDirError::new(format!(
-            "cannot create the link probe in the journal directory: {:?}",
-            error.kind()
-        ))
-    })?;
-    let result = link(&source, &target).map_err(|error| {
-        StateDirError::new(format!(
-            "cannot hard-link in the journal directory, which the journal needs \
-             (FAT and exFAT have no hard links): {:?}",
-            error.kind()
-        ))
-    });
-    if result.is_ok() {
-        let _ = fs::remove_file(&target);
+    for _ in 0..PROBE_ATTEMPTS {
+        let stem = format!(
+            ".link-probe-{}-{}",
+            std::process::id(),
+            count.fetch_add(1, Ordering::Relaxed)
+        );
+        let source = dir.join(&stem);
+        let target = dir.join(format!("{stem}.linked"));
+        match File::create_new(&source) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(StateDirError::new(format!(
+                    "cannot create the link probe in the journal directory: {:?}",
+                    error.kind()
+                )));
+            }
+        }
+        let result = link(&source, &target);
+        if result.is_ok() {
+            let _ = fs::remove_file(&target);
+        }
+        let _ = fs::remove_file(&source);
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(StateDirError::new(format!(
+                    "cannot hard-link in the journal directory, which the journal needs \
+                     (FAT and exFAT have no hard links): {:?}",
+                    error.kind()
+                )));
+            }
+        }
     }
-    let _ = fs::remove_file(&source);
-    result
+    Err(StateDirError::new(
+        "every link probe name tried in the journal directory is taken",
+    ))
 }
+
+/// How many probe names [`probe_hard_links`] tries before it gives up.
+const PROBE_ATTEMPTS: u32 = 16;
 
 /// Makes a new directory entry durable. NTFS logs the entry with the file's metadata, which
 /// the file's own sync covers.
@@ -3621,14 +3656,67 @@ mod tests {
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
     }
 
-    /// A probe another process left behind is no obstacle.
+    /// Probe files a crashed process with this process's ID left behind are skipped and stay
+    /// untouched, and a taken `.linked` name alone is skipped too.
     #[test]
-    fn a_leftover_probe_does_not_stop_the_next() {
+    fn taken_probe_names_are_skipped() {
         let temp = TempDir::new();
-        let var = user_env(&temp.0);
-        let dir = journal_dir_from(OperatingMode::User, &var, &real_link).unwrap();
-        fs::write(dir.join(".link-probe-1-0"), b"").unwrap();
-        journal_dir_from(OperatingMode::User, &var, &real_link).unwrap();
+        let dir = journal_dir_from(OperatingMode::User, &user_env(&temp.0), &real_link).unwrap();
+        let pid = std::process::id();
+        fs::write(dir.join(format!(".link-probe-{pid}-0")), b"").unwrap();
+        fs::write(dir.join(format!(".link-probe-{pid}-1.linked")), b"").unwrap();
+        let count = AtomicU64::new(0);
+        probe_hard_links(&dir, &count, &real_link).unwrap();
+        assert_eq!(count.load(Ordering::Relaxed), 3);
+        let mut left: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                format!(".link-probe-{pid}-0"),
+                format!(".link-probe-{pid}-1.linked")
+            ]
+        );
+    }
+
+    /// When every name tried is taken the probe gives up instead of looping.
+    #[test]
+    fn a_probe_gives_up_after_its_attempts() {
+        let temp = TempDir::new();
+        let dir = journal_dir_from(OperatingMode::User, &user_env(&temp.0), &real_link).unwrap();
+        let taken = |_: &Path, _: &Path| Err(io::Error::from(io::ErrorKind::AlreadyExists));
+        let count = AtomicU64::new(0);
+        let error = probe_hard_links(&dir, &count, &taken).unwrap_err();
+        assert!(error.to_string().contains("taken"), "{error}");
+        assert_eq!(count.load(Ordering::Relaxed), u64::from(PROBE_ATTEMPTS));
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+    }
+
+    /// A directory is probed once while its probe succeeds, and again after one that failed.
+    #[test]
+    fn a_directory_is_probed_once_per_process() {
+        let temp = TempDir::new();
+        let dir = journal_dir_from(OperatingMode::User, &user_env(&temp.0), &real_link).unwrap();
+        let probed = std::sync::Mutex::new(Vec::new());
+        let count = AtomicU64::new(0);
+        let links = AtomicU64::new(0);
+        let fail = std::sync::atomic::AtomicBool::new(true);
+        let link = |from: &Path, to: &Path| {
+            links.fetch_add(1, Ordering::Relaxed);
+            if fail.load(Ordering::Relaxed) {
+                Err(io::Error::from(io::ErrorKind::Unsupported))
+            } else {
+                fs::hard_link(from, to)
+            }
+        };
+        probe_once(&probed, &dir, &count, &link).unwrap_err();
+        fail.store(false, Ordering::Relaxed);
+        probe_once(&probed, &dir, &count, &link).unwrap();
+        probe_once(&probed, &dir, &count, &link).unwrap();
+        assert_eq!(links.load(Ordering::Relaxed), 2);
     }
 
     /// A file system without hard links is refused with the reason, no path, and the probe's

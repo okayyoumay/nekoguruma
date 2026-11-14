@@ -3940,6 +3940,8 @@ impl crate::oplog::LogSafe for HostError {
             HostError::NoBlockLength { block, .. } => format!(
                 "the ECU's RequestDownload response has no readable maxNumberOfBlockLength, so TransferData block {block} is not sent (ADR-336)"
             ),
+            // The reason is the document's text.
+            HostError::DeclaredLink(_) => "the document's link cannot be used".to_owned(),
             other => other.to_string(),
         }
     }

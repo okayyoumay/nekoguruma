@@ -145,7 +145,8 @@ impl JobState {
         }
     }
 
-    /// The state as a `jobState` event of `job_id` for the control channel (5.2, 5.6).
+    /// The state as a `jobState` event of `job_id` for the control channel (5.2, 5.6). An empty
+    /// `detail` is left out of the event rather than sent as an empty string.
     pub fn to_event_kind(&self, job_id: JobId) -> AgentEventKind {
         let (failure_code, procedure_code, detail) = match self {
             JobState::Failed {
@@ -159,6 +160,7 @@ impl JobState {
             JobState::NeedsOnSiteRecovery { detail } => (None, None, Some(detail.clone())),
             _ => (None, None, None),
         };
+        let detail = detail.filter(|detail| !detail.is_empty());
         AgentEventKind::JobState {
             job_id,
             state: self.wire_name().to_owned(),

@@ -396,9 +396,11 @@ components:
                 minLength: 1
                 maxLength: 128
                 description: |
-                  With failureCode procedure only: the code the procedure gave when it ended itself as failed
-                  (1 to 128 bytes of UTF-8). It is the procedure's own and never one of the codes above (5.6).
-              detail: { type: string, maxLength: 1024, description: For failed, preconditionFailed and needsOnSiteRecovery: text the agent writes, cut to 1024 bytes; for a procedure's failure, the procedure's own detail (5.6) }
+                  With failureCode procedure only: the code the procedure gave when it ended itself as failed.
+                  The rule is 1 to 128 bytes of UTF-8. JSON Schema's length keywords count characters, so
+                  maxLength 128 only rules out the longest codes; the byte count decides. It is the
+                  procedure's own and never one of the codes above (5.6).
+              detail: { type: string, maxLength: 1024, description: For failed, preconditionFailed and needsOnSiteRecovery: text the agent writes, cut to 1024 bytes; for a procedure's failure, the procedure's own detail. Left out when empty (5.6) }
           - type: object
             required: [kind, jobId, progressPermille, phase]
             additionalProperties: false

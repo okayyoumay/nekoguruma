@@ -257,7 +257,7 @@ A generic mechanism in both D-PDU API and J2534 for hardware-specific commands (
 What the server sends an agent to start one job: a postcard body (`shared_proto::JobInstruction`: job ID, ownership generation, agent ID, operator ID, job kind, VCI, VIN, the hashes of the documents, artifact and plan, issue time, start deadline) signed as exact bytes with the **instruction key** and delivered in an envelope (format byte, key fingerprint, signature, payload). The agent verifies the bytes before it parses them and answers a command that fails with a command-level rejection. See **Identification plan**.
 
 **Journal standing** (design 5.6, ADR-475)  
-What a write job's journal says about the ECU after a run ends: clean when there is no journal, or when it has not reached a flash plan and records no request sent; otherwise the ECU may have changed. A run that ends in an interruption with a journal that is not clean reports no terminal state (an **open outcome**).
+What a write job's journal says about the job after a run ends, as the next resume would judge it (`restart::classify`): clean (a plain start: nothing sent that a new start could not repeat), resumable, already decided (a journaled failure, identity abort or stop), or needing on-site recovery. A run that ends in a transient error with a resumable journal reports no terminal state (an **open outcome**); one that ends in a refusal that would repeat on every resume, or with a journal that needs on-site recovery, reports needing on-site recovery.
 
 **J2534**  
 SAE J2534 ("PassThru") standard for vehicle interface adapters. The worker supports v04.04 (DEC2004), implemented as a gRPC adapter (`j2534-0404-service`). v05.00 is not supported.

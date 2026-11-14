@@ -20,47 +20,64 @@ use shared_proto::{FailureCode, JobState, MAX_PROCEDURE_CODE_LEN};
 
 use crate::journal::{JobKey, Journal, JournalError, JournalState, MAX_FAILURE_DETAIL_LEN};
 use crate::oplog::LogSafe;
-use crate::restart::{NotResumableCause, OnSiteReason, reached_flash_plan};
+use crate::restart::{NotResumableCause, OnSiteReason, RestartDecision, classify};
 use crate::runner::{JobError, truncated};
 
-/// Whether the ECU or the job's progress could have changed since the journal's last record
-/// that a later resume would not see: the test for ending a run's interruption as a state
-/// (ADR-475 item 1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// The procedure's code reaches the wire as the journal holds it.
+const _: () = assert!(MAX_PROCEDURE_CODE_LEN == diag_ir::MAX_FAILURE_CODE_LEN);
+const _: () = assert!(MAX_PROCEDURE_CODE_LEN == crate::journal::MAX_FAILURE_CODE_LEN);
+
+/// What the next resume of the job would decide from its journal, as the run's end sees it
+/// (ADR-475 item 1). It is [`restart::classify`]'s answer, not a second set of rules.
+#[derive(Debug, Clone, PartialEq)]
 pub enum JournalStanding {
-    /// No journal, or one that has not reached a flash plan and holds no request marker for a
-    /// primitive that is not safe to repeat (ADR-335 item 2): a resume would lose nothing.
+    /// A resume would start the program afresh and lose nothing: no journal where nothing can
+    /// have been sent, or one `classify` calls a plain start (it has not reached a flash plan
+    /// and holds no request for a primitive that is not safe to repeat, ADR-335 item 2).
     Clean,
-    /// Anything else, including a journal that cannot be read back: the run is resumed.
-    MayHaveChanged,
+    /// A resume would go on from the journal: a restart or a checkpoint resume.
+    Resumable,
+    /// The journal holds a terminal decision (a procedure failure, an identity abort or a run's
+    /// stop, ADR-280, ADR-286, ADR-288): a resume would end as it says without sending anything.
+    /// The runs that end that way are terminal as their own result.
+    Decided,
+    /// A resume would end in on-site intervention for this reason, which includes a journal
+    /// that is missing where one is due and one that cannot be read back.
+    OnSite(OnSiteReason),
 }
 
 impl JournalStanding {
-    /// The standing of the journal `journal` of a job of `program`, as read after the run. A
-    /// missing journal is clean; a journal that is unreadable is not. The request markers
-    /// themselves are the journal's record of the primitives that were not safe to repeat
-    /// (`restart::needs_request_marker` decides which get one), so the check reads them rather
-    /// than the program. A marker withdrawn as provably unsent still counts: the standing errs
-    /// toward a resume.
-    pub fn of(program: &Program, journal: Result<&JournalState, &JournalError>) -> Self {
+    /// The standing of the journal `journal` of a job of `program`, as read after the run.
+    /// `first_run` says the run was the job's first: its journal is created before anything is
+    /// sent, so a journal that is not there is clean, whereas on a resume it is
+    /// [`OnSiteReason::MissingJournal`] unless the program is a plain start. A job ID that cannot
+    /// name a journal is clean on any run: no journal could have been written.
+    pub fn of(
+        program: &Program,
+        journal: Result<&JournalState, &JournalError>,
+        first_run: bool,
+    ) -> Self {
         match journal {
-            Ok(state) => {
-                if reached_flash_plan(program, &state.facts) || state.facts.first_request.is_some()
-                {
-                    Self::MayHaveChanged
-                } else {
-                    Self::Clean
-                }
+            Err(JournalError::NotFound) if first_run => return Self::Clean,
+            Err(JournalError::InvalidJobId(_)) => return Self::Clean,
+            _ => {}
+        }
+        match classify(program, journal) {
+            RestartDecision::PlainStart => Self::Clean,
+            RestartDecision::OnSiteInterventionRequired(reason) => Self::OnSite(reason),
+            RestartDecision::Restart(_) | RestartDecision::ResumeFromCheckpoint(_) => {
+                Self::Resumable
             }
-            Err(JournalError::NotFound) => Self::Clean,
-            Err(_) => Self::MayHaveChanged,
+            RestartDecision::Failed { .. }
+            | RestartDecision::Aborted { .. }
+            | RestartDecision::Stopped(_) => Self::Decided,
         }
     }
 
     /// The standing of the journal of `key` in `dir`, read without changing it (`Journal::read`
     /// takes no lock, so it works while another run holds the journal).
-    pub fn read(dir: &Path, key: &JobKey, program: &Program) -> Self {
-        Self::of(program, Journal::read(dir, key).as_ref())
+    pub fn read(dir: &Path, key: &JobKey, program: &Program, first_run: bool) -> Self {
+        Self::of(program, Journal::read(dir, key).as_ref(), first_run)
     }
 }
 
@@ -82,13 +99,18 @@ pub enum JobOutcome {
 ///
 /// A procedure's own verdict, an identity mismatch, an on-site ending and a stop the VM or the
 /// step limit made are terminal whatever the standing: the runner journals them, so a resume
-/// would end the same way. Every other ending is terminal only while the standing is clean, and
-/// open otherwise. A refusal or a failure before anything was sent on a first run is a
-/// precondition failure; on a resume the same causes are failures.
+/// would end the same way (a VM error only while no resume would go on from the journal). For every other ending the standing decides (ADR-475 item 1):
+/// - decided, the open job's resume reports what the journal holds;
+/// - on-site, the next resume would end in on-site intervention, so the job does: terminal at
+///   once, whatever the error;
+/// - resumable, a refusal that every resume would repeat ends in on-site intervention, since
+///   the job cannot go on by itself; any other error leaves the job open;
+/// - clean, the error is terminal. A refusal or a failure before anything was sent on a first
+///   run is a precondition failure; on a resume the same causes are failures.
 pub fn outcome(
     result: &Result<VmState, JobError>,
     first_run: bool,
-    standing: JournalStanding,
+    standing: &JournalStanding,
 ) -> JobOutcome {
     let error = match result {
         Ok(_) => return JobOutcome::Terminal(JobState::Completed),
@@ -120,13 +142,18 @@ pub fn outcome(
                 IdentityKind::SoftwareVersion => FailureCode::Other,
             }));
         }
-        JobError::StepLimit(_) | JobError::Vm { .. } => {
+        JobError::StepLimit(_) => {
+            return JobOutcome::Terminal(failed(FailureCode::ProcedureError));
+        }
+        // The runner journals a stop its run made, so the standing is then `Decided`; a VM error
+        // of a check before the run on a journal a resume would go on from is not a stop.
+        JobError::Vm { .. }
+            if matches!(standing, JournalStanding::Clean | JournalStanding::Decided) =>
+        {
             return JobOutcome::Terminal(failed(FailureCode::ProcedureError));
         }
         JobError::OnSiteInterventionRequired(reason) => {
-            return JobOutcome::Terminal(JobState::NeedsOnSiteRecovery {
-                detail: truncated(on_site_text(reason), MAX_FAILURE_DETAIL_LEN),
-            });
+            return JobOutcome::Terminal(on_site(reason));
         }
         // Another run owns the journal: that run reports the job.
         JobError::Journal(JournalError::InUse | JournalError::AlreadyExists) => {
@@ -134,8 +161,20 @@ pub fn outcome(
         }
         _ => {}
     }
-    if standing == JournalStanding::MayHaveChanged {
-        return JobOutcome::Open;
+    match standing {
+        JournalStanding::OnSite(reason) => return JobOutcome::Terminal(on_site(reason)),
+        JournalStanding::Resumable => {
+            return if repeats_on_every_resume(error) {
+                JobOutcome::Terminal(JobState::NeedsOnSiteRecovery {
+                    detail: detail(error),
+                })
+            } else {
+                JobOutcome::Open
+            };
+        }
+        // The resume would end as the journal says: the open job reports it then.
+        JournalStanding::Decided => return JobOutcome::Open,
+        JournalStanding::Clean => {}
     }
     // A refusal or failure that precedes everything the run sends is a precondition failure on a
     // first run.
@@ -167,9 +206,9 @@ pub fn outcome(
         | JobError::CurrentThreadRuntime
         | JobError::CommLogMismatch
         | JobError::NoCommLogDir
-        | JobError::GuardsMissing
-        | JobError::Panicked
-        | JobError::Journal(_) => before_first_request(FailureCode::Internal),
+        | JobError::GuardsMissing => before_first_request(FailureCode::Internal),
+        // These can happen mid-run, so they are failures on a first run too.
+        JobError::Panicked | JobError::Journal(_) => failed(FailureCode::Internal),
         // Interruptions with nothing changed. The exchange failed; the log says whether the
         // vehicle, the bus or the system is to blame.
         JobError::Link(_)
@@ -187,6 +226,54 @@ pub fn outcome(
     })
 }
 
+/// The state of a job that needs on-site intervention for `reason`.
+fn on_site(reason: &OnSiteReason) -> JobState {
+    JobState::NeedsOnSiteRecovery {
+        detail: truncated(on_site_text(reason), MAX_FAILURE_DETAIL_LEN),
+    }
+}
+
+/// Whether `error` is a refusal that the next resume of the same job would meet again: it comes
+/// from the program, the job's data or the agent's configuration, not from the vehicle, the
+/// link or the moment, so leaving the job open would only repeat it until the resume limit.
+fn repeats_on_every_resume(error: &JobError) -> bool {
+    match error {
+        JobError::Program(_)
+        | JobError::Vm { .. }
+        | JobError::SeveralTargets { .. }
+        | JobError::Undeclared { .. }
+        | JobError::NoDeclarations
+        | JobError::Sources(_)
+        | JobError::Refused { .. }
+        | JobError::NoArtifact
+        | JobError::ArtifactMismatch { .. }
+        | JobError::SegmentOutsideArtifact { .. }
+        | JobError::ArtifactDiffersFromJournal
+        | JobError::CommLogMismatch
+        | JobError::NoCommLogDir
+        | JobError::CurrentThreadRuntime
+        | JobError::GuardsMissing => true,
+        // A failed exchange, a lock or link held for now, a fault that need not recur and an
+        // interruption: the next resume may go through.
+        JobError::Link(_)
+        | JobError::Host { .. }
+        | JobError::IdentityRead { .. }
+        | JobError::IdentityUnreadable { .. }
+        | JobError::NoReprogrammingSlot
+        | JobError::VehicleLock(_)
+        | JobError::LinkUnconfirmed
+        | JobError::Journal(_)
+        | JobError::Panicked
+        | JobError::Cancelled
+        | JobError::Unanswerable(_) => false,
+        // Terminal before the standing is read.
+        JobError::ProcedureFailed { .. }
+        | JobError::IdentityMismatch { .. }
+        | JobError::StepLimit(_)
+        | JobError::OnSiteInterventionRequired(_) => false,
+    }
+}
+
 /// The error's `log_text`, cut to the detail's bound.
 fn detail(error: &JobError) -> String {
     truncated(error.log_text(), MAX_FAILURE_DETAIL_LEN)
@@ -195,7 +282,7 @@ fn detail(error: &JobError) -> String {
 /// The reason's name and its plain numeric fields, written by hand: a `Debug` rendering would
 /// carry the journal's text and a voltage the VCI read, which the detail leaves out. The nested
 /// teardown and confirmation outcomes are left to the operational log.
-fn on_site_text(reason: &OnSiteReason) -> String {
+pub(crate) fn on_site_text(reason: &OnSiteReason) -> String {
     let at = |at: &crate::journal::StepRef| format!("pc {} step {}", at.pc, at.steps);
     match reason {
         OnSiteReason::UnreadableJournal(_) => "UnreadableJournal".to_owned(),
@@ -308,8 +395,9 @@ mod tests {
     use super::*;
     use crate::guards::GuardError;
     use crate::host::HostError;
+    use crate::inputs::TableError;
     use crate::journal::StepRef;
-    use diag_ir::{Op, Vm, VmError, WaitingOn};
+    use diag_ir::{Idempotency, Interruptible, Op, Section, Vm, VmError, WaitingOn};
     use std::path::PathBuf;
 
     const MARKER: &str = "MARKER-external-text";
@@ -319,7 +407,7 @@ mod tests {
     }
 
     fn run(error: JobError, first_run: bool, standing: JournalStanding) -> JobOutcome {
-        outcome(&Err(error), first_run, standing)
+        outcome(&Err(error), first_run, &standing)
     }
 
     fn state(error: JobError, first_run: bool, standing: JournalStanding) -> JobState {
@@ -352,18 +440,103 @@ mod tests {
         }
     }
 
-    use JournalStanding::{Clean, MayHaveChanged};
+    /// The `index`th error of `list`, built afresh: `JobError` is not `Clone`.
+    fn nth(list: fn() -> Vec<JobError>, index: usize) -> JobError {
+        list().swap_remove(index)
+    }
+
+    /// An on-site standing for a reason that holds no text.
+    fn on_site_standing() -> JournalStanding {
+        JournalStanding::OnSite(OnSiteReason::ResumeLimitReached {
+            flash_session: 1,
+            resumes: 2,
+            max: 2,
+        })
+    }
+
+    use JournalStanding::{Clean, Decided, Resumable};
+
+    /// A refusal every resume would meet again: one of each variant that `repeats_on_every_resume`
+    /// takes.
+    fn deterministic_errors() -> Vec<JobError> {
+        vec![
+            JobError::SeveralTargets { count: 2 },
+            JobError::NoDeclarations,
+            JobError::NoArtifact,
+            JobError::ArtifactMismatch {
+                named: "a".to_owned(),
+                actual: "b".to_owned(),
+            },
+            JobError::SegmentOutsideArtifact {
+                pc: 1,
+                session: 1,
+                segment: 1,
+                end: 9,
+                artifact_len: 4,
+            },
+            JobError::Undeclared {
+                pc: 0,
+                source: VmError::StackUnderflow,
+            },
+            JobError::Refused {
+                pc: 0,
+                source: HostError::NoResponse,
+            },
+            JobError::Program(diag_ir::ProgramError::BoundaryOutOfOrder { flash_session: 1 }),
+            JobError::Sources(TableError::Duplicate {
+                service_id: 1,
+                field_id: 2,
+            }),
+            JobError::Vm {
+                pc: 2,
+                source: VmError::StackUnderflow,
+            },
+            JobError::ArtifactDiffersFromJournal,
+            JobError::CommLogMismatch,
+            JobError::NoCommLogDir,
+            JobError::CurrentThreadRuntime,
+            JobError::GuardsMissing,
+        ]
+    }
+
+    /// Interruptions the next resume may get past.
+    fn transient_errors() -> Vec<JobError> {
+        vec![
+            JobError::Host {
+                pc: 1,
+                source: HostError::NoResponse,
+            },
+            JobError::Link(HostError::NoResponse),
+            JobError::IdentityRead {
+                pc: 1,
+                identity: IdentityKind::Vin,
+                source: HostError::NoResponse,
+            },
+            JobError::IdentityUnreadable {
+                pc: 1,
+                identity: IdentityKind::Vin,
+            },
+            JobError::NoReprogrammingSlot,
+            JobError::LinkUnconfirmed,
+            JobError::Panicked,
+            JobError::Journal(JournalError::Poisoned),
+            JobError::Journal(JournalError::Io(std::io::Error::other("x"))),
+            JobError::VehicleLock(GuardError::OtherVehicleHeld),
+            JobError::Unanswerable(WaitingOn::Timer),
+            JobError::Cancelled,
+        ]
+    }
 
     #[test]
     fn a_finished_run_is_completed() {
         let program = program();
         let finished = Ok(Vm::new(&program).state);
         assert_eq!(
-            outcome(&finished, true, Clean),
+            outcome(&finished, true, &Clean),
             JobOutcome::Terminal(JobState::Completed)
         );
         assert_eq!(
-            outcome(&finished, false, MayHaveChanged),
+            outcome(&finished, false, &Resumable),
             JobOutcome::Terminal(JobState::Completed)
         );
     }
@@ -372,7 +545,7 @@ mod tests {
     fn a_procedure_failure_carries_its_own_code_and_detail_and_never_an_agent_code() {
         // A procedure may name its code after an agent's; it stays the procedure's.
         for code in ["internal", "VinMismatch", "linkNotOpened", "x"] {
-            for standing in [Clean, MayHaveChanged] {
+            for standing in [Clean, Resumable, Decided, on_site_standing()] {
                 let error = JobError::ProcedureFailed {
                     pc: 3,
                     code: code.to_owned(),
@@ -411,7 +584,7 @@ mod tests {
                 identity: IdentityKind::Vin,
             },
             false,
-            MayHaveChanged,
+            Resumable,
         );
         assert_eq!(code_of(&vin), &FailureCode::VinMismatch);
         assert!(detail_of(&vin).contains("Vin"));
@@ -435,19 +608,34 @@ mod tests {
 
     #[test]
     fn a_stop_the_vm_made_is_a_procedure_error_whatever_the_journal() {
-        for standing in [Clean, MayHaveChanged] {
-            for error in [
-                JobError::StepLimit(9),
+        for standing in [Clean, Resumable, Decided, on_site_standing()] {
+            let s = state(JobError::StepLimit(9), true, standing);
+            assert_eq!(code_of(&s), &FailureCode::ProcedureError);
+        }
+        // A VM error is the run's own stop once the journal holds it (or holds nothing).
+        for standing in [Clean, Decided] {
+            let s = state(
                 JobError::Vm {
                     pc: 2,
                     source: VmError::StackUnderflow,
                 },
-            ] {
-                let s = state(error, true, standing);
-                assert_eq!(code_of(&s), &FailureCode::ProcedureError);
-                assert!(matches!(s, JobState::Failed { .. }));
-            }
+                true,
+                standing,
+            );
+            assert_eq!(code_of(&s), &FailureCode::ProcedureError);
+            assert!(matches!(s, JobState::Failed { .. }));
         }
+    }
+
+    #[test]
+    fn a_vm_error_on_a_journal_a_resume_goes_on_from_needs_on_site_recovery() {
+        let error = || JobError::Vm {
+            pc: 2,
+            source: VmError::StackUnderflow,
+        };
+        let s = state(error(), false, Resumable);
+        assert!(matches!(s, JobState::NeedsOnSiteRecovery { .. }), "{s:?}");
+        assert!(!detail_of(&s).is_empty());
     }
 
     #[test]
@@ -459,7 +647,7 @@ mod tests {
                 max: 3,
             }),
             false,
-            MayHaveChanged,
+            Resumable,
         );
         assert_eq!(
             s,
@@ -490,6 +678,27 @@ mod tests {
     }
 
     #[test]
+    fn an_on_site_standing_ends_the_job_at_once_whatever_the_error() {
+        let expected = JobState::NeedsOnSiteRecovery {
+            detail: "ResumeLimitReached: flash session 1, 2 of 2 resumes".to_owned(),
+        };
+        let lists: [fn() -> Vec<JobError>; 2] = [deterministic_errors, transient_errors];
+        for list in lists {
+            for index in 0..list().len() {
+                for first_run in [true, false] {
+                    let error = nth(list, index);
+                    let name = format!("{error:?}");
+                    assert_eq!(
+                        run(error, first_run, on_site_standing()),
+                        JobOutcome::Terminal(expected.clone()),
+                        "{name}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_cancel_is_cancelled_while_the_journal_is_clean_and_open_after() {
         for first_run in [true, false] {
             assert_eq!(
@@ -497,7 +706,7 @@ mod tests {
                 JobState::Cancelled
             );
             assert_eq!(
-                run(JobError::Cancelled, first_run, MayHaveChanged),
+                run(JobError::Cancelled, first_run, Resumable),
                 JobOutcome::Open
             );
         }
@@ -506,31 +715,20 @@ mod tests {
     #[test]
     fn a_refusal_before_the_first_request_is_a_precondition_failure() {
         let errors = || {
-            [
-                JobError::SeveralTargets { count: 2 },
-                JobError::NoDeclarations,
-                JobError::NoArtifact,
-                JobError::ArtifactMismatch {
-                    named: "a".to_owned(),
-                    actual: "b".to_owned(),
-                },
-                JobError::SegmentOutsideArtifact {
-                    pc: 1,
-                    session: 1,
-                    segment: 1,
-                    end: 9,
-                    artifact_len: 4,
-                },
-                JobError::Undeclared {
-                    pc: 0,
-                    source: VmError::StackUnderflow,
-                },
-                JobError::Refused {
-                    pc: 0,
-                    source: HostError::NoResponse,
-                },
-                JobError::Program(diag_ir::ProgramError::BoundaryOutOfOrder { flash_session: 1 }),
-            ]
+            deterministic_errors()
+                .into_iter()
+                // A VM error is a stop, not a refusal, on a clean journal.
+                .filter(|error| !matches!(error, JobError::Vm { .. }))
+                .filter(|error| {
+                    // These four are the agent's own faults, not the job's.
+                    !matches!(
+                        error,
+                        JobError::CommLogMismatch
+                            | JobError::NoCommLogDir
+                            | JobError::CurrentThreadRuntime
+                            | JobError::GuardsMissing
+                    )
+                })
         };
         for error in errors() {
             let s = state(error, true, Clean);
@@ -538,16 +736,29 @@ mod tests {
             assert_eq!(code_of(&s), &FailureCode::JobRefused);
             assert!(!detail_of(&s).is_empty());
         }
-        // On a resume the same refusal is a failure, and the resume of a journal that may
-        // have changed stays open.
+        // On a resume the same refusal is a failure.
         for error in errors() {
             let s = state(error, false, Clean);
             assert!(matches!(s, JobState::Failed { .. }), "{s:?}");
             assert_eq!(code_of(&s), &FailureCode::JobRefused);
         }
-        for error in errors() {
-            assert_eq!(run(error, true, MayHaveChanged), JobOutcome::Open);
+    }
+
+    #[test]
+    fn a_refusal_on_a_journal_a_resume_goes_on_from_needs_on_site_recovery() {
+        for index in 0..deterministic_errors().len() {
+            for first_run in [true, false] {
+                let error = nth(deterministic_errors, index);
+                let name = format!("{error:?}");
+                let JobOutcome::Terminal(s) = run(error, first_run, Resumable) else {
+                    panic!("{name}: not terminal");
+                };
+                assert!(matches!(s, JobState::NeedsOnSiteRecovery { .. }), "{name}");
+                assert!(!detail_of(&s).is_empty(), "{name}");
+            }
         }
+        let s = state(JobError::ArtifactDiffersFromJournal, false, Resumable);
+        assert!(matches!(s, JobState::NeedsOnSiteRecovery { .. }));
         let s = state(JobError::ArtifactDiffersFromJournal, false, Clean);
         assert_eq!(code_of(&s), &FailureCode::JobRefused);
     }
@@ -574,16 +785,33 @@ mod tests {
             JobError::CommLogMismatch,
             JobError::NoCommLogDir,
             JobError::GuardsMissing,
-            JobError::Panicked,
-            JobError::Journal(JournalError::Poisoned),
         ] {
             let s = state(error, true, Clean);
             assert!(matches!(s, JobState::PreconditionFailed { .. }), "{s:?}");
             assert_eq!(code_of(&s), &FailureCode::Internal);
         }
-        let s = state(JobError::Panicked, false, Clean);
+        let s = state(JobError::NoCommLogDir, false, Clean);
         assert!(matches!(s, JobState::Failed { .. }));
+        // A panic and a journal fault can happen mid-run, so they are failures on a first run too.
+        for first_run in [true, false] {
+            for error in [
+                JobError::Panicked,
+                JobError::Journal(JournalError::Poisoned),
+                JobError::Journal(JournalError::Io(std::io::Error::other(MARKER))),
+            ] {
+                let s = state(error, first_run, Clean);
+                assert!(matches!(s, JobState::Failed { .. }), "{s:?}");
+                assert_eq!(code_of(&s), &FailureCode::Internal);
+            }
+        }
+        let s = state(
+            JobError::Journal(JournalError::Io(std::io::Error::other(MARKER))),
+            true,
+            Clean,
+        );
+        assert!(matches!(s, JobState::Failed { .. }), "{s:?}");
         assert_eq!(code_of(&s), &FailureCode::Internal);
+        assert!(!detail_of(&s).contains(MARKER));
         // A failed exchange claims neither side.
         for error in [
             JobError::Host {
@@ -610,105 +838,118 @@ mod tests {
     }
 
     #[test]
-    fn a_run_that_may_have_changed_the_journal_is_open() {
+    fn a_transient_error_on_a_journal_a_resume_goes_on_from_is_open() {
         for first_run in [true, false] {
-            for error in [
-                JobError::Host {
-                    pc: 1,
-                    source: HostError::NoResponse,
-                },
-                JobError::Link(HostError::NoResponse),
-                JobError::LinkUnconfirmed,
-                JobError::Panicked,
-                JobError::Journal(JournalError::Poisoned),
-                JobError::NoArtifact,
-                JobError::VehicleLock(GuardError::OtherVehicleHeld),
-                JobError::Unanswerable(WaitingOn::Timer),
-                JobError::ArtifactDiffersFromJournal,
-            ] {
-                assert_eq!(run(error, first_run, MayHaveChanged), JobOutcome::Open);
+            for index in 0..transient_errors().len() {
+                let error = nth(transient_errors, index);
+                let name = format!("{error:?}");
+                assert_eq!(run(error, first_run, Resumable), JobOutcome::Open, "{name}");
             }
         }
+        // A journal that holds a decision ends the resume as it says: the run stays open.
+        assert_eq!(run(JobError::Cancelled, false, Decided), JobOutcome::Open);
     }
 
     #[test]
     fn a_job_another_run_owns_reports_nothing() {
-        for error in [JournalError::InUse, JournalError::AlreadyExists] {
-            for standing in [Clean, MayHaveChanged] {
+        for standing in [Clean, Resumable, Decided, on_site_standing()] {
+            for first_run in [true, false] {
                 assert_eq!(
-                    run(JobError::Journal(error_like(&error)), true, standing),
+                    run(
+                        JobError::Journal(JournalError::InUse),
+                        first_run,
+                        standing.clone()
+                    ),
+                    JobOutcome::None
+                );
+                assert_eq!(
+                    run(
+                        JobError::Journal(JournalError::AlreadyExists),
+                        first_run,
+                        standing.clone()
+                    ),
                     JobOutcome::None
                 );
             }
         }
     }
 
-    fn error_like(error: &JournalError) -> JournalError {
-        match error {
-            JournalError::InUse => JournalError::InUse,
-            _ => JournalError::AlreadyExists,
-        }
-    }
-
-    #[test]
-    fn no_detail_carries_external_text() {
-        let guard = || GuardError::UnsafeDir(PathBuf::from(MARKER));
-        let errors = [
+    /// Errors that carry text NGR does not write: a worker's, the system's or the document's.
+    fn marker_errors() -> Vec<JobError> {
+        vec![
             JobError::Link(rpc()),
+            JobError::Link(HostError::WorkerStart {
+                spawn_failed: true,
+                reason: MARKER.to_owned(),
+            }),
+            JobError::Link(HostError::DeclaredLink(MARKER.to_owned())),
             JobError::Host {
+                pc: 1,
+                source: rpc(),
+            },
+            JobError::Host {
+                pc: 1,
+                source: HostError::StreamFailedBeforeSend(Box::new(HostError::DeclaredLink(
+                    MARKER.to_owned(),
+                ))),
+            },
+            JobError::Refused {
                 pc: 1,
                 source: rpc(),
             },
             JobError::Refused {
                 pc: 1,
-                source: rpc(),
+                source: HostError::DeclaredLink(MARKER.to_owned()),
             },
             JobError::IdentityRead {
                 pc: 1,
                 identity: IdentityKind::Vin,
                 source: rpc(),
             },
-            JobError::VehicleLock(guard()),
+            JobError::VehicleLock(GuardError::UnsafeDir(PathBuf::from(MARKER))),
+            JobError::VehicleLock(GuardError::UnlistableDir(PathBuf::from(MARKER))),
+            JobError::VehicleLock(GuardError::NotAFile(PathBuf::from(MARKER))),
+            JobError::VehicleLock(GuardError::InvalidVci(MARKER.to_owned())),
+            JobError::VehicleLock(GuardError::Io(std::io::Error::other(MARKER))),
             JobError::Journal(JournalError::Io(std::io::Error::other(MARKER))),
-        ];
-        for error in errors {
-            for first_run in [true, false] {
-                let s = state(error_copy(&error), first_run, Clean);
-                assert!(!detail_of(&s).is_empty());
-                assert!(
-                    !detail_of(&s).contains(MARKER),
-                    "{}: {}",
-                    error.log_text(),
-                    detail_of(&s)
-                );
-            }
-        }
+            JobError::Journal(JournalError::InvalidJobId(MARKER.to_owned())),
+            JobError::Sources(TableError::Document {
+                service_id: 1,
+                field_id: 2,
+                reason: MARKER.to_owned(),
+            }),
+            JobError::OnSiteInterventionRequired(OnSiteReason::UnreadableJournal(
+                MARKER.to_owned(),
+            )),
+            JobError::OnSiteInterventionRequired(OnSiteReason::InvalidEntryState(
+                MARKER.to_owned(),
+            )),
+        ]
     }
 
-    /// A copy of a marker-carrying error: `JobError` is not `Clone`.
-    fn error_copy(error: &JobError) -> JobError {
-        match error {
-            JobError::Link(_) => JobError::Link(rpc()),
-            JobError::Host { pc, .. } => JobError::Host {
-                pc: *pc,
-                source: rpc(),
-            },
-            JobError::Refused { pc, .. } => JobError::Refused {
-                pc: *pc,
-                source: rpc(),
-            },
-            JobError::IdentityRead { pc, identity, .. } => JobError::IdentityRead {
-                pc: *pc,
-                identity: *identity,
-                source: rpc(),
-            },
-            JobError::VehicleLock(_) => {
-                JobError::VehicleLock(GuardError::UnsafeDir(PathBuf::from(MARKER)))
+    #[test]
+    fn no_detail_carries_external_text() {
+        let standings = || {
+            [
+                Clean,
+                Resumable,
+                Decided,
+                JournalStanding::OnSite(OnSiteReason::UnreadableJournal(MARKER.to_owned())),
+                JournalStanding::OnSite(OnSiteReason::InvalidEntryState(MARKER.to_owned())),
+            ]
+        };
+        let count = marker_errors().len();
+        for index in 0..count {
+            for first_run in [true, false] {
+                for standing in standings() {
+                    let error = marker_errors().swap_remove(index);
+                    let text = error.log_text();
+                    assert!(!text.contains(MARKER), "log_text: {text}");
+                    if let JobOutcome::Terminal(s) = run(error, first_run, standing) {
+                        assert!(!detail_of(&s).contains(MARKER), "{text}: {s:?}");
+                    }
+                }
             }
-            JobError::Journal(_) => {
-                JobError::Journal(JournalError::Io(std::io::Error::other(MARKER)))
-            }
-            _ => unreachable!("not a marker-carrying error"),
         }
     }
 
@@ -737,35 +978,121 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_standing_is_read_from_the_journal() {
-        let dir = tempfile::tempdir().unwrap();
+    fn request_program() -> Program {
         let mut program = program();
         program.code = vec![
             Op::PushBytes(0),
             Op::ServiceRequest { service: 0x22 },
             Op::Pop,
         ];
-        // No journal at all.
-        assert_eq!(JournalStanding::read(dir.path(), &key(), &program), Clean);
+        program
+    }
+
+    fn recovery_required_section() -> Section {
+        Section {
+            start_pc: 0,
+            end_pc: 3,
+            interruptible: Interruptible::RecoveryRequired,
+            idempotency: Idempotency::Safe,
+            expected_millis: 0,
+        }
+    }
+
+    #[test]
+    fn a_missing_journal_is_clean_on_a_first_run_and_judged_by_restart_on_a_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        // No primitive, section or plan: a plain start, so a missing journal loses nothing.
+        let plain = program();
+        let mut guarded = request_program();
+        guarded.sections = vec![recovery_required_section()];
+        for first_run in [true, false] {
+            assert_eq!(
+                JournalStanding::read(dir.path(), &key(), &plain, first_run),
+                Clean
+            );
+        }
+        assert_eq!(
+            JournalStanding::read(dir.path(), &key(), &guarded, true),
+            Clean
+        );
+        // The runner creates the journal before it sends anything, so a resume that finds none
+        // of a program that is not a plain start cannot tell what was sent.
+        assert_eq!(
+            JournalStanding::read(dir.path(), &key(), &guarded, false),
+            JournalStanding::OnSite(OnSiteReason::MissingJournal)
+        );
+        // A job ID that cannot name a journal never had one.
+        for first_run in [true, false] {
+            assert_eq!(
+                JournalStanding::of(
+                    &guarded,
+                    Err(&JournalError::InvalidJobId("x".to_owned())),
+                    first_run
+                ),
+                Clean
+            );
+        }
+    }
+
+    #[test]
+    fn an_intent_in_a_recovery_required_section_without_a_marker_needs_on_site_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut program = request_program();
+        program.sections = vec![recovery_required_section()];
+        let mut journal = Journal::create(dir.path(), &key(), None, None, None).unwrap();
+        assert_eq!(
+            JournalStanding::read(dir.path(), &key(), &program, true),
+            Clean
+        );
+        journal.commit_intent(at(1)).unwrap();
+        let standing = JournalStanding::read(dir.path(), &key(), &program, true);
+        assert!(
+            matches!(
+                standing,
+                JournalStanding::OnSite(OnSiteReason::RecoveryRequiredSection { section: 0, .. })
+            ),
+            "{standing:?}"
+        );
+        // Whatever the run's error, the job ends in on-site recovery.
+        let s = state(JobError::Cancelled, true, standing);
+        assert!(matches!(s, JobState::NeedsOnSiteRecovery { .. }), "{s:?}");
+        assert!(detail_of(&s).starts_with("RecoveryRequiredSection: section 0"));
+    }
+
+    #[test]
+    fn the_standing_is_what_the_next_resume_would_decide() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = request_program();
         // One that holds no request marker.
         let mut journal = Journal::create(dir.path(), &key(), None, None, None).unwrap();
-        assert_eq!(JournalStanding::read(dir.path(), &key(), &program), Clean);
-        assert_eq!(JournalStanding::of(&program, Ok(journal.state())), Clean);
-        // One that holds a marker, which a resume must judge.
-        journal.commit_request(at(1)).unwrap();
         assert_eq!(
-            JournalStanding::read(dir.path(), &key(), &program),
-            MayHaveChanged
-        );
-        // A journal that cannot be read back may have changed.
-        assert_eq!(
-            JournalStanding::of(&program, Err(&JournalError::Poisoned)),
-            MayHaveChanged
-        );
-        assert_eq!(
-            JournalStanding::of(&program, Err(&JournalError::NotFound)),
+            JournalStanding::read(dir.path(), &key(), &program, false),
             Clean
+        );
+        assert_eq!(
+            JournalStanding::of(&program, Ok(journal.state()), true),
+            Clean
+        );
+        // One that holds a marker no state confirms: a resume needs someone on site.
+        journal.commit_request(at(1)).unwrap();
+        assert!(matches!(
+            JournalStanding::read(dir.path(), &key(), &program, true),
+            JournalStanding::OnSite(OnSiteReason::UnconfirmedRequest { .. })
+        ));
+        // A journal that cannot be read back is on-site as well, on a resume and on a first run.
+        for first_run in [true, false] {
+            assert!(matches!(
+                JournalStanding::of(&program, Err(&JournalError::Poisoned), first_run),
+                JournalStanding::OnSite(OnSiteReason::UnreadableJournal(_))
+            ));
+        }
+        // A journal that holds a decision.
+        journal
+            .commit_procedure_failed(at(1), "c", "detail")
+            .unwrap();
+        assert_eq!(
+            JournalStanding::read(dir.path(), &key(), &program, false),
+            Decided
         );
     }
 }

@@ -426,6 +426,24 @@ impl crate::oplog::LogSafe for JobError {
             }
             // The I/O error's text is the operating system's, not NGR's.
             JobError::Journal(JournalError::Io(_)) => "journal: journal I/O failed".to_owned(),
+            // The job ID is the server's text.
+            JobError::Journal(JournalError::InvalidJobId(_)) => {
+                "journal: the job ID cannot name a journal file".to_owned()
+            }
+            // The reason is the document's text.
+            JobError::Sources(crate::inputs::TableError::Document {
+                service_id,
+                field_id,
+                ..
+            }) => format!(
+                "the job's document does not declare a readable source: service {service_id} \
+                 field {field_id}: the document's declaration cannot be read"
+            ),
+            // A `Debug` rendering would carry the journal's text and the VCI's voltage.
+            JobError::OnSiteInterventionRequired(reason) => format!(
+                "the job needs on-site intervention: {}",
+                crate::job_report::on_site_text(reason)
+            ),
             other => other.to_string(),
         }
     }

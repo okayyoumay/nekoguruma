@@ -570,6 +570,15 @@ mod tests {
         assert_eq!(failure_code.as_deref(), Some("jobRefused"));
         assert_eq!(procedure_code, None);
         assert_eq!(detail.as_deref(), Some("d"));
+        // An empty detail is left out of the event.
+        let kind = JobState::NeedsOnSiteRecovery {
+            detail: String::new(),
+        }
+        .to_event_kind(JobId("j".to_owned()));
+        let AgentEventKind::JobState { detail, .. } = kind else {
+            panic!("not a job state");
+        };
+        assert_eq!(detail, None);
     }
 
     #[test]

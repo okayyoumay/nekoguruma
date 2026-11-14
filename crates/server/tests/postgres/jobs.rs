@@ -466,12 +466,16 @@ async fn the_layer_answers_before_the_body_and_a_wrong_method_needs_no_session()
         assert_eq!(r.header("allow"), Some("POST"), "{method}");
     }
 
-    // L5: a body over the limit without a session is a 401: the layer answers before the body.
-    let big = post(
-        vec![with_origin.clone(), json_type.clone(), key.clone()],
-        &"x".repeat(20_000),
-    )
-    .await;
+    // L5: a body over the limit without a session is a 401: the layer answers before the body, so
+    // only the headers are sent (unread input at close would reset the connection on Windows).
+    let mut headers = vec![with_origin.clone(), json_type.clone(), key.clone()];
+    headers.push("Content-Length: 20000".to_owned());
+    let big_raw = format!(
+        "POST /api/v1/jobs HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n{}\r\n\r\n",
+        addr.port(),
+        headers.join("\r\n")
+    );
+    let big = exchange(addr, &big_raw).await;
     assert_problem(&big, 401, "oversized, no session");
 
     // Nothing above made a job, and the session that was not touched still creates one.
@@ -523,15 +527,15 @@ async fn the_body_is_bounded_in_size_and_time_and_each_refusal_closes_the_connec
     closes(&declared, "declared");
     assert!(started.elapsed() < Duration::from_secs(4), "answered early");
 
-    // A body that grows past the limit without declaring a length is a 413 when it does.
-    let chunk = "x".repeat(8193);
+    // A body that grows past the limit without declaring a length is a 413 when it does: one
+    // chunk just over the limit, with no terminating chunk, so nothing is left unread.
+    let chunk = "x".repeat(16385);
     let chunked = format!(
         "POST /api/v1/jobs HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n{}\r\n\
-         Transfer-Encoding: chunked\r\n\r\n{:x}\r\n{chunk}\r\n{:x}\r\n{chunk}\r\n0\r\n\r\n",
+         Transfer-Encoding: chunked\r\n\r\n{:x}\r\n{chunk}",
         addr.port(),
         job_headers(addr, &cookie, "chunked").join("\r\n"),
         chunk.len(),
-        chunk.len()
     );
     let grown = exchange(addr, &chunked).await;
     assert_eq!(grown.status, 413, "{}", grown.head);
@@ -585,6 +589,18 @@ async fn an_acquire_job_is_stored_signed_and_answered_with_its_state() {
     // A version 7 UUID with the variant bits of RFC 9562.
     assert_eq!(&id[14..15], "7");
     assert!(matches!(&id[19..20], "8" | "9" | "a" | "b"), "{id}");
+    // Its time is the database's millisecond, rounded down: never ahead of the clock.
+    let embedded = i64::from_str_radix(&format!("{}{}", &id[..8], &id[9..13]), 16).unwrap();
+    let clock = lab
+        .w
+        .sql("SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint::text")
+        .await
+        .parse::<i64>()
+        .unwrap();
+    assert!(
+        embedded <= clock && clock - embedded < 60_000,
+        "{embedded} {clock}"
+    );
     let row = lab
         .field(
             &id,
@@ -904,6 +920,32 @@ async fn a_key_held_by_an_uncommitted_insert_is_decided_when_the_holder_ends() {
     assert_ne!(created, held);
     lab.assert_jobs(3, "rollback").await;
     assert_eq!(lab.field(&created, "idempotency_key").await, "gone");
+    lab.finish().await;
+}
+
+#[tokio::test]
+async fn the_replay_after_a_lost_insert_works_whatever_the_database_default_isolation() {
+    // K12 again, with the database defaulting to repeatable read: the transaction states read
+    // committed, so the re-read after the lost insert sees the holder's row.
+    let mut lab = Lab::new().await;
+    lab.w
+        .pg
+        .execute("ALTER DATABASE postgres SET default_transaction_isolation = 'repeatable read'")
+        .await;
+    // Pools are lazy: a server and a holder made now open sessions with the new default.
+    let addr = lab.another_server().await;
+    let cookie = login(addr, "alice").await;
+    let body = lab.body(json!({}));
+    let hash = body_hash(body.as_bytes()).unwrap();
+    let pool = lab.w.pg.pool();
+    let (tx, held) = hold_key(&pool, &lab.agent_id, "same", Some(hash)).await;
+    let waiting = spawn_post(addr, &cookie, "same", &body);
+    wait_for_insert_lock(&lab).await;
+    tx.commit().await.unwrap();
+    let r = waiting.await.unwrap();
+    assert_eq!(r.status, 202, "{} {}", r.head, r.body);
+    assert_eq!(job_id(&r), held);
+    lab.assert_jobs(1, "replay").await;
     lab.finish().await;
 }
 

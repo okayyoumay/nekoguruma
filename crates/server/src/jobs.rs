@@ -120,7 +120,7 @@ impl Kind {
     }
 
     /// The confirmation level of the kind (design 6.3). A `gracePeriod` is recorded here and
-    /// not enforced yet.
+    /// not enforced.
     fn confirmation(self) -> &'static str {
         match self {
             Kind::Acquire => "notifyOnly",
@@ -690,6 +690,29 @@ impl Inner {
             .await
             .map_err(|e| JobError::Internal(e.to_string()))?;
 
+        // Hold the active key's row and the agent's row shared until the commit: a retirement or a
+        // revocation then waits for this insert, or has committed before it, and is seen here.
+        let key_locked: Option<(i32,)> = sqlx::query_as(
+            "SELECT 1 FROM instruction_keys WHERE key_id = $1 AND retired_at IS NULL FOR SHARE",
+        )
+        .bind(&key_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if key_locked.is_none() {
+            return Ok(Outcome::KeyNotActive);
+        }
+        let agent_locked: Option<(i32,)> = sqlx::query_as(
+            "SELECT 1 FROM agents WHERE id = $1::uuid AND tenant_id = $2::uuid \
+               AND revoked_at IS NULL FOR SHARE",
+        )
+        .bind(&spec.agent_id)
+        .bind(&operator.tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if agent_locked.is_none() {
+            return Ok(Outcome::Denied(Denial::AgentRevoked));
+        }
+
         let digests: Vec<String> = spec.hashes.iter().map(|h| hex(h)).collect();
         let inserted: Option<StoredRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "INSERT INTO jobs (tenant_id, id, kind, agent_id, operator_id, vci_id, vin, \
@@ -755,7 +778,7 @@ impl Inner {
                        AND l.agent_id = $3::uuid AND l.operator_id = $2::uuid), \
                EXISTS (SELECT 1 FROM instruction_keys k WHERE k.key_id = $4 \
                        AND k.retired_at IS NULL), \
-               (extract(epoch FROM now()) * 1000)::bigint",
+               floor(extract(epoch FROM now()) * 1000)::bigint",
         )
         .bind(&operator.tenant_id)
         .bind(&operator.operator_id)

@@ -485,9 +485,11 @@ ngr-server user disable --config <file> --username alice
   caller's permission (the key is judged before the permission). (b) One read of the permission:
   the role `worker` with an empty scope, an agent row of the session's tenant that is unrevoked,
   an allow-list row, and whether the process's key is the active `instruction_keys` row, with
-  the database's clock. A refusal is one 403 document; the reason (`not_worker`, `agent_unknown`,
+  the database's clock (the second is rounded down). A refusal is one 403 document; the reason (`not_worker`, `agent_unknown`,
   `agent_revoked`, `not_allowed`) goes to the log through its own gate. A key that is not the
-  active one is 503 and one logged error. (c) The ID (UUIDv7 from the database's milliseconds
+  active one is 503 and one logged error. Before the insert the active key's row and the agent's unrevoked row are locked `FOR SHARE`, so
+  a retirement or a revocation waits for the insert; a row gone at that point is the 503 for a
+  key that is not active, or the 403 `agent_revoked`. (c) The ID (UUIDv7 from the database's milliseconds
   and ten random bytes) and the instruction (version 1, generation 1, the session's operator, the
   sorted unique hashes, no plan, issued at the database's second, start deadline 900 seconds
   later) are sealed; a signer's failure is 500 and nothing is written. (d) `INSERT ... ON
@@ -497,14 +499,14 @@ ngr-server user disable --config <file> --username alice
   an uncommitted insert of the same key, is 503.
 - **The row and the answer.** The row holds the signed bytes, the key's ID, the sorted hashes as
   hex (`ir_digests`), the confirmation level (`notifyOnly` for `acquire`, `gracePeriod` for
-  `writeSettings`, recorded and not enforced yet) and `request_hash`: SHA-256 over a tagged,
+  `writeSettings`, recorded and not enforced) and `request_hash`: SHA-256 over a tagged,
   length-prefixed encoding of the normalized request (kind, agent, VCI, VIN, hashes, artifact),
   with the operator left out (the row's operator is compared). The 202 body is the `Job`
   (`jobId`, `kind`, `state`, `progressPermille`, `confirmation.level`), built by one function
   from the row for a creation and a replay, which shows the current state; `Cache-Control:
   no-store`, no `Location`. The delivery queue sends the stored bytes (ADR-476).
-- **Not done here.** The vehicle lock, the audit record and the start deadline in the request
-  are not part of creation yet.
+- **Not part of creation.** The vehicle lock and the audit record are not taken or written, and
+  the request cannot set the start deadline.
 - **Logging.** `job created` at info with the job and operator IDs; each refusal reason, a
   key that is not the active one, a 503 and a 500 have their own gate, once a minute. The body,
   the idempotency key, the VCI ID and the VIN are never logged.

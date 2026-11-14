@@ -72,14 +72,14 @@ paths:
         documents by hash, 11.1, ADR-461), stores it with the job and leaves its delivery to the
         queue (5.3, ADR-476). The request's start deadline is 15 minutes after the instruction is
         issued. A `writeSettings` job's `gracePeriod` confirmation level is recorded and not
-        enforced yet. Operations requiring seed-key or OEM authentication must be online (5.7).
+        enforced. Operations requiring seed-key or OEM authentication must be online (5.7).
 
         The local deployment accepts `kind` `acquire` and `writeSettings` only. Other kinds, a
         `remote` of `true`, a non-empty `parameters`, an `executionWindow`, a `startDeadline` and an
         `onSiteContact` are **400**; `remote: false` and an empty `parameters` count as absent.
         `irDigests` is required (1 to 128 entries of 64 lowercase hex digits, in any order, repeats
-        allowed). `agentId` is a lowercase UUID, `vciId` 1 to 1024 bytes without a control
-        character, and `vin`, when given, a well-formed VIN. The body is one JSON object of the
+        allowed). `agentId` is a lowercase UUID, `vciId` 1 to 1024 bytes of UTF-8 without a
+        control character, and `vin`, when given, a well-formed VIN. The body is one JSON object of the
         names below, each at most once and none null, in at most 16384 bytes.
 
         `Idempotency-Key` (1 to 128 visible ASCII characters, compared as bytes) names the job for
@@ -116,7 +116,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Job' }
         '400':
-          description: The Content-Type, the idempotency key, the body or a value is invalid, or the request asks for something the server does not support yet
+          description: The Content-Type, the idempotency key, the body or a value is invalid, or the request asks for something the server does not support
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
@@ -949,14 +949,13 @@ components:
       description: |
         What `POST /v1/jobs` of the local deployment accepts: `kind` is `acquire` or
         `writeSettings`, and `startDeadline`, `executionWindow`, `onSiteContact`, a `parameters`
-        that is not empty and a `remote` of `true` are refused (400) until the work that gives
-        them a meaning is done.
+        that is not empty and a `remote` of `true` are refused (400): the server gives them no meaning.
       properties:
         kind:
           type: string
           enum: [acquire, monitorSession, monitorCapture, runSequence, writeSettings, reprogram, identify]
         agentId: { type: string, description: The target agent; a lowercase UUID }
-        vciId: { type: string, minLength: 1, maxLength: 1024, description: The VCI as the agent reported it; no control characters }
+        vciId: { type: string, minLength: 1, description: The VCI as the agent reported it; 1 to 1024 bytes of UTF-8 (the route counts bytes), no control characters }
         vin: { type: string, description: A well-formed VIN (17 characters, no I, O or Q) }
         irDigests:
           type: array

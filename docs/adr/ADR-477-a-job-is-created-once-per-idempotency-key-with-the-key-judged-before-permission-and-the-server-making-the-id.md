@@ -23,11 +23,10 @@ concurrent insert of one key ends without a second job or a broken transaction.
    supported". A request that sets `remote: true`, a non-empty `parameters`, an
    `executionWindow`, a `startDeadline` or an `onSiteContact` is 400 as well; `remote: false` and an
    empty `parameters` count as absent. A `startDeadline` cannot be parsed without a date
-   dependency, and the others have no meaning yet. The start deadline is 15 minutes after the
+   dependency, and the others have no meaning to the server. The start deadline is 15 minutes after the
    instruction is issued. The digests are taken as named: at least one, at most 128, in any order
    and with repeats, stored sorted and unique. The confirmation level is `notifyOnly` for
-   acquisition and `gracePeriod` for a write, recorded and not enforced until the agent's
-   confirmation flow exists. 400 means the request can never be valid, 422 only that the key is
+   acquisition and `gracePeriod` for a write, recorded and not enforced. 400 means the request can never be valid, 422 only that the key is
    another request's.
 3. **The caller needs the role `worker` with an empty scope**, the agent in the caller's tenant,
    unrevoked and listing the caller among its allowed operators, and the process's key must be the
@@ -48,12 +47,14 @@ concurrent insert of one key ends without a second job or a broken transaction.
    request has it, so earlier hashes stay valid.
 7. **One transaction at read committed, in a fixed order.** Read the key's row; if there is none,
    read the permission and the active key in one statement; build and sign the instruction with the
-   database's second as its issue time; `INSERT ... ON CONFLICT (tenant_id, idempotency_key) DO
+   database's second (rounded down) as its issue time; lock the active key's row and the agent's
+   unrevoked row `FOR SHARE`, so a retirement or a revocation waits for the insert (a row gone at
+   that point is the key-not-active 503 or the revoked 403); `INSERT ... ON CONFLICT (tenant_id, idempotency_key) DO
    NOTHING RETURNING`. A returned row commits and answers 202. No row means a concurrent insert won:
    the row is read again, with a new statement's snapshot, and decided as in item 4; a row that is
    gone again is 503. A lock wait is bounded by the 5 second `lock_timeout` (503). One function
    builds the `Job` answer from a row for a creation and a replay, with `Cache-Control: no-store`
-   and no `Location` (there is no `GET /v1/jobs/{jobId}` yet).
+   and no `Location` (the route has no `GET /v1/jobs/{jobId}` to point to).
 8. **The schema changes in migration 0008:** `request_hash`; `ir_digests text[] NOT NULL DEFAULT '{}'`
    replacing `ir_digest` (the sorted unique hex list is what is written); `jobs_kind_check` dropped
    and added again with `identify`, as migration 0004 did for the agent mode; a comment on
@@ -66,7 +67,7 @@ concurrent insert of one key ends without a second job or a broken transaction.
 - A replay can show a job to an operator who could no longer create it (item 5).
 - The instruction is signed before the insert, so one is discarded when its insert loses to a
   concurrent request for the same key.
-- A `gracePeriod` is a recorded level and not a wait until the agent's confirmation flow exists.
+- A `gracePeriod` is a recorded level and not a wait.
 - Design 4.4 and the comment on `jobs.id` no longer call a job's ID client-generated.
 - The route does not take the vehicle lock (8.8), writes no audit record and cannot set a start
   deadline, a window or an on-site contact. Each of these replaces one named place in the route when

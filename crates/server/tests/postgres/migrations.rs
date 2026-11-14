@@ -609,7 +609,11 @@ async fn job_creation_columns_replace_the_digest_and_the_kind_check_allows_ident
     let unknown = sqlx::query(sqlx::AssertSqlSafe(job_insert("bogus", "", "")))
         .execute(&pool)
         .await;
-    assert!(unknown.is_err(), "an unknown kind");
+    assert_eq!(
+        sqlstate(&unknown),
+        Some("23514".to_owned()),
+        "an unknown kind: {unknown:?}"
+    );
 
     // The request hash is 32 bytes or absent.
     for (bytes, ok) in [(32, true), (31, false), (33, false), (0, false)] {
@@ -621,6 +625,13 @@ async fn job_creation_columns_replace_the_digest_and_the_kind_check_allows_ident
         .execute(&pool)
         .await;
         assert_eq!(outcome.is_ok(), ok, "{bytes} bytes: {outcome:?}");
+        if !ok {
+            assert_eq!(
+                sqlstate(&outcome),
+                Some("23514".to_owned()),
+                "{bytes} bytes"
+            );
+        }
     }
 
     // The column that holds the job's ID says who makes it.
@@ -632,4 +643,12 @@ async fn job_creation_columns_replace_the_digest_and_the_kind_check_allows_ident
         .await;
     assert!(comment.contains("server"), "{comment}");
     db::close(&pool).await;
+}
+
+/// The SQLSTATE of a failed statement.
+fn sqlstate<T>(outcome: &Result<T, sqlx::Error>) -> Option<String> {
+    match outcome {
+        Err(sqlx::Error::Database(e)) => e.code().map(|c| c.into_owned()),
+        _ => None,
+    }
 }

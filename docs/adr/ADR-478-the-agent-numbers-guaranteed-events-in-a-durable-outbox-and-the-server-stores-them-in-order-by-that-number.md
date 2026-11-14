@@ -2,7 +2,7 @@
 
 **Date:** 2026-11-14
 **Status:** Accepted
-**Affects:** design 5.3, 5.4; `api/asyncapi.yaml` (`agentEvent`, `eventAck`); `crates/shared-proto` (`control`); `crates/agent` (`outbox`, `state`, later `control`), `crates/agent/docs/ngr-agent.md`; the server's event storage and `db/migrations` (later work); details ADR-466 item 10 and ADR-473 item 1
+**Affects:** design 5.3, 5.4; `api/asyncapi.yaml` (`agentEvent`, `eventAck`); `crates/shared-proto` (`control`); `crates/agent` (`outbox`, `state`, `control`), `crates/agent/docs/ngr-agent.md`; the server's event storage and `db/migrations`; details ADR-466 item 10 and ADR-473 item 1
 
 ## Context
 
@@ -78,8 +78,8 @@ backwards under one agent ID, since the server would drop the repeated number as
 - **One file per event.** A directory scan and a sync of the directory per event; the order is
   implicit in names.
 - **A random stream ID in the header** (deduplicating by agent, stream and number), which would
-  let a lost outbox restart under the same agent ID. Kept for later if an outbox that is lost
-  without a re-registration proves common.
+  let a lost outbox restart under the same agent ID: a re-registration covers that case, and the
+  stream ID would add a wire property and a column for it.
 - **Folding the events into the state storage** of the job (too large a change for this step),
   **the cursor alone** (the detail would be lost), **only the intake appending** (no event
   before the runner exists) and **acknowledging even when the append failed** (a `received`

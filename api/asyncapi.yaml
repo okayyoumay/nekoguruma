@@ -86,7 +86,7 @@ channels:
       | Code | Sent by | Meaning |
       |---|---|---|
       | 1001 | either | Going away: the sender is stopping (13.3; the agent sends it when it is stopped, unless a stalled write makes it drop the connection instead, ADR-471) |
-      | 1002 | either | Protocol error: malformed text, unknown `type`, unknown or missing property, value out of range, `hello` not first or not received in time |
+      | 1002 | either | Protocol error: malformed text, unknown `type`, unknown or missing property, value out of range, `hello` not first or not received in time. The server also sends it for a numbered `agentEvent` that skips a number or repeats a stored number with a different text (nothing of it is stored or acknowledged; 5.3, ADR-479) |
       | 1003 | either | A binary frame |
       | 1009 | either | A message over 128 KiB |
       | 1011 | agent | The agent's outbox failed: a verified command's `received` event could not be recorded (the command is not acknowledged), or rewriting the file after an `eventAck` failed. The agent reopens the outbox before it connects again (5.3, ADR-478 item 4) |
@@ -453,7 +453,10 @@ components:
       summary: Server → agent. Events stored up to a sequence number
       description: |
         Cumulative (5.3, ADR-478). The server sends the highest number it has stored in order,
-        also in answer to an event whose number it already holds. An agent ignores a number
+        also in answer to an event whose number it already holds with the same text. It sends it
+        after the commit that stored the events, on the connection the events came on and only
+        while that is the agent's current connection, and one frame may cover several events;
+        it sends none at connect (ADR-479). An agent ignores a number
         at or below the one it already saw acknowledged and closes the connection with 1002 on a
         number above the highest it assigned, dropping nothing.
       payload:

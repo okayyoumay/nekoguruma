@@ -1,6 +1,6 @@
-//! The job delivery queue (design 5.3, 12, 14.1; ADR-476): one task of the hub's set that polls the
-//! `jobs` table and puts each job's stored instruction on the connection of the agent it is for,
-//! and the only consumer of [`Hub::inbox`].
+//! The job delivery queue (design 5.3, 12, 14.1; ADR-476, ADR-479): one task of the hub's set that
+//! polls the `jobs` table and puts each job's stored instruction on the connection of the agent it
+//! is for, stores the agents' numbered events, and is the only consumer of [`Hub::inbox`].
 //!
 //! A pass is one transaction: it ends the jobs signed by a key that is no longer active, takes the
 //! rows of the agents connected to this instance (the oldest few of each, at most one connection's
@@ -18,6 +18,15 @@
 //! the mark returned, until the commit is known); a rejection ends the job, and nothing is resent
 //! after it.
 //!
+//! The numbered events in the inbox (ADR-478 item 6, ADR-479) are split out before the answers are
+//! applied and are stored by [`crate::agent_events::store`], one transaction per agent, after the
+//! iteration's answers have been written. An event is acknowledged on the connection it came on,
+//! or its connection closed with 1002, only after the transaction has committed. A transaction
+//! that fails keeps the events, which count against the same bound as the buffered messages
+//! ([`HELD_LIMIT`], past which the inbox is not read), and the next tick tries again; the first
+//! failure ends the round, and the failed agent's events go behind the others'. A connection closed for
+//! a bad event has its later events dropped until it leaves the hub's snapshot. `progress` and `reconcile` messages are dropped.
+//!
 //! The task ends when the stop begins, in its waits and in the pass's read; once a frame has been
 //! queued the pass finishes its mark. While a pass or a write waits on the database the inbox is
 //! still read into a buffer, so that the database never fills it, and an answer that could not be
@@ -32,11 +41,12 @@ use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use shared_proto::{AgentId, AgentMessage};
+use shared_proto::{AgentId, AgentMessage, CLOSE_CODE_PROTOCOL};
 use sqlx::{PgConnection, PgPool};
 use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, MissedTickBehavior, interval_at};
 
+use crate::agent_events::{self, Cause, Event, Stored};
 use crate::db::{failure, statement_timeouts};
 use crate::health::may_log;
 use crate::hub::{ConnectionId, Delivery, Hub, Inbound, OUTBOUND_CAPACITY, SendError};
@@ -52,9 +62,12 @@ const PASS_LIMIT: i64 = 64;
 const _: () = assert!(PASS_LIMIT >= PER_AGENT_LIMIT);
 /// How many times an iteration applies what was buffered during a write before it goes on.
 const APPLY_ROUNDS: usize = 4;
-/// How many messages are buffered while the database is waited for; past this the inbox fills and
-/// the connections stop reading, as they do for any slow consumer.
+/// How many messages are buffered while the database is waited for, the events kept for a retry
+/// among them; past this the inbox is not read and fills, and the connections stop reading, as
+/// they do for any slow consumer.
 const HELD_LIMIT: usize = 4096;
+/// How many agents' events one round stores, so that a round stays short.
+const EVENT_AGENTS_PER_ROUND: usize = 64;
 
 /// When the queue polls and how long an unanswered delivery is kept (ADR-476). Tests shorten both.
 #[doc(hidden)]
@@ -67,6 +80,20 @@ pub struct Settings {
     /// Counts the passes that read the database and finished (a test waits on it to know that a
     /// pass ran).
     pub passes: Option<Arc<AtomicU64>>,
+    /// Counts the events the queue has seen, stored and answered as repeats (a test waits on it).
+    pub events: Option<Arc<EventCounts>>,
+}
+
+/// What the queue has done with the agents' numbered events, for tests.
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct EventCounts {
+    /// Numbered events taken out of the inbox, once each, whether or not they were stored yet.
+    pub seen: AtomicU64,
+    /// Events stored, counted after their transaction committed.
+    pub stored: AtomicU64,
+    /// Repeats of a stored or deleted event whose text was the same, counted after the commit.
+    pub duplicates: AtomicU64,
 }
 
 impl Default for Settings {
@@ -75,6 +102,7 @@ impl Default for Settings {
             period: Duration::from_secs(2),
             lease: Duration::from_secs(90),
             passes: None,
+            events: None,
         }
     }
 }
@@ -413,24 +441,167 @@ async fn stopped(stopping: &mut watch::Receiver<bool>) {
 }
 
 /// Runs `work`, which waits on the database, and meanwhile reads the inbox into `held` (up to
-/// [`HELD_LIMIT`] messages), so that a slow database does not fill the inbox and stop the
-/// connections reading. The messages are applied by the next iteration.
+/// [`HELD_LIMIT`] messages, with the `kept` events that wait for a retry counted in), so that a
+/// slow database does not fill the inbox and stop the connections reading. The messages are
+/// applied by the next iteration.
 async fn draining<T>(
     inbox: &mut mpsc::Receiver<Inbound>,
     held: &mut Vec<Inbound>,
+    kept: usize,
     work: impl Future<Output = T>,
 ) -> T {
     let mut work = std::pin::pin!(work);
     loop {
         tokio::select! {
             out = &mut work => return out,
-            item = inbox.recv(), if held.len() < HELD_LIMIT => match item {
+            item = inbox.recv(), if held.len() + kept < HELD_LIMIT => match item {
                 Some(item) => held.push(item),
                 // No sender is left: nothing more comes.
                 None => return work.await,
             },
         }
     }
+}
+
+/// Takes the numbered events out of `messages`, in order, and returns them with everything else.
+fn split_events(messages: Vec<Inbound>) -> (Vec<Event>, Vec<Inbound>) {
+    let mut events = Vec::new();
+    let mut rest = Vec::new();
+    for message in messages {
+        match Event::of(message) {
+            Ok(event) => events.push(event),
+            Err(message) => rest.push(*message),
+        }
+    }
+    (events, rest)
+}
+
+/// An agent's events, in the order they were read.
+type Groups = Vec<(AgentId, Vec<Event>)>;
+
+/// Groups `events` by agent, in the order each agent first appears; an agent's own order is kept.
+fn by_agent(events: Vec<Event>) -> Groups {
+    let mut groups: Groups = Vec::new();
+    for event in events {
+        match groups.iter_mut().find(|(agent, _)| *agent == event.agent) {
+            Some((_, batch)) => batch.push(event),
+            None => groups.push((event.agent.clone(), vec![event])),
+        }
+    }
+    groups
+}
+
+/// Splits `events` into the agents this round stores (at most [`EVENT_AGENTS_PER_ROUND`], the
+/// first to appear) and the agents left for a later round.
+fn this_round(events: Vec<Event>) -> (Groups, Groups) {
+    let mut groups = by_agent(events);
+    let later = groups.split_off(groups.len().min(EVENT_AGENTS_PER_ROUND));
+    (groups, later)
+}
+
+/// What the queue tells agents and counts after a store committed.
+fn answer(
+    hub: &Hub,
+    agent: &AgentId,
+    stored: &Stored,
+    counts: Option<&EventCounts>,
+    gate: &Mutex<Option<std::time::Instant>>,
+) {
+    for (connection, seq) in &stored.acks {
+        hub.ack_events(agent, *connection, *seq);
+    }
+    for (connection, seq, cause) in &stored.closes {
+        hub.close_connection(agent, *connection, CLOSE_CODE_PROTOCOL);
+        match cause {
+            Cause::Gap => tracing::debug!(
+                agent_id = %agent.0, seq,
+                "an event skipped a number; its connection is closed"
+            ),
+            // Never the text: it is vehicle data.
+            Cause::Differs => {
+                if may_log(gate, now(), LOG_EVERY) {
+                    tracing::warn!(
+                        agent_id = %agent.0, seq,
+                        "a repeated event differs from the stored one; its connection is closed"
+                    );
+                }
+            }
+        }
+    }
+    if let Some(counts) = counts {
+        counts.stored.fetch_add(stored.stored, Ordering::Relaxed);
+        counts
+            .duplicates
+            .fetch_add(stored.repeats, Ordering::Relaxed);
+    }
+}
+
+/// What a round of [`store_events`] needs besides the inbox and the events.
+struct Round<'a> {
+    /// The log gates of the store failures and of the connections closed.
+    gates: (
+        &'a Mutex<Option<std::time::Instant>>,
+        &'a Mutex<Option<std::time::Instant>>,
+    ),
+    counts: Option<&'a EventCounts>,
+    stopping: &'a watch::Receiver<bool>,
+    /// The connections the queue closed with 1002 and that are still in the hub's snapshot: their
+    /// later events are dropped, in this round and in the next ones.
+    ended: &'a mut HashSet<(AgentId, ConnectionId)>,
+}
+
+/// Stores the events of up to [`EVENT_AGENTS_PER_ROUND`] agents, one transaction each, answering
+/// each agent after its commit. The first failure ends the round and returns `false`, as does the
+/// stop, which is checked between agents; the events of the failed agent stay in `events` behind
+/// those of the agents not yet tried, so that an agent whose store keeps failing does not keep the
+/// others from being stored. The events of a connection in `ended` are dropped first.
+async fn store_events(
+    hub: &Hub,
+    pool: &PgPool,
+    inbox: &mut mpsc::Receiver<Inbound>,
+    held: &mut Vec<Inbound>,
+    events: &mut Vec<Event>,
+    round: Round<'_>,
+) -> bool {
+    events.retain(|e| !round.ended.contains(&(e.agent.clone(), e.connection)));
+    let total = events.len();
+    let (groups, later) = this_round(std::mem::take(events));
+    let mut groups = groups.into_iter();
+    while let Some((agent, batch)) = groups.next() {
+        if *round.stopping.borrow() {
+            let rest = std::iter::once((agent, batch)).chain(groups).chain(later);
+            events.extend(rest.flat_map(|(_, batch)| batch));
+            return false;
+        }
+        let stored = draining(
+            inbox,
+            held,
+            total,
+            agent_events::store(pool, &agent, &batch),
+        )
+        .await;
+        match stored {
+            Ok(stored) => {
+                answer(hub, &agent, &stored, round.counts, round.gates.1);
+                for (connection, _, _) in &stored.closes {
+                    round.ended.insert((agent.clone(), *connection));
+                }
+            }
+            Err(error) => {
+                warn(
+                    round.gates.0,
+                    &error,
+                    "the delivery queue could not store events",
+                );
+                let untried = groups.chain(later);
+                events.extend(untried.flat_map(|(_, batch)| batch));
+                events.extend(batch);
+                return false;
+            }
+        }
+    }
+    events.extend(later.into_iter().flat_map(|(_, batch)| batch));
+    true
 }
 
 /// Runs the queue until the stop, with the receiver of the hub's inbox.
@@ -445,19 +616,27 @@ pub(crate) async fn run(
     // A tick missed because the task was slow gives one pass, not a burst.
     ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let gate = Mutex::new(None);
+    let event_gate = Mutex::new(None);
     let mut queue = Queue::default();
     // The messages read while the database was waited for, and what has not been written yet.
     let mut held: Vec<Inbound> = Vec::new();
     let mut carry = Step::default();
-    // The last write failed: it is retried on the tick, not on every message.
-    let mut failed = false;
+    // The numbered events read and not yet stored (kept when a store fails).
+    let mut events: Vec<Event> = Vec::new();
+    // The last write of answers failed: it is retried on the tick, not on every message.
+    let mut write_failed = false;
+    // The last store of events failed: the same, kept apart so that it does not delay the answers.
+    let mut store_failed = false;
+    // The connections closed with 1002 for a bad event, while the hub still shows them.
+    let mut ended: HashSet<(AgentId, ConnectionId)> = HashSet::new();
     let mut marks: Vec<(String, i32, String)> = Vec::new();
+    let counts = settings.events.clone();
     loop {
         let due = tokio::select! {
             biased;
             () = stopped(&mut stopping) => return,
             _ = ticks.tick() => true,
-            first = inbox.recv() => match first {
+            first = inbox.recv(), if held.len() + events.len() < HELD_LIMIT => match first {
                 Some(first) => {
                     held.push(first);
                     false
@@ -468,29 +647,63 @@ pub(crate) async fn run(
         // The connections first, then the inbox: an answer read before its connection left is
         // in the inbox (or already held) by then, so it is applied before the release. What is
         // buffered while a write waits is applied at once, without waiting for the next tick.
+        // The answers are written before the events are stored.
         let mut snapshot = Vec::new();
         for _ in 0..APPLY_ROUNDS {
             snapshot = hub.connected();
-            while let Ok(item) = inbox.try_recv() {
+            ended.retain(|key| snapshot.contains(key));
+            while held.len() + events.len() < HELD_LIMIT
+                && let Ok(item) = inbox.try_recv()
+            {
                 held.push(item);
             }
-            carry.append(queue.step(&snapshot, std::mem::take(&mut held), now(), settings.lease));
-            if carry.is_empty() || (failed && !due) {
+            let (numbered, others) = split_events(std::mem::take(&mut held));
+            if let Some(counts) = &counts {
+                counts
+                    .seen
+                    .fetch_add(numbered.len() as u64, Ordering::Relaxed);
+            }
+            events.extend(numbered);
+            carry.append(queue.step(&snapshot, others, now(), settings.lease));
+            if carry.is_empty() && events.is_empty() {
                 break;
             }
+            let mut attempted = false;
             // A write that fails keeps the step, and the next tick writes it again.
-            match draining(&mut inbox, &mut held, write(&pool, &carry)).await {
-                Ok(()) => {
-                    carry = Step::default();
-                    failed = false;
-                }
-                Err(error) => {
-                    failed = true;
-                    warn(&gate, &error, "the delivery queue could not record answers");
-                    break;
+            if !carry.is_empty() && (!write_failed || due) {
+                attempted = true;
+                let kept = events.len();
+                match draining(&mut inbox, &mut held, kept, write(&pool, &carry)).await {
+                    Ok(()) => {
+                        carry = Step::default();
+                        write_failed = false;
+                    }
+                    Err(error) => {
+                        write_failed = true;
+                        warn(&gate, &error, "the delivery queue could not record answers");
+                        break;
+                    }
                 }
             }
-            if held.is_empty() {
+            if !events.is_empty() && (!store_failed || due) {
+                attempted = true;
+                let round = Round {
+                    gates: (&gate, &event_gate),
+                    counts: counts.as_deref(),
+                    stopping: &stopping,
+                    ended: &mut ended,
+                };
+                let stored = store_events(&hub, &pool, &mut inbox, &mut held, &mut events, round);
+                if !stored.await {
+                    store_failed = true;
+                    break;
+                }
+                store_failed = false;
+            }
+            if !attempted {
+                break;
+            }
+            if held.is_empty() && events.is_empty() {
                 break;
             }
         }
@@ -500,7 +713,7 @@ pub(crate) async fn run(
         let skip: Vec<String> = queue.in_flight().into_iter().chain(carry.ids()).collect();
         let read = tokio::select! {
             () = stopped(&mut stopping) => return,
-            read = draining(&mut inbox, &mut held, read(&pool, &snapshot, skip, settings.lease)) => read,
+            read = draining(&mut inbox, &mut held, events.len(), read(&pool, &snapshot, skip, settings.lease)) => read,
         };
         match read {
             Ok((tx, taken)) => {
@@ -508,8 +721,13 @@ pub(crate) async fn run(
                 let dispatched = dispatch(&hub, taken, || *stopping.borrow());
                 queue.register(&dispatched.sent, now());
                 marks.clear();
-                let marked =
-                    draining(&mut inbox, &mut held, mark(tx, &dispatched, &mut marks)).await;
+                let marked = draining(
+                    &mut inbox,
+                    &mut held,
+                    events.len(),
+                    mark(tx, &dispatched, &mut marks),
+                )
+                .await;
                 match marked {
                     Ok(()) => {
                         queue.set_marks(&marks, true);
@@ -696,6 +914,7 @@ mod tests {
             agent: agent.clone(),
             connection,
             message,
+            text: None,
         }
     }
 
@@ -927,7 +1146,7 @@ mod tests {
         // The stalled "database" ends only after the producer has sent all of its messages.
         let out = tokio::time::timeout(
             Duration::from_secs(10),
-            draining(&mut inbox, &mut held, async { wait.await.unwrap() }),
+            draining(&mut inbox, &mut held, 0, async { wait.await.unwrap() }),
         )
         .await
         .expect("the inbox is read while the work waits");
@@ -972,7 +1191,7 @@ mod tests {
         let mut held = Vec::new();
         tokio::time::timeout(
             Duration::from_secs(10),
-            draining(&mut inbox, &mut held, async { wait.await.unwrap() }),
+            draining(&mut inbox, &mut held, 0, async { wait.await.unwrap() }),
         )
         .await
         .expect("the work ends once the producer releases it");
@@ -1049,9 +1268,9 @@ mod tests {
         assert_eq!(step.released[0], *flight);
     }
 
-    // Case 22
+    // Case 22, store case E20
     #[test]
-    fn events_and_reconciliations_are_dropped_and_settle_nothing() {
+    fn progress_and_reconciliations_are_dropped_and_settle_nothing() {
         let hub = Hub::new();
         let a = agent("a");
         let mut queue = Queue::default();
@@ -1077,5 +1296,315 @@ mod tests {
         );
         assert!(step.is_empty());
         assert_eq!(queue.in_flight().len(), 1);
+    }
+
+    fn numbered(agent: &AgentId, connection: ConnectionId, seq: u64) -> Inbound {
+        Inbound {
+            text: Some(format!("frame {seq}")),
+            ..inbound(
+                agent,
+                connection,
+                AgentMessage::AgentEvent(AgentEventMessage {
+                    seq: Some(seq),
+                    occurred_at_agent: None,
+                    event: AgentEventKind::JobState {
+                        job_id: shared_proto::JobId("j".to_owned()),
+                        state: "running".to_owned(),
+                        failure_code: None,
+                        procedure_code: None,
+                        detail: None,
+                    },
+                }),
+            )
+        }
+    }
+
+    // Store case E20
+    #[test]
+    fn numbered_events_are_split_out_in_order_and_everything_else_stays_in_order() {
+        let hub = Hub::new();
+        let a = agent("a");
+        let connection = hub.register(&a).unwrap().id;
+        let ack_of = |id: &str| {
+            inbound(
+                &a,
+                connection,
+                AgentMessage::CommandAck {
+                    command_id: id.to_owned(),
+                },
+            )
+        };
+        let reconcile = inbound(
+            &a,
+            connection,
+            AgentMessage::Reconcile { open_jobs: vec![] },
+        );
+        // A numbered event without its text cannot be stored: it stays, and the step drops it.
+        let mut textless = numbered(&a, connection, 9);
+        textless.text = None;
+        let (events, rest) = split_events(vec![
+            ack_of("c-1"),
+            numbered(&a, connection, 1),
+            reconcile,
+            numbered(&a, connection, 2),
+            textless,
+            ack_of("c-2"),
+        ]);
+        assert_eq!(events.iter().map(|e| e.seq).collect::<Vec<_>>(), [1, 2]);
+        assert_eq!(events[0].text, "frame 1");
+        let kinds: Vec<&str> = rest
+            .iter()
+            .map(|m| match &m.message {
+                AgentMessage::CommandAck { command_id } => command_id.as_str(),
+                AgentMessage::Reconcile { .. } => "reconcile",
+                AgentMessage::AgentEvent(_) => "event",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, ["c-1", "reconcile", "event", "c-2"]);
+    }
+
+    #[test]
+    fn events_are_grouped_by_agent_in_first_appearance_order_and_each_agents_order_is_kept() {
+        let hub = Hub::new();
+        let (a, b) = (agent("a"), agent("b"));
+        let (ca, cb) = (hub.register(&a).unwrap().id, hub.register(&b).unwrap().id);
+        let (events, _) = split_events(vec![
+            numbered(&b, cb, 1),
+            numbered(&a, ca, 1),
+            numbered(&b, cb, 2),
+            numbered(&a, ca, 2),
+            numbered(&b, cb, 3),
+        ]);
+        let groups = by_agent(events);
+        let shown: Vec<(String, Vec<u64>)> = groups
+            .iter()
+            .map(|(agent, batch)| (agent.0.clone(), batch.iter().map(|e| e.seq).collect()))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("b".to_owned(), vec![1, 2, 3]),
+                ("a".to_owned(), vec![1, 2])
+            ]
+        );
+    }
+
+    // Store case E21 (the bound on the agents of a round)
+    #[test]
+    fn a_round_takes_the_first_sixty_four_agents_and_leaves_the_rest_in_order() {
+        let hub = Hub::new();
+        let all: Vec<AgentId> = (0..EVENT_AGENTS_PER_ROUND + 6)
+            .map(|n| agent(&format!("a{n}")))
+            .collect();
+        let messages: Vec<Inbound> = all
+            .iter()
+            .map(|a| numbered(a, hub.register(a).unwrap().id, 1))
+            .collect();
+        let (events, _) = split_events(messages);
+        let (now, later) = this_round(events);
+        assert_eq!(now.len(), EVENT_AGENTS_PER_ROUND);
+        assert_eq!(later.len(), 6);
+        assert_eq!(now[0].0, all[0]);
+        assert_eq!(later[0].0, all[EVENT_AGENTS_PER_ROUND]);
+        let (few, none) = this_round(vec![]);
+        assert!(few.is_empty() && none.is_empty());
+    }
+
+    // Store case E21
+    #[tokio::test]
+    async fn events_kept_for_a_retry_count_against_the_bound_so_the_inbox_is_not_read_past_it() {
+        let (sender, mut inbox) = mpsc::channel::<Inbound>(8);
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        let a = agent("a");
+        let connection = Hub::new().register(&a).unwrap().id;
+        let producer = {
+            let a = a.clone();
+            tokio::spawn(async move {
+                // The bound leaves room for 5 more; the inbox takes 8 and then a send finds it full.
+                for seq in 0..5 + 8 {
+                    sender
+                        .send(numbered(&a, connection, seq + 1))
+                        .await
+                        .unwrap();
+                }
+                tokio::task::yield_now().await;
+                assert!(sender.try_send(numbered(&a, connection, 99)).is_err());
+                release.send(()).unwrap();
+            })
+        };
+        let mut held = Vec::new();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            draining(&mut inbox, &mut held, HELD_LIMIT - 5, async {
+                wait.await.unwrap()
+            }),
+        )
+        .await
+        .expect("the work ends once the producer releases it");
+        producer.await.unwrap();
+        assert_eq!(held.len(), 5, "the kept events took the rest of the bound");
+    }
+
+    // Store case E9 (the failing round's half: nothing is answered, every event is kept)
+    #[tokio::test]
+    async fn a_failed_store_keeps_every_event_in_order_and_answers_nothing() {
+        let hub = Hub::new();
+        let (a, b) = (agent("a"), agent("b"));
+        let mut reg_a = hub.register(&a).unwrap();
+        let (ca, cb) = (reg_a.id, hub.register(&b).unwrap().id);
+        let (events, _) = split_events(vec![
+            numbered(&a, ca, 1),
+            numbered(&b, cb, 1),
+            numbered(&a, ca, 2),
+        ]);
+        // A pool that is closed refuses every transaction at once.
+        let pool = PgPool::connect_lazy("postgres://127.0.0.1:1/none").unwrap();
+        pool.close().await;
+        let (_sender, mut inbox) = mpsc::channel::<Inbound>(1);
+        let (mut held, mut kept) = (Vec::new(), events);
+        let gate = Mutex::new(None);
+        let counts = EventCounts::default();
+        let (_stop, stopping) = watch::channel(false);
+        let mut ended = HashSet::new();
+        let ok = store_events(
+            &hub,
+            &pool,
+            &mut inbox,
+            &mut held,
+            &mut kept,
+            Round {
+                gates: (&gate, &gate),
+                counts: Some(&counts),
+                stopping: &stopping,
+                ended: &mut ended,
+            },
+        )
+        .await;
+        assert!(!ok);
+        // The failed agent (the first tried, a) goes behind the one not yet tried.
+        let seqs: Vec<(String, u64)> = kept.iter().map(|e| (e.agent.0.clone(), e.seq)).collect();
+        assert_eq!(
+            seqs,
+            [
+                ("b".to_owned(), 1),
+                ("a".to_owned(), 1),
+                ("a".to_owned(), 2)
+            ]
+        );
+        assert_eq!(counts.stored.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            *reg_a.ack.borrow_and_update(),
+            0,
+            "nothing was acknowledged"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stop_ends_the_round_between_agents_and_keeps_every_event() {
+        let hub = Hub::new();
+        let (a, b) = (agent("a"), agent("b"));
+        let (ca, cb) = (hub.register(&a).unwrap().id, hub.register(&b).unwrap().id);
+        let (mut kept, _) = split_events(vec![numbered(&a, ca, 1), numbered(&b, cb, 1)]);
+        let pool = PgPool::connect_lazy("postgres://127.0.0.1:1/none").unwrap();
+        let (_sender, mut inbox) = mpsc::channel::<Inbound>(1);
+        let (_stop, stopping) = watch::channel(true);
+        let (mut held, gate, mut ended) = (Vec::new(), Mutex::new(None), HashSet::new());
+        let ok = store_events(
+            &hub,
+            &pool,
+            &mut inbox,
+            &mut held,
+            &mut kept,
+            Round {
+                gates: (&gate, &gate),
+                counts: None,
+                stopping: &stopping,
+                ended: &mut ended,
+            },
+        )
+        .await;
+        assert!(!ok);
+        assert_eq!(kept.len(), 2, "stopped before any store, nothing is lost");
+    }
+
+    #[tokio::test]
+    async fn the_events_of_an_ended_connection_are_dropped_before_the_round() {
+        let hub = Hub::new();
+        let a = agent("a");
+        let (c1, c2) = (hub.register(&a).unwrap().id, hub.register(&a).unwrap().id);
+        let (mut kept, _) = split_events(vec![numbered(&a, c1, 3), numbered(&a, c2, 4)]);
+        let pool = PgPool::connect_lazy("postgres://127.0.0.1:1/none").unwrap();
+        pool.close().await;
+        let (_sender, mut inbox) = mpsc::channel::<Inbound>(1);
+        let (_stop, stopping) = watch::channel(false);
+        let (mut held, gate) = (Vec::new(), Mutex::new(None));
+        let mut ended = HashSet::from([(a.clone(), c1)]);
+        let round = Round {
+            gates: (&gate, &gate),
+            counts: None,
+            stopping: &stopping,
+            ended: &mut ended,
+        };
+        // The store fails (closed pool) and keeps what was not dropped.
+        assert!(!store_events(&hub, &pool, &mut inbox, &mut held, &mut kept, round).await);
+        assert_eq!(kept.iter().map(|e| e.seq).collect::<Vec<_>>(), [4]);
+    }
+
+    // Store case E21: the guards on the queue's two reads of the inbox, with a store that always
+    // fails so that the events stay kept.
+    #[tokio::test]
+    async fn the_queue_stops_reading_the_inbox_at_the_bound_while_events_wait_for_a_retry() {
+        let (sender, inbox) = mpsc::channel::<Inbound>(8);
+        let a = agent("a");
+        let connection = Hub::new().register(&a).unwrap().id;
+        let pool = PgPool::connect_lazy("postgres://127.0.0.1:1/none").unwrap();
+        pool.close().await;
+        let counts = Arc::new(EventCounts::default());
+        let (stop, stopping) = watch::channel(false);
+        let settings = Settings {
+            period: Duration::from_secs(3600),
+            lease: Duration::from_secs(60),
+            passes: None,
+            events: Some(counts.clone()),
+        };
+        let task = tokio::spawn(run(Hub::new(), pool, inbox, stopping, settings));
+        let limit = HELD_LIMIT as u64;
+        let seen = || counts.seen.load(Ordering::Relaxed);
+        let until = |n: u64| async move {
+            tokio::time::timeout(Duration::from_secs(20), async {
+                while seen() < n {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the events are read");
+        };
+        // Three short of the bound, read one by one.
+        for seq in 0..limit - 3 {
+            sender
+                .send(numbered(&a, connection, seq + 1))
+                .await
+                .unwrap();
+        }
+        until(limit - 3).await;
+        // A burst that the queue finds all at once: only 3 of its 8 fit under the bound.
+        for seq in 0..8 {
+            sender
+                .try_send(numbered(&a, connection, 9000 + seq))
+                .unwrap();
+        }
+        until(limit).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(seen(), limit, "not read past the bound");
+        // 5 of the burst are still in the inbox, which has room for 3 more and then is full.
+        for seq in 0..3 {
+            sender
+                .try_send(numbered(&a, connection, 9100 + seq))
+                .unwrap();
+        }
+        assert!(sender.try_send(numbered(&a, connection, 9200)).is_err());
+        stop.send(true).unwrap();
+        task.await.unwrap();
     }
 }

@@ -645,14 +645,23 @@ connection with hyper's `with_upgrades()`.
   (the frame over 131072 bytes with the widest command ID, `c-` and the 20 digits of `u64::MAX`, so that the verdict does not depend on the counter; judged before the connection is looked at). A frame queued on a
   connection that has been told to close, or at a stop, is not written. `Hub::inbox()` gives its
   receiver (256 messages) to the first caller: `commandAck`, `commandRejected`, `agentEvent`
-  and `reconcile` arrive as `Inbound { agent, connection, message }` in read order, never a
-  heartbeat. The task asks the hub per message: with no receiver (not taken yet, or dropped) the
+  and `reconcile` arrive as `Inbound { agent, connection, message, text }` in read order, never a
+  heartbeat; `text` is the exact frame text of a numbered `agentEvent` (the event is stored as
+  it was sent) and `None` for every other message. The task asks the hub per message: with no receiver (not taken yet, or dropped) the
   message is dropped with a gated debug line, never buffered. With the inbox full the task holds
   the message and waits, reading nothing (so the agent sees no echo), while it watches its close
   instruction and the stop. The hub keeps no delivery table. `Hub::close_agent(agent, code)`
   gives the current connection's close instruction once (a code that is not one of the server's
-  own close codes is refused with `false`), and `Hub::connected()` lists the
-  current connections.
+  own close codes is refused with `false`), `Hub::connected()` lists the
+  current connections, and the events' answer goes through two more calls (ADR-479):
+  `Hub::ack_events(agent, connection, seq)` raises the connection's one-value slot of the
+  latest number to acknowledge and wakes its task, and `Hub::close_connection(agent, connection,
+  code)` gives the close instruction by connection number. Each returns `false`, and does
+  nothing, unless the connection is still the agent's current one and has not been told to close
+  (`ack_events` also not after the stop began), so a replaced connection's events never
+  acknowledge or close its successor. The task writes one `eventAck {latest}` when its slot
+  changes, never after a close instruction or a stop, and its read loop does not look at the slot
+  while it waits on a full inbox (it is inside the hand-over then).
 - **The revocation pass (`revocation.rs`).** One task of the hub's set, spawned by
   `Server::run`: a tick every 30 seconds (the first one 30 seconds after the start, a missed
   tick delayed, so a long jump gives one pass), no query when nobody is connected, otherwise one
@@ -693,10 +702,33 @@ connection with hyper's `with_upgrades()`.
   acknowledgement sets `delivered_at`; a rejection ends the job
   (`failed`, `instructionRejected`, the agent's reason as the detail); both, and a release, write only while the
   job is neither finished nor delivered and still carries a mark that delivery expects (see above)
-  with the attempts that go with it. `agentEvent` and `reconcile` messages are dropped with a
-  debug line; the agent records a numbered `received` event before each `commandAck`, sends it as
-  an `agentEvent` after the acknowledgement, and sends it again on every connection, since no
-  `eventAck` comes (ADR-478). A failed pass sends nothing and is one gated warning (60 seconds). The task ends
+  with the attempts that go with it. `progress` and `reconcile` messages are dropped with a
+  debug line. The numbered `agentEvent`s are split out of the buffered messages before the
+  answers are applied and stored by `agent_events.rs` (ADR-478 item 6, ADR-479): the answers of
+  the iteration are written first, then each agent's events, in the order read, in one
+  transaction per agent (at most 64 agents per round). The transaction takes the tenant from the
+  agent's unrevoked row (a revoked or missing agent gets nothing stored or answered), inserts the
+  cursor row `ON CONFLICT DO NOTHING`, locks it `FOR UPDATE` (so two instances take turns), and
+  applies the pure rule `Plan` to each event: a number at or below the cursor is a repeat whose
+  text is compared with the stored row's in SQL (equal, or no row because it was deleted, is
+  answered with the cursor; a different text stores nothing, acknowledges nothing and ends that
+  connection with 1002 and one gated warning with the agent ID and the number, never the text);
+  the next number is inserted with its kind, job ID (only when a canonical UUID), device time
+  (only when `strict_device_time` accepts it) and the exact text; any other number, one no
+  `bigint` holds included, is a gap that closes its connection with 1002 and ends its later
+  events in the round. The cursor is moved to the last number stored and the transaction
+  commits; only then are the answers given through the hub (`Hub::ack_events` for each
+  connection, `Hub::close_connection` for each close), and the counters of `Settings::events`
+  (seen, stored, repeats answered; for tests) are raised. The events of a connection that ended
+  are stored and not acknowledged. A failed transaction (the statements run under the 5 second
+  lock and statement timeouts, so a held cursor row is a failure after 5 seconds) keeps its
+  events and those of the agents not yet tried, ends the round and is tried again on the next
+  tick, with one gated warning, the failed agent's events behind the others' so that only that
+  agent waits; a store failure and a failure to write answers are kept apart, so the first does
+  not delay settling an answer. A connection the queue closed with 1002 keeps its later events
+  from being stored, in later rounds too, until it leaves the hub's snapshot; the stop is checked
+  between agents. The kept events count with the buffered messages against the
+  4096 bound, and past it the inbox is not read. A `jobState` event changes no job row. A failed pass sends nothing and is one gated warning (60 seconds). The task ends
   when the stop begins, in its wait and in its read.
 - **After a close.** The task leaves the registry first, then writes the Close frame, then the
   disconnect stamp (above), then drains (reads and discards until the peer's reply, at most `CLOSE_WAIT`, 5 seconds). After a
@@ -792,7 +824,23 @@ a new migration file rebuilds the crate. How migrations are written and applied 
   replacement, a rejection, answers that write nothing, a retired or missing key, a revoked
   agent, a past deadline, the stop, a failing pass, and `Server::start` turning the queue on. The
   agent binary's refusal of a forged stored command, and its acceptance of a job created through
-  the route, are in `agent_connect.rs`.
+  the route, are in `agent_connect.rs`, which also follows three accepted jobs' `received` events
+  through a held cursor row, a kill of the agent, a restart (every event a repeat, answered) and a
+  fourth job's event stored and acknowledged, with nothing sent or closed after a further restart.
+  `agent_events.rs` (database; the pure rule, the strict device-time check and the event's
+  derivation are unit tests in `src/agent_events.rs`, the queue's split, grouping, bound and
+  failure in `src/job_queue.rs`, and the hub's slot and scoped close in `src/hub.rs`) covers the
+  storing of events with fake agents: events in order stored once with their exact text and the
+  cursor, an acknowledgement never read before its row and cursor are visible, a repeat with the
+  same text answered with the cursor, a repeat with another text (nothing stored or
+  acknowledged, 1002 on that connection only, the warning without the text), a repeat of a
+  deleted row, a gap beside a sibling agent, numbers beyond `bigint`, a repeat in one batch, a
+  refused commit (kept and stored later), a commit that went through though reported as failed
+  (staged), a connection replaced or gone between the store and the acknowledgement, two servers
+  and a held cursor row, a first store beside a concurrent creation of the cursor row, a revoked
+  or missing agent, tenants and the job an event names, a `received` event changing no job, a
+  NUL escape, a frame of the limit and device times, `progress` and `reconcile` not stored, and
+  a re-registered agent's own cursor.
   `jobs.rs` (unit tests in `src/jobs.rs` for the shape rules, the request hash, the job ID, the
   largest request and the pure decisions) covers `POST /api/v1/jobs` over PostgreSQL: the layer
   and the body bounds, creation and its row, the stored instruction verifying under the key, the
@@ -840,7 +888,8 @@ a new migration file rebuilds the crate. How migrations are written and applied 
   ending a task that waits; a command written to a silent agent not restarting the idle clock.
   The unit tests cover the `Authorization` table, the close for each decode error, the
   classes of read errors, the hub's registration, replacement, stop, queues (`Busy`, the size
-  boundary, the numbering, the close instruction) and `leave`, and the pass (`revocation.rs`
+  boundary, the numbering, the close instruction), the event acknowledgement slot, the scoped
+  close and `leave`, and the pass (`revocation.rs`
   under a paused clock: cadence, no query for nobody, the agents that change after the
   snapshot, a failed read, the stop in the wait and in the read). The plain-HTTP stop tests in `serving.rs` are the check that the loop's own watch did
   not change that behaviour.

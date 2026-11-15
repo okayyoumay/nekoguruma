@@ -12,6 +12,12 @@
 //! delivery table: a delivery is settled by the agent's answer, which the inbox's consumer matches
 //! by connection and command ID.
 //!
+//! The consumer also answers the agent's events through the hub (ADR-479): [`Hub::ack_events`]
+//! raises the latest acknowledgement of one connection, a one-value slot its task writes as an
+//! `eventAck`, and [`Hub::close_connection`] ends one connection by its number. Both name the
+//! connection the event came on, and do nothing for a connection that is no longer the agent's
+//! current one, so a successor is never acknowledged or closed for its predecessor's events.
+//!
 //! The lock is a `std` mutex and is never held across an await.
 
 use std::collections::HashMap;
@@ -107,6 +113,8 @@ struct Handle {
     close: Option<oneshot::Sender<u16>>,
     /// The frames waiting to be written to the connection.
     outbound: mpsc::Sender<String>,
+    /// The highest number the connection's task is asked to acknowledge (`eventAck`); 0 is none.
+    ack: watch::Sender<u64>,
 }
 
 /// What a session task gets when it becomes its agent's current connection.
@@ -117,6 +125,8 @@ pub(crate) struct Registration {
     pub(crate) stopping: watch::Receiver<bool>,
     /// The frames [`Hub::send_job_command`] queued, in call order.
     pub(crate) outbound: mpsc::Receiver<String>,
+    /// The latest number [`Hub::ack_events`] raised for this connection.
+    pub(crate) ack: watch::Receiver<u64>,
 }
 
 /// A job command queued on an agent's current connection. It means queued, not written: only the
@@ -147,6 +157,9 @@ pub struct Inbound {
     /// The connection that read it.
     pub connection: ConnectionId,
     pub message: AgentMessage,
+    /// The exact text of the frame, kept for a numbered `agentEvent` (ADR-479) and `None` for
+    /// every other message.
+    pub text: Option<String>,
 }
 
 /// The hub is stopping and takes no more connections.
@@ -188,12 +201,14 @@ impl Hub {
         state.next_id += 1;
         let (close_tx, close) = oneshot::channel();
         let (outbound_tx, outbound) = mpsc::channel(OUTBOUND_CAPACITY);
+        let (ack_tx, ack) = watch::channel(0);
         let displaced = state.current.insert(
             agent.clone(),
             Handle {
                 id,
                 close: Some(close_tx),
                 outbound: outbound_tx,
+                ack: ack_tx,
             },
         );
         if let Some(close) = displaced.and_then(|old| old.close) {
@@ -204,6 +219,7 @@ impl Hub {
             close,
             stopping: self.0.stopping.subscribe(),
             outbound,
+            ack,
         })
     }
 
@@ -213,6 +229,17 @@ impl Hub {
     /// server's own close codes are sent; any other code (such as 1005, 1006 or 1015, which are
     /// never put on the wire) is refused with `false` and tells nobody.
     pub fn close_agent(&self, agent: &AgentId, code: u16) -> bool {
+        self.close_where(agent, None, code)
+    }
+
+    /// Like [`Hub::close_agent`], but only when connection `connection` is still the agent's
+    /// current one: a connection that was replaced, or has left, tells nobody, and its successor is
+    /// spared (ADR-479).
+    pub fn close_connection(&self, agent: &AgentId, connection: ConnectionId, code: u16) -> bool {
+        self.close_where(agent, Some(connection), code)
+    }
+
+    fn close_where(&self, agent: &AgentId, only: Option<ConnectionId>, code: u16) -> bool {
         if !CLOSE_CODES.contains(&code) {
             return false;
         }
@@ -220,8 +247,34 @@ impl Hub {
         state
             .current
             .get_mut(agent)
+            .filter(|handle| only.is_none_or(|id| id == handle.id))
             .and_then(|handle| handle.close.take())
             .is_some_and(|close| close.send(code).is_ok())
+    }
+
+    /// Asks connection `connection` of `agent` to acknowledge every event up to `seq`, and says
+    /// whether it was asked: `false` when it is no longer the agent's current connection, or it has
+    /// been told to close, or the stop has begun. The slot holds one number, the highest asked, and
+    /// every call wakes the task, so a repeat of an event is answered again, a later, smaller
+    /// number never lowers the slot, and a slow connection writes one `eventAck` for several calls
+    /// (ADR-479).
+    pub fn ack_events(&self, agent: &AgentId, connection: ConnectionId, seq: u64) -> bool {
+        let state = self.0.lock();
+        if state.tasks.is_none() {
+            return false;
+        }
+        let Some(handle) = state.current.get(agent) else {
+            return false;
+        };
+        if handle.id != connection || handle.close.is_none() {
+            return false;
+        }
+        // Always a notification, even for a number the slot already holds: a repeated event is
+        // answered with the cursor again, and a smaller number never lowers the slot.
+        handle
+            .ack
+            .send_modify(|latest| *latest = (*latest).max(seq));
+        true
     }
 
     /// Queues a signed job on `agent`'s current connection. It does not wait and writes nothing
@@ -660,5 +713,72 @@ mod tests {
         let successor = hub.register(&a).unwrap();
         assert!(!hub.leave(&a, closed.id));
         assert!(hub.leave(&a, successor.id));
+    }
+
+    // Store case E22: the ack slot
+    #[test]
+    fn the_ack_slot_holds_the_highest_number_asked_and_only_for_the_current_open_connection() {
+        let hub = Hub::new();
+        let a = agent("a");
+        let mut reg = hub.register(&a).unwrap();
+        assert_eq!(*reg.ack.borrow(), 0, "nothing is owed at connect");
+        assert!(hub.ack_events(&a, reg.id, 3));
+        assert!(hub.ack_events(&a, reg.id, 2), "asked, and the slot keeps 3");
+        assert_eq!(*reg.ack.borrow_and_update(), 3);
+        // A repeat of an acknowledged number still wakes the task, and never lowers the slot.
+        assert!(hub.ack_events(&a, reg.id, 2));
+        assert!(reg.ack.has_changed().unwrap());
+        assert_eq!(*reg.ack.borrow_and_update(), 3);
+        assert!(hub.ack_events(&a, reg.id, 5));
+        assert!(reg.ack.has_changed().unwrap());
+        assert_eq!(*reg.ack.borrow_and_update(), 5);
+        // Another agent's connection, and one that does not exist, are not this one.
+        assert!(!hub.ack_events(&agent("b"), reg.id, 9));
+        // The close instruction was given: nothing more is acknowledged on it.
+        assert!(hub.close_agent(&a, 4002));
+        assert!(!hub.ack_events(&a, reg.id, 9));
+        assert_eq!(*reg.ack.borrow(), 5);
+    }
+
+    // Store case E11, E22
+    #[test]
+    fn a_replaced_or_departed_connection_is_neither_acknowledged_nor_closed_and_its_successor_is_spared()
+     {
+        let hub = Hub::new();
+        let a = agent("a");
+        let first = hub.register(&a).unwrap();
+        let mut second = hub.register(&a).unwrap();
+        assert!(
+            !hub.ack_events(&a, first.id, 1),
+            "replaced between store and ack"
+        );
+        assert!(!hub.close_connection(&a, first.id, 1002));
+        assert!(
+            second.close.try_recv().is_err(),
+            "the successor was not told"
+        );
+        assert_eq!(*second.ack.borrow(), 0);
+        assert!(hub.ack_events(&a, second.id, 1));
+        assert!(hub.close_connection(&a, second.id, 1002));
+        assert_eq!(second.close.try_recv(), Ok(1002));
+        assert!(!hub.close_connection(&a, second.id, 1002), "told once");
+        // It leaves: neither call reaches anything.
+        assert!(hub.leave(&a, second.id));
+        assert!(!hub.ack_events(&a, second.id, 2));
+        assert!(!hub.close_connection(&a, second.id, 1002));
+    }
+
+    // Store case E22
+    #[test]
+    fn close_connection_refuses_a_code_that_is_not_the_servers_own_and_a_stop_ends_the_acks() {
+        let hub = Hub::new();
+        let a = agent("a");
+        let mut reg = hub.register(&a).unwrap();
+        for code in [1000, 1005, 1006, 1015, 4000, 0] {
+            assert!(!hub.close_connection(&a, reg.id, code), "code {code}");
+        }
+        assert!(reg.close.try_recv().is_err());
+        let _tasks = hub.begin_stop();
+        assert!(!hub.ack_events(&a, reg.id, 1), "the stop has begun");
     }
 }

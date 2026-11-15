@@ -8,6 +8,7 @@
 //! (ADR-462), and opens the object store (ADR-474), whose directory it locks for the process's
 //! life. Local users sign in with a password and keep a cookie session (ADR-469).
 
+pub(crate) mod agent_events;
 pub mod config;
 pub mod control;
 pub mod db;

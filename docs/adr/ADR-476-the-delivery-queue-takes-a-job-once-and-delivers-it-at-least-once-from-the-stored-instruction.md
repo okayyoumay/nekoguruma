@@ -1,7 +1,7 @@
 # ADR-476: The Delivery Queue Takes a Job Once and Delivers It at Least Once, From the Stored Instruction
 
 **Date:** 2026-11-14
-**Status:** Accepted
+**Status:** Accepted (item 5's dropping of `agentEvent` superseded by ADR-479)
 **Affects:** design 5.3, 12, 14.1; `db/migrations/0007_job_delivery.sql`, `db/README.md`; `api/asyncapi.yaml` (`failureCode`); `crates/server` (`job_queue`, `hub`, `lib`), `crates/server/docs/ngr-server.md`; `crates/shared-proto` (`FailureCode`); details ADR-466 items 10 and 13, ADR-468 item 12 and ADR-472 item 4 for the server's side, and ADR-461 item 8 and ADR-462 for a retired key
 
 ## Context

@@ -481,8 +481,9 @@ connect`, above) loads the agent key and passes it in.
   `event-ack`) and drops nothing. After an acknowledgement whose rewrite failed, the connection
   takes the later ones at once, in memory, and tries the owed rewrite again only with the first
   one after a 10-second pause, so the rewrite is tried about once per pause and the window keeps
-  moving. The server does not read events and acknowledges none,
-  so every connection sends the whole outbox again.
+  moving. The server stores each event and acknowledges it after the commit
+  (ADR-479), so a connection sends again only what an earlier one left unacknowledged; against a
+  server that acknowledges none (a test's), every connection sends the whole outbox again.
 - **Only local facts end the task**: the `open` and `start` refusals above, an outbox that is poisoned and, when opened again
   before an attempt, is found corrupt (`Handle::ended()`; `connect` exits 1), and a stop. Every
   answer of the server, a 403, a 429 and Close 4002 included, is retried, and nothing is erased.

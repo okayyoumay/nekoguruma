@@ -31,7 +31,7 @@ pub(crate) const PERIOD: Duration = Duration::from_millis(50);
 /// A lease no test waits for.
 pub(crate) const LONG: Duration = Duration::from_secs(600);
 pub(crate) const FRESH: &str = "received|0|false|false|||false";
-const SENT: &str = "received|1|true|false|||false";
+pub(crate) const SENT: &str = "received|1|true|false|||false";
 pub(crate) const DELIVERED: &str = "received|1|true|true|||false";
 const RETIRED: &str = "failed|0|false|false|instructionKeyRetired|the instruction was signed by a key that is no longer active|true";
 
@@ -134,7 +134,7 @@ pub(crate) async fn ack(client: &mut Client, command_id: &str) {
     .await;
 }
 
-async fn reject(client: &mut Client, command_id: &str, reason: &str) {
+pub(crate) async fn reject(client: &mut Client, command_id: &str, reason: &str) {
     answer(
         client,
         format!(r#"{{"type":"commandRejected","commandId":"{command_id}","reason":"{reason}"}}"#),
@@ -1365,5 +1365,50 @@ async fn an_end_frees_only_the_lock_its_own_job_holds_and_a_stale_rejection_free
     let mut expected = [delivered, marker];
     expected.sort();
     assert_eq!(holders(&u.w).await, expected.join(","));
+    u.finish().await;
+}
+
+// The sweep's count (the log line carries it): nothing ended is not logged, N ended is N.
+#[tokio::test]
+async fn the_sweep_logs_the_number_of_jobs_it_ended_and_nothing_when_it_ended_none() {
+    let (log, _guard) = capture();
+    let u = up(LONG).await;
+    let fresh = add_job(&u.w, &u.id, 1, b"fresh").await;
+    let mut client = open(u.s.addr, &token(&u).await).await;
+    assert_eq!(command(&mut client).await.1, b"fresh");
+    until_row(&u.w, &fresh, SENT).await;
+    assert!(
+        !log.text().contains("were ended"),
+        "nothing ended: {}",
+        log.text()
+    );
+    // Three stale jobs in one statement, so that one pass sees all of them.
+    let stale: Vec<String> = sqlx::query_scalar(
+        "INSERT INTO jobs (tenant_id, id, kind, agent_id, operator_id, vci_id, \
+             confirmation_level, start_deadline, signed_job, signing_key_id, idempotency_key) \
+         SELECT a.tenant_id, gen_random_uuid(), 'runSequence', a.id, o.id, 'vci', 'notifyOnly', \
+             now() + interval '1 hour', '\\x01'::bytea, $2, gen_random_uuid()::text \
+         FROM agents a JOIN operators o ON o.tenant_id = a.tenant_id, generate_series(1, 3) \
+         WHERE a.id = $1::uuid RETURNING id::text",
+    )
+    .bind(&u.id)
+    .bind("0".repeat(64))
+    .fetch_all(&u.w.pool)
+    .await
+    .unwrap();
+    assert_eq!(stale.len(), 3);
+    for job in &stale {
+        until_row(&u.w, job, RETIRED).await;
+    }
+    // The line is written in the pass, before its commit that the rows above waited for.
+    until_logged(&log, "were ended").await;
+    let ended: Vec<String> = log
+        .text()
+        .lines()
+        .filter(|l| l.contains("were ended"))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(ended.len(), 1, "{ended:?}");
+    assert!(ended[0].contains("jobs=3"), "{ended:?}");
     u.finish().await;
 }

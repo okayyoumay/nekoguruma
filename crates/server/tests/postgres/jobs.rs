@@ -27,7 +27,7 @@ use shared_proto::{INSTRUCTION_VERSION, JobInstruction, JobKind};
 use sqlx::Postgres;
 
 use crate::control::{open, quiet_for};
-use crate::job_queue::{DELIVERED, LONG, ack, command, row, settings, until_row};
+use crate::job_queue::{DELIVERED, LONG, SENT, ack, command, reject, row, settings, until_row};
 use crate::redeem::{Agent, Flaky, World, capture, instruction_key, json};
 use crate::serving::{Reply, Running, exchange};
 use crate::session::{audience_of, get_challenge, proof, send_session, session_body};
@@ -1548,5 +1548,109 @@ async fn a_lock_held_uncommitted_for_more_than_five_seconds_is_a_503() {
     );
     tx.rollback().await.unwrap();
     lab.assert_jobs(0, "V11").await;
+    lab.finish().await;
+}
+
+#[tokio::test]
+async fn the_refusal_for_a_locked_vehicle_is_logged_once_without_the_vehicle() {
+    // V3: its own gate, the operator only.
+    let (logs, _guard) = capture();
+    let lab = Lab::new().await;
+    let cookie = lab.login("alice").await;
+    let body = lab.body(json!({ "vin": VIN }));
+    let holder = job_id(&lab.post(&cookie, "k-holder", &body).await);
+    for key in ["k-1", "k-2"] {
+        assert_problem(&lab.post(&cookie, key, &body).await, 409, key);
+    }
+    let text = logs.text();
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("the vehicle is locked"))
+        .collect();
+    assert_eq!(lines.len(), 1, "{text}");
+    assert!(lines[0].contains("operator_id="), "{}", lines[0]);
+    // The holder's own "job created" line names its ID; the refusal's line names no holder.
+    assert!(!text.contains(VIN), "{text}");
+    assert!(!lines[0].contains(&holder), "{}", lines[0]);
+    lab.finish().await;
+}
+
+impl Lab {
+    /// An uncommitted take of the lock row of `vin` as the creation runs it, which locks the row.
+    async fn hold_take(&self, vin: &str) -> sqlx::Transaction<'static, Postgres> {
+        let mut tx = self.w.pg.pool().begin().await.unwrap();
+        sqlx::query(
+            "INSERT INTO vehicle_locks AS l (tenant_id, vin, job_id, agent_id, expires_at) \
+             SELECT tenant_id, $2, gen_random_uuid(), id, now() + interval '1 hour' \
+             FROM agents WHERE id = $1::uuid \
+             ON CONFLICT (tenant_id, vin) DO UPDATE SET job_id = EXCLUDED.job_id, \
+                 agent_id = EXCLUDED.agent_id, acquired_at = now(), \
+                 expires_at = EXCLUDED.expires_at \
+             WHERE l.expires_at <= now()",
+        )
+        .bind(&self.agent_id)
+        .bind(vin)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx
+    }
+}
+
+#[tokio::test]
+async fn a_creation_waiting_on_an_uncommitted_replacement_of_an_expired_lock_is_decided_when_it_ends()
+ {
+    // V11 and V12: a commit leaves a live lock and a 409, a rollback leaves the expired one and a
+    // 202.
+    let lab = Lab::new().await;
+    let cookie = lab.login("alice").await;
+    let body = lab.body(json!({ "vin": VIN }));
+    job_id(&lab.post(&cookie, "k0", &body).await);
+    lab.age_lock(VIN, "interval '1 day'").await;
+
+    let tx = lab.hold_take(VIN).await;
+    let waiting = spawn_post(lab.addr(), &cookie, "k-commit", &body);
+    wait_for_lock(&lab, "INSERT INTO vehicle_locks").await;
+    assert!(!waiting.is_finished(), "the creation ended early");
+    tx.commit().await.unwrap();
+    assert_problem(&waiting.await.unwrap(), 409, "replacement committed");
+    lab.assert_jobs(1, "replacement committed").await;
+
+    lab.age_lock(VIN, "interval '1 day'").await;
+    let tx = lab.hold_take(VIN).await;
+    let waiting = spawn_post(lab.addr(), &cookie, "k-rollback", &body);
+    wait_for_lock(&lab, "INSERT INTO vehicle_locks").await;
+    tx.rollback().await.unwrap();
+    let id = job_id(&waiting.await.unwrap());
+    assert_eq!(lab.locks().await, format!("{VIN}>{id}"));
+    lab.assert_jobs(2, "replacement rolled back").await;
+    lab.finish().await;
+}
+
+#[tokio::test]
+async fn an_end_of_the_old_job_waits_for_an_uncommitted_take_and_then_deletes_nothing() {
+    // V16: the queue ends J_old by a rejection while a take of its expired lock is uncommitted.
+    let lab = Lab::build(instruction_key(), Some(settings(LONG))).await;
+    let cookie = lab.login("alice").await;
+    let body = lab.body(json!({ "vin": VIN }));
+    let old = job_id(&lab.post(&cookie, "k-old", &body).await);
+    lab.age_lock(VIN, "interval '1 day'").await;
+    let mut client = open(lab.addr(), &lab.agent_token().await).await;
+    let (command_id, _) = command(&mut client).await;
+    until_row(&lab.w, &old, SENT).await;
+
+    let tx = lab.hold_take(VIN).await;
+    reject(&mut client, &command_id, "badSignature").await;
+    wait_for_lock(&lab, "WITH ended AS").await;
+    tx.commit().await.unwrap();
+    until_row(
+        &lab.w,
+        &old,
+        "failed|1|true|false|instructionRejected|badSignature|true",
+    )
+    .await;
+    let holder = lab.w.sql("SELECT job_id::text FROM vehicle_locks").await;
+    assert_ne!(holder, old);
+    assert_eq!(lab.locks().await, format!("{VIN}>{holder}"));
     lab.finish().await;
 }

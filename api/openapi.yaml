@@ -93,7 +93,9 @@ paths:
         (8.8, ADR-480): while another job of the tenant holds it, the request is **409** with the
         `code` `VEHICLE_LOCKED`, nothing is created and the key stays free. The lock expires on
         its own, 10 minutes (`acquire`) or 30 minutes (`writeSettings`) after the job's start
-        deadline, and ends with the job. A replay never takes a lock, and a job with no `vin`
+        deadline. The server deletes it when it ends the job itself (an agent's rejection, a
+        retired instruction key, an instruction too large to send); a job that finishes on the
+        agent keeps it until it expires. A replay never takes a lock, and a job with no `vin`
         takes none. The answer names no holder, expiry or VIN, and there is no override.
 
         Like every operator route the request needs a live session and, as a POST, the pinned

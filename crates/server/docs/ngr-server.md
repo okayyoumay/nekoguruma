@@ -711,7 +711,9 @@ connection with hyper's `with_upgrades()`.
   statement that also deletes the vehicle lock the job holds (`WITH ended AS (UPDATE ... RETURNING
   ...) DELETE FROM vehicle_locks ... WHERE job_id = ended.id`, ADR-480), so a lock of another job
   on the same VIN stays and a rejection that ends nothing frees nothing; the sweep counts the
-  jobs it ended, not the locks it freed.
+  jobs it ended, not the locks it freed. A create that holds a lock row (also on the 409 path,
+  since `ON CONFLICT DO UPDATE` locks the conflicting row) can make the ending statement wait; past
+  the 5 second lock timeout that pass fails and the next tick retries.
   While a pass or a write waits for the database the task keeps reading the inbox into a buffer
   (4096 messages at most, applied by the next iteration), and an answer that could not be
   written is kept and written again on the next tick (not on every message); what was buffered during a write is applied right after it, and at the latest on the next tick. Two instances never hold one row at once; a commit that

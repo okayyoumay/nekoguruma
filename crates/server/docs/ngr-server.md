@@ -694,7 +694,9 @@ connection with hyper's `with_upgrades()`.
   (`failed`, `instructionRejected`, the agent's reason as the detail); both, and a release, write only while the
   job is neither finished nor delivered and still carries a mark that delivery expects (see above)
   with the attempts that go with it. `agentEvent` and `reconcile` messages are dropped with a
-  debug line. A failed pass sends nothing and is one gated warning (60 seconds). The task ends
+  debug line; the agent records a numbered `received` event before each `commandAck`, sends it as
+  an `agentEvent` after the acknowledgement, and sends it again on every connection, since no
+  `eventAck` comes (ADR-478). A failed pass sends nothing and is one gated warning (60 seconds). The task ends
   when the stop begins, in its wait and in its read.
 - **After a close.** The task leaves the registry first, then writes the Close frame, then the
   disconnect stamp (above), then drains (reads and discards until the peer's reply, at most `CLOSE_WAIT`, 5 seconds). After a

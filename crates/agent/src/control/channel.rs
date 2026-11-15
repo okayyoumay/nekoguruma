@@ -5,13 +5,22 @@
 //! connection: it waits for `hello`, sends `heartbeat` at the interval `hello` names, reads what
 //! the server sends and closes the connection when something is wrong. The loop is driven only by
 //! `tokio::time`, with one writer (this task), and its select is biased while connected: stop,
-//! the idle deadline, the heartbeat tick, then the read, so a server that is silent since `hello`
-//! gets heartbeats at one and two intervals and the idle close at three.
+//! the idle deadline, the heartbeat tick, the read, then the outbox, so a server that is silent
+//! since `hello` gets heartbeats at one and two intervals and the idle close at three, and a long
+//! backlog of events delays neither a heartbeat nor a read.
+//!
+//! The outbox arm writes the next pending event ([`super::events`], ADR-478); a sent event is not
+//! a received frame, so it does not move the idle deadline. `eventAck` is applied to the outbox
+//! and counts as a received frame; one above the highest number assigned closes with 1002.
 //!
 //! What ends a connection is an [`End`]: the close to send (or none), how the loop backs off and
 //! what the log says. A job command goes to the connection's [`Gate`]: a verified instruction is
-//! handed to the [`Intake`] and answered `commandAck`, a refusal is answered `commandRejected`
-//! with its reason, both on this connection through the one writer and under the write bound.
+//! handed to the [`Intake`], recorded as a `received` event in the outbox and then answered
+//! `commandAck` (an append that fails withholds the answer, and one that finds the outbox
+//! poisoned or fails to write closes the connection with 1011: the session reopens the outbox
+//! before its next connection); a refusal is answered
+//! `commandRejected` with its reason and records nothing. Answers are written on this connection
+//! through the one writer and under the write bound.
 //! Sending an answer does not reset the idle deadline; only a frame received does. Never logged:
 //! the token, a message's text, a `commandId`, a close reason the server sent.
 
@@ -19,9 +28,10 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use shared_proto::{
-    AgentMessage, CLOSE_CODE_BINARY, CLOSE_CODE_GOING_AWAY, CLOSE_CODE_IDLE, CLOSE_CODE_PROTOCOL,
-    CLOSE_CODE_REPLACED, CLOSE_CODE_REVOKED, CLOSE_CODE_TOO_BIG, CONTROL_SUBPROTOCOL,
-    HEARTBEAT_MISSED_LIMIT, MAX_CONTROL_MESSAGE_LEN, ServerMessage, close_reason,
+    AgentEventKind, AgentEventMessage, AgentMessage, CLOSE_CODE_BINARY, CLOSE_CODE_GOING_AWAY,
+    CLOSE_CODE_IDLE, CLOSE_CODE_PROTOCOL, CLOSE_CODE_REPLACED, CLOSE_CODE_REVOKED,
+    CLOSE_CODE_TOO_BIG, CONTROL_SUBPROTOCOL, HEARTBEAT_MISSED_LIMIT, JobId,
+    MAX_CONTROL_MESSAGE_LEN, ServerMessage, close_reason,
 };
 use tokio::time::Instant;
 use tokio_tungstenite::WebSocketStream;
@@ -31,10 +41,16 @@ use tokio_tungstenite::tungstenite::{self, ClientRequestBuilder, Message, http};
 
 use super::backoff::lived;
 use super::dial::{self, ConnectError, Stream};
+use super::events::{Acked, Sender};
 use super::exchange::Token;
 use super::gate::Gate;
 use super::{Fail, Outcome, Phase, SessionState, Stop, Wiring};
+use crate::outbox::{Kind, OutboxError};
 use crate::server_http;
+
+/// The standard close code (RFC 6455 section 7.4.1) for an endpoint that cannot go on because of
+/// a fault of its own: the agent's outbox cannot take events.
+const CLOSE_CODE_INTERNAL: u16 = 1011;
 
 /// The upgrade route.
 pub(super) const CONTROL_PATH: &str = "/api/v1/agent/control";
@@ -437,6 +453,8 @@ async fn connected(
     state: &mut SessionState<'_>,
     gate: &mut Gate<'_>,
 ) -> End {
+    let w = state.wiring;
+    let mut sender = Sender::new(&w.outbox);
     let interval = Duration::from_secs(u64::from(secs));
     let idle = interval * HEARTBEAT_MISSED_LIMIT;
     let hello_at = Instant::now();
@@ -495,9 +513,25 @@ async fn connected(
                             // Not reachable once the longest answer encodes.
                             return End::close(CLOSE_CODE_PROTOCOL, "command-id", lived_now);
                         };
-                        // The intake has the instruction before the ack is written.
+                        // The intake has the instruction before the ack is written, and the
+                        // outbox has the `received` event before it too (ADR-478 item 5).
                         if let Some(verified) = verified {
-                            state.wiring.intake.take(verified);
+                            let job_id = verified.instruction().job_id.0.clone();
+                            w.intake.take(verified);
+                            match record_received(w, state.stop, job_id).await {
+                                Recorded::Done => {}
+                                Recorded::Stopped => return End::stop(),
+                                Recorded::Failed(class, error) => {
+                                    state.warnings.event_failure(class, &error);
+                                    // A poisoned outbox cannot take any event until it is
+                                    // reopened, which the session does before its next
+                                    // connection (ADR-478 item 4): end this one.
+                                    if matches!(class, "outbox-poisoned" | "outbox-write") {
+                                        return End::close(CLOSE_CODE_INTERNAL, class, lived_now);
+                                    }
+                                    continue;
+                                }
+                            }
                         }
                         if let Err(end) =
                             write_or_stop(socket, &text, state.stop, lived_now).await
@@ -509,11 +543,33 @@ async fn connected(
                             Some(_) => state.status.command_rejected(),
                         }
                     }
+                    Ok(ServerMessage::EventAck { seq }) => {
+                        last_frame_at = Instant::now();
+                        let acked = tokio::select! {
+                            biased;
+                            () = state.stop.requested() => return End::stop(),
+                            acked = sender.ack(seq) => acked,
+                        };
+                        match acked {
+                            Acked::Taken => {}
+                            Acked::OutOfRange => {
+                                let lived_now = lived(hello_at, last_frame_at);
+                                return End::close(CLOSE_CODE_PROTOCOL, "event-ack", lived_now);
+                            }
+                            Acked::Poisoned => {
+                                let lived_now = lived(hello_at, last_frame_at);
+                                return End::close(
+                                    CLOSE_CODE_INTERNAL,
+                                    "outbox-poisoned",
+                                    lived_now,
+                                );
+                            }
+                        }
+                    }
                     Ok(
                         ServerMessage::CancelCommand { .. }
                         | ServerMessage::HmiResponse { .. }
-                        | ServerMessage::SeedKeyResponse { .. }
-                        | ServerMessage::EventAck { .. },
+                        | ServerMessage::SeedKeyResponse { .. },
                     ) => {
                         tracing::debug!("a control message was read and not handled");
                         last_frame_at = Instant::now();
@@ -528,7 +584,69 @@ async fn connected(
                 Some(Ok(Message::Ping(_) | Message::Pong(_))) => last_frame_at = Instant::now(),
                 Some(Ok(Message::Frame(_))) => {}
                 Some(Ok(Message::Close(frame))) => return peer_close(frame, lived_now),
+            },
+            (seq, text) = sender.next() => {
+                if let Err(end) = write_or_stop(socket, &text, state.stop, lived_now).await {
+                    return end;
+                }
+                sender.wrote(seq);
             }
+        }
+    }
+}
+
+/// What recording a `received` event came to.
+enum Recorded {
+    Done,
+    /// The stop came first: the append, if it started, goes on unobserved.
+    Stopped,
+    /// The warning class and the error; the command is not acknowledged.
+    Failed(&'static str, OutboxError),
+}
+
+/// The text of the `received` event of `job_id` with number `seq`. No device time is given: the
+/// property is optional and the server stamps its own receive time (16.3).
+fn received_event(job_id: &str, seq: u64) -> Result<String, shared_proto::ControlError> {
+    AgentMessage::AgentEvent(AgentEventMessage {
+        seq: Some(seq),
+        occurred_at_agent: None,
+        event: AgentEventKind::JobState {
+            job_id: JobId(job_id.to_owned()),
+            state: shared_proto::JobState::Received.wire_name().to_owned(),
+            failure_code: None,
+            procedure_code: None,
+            detail: None,
+        },
+    })
+    .encode()
+}
+
+/// Appends the `received` event on a blocking task, raced with the stop (ADR-478 item 5). It is
+/// tried once per command: the server's redelivery after the lease is the retry.
+async fn record_received(w: &Wiring, stop: &Stop, job_id: String) -> Recorded {
+    // The longest number the counter gives, so the text that is appended encodes as well.
+    if let Err(error) = received_event(&job_id, u64::MAX - 1) {
+        let error = OutboxError::Io(std::io::Error::other(error.to_string()));
+        return Recorded::Failed("outbox-event", error);
+    }
+    let append = w.outbox.append(Kind::Received, move |seq| {
+        received_event(&job_id, seq).unwrap_or_default()
+    });
+    let appended = tokio::select! {
+        biased;
+        () = stop.requested() => return Recorded::Stopped,
+        appended = append => appended,
+    };
+    match appended {
+        Ok(_) => Recorded::Done,
+        Err(error) => {
+            let class = match error {
+                OutboxError::Full => "outbox-full",
+                OutboxError::Poisoned => "outbox-poisoned",
+                OutboxError::TooLarge => "outbox-event",
+                _ => "outbox-write",
+            };
+            Recorded::Failed(class, error)
         }
     }
 }

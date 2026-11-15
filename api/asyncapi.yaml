@@ -89,6 +89,7 @@ channels:
       | 1002 | either | Protocol error: malformed text, unknown `type`, unknown or missing property, value out of range, `hello` not first or not received in time |
       | 1003 | either | A binary frame |
       | 1009 | either | A message over 128 KiB |
+      | 1011 | agent | The agent's outbox failed: a verified command's `received` event could not be recorded (the command is not acknowledged), or rewriting the file after an `eventAck` failed. The agent reopens the outbox before it connects again (5.3, ADR-478 item 4) |
       | 4001 | server | Replaced by a newer connection of the same agent |
       | 4002 | server | The agent's key was revoked, or its session ended. Sent as the first frame when the row is revoked or missing at connect (nothing else precedes it, and no earlier connection is replaced), or later by the server's 30 second pass |
       | 4003 | either | No frame of any kind for three heartbeat intervals |
@@ -139,8 +140,10 @@ operations:
       duplicates (5.3, ADR-461). A command whose
       instruction fails verification is answered with commandRejected (ADR-461) and creates no job. Jobs past their start deadline are not run; Expired is reported instead.
       The agent settles each delivery with commandAck or commandRejected (ADR-466). The duplicate
-      check and the journal record belong to the agent's job intake, which the ACK follows; a
-      verified command is answered with commandAck alone, and no agentEvent (ADR-473).
+      check and the journal record belong to the agent's job intake, which the ACK follows. A
+      verified command's received jobState is appended to the agent's outbox after the hand-over
+      to the intake and before commandAck, and sent as a numbered agentEvent; when the append
+      fails, no commandAck is sent and the server delivers the command again (ADR-478 item 5).
     messages:
       - { $ref: '#/channels/agentControl/messages/jobCommand' }
 

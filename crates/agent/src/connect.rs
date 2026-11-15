@@ -5,13 +5,18 @@
 //!
 //! 1. [`crate::control::open`]: the connection lock, the registration lock and the registration
 //!    record. A missing record ends the command before the key store is touched.
-//! 2. The agent key, through [`crate::identity::agent_key`] (the create-once routine). A key
+//! 2. The agent's outbox ([`crate::outbox::Outbox::open`], ADR-478): the file of the record's
+//!    agent ID, created when missing. One that does not read back is corrupt, and the owner
+//!    registers again (exit 1); another process holding it, or a directory that cannot be used,
+//!    is exit 3.
+//! 3. The agent key, through [`crate::identity::agent_key`] (the create-once routine). A key
 //!    store that is unavailable, or a creation lock held past its wait, is tried again with the
 //!    session's delays until the stop signal; any other error (a refused identity directory, a
 //!    lock that cannot be opened) ends the command at once. A key this run had to create, or one
 //!    that is not the record's, means registering again.
-//! 3. [`crate::control::Opened::start`], then a wait for the stop signal or for the task to end
-//!    (a task that ends alone is an error), then [`crate::control::Handle::stop`] (Close 1001)
+//! 4. [`crate::control::Opened::start`], then a wait for the stop signal or for the task to end
+//!    (a task that ends alone is an error: exit 1 when its outbox, poisoned and opened again,
+//!    was corrupt, otherwise the same exit with a generic text), then [`crate::control::Handle::stop`] (Close 1001)
 //!    and a wait for the task to end.
 //!
 //! The command prints and logs nothing the server sent and no token; its messages are fixed
@@ -23,8 +28,9 @@ use std::time::Duration;
 
 use worker_host::service::OperatingMode;
 
-use crate::control::{self, ControlError, LogIntake};
+use crate::control::{self, ControlError, LogIntake, SharedOutbox};
 use crate::identity::{AgentKey, IdentityError, agent_key};
+use crate::outbox::{Outbox, OutboxError};
 use crate::registration::record::RecordError;
 
 /// The first wait before the key store is tried again, as the session's own delay starts.
@@ -127,6 +133,28 @@ fn control_error(error: &ControlError) -> ConnectError {
     }
 }
 
+/// The exit and the text of an error that ends the open of the outbox. The texts are NGR's own.
+fn outbox_error(error: &OutboxError) -> ConnectError {
+    match error {
+        OutboxError::Corrupt(_) => fail(
+            Exit::CannotConnect,
+            "the outbox is corrupt and is not repaired; register again with `ngr-agent register --replace`",
+        ),
+        OutboxError::BadAgentId => fail(
+            Exit::CannotConnect,
+            "the registration record cannot be used; register again with `ngr-agent register --replace`",
+        ),
+        OutboxError::InUse => fail(
+            Exit::Unavailable,
+            "the outbox is open in another process; nothing changed, try again",
+        ),
+        other => fail(
+            Exit::Unavailable,
+            format!("the outbox cannot be opened: {other}; nothing changed, try again"),
+        ),
+    }
+}
+
 /// The exit and the text of a key error that ends the load, as `register` reports it. The retried
 /// errors ([`IdentityError::retry_class`]) never get here.
 fn identity_error(error: &IdentityError) -> ConnectError {
@@ -146,10 +174,15 @@ fn identity_error(error: &IdentityError) -> ConnectError {
 pub async fn run(mode: OperatingMode, stop: impl Future<Output = ()>) -> Result<(), ConnectError> {
     // Both locks and the record first: no record ends the command with the key store untouched.
     let opened = control::open(mode).map_err(|error| control_error(&error))?;
+    // After the record (it names the agent ID) and before the key store, which a corrupt outbox
+    // need not wait for. Dropping `opened` on the error releases both locks.
+    let outbox =
+        Outbox::open(mode, &opened.record().agent_id).map_err(|error| outbox_error(&error))?;
+    let outbox = SharedOutbox::new(outbox);
     run_opened(
         opened,
         move || agent_key(mode),
-        |opened, key| opened.start(key, Arc::new(LogIntake)),
+        |opened, key| opened.start(key, Arc::new(LogIntake), outbox),
         stop,
     )
     .await
@@ -179,6 +212,9 @@ async fn run_opened(
         biased;
         () = stop.as_mut() => {}
         () = handle.stopped() => {
+            if handle.ended() == Some(control::Ended::OutboxUnusable) {
+                return Err(outbox_error(&OutboxError::Corrupt("reopen")));
+            }
             return Err(fail(
                 Exit::CannotConnect,
                 "the control channel session ended unexpectedly",

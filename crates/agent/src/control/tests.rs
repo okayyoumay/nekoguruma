@@ -11,7 +11,7 @@
 use std::io;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -47,6 +47,7 @@ use super::*;
 use crate::identity::load_or_create;
 use crate::identity::store::{MemoryStore, SecretName};
 use crate::instruction::VerifiedInstruction;
+use crate::outbox::{Kind, Outbox, Probe};
 use crate::registration::{Request as RegisterRequest, register_in};
 use crate::server_http::Timeouts;
 
@@ -340,6 +341,8 @@ struct Opts {
     random: fn() -> Result<[u8; 32], RandomError>,
     broken_signer: bool,
     origin: &'static str,
+    /// A hook on the outbox's write path.
+    probe: Option<Probe>,
 }
 
 impl Default for Opts {
@@ -348,8 +351,17 @@ impl Default for Opts {
             random: shared_crypto::random_32,
             broken_signer: false,
             origin: ORIGIN,
+            probe: None,
         }
     }
+}
+
+/// The outbox of the fixture's agent in its state directory.
+fn open_outbox(fx: &Fixture, probe: Option<Probe>) -> SharedOutbox {
+    let dir = fx.dir.path().join("outbox");
+    std::fs::create_dir_all(&dir).unwrap();
+    let probe = probe.unwrap_or_else(|| Box::new(|_| Ok(())));
+    SharedOutbox::new(Outbox::open_with(&dir, AGENT_ID, probe).unwrap())
 }
 
 /// An intake that keeps what it was given: the job ID and the envelope.
@@ -368,6 +380,8 @@ impl Intake for RecordingIntake {
 struct Env {
     fx: Fixture,
     intake: Arc<RecordingIntake>,
+    /// `None` only while a restart has the outbox closed.
+    outbox: Option<SharedOutbox>,
     handle: Handle,
     conns: mpsc::UnboundedReceiver<Dialed>,
     dial: Arc<FakeDial>,
@@ -431,11 +445,13 @@ impl Env {
             fx.key.clone()
         };
         let intake = Arc::new(RecordingIntake::default());
+        let outbox = open_outbox(&fx, opts.probe);
         let seams = Seams {
             dial: dial.clone(),
             signer,
             random: opts.random,
             intake: intake.clone(),
+            outbox: outbox.clone(),
         };
         let started = Instant::now();
         let handle = fx
@@ -446,6 +462,7 @@ impl Env {
         Env {
             fx,
             intake,
+            outbox: Some(outbox),
             handle,
             conns: rx,
             dial,
@@ -453,6 +470,38 @@ impl Env {
             started,
             _subscriber: guard,
         }
+    }
+
+    fn outbox(&self) -> &SharedOutbox {
+        self.outbox.as_ref().expect("the outbox is open")
+    }
+
+    /// Appends a `jobState` event with the state's name; returns its number.
+    async fn append(&self, state: &'static str) -> u64 {
+        append_event(self.outbox(), state).await
+    }
+
+    /// Stops the session, waits for its end and starts a new one on the same state directory, as
+    /// a restart of the process would: the outbox is opened again from its file.
+    async fn restart(&mut self) {
+        self.handle.stop();
+        self.handle.stopped().await;
+        self.outbox = None;
+        let outbox = open_outbox(&self.fx, None);
+        let seams = Seams {
+            dial: self.dial.clone(),
+            signer: self.fx.key.clone(),
+            random: shared_crypto::random_32,
+            intake: self.intake.clone(),
+            outbox: outbox.clone(),
+        };
+        self.handle = self
+            .fx
+            .open()
+            .unwrap()
+            .start_with(&self.fx.key.public_key(), seams)
+            .unwrap();
+        self.outbox = Some(outbox);
     }
 
     /// The commands answered `commandAck` and `commandRejected` so far.
@@ -778,6 +827,59 @@ async fn send(ws: &mut Ws, text: &str) {
 
 fn hello(secs: u32) -> String {
     format!(r#"{{"type":"hello","heartbeatSecs":{secs}}}"#)
+}
+
+/// The text of a `jobState` event with number `seq`, as a producer builds it.
+fn event_text(seq: u64, state: &str) -> String {
+    AgentMessage::AgentEvent(shared_proto::AgentEventMessage {
+        seq: Some(seq),
+        occurred_at_agent: None,
+        event: shared_proto::AgentEventKind::JobState {
+            job_id: JobId(JOB_ID.to_owned()),
+            state: state.to_owned(),
+            failure_code: None,
+            procedure_code: None,
+            detail: None,
+        },
+    })
+    .encode()
+    .unwrap()
+}
+
+/// Appends a `jobState` event to `outbox`; returns its number.
+async fn append_event(outbox: &SharedOutbox, state: &'static str) -> u64 {
+    outbox
+        .append(Kind::Other, move |seq| event_text(seq, state))
+        .await
+        .unwrap()
+}
+
+/// The next message from the agent must be an event: its number and its state's name.
+async fn event(ws: &mut Ws) -> (Instant, u64, String) {
+    let (at, message) = got(ws).await;
+    let Got::Text(text) = message else {
+        panic!("an event is next, got {message:?}");
+    };
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(value["type"], "agentEvent", "{text}");
+    (
+        at,
+        value["seq"].as_u64().unwrap(),
+        value["state"].as_str().unwrap().to_owned(),
+    )
+}
+
+/// The next `count` messages must be events; returns their numbers.
+async fn events(ws: &mut Ws, count: usize) -> Vec<u64> {
+    let mut seqs = Vec::new();
+    for _ in 0..count {
+        seqs.push(event(ws).await.1);
+    }
+    seqs
+}
+
+fn ack(seq: u64) -> String {
+    format!(r#"{{"type":"eventAck","seq":{seq}}}"#)
 }
 
 fn job_command(id: &str) -> String {
@@ -1205,6 +1307,7 @@ async fn a7_a_key_with_another_fingerprint_is_a_key_mismatch() {
         signer: fx.key.clone(),
         random: shared_crypto::random_32,
         intake: Arc::new(LogIntake),
+        outbox: open_outbox(&fx, None),
     };
     let error = fx.open().unwrap().start_with(&other, seams).unwrap_err();
     assert!(matches!(error, ControlError::KeyMismatch));
@@ -1272,6 +1375,7 @@ async fn a11_a_second_open_in_the_same_process_is_already_running() {
         signer: fx.key.clone(),
         random: shared_crypto::random_32,
         intake: Arc::new(LogIntake),
+        outbox: open_outbox(&fx, None),
     };
     let handle = first.start_with(&fx.key.public_key(), seams).unwrap();
     assert!(matches!(fx.open(), Err(ControlError::AlreadyRunning)));
@@ -1332,6 +1436,7 @@ fn a12_runtime_shutdown_and_an_unstarted_opened_release_both_locks() {
             signer: fx.key.clone(),
             random: shared_crypto::random_32,
             intake: Arc::new(LogIntake),
+            outbox: open_outbox(&fx, None),
         };
         let handle = fx
             .open()
@@ -2383,13 +2488,32 @@ async fn f8_a_verified_job_command_is_answered_with_an_ack_and_the_answer_is_no_
     let second = signed_command(&env.fx, "cmd-2", AGENT_ID, Tamper::None);
     send(&mut ws, &first.text).await;
     send(&mut ws, &second.text).await;
-    for id in ["cmd-1", "cmd-2"] {
-        let (at, answer) = answer(&mut ws).await;
-        assert_after(hello_at, at, 25, "the answer comes at once");
-        assert_eq!(
-            answer,
-            serde_json::json!({"type": "commandAck", "commandId": id})
-        );
+    // Each ack is followed by its `received` event (numbers 1 and 2), the second ack may come
+    // before the first event.
+    let mut acks = Vec::new();
+    let mut seqs = Vec::new();
+    let mut order = Vec::new();
+    for _ in 0..4 {
+        let (at, message) = got(&mut ws).await;
+        assert_after(hello_at, at, 25, "the answers come at once");
+        let Got::Text(text) = message else {
+            panic!("an answer or an event is next, got {message:?}");
+        };
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        if value["type"] == "commandAck" {
+            acks.push(value["commandId"].as_str().unwrap().to_owned());
+            order.push(format!("ack{}", acks.len()));
+        } else {
+            assert_eq!(value["state"], "received");
+            seqs.push(value["seq"].as_u64().unwrap());
+            order.push(format!("event{}", seqs.len()));
+        }
+    }
+    assert_eq!(acks, ["cmd-1", "cmd-2"]);
+    assert_eq!(seqs, [1, 2]);
+    for n in 1..=2 {
+        let at = |what: String| order.iter().position(|o| *o == what).unwrap();
+        assert!(at(format!("ack{n}")) < at(format!("event{n}")), "{order:?}");
     }
     assert_eq!(env.counts(), (2, 0));
     // The intake had both, byte for byte, before the acks.
@@ -2574,8 +2698,10 @@ async fn f9_a_stalled_answer_is_dropped_after_10_seconds_and_counts_nothing() {
     assert_eq!(env.counts(), (0, 0));
     // F8b: the intake took the instruction before the ack, which was lost.
     assert_eq!(env.intake.0.lock().unwrap().len(), 1);
-    // The server redelivers it under a new commandId; the intake gets it a second time.
+    // The server redelivers it under a new commandId; the intake gets it a second time. The
+    // first delivery's `received` event is in the outbox and is sent first.
     let (_, mut ws) = env.connected(60).await;
+    assert_eq!(event(&mut ws).await.1, 1);
     send(
         &mut ws,
         &signed_command(&env.fx, "c-again", AGENT_ID, Tamper::None).text,
@@ -2586,6 +2712,8 @@ async fn f9_a_stalled_answer_is_dropped_after_10_seconds_and_counts_nothing() {
         got,
         serde_json::json!({"type": "commandAck", "commandId": "c-again"})
     );
+    // C14: the second delivery of the same job is a second `received` event.
+    assert_eq!(event(&mut ws).await.1, 2);
     assert_eq!(env.counts(), (1, 0));
     assert_eq!(env.intake.0.lock().unwrap().len(), 2);
 }
@@ -2768,7 +2896,6 @@ async fn f11_other_valid_messages_are_dropped_with_a_debug_line_and_count_as_fra
         format!(r#"{{"type":"cancelCommand","jobId":"{JOB_ID}"}}"#),
         format!(r#"{{"type":"hmiResponse","jobId":"{JOB_ID}","requestId":"r1"}}"#),
         format!(r#"{{"type":"seedKeyResponse","jobId":"{JOB_ID}","requestId":"r1","key":"AAAA"}}"#),
-        r#"{"type":"eventAck","seq":3}"#.to_owned(),
     ];
     assert_after(hello_at, heartbeat(&mut ws).await, 10, "tick 1");
     assert_after(hello_at, heartbeat(&mut ws).await, 20, "tick 2");
@@ -3348,6 +3475,854 @@ fn a_read_error_is_classified_by_what_the_stack_says() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// O. The outbox (ADR-478): sending, `eventAck` and the `received` event. The case numbers are
+// the ones of the outbox send spec (C1 to C19; C19 is in the server's tests).
+
+/// The next `count` messages must be events; returns their texts, byte for byte.
+async fn texts(ws: &mut Ws, count: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for _ in 0..count {
+        let (_, message) = got(ws).await;
+        let Got::Text(text) = message else {
+            panic!("an event is next, got {message:?}");
+        };
+        assert!(text.contains(r#""type":"agentEvent""#), "{text}");
+        out.push(text);
+    }
+    out
+}
+
+/// Nothing arrives within `wait` (the paused clock moves on while the test waits).
+async fn quiet(ws: &mut Ws, wait: u64) {
+    assert!(
+        tokio::time::timeout(secs(wait), ws.next()).await.is_err(),
+        "nothing was to be sent"
+    );
+}
+
+/// A `jobState` event text whose size makes a few of them fill the outbox.
+fn big_event_text(seq: u64) -> String {
+    let mut value: serde_json::Value = serde_json::from_str(&event_text(seq, "running")).unwrap();
+    value["detail"] = "x".repeat(129_000).into();
+    value.to_string()
+}
+
+fn received_of(seq: u64) -> serde_json::Value {
+    serde_json::json!({
+        "type": "agentEvent", "seq": seq, "kind": "jobState", "jobId": JOB_ID, "state": "received"
+    })
+}
+
+fn verified(env: &Env, id: &str) -> String {
+    signed_command(&env.fx, id, AGENT_ID, Tamper::None).text
+}
+
+/// C1: events pending at `hello` are sent in order after it and nothing before it.
+#[tokio::test(start_paused = true)]
+async fn outbox_c1_pending_events_are_sent_in_order_after_hello_and_nothing_before() {
+    let mut env = Env::new();
+    for state in ["received", "running", "completed"] {
+        env.append(state).await;
+    }
+    let (_, mut ws) = env.upgraded().await;
+    quiet(&mut ws, 5).await;
+    send(&mut ws, &hello(60)).await;
+    let hello_at = Instant::now();
+    for (want, state) in [(1, "received"), (2, "running"), (3, "completed")] {
+        let (at, seq, name) = event(&mut ws).await;
+        assert_eq!((seq, name.as_str()), (want, state));
+        assert_after(hello_at, at, 0, "sent at once");
+    }
+    // They are not frames: the heartbeat comes on its tick.
+    assert_after(hello_at, heartbeat(&mut ws).await, 60, "tick");
+}
+
+/// C2: an append while connected is sent at once, after the earlier ones.
+#[tokio::test(start_paused = true)]
+async fn outbox_c2_an_append_while_connected_is_sent_without_waiting_for_a_tick() {
+    let mut env = Env::new();
+    let (hello_at, mut ws) = env.connected(60).await;
+    quiet(&mut ws, 3).await;
+    let appended = Instant::now();
+    env.append("received").await;
+    let (at, seq, _) = event(&mut ws).await;
+    assert_eq!(seq, 1);
+    assert_after(appended, at, 0, "no tick");
+    env.append("running").await;
+    env.append("completed").await;
+    assert_eq!(events(&mut ws, 2).await, [2, 3]);
+    assert_after(hello_at, heartbeat(&mut ws).await, 60, "tick");
+}
+
+/// C3: an append during any phase before `hello` is sent after the next `hello`.
+async fn append_in_phase_then_hello(phase: &str) {
+    let mut env = Env::new();
+    let mut ws = match phase {
+        "waiting" => {
+            env.fail_challenge(503, &[], b"").await;
+            env.wait_phase(Phase::Waiting).await;
+            env.append("received").await;
+            env.upgraded().await.1
+        }
+        "exchange" => {
+            let (_, challenge) = env.challenge().await;
+            env.append("received").await;
+            let (_, mut stream, _) = env.session(challenge).await;
+            json_reply(&mut stream, 200, &token_body(&token_text())).await;
+            env.upgrade().await.1
+        }
+        "upgrade" => {
+            env.exchange().await;
+            env.append("received").await;
+            env.upgrade().await.1
+        }
+        _ => {
+            let (_, ws) = env.upgraded().await;
+            env.append("received").await;
+            ws
+        }
+    };
+    quiet(&mut ws, 1).await;
+    send(&mut ws, &hello(60)).await;
+    assert_eq!(event(&mut ws).await.1, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn outbox_c3_an_append_while_waiting_is_sent_after_the_next_hello() {
+    append_in_phase_then_hello("waiting").await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn outbox_c3_an_append_during_the_exchange_is_sent_after_the_next_hello() {
+    append_in_phase_then_hello("exchange").await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn outbox_c3_an_append_during_the_upgrade_is_sent_after_the_next_hello() {
+    append_in_phase_then_hello("upgrade").await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn outbox_c3_an_append_before_hello_is_sent_after_it() {
+    append_in_phase_then_hello("hello").await;
+}
+
+/// C4: an acknowledged event is not sent again by a later connection.
+#[tokio::test(start_paused = true)]
+async fn outbox_c4_an_acknowledged_event_is_not_sent_on_a_later_connection() {
+    let mut env = Env::new();
+    for state in ["received", "running", "completed"] {
+        env.append(state).await;
+    }
+    let (_, mut ws) = env.connected(60).await;
+    assert_eq!(events(&mut ws, 3).await, [1, 2, 3]);
+    send(&mut ws, &ack(2)).await;
+    drop(ws);
+    let (_, mut ws) = env.connected(60).await;
+    assert_eq!(events(&mut ws, 1).await, [3], "only the unacknowledged one");
+    quiet(&mut ws, 5).await;
+    send(&mut ws, &ack(3)).await;
+    drop(ws);
+    let (_, mut ws) = env.connected(60).await;
+    quiet(&mut ws, 5).await;
+    assert_eq!(env.counts(), (0, 0));
+}
+
+/// C5: a connection that ends between the send and the acknowledgement; the next one sends the
+/// events again, with the same text and in the same order. `how` is how it ends.
+async fn the_events_come_again_after(how: &str) {
+    let mut env = Env::new();
+    for state in ["received", "running"] {
+        env.append(state).await;
+    }
+    let (_, mut ws) = env.connected(10).await;
+    let first = texts(&mut ws, 2).await;
+    match how {
+        "reset" => drop(ws),
+        "peer close" => {
+            ws.send(close_frame(Some(1000))).await.unwrap();
+            let _ = got(&mut ws).await;
+        }
+        "replaced" => {
+            ws.send(close_frame(Some(4001))).await.unwrap();
+            let _ = got(&mut ws).await;
+        }
+        _ => {
+            let (_, code) = close_after_heartbeats(&mut ws, true).await;
+            assert_eq!(code, Some(4003));
+        }
+    }
+    let (_, mut ws) = env.connected(10).await;
+    assert_eq!(
+        texts(&mut ws, 2).await,
+        first,
+        "the same text in the same order"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn outbox_c5_the_events_come_again_after_a_reset() {
+    the_events_come_again_after("reset").await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn outbox_c5_the_events_come_again_after_the_peer_closes() {
+    the_events_come_again_after("peer close").await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn outbox_c5_the_events_come_again_after_the_idle_close() {
+    the_events_come_again_after("idle").await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn outbox_c5_the_events_come_again_after_a_replaced_close() {
+    the_events_come_again_after("replaced").await;
+}
+
+/// C6: an acknowledgement that covers events this connection has not sent yet skips them.
+#[tokio::test(start_paused = true)]
+async fn outbox_c6_an_ack_covering_events_not_yet_sent_skips_them() {
+    let mut env = Env::new();
+    for _ in 0..5 {
+        env.append("running").await;
+    }
+    let (_, mut ws) = env.upgraded().await;
+    // Both are read before the outbox arm is polled.
+    send(&mut ws, &hello(60)).await;
+    send(&mut ws, &ack(4)).await;
+    assert_eq!(events(&mut ws, 1).await, [5]);
+    env.append("completed").await;
+    assert_eq!(events(&mut ws, 1).await, [6], "sending goes on at n + 1");
+}
+
+/// C7: an acknowledgement at or below the acknowledged number changes nothing and is a frame.
+#[tokio::test(start_paused = true)]
+async fn outbox_c7_an_old_ack_is_ignored_and_counts_as_a_frame() {
+    let mut env = Env::new();
+    env.append("received").await;
+    env.append("running").await;
+    let (hello_at, mut ws) = env.connected(10).await;
+    assert_eq!(events(&mut ws, 2).await, [1, 2]);
+    send(&mut ws, &ack(2)).await;
+    assert_after(hello_at, heartbeat(&mut ws).await, 10, "tick");
+    assert_after(hello_at, heartbeat(&mut ws).await, 20, "tick");
+    until(hello_at + secs(25)).await;
+    send(&mut ws, &ack(1)).await;
+    send(&mut ws, &ack(2)).await;
+    for tick in [30, 40, 50] {
+        assert_after(hello_at, heartbeat(&mut ws).await, tick, "tick");
+    }
+    let at = close_of(&mut ws, 4003, true).await;
+    assert_after(hello_at, at, 55, "idle from the old ack");
+}
+
+/// C8: an acknowledgement above the highest number assigned closes with 1002 and drops nothing.
+#[tokio::test(start_paused = true)]
+async fn outbox_c8_an_ack_above_the_highest_number_closes_with_1002_and_drops_nothing() {
+    let mut env = Env::new();
+    env.append("received").await;
+    env.append("running").await;
+    let (_, mut ws) = env.connected(60).await;
+    assert_eq!(events(&mut ws, 2).await, [1, 2]);
+    send(&mut ws, &ack(3)).await;
+    close_of(&mut ws, 1002, true).await;
+    env.wait_phase(Phase::Waiting).await;
+    assert_eq!(env.log.warns("event-ack"), 1);
+    let (_, mut ws) = env.connected(60).await;
+    assert_eq!(events(&mut ws, 2).await, [1, 2], "nothing was dropped");
+}
+
+/// C9: a backlog is sent at most 64 past the acknowledged number, while heartbeats keep their
+/// ticks and reads go on.
+#[tokio::test(start_paused = true)]
+async fn outbox_c9_a_backlog_is_sent_within_the_window_and_heartbeats_keep_their_ticks() {
+    let mut env = Env::new();
+    for _ in 0..200 {
+        env.append("running").await;
+    }
+    let (hello_at, mut ws) = env.connected(10).await;
+    let first = events(&mut ws, 64).await;
+    assert_eq!(first, (1..=64).collect::<Vec<_>>());
+    assert_after(
+        hello_at,
+        heartbeat(&mut ws).await,
+        10,
+        "tick: no 65th event came",
+    );
+    send(&mut ws, &ack(10)).await;
+    assert_eq!(events(&mut ws, 10).await, (65..=74).collect::<Vec<_>>());
+    quiet(&mut ws, 1).await;
+    send(&mut ws, &ack(100)).await;
+    // 75 to 100 were acknowledged unsent (C6), so the window of 64 past 100 holds 101 to 164.
+    assert_eq!(events(&mut ws, 64).await, (101..=164).collect::<Vec<_>>());
+    send(&mut ws, &ack(150)).await;
+    assert_eq!(events(&mut ws, 36).await, (165..=200).collect::<Vec<_>>());
+    assert_after(hello_at, heartbeat(&mut ws).await, 20, "tick");
+}
+
+/// C10: an event write that fails or stalls drops the connection and the event stays.
+async fn an_event_write_goes_wrong(stall: bool) {
+    let mut env = Env::new();
+    let (_, ws) = env.connected(60).await;
+    let flag = if stall {
+        &env.dial.flags.stall_write
+    } else {
+        &env.dial.flags.fail_write
+    };
+    flag.store(true, Ordering::SeqCst);
+    let at = Instant::now();
+    env.append("received").await;
+    env.wait_phase(Phase::Waiting).await;
+    assert_after(
+        at,
+        Instant::now(),
+        if stall { 10 } else { 0 },
+        "the write bound",
+    );
+    assert!(env.log.contains("write"), "dropped as a write");
+    flag.store(false, Ordering::SeqCst);
+    drop(ws);
+    let (_, mut ws) = env.connected(60).await;
+    assert_eq!(events(&mut ws, 1).await, [1], "the event stayed");
+}
+
+#[tokio::test(start_paused = true)]
+async fn outbox_c10_an_event_write_that_fails_drops_the_connection_and_the_event_stays() {
+    an_event_write_goes_wrong(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn outbox_c10_an_event_write_that_stalls_drops_the_connection_and_the_event_stays() {
+    an_event_write_goes_wrong(true).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn outbox_c10_a_stop_during_a_stalled_event_write_drops_without_a_close() {
+    let mut env = Env::new();
+    let (_, mut ws) = env.connected(60).await;
+    env.dial.flags.stall_write.store(true, Ordering::SeqCst);
+    env.append("received").await;
+    tokio::time::sleep(secs(2)).await;
+    let at = Instant::now();
+    env.handle.stop();
+    tokio::time::timeout(DEADLINE, env.handle.stopped())
+        .await
+        .expect("the stop waited for the stalled write");
+    assert_after(at, Instant::now(), 0, "no waiting");
+    env.dial.flags.stall_write.store(false, Ordering::SeqCst);
+    assert_eq!(got(&mut ws).await.1, Got::Eof, "no Close");
+    env.restart().await;
+    let (_, mut ws) = env.connected(60).await;
+    assert_eq!(events(&mut ws, 1).await, [1], "the event stayed");
+}
+
+/// C11: a stop with events pending sends Close 1001; a new session on the same directory sends
+/// all of them again.
+#[tokio::test(start_paused = true)]
+async fn outbox_c11_a_stop_with_events_pending_closes_with_1001_and_the_next_session_sends_them() {
+    let mut env = Env::new();
+    for state in ["received", "running", "completed"] {
+        env.append(state).await;
+    }
+    let (_, mut ws) = env.connected(60).await;
+    let first = texts(&mut ws, 3).await;
+    env.handle.stop();
+    close_of(&mut ws, 1001, true).await;
+    env.restart().await;
+    let (_, mut ws) = env.connected(60).await;
+    assert_eq!(texts(&mut ws, 3).await, first);
+}
+
+/// C12: a verified command goes to the intake, its `received` event is durable, then `commandAck`
+/// is written, then the event is sent with its number.
+#[tokio::test(start_paused = true)]
+async fn outbox_c12_a_verified_command_is_recorded_before_it_is_acknowledged() {
+    let mut env = Env::new();
+    let (_, mut ws) = env.connected(60).await;
+    send(&mut ws, &verified(&env, "cmd-1")).await;
+    let (_, answered) = answer(&mut ws).await;
+    assert_eq!(
+        answered,
+        serde_json::json!({"type": "commandAck", "commandId": "cmd-1"})
+    );
+    // The event is in the file by the time the ack is read, and the intake has the job.
+    let file = std::fs::read(
+        env.fx
+            .dir
+            .path()
+            .join("outbox")
+            .join(format!("{AGENT_ID}.outbox")),
+    )
+    .unwrap();
+    assert!(
+        file.windows(10).any(|w| w == b"\"received\""),
+        "the event is durable"
+    );
+    assert_eq!(env.intake.0.lock().unwrap().len(), 1);
+    let (_, seq, state) = event(&mut ws).await;
+    assert_eq!((seq, state.as_str()), (1, "received"));
+    send(&mut ws, &ack(1)).await;
+    assert_eq!(env.counts(), (1, 0));
+}
+
+/// The event is a `jobState` event of the job, in the exact form.
+#[tokio::test(start_paused = true)]
+async fn outbox_c12_the_received_event_is_a_job_state_event_of_the_job() {
+    let mut env = Env::new();
+    let (_, mut ws) = env.connected(60).await;
+    send(&mut ws, &verified(&env, "cmd-1")).await;
+    let _ = answer(&mut ws).await;
+    let (_, message) = got(&mut ws).await;
+    let Got::Text(text) = message else {
+        panic!("{message:?}")
+    };
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+        received_of(1)
+    );
+    AgentMessage::decode(&text).unwrap();
+}
+
+/// C13: a `received` append whose write fails withholds the ack and closes the connection with
+/// 1011 (the session reopens the outbox before the next one); it warns once and counts nothing.
+#[tokio::test(start_paused = true)]
+async fn outbox_c13_a_failed_append_withholds_the_ack_and_closes_with_1011() {
+    let fail = Arc::new(AtomicBool::new(false));
+    let probe_flag = fail.clone();
+    let mut env = Env::with(Opts {
+        probe: Some(Box::new(move |step| {
+            if step == crate::outbox::Step::BeforeWrite && probe_flag.load(Ordering::SeqCst) {
+                return Err(io::Error::other("a scripted write failure"));
+            }
+            Ok(())
+        })),
+        ..Opts::default()
+    });
+    let (_, mut ws) = env.connected(60).await;
+    fail.store(true, Ordering::SeqCst);
+    send(&mut ws, &verified(&env, "a")).await;
+    // No ack: the close is the next thing the agent writes.
+    close_of(&mut ws, 1011, true).await;
+    assert_eq!(env.counts(), (0, 0));
+    assert_eq!(
+        env.intake.0.lock().unwrap().len(),
+        1,
+        "handed over before the append"
+    );
+    assert_eq!(env.log.warns("outbox-write"), 1);
+    assert!(!env.log.contains("commandId"));
+}
+
+/// A write failure on the `received` append ends the connection; the next one reopens the
+/// outbox, the redelivered command is recorded and acknowledged, and the event is sent.
+#[tokio::test(start_paused = true)]
+async fn outbox_reopen_a_write_failure_closes_with_1011_and_the_next_connection_reopens() {
+    let fail = Arc::new(AtomicBool::new(false));
+    let probe_flag = fail.clone();
+    let mut env = Env::with(Opts {
+        probe: Some(Box::new(move |step| {
+            if step == crate::outbox::Step::BeforeWrite && probe_flag.load(Ordering::SeqCst) {
+                return Err(io::Error::other("a scripted write failure"));
+            }
+            Ok(())
+        })),
+        ..Opts::default()
+    });
+    let (_, mut ws) = env.connected(60).await;
+    fail.store(true, Ordering::SeqCst);
+    send(&mut ws, &verified(&env, "a")).await;
+    close_of(&mut ws, 1011, true).await;
+    assert!(env.outbox().is_poisoned_for_test().await);
+    fail.store(false, Ordering::SeqCst);
+    let (_, mut ws) = env.connected(60).await;
+    assert!(!env.outbox().is_poisoned_for_test().await, "reopened");
+    send(&mut ws, &verified(&env, "a")).await;
+    let (_, answered) = answer(&mut ws).await;
+    assert_eq!(answered["type"], "commandAck");
+    let (_, seq, state) = event(&mut ws).await;
+    assert_eq!((seq, state.as_str()), (1, "received"));
+    assert_eq!(env.counts(), (1, 0));
+}
+
+/// An acknowledgement whose rewrite poisons the outbox (the sync after the rename fails) closes the
+/// connection with 1011, and the next connection reopens it: appends work again.
+#[tokio::test(start_paused = true)]
+async fn outbox_reopen_an_acknowledgement_that_poisons_closes_with_1011() {
+    let fail = Arc::new(AtomicBool::new(false));
+    let probe_flag = fail.clone();
+    let mut env = Env::with(Opts {
+        probe: Some(Box::new(move |step| {
+            if step == crate::outbox::Step::AfterRename && probe_flag.load(Ordering::SeqCst) {
+                return Err(io::Error::other("a scripted sync failure"));
+            }
+            Ok(())
+        })),
+        ..Opts::default()
+    });
+    env.outbox()
+        .append(Kind::Other, big_event_text)
+        .await
+        .unwrap();
+    let (_, mut ws) = env.connected(60).await;
+    assert_eq!(events(&mut ws, 1).await, [1]);
+    fail.store(true, Ordering::SeqCst);
+    // Nothing is pending after it: the rewrite is due, renames and fails its sync.
+    send(&mut ws, &ack(1)).await;
+    close_of(&mut ws, 1011, true).await;
+    assert!(env.outbox().is_poisoned_for_test().await);
+    fail.store(false, Ordering::SeqCst);
+    let (_, mut ws) = env.connected(60).await;
+    assert!(!env.outbox().is_poisoned_for_test().await, "reopened");
+    send(&mut ws, &verified(&env, "a")).await;
+    let (_, answered) = answer(&mut ws).await;
+    assert_eq!(answered["type"], "commandAck");
+    assert_eq!(events(&mut ws, 1).await, [2]);
+}
+
+/// A reopen that fails with an I/O error keeps the session reconnecting: a command that finds the
+/// outbox still poisoned closes the connection with 1011, and once the fault clears the next
+/// connection reopens it and the command is acknowledged.
+#[tokio::test(start_paused = true)]
+async fn outbox_reopen_an_io_failure_keeps_the_session_reconnecting_until_it_clears() {
+    let write_fails = Arc::new(AtomicBool::new(false));
+    let open_fails = Arc::new(AtomicBool::new(false));
+    let (write_flag, open_flag) = (write_fails.clone(), open_fails.clone());
+    let mut env = Env::with(Opts {
+        probe: Some(Box::new(move |step| {
+            let failing = match step {
+                crate::outbox::Step::BeforeWrite => write_flag.load(Ordering::SeqCst),
+                crate::outbox::Step::AfterRename => open_flag.load(Ordering::SeqCst),
+                _ => false,
+            };
+            if failing {
+                return Err(io::Error::other("a scripted failure"));
+            }
+            Ok(())
+        })),
+        ..Opts::default()
+    });
+    let (_, mut ws) = env.connected(60).await;
+    write_fails.store(true, Ordering::SeqCst);
+    open_fails.store(true, Ordering::SeqCst);
+    send(&mut ws, &verified(&env, "a")).await;
+    close_of(&mut ws, 1011, true).await;
+    // The reopen fails before this connection: the command finds the outbox poisoned.
+    let (_, mut ws) = env.connected(60).await;
+    send(&mut ws, &verified(&env, "a")).await;
+    close_of(&mut ws, 1011, true).await;
+    assert_eq!(env.counts(), (0, 0));
+    assert!(env.log.warns("outbox-reopen") >= 1);
+    assert_eq!(env.log.warns("outbox-poisoned"), 1);
+    write_fails.store(false, Ordering::SeqCst);
+    open_fails.store(false, Ordering::SeqCst);
+    let (_, mut ws) = env.connected(60).await;
+    send(&mut ws, &verified(&env, "a")).await;
+    let (_, answered) = answer(&mut ws).await;
+    assert_eq!(answered["type"], "commandAck");
+    assert_eq!(events(&mut ws, 1).await, [1]);
+    assert_eq!(env.counts(), (1, 0));
+}
+
+/// A reopen that finds the file corrupt ends the session as a local fact: no more connections,
+/// and the handle says why (`ngr-agent connect` exits 1).
+#[tokio::test(start_paused = true)]
+async fn outbox_reopen_a_corrupt_file_ends_the_session() {
+    let fail = Arc::new(AtomicBool::new(false));
+    let probe_flag = fail.clone();
+    let mut env = Env::with(Opts {
+        probe: Some(Box::new(move |step| {
+            if step == crate::outbox::Step::BeforeWrite && probe_flag.load(Ordering::SeqCst) {
+                return Err(io::Error::other("a scripted write failure"));
+            }
+            Ok(())
+        })),
+        ..Opts::default()
+    });
+    let (_, mut ws) = env.connected(60).await;
+    fail.store(true, Ordering::SeqCst);
+    send(&mut ws, &verified(&env, "a")).await;
+    close_of(&mut ws, 1011, true).await;
+    // The agent waits out its delay before it reopens, so this lands first.
+    let path = env
+        .fx
+        .dir
+        .path()
+        .join("outbox")
+        .join(format!("{AGENT_ID}.outbox"));
+    std::fs::write(path, b"not an outbox").unwrap();
+    tokio::time::timeout(DEADLINE, env.handle.stopped())
+        .await
+        .expect("the session ended by itself");
+    assert_eq!(env.handle.ended(), Some(Ended::OutboxUnusable));
+    assert_eq!(env.status().phase, Phase::Stopped);
+    assert!(env.conns.try_recv().is_err(), "no connection was made");
+}
+
+#[tokio::test(start_paused = true)]
+async fn outbox_c13_a_full_outbox_withholds_the_ack() {
+    let mut env = Env::new();
+    // 65 events of about 129 KB pass 8 MiB, above which a `received` event is refused.
+    for _ in 0..65 {
+        env.outbox()
+            .append(Kind::Other, big_event_text)
+            .await
+            .unwrap();
+    }
+    let (hello_at, mut ws) = env.connected(60).await;
+    for _ in 0..64 {
+        let _ = got(&mut ws).await;
+    }
+    send(&mut ws, &verified(&env, "a")).await;
+    send(&mut ws, &verified(&env, "b")).await;
+    assert_after(hello_at, heartbeat(&mut ws).await, 60, "tick");
+    assert_eq!(env.counts(), (0, 0));
+    assert_eq!(env.log.warns("outbox-full"), 1);
+}
+
+/// C14: the same job delivered twice is recorded twice (until the intake is idempotent).
+#[tokio::test(start_paused = true)]
+async fn outbox_c14_the_same_job_delivered_twice_gets_a_second_received_event() {
+    let mut env = Env::new();
+    let (_, mut ws) = env.connected(60).await;
+    send(&mut ws, &verified(&env, "first")).await;
+    let _ = answer(&mut ws).await;
+    assert_eq!(events(&mut ws, 1).await, [1]);
+    send(&mut ws, &verified(&env, "second")).await;
+    let _ = answer(&mut ws).await;
+    assert_eq!(events(&mut ws, 1).await, [2]);
+}
+
+/// C15: a refused command is answered and records nothing.
+#[tokio::test(start_paused = true)]
+async fn outbox_c15_a_refused_command_is_rejected_and_has_no_event() {
+    let mut env = Env::new();
+    let (hello_at, mut ws) = env.connected(60).await;
+    send(
+        &mut ws,
+        &signed_command(&env.fx, "bad", AGENT_ID, Tamper::ForeignKey).text,
+    )
+    .await;
+    let (_, rejected) = answer(&mut ws).await;
+    assert_eq!(rejected["type"], "commandRejected");
+    assert_after(
+        hello_at,
+        heartbeat(&mut ws).await,
+        60,
+        "tick: no event came",
+    );
+    assert_eq!(env.counts(), (0, 1));
+}
+
+/// C16: a stop during the blocking append ends as a stop, writes no ack and leaves a valid file.
+#[tokio::test(start_paused = true)]
+async fn outbox_c16_a_stop_during_the_append_ends_as_a_stop_and_the_file_stays_valid() {
+    let hold = Arc::new(AtomicBool::new(false));
+    let entered = Arc::new(AtomicBool::new(false));
+    let (probe_hold, probe_entered) = (hold.clone(), entered.clone());
+    let mut env = Env::with(Opts {
+        probe: Some(Box::new(move |step| {
+            if step == crate::outbox::Step::BeforeWrite && probe_hold.load(Ordering::SeqCst) {
+                probe_entered.store(true, Ordering::SeqCst);
+                while probe_hold.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            Ok(())
+        })),
+        ..Opts::default()
+    });
+    let (_, mut ws) = env.connected(60).await;
+    hold.store(true, Ordering::SeqCst);
+    send(&mut ws, &verified(&env, "a")).await;
+    while !entered.load(Ordering::SeqCst) {
+        tokio::task::yield_now().await;
+    }
+    env.handle.stop();
+    // The Close comes while the append is still held: the stop did not wait for it. (A paused
+    // clock does not advance while a blocking task runs, so the Close is read first.)
+    close_of(&mut ws, 1001, true).await;
+    env.handle.stopped().await;
+    assert_eq!(got(&mut ws).await.1, Got::Eof, "no ack");
+    assert_eq!(env.counts(), (0, 0));
+    // The append finishes on its own and the file reads back with the event in it.
+    env.outbox = None;
+    hold.store(false, Ordering::SeqCst);
+    let dir = env.fx.dir.path().join("outbox");
+    let outbox = loop {
+        match Outbox::open_in(&dir, AGENT_ID) {
+            Err(crate::outbox::OutboxError::InUse) => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            other => break other.unwrap(),
+        }
+    };
+    assert_eq!(outbox.pending().count(), 1);
+}
+
+/// C17: events flowing do not keep a silent server's connection alive.
+#[tokio::test(start_paused = true)]
+async fn outbox_c17_events_flowing_do_not_defer_the_idle_close() {
+    let mut env = Env::new();
+    let (hello_at, mut ws) = env.connected(10).await;
+    let mut seen = 0;
+    for at in [5, 15, 25] {
+        until(hello_at + secs(at)).await;
+        env.append("running").await;
+        let (sent, seq, _) = event(&mut ws).await;
+        seen += 1;
+        assert_eq!(seq, seen);
+        assert_after(hello_at, sent, at, "sent when appended");
+        // The heartbeat between them comes on its tick.
+        if at < 25 {
+            let tick = heartbeat(&mut ws).await;
+            assert_after(hello_at, tick, at + 5, "tick");
+        }
+    }
+    let (at, code) = close_after_heartbeats(&mut ws, true).await;
+    assert_eq!(code, Some(4003));
+    assert_after(hello_at, at, 30, "three intervals of silence");
+}
+
+/// C18: a server that never acknowledges (today's) leaves the events to be sent again at every
+/// connection, and commands are acknowledged all the same.
+#[tokio::test(start_paused = true)]
+async fn outbox_c18_a_server_that_never_acks_events_gets_them_again_and_commands_are_acked() {
+    let mut env = Env::new();
+    let (_, mut ws) = env.connected(60).await;
+    send(&mut ws, &verified(&env, "one")).await;
+    assert_eq!(answer(&mut ws).await.1["type"], "commandAck");
+    let first = texts(&mut ws, 1).await;
+    drop(ws);
+    let (_, mut ws) = env.connected(60).await;
+    assert_eq!(texts(&mut ws, 1).await, first, "sent again");
+    send(&mut ws, &verified(&env, "two")).await;
+    assert_eq!(answer(&mut ws).await.1["type"], "commandAck");
+    assert_eq!(events(&mut ws, 1).await, [2]);
+    assert_eq!(env.counts(), (2, 0));
+}
+
+/// Acknowledgements that follow a failed rewrite do not try it again during the pause, so the
+/// owed rewrite is tried once per pause and not once per acknowledgement.
+#[tokio::test(start_paused = true)]
+async fn an_owed_rewrite_is_tried_once_per_pause() {
+    let fail = Arc::new(AtomicBool::new(false));
+    let probe_flag = fail.clone();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let probe_attempts = attempts.clone();
+    let mut env = Env::with(Opts {
+        probe: Some(Box::new(move |step| {
+            if step == crate::outbox::Step::BeforeRename && probe_flag.load(Ordering::SeqCst) {
+                probe_attempts.fetch_add(1, Ordering::SeqCst);
+                return Err(io::Error::other("a scripted rename failure"));
+            }
+            Ok(())
+        })),
+        ..Opts::default()
+    });
+    for _ in 0..3 {
+        env.append("running").await;
+    }
+    let (hello_at, mut ws) = env.connected(30).await;
+    assert_eq!(events(&mut ws, 3).await, [1, 2, 3]);
+    fail.store(true, Ordering::SeqCst);
+    send(&mut ws, &ack(3)).await;
+    until(hello_at + secs(1)).await;
+    for _ in 0..4 {
+        send(&mut ws, &ack(3)).await;
+    }
+    assert_after(hello_at, heartbeat(&mut ws).await, 30, "tick");
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "the others did not try it"
+    );
+    until(hello_at + secs(35)).await;
+    send(&mut ws, &ack(3)).await;
+    assert_after(hello_at, heartbeat(&mut ws).await, 60, "tick");
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        2,
+        "once the pause was over"
+    );
+    fail.store(false, Ordering::SeqCst);
+    until(hello_at + secs(65)).await;
+    send(&mut ws, &ack(3)).await;
+    assert_after(hello_at, heartbeat(&mut ws).await, 90, "tick");
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    // The rewrite worked: a restart finds nothing pending.
+    env.restart().await;
+    let (_, mut ws) = env.connected(30).await;
+    quiet(&mut ws, 5).await;
+}
+
+/// An acknowledgement taken during the pause after a failed rewrite moves the window at once,
+/// also when it covers events this connection has not sent: the server only heartbeats, and
+/// every event after the acknowledged one still comes.
+#[tokio::test(start_paused = true)]
+async fn an_acknowledgement_during_the_pause_moves_the_window() {
+    let fail = Arc::new(AtomicBool::new(false));
+    let probe_flag = fail.clone();
+    let mut env = Env::with(Opts {
+        probe: Some(Box::new(move |step| {
+            if step == crate::outbox::Step::BeforeRename && probe_flag.load(Ordering::SeqCst) {
+                return Err(io::Error::other("a scripted rename failure"));
+            }
+            Ok(())
+        })),
+        ..Opts::default()
+    });
+    for _ in 0..100 {
+        env.outbox()
+            .append(Kind::Other, big_event_text)
+            .await
+            .unwrap();
+    }
+    let (_, mut ws) = env.connected(30).await;
+    for seq in 1..=64 {
+        let (_, m) = got(&mut ws).await;
+        let Got::Text(text) = m else { panic!("{m:?}") };
+        assert!(text.contains(&format!(r#""seq":{seq}"#)), "{text}");
+    }
+    fail.store(true, Ordering::SeqCst);
+    // Event 1 is over 64 KiB: the rewrite is due, fails and starts the pause.
+    send(&mut ws, &ack(1)).await;
+    let (_, m) = got(&mut ws).await;
+    let Got::Text(text) = m else { panic!("{m:?}") };
+    assert!(text.contains(r#""seq":65"#), "{text}");
+    // During the pause, an acknowledgement past what was sent: 66 to 70 are skipped.
+    send(&mut ws, &ack(70)).await;
+    let mut seqs = Vec::new();
+    let collect = async {
+        while seqs.len() < 30 {
+            send(&mut ws, r#"{"type":"heartbeat"}"#).await;
+            loop {
+                let (_, m) = got(&mut ws).await;
+                match m {
+                    Got::Text(text) if text.contains("agentEvent") => {
+                        let start = text.find(r#""seq":"#).unwrap() + 6;
+                        let digits: String = text[start..]
+                            .chars()
+                            .take_while(char::is_ascii_digit)
+                            .collect();
+                        seqs.push(digits.parse::<u64>().unwrap());
+                        if seqs.len() == 30 {
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+        }
+    };
+    // Without the fix the window stays shut and only heartbeats come.
+    tokio::time::timeout(secs(300), collect)
+        .await
+        .expect("every event after the acknowledged one comes");
+    assert_eq!(seqs, (71..=100).collect::<Vec<_>>());
+}
+
+// ---------------------------------------------------------------------------------------------
 // R1: real loopback, real time
 
 /// A key of the agent's kind, and the record that names it, in a fresh state directory.
@@ -3389,7 +4364,7 @@ async fn r1_over_real_loopback_an_exchange_an_upgrade_a_heartbeat_and_a_stop() {
     let handle = fx
         .open()
         .unwrap()
-        .start(agent, Arc::new(LogIntake))
+        .start(agent, Arc::new(LogIntake), open_outbox(&fx, None))
         .unwrap();
     tokio::time::timeout(secs(30), async {
         let (mut stream, _) = listener.accept().await.unwrap();
@@ -3440,7 +4415,7 @@ async fn r1_over_real_loopback_a_refused_connection_and_then_the_server_appears(
     let handle = fx
         .open()
         .unwrap()
-        .start(agent, Arc::new(LogIntake))
+        .start(agent, Arc::new(LogIntake), open_outbox(&fx, None))
         .unwrap();
     tokio::time::timeout(secs(30), async {
         // The first attempt is refused: the loop waits.

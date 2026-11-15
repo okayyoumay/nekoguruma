@@ -4,25 +4,42 @@
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
-/// A problem response with no `code`.
+/// A problem response, with a `code` when the client has to tell the case from others of the
+/// same status.
 pub struct Problem {
     status: StatusCode,
     title: &'static str,
+    code: Option<&'static str>,
 }
 
 impl Problem {
     pub fn new(status: StatusCode, title: &'static str) -> Problem {
-        Problem { status, title }
+        Problem {
+            status,
+            title,
+            code: None,
+        }
+    }
+
+    pub fn with_code(status: StatusCode, title: &'static str, code: &'static str) -> Problem {
+        Problem {
+            status,
+            title,
+            code: Some(code),
+        }
     }
 }
 
 impl IntoResponse for Problem {
     fn into_response(self) -> Response {
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "type": "about:blank",
             "title": self.title,
             "status": self.status.as_u16(),
         });
+        if let Some(code) = self.code {
+            body["code"] = code.into();
+        }
         let mut response = (self.status, body.to_string()).into_response();
         let headers = response.headers_mut();
         headers.insert(

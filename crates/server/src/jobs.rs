@@ -127,6 +127,15 @@ impl Kind {
             Kind::WriteSettings => "gracePeriod",
         }
     }
+
+    /// How long the job may hold its vehicle's lock after its start deadline (design 8.8): the
+    /// run allowance of the kind. Each kind that this route learns to create adds its arm here.
+    fn lock_secs(self) -> u64 {
+        match self {
+            Kind::Acquire => 600,
+            Kind::WriteSettings => 1800,
+        }
+    }
 }
 
 /// A request that passed the shape rules, normalized: the digests are sorted and unique.
@@ -509,14 +518,16 @@ fn authorize(facts: Facts) -> Result<(), Denial> {
 // The route
 
 /// The log gates of one router: one per refusal reason, one for an instruction key that is not
-/// the active one, and one each for the unavailable (503) and the internal (500) failure.
+/// the active one, one each for the unavailable (503) and the internal (500) failure, and one
+/// for a refusal because the vehicle is locked (409).
 struct Gates {
-    slots: [Mutex<Option<Instant>>; 7],
+    slots: [Mutex<Option<Instant>>; 8],
 }
 
 const SLOT_KEY_INACTIVE: usize = 4;
 const SLOT_UNAVAILABLE: usize = 5;
 const SLOT_INTERNAL: usize = 6;
+const SLOT_LOCKED: usize = 7;
 
 impl Gates {
     fn allow(&self, slot: usize, now: Instant) -> bool {
@@ -555,6 +566,8 @@ enum Outcome {
     Denied(Denial),
     /// The process's key is not the active row of `instruction_keys`.
     KeyNotActive,
+    /// Another job holds the vehicle's lock (design 8.8); nothing was written.
+    VehicleLocked,
 }
 
 /// What a failed creation is.
@@ -611,6 +624,21 @@ pub async fn create(
                 );
             }
             Problem::new(StatusCode::FORBIDDEN, "Not permitted to create this job").into_response()
+        }
+        Ok(Outcome::VehicleLocked) => {
+            // The refusal is logged without the VIN or the holder.
+            if inner.gates.allow(SLOT_LOCKED, now) {
+                tracing::info!(
+                    operator_id = %operator.operator_id,
+                    "job refused: the vehicle is locked"
+                );
+            }
+            Problem::with_code(
+                StatusCode::CONFLICT,
+                "Another job holds this vehicle",
+                "VEHICLE_LOCKED",
+            )
+            .into_response()
         }
         Ok(Outcome::KeyNotActive) => {
             if inner.gates.allow(SLOT_KEY_INACTIVE, now) {
@@ -717,6 +745,33 @@ impl Inner {
         .fetch_optional(&mut *tx)
         .await?;
         if let Some(row) = inserted {
+            // The vehicle's lock (design 8.8), taken by the creation that won the insert: a
+            // replay never reaches here. The replace condition reads only the lock row, so a
+            // concurrent take of the same VIN waits for this transaction and re-checks the row
+            // it left. A job without a VIN takes none.
+            if let Some(vin) = &spec.vin {
+                let lock_secs = spec.kind.lock_secs() as f64;
+                let taken: Option<(i32,)> = sqlx::query_as(
+                    "INSERT INTO vehicle_locks AS l (tenant_id, vin, job_id, agent_id, expires_at) \
+                     VALUES ($1::uuid, $2, $3::uuid, $4::uuid, \
+                         to_timestamp($5::bigint::float8) + make_interval(secs => $6::float8)) \
+                     ON CONFLICT (tenant_id, vin) DO UPDATE SET job_id = EXCLUDED.job_id, \
+                         agent_id = EXCLUDED.agent_id, acquired_at = now(), \
+                         expires_at = EXCLUDED.expires_at \
+                     WHERE l.expires_at <= now() RETURNING 1",
+                )
+                .bind(&operator.tenant_id)
+                .bind(vin)
+                .bind(&id)
+                .bind(&spec.agent_id)
+                .bind(instruction.start_deadline as i64)
+                .bind(lock_secs)
+                .fetch_optional(&mut *tx)
+                .await?;
+                if taken.is_none() {
+                    return Ok(Outcome::VehicleLocked);
+                }
+            }
             // Hold the agent's row and the active key's row shared until the commit, taken after
             // the insert so that an insert waiting behind another insert of the same key holds
             // neither: a revocation or a retirement then waits for this commit, or has committed
@@ -1356,5 +1411,12 @@ mod tests {
         );
         assert_eq!(Kind::Acquire.confirmation(), "notifyOnly");
         assert_eq!(Kind::WriteSettings.confirmation(), "gracePeriod");
+    }
+
+    // V1: the run allowance after the start deadline of each kind this route creates.
+    #[test]
+    fn each_kind_has_its_lock_allowance() {
+        assert_eq!(Kind::Acquire.lock_secs(), 600);
+        assert_eq!(Kind::WriteSettings.lock_secs(), 1800);
     }
 }

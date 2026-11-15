@@ -31,7 +31,7 @@ pub(crate) const PERIOD: Duration = Duration::from_millis(50);
 /// A lease no test waits for.
 pub(crate) const LONG: Duration = Duration::from_secs(600);
 pub(crate) const FRESH: &str = "received|0|false|false|||false";
-const SENT: &str = "received|1|true|false|||false";
+pub(crate) const SENT: &str = "received|1|true|false|||false";
 pub(crate) const DELIVERED: &str = "received|1|true|true|||false";
 const RETIRED: &str = "failed|0|false|false|instructionKeyRetired|the instruction was signed by a key that is no longer active|true";
 
@@ -134,7 +134,7 @@ pub(crate) async fn ack(client: &mut Client, command_id: &str) {
     .await;
 }
 
-async fn reject(client: &mut Client, command_id: &str, reason: &str) {
+pub(crate) async fn reject(client: &mut Client, command_id: &str, reason: &str) {
     answer(
         client,
         format!(r#"{{"type":"commandRejected","commandId":"{command_id}","reason":"{reason}"}}"#),
@@ -1185,7 +1185,7 @@ async fn the_inbox_is_still_read_while_a_pass_waits_for_a_lock_on_the_jobs_table
             u.w.pg
                 .scalar(
                     "SELECT count(*) FROM pg_stat_activity WHERE pid <> pg_backend_pid() \
-                 AND wait_event_type = 'Lock' AND query LIKE 'UPDATE jobs SET state%'",
+                 AND wait_event_type = 'Lock' AND query LIKE 'WITH ended AS%'",
                 )
                 .await;
         if waiting != "0" {
@@ -1235,4 +1235,180 @@ async fn start_turns_the_queue_on_and_bind_leaves_it_off() {
         .await
         .unwrap();
     assert!(!bound.job_queue_enabled());
+}
+
+// ---------------------------------------------------------------------------------------------
+// The vehicle lock's release (design 8.8): V15 and V16
+
+const LOCK_VIN: &str = "1HGCM82633A004352";
+
+/// Gives the job a VIN and makes it the holder of that VIN's lock for an hour.
+async fn hold_lock(w: &World, job: &str, vin: &str) {
+    sqlx::query("UPDATE jobs SET vin = $2 WHERE id = $1::uuid")
+        .bind(job)
+        .bind(vin)
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO vehicle_locks (tenant_id, vin, job_id, agent_id, expires_at) \
+         SELECT tenant_id, vin, id, agent_id, now() + interval '1 hour' FROM jobs \
+         WHERE id = $1::uuid",
+    )
+    .bind(job)
+    .execute(&w.pool)
+    .await
+    .unwrap();
+}
+
+/// The job IDs that hold a lock, as one line.
+async fn holders(w: &World) -> String {
+    w.sql("SELECT coalesce(string_agg(job_id::text, ',' ORDER BY job_id), '') FROM vehicle_locks")
+        .await
+}
+
+// V15: an agent's rejection ends the job and frees its lock; the queue's other ends do too.
+#[tokio::test]
+async fn a_rejection_frees_the_vehicle_lock_of_the_job_it_ends() {
+    let u = up(LONG).await;
+    let job = add_job(&u.w, &u.id, 1, b"a").await;
+    hold_lock(&u.w, &job, LOCK_VIN).await;
+    let mut client = open(u.s.addr, &token(&u).await).await;
+    let (id, _) = command(&mut client).await;
+    assert_eq!(holders(&u.w).await, job);
+    reject(&mut client, &id, "badSignature").await;
+    until_row(
+        &u.w,
+        &job,
+        "failed|1|true|false|instructionRejected|badSignature|true",
+    )
+    .await;
+    assert_eq!(holders(&u.w).await, "");
+    u.finish().await;
+}
+
+// V15: the sweep of a retired key frees the lock, and the other jobs' locks stay.
+#[tokio::test]
+async fn the_sweep_of_a_retired_key_frees_the_vehicle_lock_of_each_job_it_ends() {
+    let u = up(LONG).await;
+    let stale = add_job_with(&u.w, &u.id, 1, b"stale", &"0".repeat(64), 3600).await;
+    let fresh = add_job(&u.w, &u.id, 2, b"fresh").await;
+    hold_lock(&u.w, &stale, LOCK_VIN).await;
+    hold_lock(&u.w, &fresh, "WVWZZZ1JZXW000001").await;
+    let mut client = open(u.s.addr, &token(&u).await).await;
+    assert_eq!(command(&mut client).await.1, b"fresh");
+    until_row(&u.w, &stale, RETIRED).await;
+    assert_eq!(holders(&u.w).await, fresh);
+    u.finish().await;
+}
+
+// V15: a job whose instruction is too large to send is ended and frees its lock.
+#[tokio::test]
+async fn a_job_ended_as_too_large_frees_its_vehicle_lock() {
+    let u = up(LONG).await;
+    let big = add_job(&u.w, &u.id, 1, &vec![0u8; 200_000]).await;
+    let next = add_job(&u.w, &u.id, 2, b"next").await;
+    hold_lock(&u.w, &big, LOCK_VIN).await;
+    let mut client = open(u.s.addr, &token(&u).await).await;
+    assert_eq!(command(&mut client).await.1, b"next");
+    until_row(
+        &u.w,
+        &big,
+        "failed|0|false|false|internal|the instruction is too large to send|true",
+    )
+    .await;
+    assert_eq!(holders(&u.w).await, "");
+    until_row(&u.w, &next, SENT).await;
+    u.finish().await;
+}
+
+// V16: a job's end does not free the lock another job holds on the same VIN, and a rejection
+// that ends nothing (the job is delivered) frees nothing.
+#[tokio::test]
+async fn an_end_frees_only_the_lock_its_own_job_holds_and_a_stale_rejection_frees_nothing() {
+    let u = up(LONG).await;
+    let rejected = add_job(&u.w, &u.id, 1, b"a").await;
+    let delivered = add_job(&u.w, &u.id, 2, b"c").await;
+    let marker = add_job(&u.w, &u.id, 3, b"m").await;
+    // `rejected` shares its VIN with `marker`, which holds the lock; `delivered` holds its own.
+    sqlx::query("UPDATE jobs SET vin = $2 WHERE id = $1::uuid")
+        .bind(&rejected)
+        .bind(LOCK_VIN)
+        .execute(&u.w.pool)
+        .await
+        .unwrap();
+    hold_lock(&u.w, &marker, LOCK_VIN).await;
+    hold_lock(&u.w, &delivered, "WVWZZZ1JZXW000001").await;
+    let mut client = open(u.s.addr, &token(&u).await).await;
+    let (a_id, _) = command(&mut client).await;
+    let (c_id, _) = command(&mut client).await;
+    let (m_id, _) = command(&mut client).await;
+    for job in [&rejected, &delivered, &marker] {
+        until_row(&u.w, job, SENT).await;
+    }
+    sqlx::query("UPDATE jobs SET delivered_at = now() WHERE id = $1::uuid")
+        .bind(&delivered)
+        .execute(&u.w.pool)
+        .await
+        .unwrap();
+    reject(&mut client, &a_id, "malformed").await;
+    reject(&mut client, &c_id, "malformed").await;
+    ack(&mut client, &m_id).await;
+    until_row(&u.w, &marker, DELIVERED).await;
+    until_row(
+        &u.w,
+        &rejected,
+        "failed|1|true|false|instructionRejected|malformed|true",
+    )
+    .await;
+    assert_eq!(row(&u.w, &delivered).await, DELIVERED);
+    let mut expected = [delivered, marker];
+    expected.sort();
+    assert_eq!(holders(&u.w).await, expected.join(","));
+    u.finish().await;
+}
+
+// The sweep's count (the log line carries it): nothing ended is not logged, N ended is N.
+#[tokio::test]
+async fn the_sweep_logs_the_number_of_jobs_it_ended_and_nothing_when_it_ended_none() {
+    let (log, _guard) = capture();
+    let u = up(LONG).await;
+    let fresh = add_job(&u.w, &u.id, 1, b"fresh").await;
+    let mut client = open(u.s.addr, &token(&u).await).await;
+    assert_eq!(command(&mut client).await.1, b"fresh");
+    until_row(&u.w, &fresh, SENT).await;
+    assert!(
+        !log.text().contains("were ended"),
+        "nothing ended: {}",
+        log.text()
+    );
+    // Three stale jobs in one statement, so that one pass sees all of them.
+    let stale: Vec<String> = sqlx::query_scalar(
+        "INSERT INTO jobs (tenant_id, id, kind, agent_id, operator_id, vci_id, \
+             confirmation_level, start_deadline, signed_job, signing_key_id, idempotency_key) \
+         SELECT a.tenant_id, gen_random_uuid(), 'runSequence', a.id, o.id, 'vci', 'notifyOnly', \
+             now() + interval '1 hour', '\\x01'::bytea, $2, gen_random_uuid()::text \
+         FROM agents a JOIN operators o ON o.tenant_id = a.tenant_id, generate_series(1, 3) \
+         WHERE a.id = $1::uuid RETURNING id::text",
+    )
+    .bind(&u.id)
+    .bind("0".repeat(64))
+    .fetch_all(&u.w.pool)
+    .await
+    .unwrap();
+    assert_eq!(stale.len(), 3);
+    for job in &stale {
+        until_row(&u.w, job, RETIRED).await;
+    }
+    // The line is written in the pass, before its commit that the rows above waited for.
+    until_logged(&log, "were ended").await;
+    let ended: Vec<String> = log
+        .text()
+        .lines()
+        .filter(|l| l.contains("were ended"))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(ended.len(), 1, "{ended:?}");
+    assert!(ended[0].contains("jobs=3"), "{ended:?}");
+    u.finish().await;
 }

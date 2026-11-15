@@ -89,6 +89,15 @@ paths:
         for a job another operator created. A request whose key no job uses is permission-checked
         before anything is written.
 
+        A job that gives a `vin` takes the server's lock on that vehicle in the same transaction
+        (8.8, ADR-480): while another job of the tenant holds it, the request is **409** with the
+        `code` `VEHICLE_LOCKED`, nothing is created and the key stays free. The lock expires on
+        its own, 10 minutes (`acquire`) or 30 minutes (`writeSettings`) after the job's start
+        deadline. The server deletes it when it ends the job itself (an agent's rejection, a
+        retired instruction key, an instruction too large to send); a job that finishes on the
+        agent keeps it until it expires. A replay never takes a lock, and a job with no `vin`
+        takes none. The answer names no holder, expiry or VIN, and there is no override.
+
         Like every operator route the request needs a live session and, as a POST, the pinned
         Origin (**403**) before the cookie is read (**401**). The body is read within 5 seconds
         (**408**); a body over the limit is **413**; each of them closes the connection.
@@ -143,6 +152,11 @@ paths:
               schema: { $ref: '#/components/schemas/Problem' }
         '413':
           description: The body is over 16384 bytes; the connection is closed
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '409':
+          description: Another job holds the lock of this vehicle (`code` `VEHICLE_LOCKED`); nothing was created and the idempotency key is not used
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }

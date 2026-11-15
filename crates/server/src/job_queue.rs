@@ -153,17 +153,24 @@ FOR UPDATE OF j SKIP LOCKED";
 
 /// Ends the undelivered jobs whose key is not the active one and whose instruction is not
 /// outstanding, skipping rows another pass holds; with no active key the comparison is null and
-/// nothing is ended.
+/// nothing is ended. Each ended job releases the vehicle lock it holds, in the same statement
+/// (design 8.8); the result counts the ended jobs, as the delete's rows do not.
 const SWEEP_SQL: &str = "\
-UPDATE jobs SET state = 'failed', failure_code = 'instructionKeyRetired', \
-    failure_detail = 'the instruction was signed by a key that is no longer active', \
-    finished_at = now() \
-WHERE (tenant_id, id) IN ( \
-  SELECT tenant_id, id FROM jobs \
-  WHERE state = 'received' AND finished_at IS NULL AND delivered_at IS NULL \
-    AND (delivery_sent_at IS NULL OR delivery_sent_at < now() - make_interval(secs => $1::float8)) \
-    AND signing_key_id <> (SELECT key_id FROM instruction_keys WHERE retired_at IS NULL) \
-  FOR UPDATE SKIP LOCKED)";
+WITH ended AS ( \
+  UPDATE jobs SET state = 'failed', failure_code = 'instructionKeyRetired', \
+      failure_detail = 'the instruction was signed by a key that is no longer active', \
+      finished_at = now() \
+  WHERE (tenant_id, id) IN ( \
+    SELECT tenant_id, id FROM jobs \
+    WHERE state = 'received' AND finished_at IS NULL AND delivered_at IS NULL \
+      AND (delivery_sent_at IS NULL OR delivery_sent_at < now() - make_interval(secs => $1::float8)) \
+      AND signing_key_id <> (SELECT key_id FROM instruction_keys WHERE retired_at IS NULL) \
+    FOR UPDATE SKIP LOCKED) \
+  RETURNING tenant_id, id, vin), \
+released AS ( \
+  DELETE FROM vehicle_locks l USING ended e \
+  WHERE l.tenant_id = e.tenant_id AND l.vin = e.vin AND l.job_id = e.id) \
+SELECT count(*) FROM ended";
 
 /// The mark is the time of the statement, not of the transaction, so that the lease counts from
 /// the moment the frame was queued; it is returned, and kept in the flight as the token the
@@ -173,10 +180,15 @@ UPDATE jobs SET delivery_attempts = delivery_attempts + 1, delivery_sent_at = st
 WHERE tenant_id = $1::uuid AND id = $2::uuid \
 RETURNING delivery_sent_at::text";
 
+/// Ends the job and releases the vehicle lock it holds (design 8.8).
 const TOO_LARGE_SQL: &str = "\
-UPDATE jobs SET state = 'failed', failure_code = 'internal', \
-    failure_detail = 'the instruction is too large to send', finished_at = now() \
-WHERE tenant_id = $1::uuid AND id = $2::uuid";
+WITH ended AS ( \
+  UPDATE jobs SET state = 'failed', failure_code = 'internal', \
+      failure_detail = 'the instruction is too large to send', finished_at = now() \
+  WHERE tenant_id = $1::uuid AND id = $2::uuid \
+  RETURNING tenant_id, id, vin) \
+DELETE FROM vehicle_locks l USING ended e \
+WHERE l.tenant_id = e.tenant_id AND l.vin = e.vin AND l.job_id = e.id";
 
 /// The condition on the row's mark and attempts that the answer's writes share, with the numbers of
 /// the parameters it uses: the attempt number this delivery recorded (n + 1), the mark the row had
@@ -217,13 +229,18 @@ const DELIVERED_SQL: &str = concat!(
     mark_guard!("$3", "$4", "$5", "$6")
 );
 
-/// `$3` is the reason, `$4` the delivery's attempt number, `$5` to `$7` the tokens.
+/// `$3` is the reason, `$4` the delivery's attempt number, `$5` to `$7` the tokens. A job it ends
+/// releases the vehicle lock it holds (design 8.8); a job it does not end releases nothing.
 const REJECTED_SQL: &str = concat!(
-    "UPDATE jobs SET state = 'failed', failure_code = 'instructionRejected', failure_detail = $3, \
-         finished_at = now() \
-     WHERE tenant_id = $1::uuid AND id = $2::uuid AND state = 'received' \
-       AND finished_at IS NULL AND delivered_at IS NULL ",
-    mark_guard!("$4", "$5", "$6", "$7")
+    "WITH ended AS ( \
+       UPDATE jobs SET state = 'failed', failure_code = 'instructionRejected', \
+           failure_detail = $3, finished_at = now() \
+       WHERE tenant_id = $1::uuid AND id = $2::uuid AND state = 'received' \
+         AND finished_at IS NULL AND delivered_at IS NULL ",
+    mark_guard!("$4", "$5", "$6", "$7"),
+    " RETURNING tenant_id, id, vin) \
+     DELETE FROM vehicle_locks l USING ended e \
+     WHERE l.tenant_id = e.tenant_id AND l.vin = e.vin AND l.job_id = e.id"
 );
 
 /// Clears the mark only while it is still this delivery's (attempt number and tokens, as above).
@@ -768,11 +785,10 @@ async fn read(
 ) -> Result<(sqlx::Transaction<'static, sqlx::Postgres>, Vec<Taken>), sqlx::Error> {
     let mut tx = pool.begin().await?;
     statement_timeouts(&mut tx).await?;
-    let ended = sqlx::query(SWEEP_SQL)
+    let (ended,): (i64,) = sqlx::query_as(SWEEP_SQL)
         .bind(lease.as_secs_f64())
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
+        .fetch_one(&mut *tx)
+        .await?;
     if ended > 0 {
         tracing::info!(jobs = ended, "jobs signed by a retired key were ended");
     }

@@ -20,7 +20,7 @@ use server::job_queue::{Settings, TAKE_SQL};
 use shared_proto::ServerMessage;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::control::{Client, close_code, heartbeat, numbered_event, open, quiet_for, revoke_row};
+use crate::control::{Client, close_code, heartbeat, open, quiet_for, revoke_row};
 use crate::control::{second_agent, text, token};
 use crate::redeem::{World, capture, instruction_key, json};
 use crate::serving::Running;
@@ -30,7 +30,7 @@ use crate::support::TestPostgres;
 pub(crate) const PERIOD: Duration = Duration::from_millis(50);
 /// A lease no test waits for.
 pub(crate) const LONG: Duration = Duration::from_secs(600);
-const FRESH: &str = "received|0|false|false|||false";
+pub(crate) const FRESH: &str = "received|0|false|false|||false";
 const SENT: &str = "received|1|true|false|||false";
 pub(crate) const DELIVERED: &str = "received|1|true|true|||false";
 const RETIRED: &str = "failed|0|false|false|instructionKeyRetired|the instruction was signed by a key that is no longer active|true";
@@ -40,6 +40,7 @@ pub(crate) fn settings(lease: Duration) -> Settings {
         period: PERIOD,
         lease,
         passes: None,
+        events: None,
     }
 }
 
@@ -77,7 +78,7 @@ async fn add_job_with(
     .unwrap()
 }
 
-async fn add_job(w: &World, agent: &str, order: i64, bytes: &[u8]) -> String {
+pub(crate) async fn add_job(w: &World, agent: &str, order: i64, bytes: &[u8]) -> String {
     add_job_with(w, agent, order, bytes, &w.key.key_id(), 3600).await
 }
 
@@ -154,7 +155,7 @@ async fn second_server(u: &Up, lease: Duration) -> Running {
     Running::spawn(server)
 }
 
-async fn session_token(reply: crate::serving::Reply) -> String {
+pub(crate) async fn session_token(reply: crate::serving::Reply) -> String {
     assert_eq!(reply.status, 200, "{}", reply.head);
     json(&reply)["token"].as_str().unwrap().to_owned()
 }
@@ -581,6 +582,7 @@ async fn a_stop_while_the_queue_waits_for_its_tick_ends_it_at_once() {
         period: Duration::from_secs(3600),
         lease: LONG,
         passes: None,
+        events: None,
     };
     let u = Up::with_queue(2, Some(long_period)).await;
     let Up { w, s, .. } = u;
@@ -619,8 +621,8 @@ async fn a_failed_pass_sends_nothing_warns_once_keeps_draining_and_the_next_tick
     let mut client = open(u.s.addr, &t).await;
     // More ticks pass, the warning is not repeated, nothing is sent, and the inbox is still read:
     // more events than it holds are taken in and the heartbeat after them is echoed.
-    for seq in 0..300 {
-        client.send(numbered_event(seq)).await.unwrap();
+    for _ in 0..300 {
+        client.send(dropped_message()).await.unwrap();
     }
     heartbeat(&mut client).await;
     tokio::time::sleep(PERIOD * 4).await;
@@ -632,6 +634,12 @@ async fn a_failed_pass_sends_nothing_warns_once_keeps_draining_and_the_next_tick
     assert_eq!(command(&mut client).await.1, b"a");
     until_row(&u.w, &a, SENT).await;
     u.finish().await;
+}
+
+/// A message the queue reads and drops (a reconciliation), as a stand-in for traffic that fills
+/// the inbox; a numbered event would be stored and acknowledged now (ADR-479).
+fn dropped_message() -> Message {
+    Message::Text(r#"{"type":"reconcile","openJobs":[]}"#.into())
 }
 
 /// A row as the take returns it.
@@ -956,7 +964,7 @@ async fn refuse_answers(u: &Up) {
         .await;
 }
 
-async fn until_logged(log: &crate::redeem::Captured, what: &str) {
+pub(crate) async fn until_logged(log: &crate::redeem::Captured, what: &str) {
     let deadline = Instant::now() + Duration::from_secs(15);
     while !log.text().contains(what) {
         assert!(Instant::now() < deadline, "not logged: {what}");
@@ -1189,8 +1197,8 @@ async fn the_inbox_is_still_read_while_a_pass_waits_for_a_lock_on_the_jobs_table
     let mut client = open(u.s.addr, &t).await;
     // More events than the inbox holds, then a heartbeat: the connection keeps reading only if the
     // queue keeps taking from the inbox while it waits.
-    for seq in 0..300 {
-        client.send(numbered_event(seq)).await.unwrap();
+    for _ in 0..300 {
+        client.send(dropped_message()).await.unwrap();
     }
     tokio::time::timeout(Duration::from_secs(3), heartbeat(&mut client))
         .await

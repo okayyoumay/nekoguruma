@@ -16,6 +16,8 @@ local users (design 13.3, ADR-469).
 ADR-476).
 `migrations/0008_job_creation.sql` adds `jobs.request_hash`, replaces `jobs.ir_digest` with
 `ir_digests`, lets `jobs.kind` be `identify` and comments `jobs.id` (design 4.4, 5.1, ADR-477).
+`migrations/0009_agent_events.sql` adds `agent_events`, the agent's stored outbox events (design
+5.3, 5.4, ADR-478 item 6, ADR-479).
 
 ## How migrations are applied
 
@@ -116,6 +118,19 @@ that fails after the frame was queued leaves the row as it was before the send, 
 is the time of the mark statement; the answer's writes and a release match the row against the marks the delivery expects (the earlier value, with the earlier attempts, or its own, with one more, as a failed commit may or may not have happened). A mark that is not acknowledged is released when its connection is no longer
 current, and a mark older than the lease (90 seconds) makes the job takeable again: delivery is
 at least once, and a resend carries the same stored bytes under a new command ID.
+
+**Events are stored as the agent's exact frame text, beside a cursor**
+`agent_events` (migration 0009, ADR-479) holds one row per guaranteed event, keyed by tenant,
+agent and the outbox number `seq`, and `agent_event_cursor.last_seq` is the highest number stored.
+Both change in one transaction that first locks the cursor row (`FOR UPDATE`), so two server
+instances serve one agent in turn. `body` is the frame's text, not `jsonb`, because a repeat is
+compared with it byte for byte and `jsonb` refuses the `\u0000` escape; `kind`, `job_id` (only
+when the text is a canonical UUID; no foreign key) and `occurred_at_agent` (only when a strict
+check passes) are read out of it. `received_at` is the database's clock. The detail an event
+carries is vehicle data (design 4.3): the table is shaped for the retention pass and the VIN
+deletion, with an index on `(tenant_id, job_id)` for a job's rows and one on
+`(tenant_id, received_at)` for age. Removing rows never lowers the
+cursor, and a repeat of a removed row is acknowledged with the cursor, not stored again.
 
 **Version work records per item**
 The unit of 3-way merge (4.4) is the item, so `work_record_items.version` exists.

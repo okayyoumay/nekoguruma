@@ -10,8 +10,8 @@
 //! Each accepted socket runs as one task that [`Hub`] spawns and owns. The task stamps the
 //! agent's `last_seen_at` (ADR-468 item 11), registers with the hub, writes `hello`, reads complete
 //! messages, echoes `heartbeat`, hands every other valid message to the hub's inbox, writes the job
-//! commands the hub queued, and ends by the close table of the asyncapi file. All writes come
-//! from that one task, so the socket is not split.
+//! commands the hub queued and the `eventAck` the hub asked for (ADR-479), and ends by the close
+//! table of the asyncapi file. All writes come from that one task, so the socket is not split.
 //!
 //! Never logged: a token, or the text of a message.
 
@@ -311,6 +311,7 @@ async fn run(
         close,
         stopping,
         outbound,
+        ack,
     } = registration;
     let hello = ServerMessage::Hello {
         heartbeat_secs: DEFAULT_HEARTBEAT_SECS,
@@ -348,6 +349,26 @@ async fn run(
                     return Finish::Drop("write");
                 }
             }
+            // The acknowledgement the hub asked for: one `eventAck` with the latest number, not
+            // one per call. It is not written after a close instruction or a stop. While the
+            // task waits on a full inbox it is inside `deliver`, so this arm is not polled.
+            Ok(()) = ack.changed() => {
+                if let Ok(code) = close.try_recv() {
+                    return Finish::Close(code);
+                }
+                if *stopping.borrow() {
+                    return Finish::Close(CLOSE_CODE_GOING_AWAY);
+                }
+                let seq = *ack.borrow_and_update();
+                if seq > 0 {
+                    let Ok(frame) = (ServerMessage::EventAck { seq }).encode() else {
+                        return Finish::Drop("encode");
+                    };
+                    if !write(socket, Message::Text(frame.into())).await {
+                        return Finish::Drop("write");
+                    }
+                }
+            }
             received = socket.recv() => {
                 let message = match received {
                     None => return Finish::Drop("closed"),
@@ -362,8 +383,16 @@ async fn run(
                             }
                         }
                         Ok(message) => {
+                            // The text is kept for a numbered event, which the queue stores as
+                            // it was sent (ADR-479).
+                            let kept = matches!(
+                                &message,
+                                AgentMessage::AgentEvent(event) if event.seq.is_some()
+                            )
+                            .then(|| text.as_str().to_owned());
                             if let Some(end) =
-                                deliver(control, agent, *id, message, close, stopping).await
+                                deliver(control, agent, *id, (message, kept), close, stopping)
+                                    .await
                             {
                                 return end;
                             }
@@ -390,7 +419,7 @@ async fn deliver(
     control: &Control,
     agent: &AgentId,
     connection: ConnectionId,
-    message: AgentMessage,
+    (message, text): (AgentMessage, Option<String>),
     close: &mut oneshot::Receiver<u16>,
     stopping: &mut watch::Receiver<bool>,
 ) -> Option<Finish> {
@@ -405,6 +434,7 @@ async fn deliver(
         agent: agent.clone(),
         connection,
         message,
+        text,
     };
     let inbound = match inbox.try_send(inbound) {
         Ok(()) => return None,

@@ -6,21 +6,26 @@
 //!
 //! The agent has no job runner behind the session yet, so a verified command is acknowledged and
 //! dropped (`LogIntake`); the answers are the observable behaviour. After `commandAck` the agent
-//! sends the `received` event it recorded in its outbox (design 5.3, ADR-478); the server does not
-//! read events yet, so it acknowledges none and the agent sends them again at every connection.
+//! sends the `received` event it recorded in its outbox (design 5.3, ADR-478). A test that holds
+//! the hub's inbox itself reads those events and acknowledges none, so the agent sends them again
+//! at every connection; with the delivery queue on, the server stores each event once and
+//! acknowledges it after the commit (ADR-479), which the last test follows through a kill and a
+//! restart of the agent.
 //!
 //! A release agent has no plain-file store, so this module is compiled in debug builds only. The
 //! stop signal is SIGINT on Unix; elsewhere the child is killed and its exit status is not
 //! asserted.
 
 use std::process::{Child, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use server::config::Http;
 use server::hub::Inbound;
-use server::job_queue::Settings;
+use server::job_queue::{EventCounts, Settings};
 use server::{Hub, Server};
 use shared_proto::{
     AgentEventKind, AgentEventMessage, AgentId, AgentMessage, INSTRUCTION_VERSION,
@@ -45,6 +50,8 @@ struct Fixture {
     inbox: Option<Receiver<Inbound>>,
     env: AgentEnv,
     agent_id: String,
+    /// What the delivery queue has done with the agent's events (the queue is on).
+    counts: Arc<EventCounts>,
 }
 
 impl Fixture {
@@ -82,11 +89,13 @@ impl Fixture {
             .await
             .unwrap();
         let hub = server.hub();
+        let counts = Arc::new(EventCounts::default());
         let (server, inbox) = if queue {
             let settings = Settings {
                 period: Duration::from_millis(50),
                 lease: LIMIT,
                 passes: None,
+                events: Some(counts.clone()),
             };
             (server.with_job_queue(settings), None)
         } else {
@@ -122,6 +131,7 @@ impl Fixture {
             inbox,
             env,
             agent_id,
+            counts,
         }
     }
 
@@ -260,6 +270,61 @@ impl Fixture {
         }
     }
 
+    /// The size of the agent's outbox file, which goes back to its header alone once every event
+    /// is acknowledged (the file is rewritten without them); `None` while it cannot be read.
+    fn outbox_len(&self) -> Option<u64> {
+        let path = self
+            .env
+            .state
+            .path()
+            .join("outbox")
+            .join(format!("{}.outbox", self.agent_id));
+        std::fs::metadata(path).ok().map(|meta| meta.len())
+    }
+
+    /// Waits until the outbox file has `len` bytes: the agent has read the acknowledgement.
+    async fn until_outbox_len(&self, len: u64) {
+        let deadline = Instant::now() + LIMIT;
+        while self.outbox_len() != Some(len) {
+            assert!(
+                Instant::now() < deadline,
+                "the outbox is {:?} bytes, not {len}",
+                self.outbox_len()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The stored events: `seq:state` of the text each carries, in order, and the cursor.
+    async fn stored_events(&self) -> (Vec<String>, i64) {
+        let rows: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT seq, body FROM agent_events WHERE agent_id = $1::uuid ORDER BY seq",
+        )
+        .bind(&self.agent_id)
+        .fetch_all(&self.world.pool)
+        .await
+        .unwrap();
+        let cursor = sqlx::query_scalar(
+            "SELECT coalesce((SELECT last_seq FROM agent_event_cursor WHERE agent_id = $1::uuid), -1)",
+        )
+        .bind(&self.agent_id)
+        .fetch_one(&self.world.pool)
+        .await
+        .unwrap();
+        let shown = rows
+            .into_iter()
+            .map(|(seq, body)| {
+                let event: serde_json::Value = serde_json::from_str(&body).unwrap();
+                format!(
+                    "{seq}:{}:{}",
+                    event["jobId"].as_str().unwrap(),
+                    event["state"].as_str().unwrap()
+                )
+            })
+            .collect();
+        (shown, cursor)
+    }
+
     async fn next(&mut self) -> Inbound {
         tokio::time::timeout(
             LIMIT,
@@ -315,6 +380,14 @@ impl Agent {
         } else {
             None
         }
+    }
+
+    /// Kills the process at once (SIGKILL on Unix) and waits for it, so that it sends and writes
+    /// nothing more.
+    fn kill(&mut self) {
+        let mut child = self.child.take().unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 
     fn running(&mut self) -> bool {
@@ -501,6 +574,131 @@ async fn a_job_created_through_the_route_is_accepted_and_acknowledged_by_the_age
         .to_owned();
     f.until_job(&id, "received|||true").await;
     assert!(f.is_connected(), "{}", agent.log_text());
+    agent.stop().await;
+    f.server.take().unwrap().finish().await;
+    f.world.finish().await;
+}
+
+async fn until_count(counter: &AtomicU64, expected: u64, what: &str, agent: &Agent) {
+    let deadline = Instant::now() + LIMIT;
+    while counter.load(Ordering::Relaxed) != expected {
+        assert!(
+            Instant::now() < deadline,
+            "{what} is {}, not {expected}; the agent says:\n{}",
+            counter.load(Ordering::Relaxed),
+            agent.log_text()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The server stores the `received` events of three accepted jobs, which the real agent sends,
+/// once each, and acknowledges them (design 5.3, ADR-478 item 6, ADR-479; E24). The cursor row is
+/// held locked while the events arrive, so that all three are seen and none is stored; the agent
+/// is killed, the lock is released, and the events are stored without an acknowledgement, since
+/// their connection is gone. The restarted agent sends the three again from its outbox: each is a
+/// repeat, answered with the cursor, and nothing is doubled. A fourth job's event is stored and
+/// acknowledged (the agent's outbox file shrinks to its header again), and a further restart sends
+/// nothing, repeats nothing and is closed for nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn events_seen_while_the_cursor_is_held_are_stored_once_across_a_kill_and_a_restart_and_acknowledged()
+ {
+    const JOBS: [&str; 4] = [
+        "0194f0a2-7c3e-7d11-8a52-3f6f9b1c2d4f",
+        "0194f0a2-7c3e-7d11-8a52-3f6f9b1c2d50",
+        "0194f0a2-7c3e-7d11-8a52-3f6f9b1c2d51",
+        "0194f0a2-7c3e-7d11-8a52-3f6f9b1c2d52",
+    ];
+    let mut f = Fixture::with_queue(true).await;
+    sqlx::query(
+        "INSERT INTO agent_event_cursor (tenant_id, agent_id) \
+         SELECT tenant_id, id FROM agents WHERE id = $1::uuid",
+    )
+    .bind(&f.agent_id)
+    .execute(&f.world.pool)
+    .await
+    .unwrap();
+    let mut held = f.world.pool.begin().await.unwrap();
+    sqlx::query("SELECT last_seq FROM agent_event_cursor WHERE agent_id = $1::uuid FOR UPDATE")
+        .bind(&f.agent_id)
+        .fetch_one(&mut *held)
+        .await
+        .unwrap();
+    let mut agent = f.start_agent();
+    f.wait_connected(Some(&mut agent), true).await;
+    // The empty outbox is the file's header alone: measured before any job exists, since a job's
+    // event is appended within moments of its delivery.
+    let header = {
+        let deadline = Instant::now() + LIMIT;
+        loop {
+            if let Some(len) = f.outbox_len() {
+                break len;
+            }
+            assert!(Instant::now() < deadline, "no outbox file");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    for (order, job) in JOBS.iter().take(3).enumerate() {
+        let envelope = f.envelope(job, false).await;
+        f.add_job(job, i64::try_from(order).unwrap(), &envelope)
+            .await;
+    }
+    // The queue reads all three events, though each of its attempts to store waits on the lock
+    // and gives up; nothing is stored.
+    until_count(&f.counts.seen, 3, "the events seen", &agent).await;
+    assert_eq!(f.counts.stored.load(Ordering::Relaxed), 0);
+    assert_eq!(f.stored_events().await, (vec![], 0));
+    // The agent dies with its three events unacknowledged, and the lock is released.
+    agent.kill();
+    f.wait_connected(None, false).await;
+    held.commit().await.unwrap();
+    until_count(&f.counts.stored, 3, "the events stored", &agent).await;
+    let received = |ids: &[&str]| -> Vec<String> {
+        ids.iter()
+            .enumerate()
+            .map(|(n, job)| format!("{}:{job}:received", n + 1))
+            .collect()
+    };
+    assert_eq!(f.stored_events().await, (received(&JOBS[..3]), 3));
+    assert_eq!(f.counts.duplicates.load(Ordering::Relaxed), 0);
+    for job in &JOBS[..3] {
+        f.until_job(job, "received|||true").await;
+    }
+    // The restart sends the three again: each is a repeat, and the answer empties the outbox.
+    let mut agent = f.start_agent();
+    f.wait_connected(Some(&mut agent), true).await;
+    until_count(&f.counts.duplicates, 3, "the repeats", &agent).await;
+    f.until_outbox_len(header).await;
+    assert_eq!(f.stored_events().await, (received(&JOBS[..3]), 3));
+    // A fourth job: its event is stored as number 4 and acknowledged.
+    let envelope = f.envelope(JOBS[3], false).await;
+    f.add_job(JOBS[3], 4, &envelope).await;
+    f.until_job(JOBS[3], "received|||true").await;
+    until_count(&f.counts.stored, 4, "the events stored", &agent).await;
+    assert_eq!(f.stored_events().await, (received(&JOBS), 4));
+    f.until_outbox_len(header).await;
+    // After a stop and a restart the agent has nothing pending: no repeat, no new event, and the
+    // connection is not closed for an acknowledgement.
+    assert_eq!(agent.stop().await.unwrap_or(0), 0, "{}", agent.log_text());
+    f.wait_connected(None, false).await;
+    let mut agent = f.start_agent();
+    f.wait_connected(Some(&mut agent), true).await;
+    let connection = f.hub.connected();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        f.hub.connected(),
+        connection,
+        "the connection was not closed"
+    );
+    assert!(agent.running(), "{}", agent.log_text());
+    assert!(
+        !agent.log_text().contains("event-ack"),
+        "{}",
+        agent.log_text()
+    );
+    assert_eq!(f.counts.duplicates.load(Ordering::Relaxed), 3);
+    assert_eq!(f.counts.stored.load(Ordering::Relaxed), 4);
+    assert_eq!(f.counts.seen.load(Ordering::Relaxed), 7);
     agent.stop().await;
     f.server.take().unwrap().finish().await;
     f.world.finish().await;

@@ -1,7 +1,7 @@
 # ADR-478: The Agent Numbers Guaranteed Events in a Durable Outbox, and the Server Stores Them in Order by That Number
 
 **Date:** 2026-11-14
-**Status:** Accepted
+**Status:** Accepted (item 6 detailed by ADR-479)
 **Affects:** design 5.3, 5.4; `api/asyncapi.yaml` (`agentEvent`, `eventAck`); `crates/shared-proto` (`control`); `crates/agent` (`outbox`, `state`, `control`), `crates/agent/docs/ngr-agent.md`; the server's event storage and `db/migrations`; details ADR-466 item 10 and supersedes ADR-473 item 1
 
 ## Context

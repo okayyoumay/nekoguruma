@@ -465,9 +465,10 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-473](ADR-473-the-agent-answers-a-verified-job-command-with-an-acknowledgement-alone-until-the-outbox-numbers-events.md) | The Agent Answers a Verified Job Command With an Acknowledgement Alone Until the Outbox Numbers Events | Accepted (item 1 superseded by ADR-478 item 5) | design 5.3, `api/asyncapi.yaml`, `crates/agent`; details ADR-466 items 10 and 13, ADR-461 items 9 and 10 and ADR-471 item 5 for the agent's side |
 | [ADR-474](ADR-474-the-local-object-store-appends-by-offset-shows-only-finished-objects-and-issues-its-keys.md) | The Local Object Store Appends by Offset, Shows Only Finished Objects and Issues Its Keys | Accepted | design 13, `crates/server`, `db/README.md` |
 | [ADR-475](ADR-475-a-runs-end-is-mapped-to-the-jobs-state-by-its-error-and-its-journals-standing.md) | A Run's End Is Mapped to the Job's Reported State by Its Error and Its Journal's Standing | Accepted | design 5.6, `api/asyncapi.yaml`, `crates/agent`, `crates/shared-proto`; annotates ADR-280, ADR-288 |
-| [ADR-476](ADR-476-the-delivery-queue-takes-a-job-once-and-delivers-it-at-least-once-from-the-stored-instruction.md) | The Delivery Queue Takes a Job Once and Delivers It at Least Once, From the Stored Instruction | Accepted | design 5.3, 12, 14.1, `db/migrations`, `db/README.md`, `api/asyncapi.yaml`, `crates/server`, `crates/shared-proto`; details ADR-466 items 10 and 13, ADR-468 item 12 and ADR-472 item 4 |
+| [ADR-476](ADR-476-the-delivery-queue-takes-a-job-once-and-delivers-it-at-least-once-from-the-stored-instruction.md) | The Delivery Queue Takes a Job Once and Delivers It at Least Once, From the Stored Instruction | Accepted (item 5's dropping of `agentEvent` superseded by ADR-479) | design 5.3, 12, 14.1, `db/migrations`, `db/README.md`, `api/asyncapi.yaml`, `crates/server`, `crates/shared-proto`; details ADR-466 items 10 and 13, ADR-468 item 12 and ADR-472 item 4 |
 | [ADR-477](ADR-477-a-job-is-created-once-per-idempotency-key-with-the-key-judged-before-permission-and-the-server-making-the-id.md) | A Job Is Created Once per Idempotency Key, With the Key Judged Before Permission and the Server Making the ID | Accepted | design 4.4, 5.1, 12, `db/migrations`, `db/README.md`, `api/openapi.yaml`, `crates/server`, `crates/shared-proto`, `crates/agent`; details ADR-461 and ADR-476 |
-| [ADR-478](ADR-478-the-agent-numbers-guaranteed-events-in-a-durable-outbox-and-the-server-stores-them-in-order-by-that-number.md) | The Agent Numbers Guaranteed Events in a Durable Outbox, and the Server Stores Them in Order by That Number | Accepted | design 5.3, 5.4, `api/asyncapi.yaml`, `crates/shared-proto`, `crates/agent`, `db/migrations`; details ADR-466 item 10 and supersedes ADR-473 item 1 |
+| [ADR-478](ADR-478-the-agent-numbers-guaranteed-events-in-a-durable-outbox-and-the-server-stores-them-in-order-by-that-number.md) | The Agent Numbers Guaranteed Events in a Durable Outbox, and the Server Stores Them in Order by That Number | Accepted (item 6 detailed by ADR-479) | design 5.3, 5.4, `api/asyncapi.yaml`, `crates/shared-proto`, `crates/agent`, `db/migrations`; details ADR-466 item 10 and supersedes ADR-473 item 1 |
+| [ADR-479](ADR-479-the-server-stores-an-agents-events-in-one-transaction-per-agent-and-answers-on-the-connection-they-came-on.md) | The Server Stores an Agent's Events in One Transaction per Agent and Answers on the Connection They Came On | Accepted | design 5.3, 5.4, 14.1, `api/asyncapi.yaml`, `crates/server`, `db/migrations`, `db/README.md`; details ADR-478 item 6 and supersedes ADR-476 item 5's dropping of `agentEvent` |
 
 ## Status Legend
 
@@ -1061,6 +1062,7 @@ the predecessor repository these ADRs came from.
 - ADR-471 (item 5's job command answered through the gate, ADR-473)
 - ADR-472
 - ADR-473 (item 1 superseded by ADR-478 item 5)
-- ADR-476
+- ADR-476 (item 5's dropping of `agentEvent` superseded by ADR-479)
 - ADR-477
-- ADR-478
+- ADR-478 (item 6 detailed by ADR-479)
+- ADR-479

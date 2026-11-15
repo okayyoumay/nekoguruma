@@ -132,6 +132,22 @@ deletion, with an index on `(tenant_id, job_id)` for a job's rows and one on
 `(tenant_id, received_at)` for age. Removing rows never lowers the
 cursor, and a repeat of a removed row is acknowledged with the cursor, not stored again.
 
+**`vehicle_locks`: one holder per tenant and VIN, expiry from the job kind**
+`vehicle_locks` (design 8.8) holds at most one row per `(tenant_id, vin)`, the server's lock on a
+vehicle. `POST /api/v1/jobs` takes it for a job that names a VIN, in the transaction that inserts
+the job (ADR-480). The server sets `expires_at` to the job's start deadline plus an allowance for
+the kind (the column has no default; no migration is needed):
+
+| Kind | Allowance after the start deadline |
+|---|---|
+| `acquire` | 600 seconds |
+| `writeSettings` | 1800 seconds |
+
+A row whose `expires_at` has passed is replaced by the next take for the VIN; no sweeper deletes
+expired rows. The job's end deletes its own row (the delivery queue's ends, ADR-480). A new job
+kind that the route creates states its allowance in the same place as its confirmation level.
+The columns hold no foreign keys and a stale row keeps its VIN until a take replaces it.
+
 **Version work records per item**
 The unit of 3-way merge (4.4) is the item, so `work_record_items.version` exists.
 `origin` distinguishes auto-filled values (from the vehicle, not editable) from manual entries.

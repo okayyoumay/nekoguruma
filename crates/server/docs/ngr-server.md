@@ -462,7 +462,7 @@ ngr-server user disable --config <file> --username alice
 
 ## Creating a job
 
-`jobs.rs`; the decisions are in ADR-477.
+`jobs.rs`; the decisions are in ADR-477 and, for the vehicle lock, ADR-480.
 
 - **`POST /api/v1/jobs`, in this order, the first step that applies answers.** The guard; the
   method (405 with `Allow: POST`); the session layer of "Logging in" (403 for the Origin, 401,
@@ -496,7 +496,8 @@ ngr-server user disable --config <file> --username alice
   the commit, so a revocation or a retirement waits for it or is seen; a row gone is a rollback
   and the 403 `agent_revoked` or the 503 for a key that is not active. The commit is the 202.
   The locks come after the insert so that an insert waiting behind another insert of the key
-  holds neither row and does not block the agent's connect stamp. (e) No row means another request inserted the key first: the row is read again and
+  holds neither row and does not block the agent's connect stamp. Between the insert and these
+  locks a job that names a VIN takes the vehicle's lock (next item). (e) No row means another request inserted the key first: the row is read again and
   decided as in (a); a row that is gone again is 503. The conflict path takes no lock. Each lock wait is bounded by the 5 second `lock_timeout`
   (per wait, not per request); one past it, for example on an uncommitted insert of the same
   key, is 503.
@@ -508,10 +509,21 @@ ngr-server user disable --config <file> --username alice
   (`jobId`, `kind`, `state`, `progressPermille`, `confirmation.level`), built by one function
   from the row for a creation and a replay, which shows the current state; `Cache-Control:
   no-store`, no `Location`. The delivery queue sends the stored bytes (ADR-476).
-- **Not part of creation.** The vehicle lock and the audit record are not taken or written, and
-  the request cannot set the start deadline.
+- **The vehicle lock** (design 8.8, ADR-480). After the insert wins, a job with a VIN runs one
+  `INSERT INTO vehicle_locks ... ON CONFLICT (tenant_id, vin) DO UPDATE ... WHERE expires_at <=
+  now() RETURNING 1`. A new row, or an expired one replaced, is the take; no returned row means a
+  live lock of another job, and the transaction rolls back (no job row, the key unbound) and
+  answers 409 with a Problem whose `code` is `VEHICLE_LOCKED` and which names no holder, expiry
+  or VIN. The row's `expires_at` is the instruction's start deadline plus `Kind::lock_secs`
+  (acquire 600 s, writeSettings 1800 s). The replace condition reads only the lock row, so a
+  concurrent take of the same VIN waits for the other transaction and re-checks the row it left;
+  a wait past the 5 second lock timeout is 503. A replay answers 202 before any lock is read,
+  and a job with no VIN takes no lock. The take comes before the agent and key locks, so its wait
+  holds neither. No sweeper removes expired rows: the next take replaces them.
+- **Not part of creation.** The audit record is not written, and the request cannot set the start
+  deadline.
 - **Logging.** `job created` at info with the job and operator IDs; each refusal reason, a
-  key that is not the active one, a 503 and a 500 have their own gate, once a minute. The body,
+  key that is not the active one, a locked vehicle, a 503 and a 500 have their own gate, once a minute. The body,
   the idempotency key, the VCI ID and the VIN are never logged.
 
 ## Routes
@@ -695,6 +707,11 @@ connection with hyper's `with_upgrades()`.
   A frame over the limit (`SendError::TooLarge`) is not like a full queue or a missing connection
   (`Busy`, `NotConnected`: the job stays queued): it can never be sent, so the job is ended as `failed`
   with `internal`.
+  Every statement that ends a job here (the sweep, the too-large end, a rejection) is one
+  statement that also deletes the vehicle lock the job holds (`WITH ended AS (UPDATE ... RETURNING
+  ...) DELETE FROM vehicle_locks ... WHERE job_id = ended.id`, ADR-480), so a lock of another job
+  on the same VIN stays and a rejection that ends nothing frees nothing; the sweep counts the
+  jobs it ended, not the locks it freed.
   While a pass or a write waits for the database the task keeps reading the inbox into a buffer
   (4096 messages at most, applied by the next iteration), and an answer that could not be
   written is kept and written again on the next tick (not on every message); what was buffered during a write is applied right after it, and at the latest on the next tick. Two instances never hold one row at once; a commit that

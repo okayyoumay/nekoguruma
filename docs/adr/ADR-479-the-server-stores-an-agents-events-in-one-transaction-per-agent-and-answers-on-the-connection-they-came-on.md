@@ -100,5 +100,8 @@ acknowledged events the outbox only grew.
 - An agent whose connection the server keeps closing stays the delivery queue's target, since
   nothing marks it.
 - The queue's buffers count messages, not bytes: 4096 events of 128 KiB are held in memory.
-- A statement that fails for good (an inconsistent table) ends every round at that agent, and
-  the queue keeps trying; only a transient failure was designed for.
+- An event read before a `commandAck` in the same batch is stored after that answer is written
+  (answers first), which the later job-state work must take into account.
+- A statement that fails for good (an inconsistent table) fails every round at that agent, and
+  the queue keeps trying; the failed agent goes behind the others, so only that agent waits.
+  Only a transient failure was designed for.

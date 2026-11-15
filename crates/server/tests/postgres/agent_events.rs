@@ -139,6 +139,14 @@ async fn until_count(counter: &AtomicU64, expected: u64, what: &str) {
     }
 }
 
+async fn until_at_least(counter: &AtomicU64, expected: u64, what: &str) {
+    let deadline = Instant::now() + LIMIT;
+    while counter.load(Ordering::Relaxed) < expected {
+        assert!(Instant::now() < deadline, "{what} did not reach {expected}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 /// The rows of `agent`'s events: number and text.
 async fn rows(u: &Up, agent: &str) -> Vec<(i64, String)> {
     sqlx::query_as("SELECT seq, body FROM agent_events WHERE agent_id = $1::uuid ORDER BY seq")
@@ -192,6 +200,80 @@ async fn refuse_events(u: &Up) {
              DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION test_commit_refused()",
         )
         .await;
+}
+
+// E3 (a later round)
+#[tokio::test]
+async fn a_connection_closed_for_a_differing_repeat_has_its_later_events_dropped_in_a_later_round()
+{
+    let r = Rig::new().await;
+    let (other_id, other_token) = second_agent(&r.u).await;
+    let mut other = open(r.u.s.addr, &other_token).await;
+    let mut client = r.connect().await;
+    for seq in 1..=2 {
+        send(&mut client, &frame(seq)).await;
+    }
+    acked_up_to(&mut client, 2).await;
+    let held = hold_cursor(&r.u, &r.u.id).await;
+    // A differing 2 waits on the lock in its round; the 3 is read meanwhile and is for the next.
+    send(&mut client, &frame_of(2, JOB, "failed", "")).await;
+    until_count(&r.counts.seen, 3, "the events seen").await;
+    send(&mut client, &frame(3)).await;
+    // Time for the connection to read the 3 into the inbox before its close can come.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    held.commit().await.unwrap();
+    assert_eq!(until_closed(&mut client).await.1, 1002);
+    until_count(&r.counts.seen, 4, "the events seen").await;
+    // Something positive that is handled after the dropped 3.
+    send(&mut other, &frame(1)).await;
+    assert_eq!(read_ack(&mut other).await, 1);
+    assert_eq!(rows(&r.u, &r.u.id).await, [(1, frame(1)), (2, frame(2))]);
+    assert_eq!(cursor(&r.u, &r.u.id).await, 2);
+    assert_eq!(rows(&r.u, &other_id).await.len(), 1);
+    r.finish().await;
+}
+
+// E9 (one failing agent beside another)
+#[tokio::test]
+async fn an_agent_whose_store_keeps_failing_does_not_keep_another_agent_from_being_stored() {
+    let (log, _guard) = capture();
+    let r = Rig::new().await;
+    let (other_id, other_token) = second_agent(&r.u).await;
+    r.u.w
+        .pg
+        .execute(
+            "CREATE FUNCTION test_x_refused() RETURNS trigger LANGUAGE plpgsql \
+             AS $$ BEGIN RAISE EXCEPTION 'test: insert refused'; END $$",
+        )
+        .await;
+    // The agent's ID is a UUID the server generated: nothing a test input controls.
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE TRIGGER test_x_refused BEFORE INSERT ON agent_events FOR EACH ROW \
+         WHEN (NEW.agent_id = '{}'::uuid) EXECUTE FUNCTION test_x_refused()",
+        r.u.id
+    )))
+    .execute(&r.u.w.pool)
+    .await
+    .unwrap();
+    let mut x = r.connect().await;
+    let mut y = open(r.u.s.addr, &other_token).await;
+    send(&mut x, &frame(1)).await;
+    until_logged(&log, "could not store events").await;
+    send(&mut y, &frame(1)).await;
+    assert_eq!(read_ack(&mut y).await, 1);
+    assert_eq!(rows(&r.u, &other_id).await.len(), 1);
+    assert!(rows(&r.u, &r.u.id).await.is_empty());
+    // The failing agent is retried and still not stored; its events were kept.
+    send(&mut y, &frame(2)).await;
+    assert_eq!(read_ack(&mut y).await, 2);
+    quiet_for(&mut x, 300).await;
+    assert!(rows(&r.u, &r.u.id).await.is_empty());
+    r.u.w
+        .pg
+        .execute("DROP TRIGGER test_x_refused ON agent_events")
+        .await;
+    assert_eq!(read_ack(&mut x).await, 1);
+    r.finish().await;
 }
 
 // E1
@@ -607,11 +689,19 @@ async fn two_servers_serve_one_agent_in_turn_on_the_held_cursor_and_store_each_e
         send(client, &frame(1)).await;
         send(client, &frame(2)).await;
     }
-    until_count(&first.seen, 2, "the first server's events seen").await;
-    until_count(&second.seen, 2, "the second server's events seen").await;
+    // Each server has read the first event and waits on the lock in turn (the second one is read
+    // after that store ends); the lock is released well before the 5 s lock timeout, so the wait
+    // itself is what is tested, not the failure and the retry.
+    until_at_least(&first.seen, 1, "the first server's events seen").await;
+    until_at_least(&second.seen, 1, "the second server's events seen").await;
+    let released = Instant::now();
     held.commit().await.unwrap();
     acked_up_to(&mut c1, 2).await;
     acked_up_to(&mut c2, 2).await;
+    assert!(
+        released.elapsed() < Duration::from_secs(4),
+        "the stores waited in turn, they did not fail on the lock timeout"
+    );
     assert_eq!(rows(&u, &u.id).await.len(), 2);
     assert_eq!(cursor(&u, &u.id).await, 2);
     let stored = first.stored.load(Ordering::Relaxed) + second.stored.load(Ordering::Relaxed);

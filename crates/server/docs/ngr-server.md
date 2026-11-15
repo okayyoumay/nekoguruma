@@ -723,7 +723,11 @@ connection with hyper's `with_upgrades()`.
   are stored and not acknowledged. A failed transaction (the statements run under the 5 second
   lock and statement timeouts, so a held cursor row is a failure after 5 seconds) keeps its
   events and those of the agents not yet tried, ends the round and is tried again on the next
-  tick, with one gated warning; the kept events count with the buffered messages against the
+  tick, with one gated warning, the failed agent's events behind the others' so that only that
+  agent waits; a store failure and a failure to write answers are kept apart, so the first does
+  not delay settling an answer. A connection the queue closed with 1002 keeps its later events
+  from being stored, in later rounds too, until it leaves the hub's snapshot; the stop is checked
+  between agents. The kept events count with the buffered messages against the
   4096 bound, and past it the inbox is not read. A `jobState` event changes no job row. A failed pass sends nothing and is one gated warning (60 seconds). The task ends
   when the stop begins, in its wait and in its read.
 - **After a close.** The task leaves the registry first, then writes the Close frame, then the

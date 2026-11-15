@@ -23,8 +23,8 @@ it. Design 8.8 said the server records running jobs and warns.
    Design 8.8's server row says so.
 2. **One holder per tenant and VIN.** The table's primary key already says it; two tenants may
    hold the same VIN.
-3. **A job with no VIN takes no lock.** The server cannot name what it would lock; promoting a lock
-   when an agent later reports the VIN is later work. A job that does name a VIN is held to the
+3. **A job with no VIN takes no lock.** The server cannot name what it would lock, and nothing takes
+   a lock for it when an agent reports the VIN. A job that does name a VIN is held to the
    rule whatever its kind.
 4. **The expiry is the start deadline plus an allowance for the kind**: 600 seconds for
    acquisition and 1800 seconds for a configuration write, constants in an exhaustive `match`
@@ -55,8 +55,8 @@ it. Design 8.8 said the server records running jobs and warns.
 
 ## Consequences
 
-- Until the server also frees the lock when it is told that a job reached a terminal state
-  (the job's reported state), a job that finished on the agent holds its vehicle until its expiry.
+- The server frees a lock only at the ends the delivery queue writes, so a job that finished on
+  the agent holds its vehicle until its lock expires.
 - A job that outlives its allowance loses its lock to the next job; nothing renews it.
 - A stale row keeps a VIN, so a deletion by VIN (design 4.3, 15.2) has to cover `vehicle_locks`.
 - The lock does not cover a job with no VIN, offers no override and no view of the holder.

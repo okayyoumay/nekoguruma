@@ -11,8 +11,8 @@ number, answer a repeat with the cursor, close on a gap) and left the table, the
 meaning of a repeat whose text differs, the way the answer reaches the connection and the queue's
 handling of failures open. The delivery queue still dropped every `agentEvent` (ADR-476 item 5),
 nothing read `agent_event_cursor`, and the hub could not write an `eventAck`. The agent resends
-its whole unacknowledged outbox at every connection, so until the server stores and acknowledges
-events the outbox only grows.
+its whole unacknowledged outbox at every connection, so with no server that stored and
+acknowledged events the outbox only grew.
 
 ## Decision
 
@@ -73,8 +73,8 @@ events the outbox only grows.
    deleted row is answered with the cursor, so a deletion never makes an agent resend from the
    start or the server store a deleted event again.
 7. **`jobs` is not changed.** An event is stored whatever job it names and affects no job row;
-   applying a state to the job is separate work, which belongs in the storing transaction and only
-   for an event stored as the next number.
+   how a stored state is applied to the job is not decided here; when it is, it belongs in the
+   storing transaction and only for an event stored as the next number.
 
 ## Rejected
 
@@ -82,7 +82,7 @@ events the outbox only grows.
   already used, as when an outbox file was replaced and numbering restarted, and the server
   would acknowledge events it never stored.
 - **Closing silently or marking the agent on a differing repeat.** The close is the whole
-  reaction for now; a state the operator can see for an agent the server keeps closing is not
+  reaction; a state the operator can see for an agent the server keeps closing is not
   part of this decision.
 - **`jsonb` for the body, or both.** The escape for U+0000 is refused by `jsonb`, an event could
   then not be stored at all, and the exact text would be lost.

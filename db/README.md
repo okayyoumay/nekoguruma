@@ -18,6 +18,8 @@ ADR-476).
 `ir_digests`, lets `jobs.kind` be `identify` and comments `jobs.id` (design 4.4, 5.1, ADR-477).
 `migrations/0009_agent_events.sql` adds `agent_events`, the agent's stored outbox events (design
 5.3, 5.4, ADR-478 item 6, ADR-479).
+`migrations/0010_job_procedure_code.sql` adds `jobs.procedure_code`, the procedure's own code of a
+failed job (design 5.6, ADR-475, ADR-481).
 
 ## How migrations are applied
 
@@ -132,6 +134,18 @@ deletion, with an index on `(tenant_id, job_id)` for a job's rows and one on
 `(tenant_id, received_at)` for age. Removing rows never lowers the
 cursor, and a repeat of a removed row is acknowledged with the cursor, not stored again.
 
+**A job's reported state is written to its row by the transaction that stores the event**
+The server applies a stored `jobState` event to the sender's own job (ADR-481): `state`,
+`last_reported_at`, `delivered_at` (set once), and for an end `finished_at`, `failure_code`,
+`procedure_code` (migration 0010; only with `failure_code = 'procedure'`, 1 to 128 bytes) and
+`failure_detail` (at most 1024 bytes; U+0000 replaced by U+FFFD, empty as null). These columns carry
+no CHECK: the server keeps only what its rule allows, and a bound in the column would turn a bad
+report into a failure of the agent's whole transaction. `failure_detail` is vehicle data (design
+4.3): the retention pass nulls it and deletes the job's stored events, and the VIN redaction does
+the same before it redacts `jobs.vin`. A job the agent reports as needsOnSiteRecovery has
+`finished_at` set; a later report that reopens it clears `finished_at` and the failure columns.
+`progress_permille` is not written from events.
+
 **`vehicle_locks`: one holder per tenant and VIN, expiry from the job kind**
 `vehicle_locks` (design 8.8) holds at most one row per `(tenant_id, vin)`, the server's lock on a
 vehicle. `POST /api/v1/jobs` takes it for a job that names a VIN, in the transaction that inserts
@@ -144,7 +158,8 @@ the kind (the column has no default; no migration is needed):
 | `writeSettings` | 1800 seconds |
 
 A row whose `expires_at` has passed is replaced by the next take for the VIN; no sweeper deletes
-expired rows. The job's end deletes its own row (the delivery queue's ends, ADR-480). A new job
+expired rows. The job's end deletes its own row, whether the delivery queue writes it (ADR-480) or
+the agent reports it (ADR-481); a reopened needsOnSiteRecovery job holds no row. A new job
 kind that the route creates states its allowance in the same place as its confirmation level.
 The columns hold no foreign keys and a stale row keeps its VIN until a take replaces it.
 

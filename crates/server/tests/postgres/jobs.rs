@@ -26,6 +26,7 @@ use shared_crypto::{SigningKey, random_32};
 use shared_proto::{INSTRUCTION_VERSION, JobInstruction, JobKind};
 use sqlx::Postgres;
 
+use crate::agent_events::say;
 use crate::control::{open, quiet_for};
 use crate::job_queue::{DELIVERED, LONG, SENT, ack, command, reject, row, settings, until_row};
 use crate::redeem::{Agent, Flaky, World, capture, instruction_key, json};
@@ -1652,5 +1653,113 @@ async fn an_end_of_the_old_job_waits_for_an_uncommitted_take_and_then_deletes_no
     let holder = lab.w.sql("SELECT job_id::text FROM vehicle_locks").await;
     assert_ne!(holder, old);
     assert_eq!(lab.locks().await, format!("{VIN}>{holder}"));
+    lab.finish().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The lock and the reported state (ADR-481): J17 to J19
+
+impl Lab {
+    /// A lab whose queue is on and whose agent is connected; the agent's session.
+    async fn with_agent() -> (Lab, crate::control::Client, String) {
+        let lab = Lab::build(instruction_key(), Some(settings(LONG))).await;
+        let client = open(lab.addr(), &lab.agent_token().await).await;
+        let cookie = lab.login("alice").await;
+        (lab, client, cookie)
+    }
+
+    /// Creates a job for the agent with `vin` under `key` and reads its command off the agent's
+    /// connection; the job's ID.
+    async fn job_for(
+        &self,
+        client: &mut crate::control::Client,
+        cookie: &str,
+        key: &str,
+        vin: &str,
+    ) -> String {
+        let r = self
+            .post(cookie, key, &self.body(json!({ "vin": vin })))
+            .await;
+        assert_eq!(r.status, 202, "{}", r.head);
+        let id = job_id(&r);
+        command(client).await;
+        id
+    }
+}
+
+// J17
+#[tokio::test]
+async fn the_lock_is_held_until_the_agent_reports_an_end_and_a_recovery_is_an_end() {
+    let (lab, mut client, cookie) = Lab::with_agent().await;
+    let held = lab.job_for(&mut client, &cookie, "k-1", VIN).await;
+    let other = lab.job_for(&mut client, &cookie, "k-2", VIN_2).await;
+    let refused = lab.body(json!({ "vin": VIN }));
+    assert_eq!(lab.post(&cookie, "k-3", &refused).await.status, 409);
+    // A state that is not an end frees nothing.
+    say(&mut client, 1, &held, "running", "").await;
+    assert_eq!(lab.post(&cookie, "k-3", &refused).await.status, 409);
+    assert_eq!(lab.locks().await, format!("{VIN}>{held},{VIN_2}>{other}"));
+    // An end frees the job's own lock, and only that one.
+    say(&mut client, 2, &held, "completed", "").await;
+    assert_eq!(lab.locks().await, format!("{VIN_2}>{other}"));
+    let r = lab.post(&cookie, "k-3", &refused).await;
+    assert_eq!(r.status, 202, "{}", r.head);
+    command(&mut client).await;
+    // So does an agent's needsOnSiteRecovery, the one end a later report may replace.
+    say(
+        &mut client,
+        3,
+        &other,
+        "needsOnSiteRecovery",
+        r#","detail":"cable""#,
+    )
+    .await;
+    assert_eq!(lab.locks().await, format!("{VIN}>{}", job_id(&r)));
+    let r = lab
+        .post(&cookie, "k-4", &lab.body(json!({ "vin": VIN_2 })))
+        .await;
+    assert_eq!(r.status, 202, "{}", r.head);
+    lab.finish().await;
+}
+
+// J18
+#[tokio::test]
+async fn the_end_of_a_job_whose_lock_expired_and_was_taken_leaves_the_new_holders_row() {
+    let (lab, mut client, cookie) = Lab::with_agent().await;
+    let old = lab.job_for(&mut client, &cookie, "k-old", VIN).await;
+    lab.age_lock(VIN, "interval '1 day'").await;
+    let new = lab.job_for(&mut client, &cookie, "k-new", VIN).await;
+    assert_eq!(lab.locks().await, format!("{VIN}>{new}"));
+    say(&mut client, 1, &old, "completed", "").await;
+    assert_eq!(lab.field(&old, "state").await, "completed");
+    assert_eq!(lab.locks().await, format!("{VIN}>{new}"));
+    lab.finish().await;
+}
+
+// J19
+#[tokio::test]
+async fn a_replay_of_a_failed_job_shows_its_failure_code_and_procedure_code_and_no_detail() {
+    let (lab, mut client, cookie) = Lab::with_agent().await;
+    let body = lab.body(json!({ "vin": VIN }));
+    let r = lab.post(&cookie, "k-failed", &body).await;
+    let job = job_id(&r);
+    command(&mut client).await;
+    assert!(json(&r).get("failure").is_none());
+    say(
+        &mut client,
+        1,
+        &job,
+        "failed",
+        r#","failureCode":"procedure","procedureCode":"P-17","detail":"SECRET-DETAIL""#,
+    )
+    .await;
+    let replay = lab.post(&cookie, "k-failed", &body).await;
+    assert_eq!(replay.status, 202, "{}", replay.head);
+    assert_eq!(json(&replay)["state"], "failed");
+    assert_eq!(
+        json(&replay)["failure"],
+        json!({ "code": "procedure", "procedureCode": "P-17" })
+    );
+    assert!(!replay.body.contains("SECRET-DETAIL"));
     lab.finish().await;
 }

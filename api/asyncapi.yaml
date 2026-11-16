@@ -361,6 +361,19 @@ components:
         that belongs to another kind is refused like any unknown one. Communication logs and
         captured data travel over the data channel, not as events; reporting the agent's
         capabilities is later work and will add its own kind.
+
+        The server stores each numbered event and acknowledges it (5.3, ADR-479). It also applies
+        a stored jobState to the sender's own job in the same transaction (5.6, ADR-481): `received`
+        only records the delivery and the report time and never changes the job's state; another
+        state becomes the job's, the last report winning while the job is open; an end (completed,
+        failed, cancelled, expired, preconditionFailed, needsOnSiteRecovery) is final and frees
+        the job's vehicle lock, except that a needsOnSiteRecovery may be replaced by any later
+        state but `received`. failureCode is kept for failed and preconditionFailed only (one the
+        server does not know, or one of its own, is stored as other), procedureCode only with
+        failureCode procedure, and detail only for failed, preconditionFailed and
+        needsOnSiteRecovery, with U+0000 replaced and cut to 1024 bytes. A report that changes
+        nothing (another agent's or an unknown job, a job already ended, an unknown state name) is
+        still stored and acknowledged. The job's times are the server's; occurredAtAgent is not used.
       payload:
         type: object
         required: [type, kind]

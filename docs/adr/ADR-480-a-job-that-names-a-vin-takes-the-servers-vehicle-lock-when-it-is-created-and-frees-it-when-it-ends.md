@@ -1,7 +1,7 @@
 # ADR-480: A Job That Names a VIN Takes the Server's Vehicle Lock When It Is Created and Frees It When It Ends
 
 **Date:** 2026-11-15
-**Status:** Accepted
+**Status:** Accepted (its first consequence, that a job finished on the agent holds its vehicle until the lock expires, replaced by ADR-481)
 **Affects:** design 5.1, 5.3, 8.8, 12; `db/README.md`; `api/openapi.yaml` (`POST /v1/jobs`); `crates/server` (`jobs`, `job_queue`, `problem`), `crates/server/docs/ngr-server.md`; `docs/glossary.md`; annotates ADR-477 item 7 and ADR-476
 
 ## Context

@@ -94,6 +94,8 @@ pub struct EventCounts {
     pub stored: AtomicU64,
     /// Repeats of a stored or deleted event whose text was the same, counted after the commit.
     pub duplicates: AtomicU64,
+    /// Stored events that wrote to their job (design 5.6, ADR-481), counted after the commit.
+    pub applied: AtomicU64,
 }
 
 impl Default for Settings {
@@ -550,6 +552,20 @@ fn answer(
         counts
             .duplicates
             .fetch_add(stored.repeats, Ordering::Relaxed);
+        counts.applied.fetch_add(stored.applied, Ordering::Relaxed);
+    }
+    if stored.ignored > 0 {
+        tracing::debug!(agent_id = %agent.0, count = stored.ignored, "reports changed no job");
+    }
+    // Names only, never the frame's text.
+    if !stored.unapplied.is_empty() && may_log(gate, now(), LOG_EVERY) {
+        for u in &stored.unapplied {
+            tracing::warn!(
+                agent_id = %agent.0, job_id = %u.job_id, seq = u.seq,
+                current = u.current, reported = u.reported,
+                "a stored job report was not applied to its job"
+            );
+        }
     }
 }
 

@@ -17,6 +17,7 @@ pub mod health;
 pub mod hub;
 pub mod instruction_key;
 pub mod job_queue;
+pub(crate) mod job_state;
 pub mod jobs;
 pub mod local_guard;
 pub mod local_user;

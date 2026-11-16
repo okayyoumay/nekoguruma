@@ -413,10 +413,20 @@ pub fn instruction(id: &str, operator_id: &str, spec: &Spec, issued_at: u64) -> 
 }
 
 /// The job columns every read and the insert return, in the order of [`Stored`].
-const JOB_COLUMNS: &str =
-    "id::text, kind, state, progress_permille, confirmation_level, operator_id::text, request_hash";
+const JOB_COLUMNS: &str = "id::text, kind, state, progress_permille, confirmation_level, \
+     operator_id::text, request_hash, failure_code, procedure_code";
 
-type StoredRow = (String, String, String, i16, String, String, Option<Vec<u8>>);
+type StoredRow = (
+    String,
+    String,
+    String,
+    i16,
+    String,
+    String,
+    Option<Vec<u8>>,
+    Option<String>,
+    Option<String>,
+);
 
 /// A job row, as far as the answer and the key's decision need it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -428,6 +438,10 @@ struct Stored {
     level: String,
     operator_id: String,
     request_hash: Option<Vec<u8>>,
+    /// The failure code of a job that ended as failed (design 5.6, ADR-481).
+    failure_code: Option<String>,
+    /// The procedure's own code, with the failure code `procedure`.
+    procedure_code: Option<String>,
 }
 
 impl From<StoredRow> for Stored {
@@ -440,21 +454,33 @@ impl From<StoredRow> for Stored {
             level: row.4,
             operator_id: row.5,
             request_hash: row.6,
+            failure_code: row.7,
+            procedure_code: row.8,
         }
     }
 }
 
 impl Stored {
     /// The `Job` document, the same for a creation and a replay (a replay shows the current
-    /// state).
+    /// state). A job with a failure code shows `failure`: the code and, with the code
+    /// `procedure`, the procedure's own. Never the failure's detail, which is vehicle data a
+    /// replay would show without the result's permission (ADR-477 item 5, ADR-481).
     fn document(&self) -> Value {
-        serde_json::json!({
+        let mut document = serde_json::json!({
             "jobId": self.id,
             "kind": self.kind,
             "state": self.state,
             "progressPermille": self.progress_permille,
             "confirmation": { "level": self.level },
-        })
+        });
+        if let Some(code) = &self.failure_code {
+            let mut failure = serde_json::json!({ "code": code });
+            if let Some(procedure) = &self.procedure_code {
+                failure["procedureCode"] = Value::from(procedure.as_str());
+            }
+            document["failure"] = failure;
+        }
+        document
     }
 }
 
@@ -1401,6 +1427,8 @@ mod tests {
             level: "notifyOnly".into(),
             operator_id: "o".into(),
             request_hash: None,
+            failure_code: None,
+            procedure_code: None,
         };
         assert_eq!(
             stored.document(),
@@ -1411,6 +1439,34 @@ mod tests {
         );
         assert_eq!(Kind::Acquire.confirmation(), "notifyOnly");
         assert_eq!(Kind::WriteSettings.confirmation(), "gracePeriod");
+    }
+
+    // J17 (the document's half): the failure shows its code and procedure code, never a detail.
+    #[test]
+    fn a_failed_job_document_shows_the_failure_code_and_the_procedure_code_only() {
+        let mut stored = Stored {
+            id: "i".into(),
+            kind: "runSequence".into(),
+            state: "failed".into(),
+            progress_permille: 0,
+            level: "notifyOnly".into(),
+            operator_id: "o".into(),
+            request_hash: None,
+            failure_code: Some("procedure".into()),
+            procedure_code: Some("P-17".into()),
+        };
+        assert_eq!(
+            stored.document()["failure"],
+            serde_json::json!({ "code": "procedure", "procedureCode": "P-17" })
+        );
+        stored.procedure_code = None;
+        stored.failure_code = Some("vinMismatch".into());
+        assert_eq!(
+            stored.document()["failure"],
+            serde_json::json!({ "code": "vinMismatch" })
+        );
+        stored.failure_code = None;
+        assert!(stored.document().get("failure").is_none());
     }
 
     // V1: the run allowance after the start deadline of each kind this route creates.

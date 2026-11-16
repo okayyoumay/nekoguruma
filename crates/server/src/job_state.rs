@@ -210,6 +210,15 @@ mod tests {
         let code = |state, code| Report::of(state, Some(code), None, None).failure_code;
         assert_eq!(code("failed", "vinMismatch"), Some("vinMismatch"));
         assert_eq!(code("preconditionFailed", "jobRefused"), Some("jobRefused"));
+        // O12: the operator refusal's code is an agent's own and is kept, with no detail.
+        assert_eq!(
+            code("preconditionFailed", "operatorNotAllowed"),
+            Some("operatorNotAllowed")
+        );
+        assert_eq!(
+            Report::of("preconditionFailed", Some("operatorNotAllowed"), None, None).detail,
+            None
+        );
         assert_eq!(code("failed", "procedure"), Some("procedure"));
         // Unknown, wrongly cased and the server's own two are `other`.
         for odd in [

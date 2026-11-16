@@ -420,8 +420,9 @@ connect`, above) loads the agent key and passes it in.
   once both locks are released) and `status()`, a watch of the phase, the heartbeat interval, the
   next delay and `commands_acknowledged` and `commands_rejected`, the job commands answered
   `commandAck` and `commandRejected` over all connections (a command is counted once its answer
-  is written). `intake` is the `Intake` trait object that takes every verified instruction; the
-  default, `LogIntake`, is connected to no job runner: it logs the job ID at `debug` and drops the
+  is written; a job refused for its operator was answered `commandAck` and counts under
+  `commands_acknowledged`). `intake` is the `Intake` trait object that takes every verified instruction whose operator
+  the gate allows (ADR-483); the default, `LogIntake`, is connected to no job runner: it logs the job ID at `debug` and drops the
   instruction. `outbox` is the `SharedOutbox` around the open `Outbox` of the record's agent ID
   (below); the caller opens it, and the connections send its events.
 - **Both locks are held from `open` until the task ends**, waits included, and released by drop
@@ -443,8 +444,15 @@ connect`, above) loads the agent key and passes it in.
   1009; after a read error the agent sends its Close and waits 5 seconds without reading.
 - **A job command** goes to the connection's gate (`control/gate.rs`), which wraps
   `agent::instruction` ("Job instruction gate" below) with the instruction key and the agent ID
-  from the registration record the session holds. A verified instruction is handed to the
-  `Intake`; the channel then appends a `received` event for the job to the outbox, on a blocking
+  from the registration record the session holds. A verified instruction then meets the
+  operator policy (ADR-483), derived once per session from the record's preset: on `personal`
+  and `personalRemote` its operator ID must equal the record's owner ID byte for byte, on
+  `shared` nothing is checked, and a preset that does not parse is owner-only. One that fails the
+  match skips the `Intake` and has one terminal `jobState` event appended in place of `received`
+  (`preconditionFailed`, failure code `operatorNotAllowed`, no detail; the same admission bound
+  and failure handling as `received`), and is then answered `commandAck`: the acknowledgement
+  settles the delivery, and the refused job is never journaled. A verified instruction that
+  passes is handed to the `Intake`; the channel then appends a `received` event for the job to the outbox, on a blocking
   task raced with the stop, and answers `{"type":"commandAck","commandId":...}`. A failed append
   (`Full`, `Poisoned`, a write error) withholds the acknowledgement: the
   command counts as neither acknowledged nor rejected, the server delivers the job again after
@@ -518,6 +526,7 @@ connect`, above) loads the agent key and passes it in.
 | 5 | the body decodes with no byte left over and within its bounds | `UnsupportedVersion` for an unknown body version, else `Malformed` |
 | 6 | the agent ID in the body is the agent's own | `NotForThisAgent` |
 
+The operator check is not a step of `open`: it runs in the control channel's gate on the instruction `open` returned (ADR-483), because its answer is a job state and not a rejection.
 Nothing reads the payload before step 4 has passed and nothing re-encodes the decoded instruction. `VerifiedInstruction` has private fields, no public constructor and no `Clone`; it gives the decoded `JobInstruction` by reference and the envelope bytes it came from, byte for byte, for the journal that will keep and re-verify them. A refusal writes one `warn` entry (reason, the envelope's length and, for `UnknownKey`, the fingerprint the envelope offered; `operational-log.md`) and returns the reason, which the control channel sends back keyed by the command's ID. The control channel's gate calls the variant that returns the refusal without writing the entry, and writes a bounded one itself; the free `open` keeps its own entry for one-shot callers.
 
 ## Operational log

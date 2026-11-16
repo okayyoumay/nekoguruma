@@ -92,6 +92,14 @@ throughout.
   a string has the same entry (reason `Malformed`) with an envelope length of 0; one that is
   text but not base64 has it with the length of that text. No `commandId` is logged.
 
+- **A job refused for its operator** (`agent::control::gate`, ADR-483): a verified instruction
+  whose operator is not the registered owner, on a `personal` or `personalRemote` preset. The
+  entry holds the job ID (the instruction verified, so the ID is the server's own word) and the
+  failure code `operatorNotAllowed`; it never holds the operator ID, the owner ID or a
+  `commandId`. The gate bounds it as it bounds the refused-instruction entry: the first per
+  connection at `warn`, later ones at `debug`, and the end-of-connection `info` line of refused
+  instructions carries the count as `operator_not_allowed`. The warning and the count are refusals decided, not refusals recorded: when the outbox is full the command stays unacknowledged, and its redelivery is decided and counted again.
+
 - **The control channel session** (`agent::control`, ADR-471): the entries hold a failure
   class, an HTTP status, a close code and the heartbeat interval. They never hold the token, the
   challenge, the nonce or the proof, an HTTP body, a message's text, a `commandId`, or the reason

@@ -153,7 +153,11 @@ operations:
     summary: Agent → server. A job command was accepted
     description: |
       Sent once the instruction verified and, when the journal exists, was recorded (5.3). The
-      server stops redelivering that command.
+      server stops redelivering that command. The acknowledgement settles the delivery and does
+      not say the job was accepted: a verified instruction whose operator is not the registered
+      owner, on a personal preset, is acknowledged too, after the agent recorded a terminal
+      preconditionFailed jobState event with failureCode operatorNotAllowed in place of received
+      (5.3, 6.6, ADR-483).
     messages:
       - { $ref: '#/channels/agentControl/messages/commandAck' }
 
@@ -410,11 +414,13 @@ components:
                   deviceLocked, vehicleLocked, vinMismatch, variantMismatch, powerCondition, signatureInvalid,
                   libraryLoadFailed, unsupportedAbi, runtime32BitMissing, cpuOrKernelNo32Bit,
                   gatewayAuthExpired, ticketExpired, procedure, procedureError, jobRefused, linkNotOpened,
-                  exchangeFailed, internal, instructionRejected, instructionKeyRetired and other.
+                  exchangeFailed, internal, instructionRejected, instructionKeyRetired, operatorNotAllowed and other.
                   instructionRejected and instructionKeyRetired are the server's own, for a job it ends before
                   the agent runs it: the first when the agent refused the delivered command (the detail is the
                   agent's coarse reason), the second when the job's instruction was signed by a key that is
-                  no longer the active one (5.3, ADR-476); an agent does not send them. Only internal asserts a fault of the diagnostic system
+                  no longer the active one (5.3, ADR-476); an agent does not send them. operatorNotAllowed is the agent's: it
+                  refused a verified job because its operator is not one the agent allows, with no detail
+                  (5.3, 6.6, ADR-483). Only internal asserts a fault of the diagnostic system
                   (the agent's, or the server's when it ends a job whose instruction is too large to send);
                   exchangeFailed asserts neither a fault of the vehicle nor of the system, which the
                   communication log tells apart (8.11).

@@ -18,7 +18,9 @@
 //! handed to the [`Intake`], recorded as a `received` event in the outbox and then answered
 //! `commandAck` (an append that fails withholds the answer, and one that finds the outbox
 //! poisoned or fails to write closes the connection with 1011: the session reopens the outbox
-//! before its next connection); a refusal is answered
+//! before its next connection); one whose operator the gate does not allow skips the intake, is
+//! recorded as a `preconditionFailed` event with the code `operatorNotAllowed` instead and is
+//! answered `commandAck` the same way (ADR-483); a refusal is answered
 //! `commandRejected` with its reason and records nothing. Answers are written on this connection
 //! through the one writer and under the write bound.
 //! Sending an answer does not reset the idle deadline; only a frame received does. Never logged:
@@ -28,9 +30,9 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use shared_proto::{
-    AgentEventKind, AgentEventMessage, AgentMessage, CLOSE_CODE_BINARY, CLOSE_CODE_GOING_AWAY,
-    CLOSE_CODE_IDLE, CLOSE_CODE_PROTOCOL, CLOSE_CODE_REPLACED, CLOSE_CODE_REVOKED,
-    CLOSE_CODE_TOO_BIG, CONTROL_SUBPROTOCOL, HEARTBEAT_MISSED_LIMIT, JobId,
+    AgentEventMessage, AgentMessage, CLOSE_CODE_BINARY, CLOSE_CODE_GOING_AWAY, CLOSE_CODE_IDLE,
+    CLOSE_CODE_PROTOCOL, CLOSE_CODE_REPLACED, CLOSE_CODE_REVOKED, CLOSE_CODE_TOO_BIG,
+    CONTROL_SUBPROTOCOL, FailureCode, HEARTBEAT_MISSED_LIMIT, JobId, JobState,
     MAX_CONTROL_MESSAGE_LEN, ServerMessage, close_reason,
 };
 use tokio::time::Instant;
@@ -43,7 +45,7 @@ use super::backoff::lived;
 use super::dial::{self, ConnectError, Stream};
 use super::events::{Acked, Sender};
 use super::exchange::Token;
-use super::gate::Gate;
+use super::gate::{Admitted, Gate};
 use super::{Fail, Outcome, Phase, SessionState, Stop, Wiring};
 use crate::outbox::{Kind, OutboxError};
 use crate::server_http;
@@ -406,7 +408,12 @@ pub(super) async fn serve(mut socket: Socket, state: &mut SessionState<'_>) -> O
             state.warnings.hello();
             tracing::info!(heartbeat_secs = secs, "control channel connected");
             state.status.connected(secs);
-            let mut gate = Gate::new(&state.wiring.instruction_key, &state.wiring.record.agent_id);
+            let mut gate = Gate::new(
+                &state.wiring.instruction_key,
+                &state.wiring.record.agent_id,
+                &state.wiring.record.owner_id,
+                &state.wiring.record.preset,
+            );
             let end = connected(&mut socket, secs, state, &mut gate).await;
             gate.finish();
             end
@@ -501,8 +508,8 @@ async fn connected(
                         if longest.encode().is_err() {
                             return End::close(CLOSE_CODE_PROTOCOL, "command-id", lived_now);
                         }
-                        let (rejected, verified) = match gate.admit(signed_job.as_deref()) {
-                            Ok(verified) => (None, Some(verified)),
+                        let (rejected, admitted) = match gate.admit(signed_job.as_deref()) {
+                            Ok(admitted) => (None, Some(admitted)),
                             Err(reason) => (Some(reason), None),
                         };
                         let answer = match rejected {
@@ -514,23 +521,37 @@ async fn connected(
                             return End::close(CLOSE_CODE_PROTOCOL, "command-id", lived_now);
                         };
                         // The intake has the instruction before the ack is written, and the
-                        // outbox has the `received` event before it too (ADR-478 item 5).
-                        if let Some(verified) = verified {
-                            let job_id = verified.instruction().job_id.0.clone();
-                            w.intake.take(verified);
-                            match record_received(w, state.stop, job_id).await {
-                                Recorded::Done => {}
-                                Recorded::Stopped => return End::stop(),
-                                Recorded::Failed(class, error) => {
-                                    state.warnings.event_failure(class, &error);
-                                    // A poisoned outbox cannot take any event until it is
-                                    // reopened, which the session does before its next
-                                    // connection (ADR-478 item 4): end this one.
-                                    if matches!(class, "outbox-poisoned" | "outbox-write") {
-                                        return End::close(CLOSE_CODE_INTERNAL, class, lived_now);
-                                    }
-                                    continue;
+                        // outbox has the `received` event before it too (ADR-478 item 5). An
+                        // instruction whose operator is not allowed skips the intake and gets one
+                        // terminal event instead of `received`, under the same bound and with the
+                        // same failure handling (ADR-483).
+                        let recorded = match admitted {
+                            None => None,
+                            Some(Admitted::Accepted(verified)) => {
+                                let job_id = verified.instruction().job_id.0.clone();
+                                w.intake.take(*verified);
+                                Some(record_job_state(w, state.stop, job_id, JobState::Received).await)
+                            }
+                            Some(Admitted::OperatorNotAllowed { job_id }) => {
+                                let refused = JobState::PreconditionFailed {
+                                    code: FailureCode::OperatorNotAllowed,
+                                    detail: String::new(),
+                                };
+                                Some(record_job_state(w, state.stop, job_id, refused).await)
+                            }
+                        };
+                        match recorded {
+                            None | Some(Recorded::Done) => {}
+                            Some(Recorded::Stopped) => return End::stop(),
+                            Some(Recorded::Failed(class, error)) => {
+                                state.warnings.event_failure(class, &error);
+                                // A poisoned outbox cannot take any event until it is
+                                // reopened, which the session does before its next
+                                // connection (ADR-478 item 4): end this one.
+                                if matches!(class, "outbox-poisoned" | "outbox-write") {
+                                    return End::close(CLOSE_CODE_INTERNAL, class, lived_now);
                                 }
+                                continue;
                             }
                         }
                         if let Err(end) =
@@ -595,7 +616,7 @@ async fn connected(
     }
 }
 
-/// What recording a `received` event came to.
+/// What recording a job's first event came to.
 enum Recorded {
     Done,
     /// The stop came first: the append, if it started, goes on unobserved.
@@ -604,33 +625,33 @@ enum Recorded {
     Failed(&'static str, OutboxError),
 }
 
-/// The text of the `received` event of `job_id` with number `seq`. No device time is given: the
-/// property is optional and the server stamps its own receive time (16.3).
-fn received_event(job_id: &str, seq: u64) -> Result<String, shared_proto::ControlError> {
+/// The text of the first event of `job_id` with number `seq`: the job's `state`, `received` or
+/// the terminal `preconditionFailed` of a refusal (ADR-483). No device time is given: the property
+/// is optional and the server stamps its own receive time (16.3).
+fn first_event(
+    job_id: &str,
+    seq: u64,
+    state: &shared_proto::JobState,
+) -> Result<String, shared_proto::ControlError> {
     AgentMessage::AgentEvent(AgentEventMessage {
         seq: Some(seq),
         occurred_at_agent: None,
-        event: AgentEventKind::JobState {
-            job_id: JobId(job_id.to_owned()),
-            state: shared_proto::JobState::Received.wire_name().to_owned(),
-            failure_code: None,
-            procedure_code: None,
-            detail: None,
-        },
+        event: state.to_event_kind(JobId(job_id.to_owned())),
     })
     .encode()
 }
 
-/// Appends the `received` event on a blocking task, raced with the stop (ADR-478 item 5). It is
-/// tried once per command: the server's redelivery after the lease is the retry.
-async fn record_received(w: &Wiring, stop: &Stop, job_id: String) -> Recorded {
+/// Appends the job's first event on a blocking task, raced with the stop (ADR-478 item 5):
+/// `received`, or the refusal's terminal event. Both are `Kind::Received` for the admission bound.
+/// It is tried once per command: the server's redelivery after the lease is the retry.
+async fn record_job_state(w: &Wiring, stop: &Stop, job_id: String, state: JobState) -> Recorded {
     // The longest number the counter gives, so the text that is appended encodes as well.
-    if let Err(error) = received_event(&job_id, u64::MAX - 1) {
+    if let Err(error) = first_event(&job_id, u64::MAX - 1, &state) {
         let error = OutboxError::Io(std::io::Error::other(error.to_string()));
         return Recorded::Failed("outbox-event", error);
     }
     let append = w.outbox.append(Kind::Received, move |seq| {
-        received_event(&job_id, seq).unwrap_or_default()
+        first_event(&job_id, seq, &state).unwrap_or_default()
     });
     let appended = tokio::select! {
         biased;

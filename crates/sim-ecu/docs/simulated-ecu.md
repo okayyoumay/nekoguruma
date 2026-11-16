@@ -48,7 +48,7 @@ General behaviour (clause 7.7):
 | 19 | ReadDTCInformation | all | 01, 02, 0A |
 | 22 | ReadDataByIdentifier | all | up to 8 DIDs per request (DIDs below) |
 | 27 | SecurityAccess | extended, programming | 01 requestSeed, 02 sendKey |
-| 2E | WriteDataByIdentifier | all (VIN: extended, programming) | F190 only |
+| 2E | WriteDataByIdentifier | all (VIN: extended, programming) | F190 and the configured DIDs that declare a write (below) |
 | 31 | RoutineControl | all (routines: programming) | 01 startRoutine on FF00, FF01 |
 | 34 | RequestDownload | programming | no compression or encryption |
 | 36 | TransferData | programming | |
@@ -110,6 +110,53 @@ or `reconnect()` of the simulated ECU leaves it as it is.
 
 `EcuConfig::validate` refuses a part number, software version or `downloaded_sw_version` that is not ASCII or is longer than its width, and a VIN that is not exactly 17 ASCII bytes (F190 is a fixed 17-byte row); `sim-vci` and `iso22900-mock` call it when they load or attach a configuration. A `SimEcu` built directly from a longer value cuts it, so the answer keeps its length. A configured `sw_version` or `downloaded_sw_version` shorter than 5 bytes is read back space-padded, so a job's intended software version, which the agent compares as the field's raw bytes (ADR-268), must include the padding.
 
+### Configured data identifiers
+
+`EcuConfig::dids` adds DIDs beyond the built-in ones above (F186, F187, F189, F190, FD00, FD01 and
+FD04 to FD07, which a configuration cannot replace). Each entry has `did`, `value` (its record;
+its length is the DID's length) and, when the DID is writable, `write` with an optional `session`
+(`default`, `programming` or `extended`; absent means every session) and an optional
+`security_level` (only 1 exists; absent means no security check). Without `write` the DID is
+read-only. `EcuConfig::security_key_mask` sets the key mask (below).
+
+`did` and `security_key_mask` take a JSON number or a string of hex digits (either case) after a
+lowercase `0x` prefix; `value` takes an array of bytes or a string of an even number of hex digits
+with no prefix and no separators.
+Both forms mean the same, and a malformed string is a parse error. The hex strings are for human-readable
+formats; the state file and the snapshot hold numbers and byte arrays.
+
+```json
+{"security_key_mask": "0x3C3C3C3C",
+ "dids": [{"did": "0x1200", "value": "010002"},
+          {"did": "0x1201", "value": "000000",
+           "write": {"session": "extended", "security_level": 1}}]}
+```
+
+```json
+{"security_key_mask": 1010580540,
+ "dids": [{"did": 4608, "value": [1, 0, 2]},
+          {"did": 4609, "value": [0, 0, 0],
+           "write": {"session": "extended", "security_level": 1}}]}
+```
+
+`EcuConfig::validate` also refuses a configured DID that is built-in, declared twice, has an empty
+value or one longer than a response can carry (4092 bytes), has a `security_level` other than 1, or
+gives a security level without naming a non-default session (an absent session means every
+session, the default one included, where SecurityAccess is not available).
+`SimEcu` built from an unvalidated configuration does not fail: a built-in DID wins and the first
+of two equal DIDs wins.
+
+A write to a configured DID is checked in this order: gateway authentication (NRC 34, all
+writes), a request shorter than 4 bytes (NRC 13), then a DID that is not configured or has no
+`write`, or a session other than the one `write` names (NRC 31), a record whose length differs from
+the value's (NRC 13), and an unlocked level the DID needs (NRC 33). On success the record replaces
+`value` and the response echoes the DID; an armed `Fault::DropResponse` applies the write and loses the answer, and
+`Fault::NegativeResponse` refuses the request with no effect. A functionally addressed request that is refused with NRC 31 gets no response.
+
+Security for a configured DID is per DID (ADR-482): one with a `security_level` always needs the
+level unlocked, whatever `require_security_access` says, and one without never checks. The flag
+gates only the VIN write, eraseMemory and the download.
+
 The example ECU definition (`crates/diag-frontend/examples/example-ecu`) also declares FD02 and
 FD03, which the simulator does not answer (RequestOutOfRange).
 
@@ -121,7 +168,7 @@ is the download start plus the received count.
 ## Security access
 
 One level (01/02). The seed is 4 bytes, deterministic per `SimEcu` instance and never zero; the
-expected key is `seed XOR 5A5A5A5A` (`SimEcu::key_for_seed`). The handling follows the state chart
+expected key is `seed XOR 5A5A5A5A` by default; `EcuConfig::security_key_mask` replaces the mask (`EcuConfig::key_for_seed`, also on `SimEcu`). The handling follows the state chart
 in Annex I with a fresh seed for every requestSeed (no static seed). Any SecurityAccess request
 other than a successful requestSeed discards the pending seed (Annex I, transition 9): a seed
 answers exactly one sendKey, and a sendKey without a seed gets NRC 24.
@@ -134,7 +181,7 @@ ECU reset, from when its response goes out; the reset itself is applied at once,
 arriving before a delayed reset response already sees the reset state); one that has already run
 out stays over. Clause 9.4.1 also asks a server that supports the delay to start it at power-up
 when an earlier SecurityAccess failed on a single false key; the simulator does not. With
-`EcuConfig::require_security_access` unset, secured operations do not check the lock state.
+`EcuConfig::require_security_access` unset, the VIN write, eraseMemory and the download do not check the lock state; a configured DID with a `security_level` still does (ADR-482).
 
 ## Routines and download
 
@@ -173,7 +220,7 @@ directly.
 `SimEcu::restore(snapshot, clock, elapsed)` rebuilds it on another clock, as it was `elapsed`
 after the snapshot: running timers have that much less to go, and one that has run out takes
 effect at once. It refuses (`InvalidSnapshot`) a snapshot whose download, image and block
-numbers contradict each other or exceed the flash window, which the ECU itself never produces. `sim-vci` uses this to keep the ECU across worker processes (ADR-241).
+numbers contradict each other or exceed the flash window, which the ECU itself never produces. The snapshot holds the configuration, so a value written to a configured DID and the key mask survive with it. `sim-vci` uses this to keep the ECU across worker processes (ADR-241).
 
 ## Fault injection
 

@@ -1,7 +1,7 @@
 # ADR-241: Simulated ECU State Kept in a File Across Worker Processes
 
 **Date:** 2026-10-07
-**Status:** Accepted
+**Status:** Accepted (item 2 detailed by ADR-482)
 **Affects:** `crates/sim-ecu` (`SimEcu::snapshot`, `SimEcu::restore`, `EcuSnapshot`), `crates/sim-vci` (`NGR_SIM_ECU_STATE`), `crates/j2534-0404-service/tests/sim_vci_restart.rs`
 
 ## Context

@@ -9,7 +9,7 @@ use crate::{
     FLASH_START, Fault, FlashPhase, MAX_BLOCK_LENGTH, MAX_DIDS_PER_READ, MAX_RESPONSE_LENGTH,
     MAX_SECURITY_ATTEMPTS, Nrc, PART_NUMBER_LENGTH, POSITIVE_RESPONSE_OFFSET,
     RID_CHECK_PROGRAMMING_DEPENDENCIES, RID_ERASE_MEMORY, SUPPRESS_POS_RSP, SW_VERSION_LENGTH,
-    ServiceResult, Session, SimEcu, fixed_width,
+    ServiceResult, Session, SimEcu, fixed_width, is_builtin_did,
 };
 
 const SID_DIAGNOSTIC_SESSION_CONTROL: u8 = 0x10;
@@ -237,7 +237,7 @@ impl SimEcu {
             return Err(Nrc::IncorrectMessageLengthOrInvalidFormat);
         }
         let key = u32::from_be_bytes([message[2], message[3], message[4], message[5]]);
-        if key != Self::key_for_seed(seed) {
+        if key != self.config.key_for_seed(seed) {
             self.failed_attempts = self.failed_attempts.saturating_add(1);
             if self.failed_attempts >= MAX_SECURITY_ATTEMPTS {
                 self.start_security_delay();
@@ -317,7 +317,12 @@ impl SimEcu {
             DID_BATTERY_VOLTAGE => Some(BATTERY_VOLTAGE_RAW.to_be_bytes().to_vec()),
             DID_BOOT_TIME => Some(BOOT_TIME_RAW.to_be_bytes().to_vec()),
             DID_EXTERNAL_SUPPLY | DID_IGNITION => Some(vec![1]),
-            _ => None,
+            _ => self
+                .config
+                .dids
+                .iter()
+                .find(|d| d.did == did)
+                .map(|d| d.value.clone()),
         }
     }
 
@@ -328,8 +333,11 @@ impl SimEcu {
             return Err(Nrc::IncorrectMessageLengthOrInvalidFormat);
         }
         let did = u16::from_be_bytes([message[1], message[2]]);
-        // Only the VIN is writable, and only outside the default session.
-        if did != DID_VIN || self.session == Session::Default {
+        if did != DID_VIN {
+            return self.write_configured_did(did, &message[3..]);
+        }
+        // The VIN is writable outside the default session.
+        if self.session == Session::Default {
             return Err(Nrc::RequestOutOfRange);
         }
         let record = &message[3..];
@@ -344,6 +352,38 @@ impl SimEcu {
         }
         self.config.vin = String::from_utf8(record.to_vec()).expect("ASCII checked above");
         Ok(Some(positive(SID_WRITE_DATA_BY_IDENTIFIER, &message[1..3])))
+    }
+
+    /// A write to a DID other than the VIN: only a configured, writable DID in a session its
+    /// `write` allows is accepted. The length is checked before security; a configured level
+    /// decides on its own, whatever `require_security_access` says (ADR-482).
+    fn write_configured_did(&mut self, did: u16, record: &[u8]) -> ServiceResult {
+        let Some(index) = self
+            .config
+            .dids
+            .iter()
+            .position(|d| d.did == did && !is_builtin_did(did))
+        else {
+            return Err(Nrc::RequestOutOfRange);
+        };
+        let entry = &self.config.dids[index];
+        let Some(write) = entry.write else {
+            return Err(Nrc::RequestOutOfRange);
+        };
+        if write.session.is_some_and(|session| session != self.session) {
+            return Err(Nrc::RequestOutOfRange);
+        }
+        if record.len() != entry.value.len() {
+            return Err(Nrc::IncorrectMessageLengthOrInvalidFormat);
+        }
+        if write.security_level.is_some() && !self.security_unlocked {
+            return Err(Nrc::SecurityAccessDenied);
+        }
+        self.config.dids[index].value = record.to_vec();
+        Ok(Some(positive(
+            SID_WRITE_DATA_BY_IDENTIFIER,
+            &did.to_be_bytes(),
+        )))
     }
 
     // ------------------------------------------------------------ 0x14 (clause 11.2)

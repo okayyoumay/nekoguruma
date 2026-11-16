@@ -45,7 +45,7 @@ fn unlock(ecu: &mut SimEcu) {
         panic!("requestSeed failed");
     };
     let seed = u32::from_be_bytes([seed[2], seed[3], seed[4], seed[5]]);
-    let key = SimEcu::key_for_seed(seed).to_be_bytes();
+    let key = ecu.key_for_seed(seed).to_be_bytes();
     assert_eq!(
         ecu.request(&[0x27, 0x02, key[0], key[1], key[2], key[3]]),
         pos(&[0x67, 0x02])
@@ -996,7 +996,7 @@ fn any_failed_security_request_discards_the_pending_seed() {
         };
         assert!(matches!(ecu.request(bad), SimResponse::Negative { .. }));
         let seed = u32::from_be_bytes([seed[2], seed[3], seed[4], seed[5]]);
-        let key = SimEcu::key_for_seed(seed).to_be_bytes();
+        let key = ecu.key_for_seed(seed).to_be_bytes();
         assert_eq!(
             ecu.request(&[0x27, 0x02, key[0], key[1], key[2], key[3]]),
             neg(0x27, Nrc::RequestSequenceError),
@@ -1033,7 +1033,7 @@ fn suppressed_positive_responses_still_change_state() {
         panic!("requestSeed failed");
     };
     let seed = u32::from_be_bytes([seed[2], seed[3], seed[4], seed[5]]);
-    let key = SimEcu::key_for_seed(seed).to_be_bytes();
+    let key = ecu.key_for_seed(seed).to_be_bytes();
     assert_eq!(
         ecu.request(&[0x27, 0x82, key[0], key[1], key[2], key[3]]),
         SimResponse::NoResponse
@@ -1344,7 +1344,7 @@ fn session_change_and_reset_discard_the_pending_seed() {
         assert!(matches!(ecu.request(reset), SimResponse::Positive(_)));
         enter(&mut ecu, Session::Extended);
         let seed = u32::from_be_bytes([seed[2], seed[3], seed[4], seed[5]]);
-        let key = SimEcu::key_for_seed(seed).to_be_bytes();
+        let key = ecu.key_for_seed(seed).to_be_bytes();
         assert_eq!(
             ecu.request(&[0x27, 0x02, key[0], key[1], key[2], key[3]]),
             neg(0x27, Nrc::RequestSequenceError),
@@ -1365,7 +1365,7 @@ fn a_wrong_key_consumes_the_seed() {
         neg(0x27, Nrc::InvalidKey)
     );
     let seed = u32::from_be_bytes([seed[2], seed[3], seed[4], seed[5]]);
-    let key = SimEcu::key_for_seed(seed).to_be_bytes();
+    let key = ecu.key_for_seed(seed).to_be_bytes();
     assert_eq!(
         ecu.request(&[0x27, 0x02, key[0], key[1], key[2], key[3]]),
         neg(0x27, Nrc::RequestSequenceError)
@@ -1384,7 +1384,7 @@ fn a_second_request_seed_replaces_the_first() {
         SimResponse::Positive(_)
     ));
     let first = u32::from_be_bytes([first[2], first[3], first[4], first[5]]);
-    let key = SimEcu::key_for_seed(first).to_be_bytes();
+    let key = ecu.key_for_seed(first).to_be_bytes();
     assert_eq!(
         ecu.request(&[0x27, 0x02, key[0], key[1], key[2], key[3]]),
         neg(0x27, Nrc::InvalidKey)
@@ -2915,4 +2915,398 @@ fn the_battery_voltage_and_boot_time_dids_report_their_fixed_readings() {
         ecu.request(&[0x22, 0xFD, 0x04, 0xFD, 0x05]),
         SimResponse::Positive(vec![0x62, 0xFD, 0x04, 0x00, 0x7D, 0xFD, 0x05, 0x00, 0x2D])
     );
+}
+
+// ---------------------------------------------------------------- Configured DIDs
+
+/// Both number forms in one file: R is read-only, C needs the extended session and the unlocked
+/// level, L needs the extended session only, P is writable in every session without a level.
+const DIDS_JSON: &str = r#"{
+    "vin": "WVWZZZ1KZAW000001", "part_number": "1K0907115", "sw_version": "0042",
+    "response_delay_ms": 0, "require_security_access": true, "require_gateway_auth": false,
+    "fail_checksum": false,
+    "security_key_mask": "0x3C3C3C3C",
+    "dids": [
+        {"did": "0x1200", "value": "010203"},
+        {"did": 4609, "value": [0, 0, 0],
+         "write": {"session": "extended", "security_level": 1}},
+        {"did": "0x1202", "value": [9, 9], "write": {"session": "extended"}},
+        {"did": "0x1203", "value": "AA", "write": {}}
+    ]
+}"#;
+
+fn dids_config() -> EcuConfig {
+    serde_json::from_str(DIDS_JSON).unwrap()
+}
+
+fn dids_ecu() -> SimEcu {
+    SimEcu::new(dids_config())
+}
+
+fn write(did: u16, record: &[u8]) -> Vec<u8> {
+    let mut m = vec![0x2E, (did >> 8) as u8, did as u8];
+    m.extend_from_slice(record);
+    m
+}
+
+fn read(ecu: &mut SimEcu, did: u16) -> SimResponse {
+    ecu.request(&[0x22, (did >> 8) as u8, did as u8])
+}
+
+fn wrote(did: u16) -> SimResponse {
+    pos(&[0x6E, (did >> 8) as u8, did as u8])
+}
+
+#[test]
+fn configured_dids_parse_in_both_number_forms_to_the_same_config() {
+    // D1: a configuration without the new fields keeps the fixed behaviour.
+    let old = r#"{"vin": "WVWZZZ1KZAW000001", "part_number": "P", "sw_version": "1",
+        "response_delay_ms": 0, "require_security_access": false, "require_gateway_auth": false,
+        "fail_checksum": false}"#;
+    let old: EcuConfig = serde_json::from_str(old).unwrap();
+    assert!(old.dids.is_empty());
+    assert_eq!(old.security_key_mask, None);
+    assert_eq!(old.key_for_seed(0x1), 0x1 ^ SECURITY_KEY_MASK);
+
+    let c = dids_config();
+    assert_eq!(c.security_key_mask, Some(0x3C3C_3C3C));
+    assert_eq!(c.dids[0].did, 0x1200);
+    assert_eq!(c.dids[0].value, [1, 2, 3]);
+    assert_eq!(c.dids[1].did, 0x1201);
+    assert_eq!(c.dids[3].value, [0xAA]);
+    let numeric = DIDS_JSON
+        .replace("\"0x3C3C3C3C\"", "1010580540")
+        .replace("\"0x1200\"", "4608")
+        .replace("\"010203\"", "[1, 2, 3]");
+    let n: EcuConfig = serde_json::from_str(&numeric).unwrap();
+    assert_eq!(n.security_key_mask, c.security_key_mask);
+    assert_eq!(n.dids, c.dids);
+    // The serialized form is numbers and byte arrays, and reads back the same.
+    let json = serde_json::to_value(&c).unwrap();
+    assert_eq!(json["dids"][0]["did"], 0x1200);
+    assert_eq!(json["dids"][0]["value"], serde_json::json!([1, 2, 3]));
+    assert_eq!(json["dids"][1]["write"]["session"], "extended");
+    let back: EcuConfig = serde_json::from_value(json).unwrap();
+    assert_eq!(back.dids, c.dids);
+    assert_eq!(back.security_key_mask, c.security_key_mask);
+}
+
+#[test]
+fn malformed_hex_in_a_configuration_is_refused() {
+    for (from, to) in [
+        ("\"0x1200\"", "\"1200\""),
+        ("\"0x1200\"", "\"0x12G0\""),
+        ("\"0x1200\"", "\"0x\""),
+        ("\"0x1200\"", "\"0x10000\""),
+        ("\"0x1200\"", "70000"),
+        ("\"0x1200\"", "-1"),
+        ("\"010203\"", "\"01020\""),
+        ("\"010203\"", "\"01 02 03\""),
+        ("\"010203\"", "\"0102zz\""),
+        ("\"010203\"", "[256]"),
+        ("\"0x3C3C3C3C\"", "\"0x100000000\""),
+        ("\"0x3C3C3C3C\"", "\"3C3C3C3C\""),
+        ("\"session\": \"extended\"", "\"session\": \"Extended\""),
+    ] {
+        let json = DIDS_JSON.replacen(from, to, 1);
+        assert!(
+            serde_json::from_str::<EcuConfig>(&json).is_err(),
+            "{from} -> {to}"
+        );
+    }
+    let err = serde_json::from_str::<EcuConfig>(&DIDS_JSON.replacen("\"010203\"", "\"01020\"", 1))
+        .unwrap_err();
+    assert!(err.to_string().contains("hex digits"), "{err}");
+}
+
+#[test]
+fn configured_dids_are_read_with_the_builtin_ones() {
+    // D2
+    let mut ecu = dids_ecu();
+    assert_eq!(read(&mut ecu, 0x1200), pos(&[0x62, 0x12, 0x00, 1, 2, 3]));
+    assert_eq!(ecu.request(&[0x22, 0xF1, 0x90, 0x12, 0x02]), {
+        let mut r = vec![0x62, 0xF1, 0x90];
+        r.extend_from_slice(b"WVWZZZ1KZAW000001");
+        r.extend_from_slice(&[0x12, 0x02, 9, 9]);
+        pos(&r)
+    });
+    assert_eq!(read(&mut ecu, 0x1299), neg(0x22, Nrc::RequestOutOfRange));
+}
+
+#[test]
+fn a_configured_did_is_written_in_its_session_after_unlock_and_kept() {
+    // D3
+    let mut ecu = dids_ecu();
+    enter(&mut ecu, Session::Extended);
+    unlock(&mut ecu);
+    assert_eq!(ecu.request(&write(0x1201, &[7, 8, 9])), wrote(0x1201));
+    assert_eq!(read(&mut ecu, 0x1201), pos(&[0x62, 0x12, 0x01, 7, 8, 9]));
+    assert_eq!(ecu.request(&[0x11, 0x01]), pos(&[0x51, 0x01]));
+    ecu.reconnect();
+    assert_eq!(read(&mut ecu, 0x1201), pos(&[0x62, 0x12, 0x01, 7, 8, 9]));
+}
+
+#[test]
+fn a_write_outside_the_configured_session_is_out_of_range() {
+    // D4
+    let mut ecu = dids_ecu();
+    let w = write(0x1201, &[7, 8, 9]);
+    assert_eq!(ecu.request(&w), neg(0x2E, Nrc::RequestOutOfRange));
+    enter(&mut ecu, Session::Programming);
+    unlock(&mut ecu);
+    assert_eq!(ecu.request(&w), neg(0x2E, Nrc::RequestOutOfRange));
+    assert_eq!(read(&mut ecu, 0x1201), pos(&[0x62, 0x12, 0x01, 0, 0, 0]));
+}
+
+#[test]
+fn a_locked_write_is_denied_again_after_a_relock() {
+    // D5
+    let mut ecu = dids_ecu();
+    let w = write(0x1201, &[7, 8, 9]);
+    enter(&mut ecu, Session::Extended);
+    assert_eq!(ecu.request(&w), neg(0x2E, Nrc::SecurityAccessDenied));
+    unlock(&mut ecu);
+    enter(&mut ecu, Session::Extended);
+    assert_eq!(ecu.request(&w), neg(0x2E, Nrc::SecurityAccessDenied));
+    assert_eq!(read(&mut ecu, 0x1201), pos(&[0x62, 0x12, 0x01, 0, 0, 0]));
+}
+
+#[test]
+fn the_length_is_judged_before_security() {
+    // D6
+    let mut ecu = dids_ecu();
+    enter(&mut ecu, Session::Extended);
+    for m in [write(0x1201, &[1, 2]), write(0x1201, &[1, 2, 3, 4])] {
+        assert_eq!(
+            ecu.request(&m),
+            neg(0x2E, Nrc::IncorrectMessageLengthOrInvalidFormat)
+        );
+    }
+    // A request with a DID and no record is too short for the service.
+    assert_eq!(
+        ecu.request(&[0x2E, 0x12, 0x01]),
+        neg(0x2E, Nrc::IncorrectMessageLengthOrInvalidFormat)
+    );
+}
+
+#[test]
+fn read_only_unknown_and_builtin_dids_are_not_writable() {
+    // D7
+    let mut ecu = dids_ecu();
+    enter(&mut ecu, Session::Extended);
+    unlock(&mut ecu);
+    for m in [
+        write(0x1200, &[1, 2, 3]),
+        write(0x1299, &[1]),
+        write(0xF187, b"12345678901"),
+    ] {
+        assert_eq!(ecu.request(&m), neg(0x2E, Nrc::RequestOutOfRange));
+    }
+    assert_eq!(
+        ecu.request_with(Addressing::Functional, &write(0x1200, &[1, 2, 3])),
+        SimResponse::NoResponse
+    );
+    assert_eq!(read(&mut ecu, 0x1200), pos(&[0x62, 0x12, 0x00, 1, 2, 3]));
+}
+
+#[test]
+fn a_did_without_a_level_needs_no_unlock() {
+    // D8
+    let mut ecu = dids_ecu();
+    assert_eq!(
+        ecu.request(&write(0x1202, &[1, 1])),
+        neg(0x2E, Nrc::RequestOutOfRange)
+    );
+    enter(&mut ecu, Session::Extended);
+    assert_eq!(ecu.request(&write(0x1202, &[1, 1])), wrote(0x1202));
+    // P has no session and no level: any session, never locked.
+    let mut ecu = dids_ecu();
+    assert_eq!(ecu.request(&write(0x1203, &[0x55])), wrote(0x1203));
+}
+
+#[test]
+fn a_dids_own_level_decides_whatever_the_ecu_flag_says() {
+    // D9 (ADR-482)
+    let mut c = dids_config();
+    c.require_security_access = false;
+    let mut ecu = SimEcu::new(c);
+    enter(&mut ecu, Session::Extended);
+    assert_eq!(
+        ecu.request(&write(0x1201, &[7, 8, 9])),
+        neg(0x2E, Nrc::SecurityAccessDenied)
+    );
+    unlock(&mut ecu);
+    assert_eq!(ecu.request(&write(0x1201, &[7, 8, 9])), wrote(0x1201));
+    // The flag keeps gating only the built-in services: the VIN needs no unlock here.
+    let mut c = dids_config();
+    c.require_security_access = false;
+    let mut ecu = SimEcu::new(c);
+    enter(&mut ecu, Session::Extended);
+    assert_eq!(
+        ecu.request(&write(0xF190, b"WVWZZZ1KZAW000002")),
+        wrote(0xF190)
+    );
+}
+
+#[test]
+fn gateway_authentication_is_judged_before_a_configured_write() {
+    // D10
+    let mut c = dids_config();
+    c.require_gateway_auth = true;
+    let mut ecu = SimEcu::new(c);
+    enter(&mut ecu, Session::Extended);
+    assert_eq!(
+        ecu.request(&write(0x1201, &[7, 8, 9])),
+        neg(0x2E, Nrc::AuthenticationRequired)
+    );
+    assert_eq!(
+        ecu.request(&write(0x1299, &[7])),
+        neg(0x2E, Nrc::AuthenticationRequired)
+    );
+}
+
+#[test]
+fn the_key_mask_is_configurable() {
+    // D11: the fixture's mask 3C3C3C3C unlocks; the default mask's key does not.
+    let mut ecu = dids_ecu();
+    enter(&mut ecu, Session::Extended);
+    let SimResponse::Positive(seed) = ecu.request(&[0x27, 0x01]) else {
+        panic!("requestSeed failed");
+    };
+    let seed = u32::from_be_bytes([seed[2], seed[3], seed[4], seed[5]]);
+    assert_eq!(ecu.key_for_seed(seed), seed ^ 0x3C3C_3C3C);
+    let wrong = (seed ^ SECURITY_KEY_MASK).to_be_bytes();
+    assert_eq!(
+        ecu.request(&[0x27, 0x02, wrong[0], wrong[1], wrong[2], wrong[3]]),
+        neg(0x27, Nrc::InvalidKey)
+    );
+    unlock(&mut ecu);
+    assert!(ecu.security_unlocked);
+}
+
+#[test]
+fn validate_refuses_bad_configured_dids_and_new_does_not_panic() {
+    // D12
+    let with = |d: DidConfig| EcuConfig {
+        dids: vec![d],
+        ..config()
+    };
+    let did = |did: u16, value: Vec<u8>, write: Option<DidWrite>| DidConfig { did, value, write };
+    let w = |session, security_level| {
+        Some(DidWrite {
+            session,
+            security_level,
+        })
+    };
+    assert!(with(did(0x1200, vec![1], None)).validate().is_ok());
+    assert!(
+        with(did(0x1200, vec![1], w(Some(Session::Extended), Some(1))))
+            .validate()
+            .is_ok()
+    );
+    for built_in in [
+        DID_ACTIVE_DIAGNOSTIC_SESSION,
+        DID_SPARE_PART_NUMBER,
+        DID_SOFTWARE_VERSION,
+        DID_VIN,
+        DID_FLASH_STATE,
+        DID_POWER_CYCLES,
+        DID_BATTERY_VOLTAGE,
+        DID_BOOT_TIME,
+        DID_EXTERNAL_SUPPLY,
+        DID_IGNITION,
+    ] {
+        assert!(with(did(built_in, vec![1], None)).validate().is_err());
+    }
+    let dup = EcuConfig {
+        dids: vec![did(0x1200, vec![1], None), did(0x1200, vec![2], None)],
+        ..config()
+    };
+    assert!(dup.validate().unwrap_err().contains("more than once"));
+    assert!(with(did(0x1200, vec![], None)).validate().is_err());
+    assert!(
+        with(did(0x1200, vec![0; MAX_RESPONSE_LENGTH - 2], None))
+            .validate()
+            .is_err()
+    );
+    assert!(
+        with(did(0x1200, vec![0; MAX_RESPONSE_LENGTH - 3], None))
+            .validate()
+            .is_ok()
+    );
+    assert!(
+        with(did(0x1200, vec![1], w(None, Some(2))))
+            .validate()
+            .is_err()
+    );
+    assert!(
+        with(did(0x1200, vec![1], w(Some(Session::Default), Some(1))))
+            .validate()
+            .is_err()
+    );
+    assert!(
+        with(did(0x1200, vec![1], w(Some(Session::Default), None)))
+            .validate()
+            .is_ok()
+    );
+    // An unvalidated configuration builds: the built-in wins, the first duplicate wins.
+    let mut ecu = SimEcu::new(EcuConfig {
+        dids: vec![
+            did(DID_VIN, vec![1], w(None, None)),
+            did(0x1200, vec![1], None),
+            did(0x1200, vec![2], None),
+        ],
+        ..config()
+    });
+    assert_eq!(read(&mut ecu, 0x1200), pos(&[0x62, 0x12, 0x00, 1]));
+    let SimResponse::Positive(vin) = read(&mut ecu, DID_VIN) else {
+        panic!("VIN read failed");
+    };
+    assert_eq!(&vin[3..], b"WVWZZZ1KZAW000001");
+    enter(&mut ecu, Session::Extended);
+    unlock(&mut ecu);
+    assert_eq!(
+        ecu.request(&write(DID_VIN, &[1])),
+        neg(0x2E, Nrc::IncorrectMessageLengthOrInvalidFormat)
+    );
+}
+
+#[test]
+fn a_snapshot_keeps_a_written_value_and_the_mask() {
+    // D14
+    let mut ecu = dids_ecu();
+    enter(&mut ecu, Session::Extended);
+    unlock(&mut ecu);
+    assert_eq!(ecu.request(&write(0x1201, &[7, 8, 9])), wrote(0x1201));
+    let json = serde_json::to_string(&ecu.snapshot()).unwrap();
+    let snapshot: EcuSnapshot = serde_json::from_str(&json).unwrap();
+    let mut restored = SimEcu::restore(snapshot, ManualClock::default(), ms(0)).unwrap();
+    assert_eq!(
+        read(&mut restored, 0x1201),
+        pos(&[0x62, 0x12, 0x01, 7, 8, 9])
+    );
+    assert_eq!(restored.key_for_seed(1), 1 ^ 0x3C3C_3C3C);
+    assert_eq!(restored.config.dids[1].write, dids_config().dids[1].write);
+}
+
+#[test]
+fn faults_act_on_a_configured_write_as_on_any_request() {
+    // D16
+    let mut ecu = dids_ecu();
+    enter(&mut ecu, Session::Extended);
+    unlock(&mut ecu);
+    ecu.inject(Fault::DropResponse);
+    assert_eq!(
+        ecu.request(&write(0x1201, &[7, 8, 9])),
+        SimResponse::NoResponse
+    );
+    assert_eq!(read(&mut ecu, 0x1201), pos(&[0x62, 0x12, 0x01, 7, 8, 9]));
+    ecu.inject(Fault::NegativeResponse {
+        nrc: Nrc::ConditionsNotCorrect,
+    });
+    assert_eq!(
+        ecu.request(&write(0x1201, &[1, 1, 1])),
+        neg(0x2E, Nrc::ConditionsNotCorrect)
+    );
+    assert_eq!(read(&mut ecu, 0x1201), pos(&[0x62, 0x12, 0x01, 7, 8, 9]));
 }

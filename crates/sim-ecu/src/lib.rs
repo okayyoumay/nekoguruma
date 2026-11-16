@@ -173,9 +173,155 @@ pub struct EcuConfig {
     /// startup in progress). `None` answers at once, as the simulator always did.
     #[serde(default)]
     pub startup_ms: Option<u32>,
+    /// The value the simulator XORs with the seed to form the expected key. [`SECURITY_KEY_MASK`]
+    /// when unset. A JSON number, or a string of hex digits with a `0x` prefix.
+    #[serde(default, deserialize_with = "number_form::opt_u32")]
+    pub security_key_mask: Option<u32>,
+    /// Data identifiers beyond the built-in ones, each with its value, and when it is writable,
+    /// the session and security level a write needs. A write replaces the value here, so the
+    /// state kept across restarts holds it (ADR-241 item 2).
+    #[serde(default)]
+    pub dids: Vec<DidConfig>,
+}
+
+/// A configured data identifier (clauses 10.2 and 10.7): its record is `value`, whose length is
+/// the DID's length. Without `write` the DID is read-only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DidConfig {
+    /// The DID: a JSON number, or a string of hex digits with a `0x` prefix.
+    #[serde(deserialize_with = "number_form::u16")]
+    pub did: u16,
+    /// The record: a JSON array of bytes, or a string of an even number of hex digits.
+    #[serde(deserialize_with = "number_form::bytes")]
+    pub value: Vec<u8>,
+    /// Absent: the DID cannot be written.
+    #[serde(default)]
+    pub write: Option<DidWrite>,
+}
+
+/// What a write to a configured DID needs. The security level, when set, is required whatever
+/// `EcuConfig::require_security_access` says (ADR-482).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DidWrite {
+    /// The only session the write is accepted in. Absent: every session.
+    #[serde(default)]
+    pub session: Option<Session>,
+    /// The security level that must be unlocked. The simulator has one level, so only 1 is
+    /// valid. Absent: no security check.
+    #[serde(default)]
+    pub security_level: Option<u8>,
+}
+
+/// Deserializers that also accept the hex-string form of a number or byte string in human-readable
+/// formats. Compact formats (postcard) keep the plain form.
+mod number_form {
+    use std::fmt;
+
+    use serde::Deserialize;
+    use serde::de::{self, Deserializer, SeqAccess, Visitor};
+
+    struct Number(u64);
+
+    struct NumberVisitor;
+
+    impl Visitor<'_> for NumberVisitor {
+        type Value = Number;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a non-negative number or a hex string with a 0x prefix")
+        }
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<Number, E> {
+            Ok(Number(v))
+        }
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<Number, E> {
+            u64::try_from(v)
+                .map(Number)
+                .map_err(|_| E::custom("number must not be negative"))
+        }
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Number, E> {
+            let digits = v
+                .strip_prefix("0x")
+                .ok_or_else(|| E::custom(format!("hex string {v:?} needs a 0x prefix")))?;
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(E::custom(format!("{v:?} is not a hex number")));
+            }
+            u64::from_str_radix(digits, 16)
+                .map(Number)
+                .map_err(|_| E::custom(format!("{v:?} is too large")))
+        }
+    }
+
+    impl<'de> Deserialize<'de> for Number {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            d.deserialize_any(NumberVisitor)
+        }
+    }
+
+    fn narrow<T: TryFrom<u64>, E: de::Error>(n: u64) -> Result<T, E> {
+        T::try_from(n).map_err(|_| E::custom(format!("{n} is out of range")))
+    }
+
+    pub fn u16<'de, D: Deserializer<'de>>(d: D) -> Result<u16, D::Error> {
+        if d.is_human_readable() {
+            narrow(Number::deserialize(d)?.0)
+        } else {
+            u16::deserialize(d)
+        }
+    }
+
+    pub fn opt_u32<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u32>, D::Error> {
+        if d.is_human_readable() {
+            Option::<Number>::deserialize(d)?
+                .map(|n| narrow(n.0))
+                .transpose()
+        } else {
+            Option::<u32>::deserialize(d)
+        }
+    }
+
+    struct BytesVisitor;
+
+    impl<'de> Visitor<'de> for BytesVisitor {
+        type Value = Vec<u8>;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("an array of bytes or a string of an even number of hex digits")
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<u8>, A::Error> {
+            let mut out = Vec::new();
+            while let Some(byte) = seq.next_element::<u8>()? {
+                out.push(byte);
+            }
+            Ok(out)
+        }
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Vec<u8>, E> {
+            if !v.len().is_multiple_of(2) || !v.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(E::custom(format!(
+                    "{v:?} is not a string of an even number of hex digits"
+                )));
+            }
+            Ok((0..v.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&v[i..i + 2], 16).expect("hex digits checked"))
+                .collect())
+        }
+    }
+
+    pub fn bytes<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        if d.is_human_readable() {
+            d.deserialize_any(BytesVisitor)
+        } else {
+            Vec::<u8>::deserialize(d)
+        }
+    }
 }
 
 impl EcuConfig {
+    /// The key the simulator expects for `seed` (SecurityAccess, clause 9.4).
+    pub fn key_for_seed(&self, seed: u32) -> u32 {
+        seed ^ self.security_key_mask.unwrap_or(SECURITY_KEY_MASK)
+    }
+
     /// Checks that the VIN is exactly 17 ASCII bytes (F190), and that the part number and the
     /// software versions fit the fixed widths F187 and F189 answer with ([`PART_NUMBER_LENGTH`],
     /// [`SW_VERSION_LENGTH`]): ASCII, at most that long (a shorter value is padded with spaces when read). The loaders of a configuration file
@@ -197,8 +343,50 @@ impl EcuConfig {
         if let Some(version) = &self.downloaded_sw_version {
             check("downloaded_sw_version", version, SW_VERSION_LENGTH)?;
         }
+        for (i, did) in self.dids.iter().enumerate() {
+            let name = format!("dids[{i}] ({:#06X})", did.did);
+            if is_builtin_did(did.did) {
+                return Err(format!("{name} is a built-in DID"));
+            }
+            if self.dids[..i].iter().any(|other| other.did == did.did) {
+                return Err(format!("{name} is declared more than once"));
+            }
+            if did.value.is_empty() || did.value.len() > MAX_RESPONSE_LENGTH - 3 {
+                return Err(format!(
+                    "{name} value must be 1 to {} bytes",
+                    MAX_RESPONSE_LENGTH - 3
+                ));
+            }
+            if let Some(write) = &did.write {
+                if write.security_level.is_some_and(|level| level != 1) {
+                    return Err(format!("{name} security_level must be 1"));
+                }
+                if write.session == Some(Session::Default) && write.security_level.is_some() {
+                    return Err(format!(
+                        "{name} cannot need a security level in the default session"
+                    ));
+                }
+            }
+        }
         Ok(())
     }
+}
+
+/// Whether `did` is one the simulator answers itself, which a configured DID cannot replace.
+pub(crate) fn is_builtin_did(did: u16) -> bool {
+    matches!(
+        did,
+        DID_ACTIVE_DIAGNOSTIC_SESSION
+            | DID_SPARE_PART_NUMBER
+            | DID_SOFTWARE_VERSION
+            | DID_VIN
+            | DID_FLASH_STATE
+            | DID_POWER_CYCLES
+            | DID_BATTERY_VOLTAGE
+            | DID_BOOT_TIME
+            | DID_EXTERNAL_SUPPLY
+            | DID_IGNITION
+    )
 }
 
 /// `value` as exactly `width` bytes: padded with spaces, or cut when longer.
@@ -264,6 +452,7 @@ pub struct DtcRecord {
 // ---------------------------------------------------------------- State
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Session {
     Default,
     Extended,
@@ -635,8 +824,8 @@ impl SimEcu {
     }
 
     /// The key the simulator expects for `seed` (SecurityAccess, clause 9.4).
-    pub fn key_for_seed(seed: u32) -> u32 {
-        seed ^ SECURITY_KEY_MASK
+    pub fn key_for_seed(&self, seed: u32) -> u32 {
+        self.config.key_for_seed(seed)
     }
 
     /// Ends the security delay timer started by too many false keys at once, as if it had run

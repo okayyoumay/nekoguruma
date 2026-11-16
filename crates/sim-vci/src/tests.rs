@@ -1719,6 +1719,72 @@ fn a_config_file_with_an_over_long_value_is_refused() {
 }
 
 #[test]
+fn a_config_file_naming_a_built_in_did_is_refused() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    reset(default_ecu_config());
+    let dir = StateDir::new("config-did");
+    let file = dir.0.join("ecu.json");
+    let config = |did: u16| EcuConfig {
+        dids: vec![sim_ecu::DidConfig {
+            did,
+            value: vec![1],
+            write: None,
+        }],
+        ..default_ecu_config()
+    };
+    // SAFETY: the tests that read the environment hold `SERIAL`, as this one does.
+    unsafe { std::env::set_var(ECU_CONFIG_ENV, &file) };
+    std::fs::write(&file, serde_json::to_string(&config(0x1200)).unwrap()).unwrap();
+    let accepted = load_ecu_config();
+    std::fs::write(
+        &file,
+        serde_json::to_string(&config(sim_ecu::DID_VIN)).unwrap(),
+    )
+    .unwrap();
+    let refused = load_ecu_config();
+    lock().ecu = None;
+    let mut device = 0;
+    let opened = unsafe { PassThruOpen(ptr::null(), &mut device) };
+    unsafe { std::env::remove_var(ECU_CONFIG_ENV) };
+    assert!(accepted.is_some());
+    assert!(refused.is_none());
+    assert_eq!(opened, ERR_FAILED);
+    reset(default_ecu_config());
+}
+
+#[test]
+fn the_state_file_keeps_configured_dids_and_the_key_mask() {
+    let dir = StateDir::new("dids");
+    let mut ecu = SimEcu::new(EcuConfig {
+        security_key_mask: Some(0x3C3C_3C3C),
+        dids: vec![sim_ecu::DidConfig {
+            did: 0x1201,
+            value: vec![0, 0, 0],
+            write: Some(sim_ecu::DidWrite {
+                session: Some(Session::Extended),
+                security_level: None,
+            }),
+        }],
+        ..default_ecu_config()
+    });
+    ecu.request(&[0x10, 0x03]);
+    assert_eq!(
+        ecu.request(&[0x2E, 0x12, 0x01, 7, 8, 9]),
+        sim_ecu::SimResponse::Positive(vec![0x6E, 0x12, 0x01])
+    );
+    save_ecu_state(&dir.file(), &mut ecu).expect("the state should be written");
+    let mut loaded = load_ecu_state(&dir.file())
+        .expect("the state should load")
+        .expect("the file exists");
+    assert_eq!(loaded.config.security_key_mask, Some(0x3C3C_3C3C));
+    assert_eq!(loaded.key_for_seed(1), 1 ^ 0x3C3C_3C3C);
+    assert_eq!(
+        loaded.request(&[0x22, 0x12, 0x01]),
+        sim_ecu::SimResponse::Positive(vec![0x62, 0x12, 0x01, 7, 8, 9])
+    );
+}
+
+#[test]
 fn the_state_file_round_trips_the_ecu() {
     let dir = StateDir::new("round-trip");
     let mut ecu = SimEcu::new(default_ecu_config());

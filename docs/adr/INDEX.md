@@ -471,6 +471,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-479](ADR-479-the-server-stores-an-agents-events-in-one-transaction-per-agent-and-answers-on-the-connection-they-came-on.md) | The Server Stores an Agent's Events in One Transaction per Agent and Answers on the Connection They Came On | Accepted (item 7 detailed by ADR-481) | design 5.3, 5.4, 14.1, `api/asyncapi.yaml`, `crates/server`, `db/migrations`, `db/README.md`; details ADR-478 item 6 and supersedes ADR-476 item 5's dropping of `agentEvent` |
 | [ADR-480](ADR-480-a-job-that-names-a-vin-takes-the-servers-vehicle-lock-when-it-is-created-and-frees-it-when-it-ends.md) | A Job That Names a VIN Takes the Server's Vehicle Lock When It Is Created and Frees It When It Ends | Accepted (its first consequence, that a job finished on the agent holds its vehicle until the lock expires, replaced by ADR-481) | design 5.1, 5.3, 8.8, 12, `db/README.md`, `api/openapi.yaml`, `crates/server`, `docs/glossary.md`; annotates ADR-477 item 7 and ADR-476 |
 | [ADR-481](ADR-481-a-stored-job-state-report-is-applied-to-the-senders-own-job-and-an-end-frees-its-vehicle-lock.md) | A Stored Job-State Report Is Applied to the Sender's Own Job, and an End Frees Its Vehicle Lock | Accepted | design 4.3, 5.1, 5.3, 5.6, 8.8, `db/migrations`, `db/README.md`, `api/openapi.yaml`, `api/asyncapi.yaml`, `crates/server`, `crates/shared-proto`, `docs/glossary.md`; details ADR-479 item 7, replaces a consequence each of ADR-480 and ADR-476 |
+| [ADR-482](ADR-482-a-configured-dids-own-security-level-decides-its-write-and-the-ecu-wide-flag-gates-only-the-built-in-services.md) | A Configured DID's Own Security Level Decides Its Write, and the ECU-Wide Flag Gates Only the Built-in Services | Accepted | `crates/sim-ecu`, `crates/sim-ecu/docs/simulated-ecu.md`, `crates/sim-vci`; details ADR-241 item 2 |
 
 ## Status Legend
 
@@ -855,6 +856,7 @@ the predecessor repository these ADRs came from.
 - ADR-457
 - ADR-458
 - ADR-464
+- ADR-482
 
 ### Timestamps / Clock
 - ADR-057 (amended by ADR-102)

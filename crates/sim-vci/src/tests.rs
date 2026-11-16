@@ -1214,14 +1214,20 @@ fn set_gateway_authentication_is_saved_with_the_ecu_state() {
 #[test]
 fn set_gateway_authentication_rejects_unknown_and_missing_fields() {
     let _f = fixture();
+    // Set first, so that a rejected command that reached the ECU would show by clearing it.
+    assert_eq!(
+        control(r#"{"command": "set_gateway_authentication", "authenticated": true}"#),
+        STATUS_NOERROR
+    );
     for command in [
         r#"{"command": "set_gateway_authentication", "authenticated": true, "extra": 1}"#,
         r#"{"command": "set_gateway_authentication"}"#,
-        r#"{"command": "set_gateway_authentication", "authenticated": 1}"#,
+        r#"{"command": "set_gateway_authentication", "authenticated": 0}"#,
+        r#"{"command": "set_gateway_authentication", "authenticated": false, "extra": 1}"#,
     ] {
         assert_eq!(control(command), ERR_FAILED, "{command}");
     }
-    assert!(!with_ecu(|ecu| ecu.gateway_authenticated));
+    assert!(with_ecu(|ecu| ecu.gateway_authenticated));
 }
 
 #[test]

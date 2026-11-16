@@ -686,6 +686,66 @@ async fn the_procedure_code_column_is_added_null_to_existing_jobs() {
     db::close(&pool).await;
 }
 
+// Migration 0011: on a database the migrations just built, `audit_log` and `change_feed` each take
+// a row, of any time, and give it back; both rows land in the default partitions.
+#[tokio::test]
+async fn audit_log_and_change_feed_take_rows_of_any_time_in_their_default_partitions() {
+    let pg = TestPostgres::start();
+    let pool = pg.pool();
+    db::migrate_with(&pool, &db::MIGRATOR, Duration::from_secs(30))
+        .await
+        .expect("the migrations apply");
+    pg.execute(
+        "INSERT INTO audit_log (tenant_id, action) VALUES \
+         (gen_random_uuid(), 'now'), \
+         (gen_random_uuid(), 'past'), (gen_random_uuid(), 'future')",
+    )
+    .await;
+    pg.execute(
+        "UPDATE audit_log SET recorded_at = CASE action \
+           WHEN 'past' THEN timestamptz '1970-01-01 00:00:00+00' \
+           WHEN 'future' THEN timestamptz '2999-12-31 23:59:59+00' \
+           ELSE recorded_at END",
+    )
+    .await;
+    pg.execute(
+        "INSERT INTO change_feed (tenant_id, kind, payload, occurred_at) VALUES \
+         (gen_random_uuid(), 'now', '{\"a\": 1}', now()), \
+         (gen_random_uuid(), 'past', '{}', timestamptz '1970-01-01 00:00:00+00')",
+    )
+    .await;
+    assert_eq!(
+        pg.scalar("SELECT string_agg(action, ',' ORDER BY action) FROM audit_log")
+            .await,
+        "future,now,past"
+    );
+    assert_eq!(
+        pg.scalar("SELECT payload->>'a' FROM change_feed WHERE kind = 'now'")
+            .await,
+        "1"
+    );
+    // Every row is in the default partitions, the tables' only partitions.
+    assert_eq!(
+        pg.scalar(
+            "SELECT (SELECT count(*) FROM audit_log_default) || '|' || \
+                    (SELECT count(*) FROM change_feed_default)"
+        )
+        .await,
+        "3|2"
+    );
+    assert_eq!(
+        pg.scalar(
+            "SELECT string_agg(c.relname || ':' || pg_get_expr(c.relpartbound, c.oid), ',' \
+                    ORDER BY c.relname) \
+             FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid \
+             WHERE i.inhparent IN ('audit_log'::regclass, 'change_feed'::regclass)"
+        )
+        .await,
+        "audit_log_default:DEFAULT,change_feed_default:DEFAULT"
+    );
+    db::close(&pool).await;
+}
+
 /// The SQLSTATE of a failed statement.
 fn sqlstate<T>(outcome: &Result<T, sqlx::Error>) -> Option<String> {
     match outcome {

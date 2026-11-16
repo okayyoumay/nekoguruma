@@ -20,6 +20,8 @@ ADR-476).
 5.3, 5.4, ADR-478 item 6, ADR-479).
 `migrations/0010_job_procedure_code.sql` adds `jobs.procedure_code`, the procedure's own code of a
 failed job (design 5.6, ADR-475, ADR-481).
+`migrations/0011_default_partitions.sql` gives `change_feed` and `audit_log` a default partition, so
+their first insert no longer fails for want of a partition.
 
 ## How migrations are applied
 
@@ -169,7 +171,10 @@ The unit of 3-way merge (4.4) is the item, so `work_record_items.version` exists
 
 **Partition ever-growing tables**
 `change_feed` and `audit_log` are `RANGE` partitioned. They are operated by setting a retention period
-and dropping old partitions (15.1).
+and dropping old partitions (15.1). Each has a default partition (`change_feed_default`,
+`audit_log_default`, migration 0011) that takes every row no range partition takes; with no range
+partition yet, it takes them all. Attaching a range partition checks the default partition for rows
+in that range, so those rows are moved out of it before the range partition is attached.
 
 ## Tables not created
 

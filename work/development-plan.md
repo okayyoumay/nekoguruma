@@ -29,7 +29,7 @@ M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 20
 
 **Scope.**
 
-- `server`: axum, PostgreSQL via sqlx with the `db/migrations` schema, local users (13.3), job queue with `FOR UPDATE SKIP LOCKED` (12), object storage trait with the local-file implementation.
+- `server`: axum, PostgreSQL via sqlx with the `db/migrations` schema, local users (13.3), job queue with `FOR UPDATE SKIP LOCKED` (12), object storage trait with an S3-compatible implementation, served on the local profile by a bundled S3-compatible server that the agent uploads to directly through pre-signed URLs (decided by the maintainer, 2026-11-17).
 - Control channel WSS and data channel HTTPS with resumable chunks (5.2); idempotent commands, start deadlines, sequence-numbered outbox and reconnection reconciliation (5.3).
 - Agent identity, installation and initial registration (6.1, 6.4, 6.7); job instruction signing and verification in `shared-crypto` (11.1).
 - `api/openapi.yaml` and `api/asyncapi.yaml` kept in sync with the implementation.

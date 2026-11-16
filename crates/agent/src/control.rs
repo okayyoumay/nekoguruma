@@ -412,7 +412,7 @@ impl Opened {
     }
 
     /// Step 2: compares `key`'s fingerprint with the record's and starts the loop, whose first
-    /// exchange begins at once; `intake` takes every instruction the gate verifies and `outbox`
+    /// exchange begins at once; `intake` takes every instruction the gate verifies and allows (ADR-483) and `outbox`
     /// is the open outbox of the record's agent ID, whose events each connection sends. Needs a
     /// running tokio runtime. On an error nothing was sent and both locks are released.
     pub fn start(

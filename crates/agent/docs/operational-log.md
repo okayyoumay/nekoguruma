@@ -98,7 +98,7 @@ throughout.
   failure code `operatorNotAllowed`; it never holds the operator ID, the owner ID or a
   `commandId`. The gate bounds it as it bounds the refused-instruction entry: the first per
   connection at `warn`, later ones at `debug`, and the end-of-connection `info` line of refused
-  instructions carries the count as `operator_not_allowed`.
+  instructions carries the count as `operator_not_allowed`. The warning and the count are refusals decided, not refusals recorded: when the outbox is full the command stays unacknowledged, and its redelivery is decided and counted again.
 
 - **The control channel session** (`agent::control`, ADR-471): the entries hold a failure
   class, an HTTP status, a close code and the heartbeat interval. They never hold the token, the

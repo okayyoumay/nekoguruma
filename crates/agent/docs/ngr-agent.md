@@ -420,8 +420,9 @@ connect`, above) loads the agent key and passes it in.
   once both locks are released) and `status()`, a watch of the phase, the heartbeat interval, the
   next delay and `commands_acknowledged` and `commands_rejected`, the job commands answered
   `commandAck` and `commandRejected` over all connections (a command is counted once its answer
-  is written). `intake` is the `Intake` trait object that takes every verified instruction; the
-  default, `LogIntake`, is connected to no job runner: it logs the job ID at `debug` and drops the
+  is written; a job refused for its operator was answered `commandAck` and counts under
+  `commands_acknowledged`). `intake` is the `Intake` trait object that takes every verified instruction whose operator
+  the gate allows (ADR-483); the default, `LogIntake`, is connected to no job runner: it logs the job ID at `debug` and drops the
   instruction. `outbox` is the `SharedOutbox` around the open `Outbox` of the record's agent ID
   (below); the caller opens it, and the connections send its events.
 - **Both locks are held from `open` until the task ends**, waits included, and released by drop

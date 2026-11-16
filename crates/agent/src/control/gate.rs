@@ -27,7 +27,8 @@ use shared_proto::{FailureCode, InstructionRejectReason};
 use crate::instruction::{self, Refusal, VerifiedInstruction};
 
 /// Where a verified job instruction goes. The control channel hands it over before it answers
-/// `commandAck`.
+/// `commandAck`. An instruction whose operator the gate does not allow (ADR-483) is not handed
+/// over: the job is refused and the intake never sees it.
 ///
 /// An intake can receive the same verified instruction twice: the hand-over succeeded, then the
 /// ack was lost (the write failed or the connection ended) and the server redelivers the command
@@ -79,8 +80,9 @@ pub(super) enum Admitted {
     OperatorNotAllowed { job_id: String },
 }
 
-/// Refusals so far on one connection, one counter per reason. A field per reason, bumped through
-/// one exhaustive `match`, so a new reason fails the build here and cannot index out of range.
+/// Refusals so far on one connection, one counter per reason. A field per command refusal reason,
+/// bumped through one exhaustive `match`, so a new reason fails the build here and cannot index out
+/// of range. The operator counter is not a command refusal reason: [`Gate::accept`] bumps it.
 #[derive(Default)]
 struct Refused {
     malformed: u64,
@@ -311,5 +313,29 @@ mod tests {
             Err(InstructionRejectReason::NotForThisAgent)
         ));
         assert!(gate.refused.operator_not_allowed == 0);
+    }
+
+    // O7: a command that fails verification is refused for that, whatever operator it names; the
+    // operator is read only from an instruction that verified.
+    #[test]
+    fn a_command_that_fails_verification_is_refused_for_that_whatever_its_operator() {
+        let key = SigningKey::generate().unwrap();
+        let public = key.public_key();
+        let foreign = SigningKey::generate().unwrap();
+        for operator in [OWNER, "someone-else"] {
+            let mut gate = Gate::new(&public, AGENT, OWNER, "personal");
+            let text = sealed(&foreign, AGENT, operator);
+            assert!(matches!(
+                gate.admit(Some(&text)),
+                Err(InstructionRejectReason::UnknownKey)
+            ));
+            let mut bytes = STANDARD.decode(sealed(&key, AGENT, operator)).unwrap();
+            *bytes.last_mut().unwrap() ^= 1;
+            assert!(matches!(
+                gate.admit(Some(&STANDARD.encode(bytes))),
+                Err(InstructionRejectReason::BadSignature)
+            ));
+            assert_eq!(gate.refused.operator_not_allowed, 0);
+        }
     }
 }

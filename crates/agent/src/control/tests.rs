@@ -906,8 +906,12 @@ enum Tamper {
     Truncate,
     /// Sealed by a key the agent does not trust.
     ForeignKey,
+    /// Sealed by a key the agent does not trust, for an operator who is not the owner.
+    ForeignKeyOtherOperator,
     /// A payload byte changed after signing.
     FlipPayload,
+    /// A payload byte changed after signing, in a body naming an operator who is not the owner.
+    FlipPayloadOtherOperator,
     /// An unknown envelope format byte.
     Format,
     /// The body names another agent.
@@ -936,7 +940,10 @@ fn signed_command(fx: &Fixture, id: &str, agent: &str, tamper: Tamper) -> Signed
             _ => agent.to_owned(),
         }),
         operator_id: match tamper {
-            Tamper::OtherOperator | Tamper::OtherAgentAndOperator => OTHER_OPERATOR.to_owned(),
+            Tamper::OtherOperator
+            | Tamper::OtherAgentAndOperator
+            | Tamper::ForeignKeyOtherOperator
+            | Tamper::FlipPayloadOtherOperator => OTHER_OPERATOR.to_owned(),
             _ => OWNER_ID.to_owned(),
         },
         kind: JobKind::RunSequence,
@@ -951,7 +958,7 @@ fn signed_command(fx: &Fixture, id: &str, agent: &str, tamper: Tamper) -> Signed
     let payload = body.encode().unwrap();
     let foreign;
     let key = match tamper {
-        Tamper::ForeignKey => {
+        Tamper::ForeignKey | Tamper::ForeignKeyOtherOperator => {
             foreign = SigningKey::generate().unwrap();
             &foreign
         }
@@ -960,10 +967,11 @@ fn signed_command(fx: &Fixture, id: &str, agent: &str, tamper: Tamper) -> Signed
     let mut bytes = envelope::seal(key, &payload).unwrap();
     match tamper {
         Tamper::Truncate => bytes.truncate(5),
-        Tamper::FlipPayload => *bytes.last_mut().unwrap() ^= 1,
+        Tamper::FlipPayload | Tamper::FlipPayloadOtherOperator => *bytes.last_mut().unwrap() ^= 1,
         Tamper::Format => bytes[0] = bytes[0].wrapping_add(1),
         Tamper::None
         | Tamper::ForeignKey
+        | Tamper::ForeignKeyOtherOperator
         | Tamper::OtherAgent
         | Tamper::OtherOperator
         | Tamper::OtherAgentAndOperator => {}
@@ -4246,7 +4254,9 @@ async fn operator_o7_a_forged_command_is_rejected_for_its_signature_not_its_oper
     let (hello_at, mut ws) = env.connected(60).await;
     for (tamper, reason) in [
         (Tamper::ForeignKey, "unknownKey"),
+        (Tamper::ForeignKeyOtherOperator, "unknownKey"),
         (Tamper::FlipPayload, "badSignature"),
+        (Tamper::FlipPayloadOtherOperator, "badSignature"),
     ] {
         send(
             &mut ws,
@@ -4254,6 +4264,7 @@ async fn operator_o7_a_forged_command_is_rejected_for_its_signature_not_its_oper
         )
         .await;
         let (_, rejected) = answer(&mut ws).await;
+        assert_eq!(rejected["type"], "commandRejected");
         assert_eq!(rejected["reason"], reason);
     }
     assert_after(
@@ -4263,7 +4274,7 @@ async fn operator_o7_a_forged_command_is_rejected_for_its_signature_not_its_oper
         "tick: no event came",
     );
     assert!(env.intake.0.lock().unwrap().is_empty());
-    assert_eq!(env.counts(), (0, 2));
+    assert_eq!(env.counts(), (0, 4));
 }
 
 /// O8: a refusal whose append fails to write withholds the ack and closes with 1011, as a
@@ -4316,6 +4327,93 @@ async fn operator_o8_a_full_outbox_withholds_the_ack_of_a_refusal() {
     assert_eq!(env.counts(), (0, 0));
     assert!(env.intake.0.lock().unwrap().is_empty());
     assert_eq!(env.log.warns("outbox-full"), 1);
+}
+
+/// O8: a stop during the refusal's append ends as a stop, writes no ack and leaves a valid file
+/// (as C16 does for `received`).
+#[tokio::test(start_paused = true)]
+async fn operator_o8_a_stop_during_the_refusal_append_ends_as_a_stop_and_writes_no_ack() {
+    let hold = Arc::new(AtomicBool::new(false));
+    let entered = Arc::new(AtomicBool::new(false));
+    let (probe_hold, probe_entered) = (hold.clone(), entered.clone());
+    let mut env = Env::with(Opts {
+        probe: Some(Box::new(move |step| {
+            if step == crate::outbox::Step::BeforeWrite && probe_hold.load(Ordering::SeqCst) {
+                probe_entered.store(true, Ordering::SeqCst);
+                while probe_hold.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            Ok(())
+        })),
+        ..Opts::default()
+    });
+    let (_, mut ws) = env.connected(60).await;
+    hold.store(true, Ordering::SeqCst);
+    send(&mut ws, &foreign_operator(&env, "a")).await;
+    while !entered.load(Ordering::SeqCst) {
+        tokio::task::yield_now().await;
+    }
+    env.handle.stop();
+    close_of(&mut ws, 1001, true).await;
+    env.handle.stopped().await;
+    assert_eq!(got(&mut ws).await.1, Got::Eof, "no ack");
+    assert_eq!(env.counts(), (0, 0));
+    assert!(env.intake.0.lock().unwrap().is_empty());
+    env.outbox = None;
+    hold.store(false, Ordering::SeqCst);
+    let dir = env.fx.dir.path().join("outbox");
+    let outbox = loop {
+        match Outbox::open_in(&dir, AGENT_ID) {
+            Err(crate::outbox::OutboxError::InUse) => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            other => break other.unwrap(),
+        }
+    };
+    assert_eq!(outbox.pending().count(), 1);
+}
+
+/// O8: a refusal that finds the outbox still poisoned closes with 1011 and writes no ack; once the
+/// fault clears the redelivered command is refused and acknowledged.
+#[tokio::test(start_paused = true)]
+async fn operator_o8_a_poisoned_outbox_withholds_the_ack_of_a_refusal_with_1011() {
+    let write_fails = Arc::new(AtomicBool::new(false));
+    let open_fails = Arc::new(AtomicBool::new(false));
+    let (write_flag, open_flag) = (write_fails.clone(), open_fails.clone());
+    let mut env = Env::with(Opts {
+        probe: Some(Box::new(move |step| {
+            let failing = match step {
+                crate::outbox::Step::BeforeWrite => write_flag.load(Ordering::SeqCst),
+                crate::outbox::Step::AfterRename => open_flag.load(Ordering::SeqCst),
+                _ => false,
+            };
+            if failing {
+                return Err(io::Error::other("a scripted failure"));
+            }
+            Ok(())
+        })),
+        ..Opts::default()
+    });
+    let (_, mut ws) = env.connected(60).await;
+    write_fails.store(true, Ordering::SeqCst);
+    open_fails.store(true, Ordering::SeqCst);
+    send(&mut ws, &foreign_operator(&env, "a")).await;
+    close_of(&mut ws, 1011, true).await;
+    // The reopen fails before this connection: the command finds the outbox poisoned.
+    let (_, mut ws) = env.connected(60).await;
+    send(&mut ws, &foreign_operator(&env, "a")).await;
+    close_of(&mut ws, 1011, true).await;
+    assert_eq!(env.counts(), (0, 0));
+    assert!(env.intake.0.lock().unwrap().is_empty());
+    assert!(env.log.warns("outbox-poisoned") >= 1);
+    write_fails.store(false, Ordering::SeqCst);
+    open_fails.store(false, Ordering::SeqCst);
+    let (_, mut ws) = env.connected(60).await;
+    send(&mut ws, &foreign_operator(&env, "a")).await;
+    let (_, answered) = answer(&mut ws).await;
+    assert_eq!(answered["type"], "commandAck");
+    assert_eq!(event_json(&mut ws).await, operator_refusal_of(1));
 }
 
 /// O9: the same refused command delivered twice gets two events and two acks.

@@ -30,9 +30,9 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use shared_proto::{
-    AgentEventKind, AgentEventMessage, AgentMessage, CLOSE_CODE_BINARY, CLOSE_CODE_GOING_AWAY,
-    CLOSE_CODE_IDLE, CLOSE_CODE_PROTOCOL, CLOSE_CODE_REPLACED, CLOSE_CODE_REVOKED,
-    CLOSE_CODE_TOO_BIG, CONTROL_SUBPROTOCOL, FailureCode, HEARTBEAT_MISSED_LIMIT, JobId,
+    AgentEventMessage, AgentMessage, CLOSE_CODE_BINARY, CLOSE_CODE_GOING_AWAY, CLOSE_CODE_IDLE,
+    CLOSE_CODE_PROTOCOL, CLOSE_CODE_REPLACED, CLOSE_CODE_REVOKED, CLOSE_CODE_TOO_BIG,
+    CONTROL_SUBPROTOCOL, FailureCode, HEARTBEAT_MISSED_LIMIT, JobId, JobState,
     MAX_CONTROL_MESSAGE_LEN, ServerMessage, close_reason,
 };
 use tokio::time::Instant;
@@ -530,11 +530,14 @@ async fn connected(
                             Some(Admitted::Accepted(verified)) => {
                                 let job_id = verified.instruction().job_id.0.clone();
                                 w.intake.take(*verified);
-                                Some(record_job_state(w, state.stop, job_id, None).await)
+                                Some(record_job_state(w, state.stop, job_id, JobState::Received).await)
                             }
                             Some(Admitted::OperatorNotAllowed { job_id }) => {
-                                let code = Some(FailureCode::OperatorNotAllowed);
-                                Some(record_job_state(w, state.stop, job_id, code).await)
+                                let refused = JobState::PreconditionFailed {
+                                    code: FailureCode::OperatorNotAllowed,
+                                    detail: String::new(),
+                                };
+                                Some(record_job_state(w, state.stop, job_id, refused).await)
                             }
                         };
                         match recorded {
@@ -622,28 +625,18 @@ enum Recorded {
     Failed(&'static str, OutboxError),
 }
 
-/// The text of the first event of `job_id` with number `seq`: `received`, or with a `refusal`
-/// the terminal `preconditionFailed` event with that code and no detail (ADR-483). No device time
-/// is given: the property is optional and the server stamps its own receive time (16.3).
+/// The text of the first event of `job_id` with number `seq`: the job's `state`, `received` or
+/// the terminal `preconditionFailed` of a refusal (ADR-483). No device time is given: the property
+/// is optional and the server stamps its own receive time (16.3).
 fn first_event(
     job_id: &str,
     seq: u64,
-    refusal: Option<&FailureCode>,
+    state: &shared_proto::JobState,
 ) -> Result<String, shared_proto::ControlError> {
-    let (state, failure_code) = match refusal {
-        None => (shared_proto::JobState::Received.wire_name(), None),
-        Some(code) => ("preconditionFailed", Some(code.wire_name().to_owned())),
-    };
     AgentMessage::AgentEvent(AgentEventMessage {
         seq: Some(seq),
         occurred_at_agent: None,
-        event: AgentEventKind::JobState {
-            job_id: JobId(job_id.to_owned()),
-            state: state.to_owned(),
-            failure_code,
-            procedure_code: None,
-            detail: None,
-        },
+        event: state.to_event_kind(JobId(job_id.to_owned())),
     })
     .encode()
 }
@@ -651,19 +644,14 @@ fn first_event(
 /// Appends the job's first event on a blocking task, raced with the stop (ADR-478 item 5):
 /// `received`, or the refusal's terminal event. Both are `Kind::Received` for the admission bound.
 /// It is tried once per command: the server's redelivery after the lease is the retry.
-async fn record_job_state(
-    w: &Wiring,
-    stop: &Stop,
-    job_id: String,
-    refusal: Option<FailureCode>,
-) -> Recorded {
+async fn record_job_state(w: &Wiring, stop: &Stop, job_id: String, state: JobState) -> Recorded {
     // The longest number the counter gives, so the text that is appended encodes as well.
-    if let Err(error) = first_event(&job_id, u64::MAX - 1, refusal.as_ref()) {
+    if let Err(error) = first_event(&job_id, u64::MAX - 1, &state) {
         let error = OutboxError::Io(std::io::Error::other(error.to_string()));
         return Recorded::Failed("outbox-event", error);
     }
     let append = w.outbox.append(Kind::Received, move |seq| {
-        first_event(&job_id, seq, refusal.as_ref()).unwrap_or_default()
+        first_event(&job_id, seq, &state).unwrap_or_default()
     });
     let appended = tokio::select! {
         biased;

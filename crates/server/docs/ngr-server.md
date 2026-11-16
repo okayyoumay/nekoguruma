@@ -737,7 +737,7 @@ connection with hyper's `with_upgrades()`.
   (only when `strict_device_time` accepts it) and the exact text, and a `jobState` event is then
   applied to the sender's own job in the same transaction (design 5.6, ADR-481): `job_state.rs`
   reads the event into a `Report` (the state, the failure code kept for failed and
-  preconditionFailed only with the server's own two and unknown names read as `other`, the
+  preconditionFailed only, the server-only codes and unknown names read as `other`, the
   procedure code only for failed with `procedure` and 1 to 128 bytes without U+0000, never cut, the detail
   only for failed, preconditionFailed and needsOnSiteRecovery with U+0000 replaced by U+FFFD and
   the text cut to 1024 bytes on a character boundary, empty as none), the row is locked

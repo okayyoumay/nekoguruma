@@ -14,13 +14,19 @@
 //! device time only when [`strict_device_time`] accepts it, so that no value of the frame can make
 //! the insert fail for good.
 //!
+//! A stored `jobState` event is then applied to its job (design 5.6, ADR-481): in the same
+//! transaction, under a lock on the sender's own job row, [`crate::job_state::decide`] picks one
+//! write, and the one that ends the job deletes the job's own vehicle lock in the same statement. A
+//! report that is not applied is stored and acknowledged all the same.
+//!
 //! Never logged: the text of an event.
 
-use shared_proto::{AgentEventKind, AgentId, AgentMessage, is_canonical_uuid};
+use shared_proto::{AgentEventKind, AgentId, AgentMessage, JobState, is_canonical_uuid};
 use sqlx::PgPool;
 
 use crate::db::statement_timeouts;
 use crate::hub::{ConnectionId, Inbound};
+use crate::job_state::{Current, Decision, Report, decide};
 
 /// A numbered event of one agent, as the queue keeps it until it is stored.
 #[derive(Debug, Clone)]
@@ -36,6 +42,8 @@ pub(crate) struct Event {
     pub(crate) occurred_at: Option<String>,
     /// The exact text of the frame.
     pub(crate) text: String,
+    /// What a `jobState` event reports (design 5.6); none for any other kind.
+    pub(crate) report: Option<Report>,
 }
 
 impl Event {
@@ -48,9 +56,24 @@ impl Event {
         let (Some(seq), Some(_)) = (event.seq, &inbound.text) else {
             return Err(Box::new(inbound));
         };
-        let (kind, job_id) = match &event.event {
-            AgentEventKind::JobState { job_id, .. } => ("jobState", &job_id.0),
-            AgentEventKind::HmiRequest { job_id, .. } => ("hmiRequest", &job_id.0),
+        let (kind, job_id, report) = match &event.event {
+            AgentEventKind::JobState {
+                job_id,
+                state,
+                failure_code,
+                procedure_code,
+                detail,
+            } => (
+                "jobState",
+                &job_id.0,
+                Some(Report::of(
+                    state,
+                    failure_code.as_deref(),
+                    procedure_code.as_deref(),
+                    detail.as_deref(),
+                )),
+            ),
+            AgentEventKind::HmiRequest { job_id, .. } => ("hmiRequest", &job_id.0, None),
             // The codec refuses a number on `progress`; it is never stored.
             AgentEventKind::Progress { .. } => return Err(Box::new(inbound)),
         };
@@ -69,6 +92,7 @@ impl Event {
             job_id,
             occurred_at,
             text,
+            report,
         })
     }
 }
@@ -207,9 +231,39 @@ pub(crate) struct Stored {
     pub(crate) closes: Vec<(ConnectionId, u64, Cause)>,
     pub(crate) stored: u64,
     pub(crate) repeats: u64,
+    /// The stored events that wrote to their job (design 5.6, ADR-481).
+    pub(crate) applied: u64,
+    /// The stored `jobState` events that wrote nothing: the job is not the sender's or does not
+    /// exist (a job ID that is not canonical included), is finished, or the report is not a state.
+    pub(crate) ignored: u64,
+    /// The reports not applied that the caller logs, after the commit.
+    pub(crate) unapplied: Vec<Unapplied>,
+}
+
+/// A report that was stored and not applied to its job, as the caller logs it: names only, never
+/// the text.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Unapplied {
+    pub(crate) seq: u64,
+    /// The job the report names, when that is a canonical UUID.
+    pub(crate) job_id: Option<String>,
+    /// The job's state, or `unknown` for a name that is not a state or a job that is not found.
+    pub(crate) current: &'static str,
+    pub(crate) reported: &'static str,
 }
 
 impl Stored {
+    /// A report that wrote nothing and is to be logged.
+    fn not_applied(&mut self, seq: u64, job: Option<&str>, current: &'static str, report: &Report) {
+        self.ignored += 1;
+        self.unapplied.push(Unapplied {
+            seq,
+            job_id: job.map(str::to_owned),
+            current,
+            reported: report.name(),
+        });
+    }
+
     fn ack(&mut self, connection: ConnectionId, seq: u64) {
         match self.acks.iter_mut().find(|(c, _)| *c == connection) {
             Some((_, highest)) => *highest = (*highest).max(seq),
@@ -230,6 +284,33 @@ const INSERT_SQL: &str = "INSERT INTO agent_events \
 /// Whether the stored row's text equals `$4`; no row when it was deleted.
 const COMPARE_SQL: &str = "SELECT body = $4 FROM agent_events \
      WHERE tenant_id = $1::uuid AND agent_id = $2::uuid AND seq = $3";
+/// The sender's own job, locked: `$3` is the sender, so another agent's job is no row.
+const JOB_LOCK_SQL: &str = "SELECT state, finished_at IS NOT NULL FROM jobs \
+     WHERE tenant_id = $1::uuid AND id = $2::uuid AND agent_id = $3::uuid FOR UPDATE";
+/// `received`: the stamps, never the state. The times are the transaction's, not the device's
+/// (design 16.3).
+const DELIVERED_SQL: &str = "UPDATE jobs SET last_reported_at = now(), \
+     delivered_at = coalesce(delivered_at, now()) \
+     WHERE tenant_id = $1::uuid AND id = $2::uuid";
+const TOUCH_SQL: &str = "UPDATE jobs SET last_reported_at = now() \
+     WHERE tenant_id = $1::uuid AND id = $2::uuid";
+/// `$3` the state. A job that an agent's needsOnSiteRecovery had ended is open again: no end, no
+/// failure. It takes no lock again.
+const MOVE_SQL: &str = "UPDATE jobs SET state = $3, finished_at = NULL, failure_code = NULL, \
+     procedure_code = NULL, failure_detail = NULL, last_reported_at = now(), \
+     delivered_at = coalesce(delivered_at, now()) \
+     WHERE tenant_id = $1::uuid AND id = $2::uuid";
+/// `$3` the state, `$4` the failure code, `$5` the procedure code, `$6` the detail. The job's own
+/// vehicle lock goes in the same statement (design 8.8, ADR-480); a lock another job took after
+/// this one's expired stays.
+const END_SQL: &str = "WITH ended AS ( \
+       UPDATE jobs SET state = $3, failure_code = $4, procedure_code = $5, failure_detail = $6, \
+           finished_at = now(), last_reported_at = now(), \
+           delivered_at = coalesce(delivered_at, now()) \
+       WHERE tenant_id = $1::uuid AND id = $2::uuid \
+       RETURNING tenant_id, id, vin) \
+     DELETE FROM vehicle_locks l USING ended e \
+     WHERE l.tenant_id = e.tenant_id AND l.vin = e.vin AND l.job_id = e.id";
 const CURSOR_MOVE_SQL: &str = "UPDATE agent_event_cursor SET last_seq = $3, updated_at = now() \
      WHERE tenant_id = $1::uuid AND agent_id = $2::uuid";
 
@@ -282,6 +363,14 @@ pub(crate) async fn store(
                     .await?;
                 out.stored += 1;
                 out.ack(event.connection, event.seq);
+                match (&event.job_id, &event.report) {
+                    (Some(job), Some(report)) => {
+                        apply(&mut tx, &tenant, agent, job, event.seq, report, &mut out).await?;
+                    }
+                    // A job ID that is not canonical names no job.
+                    (None, Some(report)) => out.not_applied(event.seq, None, "unknown", report),
+                    _ => {}
+                }
             }
             Verdict::Repeat => {
                 let same: Option<(bool,)> = sqlx::query_as(COMPARE_SQL)
@@ -313,6 +402,56 @@ pub(crate) async fn store(
     }
     tx.commit().await?;
     Ok(out)
+}
+
+/// Applies a stored report to its job in the transaction of [`store`].
+async fn apply(
+    tx: &mut sqlx::PgConnection,
+    tenant: &str,
+    agent: &AgentId,
+    job: &str,
+    seq: u64,
+    report: &Report,
+    out: &mut Stored,
+) -> Result<(), sqlx::Error> {
+    let row: Option<(String, bool)> = sqlx::query_as(JOB_LOCK_SQL)
+        .bind(tenant)
+        .bind(job)
+        .bind(&agent.0)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let current = row.map(|(state, finished)| Current { state, finished });
+    let state = report.name();
+    let query = match decide(current.as_ref(), report) {
+        Decision::NoJob => {
+            out.not_applied(seq, Some(job), "unknown", report);
+            return Ok(());
+        }
+        Decision::Ignore { warn } => {
+            if warn {
+                let current = current.as_ref().map_or("unknown", |c| {
+                    JobState::from_wire_name(&c.state).map_or("unknown", |s| s.wire_name())
+                });
+                out.not_applied(seq, Some(job), current, report);
+            } else {
+                out.ignored += 1;
+            }
+            return Ok(());
+        }
+        Decision::Delivered => sqlx::query(DELIVERED_SQL).bind(tenant).bind(job),
+        Decision::Touch => sqlx::query(TOUCH_SQL).bind(tenant).bind(job),
+        Decision::Move => sqlx::query(MOVE_SQL).bind(tenant).bind(job).bind(state),
+        Decision::End => sqlx::query(END_SQL)
+            .bind(tenant)
+            .bind(job)
+            .bind(state)
+            .bind(report.failure_code)
+            .bind(&report.procedure_code)
+            .bind(&report.detail),
+    };
+    query.execute(&mut *tx).await?;
+    out.applied += 1;
+    Ok(())
 }
 
 #[cfg(test)]

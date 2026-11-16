@@ -703,3 +703,58 @@ async fn events_seen_while_the_cursor_is_held_are_stored_once_across_a_kill_and_
     f.server.take().unwrap().finish().await;
     f.world.finish().await;
 }
+
+/// The real agent's `received` event is applied to its job once (design 5.3, 5.6, ADR-481; J21):
+/// the job stays `received` and carries the time of the report. The event is stored while the
+/// agent is gone, so the agent sends it again after a restart; the repeat is answered with the
+/// cursor and changes nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_agents_received_event_stamps_its_job_once_and_a_resend_changes_nothing() {
+    let mut f = Fixture::with_queue(true).await;
+    sqlx::query(
+        "INSERT INTO agent_event_cursor (tenant_id, agent_id) \
+         SELECT tenant_id, id FROM agents WHERE id = $1::uuid",
+    )
+    .bind(&f.agent_id)
+    .execute(&f.world.pool)
+    .await
+    .unwrap();
+    let mut held = f.world.pool.begin().await.unwrap();
+    sqlx::query("SELECT last_seq FROM agent_event_cursor WHERE agent_id = $1::uuid FOR UPDATE")
+        .bind(&f.agent_id)
+        .fetch_one(&mut *held)
+        .await
+        .unwrap();
+    let mut agent = f.start_agent();
+    f.wait_connected(Some(&mut agent), true).await;
+    let envelope = f.envelope(JOB_ID, false).await;
+    f.add_job(JOB_ID, 1, &envelope).await;
+    // The delivery is acknowledged by the agent (the commandAck), and its event waits on the lock.
+    f.until_job(JOB_ID, "received|||true").await;
+    until_count(&f.counts.seen, 1, "the events seen", &agent).await;
+    assert_eq!(f.counts.applied.load(Ordering::Relaxed), 0);
+    agent.kill();
+    f.wait_connected(None, false).await;
+    held.commit().await.unwrap();
+    until_count(&f.counts.applied, 1, "the reports applied", &agent).await;
+    let reported = f
+        .world
+        .sql("SELECT coalesce(last_reported_at::text, '-') FROM jobs")
+        .await;
+    assert_ne!(reported, "-");
+    f.until_job(JOB_ID, "received|||true").await;
+    let mut agent = f.start_agent();
+    f.wait_connected(Some(&mut agent), true).await;
+    until_count(&f.counts.duplicates, 1, "the repeats", &agent).await;
+    assert_eq!(f.counts.applied.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        f.world
+            .sql("SELECT coalesce(last_reported_at::text, '-') FROM jobs")
+            .await,
+        reported
+    );
+    f.until_job(JOB_ID, "received|||true").await;
+    agent.stop().await;
+    f.server.take().unwrap().finish().await;
+    f.world.finish().await;
+}

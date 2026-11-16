@@ -15,6 +15,15 @@
 //! changes no job, E19 text, size and time of an event, E20 what is not stored, E21 the buffer
 //! bound (unit tests only), E22 the ack slot (unit tests only), E23 a re-registration.
 //!
+//! The cases J5 to J16 and J20 (ADR-481) are what a stored `jobState` event does to the sender's
+//! own job: J5 received, running and completed, J6 the failure columns, J7 a detail that holds
+//! U+0000 and an oversized one, a procedure code too long and an unknown code, J8 a repeat, J9 a
+//! `received` after a later state, J10 the same state twice, J11 a report after a completed job,
+//! J12 an agent's needsOnSiteRecovery replaced, J13 another agent's, another tenant's, an unknown
+//! and a non-canonical job, J14 a job the server ended, J15 `received` as the delivery's proof,
+//! J16 a report and an answer to the command in one round, J20 a refused commit. J17 to J19 are
+//! in `jobs.rs`, J21 in `agent_connect.rs`, J22 in `migrations.rs`.
+//!
 //! The tests run on the current-thread runtime and wait in real time, never on a paused clock; a
 //! negative (a frame that must not come, a row that must not exist) is asserted only after
 //! something positive that comes later in the same order has been seen. Every wait is bounded.
@@ -32,7 +41,9 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::control::{Client, heartbeat, open, quiet_for, revoke_row, second_agent};
 use crate::control::{text, token};
-use crate::job_queue::{FRESH, add_job, row, session_token, settings, until_logged};
+use crate::job_queue::{FRESH, ack, add_job, add_job_with, command, reject, row};
+use crate::job_queue::{session_token, settings};
+use crate::job_queue::{until_logged, until_row};
 use crate::redeem::capture;
 use crate::serving::Running;
 use crate::session::Up;
@@ -48,10 +59,14 @@ struct Rig {
 
 impl Rig {
     async fn new() -> Rig {
+        Rig::with_lease(Duration::from_secs(600)).await
+    }
+
+    async fn with_lease(lease: Duration) -> Rig {
         let counts = Arc::new(EventCounts::default());
         let queue = Settings {
             events: Some(counts.clone()),
-            ..settings(Duration::from_secs(600))
+            ..settings(lease)
         };
         Rig {
             u: Up::with_queue(2, Some(queue)).await,
@@ -69,7 +84,7 @@ impl Rig {
 }
 
 /// The text of a `jobState` event for `job`; `extra` is more properties, each with its comma.
-fn frame_of(seq: u64, job: &str, state: &str, extra: &str) -> String {
+pub(crate) fn frame_of(seq: u64, job: &str, state: &str, extra: &str) -> String {
     format!(
         r#"{{"type":"agentEvent","seq":{seq},"kind":"jobState","jobId":"{job}","state":"{state}"{extra}}}"#
     )
@@ -79,7 +94,7 @@ fn frame(seq: u64) -> String {
     frame_of(seq, JOB, "running", "")
 }
 
-async fn send(client: &mut Client, body: &str) {
+pub(crate) async fn send(client: &mut Client, body: &str) {
     client
         .send(Message::Text(body.to_owned().into()))
         .await
@@ -87,7 +102,7 @@ async fn send(client: &mut Client, body: &str) {
 }
 
 /// The next frame, which must be an `eventAck`; its number.
-async fn read_ack(client: &mut Client) -> u64 {
+pub(crate) async fn read_ack(client: &mut Client) -> u64 {
     match ServerMessage::decode(&text(client).await).unwrap() {
         ServerMessage::EventAck { seq } => seq,
         other => panic!("an eventAck was due: {other:?}"),
@@ -994,5 +1009,601 @@ async fn a_re_registered_agent_has_its_own_cursor_and_starts_at_one() {
         3,
         "the old agent's cursor is its own"
     );
+    r.finish().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// What a stored `jobState` event does to the sender's own job (design 5.6, ADR-481)
+
+/// A job of `agent` that no delivery will touch: its mark is outstanding (the lease of a rig is
+/// long) and, when `delivered`, the agent has acknowledged it. Its state is `received`.
+async fn own_job(u: &Up, agent: &str, delivered: bool) -> String {
+    sqlx::query_scalar(
+        "INSERT INTO jobs (tenant_id, id, kind, agent_id, operator_id, vci_id, \
+             confirmation_level, start_deadline, signed_job, signing_key_id, idempotency_key, \
+             delivery_attempts, delivery_sent_at, delivered_at) \
+         SELECT a.tenant_id, gen_random_uuid(), 'runSequence', a.id, o.id, 'vci', 'notifyOnly', \
+             now() + interval '1 hour', 'x', $2, gen_random_uuid()::text, 1, now(), \
+             CASE WHEN $3 THEN now() END \
+         FROM agents a JOIN operators o ON o.tenant_id = a.tenant_id WHERE a.id = $1::uuid \
+         RETURNING id::text",
+    )
+    .bind(agent)
+    .bind(u.w.key.key_id())
+    .bind(delivered)
+    .fetch_one(&u.w.pool)
+    .await
+    .unwrap()
+}
+
+/// The job's state, failure, end and stamps as one line: state, failure code, procedure code,
+/// detail, then whether it is finished, was reported on and was delivered (`-` for none).
+async fn line(u: &Up, job: &str) -> String {
+    sqlx::query_scalar(
+        "SELECT concat_ws('|', state, coalesce(failure_code, '-'), coalesce(procedure_code, '-'), \
+             coalesce(failure_detail, '-'), (finished_at IS NOT NULL)::text, \
+             (last_reported_at IS NOT NULL)::text, (delivered_at IS NOT NULL)::text) \
+         FROM jobs WHERE id = $1::uuid",
+    )
+    .bind(job)
+    .fetch_one(&u.w.pool)
+    .await
+    .unwrap()
+}
+
+/// A timestamp column of the job, as text (null reads `-`).
+async fn stamp(u: &Up, job: &str, column: &str) -> String {
+    u.w.sql(&format!(
+        "SELECT coalesce({column}::text, '-') FROM jobs WHERE id = '{job}'"
+    ))
+    .await
+}
+
+async fn is_later(u: &Up, later: &str, earlier: &str) -> bool {
+    u.w.sql(&format!(
+        "SELECT '{later}'::timestamptz > '{earlier}'::timestamptz"
+    ))
+    .await
+        == "true"
+}
+
+/// Sends the event and waits for its acknowledgement, so the job is as the commit left it.
+pub(crate) async fn say(client: &mut Client, seq: u64, job: &str, state: &str, extra: &str) {
+    send(client, &frame_of(seq, job, state, extra)).await;
+    assert_eq!(read_ack(client).await, seq);
+}
+
+// J7: written first. The detail holds the escape for U+0000, which a `text` column refuses; if
+// the server wrote it as it came, the agent's transaction would fail again on every retry.
+#[tokio::test]
+async fn a_detail_with_nul_is_kept_with_a_replacement_cut_to_1024_bytes_and_a_bad_code_is_other() {
+    let r = Rig::new().await;
+    let a = own_job(&r.u, &r.u.id, true).await;
+    let b = own_job(&r.u, &r.u.id, true).await;
+    let c = own_job(&r.u, &r.u.id, true).await;
+    let mut client = r.connect().await;
+    let detail = format!("a\\u0000b{}", "d".repeat(2000));
+    let long_code = "p".repeat(129);
+    say(
+        &mut client,
+        1,
+        &a,
+        "failed",
+        &format!(r#","failureCode":"procedure","procedureCode":"{long_code}","detail":"{detail}""#),
+    )
+    .await;
+    say(
+        &mut client,
+        2,
+        &b,
+        "failed",
+        r#","failureCode":"bogusCode""#,
+    )
+    .await;
+    say(&mut client, 3, &c, "running", "").await;
+    let kept: String =
+        r.u.w
+            .sql(&format!("SELECT failure_detail FROM jobs WHERE id = '{a}'"))
+            .await;
+    assert_eq!(kept, format!("a\u{fffd}b{}", "d".repeat(1019)));
+    assert_eq!(kept.len(), 1024);
+    assert_eq!(line(&r.u, &a).await[..16], *"failed|procedure");
+    assert_eq!(
+        line(&r.u, &a).await.split('|').nth(2),
+        Some("-"),
+        "a procedure code of 129 bytes is left out, not cut"
+    );
+    assert_eq!(line(&r.u, &b).await, "failed|other|-|-|true|true|true");
+    assert_eq!(line(&r.u, &c).await, "running|-|-|-|false|true|true");
+    assert_eq!(rows(&r.u, &r.u.id).await.len(), 3);
+    assert_eq!(cursor(&r.u, &r.u.id).await, 3);
+    assert_eq!(r.counts.applied.load(Ordering::Relaxed), 3);
+    r.finish().await;
+}
+
+// J5
+#[tokio::test]
+async fn received_running_and_completed_move_the_senders_own_job() {
+    let r = Rig::new().await;
+    let job = own_job(&r.u, &r.u.id, false).await;
+    let mut client = r.connect().await;
+    assert_eq!(line(&r.u, &job).await, "received|-|-|-|false|false|false");
+    // `received` stamps the report and the delivery and never moves the state.
+    say(&mut client, 1, &job, "received", "").await;
+    assert_eq!(line(&r.u, &job).await, "received|-|-|-|false|true|true");
+    say(&mut client, 2, &job, "running", "").await;
+    assert_eq!(line(&r.u, &job).await, "running|-|-|-|false|true|true");
+    say(&mut client, 3, &job, "completed", "").await;
+    assert_eq!(line(&r.u, &job).await, "completed|-|-|-|true|true|true");
+    // The progress is not the state's to change, and nothing here writes the audit log.
+    assert_eq!(
+        r.u.w
+            .sql(&format!(
+                "SELECT progress_permille FROM jobs WHERE id = '{job}'"
+            ))
+            .await,
+        "0"
+    );
+    assert_eq!(r.u.w.sql("SELECT count(*) FROM audit_log").await, "0");
+    assert_eq!(r.counts.applied.load(Ordering::Relaxed), 3);
+    r.finish().await;
+}
+
+// J6
+#[tokio::test]
+async fn a_failure_keeps_its_code_the_procedures_code_and_the_detail_and_a_recovery_only_a_detail()
+{
+    let r = Rig::new().await;
+    let failed = own_job(&r.u, &r.u.id, true).await;
+    let refused = own_job(&r.u, &r.u.id, true).await;
+    let recovery = own_job(&r.u, &r.u.id, true).await;
+    let mut client = r.connect().await;
+    say(
+        &mut client,
+        1,
+        &failed,
+        "failed",
+        r#","failureCode":"procedure","procedureCode":"P-17","detail":"boom""#,
+    )
+    .await;
+    assert_eq!(
+        line(&r.u, &failed).await,
+        "failed|procedure|P-17|boom|true|true|true"
+    );
+    say(
+        &mut client,
+        2,
+        &refused,
+        "preconditionFailed",
+        r#","failureCode":"jobRefused","detail":"bad data""#,
+    )
+    .await;
+    assert_eq!(
+        line(&r.u, &refused).await,
+        "preconditionFailed|jobRefused|-|bad data|true|true|true"
+    );
+    // A recovery has a detail and no failure code, even when the event gives one.
+    say(
+        &mut client,
+        3,
+        &recovery,
+        "needsOnSiteRecovery",
+        r#","failureCode":"internal","detail":"reconnect the cable""#,
+    )
+    .await;
+    assert_eq!(
+        line(&r.u, &recovery).await,
+        "needsOnSiteRecovery|-|-|reconnect the cable|true|true|true"
+    );
+    assert_eq!(r.u.w.sql("SELECT count(*) FROM audit_log").await, "0");
+    r.finish().await;
+}
+
+// J8
+#[tokio::test]
+async fn a_repeat_of_a_stored_event_is_not_applied_again() {
+    let r = Rig::new().await;
+    let job = own_job(&r.u, &r.u.id, true).await;
+    let mut client = r.connect().await;
+    say(&mut client, 1, &job, "running", "").await;
+    let first = stamp(&r.u, &job, "last_reported_at").await;
+    send(&mut client, &frame_of(1, &job, "running", "")).await;
+    assert_eq!(read_ack(&mut client).await, 1, "answered with the cursor");
+    until_count(&r.counts.duplicates, 1, "the repeats").await;
+    assert_eq!(stamp(&r.u, &job, "last_reported_at").await, first);
+    assert_eq!(r.counts.applied.load(Ordering::Relaxed), 1);
+    r.finish().await;
+}
+
+// J9
+#[tokio::test]
+async fn a_received_after_a_later_state_only_stamps_the_report() {
+    let r = Rig::new().await;
+    let job = own_job(&r.u, &r.u.id, true).await;
+    let mut client = r.connect().await;
+    say(&mut client, 1, &job, "running", "").await;
+    let at_running = stamp(&r.u, &job, "last_reported_at").await;
+    say(&mut client, 2, &job, "received", "").await;
+    assert_eq!(line(&r.u, &job).await, "running|-|-|-|false|true|true");
+    assert!(
+        is_later(
+            &r.u,
+            &stamp(&r.u, &job, "last_reported_at").await,
+            &at_running
+        )
+        .await
+    );
+    say(&mut client, 3, &job, "completed", "").await;
+    let ended = stamp(&r.u, &job, "finished_at").await;
+    let reported = stamp(&r.u, &job, "last_reported_at").await;
+    say(&mut client, 4, &job, "received", "").await;
+    assert_eq!(line(&r.u, &job).await, "completed|-|-|-|true|true|true");
+    assert_eq!(stamp(&r.u, &job, "finished_at").await, ended);
+    assert_eq!(stamp(&r.u, &job, "last_reported_at").await, reported);
+    r.finish().await;
+}
+
+// J10
+#[tokio::test]
+async fn the_same_state_twice_stamps_the_report_and_changes_nothing_else() {
+    let r = Rig::new().await;
+    let job = own_job(&r.u, &r.u.id, false).await;
+    let mut client = r.connect().await;
+    say(&mut client, 1, &job, "running", "").await;
+    let (reported, delivered) = (
+        stamp(&r.u, &job, "last_reported_at").await,
+        stamp(&r.u, &job, "delivered_at").await,
+    );
+    say(&mut client, 2, &job, "running", "").await;
+    assert_eq!(line(&r.u, &job).await, "running|-|-|-|false|true|true");
+    assert!(
+        is_later(
+            &r.u,
+            &stamp(&r.u, &job, "last_reported_at").await,
+            &reported
+        )
+        .await
+    );
+    assert_eq!(stamp(&r.u, &job, "delivered_at").await, delivered);
+    r.finish().await;
+}
+
+// J11
+#[tokio::test]
+async fn a_report_after_an_end_is_stored_and_acknowledged_and_logged_without_its_text() {
+    let (log, _guard) = capture();
+    let r = Rig::new().await;
+    let job = own_job(&r.u, &r.u.id, true).await;
+    let mut client = r.connect().await;
+    say(&mut client, 1, &job, "completed", "").await;
+    let before = line(&r.u, &job).await;
+    // The first report after the end carries the detail; it takes the warning's gate.
+    say(
+        &mut client,
+        2,
+        &job,
+        "failed",
+        r#","failureCode":"internal","detail":"SECRET-DETAIL""#,
+    )
+    .await;
+    say(&mut client, 3, &job, "running", "").await;
+    assert_eq!(line(&r.u, &job).await, before);
+    assert_eq!(rows(&r.u, &r.u.id).await.len(), 3);
+    until_logged(&log, "were not applied").await;
+    let text = log.text();
+    let warning = text
+        .lines()
+        .find(|l| l.contains("were not applied"))
+        .expect("the warning was written");
+    assert!(warning.contains(&job) && warning.contains("completed") && warning.contains("failed"));
+    assert!(!text.contains("SECRET-DETAIL"));
+    r.finish().await;
+}
+
+// J12
+#[tokio::test]
+async fn a_job_in_needs_on_site_recovery_is_reopened_by_a_later_report() {
+    let r = Rig::new().await;
+    let job = own_job(&r.u, &r.u.id, true).await;
+    let again = own_job(&r.u, &r.u.id, true).await;
+    let mut client = r.connect().await;
+    say(
+        &mut client,
+        1,
+        &job,
+        "needsOnSiteRecovery",
+        r#","detail":"cable""#,
+    )
+    .await;
+    assert_eq!(
+        line(&r.u, &job).await,
+        "needsOnSiteRecovery|-|-|cable|true|true|true"
+    );
+    // A `received` does not reopen it.
+    say(&mut client, 2, &job, "received", "").await;
+    assert_eq!(
+        line(&r.u, &job).await,
+        "needsOnSiteRecovery|-|-|cable|true|true|true"
+    );
+    // A state that is not an end clears the end and the detail; the job then ends once more.
+    say(&mut client, 3, &job, "running", "").await;
+    assert_eq!(line(&r.u, &job).await, "running|-|-|-|false|true|true");
+    say(&mut client, 4, &job, "completed", "").await;
+    assert_eq!(line(&r.u, &job).await, "completed|-|-|-|true|true|true");
+    // An end replaces it too, with its own failure.
+    say(
+        &mut client,
+        5,
+        &again,
+        "needsOnSiteRecovery",
+        r#","detail":"cable""#,
+    )
+    .await;
+    say(
+        &mut client,
+        6,
+        &again,
+        "failed",
+        r#","failureCode":"vinMismatch","detail":"other car""#,
+    )
+    .await;
+    assert_eq!(
+        line(&r.u, &again).await,
+        "failed|vinMismatch|-|other car|true|true|true"
+    );
+    r.finish().await;
+}
+
+// J13
+#[tokio::test]
+async fn a_report_changes_only_the_senders_own_job_of_its_own_tenant_named_in_canonical_form() {
+    let r = Rig::new().await;
+    let (other_id, other_token) = second_agent(&r.u).await;
+    sqlx::query(
+        "WITH t AS (INSERT INTO tenants (id, name) VALUES (gen_random_uuid(), 'other') RETURNING id) \
+         UPDATE agents SET tenant_id = (SELECT id FROM t) WHERE id = $1::uuid",
+    )
+    .bind(&other_id)
+    .execute(&r.u.w.pool)
+    .await
+    .unwrap();
+    let (third_id, _) = second_agent(&r.u).await;
+    let theirs = own_job(&r.u, &third_id, true).await;
+    let own = own_job(&r.u, &r.u.id, true).await;
+    let mut client = r.connect().await;
+    let mut other = open(r.u.s.addr, &other_token).await;
+    // Another agent's job of the same tenant, the job of another tenant named by an agent of the
+    // other tenant's, a job nobody has, and an upper-case spelling of the sender's own.
+    say(&mut client, 1, &theirs, "completed", "").await;
+    say(&mut other, 1, &own, "completed", "").await;
+    say(&mut client, 2, JOB, "completed", "").await;
+    say(&mut client, 3, &own.to_uppercase(), "completed", "").await;
+    // Something positive after them all.
+    say(&mut client, 4, &own, "running", "").await;
+    assert_eq!(line(&r.u, &theirs).await, "received|-|-|-|false|false|true");
+    assert_eq!(line(&r.u, &own).await, "running|-|-|-|false|true|true");
+    assert_eq!(r.counts.applied.load(Ordering::Relaxed), 1);
+    r.finish().await;
+}
+
+// J14
+#[tokio::test]
+async fn a_job_the_server_ended_is_not_changed_by_a_report() {
+    let r = Rig::new().await;
+    let job = own_job(&r.u, &r.u.id, false).await;
+    sqlx::query(
+        "UPDATE jobs SET state = 'failed', failure_code = 'instructionRejected', \
+             failure_detail = 'badSignature', finished_at = now(), delivered_at = NULL \
+         WHERE id = $1::uuid",
+    )
+    .bind(&job)
+    .execute(&r.u.w.pool)
+    .await
+    .unwrap();
+    let before = line(&r.u, &job).await;
+    assert_eq!(
+        before,
+        "failed|instructionRejected|-|badSignature|true|false|false"
+    );
+    let mut client = r.connect().await;
+    say(&mut client, 1, &job, "running", "").await;
+    say(&mut client, 2, &job, "completed", "").await;
+    say(&mut client, 3, &job, "received", "").await;
+    assert_eq!(line(&r.u, &job).await, before);
+    r.finish().await;
+}
+
+// J15
+#[tokio::test]
+async fn a_received_report_settles_the_delivery_without_a_command_ack_and_a_late_ack_writes_nothing()
+ {
+    let r = Rig::with_lease(Duration::from_millis(300)).await;
+    let job = add_job(&r.u.w, &r.u.id, 1, b"envelope").await;
+    let mut client = r.connect().await;
+    let (command_id, _) = command(&mut client).await;
+    until_row(&r.u.w, &job, "received|1|true|false|||false").await;
+    say(&mut client, 1, &job, "received", "").await;
+    until_row(&r.u.w, &job, "received|1|true|true|||false").await;
+    let delivered = stamp(&r.u, &job, "delivered_at").await;
+    // Past the lease the job is not sent again.
+    quiet_for(&mut client, 1000).await;
+    ack(&mut client, &command_id).await;
+    say(&mut client, 2, &job, "running", "").await;
+    assert_eq!(row(&r.u.w, &job).await, "running|1|true|true|||false");
+    assert_eq!(stamp(&r.u, &job, "delivered_at").await, delivered);
+    r.finish().await;
+}
+
+// J16 (the acknowledgement)
+#[tokio::test]
+async fn a_state_report_settles_the_delivery_without_a_command_ack_and_a_late_ack_changes_nothing()
+{
+    let r = Rig::new().await;
+    let job = add_job(&r.u.w, &r.u.id, 1, b"envelope").await;
+    let mut client = r.connect().await;
+    let (command_id, _) = command(&mut client).await;
+    until_row(&r.u.w, &job, "received|1|true|false|||false").await;
+    // No acknowledgement of the command came: the report's move sets the delivery.
+    say(&mut client, 1, &job, "running", "").await;
+    assert_eq!(row(&r.u.w, &job).await, "running|1|true|true|||false");
+    let delivered = stamp(&r.u, &job, "delivered_at").await;
+    ack(&mut client, &command_id).await;
+    say(&mut client, 2, &job, "completed", "").await;
+    assert_eq!(row(&r.u.w, &job).await, "completed|1|true|true|||true");
+    assert_eq!(stamp(&r.u, &job, "delivered_at").await, delivered);
+    r.finish().await;
+}
+
+// J16 (the rejection, in both orders)
+#[tokio::test]
+async fn a_report_and_a_rejection_of_the_command_leave_the_job_the_one_that_came_first() {
+    let r = Rig::new().await;
+    // The report first: the delivery is accepted, and the late rejection ends nothing.
+    let first = add_job(&r.u.w, &r.u.id, 1, b"first").await;
+    let mut client = r.connect().await;
+    let (first_command, _) = command(&mut client).await;
+    until_row(&r.u.w, &first, "received|1|true|false|||false").await;
+    say(&mut client, 1, &first, "running", "").await;
+    reject(&mut client, &first_command, "badSignature").await;
+    // The rejection first: the job is ended by the server, and the report is not applied.
+    let second = add_job(&r.u.w, &r.u.id, 2, b"second").await;
+    let (second_command, _) = command(&mut client).await;
+    until_row(&r.u.w, &second, "received|1|true|false|||false").await;
+    reject(&mut client, &second_command, "badSignature").await;
+    until_row(
+        &r.u.w,
+        &second,
+        "failed|1|true|false|instructionRejected|badSignature|true",
+    )
+    .await;
+    say(&mut client, 2, &second, "running", "").await;
+    assert_eq!(
+        row(&r.u.w, &second).await,
+        "failed|1|true|false|instructionRejected|badSignature|true"
+    );
+    assert_eq!(row(&r.u.w, &first).await, "running|1|true|true|||false");
+    r.finish().await;
+}
+
+// J20
+#[tokio::test]
+async fn a_refused_commit_leaves_the_job_as_it_was_and_the_retry_applies_the_report_once() {
+    let (log, _guard) = capture();
+    let r = Rig::new().await;
+    let job = own_job(&r.u, &r.u.id, true).await;
+    refuse_events(&r.u).await;
+    let mut client = r.connect().await;
+    send(&mut client, &frame_of(1, &job, "completed", "")).await;
+    until_logged(&log, "could not store events").await;
+    assert_eq!(line(&r.u, &job).await, "received|-|-|-|false|false|true");
+    r.u.w
+        .pg
+        .execute("DROP TRIGGER test_events_refused ON agent_events")
+        .await;
+    assert_eq!(read_ack(&mut client).await, 1);
+    assert_eq!(line(&r.u, &job).await, "completed|-|-|-|true|true|true");
+    assert_eq!(r.counts.applied.load(Ordering::Relaxed), 1);
+    r.finish().await;
+}
+
+// An end whose job was never marked delivered (its commandAck was lost) sets both times, and
+// the queue's take and its retired-key sweep leave the job alone.
+#[tokio::test]
+async fn an_end_for_a_job_not_marked_delivered_sets_both_times_and_the_queue_leaves_it() {
+    let r = Rig::with_lease(Duration::from_millis(300)).await;
+    let job = add_job(&r.u.w, &r.u.id, 1, b"envelope").await;
+    let mut client = r.connect().await;
+    let _ = command(&mut client).await;
+    until_row(&r.u.w, &job, "received|1|true|false|||false").await;
+    say(&mut client, 1, &job, "completed", "").await;
+    assert_eq!(row(&r.u.w, &job).await, "completed|1|true|true|||true");
+    // Past the lease the job is not taken again.
+    quiet_for(&mut client, 1000).await;
+    // The sweep: the job's key is now retired, as is a second job's, which the sweep ends.
+    sqlx::query("UPDATE jobs SET signing_key_id = $2 WHERE id = $1::uuid")
+        .bind(&job)
+        .bind("0".repeat(64))
+        .execute(&r.u.w.pool)
+        .await
+        .unwrap();
+    let stale = add_job_with(&r.u.w, &r.u.id, 2, b"stale", &"0".repeat(64), 3600).await;
+    until_row(
+        &r.u.w,
+        &stale,
+        "failed|0|false|false|instructionKeyRetired|the instruction was signed by a key that is no longer active|true",
+    )
+    .await;
+    assert_eq!(row(&r.u.w, &job).await, "completed|1|true|true|||true");
+    r.finish().await;
+}
+
+const LOCK_VIN: &str = "1HGCM82633A004352";
+
+/// Gives the job the VIN and makes it the holder of the VIN's lock for an hour.
+async fn hold_lock(u: &Up, job: &str) {
+    sqlx::query("UPDATE jobs SET vin = $2 WHERE id = $1::uuid")
+        .bind(job)
+        .bind(LOCK_VIN)
+        .execute(&u.w.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO vehicle_locks (tenant_id, vin, job_id, agent_id, expires_at) \
+         SELECT tenant_id, vin, id, agent_id, now() + interval '1 hour' FROM jobs \
+         WHERE id = $1::uuid",
+    )
+    .bind(job)
+    .execute(&u.w.pool)
+    .await
+    .unwrap();
+}
+
+async fn holders(u: &Up) -> String {
+    u.w.sql("SELECT coalesce(string_agg(job_id::text, ',' ORDER BY job_id), '') FROM vehicle_locks")
+        .await
+}
+
+// A reopened needsOnSiteRecovery job runs with no lock; its later end deletes only its own.
+#[tokio::test]
+async fn a_reopened_recovery_jobs_later_end_leaves_the_lock_another_job_took() {
+    let r = Rig::new().await;
+    let first = own_job(&r.u, &r.u.id, true).await;
+    let second = own_job(&r.u, &r.u.id, true).await;
+    hold_lock(&r.u, &first).await;
+    let mut client = r.connect().await;
+    say(&mut client, 1, &first, "needsOnSiteRecovery", "").await;
+    assert_eq!(holders(&r.u).await, "");
+    // The first end freed the VIN, and the second job took it.
+    hold_lock(&r.u, &second).await;
+    say(&mut client, 2, &first, "running", "").await;
+    say(&mut client, 3, &first, "completed", "").await;
+    assert_eq!(line(&r.u, &first).await, "completed|-|-|-|true|true|true");
+    assert_eq!(holders(&r.u).await, second);
+    r.finish().await;
+}
+
+// A job whose agent_id is the sender's but whose tenant is another is not the sender's own.
+#[tokio::test]
+async fn a_job_of_the_sender_in_another_tenant_is_not_changed() {
+    let r = Rig::new().await;
+    let foreign = own_job(&r.u, &r.u.id, true).await;
+    sqlx::query(
+        "WITH t AS (INSERT INTO tenants (id, name) VALUES (gen_random_uuid(), 'other') \
+             RETURNING id) \
+         UPDATE jobs SET tenant_id = (SELECT id FROM t) WHERE id = $1::uuid",
+    )
+    .bind(&foreign)
+    .execute(&r.u.w.pool)
+    .await
+    .unwrap();
+    let own = own_job(&r.u, &r.u.id, true).await;
+    let before = line(&r.u, &foreign).await;
+    let mut client = r.connect().await;
+    say(&mut client, 1, &foreign, "completed", "").await;
+    // Something positive after it.
+    say(&mut client, 2, &own, "running", "").await;
+    assert_eq!(line(&r.u, &foreign).await, before);
+    assert_eq!(line(&r.u, &own).await, "running|-|-|-|false|true|true");
+    assert_eq!(r.counts.applied.load(Ordering::Relaxed), 1);
     r.finish().await;
 }

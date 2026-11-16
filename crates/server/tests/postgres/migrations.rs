@@ -645,6 +645,47 @@ async fn job_creation_columns_replace_the_digest_and_the_kind_check_allows_ident
     db::close(&pool).await;
 }
 
+// J22 (ADR-481): a job row that exists before the migration survives it with no procedure code.
+#[tokio::test]
+async fn the_procedure_code_column_is_added_null_to_existing_jobs() {
+    let pg = TestPostgres::start();
+    let pool = pg.pool();
+    db::migrate_with(&pool, &migrator_up_to(9), Duration::from_secs(30))
+        .await
+        .expect("migrations 1 to 9 apply");
+    pg.execute("INSERT INTO tenants (id, name) VALUES (gen_random_uuid(), 'jobs')")
+        .await;
+    pg.execute(
+        "INSERT INTO operators (id, tenant_id, subject, display_name) \
+         SELECT gen_random_uuid(), id, 'op', 'op' FROM tenants",
+    )
+    .await;
+    pg.execute(
+        "INSERT INTO agents (id, tenant_id, display_name, mode, public_key) \
+         SELECT gen_random_uuid(), id, 'agent', 'user', '\\x01' FROM tenants",
+    )
+    .await;
+    sqlx::query(sqlx::AssertSqlSafe(job_insert(
+        "acquire",
+        ", state, failure_code",
+        ", 'failed', 'procedure'",
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+    db::migrate_with(&pool, &db::MIGRATOR, Duration::from_secs(30))
+        .await
+        .expect("migration 10 applies over the existing row");
+    assert_eq!(
+        pg.scalar("SELECT concat_ws('|', failure_code, procedure_code IS NULL) FROM jobs")
+            .await,
+        "procedure|t"
+    );
+    pg.execute("UPDATE jobs SET procedure_code = 'P-17'").await;
+    assert_eq!(pg.scalar("SELECT procedure_code FROM jobs").await, "P-17");
+    db::close(&pool).await;
+}
+
 /// The SQLSTATE of a failed statement.
 fn sqlstate<T>(outcome: &Result<T, sqlx::Error>) -> Option<String> {
     match outcome {

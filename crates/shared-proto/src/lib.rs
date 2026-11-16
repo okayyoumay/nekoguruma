@@ -155,6 +155,53 @@ impl JobState {
         }
     }
 
+    /// The state a `jobState` event's name stands for, the reverse of [`JobState::wire_name`], or
+    /// `None` for a name that is not one. A state that carries a payload comes back with an empty
+    /// one (code [`FailureCode::Other`], empty detail, no procedure code): the name is all the
+    /// lookup reads. The codec stays loose and keeps the name as the agent wrote it (5.2).
+    pub fn from_wire_name(name: &str) -> Option<JobState> {
+        Some(match name {
+            "received" => JobState::Received,
+            "precheck" => JobState::Precheck,
+            "ready" => JobState::Ready,
+            "running" => JobState::Running,
+            "verifying" => JobState::Verifying,
+            "awaitingHmi" => JobState::AwaitingHmi,
+            "cancelRequested" => JobState::CancelRequested,
+            "completed" => JobState::Completed,
+            "failed" => JobState::Failed {
+                code: FailureCode::Other,
+                detail: String::new(),
+                procedure_code: None,
+            },
+            "cancelled" => JobState::Cancelled,
+            "expired" => JobState::Expired,
+            "preconditionFailed" => JobState::PreconditionFailed {
+                code: FailureCode::Other,
+                detail: String::new(),
+            },
+            "needsOnSiteRecovery" => JobState::NeedsOnSiteRecovery {
+                detail: String::new(),
+            },
+            _ => return None,
+        })
+    }
+
+    /// Whether the state ends the job as 5.6 draws it: completed, failed, cancelled, expired,
+    /// preconditionFailed and needsOnSiteRecovery. (The last one an operator's recovery may
+    /// follow; the server treats it as an end that a later report may replace, ADR-481.)
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            JobState::Completed
+                | JobState::Failed { .. }
+                | JobState::Cancelled
+                | JobState::Expired
+                | JobState::PreconditionFailed { .. }
+                | JobState::NeedsOnSiteRecovery { .. }
+        )
+    }
+
     /// The state as a `jobState` event of `job_id` for the control channel (5.2, 5.6). An empty
     /// `detail` is left out of the event rather than sent as an empty string.
     pub fn to_event_kind(&self, job_id: JobId) -> AgentEventKind {
@@ -247,6 +294,35 @@ impl FailureCode {
             FailureCode::InstructionKeyRetired => "instructionKeyRetired",
             FailureCode::Other => "other",
         }
+    }
+
+    /// The code a `failureCode` name stands for, the reverse of [`FailureCode::wire_name`], or
+    /// `None` for a name that is not one (5.2).
+    pub fn from_wire_name(name: &str) -> Option<FailureCode> {
+        Some(match name {
+            "deviceLocked" => FailureCode::DeviceLocked,
+            "vehicleLocked" => FailureCode::VehicleLocked,
+            "vinMismatch" => FailureCode::VinMismatch,
+            "variantMismatch" => FailureCode::VariantMismatch,
+            "powerCondition" => FailureCode::PowerCondition,
+            "signatureInvalid" => FailureCode::SignatureInvalid,
+            "libraryLoadFailed" => FailureCode::LibraryLoadFailed,
+            "unsupportedAbi" => FailureCode::UnsupportedAbi,
+            "runtime32BitMissing" => FailureCode::Runtime32BitMissing,
+            "cpuOrKernelNo32Bit" => FailureCode::CpuOrKernelNo32Bit,
+            "gatewayAuthExpired" => FailureCode::GatewayAuthExpired,
+            "ticketExpired" => FailureCode::TicketExpired,
+            "procedure" => FailureCode::Procedure,
+            "procedureError" => FailureCode::ProcedureError,
+            "jobRefused" => FailureCode::JobRefused,
+            "linkNotOpened" => FailureCode::LinkNotOpened,
+            "exchangeFailed" => FailureCode::ExchangeFailed,
+            "internal" => FailureCode::Internal,
+            "instructionRejected" => FailureCode::InstructionRejected,
+            "instructionKeyRetired" => FailureCode::InstructionKeyRetired,
+            "other" => FailureCode::Other,
+            _ => return None,
+        })
     }
 }
 
@@ -344,5 +420,119 @@ mod vin_tests {
         ] {
             assert!(!is_well_formed_vin(bad), "{bad:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod wire_name_tests {
+    use super::{FailureCode, JobState};
+
+    // J1: every state and failure code reads back from its own wire name, and only the ends
+    // are terminal.
+    #[test]
+    fn every_job_state_name_reads_back_and_only_the_ends_are_terminal() {
+        let states: [(JobState, bool); 13] = [
+            (JobState::Received, false),
+            (JobState::Precheck, false),
+            (JobState::Ready, false),
+            (JobState::Running, false),
+            (JobState::Verifying, false),
+            (JobState::AwaitingHmi, false),
+            (JobState::CancelRequested, false),
+            (JobState::Completed, true),
+            (
+                JobState::Failed {
+                    code: FailureCode::Other,
+                    detail: "d".to_owned(),
+                    procedure_code: None,
+                },
+                true,
+            ),
+            (JobState::Cancelled, true),
+            (JobState::Expired, true),
+            (
+                JobState::PreconditionFailed {
+                    code: FailureCode::Other,
+                    detail: "d".to_owned(),
+                },
+                true,
+            ),
+            (
+                JobState::NeedsOnSiteRecovery {
+                    detail: "d".to_owned(),
+                },
+                true,
+            ),
+        ];
+        for (state, terminal) in states {
+            let back = JobState::from_wire_name(state.wire_name())
+                .unwrap_or_else(|| panic!("{}", state.wire_name()));
+            assert_eq!(back.wire_name(), state.wire_name());
+            assert_eq!(back.is_terminal(), terminal, "{}", state.wire_name());
+            assert_eq!(state.is_terminal(), terminal);
+        }
+        for bad in ["", "Received", "RUNNING", "run", "running ", "progress"] {
+            assert!(JobState::from_wire_name(bad).is_none(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn every_failure_code_name_reads_back() {
+        use FailureCode::*;
+        let codes = [
+            DeviceLocked,
+            VehicleLocked,
+            VinMismatch,
+            VariantMismatch,
+            PowerCondition,
+            SignatureInvalid,
+            LibraryLoadFailed,
+            UnsupportedAbi,
+            Runtime32BitMissing,
+            CpuOrKernelNo32Bit,
+            GatewayAuthExpired,
+            TicketExpired,
+            Procedure,
+            ProcedureError,
+            JobRefused,
+            LinkNotOpened,
+            ExchangeFailed,
+            Internal,
+            InstructionRejected,
+            InstructionKeyRetired,
+            Other,
+        ];
+        // A new variant fails to compile here until it is in the list above.
+        for code in &codes {
+            match code {
+                DeviceLocked
+                | VehicleLocked
+                | VinMismatch
+                | VariantMismatch
+                | PowerCondition
+                | SignatureInvalid
+                | LibraryLoadFailed
+                | UnsupportedAbi
+                | Runtime32BitMissing
+                | CpuOrKernelNo32Bit
+                | GatewayAuthExpired
+                | TicketExpired
+                | Procedure
+                | ProcedureError
+                | JobRefused
+                | LinkNotOpened
+                | ExchangeFailed
+                | Internal
+                | InstructionRejected
+                | InstructionKeyRetired
+                | Other => {}
+            }
+            assert_eq!(
+                FailureCode::from_wire_name(code.wire_name()).as_ref(),
+                Some(code)
+            );
+        }
+        assert!(FailureCode::from_wire_name("Procedure").is_none());
+        assert!(FailureCode::from_wire_name("").is_none());
     }
 }

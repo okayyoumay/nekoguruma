@@ -506,7 +506,8 @@ ngr-server user disable --config <file> --username alice
   `writeSettings`, recorded and not enforced) and `request_hash`: SHA-256 over a tagged,
   length-prefixed encoding of the normalized request (kind, agent, VCI, VIN, hashes, artifact),
   with the operator left out (the row's operator is compared). The 202 body is the `Job`
-  (`jobId`, `kind`, `state`, `progressPermille`, `confirmation.level`), built by one function
+  (`jobId`, `kind`, `state`, `progressPermille`, `confirmation.level`, and `failure.code` and
+  `failure.procedureCode` when the job has a failure code, never the detail), built by one function
   from the row for a creation and a replay, which shows the current state; `Cache-Control:
   no-store`, no `Location`. The delivery queue sends the stored bytes (ADR-476).
 - **The vehicle lock** (design 8.8, ADR-480). After the insert wins, a job with a VIN runs one
@@ -733,12 +734,33 @@ connection with hyper's `with_upgrades()`.
   answered with the cursor; a different text stores nothing, acknowledges nothing and ends that
   connection with 1002 and one gated warning with the agent ID and the number, never the text);
   the next number is inserted with its kind, job ID (only when a canonical UUID), device time
-  (only when `strict_device_time` accepts it) and the exact text; any other number, one no
+  (only when `strict_device_time` accepts it) and the exact text, and a `jobState` event is then
+  applied to the sender's own job in the same transaction (design 5.6, ADR-481): `job_state.rs`
+  reads the event into a `Report` (the state, the failure code kept for failed and
+  preconditionFailed only with the server's own two and unknown names read as `other`, the
+  procedure code only for failed with `procedure` and 1 to 128 bytes without U+0000, never cut, the detail
+  only for failed, preconditionFailed and needsOnSiteRecovery with U+0000 replaced by U+FFFD and
+  the text cut to 1024 bytes on a character boundary, empty as none), the row is locked
+  (`SELECT ... FOR UPDATE` on the tenant, job ID and the sender as `agent_id`: another agent's
+  job is no row) and the pure `decide` picks one write: nothing (no row, which a job ID that is
+  not canonical is too; finished and final;
+  unknown name; a `received` on a finished needsOnSiteRecovery), the `received` stamps
+  (`last_reported_at`, `delivered_at` when null; never the state), the report time alone (the
+  state is the row's), a move (the state and both stamps; on a reopened needsOnSiteRecovery also
+  the end and the failure columns cleared, no lock taken again) or an end (the state, the failure
+  columns, `finished_at` and the stamps, in one statement with the deletion of the job's own
+  vehicle lock, `WITH ended AS (UPDATE ... RETURNING) DELETE FROM vehicle_locks ... WHERE job_id
+  = ended.id`, ADR-480). Every time is the transaction's `now()`. A report that wrote nothing
+  because the job is not the sender's or does not exist, is final, or the state name is unknown
+  (not a late `received` on a finished job) is stored and acknowledged and counted as ignored;
+  after the commit the queue logs one line per answer under a gate of its own (not the 1002
+  gate): the count of such reports and the first one's agent ID, job ID (when canonical),
+  number and the two states' names (`unknown` for no job), never the text; any other number, one no
   `bigint` holds included, is a gap that closes its connection with 1002 and ends its later
   events in the round. The cursor is moved to the last number stored and the transaction
   commits; only then are the answers given through the hub (`Hub::ack_events` for each
   connection, `Hub::close_connection` for each close), and the counters of `Settings::events`
-  (seen, stored, repeats answered; for tests) are raised. The events of a connection that ended
+  (seen, stored, repeats answered, applied; for tests) are raised. The events of a connection that ended
   are stored and not acknowledged. A failed transaction (the statements run under the 5 second
   lock and statement timeouts, so a held cursor row is a failure after 5 seconds) keeps its
   events and those of the agents not yet tried, ends the round and is tried again on the next
@@ -747,7 +769,7 @@ connection with hyper's `with_upgrades()`.
   not delay settling an answer. A connection the queue closed with 1002 keeps its later events
   from being stored, in later rounds too, until it leaves the hub's snapshot; the stop is checked
   between agents. The kept events count with the buffered messages against the
-  4096 bound, and past it the inbox is not read. A `jobState` event changes no job row. A failed pass sends nothing and is one gated warning (60 seconds). The task ends
+  4096 bound, and past it the inbox is not read. A failed pass sends nothing and is one gated warning (60 seconds). The task ends
   when the stop begins, in its wait and in its read.
 - **After a close.** The task leaves the registry first, then writes the Close frame, then the
   disconnect stamp (above), then drains (reads and discards until the peer's reply, at most `CLOSE_WAIT`, 5 seconds). After a
@@ -857,8 +879,13 @@ a new migration file rebuilds the crate. How migrations are written and applied 
   refused commit (kept and stored later), a commit that went through though reported as failed
   (staged), a connection replaced or gone between the store and the acknowledgement, two servers
   and a held cursor row, a first store beside a concurrent creation of the cursor row, a revoked
-  or missing agent, tenants and the job an event names, a `received` event changing no job, a
-  NUL escape, a frame of the limit and device times, `progress` and `reconcile` not stored, and
+  or missing agent, tenants and the job an event names, a `received` event only stamping its job, a
+  NUL escape, a frame of the limit and device times, the apply rules (received, running,
+  completed, the failure columns, a NUL and an oversized detail, a repeat, a later `received`,
+  the same state twice, a report after an end and its warning, a reopened needsOnSiteRecovery,
+  another agent's, another tenant's, an unknown and a non-canonical job, a job the server ended,
+  the delivery settled by `received` beside a late `commandAck`, a report and an answer in one
+  round in both orders, a refused commit retried), `progress` and `reconcile` not stored, and
   a re-registered agent's own cursor.
   `jobs.rs` (unit tests in `src/jobs.rs` for the shape rules, the request hash, the job ID, the
   largest request and the pure decisions) covers `POST /api/v1/jobs` over PostgreSQL: the layer
@@ -867,7 +894,10 @@ a new migration file rebuilds the crate. How migrations are written and applied 
   judged before the permission), concurrent requests (two at once, two servers, a key held by an
   uncommitted insert that then commits or rolls back, a lock wait of 5 seconds), each refusal of
   permission, a key that is not active, a failing signer, a locked table, and delivery to a fake
-  agent. The migration is checked in `migrations.rs`.
+  agent, and the lock's end with the agent's reported end (held by a state that is not one,
+  freed by completed or needsOnSiteRecovery, another job's later row left alone) and the replay
+  showing the failure code and procedure code and no detail. The migrations are checked in
+  `migrations.rs`.
   `control.rs` (unit tests in `src/control.rs` and `src/hub.rs`) drives the control channel over
   TCP with `tokio-tungstenite` as the client. Refusals: every way of having no valid token is
   the same 401 (no header, another scheme, a bare scheme, two headers, 43 characters, an unknown

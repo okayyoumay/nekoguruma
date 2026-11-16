@@ -1,7 +1,7 @@
 # ADR-479: The Server Stores an Agent's Events in One Transaction per Agent and Answers on the Connection They Came On
 
 **Date:** 2026-11-15
-**Status:** Accepted
+**Status:** Accepted (item 7 detailed by ADR-481)
 **Affects:** design 5.3, 5.4, 14.1; `db/migrations/0009_agent_events.sql`, `db/README.md`; `api/asyncapi.yaml` (`eventAck`, the close table); `crates/server` (`agent_events`, `hub`, `control`, `job_queue`), `crates/server/docs/ngr-server.md`; details ADR-478 item 6 and supersedes ADR-476 item 5's dropping of `agentEvent`
 
 ## Context

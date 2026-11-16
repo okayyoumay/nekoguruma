@@ -93,9 +93,9 @@ paths:
         (8.8, ADR-480): while another job of the tenant holds it, the request is **409** with the
         `code` `VEHICLE_LOCKED`, nothing is created and the key stays free. The lock expires on
         its own, 10 minutes (`acquire`) or 30 minutes (`writeSettings`) after the job's start
-        deadline. The server deletes it when it ends the job itself (an agent's rejection, a
-        retired instruction key, an instruction too large to send); a job that finishes on the
-        agent keeps it until it expires. A replay never takes a lock, and a job with no `vin`
+        deadline. The server deletes it when the job ends: when it ends the job itself (an agent's
+        rejection, a retired instruction key, an instruction too large to send) and when the agent
+        reports an end (5.6, ADR-481). A replay never takes a lock, and a job with no `vin`
         takes none. The answer names no holder, expiry or VIN, and there is no override.
 
         Like every operator route the request needs a live session and, as a POST, the pinned
@@ -1012,6 +1012,14 @@ components:
             level: { type: string, enum: [notifyOnly, gracePeriod, onSiteApproval, twoPerson] }
             approvedAt: { type: string, format: date-time }
             approvedBy: { type: string }
+        failure:
+          type: object
+          description: |
+            Present when the job ended as failed or preconditionFailed. The failure's detail is
+            vehicle data and is not part of this resource (design 4.3, ADR-481).
+          properties:
+            code: { type: string, description: The failure code's name (5.6); one the agent sent that the server does not know is other }
+            procedureCode: { type: string, description: With code procedure only, the code the procedure gave (1 to 128 bytes) }
         datasetId: { type: string }
         lastSeenAt: { type: string, format: date-time, description: Treated as running while disconnected }
 

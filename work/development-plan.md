@@ -29,7 +29,7 @@ M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 20
 
 **Scope.**
 
-- `server`: axum, PostgreSQL via sqlx with the `db/migrations` schema, local users (13.3), job queue with `FOR UPDATE SKIP LOCKED` (12), object storage trait with the local-file implementation.
+- `server`: axum, PostgreSQL via sqlx with the `db/migrations` schema, local users (13.3), job queue with `FOR UPDATE SKIP LOCKED` (12), object storage trait with an S3-compatible implementation, served on the local profile by a bundled S3-compatible server that the agent uploads to directly through pre-signed URLs (decided by the maintainer, 2026-11-17).
 - Control channel WSS and data channel HTTPS with resumable chunks (5.2); idempotent commands, start deadlines, sequence-numbered outbox and reconnection reconciliation (5.3).
 - Agent identity, installation and initial registration (6.1, 6.4, 6.7); job instruction signing and verification in `shared-crypto` (11.1).
 - `api/openapi.yaml` and `api/asyncapi.yaml` kept in sync with the implementation.
@@ -37,7 +37,7 @@ M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 20
 
 **Exit criteria.**
 
-1. In CI, a local-profile server and an agent with the simulators run an acquisition job and a configuration write job end to end, created through the Web API, on a server whose database holds its seed data (roles, the default confirmation level, presets) and gives each per-vehicle lock an expiry derived from the job kind's expected duration (the seed data and lock expiry added at the maintainer's request, 2026-11-12)
+1. In CI, a local-profile server and an agent with the simulators run an acquisition job and a configuration write job end to end, created through the Web API, on a server whose database holds its seed data (roles, the default confirmation level, presets) and gives each per-vehicle lock an expiry derived from the job kind's expected duration (the seed data and lock expiry added at the maintainer's request, 2026-11-12), and that writes an audit row for each job it creates (the audit row added at the maintainer's request, 2026-11-17)
 2. A network fault test (disconnect, slow link; design 13.4) shows no duplicate execution, no automatic reissue of a write job, and complete event delivery after reconnection (5.3). A restart of an interrupted job runs only the program and documents its instruction names, and is refused before anything is sent when they differ (added at the maintainer's request, 2026-11-12).
 3. An agent rejects a job instruction with a bad signature, and one whose operator is not the owner the agent is registered to where the connection restriction requires it (design 6.6). It also refuses a listener on its server's port that is not its own server, and the unsigned commands such a listener sends (cancel, HMI response, seed-key response; design 14.4, 11.1) (the operator and listener checks added at the maintainer's request, 2026-11-12).
 4. The hardware checks listed below are implemented: the harness lists each one for a profile of its class, a check run without `NGR_HW_PROFILE` fails, and their parts that need no hardware are tested in CI (design 13.5). Running them on hardware is optional.

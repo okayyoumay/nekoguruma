@@ -265,6 +265,10 @@ pub enum FailureCode {
     /// The job's instruction was signed by a key that is no longer the server's active one, so
     /// it is never sent (5.3, ADR-462, ADR-476).
     InstructionKeyRetired,
+    /// The agent refused the job because its operator is not one the agent allows: on the
+    /// `personal` and `personalRemote` presets, any operator but the registered owner (5.3, 6.6,
+    /// ADR-483). The job state carries no detail.
+    OperatorNotAllowed,
     Other,
 }
 
@@ -292,6 +296,7 @@ impl FailureCode {
             FailureCode::Internal => "internal",
             FailureCode::InstructionRejected => "instructionRejected",
             FailureCode::InstructionKeyRetired => "instructionKeyRetired",
+            FailureCode::OperatorNotAllowed => "operatorNotAllowed",
             FailureCode::Other => "other",
         }
     }
@@ -320,6 +325,7 @@ impl FailureCode {
             "internal" => FailureCode::Internal,
             "instructionRejected" => FailureCode::InstructionRejected,
             "instructionKeyRetired" => FailureCode::InstructionKeyRetired,
+            "operatorNotAllowed" => FailureCode::OperatorNotAllowed,
             "other" => FailureCode::Other,
             _ => return None,
         })
@@ -500,6 +506,7 @@ mod wire_name_tests {
             Internal,
             InstructionRejected,
             InstructionKeyRetired,
+            OperatorNotAllowed,
             Other,
         ];
         // A new variant fails to compile here until it is in the list above.
@@ -525,6 +532,7 @@ mod wire_name_tests {
                 | Internal
                 | InstructionRejected
                 | InstructionKeyRetired
+                | OperatorNotAllowed
                 | Other => {}
             }
             assert_eq!(
@@ -532,6 +540,11 @@ mod wire_name_tests {
                 Some(code)
             );
         }
+        // O12: the operator refusal's wire name.
+        assert_eq!(
+            FailureCode::OperatorNotAllowed.wire_name(),
+            "operatorNotAllowed"
+        );
         assert!(FailureCode::from_wire_name("Procedure").is_none());
         assert!(FailureCode::from_wire_name("").is_none());
     }

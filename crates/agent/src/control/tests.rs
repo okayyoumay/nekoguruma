@@ -58,6 +58,10 @@ const DEADLINE: Duration = Duration::from_secs(3600);
 const TOL: Duration = Duration::from_millis(50);
 const ORIGIN: &str = "http://127.0.0.1:8080";
 const AGENT_ID: &str = "0194f0a2-7c3e-7d11-8a52-3f6f9b1c2d4e";
+/// The registered owner, and the operator of every command a test means to be accepted.
+const OWNER_ID: &str = "owner-1";
+/// An operator of the same tenant who is not the owner.
+const OTHER_OPERATOR: &str = "operator-2";
 const JOB_ID: &str = "0194f0a2-7c3e-7d11-8a52-3f6f9b1c2d4f";
 
 // ---------------------------------------------------------------------------------------------
@@ -224,7 +228,7 @@ fn record_for(public: &PublicKey, origin: &str) -> Record {
 fn record_with(public: &PublicKey, origin: &str, instruction: &PublicKey) -> Record {
     Record {
         agent_id: AGENT_ID.to_owned(),
-        owner_id: "owner-1".to_owned(),
+        owner_id: OWNER_ID.to_owned(),
         preset: "personal".to_owned(),
         allow_remote: false,
         server_origin: origin.to_owned(),
@@ -341,6 +345,8 @@ struct Opts {
     random: fn() -> Result<[u8; 32], RandomError>,
     broken_signer: bool,
     origin: &'static str,
+    /// The record's preset.
+    preset: &'static str,
     /// A hook on the outbox's write path.
     probe: Option<Probe>,
 }
@@ -351,6 +357,7 @@ impl Default for Opts {
             random: shared_crypto::random_32,
             broken_signer: false,
             origin: ORIGIN,
+            preset: "personal",
             probe: None,
         }
     }
@@ -432,6 +439,11 @@ impl Env {
         let guard = tracing::subscriber::set_default(subscriber);
         tracing::callsite::rebuild_interest_cache();
         let fx = Fixture::with_origin(opts.origin);
+        if opts.preset != "personal" {
+            let mut record = Record::read(&fx.record_path()).unwrap();
+            record.preset = opts.preset.to_owned();
+            fx.write(&record);
+        }
         let (tx, rx) = mpsc::unbounded_channel();
         let dial = Arc::new(FakeDial {
             conns: tx,
@@ -900,6 +912,10 @@ enum Tamper {
     Format,
     /// The body names another agent.
     OtherAgent,
+    /// The body names an operator who is not the owner (the signature is good).
+    OtherOperator,
+    /// The body names another agent and an operator who is not the owner.
+    OtherAgentAndOperator,
 }
 
 /// A `jobCommand` text and the envelope inside it.
@@ -916,10 +932,13 @@ fn signed_command(fx: &Fixture, id: &str, agent: &str, tamper: Tamper) -> Signed
         job_id: JobId(JOB_ID.to_owned()),
         ownership_generation: 7,
         agent_id: AgentId(match tamper {
-            Tamper::OtherAgent => "other-agent".to_owned(),
+            Tamper::OtherAgent | Tamper::OtherAgentAndOperator => "other-agent".to_owned(),
             _ => agent.to_owned(),
         }),
-        operator_id: "operator-1".to_owned(),
+        operator_id: match tamper {
+            Tamper::OtherOperator | Tamper::OtherAgentAndOperator => OTHER_OPERATOR.to_owned(),
+            _ => OWNER_ID.to_owned(),
+        },
         kind: JobKind::RunSequence,
         vci: VciId("vci-a".to_owned()),
         vin: Some(Vin("VIN-UNDER-TEST".to_owned())),
@@ -943,7 +962,11 @@ fn signed_command(fx: &Fixture, id: &str, agent: &str, tamper: Tamper) -> Signed
         Tamper::Truncate => bytes.truncate(5),
         Tamper::FlipPayload => *bytes.last_mut().unwrap() ^= 1,
         Tamper::Format => bytes[0] = bytes[0].wrapping_add(1),
-        Tamper::None | Tamper::ForeignKey | Tamper::OtherAgent => {}
+        Tamper::None
+        | Tamper::ForeignKey
+        | Tamper::OtherAgent
+        | Tamper::OtherOperator
+        | Tamper::OtherAgentAndOperator => {}
     }
     let text = format!(
         r#"{{"type":"jobCommand","commandId":"{id}","signedJob":"{}"}}"#,
@@ -2579,7 +2602,8 @@ async fn f9_every_refusal_reason_is_answered_with_a_rejection_and_logged() {
         "cmd-",
         JOB_ID,
         "other-agent",
-        "operator-1",
+        OWNER_ID,
+        OTHER_OPERATOR,
         "VIN-UNDER-TEST",
     ] {
         assert!(!text.contains(forbidden), "{forbidden} in the log");
@@ -4112,6 +4136,242 @@ async fn outbox_c15_a_refused_command_is_rejected_and_has_no_event() {
         "tick: no event came",
     );
     assert_eq!(env.counts(), (0, 1));
+}
+
+/// The `preconditionFailed` event the operator check records: the code, no detail.
+fn operator_refusal_of(seq: u64) -> serde_json::Value {
+    serde_json::json!({
+        "type": "agentEvent", "seq": seq, "kind": "jobState", "jobId": JOB_ID,
+        "state": "preconditionFailed", "failureCode": "operatorNotAllowed"
+    })
+}
+
+/// A command sealed for an operator who is not the owner.
+fn foreign_operator(env: &Env, id: &str) -> String {
+    signed_command(&env.fx, id, AGENT_ID, Tamper::OtherOperator).text
+}
+
+/// The next message, which must be the event text; returns it as JSON.
+async fn event_json(ws: &mut Ws) -> serde_json::Value {
+    let (_, message) = got(ws).await;
+    let Got::Text(text) = message else {
+        panic!("an event is next, got {message:?}");
+    };
+    AgentMessage::decode(&text).unwrap();
+    serde_json::from_str(&text).unwrap()
+}
+
+/// O1 (and O3 for `personalRemote`): an operator who is not the owner gets no intake and one
+/// terminal event instead of `received`, and the command is acknowledged all the same.
+async fn an_operator_who_is_not_the_owner_is_refused_by_event(preset: &'static str) {
+    let mut env = Env::with(Opts {
+        preset,
+        ..Opts::default()
+    });
+    let (hello_at, mut ws) = env.connected(60).await;
+    send(&mut ws, &foreign_operator(&env, "cmd-1")).await;
+    let (_, answered) = answer(&mut ws).await;
+    assert_eq!(
+        answered,
+        serde_json::json!({"type": "commandAck", "commandId": "cmd-1"})
+    );
+    assert!(env.intake.0.lock().unwrap().is_empty(), "nothing was taken");
+    assert_eq!(event_json(&mut ws).await, operator_refusal_of(1));
+    send(&mut ws, &ack(1)).await;
+    // Exactly one event: the next message is the heartbeat tick.
+    assert_after(
+        hello_at,
+        heartbeat(&mut ws).await,
+        60,
+        "tick: no more events",
+    );
+    assert_eq!(env.counts(), (1, 0));
+}
+
+#[tokio::test(start_paused = true)]
+async fn operator_o1_a_personal_agent_refuses_another_operator_by_job_state_and_acks() {
+    an_operator_who_is_not_the_owner_is_refused_by_event("personal").await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn operator_o3_a_personal_remote_agent_refuses_another_operator_by_job_state_and_acks() {
+    an_operator_who_is_not_the_owner_is_refused_by_event("personalRemote").await;
+}
+
+/// O4: a shared agent has no agent-side operator check.
+#[tokio::test(start_paused = true)]
+async fn operator_o4_a_shared_agent_takes_another_operator() {
+    let mut env = Env::with(Opts {
+        preset: "shared",
+        ..Opts::default()
+    });
+    let (_, mut ws) = env.connected(60).await;
+    send(&mut ws, &foreign_operator(&env, "cmd-1")).await;
+    let (_, answered) = answer(&mut ws).await;
+    assert_eq!(answered["type"], "commandAck");
+    assert_eq!(env.intake.0.lock().unwrap().len(), 1);
+    assert_eq!(event_json(&mut ws).await, received_of(1));
+}
+
+/// O6: a command for another agent with a wrong operator is answered as one for another agent
+/// and records nothing.
+#[tokio::test(start_paused = true)]
+async fn operator_o6_a_command_for_another_agent_is_rejected_before_the_operator_is_read() {
+    let mut env = Env::new();
+    let (hello_at, mut ws) = env.connected(60).await;
+    send(
+        &mut ws,
+        &signed_command(&env.fx, "x", AGENT_ID, Tamper::OtherAgentAndOperator).text,
+    )
+    .await;
+    let (_, rejected) = answer(&mut ws).await;
+    assert_eq!(
+        rejected,
+        serde_json::json!({"type": "commandRejected", "commandId": "x", "reason": "notForThisAgent"})
+    );
+    assert_after(
+        hello_at,
+        heartbeat(&mut ws).await,
+        60,
+        "tick: no event came",
+    );
+    assert_eq!(env.counts(), (0, 1));
+}
+
+/// O7: a command that fails verification is rejected for that reason whatever operator it names,
+/// and records nothing.
+#[tokio::test(start_paused = true)]
+async fn operator_o7_a_forged_command_is_rejected_for_its_signature_not_its_operator() {
+    let mut env = Env::new();
+    let (hello_at, mut ws) = env.connected(60).await;
+    for (tamper, reason) in [
+        (Tamper::ForeignKey, "unknownKey"),
+        (Tamper::FlipPayload, "badSignature"),
+    ] {
+        send(
+            &mut ws,
+            &signed_command(&env.fx, "f", AGENT_ID, tamper).text,
+        )
+        .await;
+        let (_, rejected) = answer(&mut ws).await;
+        assert_eq!(rejected["reason"], reason);
+    }
+    assert_after(
+        hello_at,
+        heartbeat(&mut ws).await,
+        60,
+        "tick: no event came",
+    );
+    assert!(env.intake.0.lock().unwrap().is_empty());
+    assert_eq!(env.counts(), (0, 2));
+}
+
+/// O8: a refusal whose append fails to write withholds the ack and closes with 1011, as a
+/// `received` append does (C13).
+#[tokio::test(start_paused = true)]
+async fn operator_o8_a_failed_refusal_append_withholds_the_ack_and_closes_with_1011() {
+    let fail = Arc::new(AtomicBool::new(false));
+    let probe_flag = fail.clone();
+    let mut env = Env::with(Opts {
+        probe: Some(Box::new(move |step| {
+            if step == crate::outbox::Step::BeforeWrite && probe_flag.load(Ordering::SeqCst) {
+                return Err(io::Error::other("a scripted write failure"));
+            }
+            Ok(())
+        })),
+        ..Opts::default()
+    });
+    let (_, mut ws) = env.connected(60).await;
+    fail.store(true, Ordering::SeqCst);
+    send(&mut ws, &foreign_operator(&env, "a")).await;
+    close_of(&mut ws, 1011, true).await;
+    assert_eq!(env.counts(), (0, 0));
+    assert!(env.intake.0.lock().unwrap().is_empty());
+    assert_eq!(env.log.warns("outbox-write"), 1);
+    // The next connection reopens the outbox and the redelivered command is settled.
+    fail.store(false, Ordering::SeqCst);
+    let (_, mut ws) = env.connected(60).await;
+    send(&mut ws, &foreign_operator(&env, "a")).await;
+    let (_, answered) = answer(&mut ws).await;
+    assert_eq!(answered["type"], "commandAck");
+    assert_eq!(event_json(&mut ws).await, operator_refusal_of(1));
+}
+
+/// O8: a full outbox refuses the refusal's event like a `received` one: the ack is withheld.
+#[tokio::test(start_paused = true)]
+async fn operator_o8_a_full_outbox_withholds_the_ack_of_a_refusal() {
+    let mut env = Env::new();
+    for _ in 0..65 {
+        env.outbox()
+            .append(Kind::Other, big_event_text)
+            .await
+            .unwrap();
+    }
+    let (hello_at, mut ws) = env.connected(60).await;
+    for _ in 0..64 {
+        let _ = got(&mut ws).await;
+    }
+    send(&mut ws, &foreign_operator(&env, "a")).await;
+    assert_after(hello_at, heartbeat(&mut ws).await, 60, "tick");
+    assert_eq!(env.counts(), (0, 0));
+    assert!(env.intake.0.lock().unwrap().is_empty());
+    assert_eq!(env.log.warns("outbox-full"), 1);
+}
+
+/// O9: the same refused command delivered twice gets two events and two acks.
+#[tokio::test(start_paused = true)]
+async fn operator_o9_the_same_refused_job_delivered_twice_gets_two_events_and_two_acks() {
+    let mut env = Env::new();
+    let (_, mut ws) = env.connected(60).await;
+    for (k, id) in ["first", "second"].into_iter().enumerate() {
+        send(&mut ws, &foreign_operator(&env, id)).await;
+        let (_, answered) = answer(&mut ws).await;
+        assert_eq!(answered["type"], "commandAck");
+        assert_eq!(event_json(&mut ws).await, operator_refusal_of(k as u64 + 1));
+    }
+    assert_eq!(env.counts(), (2, 0));
+}
+
+/// O10: the first refusal per connection warns with the job ID and the code, the rest are debug,
+/// the end of the connection counts them, and neither operator, owner nor a `commandId` is logged.
+#[tokio::test(start_paused = true)]
+async fn operator_o10_the_log_is_bounded_and_names_the_job_and_the_code_only() {
+    let mut env = Env::new();
+    let (_, mut ws) = env.connected(60).await;
+    for k in 0..3 {
+        send(&mut ws, &foreign_operator(&env, &format!("cmd-{k}"))).await;
+        let _ = answer(&mut ws).await;
+        let _ = event_json(&mut ws).await;
+        send(&mut ws, &ack(k + 1)).await;
+    }
+    let warns = env.log.lines("WARN");
+    let warns: Vec<_> = warns
+        .iter()
+        .filter(|line| line.contains("operator is not allowed"))
+        .collect();
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(warns[0].contains(JOB_ID) && warns[0].contains("operatorNotAllowed"));
+    let debug = env
+        .log
+        .lines("DEBUG")
+        .iter()
+        .filter(|line| line.contains("operator is not allowed"))
+        .count();
+    assert_eq!(debug, 2);
+    drop(ws);
+    env.wait_phase(Phase::Waiting).await;
+    let lines: Vec<String> = env
+        .log
+        .lines("INFO")
+        .into_iter()
+        .filter(|line| line.contains("refused on this connection"))
+        .collect();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("operator_not_allowed=3"), "{}", lines[0]);
+    let text = env.log.text();
+    for forbidden in ["cmd-", OWNER_ID, OTHER_OPERATOR, "VIN-UNDER-TEST"] {
+        assert!(!text.contains(forbidden), "{forbidden} in the log");
+    }
 }
 
 /// C16: a stop during the blocking append ends as a stop, writes no ack and leaves a valid file.

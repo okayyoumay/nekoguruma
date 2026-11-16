@@ -186,12 +186,40 @@ impl Fixture {
 
     /// The envelope of the instruction of job `job_id`; `forge` flips its last byte.
     async fn envelope(&self, job_id: &str, forge: bool) -> Vec<u8> {
+        let owner = self.owner_id().await;
+        self.envelope_for(job_id, &owner, forge).await
+    }
+
+    /// The agent's registered owner: the operator ID its gate accepts on a personal preset.
+    async fn owner_id(&self) -> String {
+        sqlx::query_scalar("SELECT owner_id::text FROM agents WHERE id = $1::uuid")
+            .bind(&self.agent_id)
+            .fetch_one(&self.world.pool)
+            .await
+            .unwrap()
+    }
+
+    /// A second operator of the agent's tenant, who is not its owner; returns the ID.
+    async fn add_second_operator(&self) -> String {
+        sqlx::query_scalar(
+            "INSERT INTO operators (id, tenant_id, subject, display_name) \
+             SELECT gen_random_uuid(), tenant_id, 'bob', 'operator' FROM agents \
+             WHERE id = $1::uuid RETURNING id::text",
+        )
+        .bind(&self.agent_id)
+        .fetch_one(&self.world.pool)
+        .await
+        .unwrap()
+    }
+
+    /// The envelope of the instruction of job `job_id` made out for `operator`.
+    async fn envelope_for(&self, job_id: &str, operator: &str, forge: bool) -> Vec<u8> {
         let instruction = JobInstruction {
             version: INSTRUCTION_VERSION,
             job_id: JobId(job_id.to_owned()),
             ownership_generation: 1,
             agent_id: AgentId(self.agent_id.clone()),
-            operator_id: "operator-1".to_owned(),
+            operator_id: operator.to_owned(),
             kind: JobKind::RunSequence,
             vci: VciId("vci-a".to_owned()),
             vin: Some(Vin("VIN-UNDER-TEST".to_owned())),
@@ -210,6 +238,12 @@ impl Fixture {
 
     /// A job row for this agent holding `envelope`, signed under the server's active key.
     async fn add_job(&self, id: &str, order: i64, envelope: &[u8]) {
+        let owner = self.owner_id().await;
+        self.add_job_of(id, order, envelope, &owner).await;
+    }
+
+    /// A job row of `operator` (an operator of the agent's tenant) for this agent.
+    async fn add_job_of(&self, id: &str, order: i64, envelope: &[u8], operator: &str) {
         sqlx::query(
             "INSERT INTO jobs (tenant_id, id, kind, agent_id, operator_id, vci_id, \
                  confirmation_level, start_deadline, signed_job, signing_key_id, created_at, \
@@ -217,13 +251,15 @@ impl Fixture {
              SELECT a.tenant_id, $2::uuid, 'runSequence', a.id, o.id, 'vci-a', 'notifyOnly', \
                  now() + interval '1 hour', $4, $5, now() - interval '1 hour' + $3 * interval '1 second', \
                  $2 \
-             FROM agents a JOIN operators o ON o.tenant_id = a.tenant_id WHERE a.id = $1::uuid",
+             FROM agents a JOIN operators o ON o.tenant_id = a.tenant_id \
+             WHERE a.id = $1::uuid AND o.id = $6::uuid",
         )
         .bind(&self.agent_id)
         .bind(id)
         .bind(order)
         .bind(envelope)
         .bind(self.world.key.key_id())
+        .bind(operator)
         .execute(&self.world.pool)
         .await
         .unwrap();
@@ -544,6 +580,44 @@ async fn a_forged_stored_command_is_rejected_by_the_agent_and_ends_the_job_and_t
     f.until_job(NEXT_ID, "received|||true").await;
     f.until_job(JOB_ID, "failed|instructionRejected|badSignature|false")
         .await;
+    agent.stop().await;
+    f.server.take().unwrap().finish().await;
+    f.world.finish().await;
+}
+
+/// O13: a stored job sealed for a second operator of the tenant is refused by the agent's own
+/// operator check (a personal agent): the job ends as preconditionFailed with the code
+/// operatorNotAllowed, is marked delivered, its vehicle lock is freed, and the owner's next job is
+/// delivered and acknowledged (design 5.3, 6.6, ADR-483).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_job_sealed_for_another_operator_is_refused_by_the_agent_and_the_owners_next_is_acked() {
+    const NEXT_ID: &str = "0194f0a2-7c3e-7d11-8a52-3f6f9b1c2d50";
+    let mut f = Fixture::with_queue(true).await;
+    let other = f.add_second_operator().await;
+    let sealed = f.envelope_for(JOB_ID, &other, false).await;
+    f.add_job_of(JOB_ID, 1, &sealed, &other).await;
+    sqlx::query("UPDATE jobs SET vin = 'VIN-UNDER-TEST' WHERE id = $1::uuid")
+        .bind(JOB_ID)
+        .execute(&f.world.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO vehicle_locks (tenant_id, vin, job_id, agent_id, expires_at) \
+         SELECT tenant_id, vin, id, agent_id, now() + interval '1 hour' FROM jobs \
+         WHERE id = $1::uuid",
+    )
+    .bind(JOB_ID)
+    .execute(&f.world.pool)
+    .await
+    .unwrap();
+    let good = f.envelope(NEXT_ID, false).await;
+    f.add_job(NEXT_ID, 2, &good).await;
+    let mut agent = f.start_agent();
+    f.wait_connected(Some(&mut agent), true).await;
+    f.until_job(NEXT_ID, "received|||true").await;
+    f.until_job(JOB_ID, "preconditionFailed|operatorNotAllowed||true")
+        .await;
+    assert_eq!(f.world.sql("SELECT count(*) FROM vehicle_locks").await, "0");
     agent.stop().await;
     f.server.take().unwrap().finish().await;
     f.world.finish().await;

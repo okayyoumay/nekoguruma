@@ -233,8 +233,8 @@ pub(crate) struct Stored {
     pub(crate) repeats: u64,
     /// The stored events that wrote to their job (design 5.6, ADR-481).
     pub(crate) applied: u64,
-    /// The stored `jobState` events that wrote nothing: the job is not the sender's, is finished,
-    /// or the report is not a state.
+    /// The stored `jobState` events that wrote nothing: the job is not the sender's or does not
+    /// exist (a job ID that is not canonical included), is finished, or the report is not a state.
     pub(crate) ignored: u64,
     /// The reports not applied that the caller logs, after the commit.
     pub(crate) unapplied: Vec<Unapplied>,
@@ -245,13 +245,25 @@ pub(crate) struct Stored {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Unapplied {
     pub(crate) seq: u64,
-    pub(crate) job_id: String,
-    /// The job's state, or `unknown` for a name that is not a state.
+    /// The job the report names, when that is a canonical UUID.
+    pub(crate) job_id: Option<String>,
+    /// The job's state, or `unknown` for a name that is not a state or a job that is not found.
     pub(crate) current: &'static str,
     pub(crate) reported: &'static str,
 }
 
 impl Stored {
+    /// A report that wrote nothing and is to be logged.
+    fn not_applied(&mut self, seq: u64, job: Option<&str>, current: &'static str, report: &Report) {
+        self.ignored += 1;
+        self.unapplied.push(Unapplied {
+            seq,
+            job_id: job.map(str::to_owned),
+            current,
+            reported: report.name(),
+        });
+    }
+
     fn ack(&mut self, connection: ConnectionId, seq: u64) {
         match self.acks.iter_mut().find(|(c, _)| *c == connection) {
             Some((_, highest)) => *highest = (*highest).max(seq),
@@ -351,8 +363,13 @@ pub(crate) async fn store(
                     .await?;
                 out.stored += 1;
                 out.ack(event.connection, event.seq);
-                if let (Some(job), Some(report)) = (&event.job_id, &event.report) {
-                    apply(&mut tx, &tenant, agent, job, event.seq, report, &mut out).await?;
+                match (&event.job_id, &event.report) {
+                    (Some(job), Some(report)) => {
+                        apply(&mut tx, &tenant, agent, job, event.seq, report, &mut out).await?;
+                    }
+                    // A job ID that is not canonical names no job.
+                    (None, Some(report)) => out.not_applied(event.seq, None, "unknown", report),
+                    _ => {}
                 }
             }
             Verdict::Repeat => {
@@ -407,21 +424,17 @@ async fn apply(
     let state = report.name();
     let query = match decide(current.as_ref(), report) {
         Decision::NoJob => {
-            out.ignored += 1;
+            out.not_applied(seq, Some(job), "unknown", report);
             return Ok(());
         }
         Decision::Ignore { warn } => {
-            out.ignored += 1;
             if warn {
                 let current = current.as_ref().map_or("unknown", |c| {
                     JobState::from_wire_name(&c.state).map_or("unknown", |s| s.wire_name())
                 });
-                out.unapplied.push(Unapplied {
-                    seq,
-                    job_id: job.to_owned(),
-                    current,
-                    reported: state,
-                });
+                out.not_applied(seq, Some(job), current, report);
+            } else {
+                out.ignored += 1;
             }
             return Ok(());
         }

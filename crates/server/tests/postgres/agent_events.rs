@@ -41,7 +41,8 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::control::{Client, heartbeat, open, quiet_for, revoke_row, second_agent};
 use crate::control::{text, token};
-use crate::job_queue::{FRESH, ack, add_job, command, reject, row, session_token, settings};
+use crate::job_queue::{FRESH, ack, add_job, add_job_with, command, reject, row};
+use crate::job_queue::{session_token, settings};
 use crate::job_queue::{until_logged, until_row};
 use crate::redeem::capture;
 use crate::serving::Running;
@@ -1276,20 +1277,25 @@ async fn a_report_after_an_end_is_stored_and_acknowledged_and_logged_without_its
     let mut client = r.connect().await;
     say(&mut client, 1, &job, "completed", "").await;
     let before = line(&r.u, &job).await;
-    say(&mut client, 2, &job, "running", "").await;
+    // The first report after the end carries the detail; it takes the warning's gate.
     say(
         &mut client,
-        3,
+        2,
         &job,
         "failed",
         r#","failureCode":"internal","detail":"SECRET-DETAIL""#,
     )
     .await;
+    say(&mut client, 3, &job, "running", "").await;
     assert_eq!(line(&r.u, &job).await, before);
     assert_eq!(rows(&r.u, &r.u.id).await.len(), 3);
-    until_logged(&log, "was not applied").await;
+    until_logged(&log, "were not applied").await;
     let text = log.text();
-    assert!(text.contains(&job) && text.contains("completed") && text.contains("running"));
+    let warning = text
+        .lines()
+        .find(|l| l.contains("were not applied"))
+        .expect("the warning was written");
+    assert!(warning.contains(&job) && warning.contains("completed") && warning.contains("failed"));
     assert!(!text.contains("SECRET-DETAIL"));
     r.finish().await;
 }
@@ -1430,20 +1436,21 @@ async fn a_received_report_settles_the_delivery_without_a_command_ack_and_a_late
 
 // J16 (the acknowledgement)
 #[tokio::test]
-async fn a_report_and_the_command_ack_in_one_round_leave_one_final_row() {
+async fn a_state_report_settles_the_delivery_without_a_command_ack_and_a_late_ack_changes_nothing()
+{
     let r = Rig::new().await;
     let job = add_job(&r.u.w, &r.u.id, 1, b"envelope").await;
     let mut client = r.connect().await;
     let (command_id, _) = command(&mut client).await;
     until_row(&r.u.w, &job, "received|1|true|false|||false").await;
-    let held = hold_cursor(&r.u, &r.u.id).await;
-    send(&mut client, &frame_of(1, &job, "running", "")).await;
-    until_count(&r.counts.seen, 1, "the events seen").await;
+    // No acknowledgement of the command came: the report's move sets the delivery.
+    say(&mut client, 1, &job, "running", "").await;
+    assert_eq!(row(&r.u.w, &job).await, "running|1|true|true|||false");
+    let delivered = stamp(&r.u, &job, "delivered_at").await;
     ack(&mut client, &command_id).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    held.commit().await.unwrap();
-    assert_eq!(read_ack(&mut client).await, 1);
-    until_row(&r.u.w, &job, "running|1|true|true|||false").await;
+    say(&mut client, 2, &job, "completed", "").await;
+    assert_eq!(row(&r.u.w, &job).await, "completed|1|true|true|||true");
+    assert_eq!(stamp(&r.u, &job, "delivered_at").await, delivered);
     r.finish().await;
 }
 
@@ -1495,6 +1502,108 @@ async fn a_refused_commit_leaves_the_job_as_it_was_and_the_retry_applies_the_rep
         .await;
     assert_eq!(read_ack(&mut client).await, 1);
     assert_eq!(line(&r.u, &job).await, "completed|-|-|-|true|true|true");
+    assert_eq!(r.counts.applied.load(Ordering::Relaxed), 1);
+    r.finish().await;
+}
+
+// An end whose job was never marked delivered (its commandAck was lost) sets both times, and
+// the queue's take and its retired-key sweep leave the job alone.
+#[tokio::test]
+async fn an_end_for_a_job_not_marked_delivered_sets_both_times_and_the_queue_leaves_it() {
+    let r = Rig::with_lease(Duration::from_millis(300)).await;
+    let job = add_job(&r.u.w, &r.u.id, 1, b"envelope").await;
+    let mut client = r.connect().await;
+    let _ = command(&mut client).await;
+    until_row(&r.u.w, &job, "received|1|true|false|||false").await;
+    say(&mut client, 1, &job, "completed", "").await;
+    assert_eq!(row(&r.u.w, &job).await, "completed|1|true|true|||true");
+    // Past the lease the job is not taken again.
+    quiet_for(&mut client, 1000).await;
+    // The sweep: the job's key is now retired, as is a second job's, which the sweep ends.
+    sqlx::query("UPDATE jobs SET signing_key_id = $2 WHERE id = $1::uuid")
+        .bind(&job)
+        .bind("0".repeat(64))
+        .execute(&r.u.w.pool)
+        .await
+        .unwrap();
+    let stale = add_job_with(&r.u.w, &r.u.id, 2, b"stale", &"0".repeat(64), 3600).await;
+    until_row(
+        &r.u.w,
+        &stale,
+        "failed|0|false|false|instructionKeyRetired|the instruction was signed by a key that is no longer active|true",
+    )
+    .await;
+    assert_eq!(row(&r.u.w, &job).await, "completed|1|true|true|||true");
+    r.finish().await;
+}
+
+const LOCK_VIN: &str = "1HGCM82633A004352";
+
+/// Gives the job the VIN and makes it the holder of the VIN's lock for an hour.
+async fn hold_lock(u: &Up, job: &str) {
+    sqlx::query("UPDATE jobs SET vin = $2 WHERE id = $1::uuid")
+        .bind(job)
+        .bind(LOCK_VIN)
+        .execute(&u.w.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO vehicle_locks (tenant_id, vin, job_id, agent_id, expires_at) \
+         SELECT tenant_id, vin, id, agent_id, now() + interval '1 hour' FROM jobs \
+         WHERE id = $1::uuid",
+    )
+    .bind(job)
+    .execute(&u.w.pool)
+    .await
+    .unwrap();
+}
+
+async fn holders(u: &Up) -> String {
+    u.w.sql("SELECT coalesce(string_agg(job_id::text, ',' ORDER BY job_id), '') FROM vehicle_locks")
+        .await
+}
+
+// A reopened needsOnSiteRecovery job runs with no lock; its later end deletes only its own.
+#[tokio::test]
+async fn a_reopened_recovery_jobs_later_end_leaves_the_lock_another_job_took() {
+    let r = Rig::new().await;
+    let first = own_job(&r.u, &r.u.id, true).await;
+    let second = own_job(&r.u, &r.u.id, true).await;
+    hold_lock(&r.u, &first).await;
+    let mut client = r.connect().await;
+    say(&mut client, 1, &first, "needsOnSiteRecovery", "").await;
+    assert_eq!(holders(&r.u).await, "");
+    // The first end freed the VIN, and the second job took it.
+    hold_lock(&r.u, &second).await;
+    say(&mut client, 2, &first, "running", "").await;
+    say(&mut client, 3, &first, "completed", "").await;
+    assert_eq!(line(&r.u, &first).await, "completed|-|-|-|true|true|true");
+    assert_eq!(holders(&r.u).await, second);
+    r.finish().await;
+}
+
+// A job whose agent_id is the sender's but whose tenant is another is not the sender's own.
+#[tokio::test]
+async fn a_job_of_the_sender_in_another_tenant_is_not_changed() {
+    let r = Rig::new().await;
+    let foreign = own_job(&r.u, &r.u.id, true).await;
+    sqlx::query(
+        "WITH t AS (INSERT INTO tenants (id, name) VALUES (gen_random_uuid(), 'other') \
+             RETURNING id) \
+         UPDATE jobs SET tenant_id = (SELECT id FROM t) WHERE id = $1::uuid",
+    )
+    .bind(&foreign)
+    .execute(&r.u.w.pool)
+    .await
+    .unwrap();
+    let own = own_job(&r.u, &r.u.id, true).await;
+    let before = line(&r.u, &foreign).await;
+    let mut client = r.connect().await;
+    say(&mut client, 1, &foreign, "completed", "").await;
+    // Something positive after it.
+    say(&mut client, 2, &own, "running", "").await;
+    assert_eq!(line(&r.u, &foreign).await, before);
+    assert_eq!(line(&r.u, &own).await, "running|-|-|-|false|true|true");
     assert_eq!(r.counts.applied.load(Ordering::Relaxed), 1);
     r.finish().await;
 }

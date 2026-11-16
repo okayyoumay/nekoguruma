@@ -20,7 +20,7 @@ pub(crate) struct Report {
     pub(crate) state: Option<JobState>,
     /// The failure code's name, only for a failed or preconditionFailed report.
     pub(crate) failure_code: Option<&'static str>,
-    /// The procedure's own code, only with the failure code `procedure`.
+    /// The procedure's own code, only for a failed report with the failure code `procedure`.
     pub(crate) procedure_code: Option<String>,
     /// The detail, only for a failed, preconditionFailed or needsOnSiteRecovery report.
     pub(crate) detail: Option<String>,
@@ -42,7 +42,7 @@ impl Report {
         let with_code = matches!(name, Some("failed" | "preconditionFailed"));
         let with_detail = with_code || name == Some("needsOnSiteRecovery");
         let code = with_code.then(|| agent_failure_code(failure_code));
-        let procedure_code = (code == Some("procedure"))
+        let procedure_code = (name == Some("failed") && code == Some("procedure"))
             .then_some(procedure_code)
             .flatten()
             .filter(|p| (1..=MAX_PROCEDURE_CODE_LEN).contains(&p.len()) && !p.contains('\0'))
@@ -110,7 +110,7 @@ pub(crate) struct Current {
 /// The one write a report leads to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Decision {
-    /// The agent has no such job of the tenant: nothing is written, and nothing is logged.
+    /// The agent has no such job of the tenant: nothing is written; the caller logs it.
     NoJob,
     /// Not applied; `warn` says whether the caller logs it (a late `received` is routine).
     Ignore { warn: bool },
@@ -251,7 +251,7 @@ mod tests {
         let no_code = Report::of("failed", None, Some("P-17"), None);
         assert_eq!(no_code.procedure_code, None);
         let precondition = Report::of("preconditionFailed", Some("procedure"), Some("P"), None);
-        assert_eq!(precondition.procedure_code.as_deref(), Some("P"));
+        assert_eq!(precondition.procedure_code, None);
         let completed = Report::of("completed", Some("procedure"), Some("P"), None);
         assert_eq!(completed.procedure_code, None);
     }

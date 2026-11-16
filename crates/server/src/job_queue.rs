@@ -525,6 +525,7 @@ fn answer(
     stored: &Stored,
     counts: Option<&EventCounts>,
     gate: &Mutex<Option<std::time::Instant>>,
+    unapplied_gate: &Mutex<Option<std::time::Instant>>,
 ) {
     for (connection, seq) in &stored.acks {
         hub.ack_events(agent, *connection, *seq);
@@ -557,25 +558,26 @@ fn answer(
     if stored.ignored > 0 {
         tracing::debug!(agent_id = %agent.0, count = stored.ignored, "reports changed no job");
     }
-    // Names only, never the frame's text.
-    if !stored.unapplied.is_empty() && may_log(gate, now(), LOG_EVERY) {
-        for u in &stored.unapplied {
-            tracing::warn!(
-                agent_id = %agent.0, job_id = %u.job_id, seq = u.seq,
-                current = u.current, reported = u.reported,
-                "a stored job report was not applied to its job"
-            );
-        }
+    // One line per answer, with the count and the first report's names, never the frame's text.
+    if let Some(first) = stored.unapplied.first()
+        && may_log(unapplied_gate, now(), LOG_EVERY)
+    {
+        tracing::warn!(
+            agent_id = %agent.0, job_id = first.job_id.as_deref().unwrap_or("-"), seq = first.seq,
+            current = first.current, reported = first.reported, count = stored.unapplied.len(),
+            "stored job reports were not applied to their jobs (the first one is named)"
+        );
     }
 }
 
+/// A log gate: when its last line was written.
+type Gate = Mutex<Option<std::time::Instant>>;
+
 /// What a round of [`store_events`] needs besides the inbox and the events.
 struct Round<'a> {
-    /// The log gates of the store failures and of the connections closed.
-    gates: (
-        &'a Mutex<Option<std::time::Instant>>,
-        &'a Mutex<Option<std::time::Instant>>,
-    ),
+    /// The log gates of the store failures, of the connections closed and of the reports not
+    /// applied.
+    gates: (&'a Gate, &'a Gate, &'a Gate),
     counts: Option<&'a EventCounts>,
     stopping: &'a watch::Receiver<bool>,
     /// The connections the queue closed with 1002 and that are still in the hub's snapshot: their
@@ -615,7 +617,14 @@ async fn store_events(
         .await;
         match stored {
             Ok(stored) => {
-                answer(hub, &agent, &stored, round.counts, round.gates.1);
+                answer(
+                    hub,
+                    &agent,
+                    &stored,
+                    round.counts,
+                    round.gates.1,
+                    round.gates.2,
+                );
                 for (connection, _, _) in &stored.closes {
                     round.ended.insert((agent.clone(), *connection));
                 }
@@ -650,6 +659,7 @@ pub(crate) async fn run(
     ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let gate = Mutex::new(None);
     let event_gate = Mutex::new(None);
+    let unapplied_gate = Mutex::new(None);
     let mut queue = Queue::default();
     // The messages read while the database was waited for, and what has not been written yet.
     let mut held: Vec<Inbound> = Vec::new();
@@ -721,7 +731,7 @@ pub(crate) async fn run(
             if !events.is_empty() && (!store_failed || due) {
                 attempted = true;
                 let round = Round {
-                    gates: (&gate, &event_gate),
+                    gates: (&gate, &event_gate, &unapplied_gate),
                     counts: counts.as_deref(),
                     stopping: &stopping,
                     ended: &mut ended,
@@ -1506,7 +1516,7 @@ mod tests {
             &mut held,
             &mut kept,
             Round {
-                gates: (&gate, &gate),
+                gates: (&gate, &gate, &gate),
                 counts: Some(&counts),
                 stopping: &stopping,
                 ended: &mut ended,
@@ -1549,7 +1559,7 @@ mod tests {
             &mut held,
             &mut kept,
             Round {
-                gates: (&gate, &gate),
+                gates: (&gate, &gate, &gate),
                 counts: None,
                 stopping: &stopping,
                 ended: &mut ended,
@@ -1573,7 +1583,7 @@ mod tests {
         let (mut held, gate) = (Vec::new(), Mutex::new(None));
         let mut ended = HashSet::from([(a.clone(), c1)]);
         let round = Round {
-            gates: (&gate, &gate),
+            gates: (&gate, &gate, &gate),
             counts: None,
             stopping: &stopping,
             ended: &mut ended,

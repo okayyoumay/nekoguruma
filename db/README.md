@@ -137,12 +137,12 @@ cursor, and a repeat of a removed row is acknowledged with the cursor, not store
 **A job's reported state is written to its row by the transaction that stores the event**
 The server applies a stored `jobState` event to the sender's own job (ADR-481): `state`,
 `last_reported_at`, `delivered_at` (set once), and for an end `finished_at`, `failure_code`,
-`procedure_code` (migration 0010; only with `failure_code = 'procedure'`, 1 to 128 bytes) and
+`procedure_code` (migration 0010; only for a failed job with `failure_code = 'procedure'`, 1 to 128 bytes) and
 `failure_detail` (at most 1024 bytes; U+0000 replaced by U+FFFD, empty as null). These columns carry
 no CHECK: the server keeps only what its rule allows, and a bound in the column would turn a bad
 report into a failure of the agent's whole transaction. `failure_detail` is vehicle data (design
-4.3): the retention pass nulls it and deletes the job's stored events, and the VIN redaction does
-the same before it redacts `jobs.vin`. A job the agent reports as needsOnSiteRecovery has
+4.3): the retention and the VIN deletion of design 4.3 must cover it and the job's stored
+events; no pass does yet. A job the agent reports as needsOnSiteRecovery has
 `finished_at` set; a later report that reopens it clears `finished_at` and the failure columns.
 `progress_permille` is not written from events.
 

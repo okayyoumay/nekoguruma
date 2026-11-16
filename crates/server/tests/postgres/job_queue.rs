@@ -50,7 +50,7 @@ async fn up(lease: Duration) -> Up {
 
 /// A job row for `agent`, created `order` seconds after an arbitrary earlier moment, so that a
 /// smaller `order` is delivered first; its instruction is the bytes `bytes`.
-async fn add_job_with(
+pub(crate) async fn add_job_with(
     w: &World,
     agent: &str,
     order: i64,

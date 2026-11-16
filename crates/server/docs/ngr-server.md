@@ -738,11 +738,12 @@ connection with hyper's `with_upgrades()`.
   applied to the sender's own job in the same transaction (design 5.6, ADR-481): `job_state.rs`
   reads the event into a `Report` (the state, the failure code kept for failed and
   preconditionFailed only with the server's own two and unknown names read as `other`, the
-  procedure code only with `procedure` and 1 to 128 bytes without U+0000, never cut, the detail
+  procedure code only for failed with `procedure` and 1 to 128 bytes without U+0000, never cut, the detail
   only for failed, preconditionFailed and needsOnSiteRecovery with U+0000 replaced by U+FFFD and
   the text cut to 1024 bytes on a character boundary, empty as none), the row is locked
   (`SELECT ... FOR UPDATE` on the tenant, job ID and the sender as `agent_id`: another agent's
-  job is no row) and the pure `decide` picks one write: nothing (no row; finished and final;
+  job is no row) and the pure `decide` picks one write: nothing (no row, which a job ID that is
+  not canonical is too; finished and final;
   unknown name; a `received` on a finished needsOnSiteRecovery), the `received` stamps
   (`last_reported_at`, `delivered_at` when null; never the state), the report time alone (the
   state is the row's), a move (the state and both stamps; on a reopened needsOnSiteRecovery also
@@ -750,9 +751,11 @@ connection with hyper's `with_upgrades()`.
   columns, `finished_at` and the stamps, in one statement with the deletion of the job's own
   vehicle lock, `WITH ended AS (UPDATE ... RETURNING) DELETE FROM vehicle_locks ... WHERE job_id
   = ended.id`, ADR-480). Every time is the transaction's `now()`. A report that wrote nothing
-  because the job is final or the state name is unknown is stored and acknowledged and, after the
-  commit, is one gated warning with the agent ID, the job ID, the number and the two states'
-  names, never the text; any other number, one no
+  because the job is not the sender's or does not exist, is final, or the state name is unknown
+  (not a late `received` on a finished job) is stored and acknowledged and counted as ignored;
+  after the commit the queue logs one line per answer under a gate of its own (not the 1002
+  gate): the count of such reports and the first one's agent ID, job ID (when canonical),
+  number and the two states' names (`unknown` for no job), never the text; any other number, one no
   `bigint` holds included, is a gap that closes its connection with 1002 and ends its later
   events in the round. The cursor is moved to the last number stored and the transaction
   commits; only then are the answers given through the hub (`Hub::ack_events` for each

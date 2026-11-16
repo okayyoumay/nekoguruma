@@ -45,14 +45,20 @@ what the operator's `Job` shows of a failure.
    - A state name that is not one of 5.6's is not applied.
 4. **A report that is not applied is still stored and acknowledged, and the cursor moves** (O2).
    The agent must not resend it for ever. The queue logs a gated warning after the commit with
-   the agent ID, the job ID, the number and the two states' names (the job's and the reported
-   one, from the enumeration, `unknown` for a name that is none); never a frame's text or a
-   detail. A late `received` is routine and not logged.
+   the agent ID, the job ID (when it is a canonical UUID), the number and the two states' names
+   (the job's and the reported one, from the enumeration, `unknown` for a name that is none and
+   for a job that is not found); never a frame's text or a detail. The warning has a gate of its
+   own and is one line per answer, with the count of the reports not applied and the first one's
+   fields. This covers a report naming a job that is not the sender's or does not exist, and
+   one whose job ID is not canonical. A late `received` on a finished job is routine and not
+   logged.
 5. **Field rules**, so that nothing an agent sends can make the transaction fail for good.
    `failure_code` is written only for failed and preconditionFailed; a code the agent may send
    is kept, and an absent, unknown or server-only code (`instructionRejected`,
-   `instructionKeyRetired`) is `other`. `procedure_code` (a new column) is kept only with the
-   failure code `procedure`, 1 to 128 bytes without U+0000, and is otherwise null, never cut.
+   `instructionKeyRetired`) is `other`. `procedure_code` (a new column) is kept only for failed
+   with the failure code `procedure` (5.6 gives that code to Failed only; a
+   preconditionFailed report has none), 1 to 128 bytes without U+0000, and is otherwise null,
+   never cut.
    `failure_detail` is kept only for failed, preconditionFailed and needsOnSiteRecovery: U+0000,
    which `text` refuses, becomes U+FFFD, the text is cut to 1024 bytes on a character boundary,
    and an empty one is null. No CHECK constraint is put on these columns: a bound in the column
@@ -103,3 +109,9 @@ what the operator's `Job` shows of a failure.
 - Two server instances serve one agent in turn (the cursor lock) and the job row lock follows it,
   so no two instances lock these rows in opposite orders; a lock wait that times out fails the
   store, and the queue retries on its tick.
+- Two server instances can still lock job rows in opposite orders: an instance that holds an
+  agent's old connection can write answers (a `commandAck` or a rejection) for one job and then
+  another, while another instance's event store locks the same jobs in the order of the
+  agent's events. PostgreSQL then aborts one side with a deadlock (40P01); nothing is
+  written, and the work is tried again on the queue's next tick. The case is transient and no
+  code orders the locks against it.

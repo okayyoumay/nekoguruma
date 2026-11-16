@@ -22,8 +22,8 @@ fixed, since configurations and tests of the coding writes depend on it.
 3. `require_security_access` keeps gating only the built-in services it gated before: the VIN
    write, eraseMemory and the download.
 4. The only valid level is 1, as the simulator has one level; `EcuConfig::validate` refuses
-   another value, and a level together with the default session, where SecurityAccess is not
-   available.
+   another value, and a level without a non-default session named (an absent session includes
+   the default one), where SecurityAccess is not available.
 
 ## Consequences
 

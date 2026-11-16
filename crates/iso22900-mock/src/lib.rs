@@ -3099,6 +3099,14 @@ mod sim_ecu_tests {
         state.ecu = None;
         assert!(apply_sim_ecu_command(&mut state, command(too_long)).is_err());
         assert!(state.ecu.is_none());
+        // The configured data identifiers and the key mask are known keys, in both number forms.
+        let dids = r#"{"attach":{"config":{"security_key_mask":"0x3C3C3C3C","dids":[{"did":4608,"value":[1,0,2]},{"did":"0x1201","value":"0000","write":{"session":"extended","security_level":1}}]}}}"#;
+        apply_sim_ecu_command(&mut state, command(dids)).unwrap();
+        assert!(state.ecu.is_some());
+        let built_in = r#"{"attach":{"config":{"dids":[{"did":"0xf190","value":"00"}]}}}"#;
+        state.ecu = None;
+        assert!(apply_sim_ecu_command(&mut state, command(built_in)).is_err());
+        assert!(state.ecu.is_none());
     }
 
     #[test]

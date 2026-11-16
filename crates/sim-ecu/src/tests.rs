@@ -3244,6 +3244,12 @@ fn validate_refuses_bad_configured_dids_and_new_does_not_panic() {
             .validate()
             .is_err()
     );
+    // Every session (absent) includes the default one, so a level needs a session named.
+    assert!(
+        with(did(0x1200, vec![1], w(None, Some(1))))
+            .validate()
+            .is_err()
+    );
     assert!(
         with(did(0x1200, vec![1], w(Some(Session::Default), None)))
             .validate()

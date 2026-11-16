@@ -119,8 +119,9 @@ its length is the DID's length) and, when the DID is writable, `write` with an o
 `security_level` (only 1 exists; absent means no security check). Without `write` the DID is
 read-only. `EcuConfig::security_key_mask` sets the key mask (below).
 
-`did` and `security_key_mask` take a JSON number or a string of hex digits with a `0x` prefix;
-`value` takes an array of bytes or a string of an even number of hex digits without separators.
+`did` and `security_key_mask` take a JSON number or a string of hex digits (either case) after a
+lowercase `0x` prefix; `value` takes an array of bytes or a string of an even number of hex digits
+with no prefix and no separators.
 Both forms mean the same, and a malformed string is a parse error. The hex strings are for human-readable
 formats; the state file and the snapshot hold numbers and byte arrays.
 
@@ -140,7 +141,8 @@ formats; the state file and the snapshot hold numbers and byte arrays.
 
 `EcuConfig::validate` also refuses a configured DID that is built-in, declared twice, has an empty
 value or one longer than a response can carry (4092 bytes), has a `security_level` other than 1, or
-combines the default session with a security level (SecurityAccess is not available there).
+gives a security level without naming a non-default session (an absent session means every
+session, the default one included, where SecurityAccess is not available).
 `SimEcu` built from an unvalidated configuration does not fail: a built-in DID wins and the first
 of two equal DIDs wins.
 

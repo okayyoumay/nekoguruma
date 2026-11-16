@@ -361,9 +361,13 @@ impl EcuConfig {
                 if write.security_level.is_some_and(|level| level != 1) {
                     return Err(format!("{name} security_level must be 1"));
                 }
-                if write.session == Some(Session::Default) && write.security_level.is_some() {
+                // Absent means every session, the default one included, where SecurityAccess is
+                // not offered: a level needs a non-default session.
+                if write.security_level.is_some()
+                    && matches!(write.session, None | Some(Session::Default))
+                {
                     return Err(format!(
-                        "{name} cannot need a security level in the default session"
+                        "{name} needs a non-default session for its security level"
                     ));
                 }
             }

@@ -88,7 +88,7 @@ A rejected DiagnosticSessionControl request changes nothing.
 
 Services 2E, 31, 34, 36 and 37 need gateway authentication when `EcuConfig::require_gateway_auth`
 is set; NRC 34 is returned until `SimEcu::gateway_authenticated` is set (there is no
-Authentication service in the simulator). The check is a service-level one at the position of
+Authentication service in the simulator; `sim-vci`'s `set_gateway_authentication` control command sets it). The check is a service-level one at the position of
 the general behaviour figure (clause 7.7.2), so it comes before each service's own length and
 range checks. Authentication is the gateway's state, not the ECU's, so a power cycle, ECU reset
 or `reconnect()` of the simulated ECU leaves it as it is.

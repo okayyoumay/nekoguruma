@@ -1137,6 +1137,93 @@ fn the_control_export_holds_the_session() {
     );
 }
 
+/// An ECU that refuses a write without gateway authentication and takes it in any session.
+fn gateway_auth_config() -> EcuConfig {
+    EcuConfig {
+        require_gateway_auth: true,
+        dids: vec![sim_ecu::DidConfig {
+            did: 0x1201,
+            value: vec![0, 0, 0],
+            write: Some(sim_ecu::DidWrite {
+                session: None,
+                security_level: None,
+            }),
+        }],
+        ..default_ecu_config()
+    }
+}
+
+/// Sends one request to the ECU and returns its response payload.
+fn exchange(channel: PassThruUlong, payload: &[u8]) -> Vec<u8> {
+    write(channel, ECU_PHYSICAL_REQUEST_ID, payload);
+    let (status, mut messages) = read(channel, 1, 1000);
+    assert_eq!(status, STATUS_NOERROR);
+    assert_eq!(messages.len(), 1);
+    messages.remove(0)[4..].to_vec()
+}
+
+#[test]
+fn set_gateway_authentication_lets_a_write_through_and_withdraws_it() {
+    let f = setup(gateway_auth_config());
+    let write_did = [0x2E, 0x12, 0x01, 7, 8, 9];
+    // NRC 0x34 (AuthenticationRequired) before the command.
+    assert_eq!(exchange(f.channel, &write_did), [0x7F, 0x2E, 0x34]);
+    assert_eq!(
+        control(r#"{"command": "set_gateway_authentication", "authenticated": true}"#),
+        STATUS_NOERROR
+    );
+    assert_eq!(exchange(f.channel, &write_did), [0x6E, 0x12, 0x01]);
+    assert_eq!(
+        exchange(f.channel, &[0x22, 0x12, 0x01]),
+        [0x62, 0x12, 0x01, 7, 8, 9]
+    );
+    assert_eq!(
+        control(r#"{"command": "set_gateway_authentication", "authenticated": false}"#),
+        STATUS_NOERROR
+    );
+    assert_eq!(
+        exchange(f.channel, &[0x2E, 0x12, 0x01, 1, 2, 3]),
+        [0x7F, 0x2E, 0x34]
+    );
+    assert_eq!(
+        exchange(f.channel, &[0x22, 0x12, 0x01]),
+        [0x62, 0x12, 0x01, 7, 8, 9]
+    );
+}
+
+#[test]
+fn set_gateway_authentication_is_saved_with_the_ecu_state() {
+    let f = setup(gateway_auth_config());
+    let dir = StateDir::new("gateway-auth");
+    let saved_path = lock().state_path.replace(dir.file());
+    let status = control(r#"{"command": "set_gateway_authentication", "authenticated": true}"#);
+    let loaded = load_ecu_state(&dir.file());
+    lock().state_path = saved_path;
+    drop(f);
+    assert_eq!(status, STATUS_NOERROR);
+    let mut loaded = loaded
+        .expect("the state should load")
+        .expect("the command saved the state");
+    assert!(loaded.gateway_authenticated);
+    assert_eq!(
+        loaded.request(&[0x2E, 0x12, 0x01, 4, 5, 6]),
+        sim_ecu::SimResponse::Positive(vec![0x6E, 0x12, 0x01])
+    );
+}
+
+#[test]
+fn set_gateway_authentication_rejects_unknown_and_missing_fields() {
+    let _f = fixture();
+    for command in [
+        r#"{"command": "set_gateway_authentication", "authenticated": true, "extra": 1}"#,
+        r#"{"command": "set_gateway_authentication"}"#,
+        r#"{"command": "set_gateway_authentication", "authenticated": 1}"#,
+    ] {
+        assert_eq!(control(command), ERR_FAILED, "{command}");
+    }
+    assert!(!with_ecu(|ecu| ecu.gateway_authenticated));
+}
+
 #[test]
 fn the_control_export_arms_a_fault_for_a_service_or_a_request() {
     let _f = fixture();

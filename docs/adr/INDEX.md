@@ -478,6 +478,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-486](ADR-486-the-agent-judges-a-jobs-start-deadline-against-the-later-of-its-clock-and-a-persisted-highest-issue-time.md) | The Agent Judges a Job's Start Deadline Against the Later of Its Clock and a Persisted Highest Issue Time | Accepted | design 5.3, 6.7, `docs/glossary.md`, `api/asyncapi.yaml`, `crates/agent`; details ADR-461 item 6 and reuses ADR-483's path |
 | [ADR-487](ADR-487-the-server-ends-a-received-job-past-its-start-deadline-as-expired-and-frees-its-vehicle-lock.md) | The Server Ends a Received Job Past Its Start Deadline as Expired and Frees Its Vehicle Lock | Accepted | design 5.3, 8.8, 12, `api/openapi.yaml`, `crates/server`; annotates ADR-476 item 3, ADR-477 items 2 and 6 and ADR-480 item 4 |
 | [ADR-488](ADR-488-confirmation-defaults-are-a-product-wide-table-and-roles-stay-a-check-list.md) | Confirmation Defaults Are a Product-Wide Table and Roles Stay a CHECK List | Accepted | design 5.1, 6.3, 6.8, `db/migrations`, `db/README.md`, `crates/server`; details ADR-477 item 7 |
+| [ADR-490](ADR-490-consult-modern-web-guidance-for-browser-code.md) | Consult Modern Web Guidance for Browser Code | Accepted | `.claude/rules/web-ui.md`, `CLAUDE.md`; design 9.6 |
 
 ## Status Legend
 
@@ -863,6 +864,7 @@ the predecessor repository these ADRs came from.
 - ADR-458
 - ADR-464
 - ADR-482
+- ADR-490
 
 ### Timestamps / Clock
 - ADR-057 (amended by ADR-102)

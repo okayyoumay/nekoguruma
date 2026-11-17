@@ -208,8 +208,8 @@ in that range, so those rows are moved out of it before the range partition is a
 
 - Seed data (ADR-488). `confirmation_defaults (kind, level)` is product-wide (no tenant ID) and
   holds the default confirmation level of each job kind (design 6.3, 5.1): `acquire`,
-  `monitorSession` and `monitorCapture` are `notifyOnly`, `writeSettings` is `gracePeriod`,
-  `runSequence` and `reprogram` are `onSiteApproval`. `identify` has no row, since no route creates
+  `monitorSession` and `monitorCapture` are `notifyOnly`, `runSequence` and `writeSettings`
+  are `gracePeriod`, `reprogram` is `onSiteApproval`. `identify` has no row, since no route creates
   it. A job creation reads its level here and fails without a row. The design's row for a firmware
   write to an unattended device is an agent-side condition and not a kind, so it is not seeded.
   Organization and per-agent policies may only tighten these defaults (a later item).

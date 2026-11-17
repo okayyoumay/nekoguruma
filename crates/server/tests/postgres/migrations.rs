@@ -762,7 +762,7 @@ async fn confirmation_defaults_hold_the_six_seeded_rows_and_refuse_an_unknown_ki
         )
         .await,
         "acquire=notifyOnly,monitorCapture=notifyOnly,monitorSession=notifyOnly,\
-         reprogram=onSiteApproval,runSequence=onSiteApproval,writeSettings=gracePeriod"
+         reprogram=onSiteApproval,runSequence=gracePeriod,writeSettings=gracePeriod"
     );
     for (sql, what) in [
         (

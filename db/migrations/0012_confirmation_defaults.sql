@@ -17,6 +17,6 @@ INSERT INTO confirmation_defaults (kind, level) VALUES
     ('acquire',        'notifyOnly'),
     ('monitorSession', 'notifyOnly'),
     ('monitorCapture', 'notifyOnly'),
-    ('runSequence',    'onSiteApproval'),
+    ('runSequence',    'gracePeriod'),
     ('writeSettings',  'gracePeriod'),
     ('reprogram',      'onSiteApproval');

@@ -16,8 +16,8 @@ override them later, and whether roles and the preset default become rows too.
 1. **A table `confirmation_defaults (kind, level)` holds the defaults.** It is product-wide, with
    no tenant column, and both columns carry the same `CHECK` lists as `jobs.kind` and
    `jobs.confirmation_level`. Migration 0012 seeds it: `acquire`, `monitorSession` and
-   `monitorCapture` with `notifyOnly`, `runSequence` and `reprogram` with `onSiteApproval`,
-   `writeSettings` with `gracePeriod`. `identify` has no row, since no route creates it.
+   `monitorCapture` with `notifyOnly`, `runSequence` and `writeSettings` with `gracePeriod`,
+   `reprogram` with `onSiteApproval`, as design 5.1's table gives them. `identify` has no row, since no route creates it.
 2. **A job creation reads its level from the table** in its own transaction, and a kind without a
    row fails the creation as 500 with nothing inserted: a missing row is a fault of the
    installation, not of the request. The constant in code is removed.

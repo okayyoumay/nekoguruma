@@ -1,0 +1,4 @@
+variants,code,display,text,status
+,0x530100,C1301-00,dtc.eps.angleNotCalibrated,dtcStatus
+,0x530200,C1302-00,dtc.eps.torqueImplausible,dtcStatus
+,0x531000,C1310-00,dtc.eps.motorOvercurrent,dtcStatus

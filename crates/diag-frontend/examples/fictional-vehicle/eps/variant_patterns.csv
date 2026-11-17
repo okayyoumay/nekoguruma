@@ -1,0 +1,2 @@
+variant,service,field,expected,note
+epsV1,sparePartNumber.read,sparePartNumber,4D 4B 2D 45 50 53 2D 30 30 30 31,"ASCII ""MK-EPS-0001"""

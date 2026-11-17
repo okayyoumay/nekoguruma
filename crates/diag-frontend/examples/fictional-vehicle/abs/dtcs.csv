@@ -1,0 +1,6 @@
+variants,code,display,text,status
+,0x501100,C1011-00,dtc.abs.wheelSensorFrontLeft,dtcStatus
+,0x501200,C1012-00,dtc.abs.wheelSensorFrontRight,dtcStatus
+,0x501300,C1013-00,dtc.abs.wheelSensorRearLeft,dtcStatus
+,0x501400,C1014-00,dtc.abs.wheelSensorRearRight,dtcStatus
+,0x502000,C1020-00,dtc.abs.pumpMotor,dtcStatus

@@ -1,0 +1,4 @@
+name,rid,start,stop,results,session,security,p2_star_ms
+shiftAdaptationReset,0x0301,yes,no,no,0x03,0x01,
+eraseMemory,0xFF00,yes,no,no,0x02,0x01,10000
+checkProgrammingDependencies,0xFF01,yes,no,no,0x02,,10000

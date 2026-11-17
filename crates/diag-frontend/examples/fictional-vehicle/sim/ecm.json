@@ -1,0 +1,35 @@
+{
+  "vin": "NGRMKSA10VK000123",
+  "part_number": "MK-ECM-0001",
+  "sw_version": "1.0.1",
+  "response_delay_ms": 0,
+  "drop_at_block": null,
+  "require_security_access": true,
+  "require_gateway_auth": true,
+  "security_key_mask": "0x5A5A5A5A",
+  "dids": [
+    { "did": "0x1000", "value": "0000" },
+    { "did": "0x1001", "value": "41" },
+    { "did": "0x1002", "value": "3C" },
+    { "did": "0x1003", "value": "00" },
+    { "did": "0x1004", "value": "05" },
+    { "did": "0x1005", "value": "04EC" },
+    { "did": "0x1006", "value": "00" },
+    {
+      "did": "0x0120",
+      "value": "00010320",
+      "write": { "session": "extended", "security_level": 1 }
+    }
+  ],
+  "fail_checksum": false,
+  "dtcs": [
+    {
+      "dtc": 196864,
+      "status": 9
+    },
+    {
+      "dtc": 352768,
+      "status": 40
+    }
+  ]
+}

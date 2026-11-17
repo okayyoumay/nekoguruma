@@ -187,6 +187,7 @@ pub struct Server {
     router: Router,
     pool: PgPool,
     sessions: Sessions,
+    operator_sessions: OperatorSessions,
     hasher: Hasher,
     hub: Hub,
     grace: Duration,
@@ -269,6 +270,7 @@ impl Server {
         let sessions = Sessions::new();
         let hub = Hub::new();
         let hasher = Hasher::new();
+        let operator_sessions = OperatorSessions::new();
         Ok(Server {
             listener,
             router: router(AppState {
@@ -277,11 +279,12 @@ impl Server {
                 instruction_key,
                 sessions: sessions.clone(),
                 hub: hub.clone(),
-                operator_sessions: OperatorSessions::new(),
+                operator_sessions: operator_sessions.clone(),
                 hasher: hasher.clone(),
             }),
             pool,
             sessions,
+            operator_sessions,
             hasher,
             hub,
             grace: Duration::from_secs(http.shutdown_grace_secs),
@@ -315,6 +318,13 @@ impl Server {
         self.sessions.clone()
     }
 
+    /// The operators' login sessions. Tests only: a test that needs a session for an operator the
+    /// login route does not serve (login looks in the local tenant only) makes it in this table.
+    #[doc(hidden)]
+    pub fn operator_sessions(&self) -> OperatorSessions {
+        self.operator_sessions.clone()
+    }
+
     /// The server's password hasher. Tests only: holding its permit pins a login between its row
     /// read and its hash.
     #[doc(hidden)]
@@ -344,6 +354,7 @@ impl Server {
             router,
             pool,
             sessions,
+            operator_sessions: _,
             hasher: _,
             hub,
             grace,

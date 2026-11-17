@@ -492,8 +492,9 @@ ngr-server user disable --config <file> --username alice
   sorted unique hashes, no plan, issued at the database's second, start deadline 900 seconds
   later) are sealed; a signer's failure is 500 and nothing is written. (d) `INSERT ... ON
   CONFLICT (tenant_id, idempotency_key) DO NOTHING RETURNING`. On a returned row, and only
-  then, the agent's unrevoked row and then the active key's row are locked `FOR SHARE` before
-  the commit, so a revocation or a retirement waits for it or is seen; a row gone is a rollback
+  then, the winner takes these steps in this order: the `audit_log` row (`jobCreated`, ADR-484),
+  the vehicle's lock (next item), then the agent's unrevoked row and the active key's row,
+  locked `FOR SHARE` before the commit, and the commit, so a revocation or a retirement waits for it or is seen; a row gone is a rollback
   and the 403 `agent_revoked` or the 503 for a key that is not active. The commit is the 202.
   The locks come after the insert so that an insert waiting behind another insert of the key
   holds neither row and does not block the agent's connect stamp. Between the insert and these

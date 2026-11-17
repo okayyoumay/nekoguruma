@@ -21,6 +21,7 @@ use server::jobs::body_hash;
 use server::local_guard::pinned_origin;
 use server::local_user::{self, Hasher, NewUser};
 use server::{InstructionKey, Server};
+use sha2::Digest;
 use shared_crypto::instruction::{Envelope, verify};
 use shared_crypto::{SigningKey, random_32};
 use shared_proto::{INSTRUCTION_VERSION, JobInstruction, JobKind};
@@ -143,6 +144,8 @@ struct Lab {
     s: Running,
     hash: String,
     more: Vec<Running>,
+    /// The first server's login sessions, for a session the login route cannot make.
+    operator_sessions: server::OperatorSessions,
 }
 
 pub(crate) async fn add_user(
@@ -184,7 +187,9 @@ impl Lab {
             Some(settings) => server.with_job_queue(settings),
             None => server,
         };
+        let operator_sessions = server.operator_sessions();
         Lab {
+            operator_sessions,
             s: Running::spawn(server),
             w,
             agent,
@@ -207,6 +212,44 @@ impl Lab {
 
     fn addr(&self) -> SocketAddr {
         self.s.addr
+    }
+
+    /// A worker of a second tenant with an agent that lists the worker, and a session of the
+    /// worker; the session's cookie, the agent's ID and the tenant's ID. The login route serves
+    /// the local tenant only, so the session is made in the table, which a login would fill the
+    /// same way.
+    async fn second_tenant(&self) -> (String, String, String) {
+        let (tenant, operator) = self.w.add_operator("bob").await;
+        self.exec(&format!(
+            "INSERT INTO operator_roles (tenant_id, operator_id, role) \
+             VALUES ('{tenant}', '{operator}', 'worker'); \
+             INSERT INTO operator_credentials (operator_id, password_hash) \
+             VALUES ('{operator}', '{}')",
+            self.hash
+        ))
+        .await;
+        let agent = Agent::new();
+        let (_, r) = self.w.redeem("bob", &agent).await;
+        assert_eq!(r.status, 201, "{}", r.head);
+        let agent_id = json(&r)["agentId"].as_str().unwrap().to_owned();
+        let token = random_32().unwrap();
+        self.operator_sessions.establish(
+            &[],
+            sha2::Sha256::digest(token).into(),
+            server::operator_session::Holder {
+                operator,
+                tenant: tenant.clone(),
+                fingerprint: server::operator_session::fingerprint(&self.hash),
+            },
+            Instant::now(),
+            std::time::SystemTime::now(),
+        );
+        let cookie = format!(
+            "{}={}",
+            server::operator_session::COOKIE_NAME,
+            URL_SAFE_NO_PAD.encode(token)
+        );
+        (cookie, agent_id, tenant)
     }
 
     /// A user with these roles; the operator ID.
@@ -1681,22 +1724,30 @@ async fn a_lock_held_uncommitted_for_more_than_five_seconds_is_a_503() {
 
 #[tokio::test]
 async fn the_same_vin_in_two_tenants_has_a_row_in_each_with_the_jobs_tenant() {
-    // A9: the lock is per tenant, so the second tenant's job for the VIN is created.
+    // A9: the lock is per tenant, so the second tenant's job for the VIN is created; each job is
+    // made through the route by a worker of its own tenant, and nothing edits `audit_log`.
     let lab = Lab::new().await;
     let cookie = lab.login("alice").await;
-    let body = lab.body(json!({ "vin": VIN }));
-    let first = job_id(&lab.post(&cookie, "k-1", &body).await);
-    // Hand the first job, its lock and its audit row to another tenant.
-    lab.exec(
-        "WITH t AS (INSERT INTO tenants (id, name) VALUES (gen_random_uuid(), 'other') \
-                        RETURNING id), \
-              j AS (UPDATE jobs SET tenant_id = (SELECT id FROM t)), \
-              l AS (UPDATE vehicle_locks SET tenant_id = (SELECT id FROM t)) \
-         UPDATE audit_log SET tenant_id = (SELECT id FROM t)",
-    )
-    .await;
-    let second = job_id(&lab.post(&cookie, "k-2", &body).await);
+    let (cookie_2, agent_2, tenant_2) = lab.second_tenant().await;
+    let first = job_id(
+        &lab.post(&cookie, "k-1", &lab.body(json!({ "vin": VIN })))
+            .await,
+    );
+    let second = job_id(
+        &lab.post(
+            &cookie_2,
+            "k-2",
+            &lab.body(json!({ "vin": VIN, "agentId": agent_2 })),
+        )
+        .await,
+    );
     assert_ne!(first, second);
+    assert_ne!(tenant_2, lab.field(&first, "tenant_id").await);
+    assert_eq!(
+        lab.field(&second, "tenant_id").await,
+        tenant_2,
+        "the second job is the second tenant's"
+    );
     assert_eq!(
         lab.w
             .sql(&format!(
@@ -1713,6 +1764,7 @@ async fn the_same_vin_in_two_tenants_has_a_row_in_each_with_the_jobs_tenant() {
             .await,
         "2"
     );
+    lab.assert_one_audit_per_job("A9").await;
     lab.finish().await;
 }
 
@@ -1755,6 +1807,40 @@ async fn an_audit_log_locked_for_five_seconds_is_a_503_that_creates_no_job_and_b
     let id = job_id(&lab.post(&cookie, "k", &body).await);
     assert_eq!(lab.field(&id, "idempotency_key").await, "k");
     lab.assert_one_audit_per_job("A11 later").await;
+    lab.finish().await;
+}
+
+#[tokio::test]
+async fn a_creation_waiting_on_the_audit_log_holds_no_vehicle_lock() {
+    // A11: the audit row comes before the vehicle lock, so a creation that waits for the audit
+    // insert has not taken the vehicle's lock row, and a take of it by another transaction is
+    // not blocked (a take placed after the audit insert would leave it waiting behind the
+    // creation's uncommitted row).
+    let lab = Lab::new().await;
+    let cookie = lab.login("alice").await;
+    let body = lab.body(json!({ "vin": VIN }));
+    let mut lock = lab.w.pg.pool().begin().await.unwrap();
+    sqlx::query("LOCK TABLE audit_log IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    let waiting = spawn_post(lab.addr(), &cookie, "k", &body);
+    wait_for_lock(&lab, "INSERT INTO audit_log").await;
+    let take = tokio::time::timeout(Duration::from_secs(2), lab.hold_take(VIN))
+        .await
+        .expect(
+            "the take of the vehicle's lock waits behind the creation that waits for the audit row",
+        );
+    assert!(!waiting.is_finished(), "the creation ended early");
+    take.rollback().await.unwrap();
+    lock.rollback().await.unwrap();
+    let id = tokio::time::timeout(Duration::from_secs(10), waiting)
+        .await
+        .expect("the creation does not end")
+        .unwrap();
+    let id = job_id(&id);
+    assert_eq!(lab.locks().await, format!("{VIN}>{id}"));
+    lab.assert_one_audit_per_job("A11 order").await;
     lab.finish().await;
 }
 
@@ -1822,6 +1908,8 @@ async fn a_creation_waiting_on_an_uncommitted_replacement_of_an_expired_lock_is_
     tx.commit().await.unwrap();
     assert_problem(&waiting.await.unwrap(), 409, "replacement committed");
     lab.assert_jobs(1, "replacement committed").await;
+    lab.assert_audits(1, "A5: the refused creation left no row")
+        .await;
 
     lab.age_lock(VIN, "interval '1 day'").await;
     let tx = lab.hold_take(VIN).await;

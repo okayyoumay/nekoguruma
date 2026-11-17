@@ -168,7 +168,9 @@ The columns hold no foreign keys and a stale row keeps its VIN until a take repl
 **`audit_log`: one row per recorded action, written by the transaction that does it**
 The server writes a row inside the transaction of the action, so a rolled-back action leaves none
 (ADR-484). Read the rows of a job or a tenant in the order `(recorded_at, id)`: `id` is a
-`bigserial` and breaks ties between rows of one instant. Columns as the server fills them:
+`bigserial` and breaks ties between rows of one instant. `(recorded_at, id)` is not the commit
+order: `recorded_at` is the transaction's start time, earlier than its commit by any lock waits, so a
+reader that pages by keyset must allow for rows that commit late. Columns as the server fills them:
 `tenant_id`, `operator_id`, `agent_id` and `job_id` name the job's own values; `vin` is the job's
 VIN in clear, NULL when the job has none, and is the one column a VIN deletion redacts (design
 4.3); `action` is free text with no CHECK, so a new action needs no migration; `confirmation_level`

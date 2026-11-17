@@ -418,6 +418,7 @@ pub(crate) fn on_site_text(reason: &OnSiteReason) -> String {
         OnSiteReason::TargetVinDiffers => "TargetVinDiffers".to_owned(),
         OnSiteReason::IntendedVersionDiffers => "IntendedVersionDiffers".to_owned(),
         OnSiteReason::ArtifactDiffers => "ArtifactDiffers".to_owned(),
+        OnSiteReason::JobContentDiffers => "JobContentDiffers".to_owned(),
         #[cfg(test)]
         OnSiteReason::StoppedBeforeErase { flash_session, .. } => {
             format!("StoppedBeforeErase: flash session {flash_session}")
@@ -751,6 +752,30 @@ mod tests {
         assert_eq!(detail_of(&s), "UnconfirmedRequest: pc 4 step 9");
     }
 
+    /// A resume given another job than the journal's names the reason and nothing else: no
+    /// hash, and the state is the terminal on-site one whether or not the journal was resumable
+    /// (ADR-485).
+    #[test]
+    fn a_differing_job_content_ends_the_job_on_site_naming_only_the_reason() {
+        for resumable in [Resumable, Clean] {
+            let s = state(
+                JobError::OnSiteInterventionRequired(OnSiteReason::JobContentDiffers),
+                false,
+                resumable,
+            );
+            assert_eq!(
+                s,
+                JobState::NeedsOnSiteRecovery {
+                    detail: "JobContentDiffers".to_owned()
+                }
+            );
+        }
+        assert_eq!(
+            on_site_text(&OnSiteReason::JobContentDiffers),
+            "JobContentDiffers"
+        );
+    }
+
     #[test]
     fn an_on_site_standing_ends_the_job_at_once_whatever_the_error() {
         let expected = JobState::NeedsOnSiteRecovery {
@@ -1043,6 +1068,10 @@ mod tests {
         StepRef { pc, steps: 1 }
     }
 
+    fn content() -> crate::journal::JobContent {
+        crate::journal::JobContent::Document([7; 32])
+    }
+
     fn key() -> JobKey {
         JobKey {
             job_id: shared_proto::JobId("0190f5a8-7c2e-7d4b-9a6e-3f1c2b4d5e6f".to_owned()),
@@ -1111,7 +1140,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut program = request_program();
         program.sections = vec![recovery_required_section()];
-        let mut journal = Journal::create(dir.path(), &key(), None, None, None).unwrap();
+        let mut journal =
+            Journal::create(dir.path(), &key(), None, None, None, &content()).unwrap();
         assert_eq!(
             JournalStanding::read(dir.path(), &key(), &program, true),
             Clean
@@ -1136,7 +1166,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let program = request_program();
         // One that holds no request marker.
-        let mut journal = Journal::create(dir.path(), &key(), None, None, None).unwrap();
+        let mut journal =
+            Journal::create(dir.path(), &key(), None, None, None, &content()).unwrap();
         assert_eq!(
             JournalStanding::read(dir.path(), &key(), &program, false),
             Clean
@@ -1174,7 +1205,8 @@ mod tests {
     /// The standing of a fresh journal that `fill` wrote to.
     fn standing_after(program: &Program, fill: impl FnOnce(&mut Journal)) -> JournalStanding {
         let dir = tempfile::tempdir().unwrap();
-        let mut journal = Journal::create(dir.path(), &key(), None, None, None).unwrap();
+        let mut journal =
+            Journal::create(dir.path(), &key(), None, None, None, &content()).unwrap();
         fill(&mut journal);
         JournalStanding::read(dir.path(), &key(), program, false)
     }
@@ -1354,7 +1386,8 @@ mod tests {
             postcard::to_allocvec(&state).unwrap()
         };
         let vin = crate::journal::Vin::new("WDB12345678901234".to_owned());
-        let mut journal = Journal::create(dir.path(), &key(), Some(&vin), None, None).unwrap();
+        let mut journal =
+            Journal::create(dir.path(), &key(), Some(&vin), None, None, &content()).unwrap();
         journal.commit_run_start(at(0), &state_bytes(0, 0)).unwrap();
         journal.commit_request(StepRef { pc: 1, steps: 1 }).unwrap();
         journal

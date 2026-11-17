@@ -58,8 +58,8 @@ use worker_host::service::OperatingMode;
 use crate::host::{HostError, TransferProgress};
 use crate::inputs::{FieldBytes, ServiceSources, read_identity_bytes};
 use crate::journal::{
-    FileStore, JobKey, Journal, JournalError, JournalState, RunStop, StageId, StepRef, Store, Vin,
-    journal_dir,
+    FileStore, JobContent, JobKey, Journal, JournalError, JournalState, RunStop, StageId, StepRef,
+    Store, Vin, journal_dir,
 };
 use crate::restart::{in_section_outside_plans, needs_request_marker};
 use crate::runner::JobError;
@@ -127,10 +127,13 @@ impl JobJournal {
     /// ran before goes on through `resume_program_journaled`, not a first run.
     ///
     /// `artifact_sha256` is the hash of the job's flash artifact, recorded in the creating write
-    /// so every resume can compare it with the artifact it is given (ADR-344).
+    /// so every resume can compare it with the artifact it is given (ADR-344). `content` is what
+    /// the job was created with, recorded last in the same write so every resume can compare it
+    /// with the job it is given (ADR-485).
     pub(crate) fn create(
         setup: JournalSetup,
         artifact_sha256: Option<&[u8; 32]>,
+        content: &JobContent,
     ) -> Result<Self, JournalError> {
         Ok(Self::new(
             Journal::create(
@@ -139,6 +142,7 @@ impl JobJournal {
                 setup.vin.as_ref(),
                 setup.intended_software_version.as_deref(),
                 artifact_sha256,
+                content,
             )?,
             setup.sources,
         ))

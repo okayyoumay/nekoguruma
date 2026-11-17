@@ -10,10 +10,15 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent::journal::{
-    JobKey, Journal, JournalError, JournalState, RecoveryFacts, StageId, StepRef, TransferAttempt,
-    TransferExit, Vin,
+    JobContent, JobKey, Journal, JournalError, JournalState, RecoveryFacts, StageId, StepRef,
+    TransferAttempt, TransferExit, Vin,
 };
 use shared_proto::JobId;
+
+/// The content every journal of these tests is created with.
+fn content() -> JobContent {
+    JobContent::Document([7; 32])
+}
 
 /// Set in a child process to the number of commits it makes before it aborts.
 const CRASH_ENV: &str = "NGR_TEST_JOURNAL_CRASH_AFTER";
@@ -80,8 +85,8 @@ const SCRIPT: &[(&str, Commit)] = &[
 
 /// Creates the journal in `dir` and makes the first `commits` commits.
 fn run_script(dir: &Path, commits: usize) -> Journal {
-    let mut journal =
-        Journal::create(dir, &key(), None, None, None).expect("the journal should be created");
+    let mut journal = Journal::create(dir, &key(), None, None, None, &content())
+        .expect("the journal should be created");
     for (name, commit) in &SCRIPT[..commits] {
         commit(&mut journal).unwrap_or_else(|error| panic!("{name}: {error}"));
     }
@@ -300,7 +305,8 @@ fn the_journal_reads_back_after_a_crash_at_each_commit() {
             reference.state(),
             "after {commits} commits"
         );
-        assert_eq!(journal.state().records, commits as u64);
+        // The creation's job content (ADR-485) comes before the commits.
+        assert_eq!(journal.state().records, commits as u64 + 1);
         checked.extend(check_named_point(commits, journal.state()));
     }
     assert_eq!(checked, NAMED_POINTS, "every named point is reached");
@@ -318,14 +324,19 @@ fn the_creating_write_holds_the_vin_and_the_intended_version() {
     ] {
         let dir = temp_dir("creation-prefix");
         let vin = vin.map(|vin| Vin::new(vin.to_owned()));
-        drop(Journal::create(&dir.0, &key(), vin.as_ref(), version, None).expect("create"));
+        drop(
+            Journal::create(&dir.0, &key(), vin.as_ref(), version, None, &content())
+                .expect("create"),
+        );
         let state = Journal::read(&dir.0, &key()).expect("read");
         assert_eq!(state.facts.target_vin, vin);
         assert_eq!(state.facts.intended_software_version.as_deref(), version);
         assert_eq!(
             state.records,
-            u64::from(vin.is_some()) + u64::from(version.is_some())
+            // The job content is the creation prefix's last record (ADR-485).
+            u64::from(vin.is_some()) + u64::from(version.is_some()) + 1
         );
+        assert_eq!(state.job_content, Some(content()));
         let mut journal = Journal::open(&dir.0, &key()).expect("open");
         journal
             .commit_ecu_hardware_part_number(b"NGR-SIM-ECU")

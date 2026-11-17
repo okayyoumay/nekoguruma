@@ -890,6 +890,7 @@ For each cause of interruption, the resume origin and whether resumption is poss
 **Cases where resumption must not occur**
 
 - The start deadline has passed (terminate as "expired", since another vehicle may be connected)
+- The resume is given another document than the journal's job was created with, or another program when the job has none, or the journal records none (one written before the record existed): on-site intervention before the classification, with nothing sent and no resume counted, whatever the journal holds (ADR-485); a resume that finds no journal at all is not compared, and a handed-over restart has no journal to compare
 - The resume is given another flash artifact than the journal recorded (a missing hash on either side counts as another): before the journal reached a flash plan the job is refused, from the plan on it needs on-site intervention, nothing is sent and no resume is counted, and a resume that already needs on-site intervention for another reason keeps that reason; the job check comes first, so a program that reads blocks and is given no artifact, or one too short for a segment, is refused there with the journal untouched (ADR-344)
 - A VIN or hardware identity mismatch on re-verification before resuming (abort): the abort is journaled as the job's last record, and a later resume ends in the same abort before the link is opened, sending nothing and counting no resume (ADR-286)
 - The number of resumes at the same stage has reached the limit (avoid infinite loops; escalate to on-site intervention)
@@ -1510,7 +1511,7 @@ What this re-signing guarantees is **provenance**, not authenticity. Flash data 
 
 When only the ECU can verify, the hash the agent compares against comes from the manifest. Since the manifest itself is signed with the distribution key, provenance is guaranteed. However, the final guarantee that "this is genuine data signed by the OEM" lies with the ECU, and the system does not substitute for it. The verification method is declared in the VCI profile (9.3) and also shown in the web UI. The method is confirmed on real hardware for each vendor.
 
-The flash artifact itself is hashed by the agent before the first instruction: the job names it by content hash, as it names documents, and `check_job` refuses a mismatch and any plan segment that lies outside the file (ADR-336). The journal records its hash at creation and a resume compares it with the artifact it is given, so another file is never run against the first one's journal (design 8.2.5, ADR-344).
+The flash artifact itself is hashed by the agent before the first instruction: the job names it by content hash, as it names documents, and `check_job` refuses a mismatch and any plan segment that lies outside the file (ADR-336). The journal records its hash at creation and a resume compares it with the artifact it is given, so another file is never run against the first one's journal (design 8.2.5, ADR-344). It records the job's document or program the same way, by hash (ADR-485), so a replaced one is not resumed either.
 
 ---
 

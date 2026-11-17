@@ -275,6 +275,10 @@ impl RecoveryFacts {
                 }
                 self.artifact_sha256 = Some(*hash);
             }
+            Record::JobContent(_) => {
+                // It changes no fact. Where it may appear, which also refuses a second one, is
+                // `creation_prefix_allowed`'s rule; `JournalState` holds the value.
+            }
             Record::RunStart { at, .. } => {
                 // It names no request and changes no fact; only its place is checked.
                 if !after_last_step(at, self) {
@@ -527,6 +531,33 @@ pub struct JournalState {
     pub latest_checkpoint: Option<(StepRef, Vec<u8>)>,
     /// Records in the journal.
     pub records: u64,
+    /// What the job was created with (ADR-485); `None` in a journal written before that
+    /// decision, and when a torn tail cut the record off. Kept apart from `facts`, so the
+    /// summary sent for handover carries no hash.
+    pub job_content: Option<JobContent>,
+}
+
+/// What a job was created with, as the journal binds it (ADR-485): the SHA-256 of the job
+/// document's bytes, or, for a job that is a program only, of the program's postcard encoding.
+/// A restart compares it with the job it was handed, so a replaced program or document is not
+/// resumed. The kind is part of the value: a document and a program never match, whatever their
+/// bytes. The variant order is part of the journal format.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JobContent {
+    /// The job document's own hash (`JobDocument::sha256`).
+    Document([u8; 32]),
+    /// The hash of the encoded program, for a job without a document.
+    Program([u8; 32]),
+}
+
+/// The hash is not printed: it identifies the job's content and logs name the reason only.
+impl std::fmt::Debug for JobContent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Document(_) => "Document(<hash>)",
+            Self::Program(_) => "Program(<hash>)",
+        })
+    }
 }
 
 /// One journal record. Variants are only ever appended: postcard encodes the variant index.
@@ -608,6 +639,11 @@ enum Record {
     RequestNotSent {
         at: StepRef,
     },
+    /// What the job was created with (ADR-485); the last record of the creation prefix, after
+    /// the target VIN, the intended software version and the artifact hash when there are any.
+    /// Changes no recovery fact: it folds into `JournalState::job_content`. Appended last: the
+    /// variant index is part of the encoding.
+    JobContent(JobContent),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -731,13 +767,15 @@ impl Journal<FileStore> {
     /// writer of the same job gets [`JournalError::InUse`]. The job's `target_vin`, when it names
     /// one, is the first record and, as are the job's `intended_software_version` (next, or first
     /// without a VIN) and `artifact_sha256` (after both, ADR-344), part of the same write, so the
-    /// journal exists with them or not at all.
+    /// journal exists with them or not at all. The job's `content` (ADR-485) is always the last
+    /// record of that prefix.
     pub fn create(
         dir: &Path,
         key: &JobKey,
         target_vin: Option<&Vin>,
         intended_software_version: Option<&[u8]>,
         artifact_sha256: Option<&[u8; 32]>,
+        content: &JobContent,
     ) -> Result<Self, JournalError> {
         let path = journal_path(dir, key)?;
         let writer = WriterLock::take(&path)?;
@@ -757,8 +795,10 @@ impl Journal<FileStore> {
             .map(|vin| Record::TargetVin(vin.clone()))
             .into_iter()
             .chain(intended_software_version.map(|v| Record::IntendedSoftwareVersion(v.to_vec())))
-            .chain(artifact_sha256.map(|hash| Record::ArtifactSha256(*hash)));
+            .chain(artifact_sha256.map(|hash| Record::ArtifactSha256(*hash)))
+            .chain(std::iter::once(Record::JobContent(*content)));
         for record in prefix {
+            creation_prefix_allowed(&record, records, &facts).map_err(JournalError::Invariant)?;
             facts.apply(&record).map_err(JournalError::Invariant)?;
             let entry = Entry {
                 seq: records,
@@ -785,6 +825,7 @@ impl Journal<FileStore> {
                 previous_vm_state: None,
                 latest_checkpoint: None,
                 records,
+                job_content: Some(*content),
             },
             poisoned: false,
         })
@@ -867,9 +908,18 @@ impl<S: Store> Journal<S> {
                 previous_vm_state: None,
                 latest_checkpoint: None,
                 records: 0,
+                job_content: None,
             },
             poisoned: false,
         }
+    }
+
+    /// The state as if the journal had been created with `content`, without a record in the
+    /// store, for tests of a resume on a hand-built journal (ADR-485).
+    #[cfg(test)]
+    pub(crate) fn with_job_content(mut self, content: JobContent) -> Self {
+        self.state.job_content = Some(content);
+        self
     }
 
     /// Records the intended software version on a journal made by `on_store`, for tests.
@@ -1101,6 +1151,7 @@ impl JournalState {
             Record::Checkpoint { at, vm_state } => {
                 self.latest_checkpoint = Some((at, vm_state));
             }
+            Record::JobContent(content) => self.job_content = Some(content),
             _ => {}
         }
     }
@@ -1109,8 +1160,9 @@ impl JournalState {
 /// Where the creation-prefix records may sit, on commit and on read-back alike, with
 /// `records_so_far` records and `facts` before `record`: the target VIN only as the first record;
 /// the intended software version only as the first, or as the second after a target VIN; the
-/// artifact hash only after those two when set and nothing else (ADR-344). A second one of any
-/// is refused by `RecoveryFacts::apply`. Other records fit anywhere.
+/// artifact hash only after those two when set and nothing else (ADR-344); the job's content
+/// only after all three when set and nothing else (ADR-485), which also refuses a second one.
+/// A second one of the others is refused by `RecoveryFacts::apply`. Other records fit anywhere.
 fn creation_prefix_allowed(
     record: &Record,
     records_so_far: u64,
@@ -1135,6 +1187,17 @@ fn creation_prefix_allowed(
                     + u64::from(facts.intended_software_version.is_some()) =>
         {
             Err("the artifact hash must follow only the target VIN and the intended version")
+        }
+        // The three before it set up to three of the records so far, and nothing else precedes it.
+        Record::JobContent(_)
+            if records_so_far
+                != u64::from(facts.target_vin.is_some())
+                    + u64::from(facts.intended_software_version.is_some())
+                    + u64::from(facts.artifact_sha256.is_some()) =>
+        {
+            Err(
+                "the job content must follow only the target VIN, the intended version and the artifact hash",
+            )
         }
         _ => Ok(()),
     }
@@ -1438,6 +1501,7 @@ fn load(bytes: &[u8], key: &JobKey) -> Result<Loaded, JournalError> {
         previous_vm_state: None,
         latest_checkpoint: None,
         records: 0,
+        job_content: None,
     };
     let entry_seq = |payload: &[u8]| postcard::from_bytes::<Entry>(payload).ok().map(|e| e.seq);
     let mut offset = next;
@@ -1546,6 +1610,25 @@ fn crc32(bytes: &[u8]) -> u32 {
     })
 }
 
+/// Cuts the file's last frame off. For a journal `create` just made that is the job content,
+/// which leaves the file an agent wrote before ADR-485 (or a creation whose last frame was
+/// torn off): the header and the VIN, version and artifact records.
+#[cfg(test)]
+pub(crate) fn without_job_content(bytes: &mut Vec<u8>) {
+    let FrameRead::Ok { next, .. } = read_frame(bytes, PREAMBLE) else {
+        panic!("header");
+    };
+    let (mut last, mut offset) = (next, next);
+    while offset < bytes.len() {
+        let FrameRead::Ok { next, .. } = read_frame(bytes, offset) else {
+            panic!("frame at {offset}");
+        };
+        (last, offset) = (offset, next);
+    }
+    assert!(last > PREAMBLE, "the file has a record");
+    bytes.truncate(last);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1573,6 +1656,23 @@ mod tests {
     impl Drop for TempDir {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The content the tests create their journals with.
+    fn content() -> JobContent {
+        JobContent::Document([7; 32])
+    }
+
+    /// A journal as an agent wrote it before ADR-485: the header and `records`, numbered from 0,
+    /// with no job content.
+    fn legacy_journal(dir: &TempDir, records: Vec<Record>) {
+        drop(Journal::create(&dir.0, &key(), None, None, None, &content()).expect("create"));
+        let mut bytes = fs::read(path(dir)).expect("read");
+        without_job_content(&mut bytes);
+        fs::write(path(dir), &bytes).expect("write");
+        for (seq, record) in (0..).zip(records) {
+            append_entry(dir, seq, record);
         }
     }
 
@@ -1656,7 +1756,8 @@ mod tests {
     #[test]
     fn reads_back_what_it_committed() {
         let dir = TempDir::new();
-        let mut journal = Journal::create(&dir.0, &key(), None, None, None).expect("create");
+        let mut journal =
+            Journal::create(&dir.0, &key(), None, None, None, &content()).expect("create");
         script(&mut journal, |_| {});
         let (state, summary) = (journal.state().clone(), journal.summary());
         drop(journal);
@@ -1680,7 +1781,7 @@ mod tests {
             reopened.state().last_vm_state,
             Some((at(3, 30), b"vm-2".to_vec()))
         );
-        assert_eq!(reopened.state().records, 15);
+        assert_eq!(reopened.state().records, 16);
         assert_eq!(
             facts.procedure_failed.map(|f| (f.at, f.code)),
             Some((at(6, 40), "ERASE_REFUSED".to_owned()))
@@ -1691,13 +1792,14 @@ mod tests {
     #[test]
     fn reads_back_the_checkpoints_and_requests() {
         let dir = TempDir::new();
-        let mut journal = Journal::create(&dir.0, &key(), None, None, None).expect("create");
+        let mut journal =
+            Journal::create(&dir.0, &key(), None, None, None, &content()).expect("create");
         script_of(&mut journal, true, |_| {});
         let state = journal.state().clone();
         drop(journal);
         let reopened = Journal::open(&dir.0, &key()).expect("open");
         assert_eq!(reopened.state(), &state);
-        assert_eq!(state.records, 19);
+        assert_eq!(state.records, 20);
         assert_eq!(state.facts.first_request, Some(at(8, 12)));
         assert_eq!(state.facts.last_request, Some(at(9, 31)));
         // The second attempt's step carries a newer state than the checkpoints.
@@ -1710,7 +1812,8 @@ mod tests {
     #[test]
     fn folds_a_withdrawn_request_and_asserts_it_is_the_last() {
         let dir = TempDir::new();
-        let mut journal = Journal::create(&dir.0, &key(), None, None, None).expect("create");
+        let mut journal =
+            Journal::create(&dir.0, &key(), None, None, None, &content()).expect("create");
         journal.commit_run_start(at(0, 0), b"init").unwrap();
         // None to withdraw.
         assert!(matches!(
@@ -1914,29 +2017,42 @@ mod tests {
             .flat_map(|vin| [(vin, false), (vin, true)])
         {
             let dir = TempDir::new();
-            let mut journal =
-                Journal::create(&dir.0, &key(), target_vin, None, None).expect("create");
+            let mut journal = Journal::create(&dir.0, &key(), target_vin, None, None, &content())
+                .expect("create");
             let mut boundaries = vec![(journal.store.len as usize, journal.state().clone())];
             script_of(&mut journal, new_records, |j| {
                 boundaries.push((j.store.len as usize, j.state().clone()));
             });
             let bytes = fs::read(path(&dir)).expect("read");
             assert_eq!(bytes.len(), boundaries.last().expect("some").0);
-            if target_vin.is_some() {
-                // A cut inside the VIN frame models storage damage (a crash cannot tear it:
-                // `create` syncs it with the header): the header alone, an empty journal.
-                let FrameRead::Ok { next, .. } = read_frame(&bytes, PREAMBLE) else {
-                    panic!("header");
+            // A cut inside a creation-prefix frame models storage damage (a crash cannot tear
+            // one: `create` makes the file complete or not at all): the state after the frames
+            // before it. The job content is the last of them, so a cut inside it leaves the
+            // prefix without it, and a cut inside the VIN frame the header alone.
+            let FrameRead::Ok {
+                next: header_end, ..
+            } = read_frame(&bytes, PREAMBLE)
+            else {
+                panic!("header");
+            };
+            let empty = JournalState {
+                facts: RecoveryFacts::new(key()),
+                last_vm_state: None,
+                previous_vm_state: None,
+                latest_checkpoint: None,
+                records: 0,
+                job_content: None,
+            };
+            if let Some(vin) = target_vin {
+                let FrameRead::Ok { next: vin_end, .. } = read_frame(&bytes, header_end) else {
+                    panic!("vin frame");
                 };
-                let empty = JournalState {
-                    facts: RecoveryFacts::new(key()),
-                    last_vm_state: None,
-                    previous_vm_state: None,
-                    latest_checkpoint: None,
-                    records: 0,
-                };
-                boundaries.insert(0, (next, empty));
+                let mut with_vin = empty.clone();
+                with_vin.facts.target_vin = Some(vin.clone());
+                with_vin.records = 1;
+                boundaries.insert(0, (vin_end, with_vin));
             }
+            boundaries.insert(0, (header_end, empty));
             for cut in 0..=bytes.len() {
                 let loaded = load(&bytes[..cut], &key());
                 match boundaries.iter().rev().find(|(len, _)| *len <= cut) {
@@ -1979,8 +2095,13 @@ mod tests {
         for whole in [false, true] {
             let dir = TempDir::new();
             let vin = Vin::new("WDB12345678901234".to_owned());
-            drop(Journal::create(&dir.0, &key(), Some(&vin), None, None).expect("create"));
+            drop(
+                Journal::create(&dir.0, &key(), Some(&vin), None, None, &content())
+                    .expect("create"),
+            );
             let mut bytes = fs::read(path(&dir)).expect("read");
+            // The job content, written after the VIN, is not part of this case.
+            without_job_content(&mut bytes);
             let FrameRead::Ok { next, .. } = read_frame(&bytes, PREAMBLE) else {
                 panic!("header");
             };
@@ -2013,7 +2134,8 @@ mod tests {
             frame
         }] {
             let dir = TempDir::new();
-            let mut journal = Journal::create(&dir.0, &key(), None, None, None).expect("create");
+            let mut journal =
+                Journal::create(&dir.0, &key(), None, None, None, &content()).expect("create");
             journal.commit_block(0).expect_err("no transfer yet");
             journal
                 .commit_ecu_hardware_part_number(b"HW-1")
@@ -2042,7 +2164,8 @@ mod tests {
     #[test]
     fn a_damaged_record_with_records_after_it_is_corrupt() {
         let dir = TempDir::new();
-        let mut journal = Journal::create(&dir.0, &key(), None, None, None).expect("create");
+        let mut journal =
+            Journal::create(&dir.0, &key(), None, None, None, &content()).expect("create");
         let header_end = journal.store.len as usize;
         script(&mut journal, |_| {});
         drop(journal);
@@ -2059,7 +2182,7 @@ mod tests {
     #[test]
     fn refuses_a_file_it_cannot_trust() {
         let dir = TempDir::new();
-        drop(Journal::create(&dir.0, &key(), None, None, None).expect("create"));
+        drop(Journal::create(&dir.0, &key(), None, None, None, &content()).expect("create"));
         let good = fs::read(path(&dir)).expect("read");
 
         let other = JobKey {
@@ -2089,7 +2212,13 @@ mod tests {
         ));
 
         // A header cut short is not a torn tail: `create` never leaves one.
-        fs::write(path(&dir), &good[..good.len() - 1]).expect("write");
+        let FrameRead::Ok {
+            next: header_end, ..
+        } = read_frame(&good, PREAMBLE)
+        else {
+            panic!("header");
+        };
+        fs::write(path(&dir), &good[..header_end - 1]).expect("write");
         assert!(matches!(
             Journal::open(&dir.0, &key()),
             Err(JournalError::Corrupt { .. })
@@ -2103,9 +2232,9 @@ mod tests {
             Journal::open(&dir.0, &key()),
             Err(JournalError::NotFound)
         ));
-        drop(Journal::create(&dir.0, &key(), None, None, None).expect("create"));
+        drop(Journal::create(&dir.0, &key(), None, None, None, &content()).expect("create"));
         assert!(matches!(
-            Journal::create(&dir.0, &key(), None, None, None),
+            Journal::create(&dir.0, &key(), None, None, None, &content()),
             Err(JournalError::AlreadyExists)
         ));
         // The journal and its writer lock's sidecar; no temporary file is left.
@@ -2132,7 +2261,7 @@ mod tests {
             };
             assert!(
                 matches!(
-                    Journal::create(&dir.0, &key, None, None, None),
+                    Journal::create(&dir.0, &key, None, None, None, &content()),
                     Err(JournalError::InvalidJobId(_))
                 ),
                 "{id:?}"
@@ -2144,9 +2273,10 @@ mod tests {
     fn the_target_vin_is_the_first_record_and_reads_back() {
         let dir = TempDir::new();
         let vin = Vin::new("WDB12345678901234".to_owned());
-        let mut j = Journal::create(&dir.0, &key(), Some(&vin), None, None).expect("create");
+        let mut j =
+            Journal::create(&dir.0, &key(), Some(&vin), None, None, &content()).expect("create");
         assert_eq!(j.state().facts.target_vin.as_ref(), Some(&vin));
-        assert_eq!(j.state().records, 1);
+        assert_eq!(j.state().records, 2);
         // A second target VIN is refused.
         assert!(matches!(
             j.commit_target_vin(&vin),
@@ -2156,13 +2286,13 @@ mod tests {
         drop(j);
         let state = Journal::read(&dir.0, &key()).expect("read back");
         assert_eq!(state.facts.target_vin, Some(vin.clone()));
-        assert_eq!(state.records, 2);
+        assert_eq!(state.records, 3);
         // No VIN in any debug output.
         assert!(!format!("{state:?} {:?}", state.facts).contains("WDB"));
 
         // A journal made without one has none.
         let dir = TempDir::new();
-        drop(Journal::create(&dir.0, &key(), None, None, None).expect("create"));
+        drop(Journal::create(&dir.0, &key(), None, None, None, &content()).expect("create"));
         assert_eq!(
             Journal::read(&dir.0, &key())
                 .expect("read")
@@ -2197,12 +2327,12 @@ mod tests {
     fn a_file_with_a_late_target_vin_is_corrupt() {
         let dir = TempDir::new();
         let vin = Vin::new("WDB12345678901234".to_owned());
-        let mut j = Journal::create(&dir.0, &key(), None, None, None).expect("create");
+        let mut j = Journal::create(&dir.0, &key(), None, None, None, &content()).expect("create");
         j.commit_step(at(1, 1), None).expect("step");
         drop(j);
         let mut frame = Vec::new();
         let entry = Entry {
-            seq: 1,
+            seq: 2,
             at_unix_ms: 0,
             record: Record::TargetVin(vin),
         };
@@ -2243,13 +2373,14 @@ mod tests {
         for target_vin in [Some(&vin), None] {
             let dir = TempDir::new();
             let mut j =
-                Journal::create(&dir.0, &key(), target_vin, Some(VERSION), None).expect("create");
+                Journal::create(&dir.0, &key(), target_vin, Some(VERSION), None, &content())
+                    .expect("create");
             assert_eq!(
                 j.state().facts.intended_software_version.as_deref(),
                 Some(VERSION)
             );
             assert_eq!(j.state().facts.target_vin.as_ref(), target_vin);
-            assert_eq!(j.state().records, 1 + u64::from(target_vin.is_some()));
+            assert_eq!(j.state().records, 2 + u64::from(target_vin.is_some()));
             // A second version is refused, and the journal goes on after the prefix.
             assert!(matches!(
                 j.commit_intended_software_version(VERSION),
@@ -2269,7 +2400,7 @@ mod tests {
 
         // A journal made without one has none.
         let dir = TempDir::new();
-        drop(Journal::create(&dir.0, &key(), None, None, None).expect("create"));
+        drop(Journal::create(&dir.0, &key(), None, None, None, &content()).expect("create"));
         let state = Journal::read(&dir.0, &key()).expect("read");
         assert_eq!(state.facts.intended_software_version, None);
     }
@@ -2317,13 +2448,12 @@ mod tests {
     fn an_empty_intended_version_is_refused_and_creates_nothing() {
         let dir = TempDir::new();
         assert!(matches!(
-            Journal::create(&dir.0, &key(), None, Some(&[]), None),
+            Journal::create(&dir.0, &key(), None, Some(&[]), None, &content()),
             Err(JournalError::Invariant(_))
         ));
         assert!(!path(&dir).exists());
         let dir = TempDir::new();
-        drop(Journal::create(&dir.0, &key(), None, None, None).expect("create"));
-        append_entry(&dir, 0, Record::IntendedSoftwareVersion(Vec::new()));
+        legacy_journal(&dir, vec![Record::IntendedSoftwareVersion(Vec::new())]);
         assert!(matches!(
             Journal::read(&dir.0, &key()),
             Err(JournalError::Corrupt { .. })
@@ -2341,8 +2471,8 @@ mod tests {
             (None, None),
         ] {
             let dir = TempDir::new();
-            let j =
-                Journal::create(&dir.0, &key(), target_vin, version, Some(&hash)).expect("create");
+            let j = Journal::create(&dir.0, &key(), target_vin, version, Some(&hash), &content())
+                .expect("create");
             assert_eq!(j.state().facts.artifact_sha256, Some(hash));
             drop(j);
             let reopened = Journal::open(&dir.0, &key()).expect("open");
@@ -2354,7 +2484,10 @@ mod tests {
         }
         // A journal created without one reads none.
         let dir = TempDir::new();
-        drop(Journal::create(&dir.0, &key(), Some(&vin), Some(VERSION), None).expect("create"));
+        drop(
+            Journal::create(&dir.0, &key(), Some(&vin), Some(VERSION), None, &content())
+                .expect("create"),
+        );
         let facts = Journal::read(&dir.0, &key()).unwrap().facts;
         assert_eq!(facts.artifact_sha256, None);
     }
@@ -2397,23 +2530,33 @@ mod tests {
         refused(j.commit(Record::ArtifactSha256(hash)));
         // On read-back the same rule makes the file corrupt.
         let dir = TempDir::new();
-        drop(Journal::create(&dir.0, &key(), None, None, Some(&hash)).expect("create"));
-        append_entry(&dir, 1, Record::ArtifactSha256(hash));
+        drop(Journal::create(&dir.0, &key(), None, None, Some(&hash), &content()).expect("create"));
+        append_entry(&dir, 2, Record::ArtifactSha256(hash));
+        assert!(matches!(
+            Journal::read(&dir.0, &key()),
+            Err(JournalError::Corrupt { .. })
+        ));
+        // Without the job content after it, too.
+        let dir = TempDir::new();
+        legacy_journal(
+            &dir,
+            vec![Record::ArtifactSha256(hash), Record::ArtifactSha256(hash)],
+        );
         assert!(matches!(
             Journal::read(&dir.0, &key()),
             Err(JournalError::Corrupt { .. })
         ));
         let dir = TempDir::new();
-        drop(Journal::create(&dir.0, &key(), None, None, None).expect("create"));
-        append_entry(
+        legacy_journal(
             &dir,
-            0,
-            Record::Step {
-                at: at(1, 1),
-                vm_state: None,
-            },
+            vec![
+                Record::Step {
+                    at: at(1, 1),
+                    vm_state: None,
+                },
+                Record::ArtifactSha256(hash),
+            ],
         );
-        append_entry(&dir, 1, Record::ArtifactSha256(hash));
         assert!(matches!(
             Journal::read(&dir.0, &key()),
             Err(JournalError::Corrupt { .. })
@@ -2457,14 +2600,13 @@ mod tests {
             ),
         ];
         for (name, target_vin, created_version, appended) in cases {
+            // A file without job content, so that only the rule of the appended record is tested.
             let dir = TempDir::new();
-            let j =
-                Journal::create(&dir.0, &key(), target_vin, created_version, None).expect("create");
-            let first = j.state().records;
-            drop(j);
-            for (seq, record) in (first..).zip(appended) {
-                append_entry(&dir, seq, record);
-            }
+            let created = target_vin
+                .map(|vin| Record::TargetVin(vin.clone()))
+                .into_iter()
+                .chain(created_version.map(|v| Record::IntendedSoftwareVersion(v.to_vec())));
+            legacy_journal(&dir, created.chain(appended).collect());
             assert!(
                 matches!(
                     Journal::read(&dir.0, &key()),
@@ -2485,10 +2627,12 @@ mod tests {
             for whole in [false, true] {
                 let dir = TempDir::new();
                 drop(
-                    Journal::create(&dir.0, &key(), target_vin, Some(VERSION), None)
+                    Journal::create(&dir.0, &key(), target_vin, Some(VERSION), None, &content())
                         .expect("create"),
                 );
                 let mut bytes = fs::read(path(&dir)).expect("read");
+                // The job content, written after the version, is not part of this case.
+                without_job_content(&mut bytes);
                 let FrameRead::Ok { mut next, .. } = read_frame(&bytes, PREAMBLE) else {
                     panic!("header");
                 };
@@ -2519,7 +2663,10 @@ mod tests {
         for whole in [false, true] {
             let dir = TempDir::new();
             let vin = Vin::new("WDB12345678901234".to_owned());
-            drop(Journal::create(&dir.0, &key(), Some(&vin), Some(VERSION), None).expect("create"));
+            drop(
+                Journal::create(&dir.0, &key(), Some(&vin), Some(VERSION), None, &content())
+                    .expect("create"),
+            );
             let mut bytes = fs::read(path(&dir)).expect("read");
             let FrameRead::Ok { next: vin_at, .. } = read_frame(&bytes, PREAMBLE) else {
                 panic!("header");
@@ -2539,7 +2686,7 @@ mod tests {
     #[test]
     fn records_out_of_order_are_refused() {
         let dir = TempDir::new();
-        let mut j = Journal::create(&dir.0, &key(), None, None, None).expect("create");
+        let mut j = Journal::create(&dir.0, &key(), None, None, None, &content()).expect("create");
         let refused = |result: Result<(), JournalError>| {
             assert!(
                 matches!(result, Err(JournalError::Invariant(_))),
@@ -2586,6 +2733,7 @@ mod tests {
                 previous_vm_state: None,
                 latest_checkpoint: None,
                 records: 0,
+                job_content: None,
             },
             poisoned: false,
         };
@@ -2627,7 +2775,8 @@ mod tests {
     #[test]
     fn damage_with_records_after_it_is_not_a_torn_tail() {
         let dir = TempDir::new();
-        let mut journal = Journal::create(&dir.0, &key(), None, None, None).expect("create");
+        let mut journal =
+            Journal::create(&dir.0, &key(), None, None, None, &content()).expect("create");
         let header_end = journal.store.len as usize;
         journal
             .commit_ecu_hardware_part_number(b"HW-1")
@@ -2683,7 +2832,8 @@ mod tests {
     #[test]
     fn damage_followed_by_records_and_a_torn_tail_is_corrupt() {
         let dir = TempDir::new();
-        let mut journal = Journal::create(&dir.0, &key(), None, None, None).expect("create");
+        let mut journal =
+            Journal::create(&dir.0, &key(), None, None, None, &content()).expect("create");
         journal
             .commit_ecu_hardware_part_number(b"HW-1")
             .expect("commit");
@@ -2720,7 +2870,8 @@ mod tests {
     #[test]
     fn a_record_numbered_u64_max_does_not_panic() {
         let dir = TempDir::new();
-        let mut journal = Journal::create(&dir.0, &key(), None, None, None).expect("create");
+        let mut journal =
+            Journal::create(&dir.0, &key(), None, None, None, &content()).expect("create");
         journal
             .commit_ecu_hardware_part_number(b"HW-1")
             .expect("commit");
@@ -2756,7 +2907,8 @@ mod tests {
     #[test]
     fn a_frame_inside_a_torn_payload_is_not_a_later_record() {
         let dir = TempDir::new();
-        let mut journal = Journal::create(&dir.0, &key(), None, None, None).expect("create");
+        let mut journal =
+            Journal::create(&dir.0, &key(), None, None, None, &content()).expect("create");
         journal
             .commit_ecu_hardware_part_number(b"HW-1")
             .expect("commit");
@@ -2764,7 +2916,7 @@ mod tests {
         let before = journal.store.len as usize;
         let mut nested = Vec::new();
         let entry = Entry {
-            seq: 1,
+            seq: 2,
             at_unix_ms: 0,
             record: Record::Block { block: 0 },
         };
@@ -2813,7 +2965,8 @@ mod tests {
     #[test]
     fn read_leaves_a_torn_tail_in_place() {
         let dir = TempDir::new();
-        let mut journal = Journal::create(&dir.0, &key(), None, None, None).expect("create");
+        let mut journal =
+            Journal::create(&dir.0, &key(), None, None, None, &content()).expect("create");
         journal
             .commit_ecu_hardware_part_number(b"HW-1")
             .expect("commit");
@@ -2920,7 +3073,8 @@ mod tests {
         assert_eq!(j.summary().last_intent, Some(at(3, 11)));
 
         let dir = TempDir::new();
-        let mut journal = Journal::create(&dir.0, &key(), None, None, None).expect("create");
+        let mut journal =
+            Journal::create(&dir.0, &key(), None, None, None, &content()).expect("create");
         journal.commit_intent(at(7, 70)).expect("intent");
         drop(journal);
         let reopened = Journal::open(&dir.0, &key()).expect("open");
@@ -2933,7 +3087,8 @@ mod tests {
     #[test]
     fn a_journal_has_one_writer() {
         let dir = TempDir::new();
-        let mut journal = Journal::create(&dir.0, &key(), None, None, None).expect("create");
+        let mut journal =
+            Journal::create(&dir.0, &key(), None, None, None, &content()).expect("create");
         journal
             .commit_ecu_hardware_part_number(b"HW")
             .expect("commit");
@@ -2943,7 +3098,7 @@ mod tests {
             Err(JournalError::InUse)
         ));
         assert!(matches!(
-            Journal::create(&dir.0, &key(), None, None, None),
+            Journal::create(&dir.0, &key(), None, None, None, &content()),
             Err(JournalError::InUse)
         ));
         assert_eq!(fs::read(path(&dir)).expect("read"), bytes);
@@ -2953,7 +3108,7 @@ mod tests {
         );
         drop(journal);
         assert!(matches!(
-            Journal::create(&dir.0, &key(), None, None, None),
+            Journal::create(&dir.0, &key(), None, None, None, &content()),
             Err(JournalError::AlreadyExists)
         ));
         let reopened = Journal::open(&dir.0, &key()).expect("open after the writer is gone");
@@ -2971,7 +3126,8 @@ mod tests {
     #[test]
     fn a_dropped_writer_releases_the_lock_a_shared_handle_still_holds() {
         let dir = TempDir::new();
-        let journal = Journal::create(&dir.0, &key(), None, None, None).expect("create");
+        let journal =
+            Journal::create(&dir.0, &key(), None, None, None, &content()).expect("create");
         let shared = journal
             .store
             ._writer
@@ -3001,7 +3157,8 @@ mod tests {
         for target_vin in [Some(&vin), None] {
             let dir = TempDir::new();
             let mut j =
-                Journal::create(&dir.0, &key(), target_vin, Some(VERSION), None).expect("create");
+                Journal::create(&dir.0, &key(), target_vin, Some(VERSION), None, &content())
+                    .expect("create");
             let facts = j.summary();
             let prefix = j.state().records;
             j.commit_run_start(at(0, 0), b"initial").expect("run start");
@@ -3033,7 +3190,7 @@ mod tests {
         j.commit_run_start(at(0, 6), b"s").expect("after the step");
 
         let dir = TempDir::new();
-        let mut j = Journal::create(&dir.0, &key(), None, None, None).expect("create");
+        let mut j = Journal::create(&dir.0, &key(), None, None, None, &content()).expect("create");
         j.commit_step(at(2, 5), None).expect("step");
         drop(j);
         append_entry(
@@ -3089,7 +3246,7 @@ mod tests {
         assert_eq!(j.state().records, records);
 
         let dir = TempDir::new();
-        let mut j = Journal::create(&dir.0, &key(), None, None, None).expect("create");
+        let mut j = Journal::create(&dir.0, &key(), None, None, None, &content()).expect("create");
         j.commit_step(at(3, 1), None).expect("step");
         j.commit_procedure_failed(at(4, 2), "E", "d")
             .expect("failure");
@@ -3162,7 +3319,7 @@ mod tests {
         assert_eq!(j.summary().identity_mismatch, None);
 
         let dir = TempDir::new();
-        let mut j = Journal::create(&dir.0, &key(), None, None, None).expect("create");
+        let mut j = Journal::create(&dir.0, &key(), None, None, None, &content()).expect("create");
         j.commit_step(at(3, 1), None).expect("step");
         j.commit_identity_mismatch(IdentityKind::Vin)
             .expect("abort");
@@ -3243,7 +3400,7 @@ mod tests {
         assert_eq!(j.summary().run_stopped, None);
 
         let dir = TempDir::new();
-        let mut j = Journal::create(&dir.0, &key(), None, None, None).expect("create");
+        let mut j = Journal::create(&dir.0, &key(), None, None, None, &content()).expect("create");
         j.commit_step(at(3, 1), None).expect("step");
         j.commit_run_stopped(at(4, 2), RunStop::StepLimit)
             .expect("stop");
@@ -3272,7 +3429,7 @@ mod tests {
     #[test]
     fn a_torn_run_stop_reads_back_as_the_state_before_it() {
         let dir = TempDir::new();
-        let mut j = Journal::create(&dir.0, &key(), None, None, None).expect("create");
+        let mut j = Journal::create(&dir.0, &key(), None, None, None, &content()).expect("create");
         j.commit_step(at(3, 1), Some(b"vm")).expect("step");
         let before = (j.store.len as usize, j.state().clone());
         j.commit_run_stopped(at(4, 2), RunStop::Vm(VmError::Overflow))
@@ -3313,7 +3470,7 @@ mod tests {
             .expect("at the limits");
 
         let dir = TempDir::new();
-        drop(Journal::create(&dir.0, &key(), None, None, None).expect("create"));
+        drop(Journal::create(&dir.0, &key(), None, None, None, &content()).expect("create"));
         append_entry(
             &dir,
             0,
@@ -3358,6 +3515,7 @@ mod tests {
                 previous_vm_state: None,
                 latest_checkpoint: None,
                 records: 0,
+                job_content: None,
             },
             poisoned: false,
         }
@@ -3457,6 +3615,7 @@ mod tests {
             Record::Request { at: at(0, 0) },
             Record::ArtifactSha256([0; 32]),
             Record::RequestNotSent { at: at(0, 0) },
+            Record::JobContent(JobContent::Document([0; 32])),
         ];
         for (index, record) in records.iter().enumerate() {
             assert_eq!(
@@ -3755,5 +3914,386 @@ mod tests {
         assert!(!text.contains(temp.0.to_str().unwrap()), "{text}");
         let dir = temp.0.join("nekoguruma").join("journal");
         assert_eq!(fs::read_dir(dir).unwrap().count(), 0);
+    }
+
+    // ---- The job content (ADR-485) ----
+
+    /// The records of the journal file, in order, as written.
+    fn records_in(dir: &TempDir) -> Vec<Record> {
+        let bytes = fs::read(path(dir)).expect("read");
+        let FrameRead::Ok { next, .. } = read_frame(&bytes, PREAMBLE) else {
+            panic!("header");
+        };
+        let mut offset = next;
+        let mut records = Vec::new();
+        while offset < bytes.len() {
+            let FrameRead::Ok { payload, next } = read_frame(&bytes, offset) else {
+                panic!("frame at {offset}");
+            };
+            let entry: Entry = postcard::from_bytes(payload).expect("entry");
+            assert_eq!(entry.seq, records.len() as u64);
+            records.push(entry.record);
+            offset = next;
+        }
+        records
+    }
+
+    fn is_corrupt<T>(result: Result<T, JournalError>) -> bool {
+        matches!(result, Err(JournalError::Corrupt { .. }))
+    }
+
+    /// `create` writes the content as the last record of the prefix, whatever of the VIN, the
+    /// version and the artifact hash the job has, and its state equals what `open` and `read`
+    /// give back (ADR-485 item 2).
+    #[test]
+    fn the_job_content_is_the_last_record_of_the_creation_prefix() {
+        let vin = Vin::new("WDB12345678901234".to_owned());
+        let hash = [0xA5u8; 32];
+        for mask in 0..8u8 {
+            for kind in [JobContent::Document([9; 32]), JobContent::Program([9; 32])] {
+                let target_vin = (mask & 1 != 0).then_some(&vin);
+                let version = (mask & 2 != 0).then_some(VERSION);
+                let artifact = (mask & 4 != 0).then_some(&hash);
+                let dir = TempDir::new();
+                let journal = Journal::create(&dir.0, &key(), target_vin, version, artifact, &kind)
+                    .expect("create");
+                let present = u64::from(mask & 1) + u64::from(mask >> 1 & 1) + u64::from(mask >> 2);
+                assert_eq!(journal.state().records, present + 1, "{mask}");
+                assert_eq!(journal.state().job_content, Some(kind), "{mask}");
+                let state = journal.state().clone();
+                drop(journal);
+                let records = records_in(&dir);
+                assert_eq!(records.len() as u64, present + 1, "{mask}");
+                assert_eq!(
+                    records[present as usize],
+                    Record::JobContent(kind),
+                    "{mask}"
+                );
+                assert_eq!(
+                    Journal::read(&dir.0, &key()).expect("read"),
+                    state,
+                    "{mask}"
+                );
+                let reopened = Journal::open(&dir.0, &key()).expect("open");
+                assert_eq!(reopened.state(), &state, "{mask}");
+            }
+        }
+    }
+
+    /// The two kinds keep their variant index in the encoding, and the format version is
+    /// unchanged by the record (ADR-485 item 2).
+    #[test]
+    fn the_job_content_keeps_its_encoding_and_the_format_version() {
+        assert_eq!(FORMAT_VERSION, 1);
+        let document = postcard::to_allocvec(&JobContent::Document([3; 32])).expect("encode");
+        let program = postcard::to_allocvec(&JobContent::Program([3; 32])).expect("encode");
+        assert_eq!((document[0], program[0]), (0, 1));
+        assert_eq!((document.len(), program.len()), (33, 33));
+        // Not printed: logs name the reason, not the hash.
+        let shown = format!("{:?}", JobContent::Document([0xAB; 32]));
+        assert!(!shown.contains("171") && !shown.contains("AB"), "{shown}");
+    }
+
+    /// A journal without the record, as an older agent wrote it, reads back with no content and
+    /// is not corrupt; the journal goes on from there (ADR-485).
+    #[test]
+    fn a_journal_without_job_content_reads_back_with_none() {
+        let vin = Vin::new("WDB12345678901234".to_owned());
+        let dir = TempDir::new();
+        legacy_journal(
+            &dir,
+            vec![
+                Record::TargetVin(vin.clone()),
+                Record::IntendedSoftwareVersion(VERSION.to_vec()),
+                Record::ArtifactSha256([1; 32]),
+            ],
+        );
+        let state = Journal::read(&dir.0, &key()).expect("read");
+        assert_eq!(state.job_content, None);
+        assert_eq!(state.records, 3);
+        assert_eq!(state.facts.target_vin, Some(vin));
+        let mut journal = Journal::open(&dir.0, &key()).expect("open");
+        assert_eq!(journal.state(), &state);
+        journal.commit_step(at(1, 1), None).expect("step");
+        assert_eq!(journal.state().job_content, None);
+        // An empty file with only the header reads back too.
+        let dir = TempDir::new();
+        legacy_journal(&dir, Vec::new());
+        assert_eq!(
+            Journal::read(&dir.0, &key()).expect("read").job_content,
+            None
+        );
+    }
+
+    /// The content is refused after any other record, and twice, on commit (ADR-485 item 2).
+    #[test]
+    fn the_job_content_is_refused_outside_the_creation_prefix_and_twice() {
+        let vin = Vin::new("WDB12345678901234".to_owned());
+        let content = Record::JobContent(JobContent::Program([5; 32]));
+        let refused = |result: Result<(), JournalError>| {
+            assert!(
+                matches!(result, Err(JournalError::Invariant(_))),
+                "{result:?}"
+            );
+        };
+        let mut j = memory();
+        j.commit_step(at(1, 1), None).expect("step");
+        refused(j.commit(content.clone()));
+        let mut j = memory();
+        j.commit_run_start(at(0, 0), b"vm").expect("run start");
+        refused(j.commit(content.clone()));
+        let mut j = memory();
+        j.commit_ecu_hardware_part_number(b"HW-1").expect("record");
+        refused(j.commit(content.clone()));
+        let mut j = memory();
+        j.commit_step(at(1, 1), None).expect("step");
+        j.commit_procedure_failed(at(2, 2), "CODE", "detail")
+            .expect("failure");
+        refused(j.commit(content.clone()));
+        // After a VIN with a gap, and as the creating write leaves it: once.
+        let mut j = memory();
+        j.commit_target_vin(&vin).expect("vin");
+        j.commit_step(at(1, 1), None).expect("step");
+        refused(j.commit(content.clone()));
+        let dir = TempDir::new();
+        let mut j = Journal::create(
+            &dir.0,
+            &key(),
+            Some(&vin),
+            None,
+            None,
+            &content_of(&content),
+        )
+        .expect("create");
+        let before = j.state().clone();
+        refused(j.commit(content.clone()));
+        assert_eq!(j.state(), &before);
+        // On its own as the first record, it is fine, once.
+        let mut j = memory();
+        j.commit(content.clone()).expect("first");
+        assert_eq!(j.state().job_content, Some(content_of(&content)));
+        refused(j.commit(content));
+    }
+
+    fn content_of(record: &Record) -> JobContent {
+        match record {
+            Record::JobContent(content) => *content,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// On read-back the same rule makes the file corrupt: after a step, run start, hardware part
+    /// number or terminal record, twice, and in any order against the others (ADR-485 item 2).
+    #[test]
+    fn a_file_with_the_job_content_out_of_place_is_corrupt() {
+        let vin = Vin::new("WDB12345678901234".to_owned());
+        let content = || Record::JobContent(JobContent::Document([5; 32]));
+        let step = || Record::Step {
+            at: at(1, 1),
+            vm_state: None,
+        };
+        let cases: Vec<(&str, Vec<Record>)> = vec![
+            ("after a step", vec![step(), content()]),
+            (
+                "after a run start",
+                vec![
+                    Record::RunStart {
+                        at: at(0, 0),
+                        vm_state: Vec::new(),
+                    },
+                    content(),
+                ],
+            ),
+            (
+                "after a hardware part number",
+                vec![Record::EcuHardwarePartNumber(b"HW".to_vec()), content()],
+            ),
+            (
+                "after a terminal record",
+                vec![
+                    step(),
+                    Record::ProcedureFailed {
+                        at: at(2, 2),
+                        code: "C".to_owned(),
+                        detail: String::new(),
+                    },
+                    content(),
+                ],
+            ),
+            ("twice", vec![content(), content()]),
+            (
+                "before the VIN",
+                vec![content(), Record::TargetVin(vin.clone())],
+            ),
+            (
+                "before the version",
+                vec![content(), Record::IntendedSoftwareVersion(VERSION.to_vec())],
+            ),
+            (
+                "between the VIN and the version",
+                vec![
+                    Record::TargetVin(vin.clone()),
+                    content(),
+                    Record::IntendedSoftwareVersion(VERSION.to_vec()),
+                ],
+            ),
+            (
+                "before the artifact hash",
+                vec![content(), Record::ArtifactSha256([1; 32])],
+            ),
+            (
+                "between the version and the artifact hash",
+                vec![
+                    Record::TargetVin(vin.clone()),
+                    Record::IntendedSoftwareVersion(VERSION.to_vec()),
+                    content(),
+                    Record::ArtifactSha256([1; 32]),
+                ],
+            ),
+        ];
+        for (name, records) in cases {
+            let dir = TempDir::new();
+            legacy_journal(&dir, records);
+            assert!(is_corrupt(Journal::read(&dir.0, &key())), "{name}");
+            assert!(is_corrupt(Journal::open(&dir.0, &key())), "{name}");
+        }
+        // The whole prefix in its order reads back.
+        let dir = TempDir::new();
+        legacy_journal(
+            &dir,
+            vec![
+                Record::TargetVin(vin.clone()),
+                Record::IntendedSoftwareVersion(VERSION.to_vec()),
+                Record::ArtifactSha256([1; 32]),
+                content(),
+                step(),
+            ],
+        );
+        let state = Journal::read(&dir.0, &key()).expect("read");
+        assert_eq!(state.job_content, Some(JobContent::Document([5; 32])));
+        assert_eq!(state.records, 5);
+    }
+
+    /// A content frame that is damaged while it is the last frame reads like a torn tail: the
+    /// journal reads back without it and the writer's open cuts it off, so every resume finds no
+    /// content (ADR-485 item 5). With a record after it, or with a record before it that is
+    /// damaged, it is corrupt instead.
+    #[test]
+    fn a_damaged_job_content_frame_is_a_torn_tail_only_while_it_is_last() {
+        let vin = Vin::new("WDB12345678901234".to_owned());
+        let hash = [4u8; 32];
+        for whole in [false, true] {
+            // Last: a torn tail.
+            let dir = TempDir::new();
+            drop(
+                Journal::create(&dir.0, &key(), Some(&vin), None, Some(&hash), &content())
+                    .expect("create"),
+            );
+            let mut bytes = fs::read(path(&dir)).expect("read");
+            let mut cut = bytes.clone();
+            without_job_content(&mut cut);
+            let from = if whole {
+                cut.len()
+            } else {
+                cut.len() + FRAME_HEADER
+            };
+            bytes[from..].fill(0);
+            let state = Journal::read(&dir.0, &key()).expect("whole");
+            assert_eq!(state.job_content, Some(content()));
+            fs::write(path(&dir), &bytes).expect("damage");
+            let state = Journal::read(&dir.0, &key()).expect("a torn tail reads back");
+            assert_eq!((state.job_content, state.records), (None, 2), "{whole}");
+            assert_eq!(state.facts.artifact_sha256, Some(hash));
+            let journal = Journal::open(&dir.0, &key()).expect("open");
+            assert_eq!(journal.state().job_content, None);
+            drop(journal);
+            assert_eq!(
+                fs::metadata(path(&dir)).expect("meta").len(),
+                cut.len() as u64
+            );
+
+            // Followed by a record: damage.
+            let dir = TempDir::new();
+            let mut journal =
+                Journal::create(&dir.0, &key(), Some(&vin), None, Some(&hash), &content())
+                    .expect("create");
+            journal.commit_step(at(1, 1), None).expect("step");
+            drop(journal);
+            let mut bytes = fs::read(path(&dir)).expect("read");
+            // The frame before the step is the content's.
+            let mut offset = PREAMBLE;
+            let mut starts = Vec::new();
+            while offset < bytes.len() {
+                let FrameRead::Ok { next, .. } = read_frame(&bytes, offset) else {
+                    panic!("frame");
+                };
+                starts.push((offset, next));
+                offset = next;
+            }
+            let (content_at, content_end) = starts[starts.len() - 2];
+            let from = if whole {
+                content_at
+            } else {
+                content_at + FRAME_HEADER
+            };
+            bytes[from..content_end].fill(0);
+            fs::write(path(&dir), &bytes).expect("damage");
+            assert!(is_corrupt(Journal::read(&dir.0, &key())), "{whole}");
+            assert!(is_corrupt(Journal::open(&dir.0, &key())), "{whole}");
+
+            // A damaged record before the content, with the content after it: damage.
+            let dir = TempDir::new();
+            drop(
+                Journal::create(&dir.0, &key(), Some(&vin), None, Some(&hash), &content())
+                    .expect("create"),
+            );
+            let mut bytes = fs::read(path(&dir)).expect("read");
+            let FrameRead::Ok { next: vin_at, .. } = read_frame(&bytes, PREAMBLE) else {
+                panic!("header");
+            };
+            let FrameRead::Ok { next: vin_end, .. } = read_frame(&bytes, vin_at) else {
+                panic!("vin frame");
+            };
+            let from = if whole { vin_at } else { vin_at + FRAME_HEADER };
+            bytes[from..vin_end].fill(0);
+            assert!(is_corrupt(load(&bytes, &key())), "{whole}");
+        }
+    }
+
+    /// A content record whose inner kind is unknown, or whose payload is short, does not decode:
+    /// the journal is corrupt, not read as a journal without content (ADR-485).
+    #[test]
+    fn a_job_content_record_that_does_not_decode_is_corrupt() {
+        let entry = Entry {
+            seq: 0,
+            at_unix_ms: 0,
+            record: Record::JobContent(JobContent::Document([6; 32])),
+        };
+        let encoded = encode(&entry).expect("encode");
+        let kind_at = encoded.len() - 33;
+        assert_eq!(encoded[kind_at], 0);
+        let mut unknown_kind = encoded.clone();
+        unknown_kind[kind_at] = 2;
+        let short = encoded[..encoded.len() - 1].to_vec();
+        for (name, payload) in [("unknown kind", unknown_kind), ("short hash", short)] {
+            let dir = TempDir::new();
+            legacy_journal(&dir, Vec::new());
+            let mut frame = Vec::new();
+            push_frame(&mut frame, &payload).expect("frame");
+            // Another whole frame after it, so the damage is not read as a torn tail.
+            let after = Entry {
+                seq: 1,
+                at_unix_ms: 0,
+                record: Record::Block { block: 0 },
+            };
+            push_frame(&mut frame, &encode(&after).expect("encode")).expect("frame");
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(path(&dir))
+                .expect("open");
+            file.write_all(&frame).expect("append");
+            drop(file);
+            assert!(is_corrupt(Journal::read(&dir.0, &key())), "{name}");
+        }
     }
 }

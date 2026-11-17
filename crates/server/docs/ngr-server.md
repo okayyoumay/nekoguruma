@@ -513,13 +513,15 @@ ngr-server user disable --config <file> --username alice
   (per wait, not per request); one past it, for example on an uncommitted insert of the same
   key, is 503.
 - **The row and the answer.** The row holds the signed bytes, the key's ID, the sorted hashes as
-  hex (`ir_digests`), the confirmation level (`notifyOnly` for `acquire`, `gracePeriod` for
-  `writeSettings`, recorded and not enforced) and `request_hash`: SHA-256 over a tagged,
-  length-prefixed encoding of the normalized request (kind, agent, VCI, VIN, hashes, artifact,
-  and, only when the request names one, the name `startDeadline` and its normalized seconds, so
-  that a request without it hashes as before and another deadline, or the field added or dropped,
-  is another request: the existing 422), with the operator left out (the row's operator is
-  compared). A replay is answered before the bounds are judged. The 202 body is the `Job`
+  hex (`ir_digests`), the confirmation level (read in the same transaction from
+  `confirmation_defaults` for the kind, ADR-488: `notifyOnly` for `acquire`, `gracePeriod` for
+  `writeSettings` as seeded, recorded and not enforced; a kind without a row fails the creation
+  as 500 with nothing inserted) and `request_hash`: SHA-256 over a tagged, length-prefixed
+  encoding of the normalized request (kind, agent, VCI, VIN, hashes, artifact, and, only when the
+  request names one, the name `startDeadline` and its normalized seconds, so that a request
+  without it hashes as before and another deadline, or the field added or dropped, is another
+  request: the existing 422), with the operator left out (the row's operator is compared). A
+  replay is answered before the bounds are judged. The 202 body is the `Job`
   (`jobId`, `kind`, `state`, `progressPermille`, `confirmation.level`, and `failure.code` and
   `failure.procedureCode` when the job has a failure code, never the detail), built by one function
   from the row for a creation and a replay, which shows the current state; `Cache-Control:

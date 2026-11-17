@@ -746,6 +746,53 @@ async fn audit_log_and_change_feed_take_rows_of_any_time_in_their_default_partit
     db::close(&pool).await;
 }
 
+// Migration 0012: a fresh database holds exactly the six seeded defaults, and the CHECKs refuse a
+// kind or level outside the lists.
+#[tokio::test]
+async fn confirmation_defaults_hold_the_six_seeded_rows_and_refuse_an_unknown_kind_or_level() {
+    let pg = TestPostgres::start();
+    let pool = pg.pool();
+    db::migrate_with(&pool, &db::MIGRATOR, Duration::from_secs(30))
+        .await
+        .expect("the migrations apply");
+    assert_eq!(
+        pg.scalar(
+            "SELECT string_agg(kind || '=' || level, ',' ORDER BY kind) \
+             FROM confirmation_defaults"
+        )
+        .await,
+        "acquire=notifyOnly,monitorCapture=notifyOnly,monitorSession=notifyOnly,\
+         reprogram=onSiteApproval,runSequence=onSiteApproval,writeSettings=gracePeriod"
+    );
+    for (sql, what) in [
+        (
+            "INSERT INTO confirmation_defaults VALUES ('unknownKind', 'notifyOnly')",
+            "kind",
+        ),
+        (
+            "INSERT INTO confirmation_defaults VALUES ('identify', 'unknownLevel')",
+            "level",
+        ),
+    ] {
+        let outcome = sqlx::query(sql).execute(&pool).await;
+        assert_eq!(sqlstate(&outcome).as_deref(), Some("23514"), "{what}");
+    }
+    let outcome = sqlx::query("INSERT INTO confirmation_defaults VALUES ('acquire', 'twoPerson')")
+        .execute(&pool)
+        .await;
+    assert_eq!(
+        sqlstate(&outcome).as_deref(),
+        Some("23505"),
+        "one row per kind"
+    );
+    assert_eq!(
+        pg.scalar("SELECT count(*) FROM confirmation_defaults")
+            .await,
+        "6"
+    );
+    db::close(&pool).await;
+}
+
 /// The SQLSTATE of a failed statement.
 fn sqlstate<T>(outcome: &Result<T, sqlx::Error>) -> Option<String> {
     match outcome {

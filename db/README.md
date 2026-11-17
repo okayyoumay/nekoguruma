@@ -22,6 +22,7 @@ ADR-476).
 failed job (design 5.6, ADR-475, ADR-481).
 `migrations/0011_default_partitions.sql` gives `change_feed` and `audit_log` a default partition, so
 their first insert no longer fails for want of a partition.
+`migrations/0012_confirmation_defaults.sql` adds `confirmation_defaults` and seeds it (design 6.3, ADR-488).
 
 ## How migrations are applied
 
@@ -204,6 +205,22 @@ in that range, so those rows are moved out of it before the range partition is a
   (ADR-469): the server keeps them in memory, so a restart signs everyone out
 
 ## Column values
+
+- Seed data (ADR-488). `confirmation_defaults (kind, level)` is product-wide (no tenant ID) and
+  holds the default confirmation level of each job kind (design 6.3, 5.1): `acquire`,
+  `monitorSession` and `monitorCapture` are `notifyOnly`, `writeSettings` is `gracePeriod`,
+  `runSequence` and `reprogram` are `onSiteApproval`. `identify` has no row, since no route creates
+  it. A job creation reads its level here and fails without a row. The design's row for a firmware
+  write to an unattended device is an agent-side condition and not a kind, so it is not seeded.
+  Organization and per-agent policies may only tighten these defaults (a later item).
+- Roles stay the `CHECK` list on `operator_roles.role` and are not a table (ADR-488). Their
+  meaning (design 6.8, axis 1): `viewer` views acquired data; `worker` is the Operator role
+  (acquisition, configuration value writes, work records); `reprogrammer` writes ECU firmware;
+  `remote` executes while not on site (with the agent's own remote permission); `approver` is the
+  approving side of two-person approval; `admin` publishes artifacts, sets policy and registers
+  agents.
+- The preset default is the column default of `agents.preset`, `personal` (design 6.6, 13.3); the
+  other presets are `personalRemote` and `shared`. Relaxing a preset needs action on the device.
 
 - `ir_documents.source_format`: `odx` or `csv-starlark` (the proprietary format, ADR-254).
   The comment in `0001_init.sql` still names the earlier `csv-js`; the column is free text, so

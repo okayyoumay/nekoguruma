@@ -761,6 +761,57 @@ async fn a_write_settings_job_has_the_grace_period_level() {
     lab.finish().await;
 }
 
+// ADR-488: a job's level is read from `confirmation_defaults` when the job is created.
+#[tokio::test]
+async fn a_job_takes_its_level_from_the_defaults_table_as_it_stands_at_its_creation() {
+    let lab = Lab::new().await;
+    let cookie = lab.login("alice").await;
+    let acquire = lab.post(&cookie, "d1", &lab.body(json!({}))).await;
+    let write = lab
+        .post(&cookie, "d2", &lab.body(json!({ "kind": "writeSettings" })))
+        .await;
+    assert_eq!(json(&acquire)["confirmation"]["level"], "notifyOnly");
+    assert_eq!(json(&write)["confirmation"]["level"], "gracePeriod");
+    // A changed row reaches the next job and leaves the earlier one alone.
+    lab.exec("UPDATE confirmation_defaults SET level = 'onSiteApproval' WHERE kind = 'acquire'")
+        .await;
+    let next = lab.post(&cookie, "d3", &lab.body(json!({}))).await;
+    assert_eq!(json(&next)["confirmation"]["level"], "onSiteApproval");
+    assert_eq!(
+        lab.field(&job_id(&next), "confirmation_level").await,
+        "onSiteApproval"
+    );
+    assert_eq!(
+        lab.field(&job_id(&acquire), "confirmation_level").await,
+        "notifyOnly"
+    );
+    lab.finish().await;
+}
+
+#[tokio::test]
+async fn a_kind_without_a_default_row_is_a_500_and_leaves_nothing_behind() {
+    let lab = Lab::new().await;
+    let cookie = lab.login("alice").await;
+    lab.exec("DELETE FROM confirmation_defaults WHERE kind = 'acquire'")
+        .await;
+    let body = lab.body(json!({ "vin": "WVWZZZ1JZXW000001" }));
+    let r = lab.post(&cookie, "d4", &body).await;
+    assert_problem(&r, 500, "no default row");
+    lab.assert_jobs(0, "no job").await;
+    lab.assert_audits(0, "no audit row").await;
+    assert_eq!(
+        lab.w.sql("SELECT count(*) FROM vehicle_locks").await,
+        "0",
+        "no lock"
+    );
+    // The key is unbound: with the row back, the same key and body create the job.
+    lab.exec("INSERT INTO confirmation_defaults VALUES ('acquire', 'notifyOnly')")
+        .await;
+    assert_eq!(lab.post(&cookie, "d4", &body).await.status, 202);
+    lab.assert_jobs(1, "created after the row is back").await;
+    lab.finish().await;
+}
+
 #[tokio::test]
 async fn the_vin_the_artifact_and_the_sorted_unique_digests_reach_the_instruction_and_the_row() {
     // C3 and C4

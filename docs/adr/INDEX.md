@@ -477,6 +477,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-485](ADR-485-the-write-job-journal-binds-the-jobs-document-or-program.md) | The Write-Job Journal Binds the Job's Document or Program | Accepted | `agent` journal (`Record::JobContent`), runner restart order, restart (`OnSiteReason::JobContentDiffers`), design 8.2.4, 8.2.5 and 11.3; ADR-244, ADR-261, ADR-268, ADR-318, ADR-327, ADR-344 |
 | [ADR-486](ADR-486-the-agent-judges-a-jobs-start-deadline-against-the-later-of-its-clock-and-a-persisted-highest-issue-time.md) | The Agent Judges a Job's Start Deadline Against the Later of Its Clock and a Persisted Highest Issue Time | Accepted | design 5.3, 6.7, `docs/glossary.md`, `api/asyncapi.yaml`, `crates/agent`; details ADR-461 item 6 and reuses ADR-483's path |
 | [ADR-487](ADR-487-the-server-ends-a-received-job-past-its-start-deadline-as-expired-and-frees-its-vehicle-lock.md) | The Server Ends a Received Job Past Its Start Deadline as Expired and Frees Its Vehicle Lock | Accepted | design 5.3, 8.8, 12, `api/openapi.yaml`, `crates/server`; annotates ADR-476 item 3, ADR-477 items 2 and 6 and ADR-480 item 4 |
+| [ADR-488](ADR-488-confirmation-defaults-are-a-product-wide-table-and-roles-stay-a-check-list.md) | Confirmation Defaults Are a Product-Wide Table and Roles Stay a CHECK List | Accepted | design 5.1, 6.3, 6.8, `db/migrations`, `db/README.md`, `crates/server`; details ADR-477 item 7 |
 
 ## Status Legend
 
@@ -1082,3 +1083,4 @@ the predecessor repository these ADRs came from.
 - ADR-484
 - ADR-486
 - ADR-487
+- ADR-488

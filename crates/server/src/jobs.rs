@@ -130,15 +130,6 @@ impl Kind {
         }
     }
 
-    /// The confirmation level of the kind (design 6.3). A `gracePeriod` is recorded here and
-    /// not enforced.
-    fn confirmation(self) -> &'static str {
-        match self {
-            Kind::Acquire => "notifyOnly",
-            Kind::WriteSettings => "gracePeriod",
-        }
-    }
-
     /// How long the job may hold its vehicle's lock after its start deadline (design 8.8): the
     /// run allowance of the kind. Each kind that this route learns to create adds its arm here.
     fn lock_secs(self) -> u64 {
@@ -804,6 +795,22 @@ impl Inner {
             .await
             .map_err(|e| JobError::Internal(e.to_string()))?;
 
+        // The kind's confirmation level (design 6.3), read from the product-wide defaults in the
+        // creating transaction (ADR-488). A `gracePeriod` is recorded and not enforced. A kind
+        // without a row is a fault of the installation, not a refusal of the request: it fails
+        // the creation as 500, and the transaction's end leaves nothing inserted.
+        let level: Option<(String,)> =
+            sqlx::query_as("SELECT level FROM confirmation_defaults WHERE kind = $1")
+                .bind(spec.kind.name())
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some((level,)) = level else {
+            return Err(JobError::Internal(format!(
+                "no confirmation default for kind {}",
+                spec.kind.name()
+            )));
+        };
+
         let digests: Vec<String> = spec.hashes.iter().map(|h| hex(h)).collect();
         let inserted: Option<StoredRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "INSERT INTO jobs (tenant_id, id, kind, agent_id, operator_id, vci_id, vin, \
@@ -822,7 +829,7 @@ impl Inner {
         .bind(&spec.vin)
         .bind(&digests)
         .bind(spec.artifact.map(|h| hex(&h)))
-        .bind(spec.kind.confirmation())
+        .bind(&level)
         .bind(instruction.start_deadline as i64)
         .bind(&sealed)
         .bind(&key_id)
@@ -1615,8 +1622,6 @@ mod tests {
                 "progressPermille": 0, "confirmation": { "level": "notifyOnly" }
             })
         );
-        assert_eq!(Kind::Acquire.confirmation(), "notifyOnly");
-        assert_eq!(Kind::WriteSettings.confirmation(), "gracePeriod");
     }
 
     // J17 (the document's half): the failure shows its code and procedure code, never a detail.

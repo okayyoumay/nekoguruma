@@ -22,7 +22,7 @@
 //! index from job ID to the highest generation. A last frame that a crash tore is cut off (and
 //! the cut synced); anything else that does not read back is [`LedgerError::Corrupt`] and is never
 //! repaired. After a failed write the ledger refuses records until it is opened again
-//! ([`ReceivedJobs::reopen`]), since a failed sync can lose data the OS had accepted; a frame
+//! ([`ReceivedJobs::reopen_if_poisoned`]), since a failed sync can lose data the OS had accepted; a frame
 //! that did reach the file counts at that open, and one that did not is cut. [`ReceivedJobs::highest`]
 //! reads memory only, so a poisoned ledger still recognises its duplicates.
 
@@ -244,7 +244,7 @@ impl ReceivedJobs {
         Ok(())
     }
 
-    /// Whether the ledger refuses records until [`ReceivedJobs::reopen`] succeeds.
+    /// Whether the ledger refuses records until [`ReceivedJobs::reopen_if_poisoned`] succeeds.
     pub fn is_poisoned(&self) -> bool {
         self.inner
             .io
@@ -373,6 +373,7 @@ impl Io {
             file.sync_all()?;
             (self.probe)(Step::AfterSync)?;
             (self.probe)(Step::BeforeRename)?;
+            drop(file);
             fs::rename(&tmp, &self.path)
         })();
         if let Err(error) = prepared {

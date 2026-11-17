@@ -4129,7 +4129,7 @@ async fn outbox_c13_a_failed_append_withholds_the_ack_and_closes_with_1011() {
 }
 
 /// A write failure on the `received` append ends the connection; the next one reopens the
-/// outbox, the redelivered command is recorded and acknowledged, and the event is sent.
+/// outbox; the redelivered command is a duplicate (the job was recorded before the append failed), acknowledged with no event, and a new job gets the event.
 #[tokio::test(start_paused = true)]
 async fn outbox_reopen_a_write_failure_closes_with_1011_and_the_next_connection_reopens() {
     let fail = Arc::new(AtomicBool::new(false));
@@ -5945,7 +5945,19 @@ async fn ledger_b4_b5_b6_a_recorded_job_is_ignored_past_its_deadline_with_other_
             .filter(|line| line.contains(word))
             .count()
     };
-    assert_eq!(debug("already recorded"), 2, "one entry per duplicate");
+    assert_eq!(
+        debug("the job is already recorded"),
+        2,
+        "one entry per duplicate"
+    );
+    for line in env.log.lines("DEBUG") {
+        if line.contains("the job is already recorded") {
+            assert!(
+                line.contains(&format!("job_id={JOB_ID}")) && line.contains("generation=7"),
+                "{line}"
+            );
+        }
+    }
     assert_eq!(env.log.warns("later generation"), 1);
     assert_eq!(debug("later generation"), 1);
     drop(ws);

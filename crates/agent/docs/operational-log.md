@@ -120,7 +120,10 @@ throughout.
   nothing else of it: never a `commandId`, an operator ID, an owner ID, a VIN, a time or a byte of
   the envelope.
   - A **duplicate** (the job recorded under the same generation) is one `debug` entry per
-    command, "already recorded", with the job ID and the generation. A command for an
+    command, "a duplicate job command", with the job ID and the generation. The entry and the
+    count are of duplicates decided, as the expiry's are (ADR-486): they come before the mark's
+    write and the answer, so a command left unanswered by a mark failure or a stop is counted,
+    and its redelivery is decided and counted again. A command for an
     **earlier generation** than the recorded one is a `warn` the first time on a connection and
     `debug` after that. Both are acknowledged; the end-of-connection `info` line of refused
     instructions carries the counts as `duplicate` and `earlier_generation`.

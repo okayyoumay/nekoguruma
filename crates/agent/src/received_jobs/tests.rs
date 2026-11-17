@@ -190,6 +190,13 @@ fn e2_the_index_changes_only_after_the_sync_and_a_failed_write_poisons_the_ledge
             assert!(!ledger.is_poisoned());
             // A file that was put in place, or a frame that was written, counts at the reopen;
             // otherwise the job is new and its record is made now.
+            let counted = (n == 1 && step == Step::AfterRename)
+                || (n == 2 && matches!(step, Step::AfterWrite | Step::AfterSync));
+            assert_eq!(
+                ledger.highest(&job(n)),
+                counted.then_some(1),
+                "{step:?} {n}: the reopen rebuilt the index from the file"
+            );
             if ledger.highest(&job(n)).is_none() {
                 ledger.record(&job(n), 1, &envelope(n, 50)).unwrap();
             }
@@ -244,6 +251,23 @@ fn e5_a_reopen_that_fails_keeps_the_ledger_poisoned_and_its_index_and_a_later_on
     );
 }
 
+// B10
+#[test]
+fn b10_another_agent_id_has_an_empty_ledger_and_the_old_file_is_left_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let ledger = open(dir.path()).unwrap();
+        record(&ledger, 1, 7);
+    }
+    let before = fs::read(file_of(dir.path())).unwrap();
+    let other = ReceivedJobs::open_in(dir.path(), OTHER).unwrap();
+    assert_eq!(other.jobs(), 0);
+    assert_eq!(other.highest(&job(1)), None);
+    drop(other);
+    assert_eq!(fs::read(file_of(dir.path())).unwrap(), before);
+    assert_eq!(open(dir.path()).unwrap().highest(&job(1)), Some(7));
+}
+
 // D3
 #[test]
 fn d3_a_torn_last_frame_is_cut_off_and_its_job_is_new_again() {
@@ -283,7 +307,8 @@ fn d3_a_torn_last_frame_is_cut_off_and_its_job_is_new_again() {
         );
         let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
         assert_eq!(text.matches("WARN").count(), 1, "tail {k}: {text}");
-        assert!(text.contains("cut="), "{text}");
+        let cut = bytes.len() - lengths[1] as usize;
+        assert!(text.contains(&format!("cut={cut}")), "{text}");
         assert!(!text.contains(&job(3)), "{text}");
         // The next record continues the numbers.
         record(&ledger, 3, 1);

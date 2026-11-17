@@ -264,7 +264,7 @@ impl<'a> Gate<'a> {
     /// generation only.
     pub(super) fn duplicate(&mut self, job_id: &str, generation: u64) {
         self.refused.duplicate += 1;
-        tracing::debug!(job_id = %job_id, generation, "a job command was acknowledged and not taken again: the job is already recorded");
+        tracing::debug!(job_id = %job_id, generation, "a duplicate job command: the job is already recorded");
     }
 
     /// Counts a command whose job ID the ledger holds under a later generation: a `warn` the first
@@ -272,9 +272,9 @@ impl<'a> Gate<'a> {
     pub(super) fn earlier_generation(&mut self, job_id: &str, generation: u64) {
         self.refused.earlier_generation += 1;
         if self.refused.earlier_generation == 1 {
-            tracing::warn!(job_id = %job_id, generation, "a job command was acknowledged and not taken: a later generation of the job is recorded");
+            tracing::warn!(job_id = %job_id, generation, "a duplicate job command: a later generation of the job is recorded");
         } else {
-            tracing::debug!(job_id = %job_id, generation, "a job command was acknowledged and not taken: a later generation of the job is recorded");
+            tracing::debug!(job_id = %job_id, generation, "a duplicate job command: a later generation of the job is recorded");
         }
     }
 

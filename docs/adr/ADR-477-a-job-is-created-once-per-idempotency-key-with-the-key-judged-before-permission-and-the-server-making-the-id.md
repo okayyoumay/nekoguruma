@@ -1,7 +1,7 @@
 # ADR-477: A Job Is Created Once per Idempotency Key, With the Key Judged Before Permission and the Server Making the ID
 
 **Date:** 2026-11-14
-**Status:** Accepted (item 7's order gains the vehicle lock's take between the insert and the two locks, ADR-480)
+**Status:** Accepted (item 7's order gains the vehicle lock's take between the insert and the two locks, ADR-480, and the audit row's insert right after the job's, ADR-484; the consequence that the route writes no audit record replaced by ADR-484)
 **Affects:** design 4.4, 5.1, 12; `db/migrations/0008_job_creation.sql`, `db/README.md`; `api/openapi.yaml` (`POST /v1/jobs`, `JobRequest`); `crates/server` (`jobs`, `register`, `lib`), `crates/server/docs/ngr-server.md`; `crates/shared-proto` (`is_well_formed_vin`), `crates/agent` (`journal`); details ADR-461 and ADR-476 for the stored instruction
 
 ## Context

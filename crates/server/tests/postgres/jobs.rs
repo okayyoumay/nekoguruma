@@ -258,6 +258,36 @@ impl Lab {
         assert_eq!(self.jobs().await, expected.to_string(), "{what}");
     }
 
+    /// The `jobCreated` rows of `audit_log` are `expected` many (ADR-484).
+    async fn assert_audits(&self, expected: u32, what: &str) {
+        assert_eq!(
+            self.w
+                .sql("SELECT count(*) FROM audit_log WHERE action = 'jobCreated'")
+                .await,
+            expected.to_string(),
+            "{what}"
+        );
+    }
+
+    /// Every job has exactly one `jobCreated` row and there is no other row in `audit_log`.
+    async fn assert_one_audit_per_job(&self, what: &str) {
+        assert_eq!(
+            self.w
+                .sql(
+                    "SELECT count(*) FROM jobs j WHERE (SELECT count(*) FROM audit_log a \
+                     WHERE a.job_id = j.id AND a.action = 'jobCreated') <> 1"
+                )
+                .await,
+            "0",
+            "{what}"
+        );
+        assert_eq!(
+            self.w.sql("SELECT count(*) FROM audit_log").await,
+            self.jobs().await,
+            "{what}"
+        );
+    }
+
     async fn field(&self, job: &str, column: &str) -> String {
         self.w
             .sql(&format!("SELECT {column} FROM jobs WHERE id = '{job}'"))
@@ -627,7 +657,31 @@ async fn an_acquire_job_is_stored_signed_and_answered_with_its_state() {
         )
     );
     assert_eq!(lab.w.sql("SELECT count(*) FROM vehicle_locks").await, "0");
-    assert_eq!(lab.w.sql("SELECT count(*) FROM audit_log").await, "0");
+    // A1: one `jobCreated` row, copied from the job; a job with no VIN has a NULL `vin`.
+    let columns = lab
+        .w
+        .sql(&format!(
+            "SELECT concat_ws('|', (a.tenant_id = j.tenant_id)::text, \
+                 (a.operator_id = j.operator_id)::text, (a.agent_id = j.agent_id)::text, \
+                 (a.job_id = j.id)::text, (a.vin IS NULL)::text, a.action, \
+                 a.confirmation_level, (a.on_site_approved IS NULL)::text, \
+                 (a.agent_reported_at IS NULL)::text, a.offline_executed::text, \
+                 (a.recorded_at = j.created_at)::text, \
+                 (SELECT string_agg(k, ',' ORDER BY k) FROM jsonb_object_keys(a.detail) k), \
+                 a.detail->>'kind', a.detail->>'irDigests', a.detail->>'signingKeyId') \
+             FROM audit_log a JOIN jobs j ON j.id = a.job_id WHERE a.job_id = '{id}'"
+        ))
+        .await;
+    assert_eq!(
+        columns,
+        format!(
+            "true|true|true|true|true|jobCreated|notifyOnly|true|true|false|true|\
+             irDigests,kind,signingKeyId|acquire|[\"{DIGEST_A}\"]|{}",
+            lab.w.key.key_id()
+        )
+    );
+    lab.assert_audits(1, "A1").await;
+    lab.assert_one_audit_per_job("A1").await;
     lab.finish().await;
 }
 
@@ -649,6 +703,16 @@ async fn a_write_settings_job_has_the_grace_period_level() {
     assert_eq!(
         lab.field(&id, "kind || '|' || confirmation_level").await,
         "writeSettings|gracePeriod"
+    );
+    // A2: the row carries the kind and the level.
+    assert_eq!(
+        lab.w
+            .sql(&format!(
+                "SELECT confirmation_level || '|' || (detail->>'kind') FROM audit_log \
+                 WHERE job_id = '{id}'"
+            ))
+            .await,
+        "gracePeriod|writeSettings"
     );
     assert_eq!(lab.instruction(&id).await.kind, JobKind::WriteSettings);
     lab.finish().await;
@@ -692,6 +756,30 @@ async fn the_vin_the_artifact_and_the_sorted_unique_digests_reach_the_instructio
             instruction.start_deadline, instruction.issued_at
         )
     );
+    // A2: the VIN is in the column and in no part of the detail, which holds the sorted unique
+    // digests, the artifact and the key, and neither the VCI nor the request's hash.
+    let audit = lab
+        .w
+        .sql(&format!(
+            "SELECT concat_ws('|', vin, confirmation_level, detail::text) FROM audit_log \
+             WHERE job_id = '{id}' AND action = 'jobCreated'"
+        ))
+        .await;
+    let (head, detail) = audit.split_at(audit.find('{').unwrap());
+    assert_eq!(head, format!("{VIN}|notifyOnly|"));
+    assert_eq!(
+        serde_json::from_str::<Value>(detail).unwrap(),
+        json!({
+            "kind": "acquire",
+            "irDigests": [DIGEST_A, DIGEST_B],
+            "artifactDigest": DIGEST_B,
+            "signingKeyId": lab.w.key.key_id(),
+        })
+    );
+    assert!(!detail.contains(VIN) && !detail.contains("vci-1") && !detail.contains("key-c3"));
+    let hash_hex = lab.field(&id, "encode(request_hash, 'hex')").await;
+    assert!(!detail.contains(&hash_hex));
+    lab.assert_audits(1, "A2").await;
     lab.finish().await;
 }
 
@@ -713,6 +801,7 @@ async fn the_same_operator_and_request_replay_the_stored_job_and_a_different_one
     assert_eq!(job_id(&again), id);
     assert_eq!(normalized(&again), normalized(&first));
     lab.assert_jobs(1, "K1").await;
+    lab.assert_audits(1, "A3: a replay writes no row").await;
     assert_eq!(lab.field(&id, "encode(signed_job, 'hex')").await, signed);
 
     // K2: another body under the key is a 422 with no data of the job.
@@ -722,6 +811,7 @@ async fn the_same_operator_and_request_replay_the_stored_job_and_a_different_one
     assert_problem(&other, 422, "K2");
     assert!(!other.body.contains(&id));
     lab.assert_jobs(1, "K2").await;
+    lab.assert_audits(1, "A4: a conflict writes no row").await;
 
     // K3: another operator of the tenant with the same body gets the same document.
     lab.user("bob", &["worker"]).await;
@@ -757,8 +847,10 @@ async fn a_replay_shows_the_current_state_and_writes_nothing() {
     let body = lab.body(json!({}));
     let id = job_id(&lab.post(&cookie, "k", &body).await);
     let snapshot = || {
-        lab.w
-            .sql("SELECT string_agg(row_to_json(j)::text, ',') FROM jobs j")
+        lab.w.sql(
+            "SELECT (SELECT string_agg(row_to_json(j)::text, ',') FROM jobs j) || '#' || \
+                    (SELECT string_agg(row_to_json(a)::text, ',') FROM audit_log a)",
+        )
     };
     let before = snapshot().await;
 
@@ -781,6 +873,9 @@ async fn a_replay_shows_the_current_state_and_writes_nothing() {
     assert_eq!(json(&finished)["progressPermille"], 1000);
     assert_eq!(snapshot().await, finished_snapshot);
     lab.assert_jobs(1, "K6").await;
+    // A3: the replays, after the delivery and after the end, left the one audit row as it was.
+    lab.assert_audits(1, "A3 after delivery and end").await;
+    assert!(before.contains("jobCreated"), "{before}");
     lab.finish().await;
 }
 
@@ -842,6 +937,7 @@ async fn two_identical_requests_at_once_make_one_job_and_both_are_202() {
     let (a, b) = tokio::join!(lab.post(&cookie, "k", &body), lab.post(&cookie, "k", &body));
     assert_eq!(job_id(&a), job_id(&b));
     lab.assert_jobs(1, "K9").await;
+    lab.assert_one_audit_per_job("A8 K9").await;
     lab.finish().await;
 }
 
@@ -869,6 +965,7 @@ async fn two_bodies_for_one_key_at_once_make_one_job_for_the_first_and_a_conflic
         .collect();
     assert_eq!(lab.field(&id, "encode(request_hash, 'hex')").await, hash);
     lab.assert_jobs(1, "K10").await;
+    lab.assert_one_audit_per_job("A8 K10").await;
     lab.finish().await;
 }
 
@@ -885,6 +982,7 @@ async fn two_servers_on_one_database_make_one_job_for_one_key() {
     );
     assert_eq!(job_id(&a), job_id(&b));
     lab.assert_jobs(1, "K11").await;
+    lab.assert_one_audit_per_job("A8 K11").await;
     lab.finish().await;
 }
 
@@ -925,6 +1023,12 @@ async fn a_key_held_by_an_uncommitted_insert_is_decided_when_the_holder_ends() {
     assert_ne!(created, held);
     lab.assert_jobs(3, "rollback").await;
     assert_eq!(lab.field(&created, "idempotency_key").await, "gone");
+    // A8: only the creation that inserted a row wrote one; the held rows came from the test.
+    lab.assert_audits(1, "A8 K12").await;
+    assert_eq!(
+        lab.w.sql("SELECT job_id::text FROM audit_log").await,
+        created
+    );
     lab.finish().await;
 }
 
@@ -997,6 +1101,8 @@ async fn a_revocation_held_uncommitted_is_seen_by_the_agent_lock_and_the_job_is_
     let r = waiting.await.unwrap();
     assert_problem(&r, 403, "revoked while creating");
     lab.assert_jobs(0, "revoked while creating").await;
+    lab.assert_audits(0, "A6: a revocation after the insert rolls the row back")
+        .await;
     assert_eq!(lab.locks().await, "", "V13");
     lab.finish().await;
 }
@@ -1020,6 +1126,7 @@ async fn a_key_held_for_more_than_five_seconds_is_a_503() {
     // The holder's row is the only one, and the waiter wrote nothing.
     tx.commit().await.unwrap();
     lab.assert_jobs(1, "K13").await;
+    lab.assert_audits(0, "A7 K13").await;
     assert_eq!(lab.field(&held, "idempotency_key").await, "k");
     lab.finish().await;
 }
@@ -1078,6 +1185,8 @@ async fn permission_needs_the_role_the_agent_and_its_allow_list_and_each_refusal
         assert_eq!(normalized(reply), normalized(&refusals[0].1), "{what}");
     }
     lab.assert_jobs(0, "refusals").await;
+    lab.assert_audits(0, "A6: a refusal before the insert writes no row")
+        .await;
     let text = logs.text();
     for reason in [
         "not_worker",
@@ -1115,6 +1224,7 @@ async fn a_key_that_is_not_the_active_one_is_a_503_and_is_logged() {
         assert_problem(&r, 503, what);
     }
     lab.assert_jobs(0, "S1").await;
+    lab.assert_audits(0, "A7 S1").await;
     assert!(
         logs.text()
             .contains("the instruction key is not the active key"),
@@ -1141,6 +1251,7 @@ async fn a_signer_that_fails_is_a_500_and_leaves_no_row() {
     let r = lab.post(&cookie, "k", &body).await;
     assert_problem(&r, 500, "S2");
     lab.assert_jobs(0, "S2").await;
+    lab.assert_audits(0, "A7 S2").await;
     assert!(logs.text().contains("job creation failed"));
     fail.store(false, Ordering::SeqCst);
     assert_eq!(lab.post(&cookie, "k", &body).await.status, 202);
@@ -1169,6 +1280,7 @@ async fn a_statement_that_waits_for_a_lock_on_jobs_for_five_seconds_is_a_503() {
     );
     lock.rollback().await.unwrap();
     lab.assert_jobs(0, "S3").await;
+    lab.assert_audits(0, "A7 S3").await;
     assert_eq!(lab.post(&cookie, "k", &body).await.status, 202);
     lab.finish().await;
 }
@@ -1317,6 +1429,8 @@ async fn a_second_job_for_a_locked_vehicle_is_a_409_that_names_no_holder_and_lea
     assert!(r.header("retry-after").is_none());
     assert!(!r.head.contains(VIN) && !r.body.contains(&holder));
     lab.assert_jobs(1, "V3").await;
+    lab.assert_audits(1, "A5: the refused creation wrote no row")
+        .await;
     assert_eq!(lab.locks().await, format!("{VIN}>{holder}"));
     assert_eq!(
         lab.w
@@ -1369,6 +1483,14 @@ async fn a_second_job_for_a_locked_vehicle_is_a_409_that_names_no_holder_and_lea
     let later = job_id(&lab.post(&cookie, "k-second", &held).await);
     assert_ne!(later, holder);
     assert_eq!(lab.field(&later, "idempotency_key").await, "k-second");
+    // A5: the later job has its row; the refused attempts left none.
+    assert_eq!(
+        lab.w
+            .sql("SELECT count(*) FROM audit_log WHERE job_id IN (SELECT id FROM jobs)")
+            .await,
+        lab.jobs().await
+    );
+    lab.assert_one_audit_per_job("A5 V4").await;
     lab.finish().await;
 }
 
@@ -1451,12 +1573,14 @@ async fn creations_at_once_for_one_vehicle_make_one_job_on_one_server_or_two() {
     statuses.sort();
     assert_eq!(statuses, [202, 409], "{} {}", a.body, b.body);
     lab.assert_jobs(1, "V10 two servers").await;
+    lab.assert_one_audit_per_job("A8 V10 two servers").await;
     let other = lab.body(json!({ "vin": VIN_2 }));
     let (a, b) = tokio::join!(lab.post(&c1, "k-c", &other), lab.post(&c1, "k-d", &other));
     let mut statuses = [a.status, b.status];
     statuses.sort();
     assert_eq!(statuses, [202, 409], "{} {}", a.body, b.body);
     lab.assert_jobs(2, "V10 one server").await;
+    lab.assert_one_audit_per_job("A8 V10 one server").await;
     lab.finish().await;
 }
 
@@ -1476,6 +1600,7 @@ async fn two_takers_of_an_expired_lock_get_one_job_and_one_refusal() {
     statuses.sort();
     assert_eq!(statuses, [202, 409], "{} {}", a.body, b.body);
     lab.assert_jobs(2, "V12").await;
+    lab.assert_one_audit_per_job("A8 V12").await;
     assert_eq!(lab.w.sql("SELECT count(*) FROM vehicle_locks").await, "1");
     lab.finish().await;
 }
@@ -1519,6 +1644,7 @@ async fn a_lock_held_by_an_uncommitted_take_is_decided_when_it_ends_and_blocks_n
     tx.commit().await.unwrap();
     assert_problem(&waiting.await.unwrap(), 409, "holder committed");
     lab.assert_jobs(0, "holder committed").await;
+    lab.assert_audits(0, "A5 holder committed").await;
 
     lab.exec(&format!("DELETE FROM vehicle_locks WHERE vin = '{VIN}'"))
         .await;
@@ -1549,6 +1675,86 @@ async fn a_lock_held_uncommitted_for_more_than_five_seconds_is_a_503() {
     );
     tx.rollback().await.unwrap();
     lab.assert_jobs(0, "V11").await;
+    lab.assert_audits(0, "A7 V11").await;
+    lab.finish().await;
+}
+
+#[tokio::test]
+async fn the_same_vin_in_two_tenants_has_a_row_in_each_with_the_jobs_tenant() {
+    // A9: the lock is per tenant, so the second tenant's job for the VIN is created.
+    let lab = Lab::new().await;
+    let cookie = lab.login("alice").await;
+    let body = lab.body(json!({ "vin": VIN }));
+    let first = job_id(&lab.post(&cookie, "k-1", &body).await);
+    // Hand the first job, its lock and its audit row to another tenant.
+    lab.exec(
+        "WITH t AS (INSERT INTO tenants (id, name) VALUES (gen_random_uuid(), 'other') \
+                        RETURNING id), \
+              j AS (UPDATE jobs SET tenant_id = (SELECT id FROM t)), \
+              l AS (UPDATE vehicle_locks SET tenant_id = (SELECT id FROM t)) \
+         UPDATE audit_log SET tenant_id = (SELECT id FROM t)",
+    )
+    .await;
+    let second = job_id(&lab.post(&cookie, "k-2", &body).await);
+    assert_ne!(first, second);
+    assert_eq!(
+        lab.w
+            .sql(&format!(
+                "SELECT count(*) FROM audit_log a JOIN jobs j ON j.id = a.job_id \
+                 AND j.tenant_id = a.tenant_id WHERE a.vin = '{VIN}' \
+                   AND a.action = 'jobCreated'"
+            ))
+            .await,
+        "2"
+    );
+    assert_eq!(
+        lab.w
+            .sql("SELECT count(DISTINCT tenant_id) FROM audit_log")
+            .await,
+        "2"
+    );
+    lab.finish().await;
+}
+
+#[tokio::test]
+async fn an_audit_log_locked_for_five_seconds_is_a_503_that_creates_no_job_and_blocks_no_stamp() {
+    // A11: the audit insert waits behind a lock on its table, after the job insert and before
+    // the agent's row is locked, so the wait times out into a rollback that holds nothing.
+    let lab = Lab::new().await;
+    let cookie = lab.login("alice").await;
+    let body = lab.body(json!({ "vin": VIN }));
+    let pool = lab.w.pg.pool();
+    let mut lock = pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE audit_log IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    let waiting = spawn_post(lab.addr(), &cookie, "k", &body);
+    wait_for_lock(&lab, "INSERT INTO audit_log").await;
+    // The agent's connect stamp is not blocked by the creation that waits.
+    let stamp = format!(
+        "UPDATE agents SET last_seen_at = now() WHERE id = '{}'::uuid",
+        lab.agent_id
+    );
+    tokio::time::timeout(Duration::from_secs(2), lab.exec(&stamp))
+        .await
+        .expect("the stamp waits behind the creation");
+    let started = Instant::now();
+    let r = waiting.await.unwrap();
+    assert_problem(&r, 503, "A11");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+    lock.rollback().await.unwrap();
+    lab.assert_jobs(0, "A11").await;
+    assert_eq!(lab.locks().await, "", "A11");
+    lab.assert_audits(0, "A11").await;
+    // The key was not bound: the same request now creates its job and its row.
+    let id = job_id(&lab.post(&cookie, "k", &body).await);
+    assert_eq!(lab.field(&id, "idempotency_key").await, "k");
+    lab.assert_one_audit_per_job("A11 later").await;
     lab.finish().await;
 }
 
@@ -1695,6 +1901,12 @@ async fn the_lock_is_held_until_the_agent_reports_an_end_and_a_recovery_is_an_en
     let other = lab.job_for(&mut client, &cookie, "k-2", VIN_2).await;
     let refused = lab.body(json!({ "vin": VIN }));
     assert_eq!(lab.post(&cookie, "k-3", &refused).await.status, 409);
+    let audit_of_the_two = format!(
+        "SELECT string_agg(row_to_json(a)::text, ',' ORDER BY id) FROM audit_log a \
+         WHERE job_id IN ('{held}', '{other}')"
+    );
+    let created = lab.w.sql(&audit_of_the_two).await;
+    assert_eq!(created.matches("jobCreated").count(), 2, "{created}");
     // A state that is not an end frees nothing.
     say(&mut client, 1, &held, "running", "").await;
     assert_eq!(lab.post(&cookie, "k-3", &refused).await.status, 409);
@@ -1719,6 +1931,12 @@ async fn the_lock_is_held_until_the_agent_reports_an_end_and_a_recovery_is_an_en
         .post(&cookie, "k-4", &lab.body(json!({ "vin": VIN_2 })))
         .await;
     assert_eq!(r.status, 202, "{}", r.head);
+    // A10: the two ends added no row, and deleting the jobs leaves the rows as they were.
+    lab.assert_audits(4, "A10 after the ends").await;
+    assert_eq!(lab.w.sql(&audit_of_the_two).await, created);
+    lab.exec("DELETE FROM jobs").await;
+    lab.assert_audits(4, "A10 after the jobs' deletion").await;
+    assert_eq!(lab.w.sql(&audit_of_the_two).await, created);
     lab.finish().await;
 }
 

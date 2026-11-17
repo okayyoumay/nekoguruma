@@ -648,6 +648,17 @@ async fn a_job_created_through_the_route_is_accepted_and_acknowledged_by_the_age
         .to_owned();
     f.until_job(&id, "received|||true").await;
     assert!(f.is_connected(), "{}", agent.log_text());
+    // A12: the creation wrote one audit row, and the agent's `received` report added none.
+    assert_eq!(
+        f.world
+            .sql(&format!(
+                "SELECT count(*) FROM audit_log WHERE job_id = '{id}'::uuid \
+                   AND action = 'jobCreated'"
+            ))
+            .await,
+        "1"
+    );
+    assert_eq!(f.world.sql("SELECT count(*) FROM audit_log").await, "1");
     agent.stop().await;
     f.server.take().unwrap().finish().await;
     f.world.finish().await;

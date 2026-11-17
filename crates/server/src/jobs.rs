@@ -33,6 +33,7 @@ use shared_proto::{
 };
 use sqlx::{PgConnection, PgPool};
 
+use crate::audit;
 use crate::db;
 use crate::health::may_log;
 use crate::instruction_key::InstructionKey;
@@ -597,7 +598,7 @@ enum Outcome {
 }
 
 /// What a failed creation is.
-enum JobError {
+pub(crate) enum JobError {
     /// The pool, the connection or a statement failed, or timed out.
     Unavailable(String),
     /// The signer, the random source or the database client failed.
@@ -771,6 +772,10 @@ impl Inner {
         .fetch_optional(&mut *tx)
         .await?;
         if let Some(row) = inserted {
+            // The creation's audit row (design 8.2.3, ADR-484), the first statement of the arm
+            // that won the insert: a replay and every refusal below write none, since each rolls
+            // this transaction back. A failed insert fails the creation.
+            audit::job_created(&mut tx, &operator.tenant_id, &id).await?;
             // The vehicle's lock (design 8.8), taken by the creation that won the insert: a
             // replay never reaches here. The replace condition reads only the lock row, so a
             // concurrent take of the same VIN waits for this transaction and re-checks the row

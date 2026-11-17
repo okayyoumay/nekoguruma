@@ -9,6 +9,7 @@
 //! life. Local users sign in with a password and keep a cookie session (ADR-469).
 
 pub(crate) mod agent_events;
+pub(crate) mod audit;
 pub mod config;
 pub mod control;
 pub mod db;

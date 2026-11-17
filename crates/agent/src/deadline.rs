@@ -155,7 +155,16 @@ impl IssueMark {
             JournalError::Io(error) => error.into(),
             _ => MarkError::Io(io::ErrorKind::Other),
         })?;
-        let value = read(&path_of(dir, agent_id), agent_id)?;
+        let path = path_of(dir, agent_id);
+        let value = read(&path, agent_id)?;
+        // The file read may be one a write renamed into place whose directory entry never reached
+        // the disk (a crash, or a failed sync after the rename). Its value counts as synced, so
+        // a redelivery would write nothing: make the entry durable first, as the outbox's open
+        // does (ADR-486). A failure fails the open.
+        if value != 0 || path.exists() {
+            probe(Step::AfterRename)?;
+            sync_after_rename(dir, &path)?;
+        }
         Ok(IssueMark {
             inner: Arc::new(Inner {
                 highest: AtomicU64::new(value),

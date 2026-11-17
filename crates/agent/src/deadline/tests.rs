@@ -320,10 +320,12 @@ fn f8_f9_f13_a_failure_at_any_step_leaves_the_known_value_and_the_next_sync_writ
     ] {
         let dir = tempfile::tempdir().unwrap();
         fs::write(file_in(dir.path()), json(10)).unwrap();
-        let armed = Arc::new(AtomicBool::new(true));
+        // Armed after the open, whose own directory sync passes the same step.
+        let armed = Arc::new(AtomicBool::new(false));
         let writes = Arc::new(AtomicUsize::new(0));
         let marks =
             IssueMark::open_with(dir.path(), AGENT, failing_at(at, &armed, &writes)).unwrap();
+        armed.store(true, Ordering::SeqCst);
         marks.raise(20);
         assert!(marks.sync().is_err(), "{at:?}");
         assert!(marks.owes_write(), "{at:?}: the known value is unchanged");
@@ -400,4 +402,43 @@ fn f16_a_second_store_is_in_use_until_the_first_and_every_clone_of_it_are_gone()
     ));
     drop(held);
     assert!(IssueMark::open_in(dir.path(), AGENT).is_ok());
+}
+
+// Codex review: a file read at open counts as synced only once its directory entry is durable.
+#[test]
+fn an_open_makes_a_present_file_durable_and_fails_when_that_sync_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(file_in(dir.path()), json(1_500)).unwrap();
+    let seen = Arc::new(AtomicUsize::new(0));
+    let probe = |armed: bool, seen: &Arc<AtomicUsize>| -> Probe {
+        let seen = seen.clone();
+        Box::new(move |step| {
+            if step == Step::AfterRename {
+                seen.fetch_add(1, Ordering::SeqCst);
+                if armed {
+                    return Err(io::Error::other("scripted"));
+                }
+            }
+            Ok(())
+        })
+    };
+    let mark = IssueMark::open_with(dir.path(), AGENT, probe(false, &seen)).unwrap();
+    assert_eq!(
+        seen.load(Ordering::SeqCst),
+        1,
+        "the open syncs the file's directory entry"
+    );
+    assert_eq!(mark.highest(), 1_500);
+    drop(mark);
+    let failed = IssueMark::open_with(dir.path(), AGENT, probe(true, &seen));
+    assert!(
+        matches!(failed, Err(MarkError::Io(_))),
+        "{:?}",
+        failed.err()
+    );
+    // An absent file has nothing to make durable.
+    let empty = tempfile::tempdir().unwrap();
+    let before = seen.load(Ordering::SeqCst);
+    drop(IssueMark::open_with(empty.path(), AGENT, probe(true, &seen)).unwrap());
+    assert_eq!(seen.load(Ordering::SeqCst), before);
 }

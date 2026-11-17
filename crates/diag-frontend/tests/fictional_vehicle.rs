@@ -1,7 +1,10 @@
 //! The fictional vehicle of `examples/fictional-vehicle` (its `README.md`): every ECU definition
 //! converts with the shared `identify.star`, the ECUs keep their own CAN identifiers and agree on
 //! the server's text and unit ids, and against `sim-ecu` configured from `sim/` each ECU is
-//! identified as its expected variant and the procedure runs to its end.
+//! identified as its expected variant and the procedure runs to its end. The engine controller's
+//! coding DID is declared with its write conditions, and its simulator reads it, refuses a write
+//! outside the extended session, without security access or without gateway authentication, and
+//! writes it once all three hold.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -389,7 +392,12 @@ fn refusal(ecu: &mut SimEcu, request: &[u8]) -> Nrc {
 
 /// Opens the extended session and unlocks security level 1 with the ECM's mask.
 fn unlock(ecu: &mut SimEcu) {
-    answer(ecu, &[0x10, 0x03]);
+    unlock_in(ecu, 0x03);
+}
+
+/// Enters `session` and unlocks security access level 1 there.
+fn unlock_in(ecu: &mut SimEcu, session: u8) {
+    answer(ecu, &[0x10, session]);
     let seed = answer(ecu, &[0x27, 0x01]);
     assert_eq!(seed.len(), 6, "{seed:02X?}");
     let seed = u32::from_be_bytes(seed[2..6].try_into().expect("four bytes"));
@@ -508,6 +516,12 @@ fn a_coding_write_is_refused_outside_the_extended_session() {
     let request = write_coding([0x01, 0x03, 0x03, 0x84]);
     assert_eq!(refusal(&mut ecu, &request), Nrc::RequestOutOfRange);
     answer(&mut ecu, &[0x10, 0x02]);
+    assert_eq!(refusal(&mut ecu, &request), Nrc::RequestOutOfRange);
+    assert_eq!(read_coding(&mut ecu), [0x00, 0x01, 0x03, 0x20]);
+    // Unlocked in the programming session, the write is still refused for its session, not for
+    // security access.
+    let mut ecu = authenticated_ecm();
+    unlock_in(&mut ecu, 0x02);
     assert_eq!(refusal(&mut ecu, &request), Nrc::RequestOutOfRange);
     assert_eq!(read_coding(&mut ecu), [0x00, 0x01, 0x03, 0x20]);
 }

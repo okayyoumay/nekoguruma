@@ -118,7 +118,7 @@ Every ECU supports these services. A service not listed gets NRC `0x11`.
 | `0x19` | ReadDTCInformation (11.3) | `02` by status mask, `0A` supported DTCs | all | none | allowed |
 | `0x22` | ReadDataByIdentifier (10.2) | up to 8 DIDs per request | all | none | allowed |
 | `0x27` | SecurityAccess (9.4) | `01` requestSeed, `02` sendKey | extended, programming | - | allowed |
-| `0x2E` | WriteDataByIdentifier (10.7) | writable DIDs (section 6) | extended | per DID | refused |
+| `0x2E` | WriteDataByIdentifier (10.7) | writable DIDs (section 6) | per DID (extended for every writable DID) | per DID | refused |
 | `0x31` | RoutineControl (13.2) | per routine (section 6) | per routine | per routine | refused |
 | `0x34` | RequestDownload (14.2) | ECM, TCM | programming | level 1 | refused |
 | `0x36` | TransferData (14.4) | ECM, TCM | programming | level 1 | refused |
@@ -192,7 +192,7 @@ endian. "Raw" gives the conversion from the transmitted value.
 | `1005` | batteryVoltage | uint16, raw / 100 V |
 | `1006` | engineRunning | uint8: 0 no, 1 yes |
 | `1010` | fuelRailPressure | uint16, raw × 10 kPa; `ecmV2` only |
-| `0120` | engineCoding | 4 bytes: market (uint8: 0 domestic, 1 export), options (uint8 bit mask: bit 0 start-stop, bit 1 cruise control, the other bits 0), target idle speed (uint16, rpm); both variants; writable (extended session, level 1) |
+| `0120` | engineCoding | 4 bytes: market (uint8: 0 domestic, 1 export), options (uint8 bit mask: bit 0 start-stop, bit 1 cruise control, the other bits reserved), target idle speed (uint16, rpm); both variants; writable (extended session, level 1) |
 
 The coding DID `0120` is the vehicle's configuration data of the engine controller: ReadDataByIdentifier
 (ISO 14229-1 (2026) 10.2) reads it in every session, and WriteDataByIdentifier (10.7) changes it in
@@ -392,11 +392,15 @@ set explicitly. `1010` is left out: a configuration serves one variant (`ecmV1`,
 
 A coding write is answered with NRC `0x34` until the gateway authentication is set, which a test
 does with `SimEcu::gateway_authenticated` and a job through `sim-vci`'s `set_gateway_authentication`
-control command (`crates/sim-vci/docs/simulated-vci.md`). With it set, `sim-ecu` checks the session
-(NRC `0x31` outside the extended session), then the security level (NRC `0x33` while locked); a
-write that passes replaces the stored value, and a read returns it.
+control command (`crates/sim-vci/docs/simulated-vci.md`). With it set, `sim-ecu` checks the DID's
+session (NRC `0x31` outside the extended session: the session condition is the DID's, section 4,
+so the answer is the DID-level one of ISO 14229-1 (2026) 10.7.4), then the record's length (NRC
+`0x13`), then the security level (NRC `0x33` while locked); a write that passes replaces the stored
+value, and a read returns it. The simulator does not check the values: a market other than 0 or 1,
+or a reserved option bit, is stored as written.
 
-`sim-ecu` does not answer `F18C`, `F197`, `1010`, the other ECUs' DIDs and routines of section 6,
+`sim-ecu` does not answer `F18C`, `F197`, `1010`, the engine controller's routines `0201` and `0202`,
+the other ECUs' DIDs and routines of section 6,
 or the other ECUs' masks, and `sim-vci` simulates one ECU on the engine controller's identifiers;
 `identify.star` and the vehicle test therefore use the common part, and the coding tests use the
 engine controller.

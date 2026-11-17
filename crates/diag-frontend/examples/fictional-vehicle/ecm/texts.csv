@@ -12,8 +12,8 @@ routine.failed,1010,Failed
 routine.notStarted,1011,Not started
 routine.running,1012,Running
 routine.aborted,1013,Aborted
-market.domestic,1014,Domestic market
-market.export,1015,Export market
+market.domestic,1206,Domestic market
+market.export,1207,Export market
 nrc.subFunctionNotSupported,1021,Sub-function not supported
 nrc.incorrectMessageLength,1022,Incorrect message length or format
 nrc.conditionsNotCorrect,1023,Conditions not correct

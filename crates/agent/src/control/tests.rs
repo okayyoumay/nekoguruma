@@ -11,7 +11,7 @@
 use std::io;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -44,6 +44,7 @@ use super::channel::{self, HEARTBEAT};
 use super::dial::{Dial, Dialled, Stream};
 use super::exchange::{CHALLENGE_PATH, SESSION_PATH};
 use super::*;
+use crate::deadline::{Clock, IssueMark};
 use crate::identity::load_or_create;
 use crate::identity::store::{MemoryStore, SecretName};
 use crate::instruction::VerifiedInstruction;
@@ -349,6 +350,8 @@ struct Opts {
     preset: &'static str,
     /// A hook on the outbox's write path.
     probe: Option<Probe>,
+    /// A hook on the issue-time mark's write path.
+    mark_probe: Option<Probe>,
 }
 
 impl Default for Opts {
@@ -359,6 +362,7 @@ impl Default for Opts {
             origin: ORIGIN,
             preset: "personal",
             probe: None,
+            mark_probe: None,
         }
     }
 }
@@ -369,6 +373,46 @@ fn open_outbox(fx: &Fixture, probe: Option<Probe>) -> SharedOutbox {
     std::fs::create_dir_all(&dir).unwrap();
     let probe = probe.unwrap_or_else(|| Box::new(|_| Ok(())));
     SharedOutbox::new(Outbox::open_with(&dir, AGENT_ID, probe).unwrap())
+}
+
+/// The device clock of a test: a time it can set, and a count of the reads.
+struct TestClock {
+    now: AtomicU64,
+    reads: AtomicUsize,
+}
+
+/// The device time a test starts at: below every deadline the fixtures sign (2000), so the cases
+/// that do not mean to expire a job do not.
+const DEVICE_NOW: u64 = 500;
+
+impl TestClock {
+    fn at(now: u64) -> Arc<TestClock> {
+        Arc::new(TestClock {
+            now: AtomicU64::new(now),
+            reads: AtomicUsize::new(0),
+        })
+    }
+
+    fn set(&self, now: u64) {
+        self.now.store(now, Ordering::SeqCst);
+    }
+
+    fn reads(&self) -> usize {
+        self.reads.load(Ordering::SeqCst)
+    }
+}
+
+impl Clock for TestClock {
+    fn now_unix(&self) -> u64 {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        self.now.load(Ordering::SeqCst)
+    }
+}
+
+/// The issue-time mark of the fixture's agent in its registration directory.
+fn open_marks(fx: &Fixture, probe: Option<Probe>) -> IssueMark {
+    let probe = probe.unwrap_or_else(|| Box::new(|_| Ok(())));
+    IssueMark::open_with(&fx.registration_dir(), AGENT_ID, probe).unwrap()
 }
 
 /// An intake that keeps what it was given: the job ID and the envelope.
@@ -389,6 +433,9 @@ struct Env {
     intake: Arc<RecordingIntake>,
     /// `None` only while a restart has the outbox closed.
     outbox: Option<SharedOutbox>,
+    /// `None` only while a restart has the mark store closed.
+    marks: Option<IssueMark>,
+    clock: Arc<TestClock>,
     handle: Handle,
     conns: mpsc::UnboundedReceiver<Dialed>,
     dial: Arc<FakeDial>,
@@ -458,12 +505,16 @@ impl Env {
         };
         let intake = Arc::new(RecordingIntake::default());
         let outbox = open_outbox(&fx, opts.probe);
+        let marks = open_marks(&fx, opts.mark_probe);
+        let clock = TestClock::at(DEVICE_NOW);
         let seams = Seams {
             dial: dial.clone(),
             signer,
             random: opts.random,
             intake: intake.clone(),
             outbox: outbox.clone(),
+            marks: marks.clone(),
+            clock: clock.clone(),
         };
         let started = Instant::now();
         let handle = fx
@@ -475,6 +526,8 @@ impl Env {
             fx,
             intake,
             outbox: Some(outbox),
+            marks: Some(marks),
+            clock,
             handle,
             conns: rx,
             dial,
@@ -499,13 +552,17 @@ impl Env {
         self.handle.stop();
         self.handle.stopped().await;
         self.outbox = None;
+        self.marks = None;
         let outbox = open_outbox(&self.fx, None);
+        let marks = open_marks(&self.fx, None);
         let seams = Seams {
             dial: self.dial.clone(),
             signer: self.fx.key.clone(),
             random: shared_crypto::random_32,
             intake: self.intake.clone(),
             outbox: outbox.clone(),
+            marks: marks.clone(),
+            clock: self.clock.clone(),
         };
         self.handle = self
             .fx
@@ -514,6 +571,7 @@ impl Env {
             .start_with(&self.fx.key.public_key(), seams)
             .unwrap();
         self.outbox = Some(outbox);
+        self.marks = Some(marks);
     }
 
     /// The commands answered `commandAck` and `commandRejected` so far.
@@ -930,6 +988,17 @@ struct Signed {
 
 /// A job command the record's instruction key signed for `agent`, spoiled as `tamper` says.
 fn signed_command(fx: &Fixture, id: &str, agent: &str, tamper: Tamper) -> Signed {
+    signed_command_at(fx, id, agent, tamper, (1_000, 2_000))
+}
+
+/// [`signed_command`] with the instruction's issue time and start deadline (Unix seconds).
+fn signed_command_at(
+    fx: &Fixture,
+    id: &str,
+    agent: &str,
+    tamper: Tamper,
+    (issued_at, start_deadline): (u64, u64),
+) -> Signed {
     use shared_crypto::instruction as envelope;
     let body = JobInstruction {
         version: INSTRUCTION_VERSION,
@@ -952,8 +1021,8 @@ fn signed_command(fx: &Fixture, id: &str, agent: &str, tamper: Tamper) -> Signed
         document_hashes: vec![],
         artifact_hash: None,
         plan_hash: None,
-        issued_at: 1_000,
-        start_deadline: 2_000,
+        issued_at,
+        start_deadline,
     };
     let payload = body.encode().unwrap();
     let foreign;
@@ -1339,6 +1408,8 @@ async fn a7_a_key_with_another_fingerprint_is_a_key_mismatch() {
         random: shared_crypto::random_32,
         intake: Arc::new(LogIntake),
         outbox: open_outbox(&fx, None),
+        marks: open_marks(&fx, None),
+        clock: TestClock::at(DEVICE_NOW),
     };
     let error = fx.open().unwrap().start_with(&other, seams).unwrap_err();
     assert!(matches!(error, ControlError::KeyMismatch));
@@ -1407,6 +1478,8 @@ async fn a11_a_second_open_in_the_same_process_is_already_running() {
         random: shared_crypto::random_32,
         intake: Arc::new(LogIntake),
         outbox: open_outbox(&fx, None),
+        marks: open_marks(&fx, None),
+        clock: TestClock::at(DEVICE_NOW),
     };
     let handle = first.start_with(&fx.key.public_key(), seams).unwrap();
     assert!(matches!(fx.open(), Err(ControlError::AlreadyRunning)));
@@ -1468,6 +1541,8 @@ fn a12_runtime_shutdown_and_an_unstarted_opened_release_both_locks() {
             random: shared_crypto::random_32,
             intake: Arc::new(LogIntake),
             outbox: open_outbox(&fx, None),
+            marks: open_marks(&fx, None),
+            clock: TestClock::at(DEVICE_NOW),
         };
         let handle = fx
             .open()
@@ -4722,7 +4797,13 @@ async fn r1_over_real_loopback_an_exchange_an_upgrade_a_heartbeat_and_a_stop() {
     let handle = fx
         .open()
         .unwrap()
-        .start(agent, Arc::new(LogIntake), open_outbox(&fx, None))
+        .start(
+            agent,
+            Arc::new(LogIntake),
+            open_outbox(&fx, None),
+            open_marks(&fx, None),
+            Arc::new(crate::deadline::SystemClock),
+        )
         .unwrap();
     tokio::time::timeout(secs(30), async {
         let (mut stream, _) = listener.accept().await.unwrap();
@@ -4773,7 +4854,13 @@ async fn r1_over_real_loopback_a_refused_connection_and_then_the_server_appears(
     let handle = fx
         .open()
         .unwrap()
-        .start(agent, Arc::new(LogIntake), open_outbox(&fx, None))
+        .start(
+            agent,
+            Arc::new(LogIntake),
+            open_outbox(&fx, None),
+            open_marks(&fx, None),
+            Arc::new(crate::deadline::SystemClock),
+        )
         .unwrap();
     tokio::time::timeout(secs(30), async {
         // The first attempt is refused: the loop waits.
@@ -4800,4 +4887,664 @@ async fn r1_over_real_loopback_a_refused_connection_and_then_the_server_appears(
     })
     .await
     .expect("the smoke test took too long");
+}
+
+// ---------------------------------------------------------------------------------------------
+// The start deadline and the highest issue time (design 5.3, ADR-486; the row's letter and number
+// of the case table begin each name). The device clock starts at `DEVICE_NOW`; the fixtures sign
+// an issue time of 1000 and a deadline of 2000 unless a test says otherwise.
+
+/// A command sealed for the owner, with the instruction's issue time and start deadline.
+fn timed(env: &Env, id: &str, issued_at: u64, deadline: u64) -> String {
+    signed_command_at(&env.fx, id, AGENT_ID, Tamper::None, (issued_at, deadline)).text
+}
+
+/// [`timed`] for an operator who is not the owner.
+fn timed_foreign(env: &Env, id: &str, issued_at: u64, deadline: u64) -> String {
+    signed_command_at(
+        &env.fx,
+        id,
+        AGENT_ID,
+        Tamper::OtherOperator,
+        (issued_at, deadline),
+    )
+    .text
+}
+
+/// The `expired` event: no failure code and no detail.
+fn expired_of(seq: u64) -> serde_json::Value {
+    serde_json::json!({
+        "type": "agentEvent", "seq": seq, "kind": "jobState", "jobId": JOB_ID, "state": "expired"
+    })
+}
+
+/// The value in the mark file, when there is a file.
+fn mark_in_file(env: &Env) -> Option<u64> {
+    let path = env
+        .fx
+        .registration_dir()
+        .join(format!("{AGENT_ID}.issue-mark.v1.json"));
+    let bytes = std::fs::read(path).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["agent_id"], AGENT_ID);
+    Some(value["highest_issued_at"].as_u64().unwrap())
+}
+
+/// A mark probe that counts the writes that begin and fails at `fail_at` while `failing` is set.
+fn mark_probe(
+    writes: &Arc<AtomicUsize>,
+    failing: &Arc<AtomicBool>,
+    fail_at: crate::outbox::Step,
+) -> Probe {
+    let (writes, failing) = (writes.clone(), failing.clone());
+    Box::new(move |step| {
+        if step == crate::outbox::Step::BeforeWrite {
+            writes.fetch_add(1, Ordering::SeqCst);
+        }
+        if step == fail_at && failing.load(Ordering::SeqCst) {
+            return Err(io::Error::other("a scripted mark failure"));
+        }
+        Ok(())
+    })
+}
+
+/// An environment whose mark writes are counted.
+fn counting_env() -> (Env, Arc<AtomicUsize>) {
+    let writes = Arc::new(AtomicUsize::new(0));
+    let env = Env::with(Opts {
+        mark_probe: Some(mark_probe(
+            &writes,
+            &Arc::new(AtomicBool::new(false)),
+            crate::outbox::Step::BeforeWrite,
+        )),
+        ..Opts::default()
+    });
+    (env, writes)
+}
+
+/// The answer to a command, which must be `commandAck`, then the event the command recorded,
+/// which is acknowledged. Returns the event.
+async fn settled(ws: &mut Ws) -> serde_json::Value {
+    let (_, answered) = answer(ws).await;
+    assert_eq!(answered["type"], "commandAck", "{answered}");
+    let event = event_json(ws).await;
+    send(ws, &ack(event["seq"].as_u64().unwrap())).await;
+    event
+}
+
+/// [`settled`] on a new connection of a session that was restarted: events an earlier connection
+/// sent without an acknowledgement come again first, and are skipped.
+async fn settled_after_restart(ws: &mut Ws) -> serde_json::Value {
+    loop {
+        let (_, message) = got(ws).await;
+        let Got::Text(text) = message else {
+            panic!("a message is next, got {message:?}");
+        };
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        if value["type"] == "commandAck" {
+            break;
+        }
+        assert_eq!(value["type"], "agentEvent", "{value}");
+    }
+    let event = event_json(ws).await;
+    send(ws, &ack(event["seq"].as_u64().unwrap())).await;
+    event
+}
+
+// T1, T3, T8
+#[tokio::test(start_paused = true)]
+async fn deadline_t1_t3_a_deadline_after_the_clock_and_the_mark_is_accepted_and_the_mark_is_synced_first()
+ {
+    let mut env = Env::new();
+    let (_, mut ws) = env.connected(60).await;
+    // The issue time is after the device clock: no skew rule, the mark rises to it (T8).
+    send(&mut ws, &timed(&env, "a", 1_000, 2_000)).await;
+    let (_, answered) = answer(&mut ws).await;
+    assert_eq!(answered["type"], "commandAck");
+    assert_eq!(
+        mark_in_file(&env),
+        Some(1_000),
+        "synced before the answer was read"
+    );
+    assert_eq!(env.intake.0.lock().unwrap().len(), 1);
+    assert_eq!(event_json(&mut ws).await, received_of(1));
+    // T3: one second before the deadline.
+    env.clock.set(1_999);
+    send(&mut ws, &timed(&env, "b", 1_000, 2_000)).await;
+    let (_, answered) = answer(&mut ws).await;
+    assert_eq!(answered["type"], "commandAck");
+    assert_eq!(event_json(&mut ws).await, received_of(2));
+    assert_eq!(env.intake.0.lock().unwrap().len(), 2);
+    assert_eq!(env.counts(), (2, 0));
+}
+
+// T2, T4, D6
+#[tokio::test(start_paused = true)]
+async fn deadline_t2_t4_a_deadline_at_or_before_the_device_clock_is_expired_and_acknowledged() {
+    let mut env = Env::new();
+    let (_, mut ws) = env.connected(60).await;
+    for (k, now) in [2_000, 2_500].into_iter().enumerate() {
+        env.clock.set(now);
+        send(&mut ws, &timed(&env, &format!("c{k}"), 1_000, 2_000)).await;
+        let (_, answered) = answer(&mut ws).await;
+        assert_eq!(answered["type"], "commandAck", "now {now}");
+        assert_eq!(event_json(&mut ws).await, expired_of(k as u64 + 1));
+    }
+    assert!(env.intake.0.lock().unwrap().is_empty(), "nothing was taken");
+    // The status counts an expired job as acknowledged, not as rejected (D6).
+    assert_eq!(env.counts(), (2, 0));
+    // The clock decided, not the mark: no warning about the clock being behind.
+    assert_eq!(env.log.warns("highest issue time"), 0);
+}
+
+// T5, T13 (the mark's warning)
+#[tokio::test(start_paused = true)]
+async fn deadline_t5_a_mark_past_the_deadline_expires_the_job_though_the_clock_is_behind() {
+    let mut env = Env::new();
+    let (_, mut ws) = env.connected(60).await;
+    send(&mut ws, &timed(&env, "a", 3_000, 5_000)).await;
+    assert_eq!(settled(&mut ws).await, received_of(1));
+    // The device clock still reads 500: only the mark (3000) is past this deadline.
+    for (k, id) in ["b", "c"].into_iter().enumerate() {
+        send(&mut ws, &timed(&env, id, 1_000, 2_500)).await;
+        assert_eq!(settled(&mut ws).await, expired_of(k as u64 + 2));
+    }
+    assert_eq!(env.intake.0.lock().unwrap().len(), 1);
+    // One warning for the connection, not one per expiry.
+    assert_eq!(env.log.warns("highest issue time"), 1);
+    assert_eq!(env.counts(), (3, 0));
+}
+
+// T6, T7, T10, T11
+#[tokio::test(start_paused = true)]
+async fn deadline_t6_t7_t10_t11_the_later_of_clock_and_mark_decides_and_a_lower_issue_time_writes_nothing()
+ {
+    let (mut env, writes) = counting_env();
+    let (_, mut ws) = env.connected(60).await;
+    // T6: the mark (1500) is after the clock (500) and before the deadline.
+    send(&mut ws, &timed(&env, "a", 1_500, 2_000)).await;
+    assert_eq!(settled(&mut ws).await, received_of(1));
+    send(&mut ws, &timed(&env, "b", 2_000, 9_000)).await;
+    assert_eq!(settled(&mut ws).await, received_of(2));
+    assert_eq!(writes.load(Ordering::SeqCst), 2);
+    // T7 and T11: the mark equals the deadline, and this instruction's issue time is lower.
+    send(&mut ws, &timed(&env, "c", 1_000, 2_000)).await;
+    assert_eq!(settled(&mut ws).await, expired_of(3));
+    // T10: a lower issue time with a later deadline is accepted; the mark is not lowered and
+    // nothing is written (it is not a replay check).
+    send(&mut ws, &timed(&env, "d", 1_000, 9_000)).await;
+    assert_eq!(settled(&mut ws).await, received_of(4));
+    assert_eq!(mark_in_file(&env), Some(2_000));
+    assert_eq!(
+        writes.load(Ordering::SeqCst),
+        2,
+        "no write for a lower issue time"
+    );
+    assert_eq!(env.marks.as_ref().unwrap().highest(), 2_000);
+}
+
+// T9
+#[tokio::test(start_paused = true)]
+async fn deadline_t9_an_issue_time_at_or_after_the_deadline_is_expired_not_malformed() {
+    let mut env = Env::new();
+    let (_, mut ws) = env.connected(60).await;
+    for (k, (issued, deadline)) in [(2_000, 2_000), (3_000, 2_000)].into_iter().enumerate() {
+        send(&mut ws, &timed(&env, "a", issued, deadline)).await;
+        assert_eq!(settled(&mut ws).await, expired_of(k as u64 + 1));
+    }
+    assert_eq!(
+        mark_in_file(&env),
+        Some(3_000),
+        "the mark rose to the issue time"
+    );
+    assert_eq!(env.counts(), (2, 0));
+}
+
+// T13, R1, R2
+#[tokio::test(start_paused = true)]
+async fn deadline_t13_r1_r2_a_far_future_mark_is_taken_as_is_and_survives_a_restart() {
+    let mut env = Env::new();
+    let (_, mut ws) = env.connected(60).await;
+    send(&mut ws, &timed(&env, "a", u64::MAX, 2_000)).await;
+    assert_eq!(settled(&mut ws).await, expired_of(1));
+    assert_eq!(mark_in_file(&env), Some(u64::MAX), "no cap");
+    // Every later instruction expires until the agent is registered again.
+    send(&mut ws, &timed(&env, "b", 1_000, 9_000)).await;
+    assert_eq!(settled(&mut ws).await, expired_of(2));
+    assert_eq!(env.log.warns("highest issue time"), 1, "one per connection");
+    // R1 and R2: a restart reads the file, so the clock (still 500, as after a reset to 1970)
+    // does not bring the instruction back.
+    env.restart().await;
+    let (_, mut ws) = env.connected(60).await;
+    send(&mut ws, &timed(&env, "c", 1_000, 9_000)).await;
+    assert_eq!(settled_after_restart(&mut ws).await, expired_of(3));
+    assert!(env.intake.0.lock().unwrap().is_empty());
+    assert_eq!(env.marks.as_ref().unwrap().highest(), u64::MAX);
+}
+
+// R1, R2
+#[tokio::test(start_paused = true)]
+async fn deadline_r1_r2_a_restart_keeps_the_mark_and_a_clock_reset_does_not_revive_a_stale_job() {
+    let mut env = Env::new();
+    let (_, mut ws) = env.connected(60).await;
+    send(&mut ws, &timed(&env, "a", 3_000, 9_000)).await;
+    assert_eq!(settled(&mut ws).await, received_of(1));
+    env.restart().await;
+    let (_, mut ws) = env.connected(60).await;
+    // The device clock reads 500 (as after a reset to 1970); the mark in the file is 3000.
+    send(&mut ws, &timed(&env, "b", 1_000, 2_500)).await;
+    assert_eq!(settled_after_restart(&mut ws).await, expired_of(2));
+    // A deadline after the mark and the clock is accepted (R2's residual: a stale deadline
+    // beyond the mark passes).
+    send(&mut ws, &timed(&env, "c", 1_000, 9_000)).await;
+    assert_eq!(settled(&mut ws).await, received_of(3));
+    assert_eq!(env.marks.as_ref().unwrap().highest(), 3_000);
+    assert_eq!(mark_in_file(&env), Some(3_000));
+}
+
+// T14
+#[tokio::test(start_paused = true)]
+async fn deadline_t14_the_clock_is_read_once_per_judged_command_and_never_for_a_refused_one() {
+    let mut env = Env::new();
+    let (hello_at, mut ws) = env.connected(60).await;
+    send(&mut ws, &timed(&env, "a", 1_000, 2_000)).await;
+    assert_eq!(settled(&mut ws).await, received_of(1));
+    assert_eq!(env.clock.reads(), 1, "accepted");
+    env.clock.set(2_500);
+    send(&mut ws, &timed(&env, "b", 1_000, 2_000)).await;
+    assert_eq!(settled(&mut ws).await, expired_of(2));
+    assert_eq!(env.clock.reads(), 2, "expired");
+    // An operator who is not allowed: refused before the clock is read, though also expired.
+    send(&mut ws, &timed_foreign(&env, "c", 1_000, 2_000)).await;
+    assert_eq!(settled(&mut ws).await, operator_refusal_of(3));
+    assert_eq!(env.clock.reads(), 2, "operator-refused");
+    send(
+        &mut ws,
+        &signed_command(&env.fx, "d", AGENT_ID, Tamper::ForeignKey).text,
+    )
+    .await;
+    let (_, rejected) = answer(&mut ws).await;
+    assert_eq!(rejected["type"], "commandRejected");
+    assert_eq!(env.clock.reads(), 2, "rejected");
+    assert_after(
+        hello_at,
+        heartbeat(&mut ws).await,
+        60,
+        "tick: no event came",
+    );
+}
+
+// V1, V2, V7
+#[tokio::test(start_paused = true)]
+async fn deadline_v1_v2_v7_a_command_that_fails_verification_leaves_the_mark_and_the_clock_alone() {
+    let mut env = Env::new();
+    let (hello_at, mut ws) = env.connected(60).await;
+    let far = (u64::MAX, 2_000);
+    for tamper in [
+        Tamper::ForeignKey,
+        Tamper::FlipPayload,
+        Tamper::Format,
+        Tamper::Truncate,
+        Tamper::OtherAgent,
+    ] {
+        send(
+            &mut ws,
+            &signed_command_at(&env.fx, "f", AGENT_ID, tamper, far).text,
+        )
+        .await;
+        let (_, rejected) = answer(&mut ws).await;
+        assert_eq!(rejected["type"], "commandRejected");
+    }
+    // A missing signedJob and one that is not base64 (V7).
+    send(&mut ws, r#"{"type":"jobCommand","commandId":"m"}"#).await;
+    assert_eq!(answer(&mut ws).await.1["reason"], "malformed");
+    send(
+        &mut ws,
+        r#"{"type":"jobCommand","commandId":"n","signedJob":"!!"}"#,
+    )
+    .await;
+    assert_eq!(answer(&mut ws).await.1["reason"], "malformed");
+    assert_eq!(env.clock.reads(), 0, "nothing was judged");
+    assert_eq!(env.marks.as_ref().unwrap().highest(), 0);
+    assert_eq!(mark_in_file(&env), None, "nothing was written");
+    assert_after(
+        hello_at,
+        heartbeat(&mut ws).await,
+        60,
+        "tick: no event came",
+    );
+    // The forged issue time did not poison the mark: a genuine command is accepted.
+    send(&mut ws, &timed(&env, "ok", 1_000, 2_000)).await;
+    assert_eq!(settled(&mut ws).await, received_of(1));
+    assert_eq!(env.counts(), (1, 7));
+}
+
+// V3, V4
+#[tokio::test(start_paused = true)]
+async fn deadline_v3_v4_an_operator_refusal_raises_and_syncs_the_mark_and_is_never_expired() {
+    let mut env = Env::new();
+    let (_, mut ws) = env.connected(60).await;
+    send(&mut ws, &timed_foreign(&env, "a", 1_200, 2_000)).await;
+    let (_, answered) = answer(&mut ws).await;
+    assert_eq!(answered["type"], "commandAck");
+    assert_eq!(mark_in_file(&env), Some(1_200), "synced before the ack");
+    assert_eq!(event_json(&mut ws).await, operator_refusal_of(1));
+    // Also past its deadline: still the operator refusal, and the mark rises again.
+    env.clock.set(2_500);
+    send(&mut ws, &timed_foreign(&env, "b", 1_300, 2_000)).await;
+    assert_eq!(settled(&mut ws).await, operator_refusal_of(2));
+    assert_eq!(mark_in_file(&env), Some(1_300));
+    assert!(env.intake.0.lock().unwrap().is_empty());
+}
+
+// V5
+#[tokio::test(start_paused = true)]
+async fn deadline_v5_a_shared_agent_applies_the_time_rules_alone() {
+    let mut env = Env::with(Opts {
+        preset: "shared",
+        ..Opts::default()
+    });
+    let (_, mut ws) = env.connected(60).await;
+    send(&mut ws, &timed_foreign(&env, "a", 1_000, 2_000)).await;
+    assert_eq!(settled(&mut ws).await, received_of(1));
+    env.clock.set(2_500);
+    send(&mut ws, &timed_foreign(&env, "b", 1_000, 2_000)).await;
+    assert_eq!(settled(&mut ws).await, expired_of(2));
+    assert_eq!(env.intake.0.lock().unwrap().len(), 1);
+}
+
+// D1
+#[tokio::test(start_paused = true)]
+async fn deadline_d1_an_expired_command_delivered_twice_gets_two_events_and_one_file_write() {
+    let (mut env, writes) = counting_env();
+    env.clock.set(2_500);
+    let (_, mut ws) = env.connected(60).await;
+    for (k, id) in ["first", "second"].into_iter().enumerate() {
+        send(&mut ws, &timed(&env, id, 1_000, 2_000)).await;
+        assert_eq!(settled(&mut ws).await, expired_of(k as u64 + 1));
+    }
+    assert_eq!(writes.load(Ordering::SeqCst), 1);
+    assert_eq!(mark_in_file(&env), Some(1_000));
+    assert_eq!(env.counts(), (2, 0));
+}
+
+// D3
+#[tokio::test(start_paused = true)]
+async fn deadline_d3_a_redelivery_after_the_deadline_or_after_the_mark_is_expired_without_a_second_intake()
+ {
+    let mut env = Env::new();
+    let (_, mut ws) = env.connected(60).await;
+    send(&mut ws, &timed(&env, "first", 1_000, 2_000)).await;
+    assert_eq!(settled(&mut ws).await, received_of(1));
+    // The ack was lost; the clock has since reached the deadline.
+    env.clock.set(2_000);
+    send(&mut ws, &timed(&env, "again", 1_000, 2_000)).await;
+    assert_eq!(settled(&mut ws).await, expired_of(2));
+    // Or the mark has: the clock is back, a later instruction raised it.
+    env.clock.set(500);
+    send(&mut ws, &timed(&env, "other", 3_000, 9_000)).await;
+    assert_eq!(settled(&mut ws).await, received_of(3));
+    send(&mut ws, &timed(&env, "third", 1_000, 2_000)).await;
+    assert_eq!(settled(&mut ws).await, expired_of(4));
+    assert_eq!(
+        env.intake.0.lock().unwrap().len(),
+        2,
+        "the expired deliveries were not handed over"
+    );
+}
+
+// D5
+#[tokio::test(start_paused = true)]
+async fn deadline_d5_the_log_names_the_job_once_and_counts_the_rest() {
+    let mut env = Env::new();
+    env.clock.set(2_500);
+    let (_, mut ws) = env.connected(60).await;
+    for k in 0..3 {
+        send(&mut ws, &timed(&env, &format!("cmd-{k}"), 1_000, 2_000)).await;
+        let _ = settled(&mut ws).await;
+    }
+    let warns: Vec<_> = env
+        .log
+        .lines("WARN")
+        .into_iter()
+        .filter(|line| line.contains("start deadline has passed"))
+        .collect();
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(warns[0].contains(JOB_ID) && warns[0].contains("expired"));
+    let debug = env
+        .log
+        .lines("DEBUG")
+        .iter()
+        .filter(|line| line.contains("start deadline has passed"))
+        .count();
+    assert_eq!(debug, 2);
+    drop(ws);
+    env.wait_phase(Phase::Waiting).await;
+    let lines: Vec<String> = env
+        .log
+        .lines("INFO")
+        .into_iter()
+        .filter(|line| line.contains("refused on this connection"))
+        .collect();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("expired=3"), "{}", lines[0]);
+    let text = env.log.text();
+    for forbidden in [
+        "cmd-",
+        OWNER_ID,
+        "VIN-UNDER-TEST",
+        "start_deadline",
+        "issued_at",
+        "2500",
+        "2000",
+    ] {
+        assert!(!text.contains(forbidden), "the log holds {forbidden}");
+    }
+}
+
+// X1, X4
+#[tokio::test(start_paused = true)]
+async fn deadline_x1_x4_a_full_outbox_withholds_the_ack_of_an_expired_job_and_the_redelivery_writes_no_mark()
+ {
+    let (mut env, writes) = counting_env();
+    env.clock.set(2_500);
+    for _ in 0..65 {
+        env.outbox()
+            .append(Kind::Other, big_event_text)
+            .await
+            .unwrap();
+    }
+    let (hello_at, mut ws) = env.connected(60).await;
+    for _ in 0..64 {
+        let _ = got(&mut ws).await;
+    }
+    send(&mut ws, &timed(&env, "a", 1_000, 2_000)).await;
+    send(&mut ws, &timed(&env, "b", 1_000, 2_000)).await;
+    assert_after(hello_at, heartbeat(&mut ws).await, 60, "tick: no answer");
+    assert_eq!(env.counts(), (0, 0));
+    assert_eq!(env.log.warns("outbox-full"), 1);
+    assert_eq!(mark_in_file(&env), Some(1_000), "synced before the append");
+    assert_eq!(writes.load(Ordering::SeqCst), 1);
+}
+
+// X2, X4, F11
+#[tokio::test(start_paused = true)]
+async fn deadline_x2_f11_a_failed_expiry_append_closes_with_1011_and_the_redelivery_is_expired_without_a_write()
+ {
+    let fail = Arc::new(AtomicBool::new(false));
+    let probe_flag = fail.clone();
+    let writes = Arc::new(AtomicUsize::new(0));
+    let mut env = Env::with(Opts {
+        probe: Some(Box::new(move |step| {
+            if step == crate::outbox::Step::BeforeWrite && probe_flag.load(Ordering::SeqCst) {
+                return Err(io::Error::other("a scripted write failure"));
+            }
+            Ok(())
+        })),
+        mark_probe: Some(mark_probe(
+            &writes,
+            &Arc::new(AtomicBool::new(false)),
+            crate::outbox::Step::BeforeWrite,
+        )),
+        ..Opts::default()
+    });
+    env.clock.set(2_500);
+    let (_, mut ws) = env.connected(60).await;
+    fail.store(true, Ordering::SeqCst);
+    send(&mut ws, &timed(&env, "a", 1_000, 2_000)).await;
+    close_of(&mut ws, 1011, true).await;
+    assert_eq!(env.counts(), (0, 0));
+    assert_eq!(mark_in_file(&env), Some(1_000), "synced before the append");
+    fail.store(false, Ordering::SeqCst);
+    // A restart after the mark was synced and before the event was recorded (F11).
+    env.restart().await;
+    let (_, mut ws) = env.connected(60).await;
+    send(&mut ws, &timed(&env, "a", 1_000, 2_000)).await;
+    assert_eq!(settled_after_restart(&mut ws).await, expired_of(1));
+    assert_eq!(
+        writes.load(Ordering::SeqCst),
+        1,
+        "the redelivery wrote no mark"
+    );
+    assert!(env.intake.0.lock().unwrap().is_empty());
+}
+
+// F8, F9, X5: a mark that cannot be written withholds everything the command leads to.
+async fn a_mark_that_cannot_be_written_withholds_the_command(
+    step: crate::outbox::Step,
+    kind: &str,
+) {
+    let writes = Arc::new(AtomicUsize::new(0));
+    let failing = Arc::new(AtomicBool::new(true));
+    let mut env = Env::with(Opts {
+        mark_probe: Some(mark_probe(&writes, &failing, step)),
+        preset: "personal",
+        ..Opts::default()
+    });
+    if kind == "expired" {
+        env.clock.set(2_500);
+    }
+    let command = |env: &Env, id: &str| match kind {
+        "refused" => timed_foreign(env, id, 1_000, 2_000),
+        _ => timed(env, id, 1_000, 2_000),
+    };
+    let (hello_at, mut ws) = env.connected(60).await;
+    send(&mut ws, &command(&env, "a")).await;
+    // No ack: the close is the next thing the agent writes.
+    close_of(&mut ws, 1011, true).await;
+    assert_eq!(env.counts(), (0, 0), "{step:?} {kind}");
+    assert!(env.intake.0.lock().unwrap().is_empty(), "{step:?} {kind}");
+    assert_eq!(env.log.warns("mark-write"), 1, "{step:?} {kind}");
+    assert!(!env.log.contains("commandId"));
+    // The mark in memory stays raised; the next verified command writes again, though its issue
+    // time is not above it.
+    failing.store(false, Ordering::SeqCst);
+    let (_, mut ws) = env.connected(60).await;
+    assert_eq!(env.marks.as_ref().unwrap().highest(), 1_000);
+    send(&mut ws, &command(&env, "a")).await;
+    let event = settled(&mut ws).await;
+    assert_eq!(event["seq"], 1, "no event came from the failed delivery");
+    assert_eq!(writes.load(Ordering::SeqCst), 2, "{step:?} {kind}");
+    assert_eq!(mark_in_file(&env), Some(1_000), "{step:?} {kind}");
+    assert_eq!(env.counts(), (1, 0));
+    let _ = hello_at;
+}
+
+#[tokio::test(start_paused = true)]
+async fn deadline_f8_f9_a_mark_that_cannot_be_written_withholds_the_ack_the_intake_and_the_event() {
+    use crate::outbox::Step;
+    for step in [
+        Step::BeforeWrite,
+        Step::AfterWrite,
+        Step::AfterSync,
+        Step::BeforeRename,
+        Step::AfterRename,
+    ] {
+        a_mark_that_cannot_be_written_withholds_the_command(step, "accepted").await;
+    }
+    a_mark_that_cannot_be_written_withholds_the_command(Step::BeforeRename, "refused").await;
+    a_mark_that_cannot_be_written_withholds_the_command(Step::BeforeRename, "expired").await;
+}
+
+// F8, R3
+#[tokio::test(start_paused = true)]
+async fn deadline_r3_a_restart_after_a_failed_mark_write_writes_it_again_on_the_redelivery() {
+    let writes = Arc::new(AtomicUsize::new(0));
+    let failing = Arc::new(AtomicBool::new(true));
+    let mut env = Env::with(Opts {
+        mark_probe: Some(mark_probe(
+            &writes,
+            &failing,
+            crate::outbox::Step::BeforeRename,
+        )),
+        ..Opts::default()
+    });
+    let (_, mut ws) = env.connected(60).await;
+    send(&mut ws, &timed(&env, "a", 1_000, 2_000)).await;
+    close_of(&mut ws, 1011, true).await;
+    assert_eq!(
+        mark_in_file(&env),
+        None,
+        "the file still holds the old value"
+    );
+    env.restart().await;
+    assert_eq!(
+        env.marks.as_ref().unwrap().highest(),
+        0,
+        "the memory is gone"
+    );
+    let (_, mut ws) = env.connected(60).await;
+    send(&mut ws, &timed(&env, "a", 1_000, 2_000)).await;
+    assert_eq!(settled_after_restart(&mut ws).await, received_of(1));
+    assert_eq!(mark_in_file(&env), Some(1_000));
+}
+
+// F10, F16
+#[tokio::test(start_paused = true)]
+async fn deadline_f10_f16_a_stop_during_the_mark_write_ends_as_a_stop_and_the_store_stays_locked_until_it_ends()
+ {
+    let hold = Arc::new(AtomicBool::new(false));
+    let entered = Arc::new(AtomicBool::new(false));
+    let (probe_hold, probe_entered) = (hold.clone(), entered.clone());
+    let mut env = Env::with(Opts {
+        mark_probe: Some(Box::new(move |step| {
+            if step == crate::outbox::Step::BeforeWrite && probe_hold.load(Ordering::SeqCst) {
+                probe_entered.store(true, Ordering::SeqCst);
+                while probe_hold.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            Ok(())
+        })),
+        ..Opts::default()
+    });
+    let (_, mut ws) = env.connected(60).await;
+    hold.store(true, Ordering::SeqCst);
+    send(&mut ws, &timed(&env, "a", 1_000, 2_000)).await;
+    while !entered.load(Ordering::SeqCst) {
+        tokio::task::yield_now().await;
+    }
+    env.handle.stop();
+    close_of(&mut ws, 1001, true).await;
+    env.handle.stopped().await;
+    assert_eq!(got(&mut ws).await.1, Got::Eof, "no ack");
+    assert_eq!(env.counts(), (0, 0));
+    assert!(env.intake.0.lock().unwrap().is_empty(), "no intake");
+    // The write is still running: the store is in use until it ends (F16).
+    env.marks = None;
+    assert!(matches!(
+        IssueMark::open_in(&env.fx.registration_dir(), AGENT_ID),
+        Err(crate::deadline::MarkError::InUse)
+    ));
+    hold.store(false, Ordering::SeqCst);
+    let marks = loop {
+        match IssueMark::open_in(&env.fx.registration_dir(), AGENT_ID) {
+            Err(crate::deadline::MarkError::InUse) => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            other => break other.unwrap(),
+        }
+    };
+    // Whether the old or the new file is there, it is valid.
+    assert!(matches!(marks.highest(), 0 | 1_000));
 }

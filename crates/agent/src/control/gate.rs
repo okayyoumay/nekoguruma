@@ -15,6 +15,12 @@
 //! and still answers `commandAck`, since the delivery itself is settled. The entry for it holds
 //! the job ID and the failure code, never the operator ID, the owner ID or a `commandId`.
 //!
+//! A verified instruction that the operator check allows is then judged against its start
+//! deadline (ADR-486): the channel does that with [`crate::deadline::IssueMark`], and an expired
+//! job is counted and logged here ([`Gate::expired`]) the way the operator refusal is: the first
+//! per connection is a `warn` with the job ID, the repeats are `debug`, and the connection's end
+//! gives the count. An entry holds no time, no operator and no `commandId`.
+//!
 //! What a verified instruction goes to is an [`Intake`]. The gate opens no link and keeps no job
 //! state; the answer to the server is the caller's.
 
@@ -27,8 +33,8 @@ use shared_proto::{FailureCode, InstructionRejectReason};
 use crate::instruction::{self, Refusal, VerifiedInstruction};
 
 /// Where a verified job instruction goes. The control channel hands it over before it answers
-/// `commandAck`. An instruction whose operator the gate does not allow (ADR-483) is not handed
-/// over: the job is refused and the intake never sees it.
+/// `commandAck`. An instruction whose operator the gate does not allow (ADR-483), or whose start
+/// deadline has passed (ADR-486), is not handed over: the intake never sees it.
 ///
 /// An intake can receive the same verified instruction twice: the hand-over succeeded, then the
 /// ack was lost (the write failed or the connection ended) and the server redelivers the command
@@ -77,7 +83,18 @@ pub(super) enum Admitted {
     /// The instruction verified and its operator may ask this agent for a job.
     Accepted(Box<VerifiedInstruction>),
     /// The instruction verified but its operator may not: the job is refused, never taken.
-    OperatorNotAllowed { job_id: String },
+    /// `issued_at` is the instruction's issue time, which still raises the highest one (ADR-486).
+    OperatorNotAllowed { job_id: String, issued_at: u64 },
+}
+
+impl Admitted {
+    /// The verified instruction's issue time, Unix seconds.
+    pub(super) fn issued_at(&self) -> u64 {
+        match self {
+            Admitted::Accepted(verified) => verified.instruction().issued_at,
+            Admitted::OperatorNotAllowed { issued_at, .. } => *issued_at,
+        }
+    }
 }
 
 /// Refusals so far on one connection, one counter per reason. A field per command refusal reason,
@@ -92,6 +109,8 @@ struct Refused {
     not_for_this_agent: u64,
     /// Verified instructions whose operator the policy did not allow (not a command refusal).
     operator_not_allowed: u64,
+    /// Verified, allowed instructions past their start deadline (not a command refusal).
+    expired: u64,
 }
 
 impl Refused {
@@ -115,6 +134,7 @@ impl Refused {
             && self.unsupported_version == 0
             && self.not_for_this_agent == 0
             && self.operator_not_allowed == 0
+            && self.expired == 0
     }
 }
 
@@ -125,6 +145,8 @@ pub(super) struct Gate<'a> {
     owner_id: &'a str,
     policy: OperatorPolicy,
     refused: Refused,
+    /// Whether the mark's own warning (the device clock is behind) was written on this connection.
+    mark_decided: bool,
 }
 
 impl<'a> Gate<'a> {
@@ -141,6 +163,7 @@ impl<'a> Gate<'a> {
             owner_id,
             policy: OperatorPolicy::of_preset(preset),
             refused: Refused::default(),
+            mark_decided: false,
         }
     }
 
@@ -176,13 +199,35 @@ impl<'a> Gate<'a> {
         }
         self.refused.operator_not_allowed += 1;
         let job_id = verified.instruction().job_id.0.clone();
+        let issued_at = verified.instruction().issued_at;
         let code = FailureCode::OperatorNotAllowed.wire_name();
         if self.refused.operator_not_allowed == 1 {
             tracing::warn!(job_id = %job_id, code, "a job was refused: its operator is not allowed");
         } else {
             tracing::debug!(job_id = %job_id, code, "a job was refused: its operator is not allowed");
         }
-        Admitted::OperatorNotAllowed { job_id }
+        Admitted::OperatorNotAllowed { job_id, issued_at }
+    }
+
+    /// Counts a job that is past its start deadline (ADR-486) and writes its entry: a `warn` the
+    /// first time on the connection, `debug` after that. `by_mark` is true when the highest issue
+    /// time decided it and the device clock alone would not have: that is warned once more per
+    /// connection, since the device clock is then probably behind.
+    pub(super) fn expired(&mut self, job_id: &str, by_mark: bool) {
+        self.refused.expired += 1;
+        if self.refused.expired == 1 {
+            tracing::warn!(job_id = %job_id, state = "expired", "a job was not started: its start deadline has passed");
+        } else {
+            tracing::debug!(job_id = %job_id, state = "expired", "a job was not started: its start deadline has passed");
+        }
+        if by_mark {
+            if self.mark_decided {
+                tracing::debug!(job_id = %job_id, "the start deadline was judged by the highest issue time: the device clock is behind it");
+            } else {
+                self.mark_decided = true;
+                tracing::warn!(job_id = %job_id, "the start deadline was judged by the highest issue time: the device clock is behind it");
+            }
+        }
     }
 
     /// Counts the refusal, writes its entry (a warning the first time per reason) and returns
@@ -206,6 +251,7 @@ impl<'a> Gate<'a> {
             unsupported_version,
             not_for_this_agent,
             operator_not_allowed,
+            expired,
         } = self.refused;
         tracing::info!(
             malformed,
@@ -214,6 +260,7 @@ impl<'a> Gate<'a> {
             unsupported_version,
             not_for_this_agent,
             operator_not_allowed,
+            expired,
             "job instructions refused on this connection"
         );
     }
@@ -256,7 +303,7 @@ mod tests {
         let mut gate = Gate::new(&public, AGENT, OWNER, preset);
         match gate.admit(Some(&sealed(&key, AGENT, operator))) {
             Ok(Admitted::Accepted(_)) => true,
-            Ok(Admitted::OperatorNotAllowed { job_id }) => {
+            Ok(Admitted::OperatorNotAllowed { job_id, .. }) => {
                 assert_eq!(job_id, JOB);
                 false
             }
@@ -273,6 +320,24 @@ mod tests {
         }
         assert!(takes("shared", OWNER));
         assert!(takes("shared", "someone-else"));
+    }
+
+    // W1, W3: an accepted instruction and an operator refusal both carry the instruction's issue
+    // time, which the channel raises the highest issue time with.
+    #[test]
+    fn an_admitted_instruction_carries_its_issue_time_whichever_way_the_operator_check_went() {
+        let key = SigningKey::generate().unwrap();
+        let public = key.public_key();
+        let mut gate = Gate::new(&public, AGENT, OWNER, "personal");
+        let accepted = gate.admit(Some(&sealed(&key, AGENT, OWNER))).ok().unwrap();
+        assert!(matches!(accepted, Admitted::Accepted(_)));
+        assert_eq!(accepted.issued_at(), 1);
+        let refused = gate
+            .admit(Some(&sealed(&key, AGENT, "someone-else")))
+            .ok()
+            .unwrap();
+        assert!(matches!(refused, Admitted::OperatorNotAllowed { .. }));
+        assert_eq!(refused.issued_at(), 1);
     }
 
     // O5: the match is on exact bytes.

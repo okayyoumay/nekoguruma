@@ -195,8 +195,9 @@ impl Drop for PendingRecord {
     }
 }
 
+/// Creates `path` new, owner-only; the issue-time mark's temporary file is made the same way.
 #[cfg(unix)]
-fn create_private(path: &Path) -> io::Result<File> {
+pub(crate) fn create_private(path: &Path) -> io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
     OpenOptions::new()
         .write(true)
@@ -206,7 +207,7 @@ fn create_private(path: &Path) -> io::Result<File> {
 }
 
 #[cfg(not(unix))]
-fn create_private(path: &Path) -> io::Result<File> {
+pub(crate) fn create_private(path: &Path) -> io::Result<File> {
     OpenOptions::new().write(true).create_new(true).open(path)
 }
 

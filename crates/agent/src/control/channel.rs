@@ -20,7 +20,11 @@
 //! poisoned or fails to write closes the connection with 1011: the session reopens the outbox
 //! before its next connection); one whose operator the gate does not allow skips the intake, is
 //! recorded as a `preconditionFailed` event with the code `operatorNotAllowed` instead and is
-//! answered `commandAck` the same way (ADR-483); a refusal is answered
+//! answered `commandAck` the same way (ADR-483); one past its start deadline likewise skips the
+//! intake and is recorded as an `expired` event (ADR-486). Every verified instruction raises the
+//! highest issue time first, and the file that holds it is synced, when it is behind, before the
+//! intake, the append and the answer; a sync that fails withholds the answer and closes with
+//! 1011 too. A refusal is answered
 //! `commandRejected` with its reason and records nothing. Answers are written on this connection
 //! through the one writer and under the write bound.
 //! Sending an answer does not reset the idle deadline; only a frame received does. Never logged:
@@ -47,6 +51,8 @@ use super::events::{Acked, Sender};
 use super::exchange::Token;
 use super::gate::{Admitted, Gate};
 use super::{Fail, Outcome, Phase, SessionState, Stop, Wiring};
+use crate::deadline::{MarkError, Verdict};
+use crate::instruction::VerifiedInstruction;
 use crate::outbox::{Kind, OutboxError};
 use crate::server_http;
 
@@ -520,24 +526,50 @@ async fn connected(
                             // Not reachable once the longest answer encodes.
                             return End::close(CLOSE_CODE_PROTOCOL, "command-id", lived_now);
                         };
+                        // The highest issue time rises with every instruction that verified,
+                        // whatever becomes of it (ADR-486).
+                        let judged = admitted.map(|admitted| {
+                            w.marks.raise(admitted.issued_at());
+                            judge(w, gate, admitted)
+                        });
+                        // The mark is synced before anything the command leads to is handed
+                        // over, recorded or answered.
+                        if judged.is_some() {
+                            match sync_marks(w, state.stop).await {
+                                Synced::Done => {}
+                                Synced::Stopped => return End::stop(),
+                                Synced::Failed(error) => {
+                                    state.warnings.mark_failure(&error);
+                                    return End::close(
+                                        CLOSE_CODE_INTERNAL,
+                                        MARK_WRITE,
+                                        lived_now,
+                                    );
+                                }
+                            }
+                        }
                         // The intake has the instruction before the ack is written, and the
                         // outbox has the `received` event before it too (ADR-478 item 5). An
                         // instruction whose operator is not allowed skips the intake and gets one
                         // terminal event instead of `received`, under the same bound and with the
-                        // same failure handling (ADR-483).
-                        let recorded = match admitted {
+                        // same failure handling (ADR-483); so does one past its deadline
+                        // (ADR-486).
+                        let recorded = match judged {
                             None => None,
-                            Some(Admitted::Accepted(verified)) => {
+                            Some(Judged::Accepted(verified)) => {
                                 let job_id = verified.instruction().job_id.0.clone();
                                 w.intake.take(*verified);
                                 Some(record_job_state(w, state.stop, job_id, JobState::Received).await)
                             }
-                            Some(Admitted::OperatorNotAllowed { job_id }) => {
+                            Some(Judged::Refused { job_id }) => {
                                 let refused = JobState::PreconditionFailed {
                                     code: FailureCode::OperatorNotAllowed,
                                     detail: String::new(),
                                 };
                                 Some(record_job_state(w, state.stop, job_id, refused).await)
+                            }
+                            Some(Judged::Expired { job_id }) => {
+                                Some(record_job_state(w, state.stop, job_id, JobState::Expired).await)
                             }
                         };
                         match recorded {
@@ -616,6 +648,67 @@ async fn connected(
     }
 }
 
+/// The class of a mark file that could not be written.
+const MARK_WRITE: &str = "mark-write";
+
+/// What a verified instruction comes to once its operator and its deadline are judged.
+enum Judged {
+    /// Handed to the intake, with a `received` event.
+    Accepted(Box<VerifiedInstruction>),
+    /// The operator is not allowed (ADR-483).
+    Refused { job_id: String },
+    /// Past the start deadline (ADR-486).
+    Expired { job_id: String },
+}
+
+/// The operator check's verdict, then the deadline's. The device clock is read only for an
+/// instruction whose operator is allowed, and once.
+fn judge(w: &Wiring, gate: &mut Gate<'_>, admitted: Admitted) -> Judged {
+    match admitted {
+        Admitted::OperatorNotAllowed { job_id, .. } => Judged::Refused { job_id },
+        Admitted::Accepted(verified) => {
+            let deadline = verified.instruction().start_deadline;
+            match w.marks.judge(&*w.clock, deadline) {
+                Verdict::Open => Judged::Accepted(verified),
+                Verdict::Expired { by_mark } => {
+                    let job_id = verified.instruction().job_id.0.clone();
+                    gate.expired(&job_id, by_mark);
+                    Judged::Expired { job_id }
+                }
+            }
+        }
+    }
+}
+
+/// What making the mark durable came to.
+enum Synced {
+    Done,
+    /// The stop came first: a write that started goes on unobserved.
+    Stopped,
+    Failed(MarkError),
+}
+
+/// Writes the mark file when it is behind, on a blocking task, raced with the stop. The write
+/// holds the store (and its lock) until it ends, so a session started after a stop finds it in
+/// use and not half written.
+async fn sync_marks(w: &Wiring, stop: &Stop) -> Synced {
+    if !w.marks.owes_write() {
+        return Synced::Done;
+    }
+    let marks = w.marks.clone();
+    let write = tokio::task::spawn_blocking(move || marks.sync());
+    let done = tokio::select! {
+        biased;
+        () = stop.requested() => return Synced::Stopped,
+        done = write => done,
+    };
+    match done {
+        Ok(Ok(())) => Synced::Done,
+        Ok(Err(error)) => Synced::Failed(error),
+        Err(_) => Synced::Failed(MarkError::Io(std::io::ErrorKind::Other)),
+    }
+}
+
 /// What recording a job's first event came to.
 enum Recorded {
     Done,
@@ -625,8 +718,8 @@ enum Recorded {
     Failed(&'static str, OutboxError),
 }
 
-/// The text of the first event of `job_id` with number `seq`: the job's `state`, `received` or
-/// the terminal `preconditionFailed` of a refusal (ADR-483). No device time is given: the property
+/// The text of the first event of `job_id` with number `seq`: the job's `state`, `received`, the
+/// terminal `preconditionFailed` of a refusal (ADR-483) or the terminal `expired` (ADR-486). No device time is given: the property
 /// is optional and the server stamps its own receive time (16.3).
 fn first_event(
     job_id: &str,
@@ -642,7 +735,7 @@ fn first_event(
 }
 
 /// Appends the job's first event on a blocking task, raced with the stop (ADR-478 item 5):
-/// `received`, or the refusal's terminal event. Both are `Kind::Received` for the admission bound.
+/// `received`, or the refusal's or the expiry's terminal event. All are `Kind::Received` for the admission bound.
 /// It is tried once per command: the server's redelivery after the lease is the retry.
 async fn record_job_state(w: &Wiring, stop: &Stop, job_id: String, state: JobState) -> Recorded {
     // The longest number the counter gives, so the text that is appended encodes as well.

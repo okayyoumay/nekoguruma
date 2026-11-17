@@ -100,6 +100,21 @@ throughout.
   connection at `warn`, later ones at `debug`, and the end-of-connection `info` line of refused
   instructions carries the count as `operator_not_allowed`. The warning and the count are refusals decided, not refusals recorded: when the outbox is full the command stays unacknowledged, and its redelivery is decided and counted again.
 
+- **A job past its start deadline** (`agent::control::gate`, ADR-486): a verified instruction
+  whose operator is allowed and whose deadline is at or before the later of the device clock and
+  the highest issue time. The entry holds the job ID and the state `expired`; it never holds a
+  time (the deadline, the issue time or the clock), the operator ID or a `commandId`. The first
+  per connection is a `warn`, later ones are `debug`, and the end-of-connection `info` line of
+  refused instructions carries the count as `expired`. When the highest issue time and not the
+  device clock decided it, one further `warn` per connection says so (the device clock is behind
+  it), with the job ID only. Like the operator entry, it is a refusal decided, not recorded.
+
+- **The issue-time mark on the control channel** (`agent::control`, ADR-486): a mark file that
+  cannot be written warns once per `hello` cycle with the class `mark-write` and the
+  `MarkError`'s own text (the kind of the I/O error; no path and no value), and is `debug` after
+  that; the connection then closes with 1011 and the command is not acknowledged. The file's open
+  is not logged: a corrupt one ends `ngr-agent connect` with its message and exit 1.
+
 - **The control channel session** (`agent::control`, ADR-471): the entries hold a failure
   class, an HTTP status, a close code and the heartbeat interval. They never hold the token, the
   challenge, the nonce or the proof, an HTTP body, a message's text, a `commandId`, or the reason

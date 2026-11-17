@@ -211,6 +211,9 @@ The server's registry of **Control channel** connections (`crates/server/src/hub
 **Inbox** (design 5.3, ADR-468, ADR-472)  
 The one bounded channel (256 messages) through which the **Hub** hands the server's job queue every valid message an agent sends on the **Control channel** except `heartbeat` (`commandAck`, `commandRejected`, `agentEvent`, `reconcile`), in the order each connection read them, with the agent and the connection. Its receiver is taken once (`Hub::inbox`). When it is full the connection waits and reads nothing, so the agent stops getting echoes and reconnects; while nobody holds the receiver, messages are validated and dropped.
 
+**Issue-time mark** (design 5.3, ADR-486)  
+The highest issue time (Unix seconds) among the job instructions an agent has verified, kept in memory and in an owner-only file named after the agent ID in the registration directory. A job's start deadline is judged against the later of the device clock and this mark, so a device clock that is behind cannot revive a stale instruction. Every verified instruction raises it, the operator-refused and the expired ones included, and nothing lowers it; a new agent ID (re-registration) starts it at 0. See **Job instruction**.
+
 **Instruction key** (design 11.1, ADR-461)  
 The ECDSA P-256 key with which the server signs job instructions, one per deployment. Its private half is an owner-only PKCS#8 file at a path named in the server's configuration, created once by the server, and its public half is the one active row of the database table `instruction_keys` (ADR-462). The agent trusts only the instruction key pinned at registration, selects it by its fingerprint (SHA-256 of its SPKI document) and replaces it only by registering again. It is not the **agent key** and not the distribution key. See **Job instruction**.
 

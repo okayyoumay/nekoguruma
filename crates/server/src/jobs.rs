@@ -6,10 +6,11 @@
 //! body (at most [`MAX_BODY`] bytes, 413; within 5 seconds, 408; broken, 400), the Content-Type,
 //! the idempotency key and the shape of the JSON (400, with no database access), then one
 //! transaction: the key's row (a replay or a conflict answers here, before any permission is
-//! judged), the caller's permission (403), the active instruction key (503), the signing of the
-//! instruction and the insert, which loses to a concurrent insert of the same key and then
-//! answers like the first read. A 400 means the request can never be valid, a 422 only that the
-//! key belongs to another request. A job's ID is made here, never taken from the client.
+//! judged), the caller's permission (403), the bounds of a `startDeadline` against the issue time
+//! (422, ADR-487), the active instruction key (503), the signing of the instruction and the
+//! insert, which loses to a concurrent insert of the same key and then answers like the first
+//! read. A 400 means the request can never be valid, a 422 that the key belongs to another request
+//! or that the deadline lies outside the bounds. A job's ID is made here, never taken from the client.
 //!
 //! What the 403 refused goes to the log only, through a gate per reason. Never logged: the
 //! body, the idempotency key, the VCI ID and the VIN.
@@ -33,6 +34,7 @@ use shared_proto::{
 };
 use sqlx::{PgConnection, PgPool};
 
+use crate::agent_events::epoch_seconds;
 use crate::audit;
 use crate::db;
 use crate::health::may_log;
@@ -53,6 +55,12 @@ pub const MAX_VCI: usize = 1024;
 pub const MAX_DIGESTS: usize = 128;
 /// How long after its issue a job may still be started (design 5.3), in seconds.
 pub const START_WINDOW_SECS: u64 = 900;
+/// The least a request's `startDeadline` may lie after the job's issue time, in seconds
+/// (design 5.3, ADR-487), inclusive.
+pub const MIN_START_SECS: i64 = 60;
+/// The most a request's `startDeadline` may lie after the job's issue time, in seconds (24
+/// hours), inclusive.
+pub const MAX_START_SECS: i64 = 86_400;
 /// A refusal reason, or a failure, is logged at most this often.
 const LOG_EVERY: Duration = Duration::from_secs(60);
 /// The job instruction layout this route writes, and the ownership generation of a new job
@@ -77,6 +85,7 @@ pub enum ShapeError {
     Vin,
     IrDigests,
     ArtifactDigest,
+    StartDeadline,
     Unsupported,
 }
 
@@ -93,6 +102,7 @@ impl ShapeError {
             ShapeError::Vin => "Invalid vin",
             ShapeError::IrDigests => "Invalid irDigests",
             ShapeError::ArtifactDigest => "Invalid artifactDigest",
+            ShapeError::StartDeadline => "Invalid startDeadline",
             ShapeError::Unsupported => "A property of the request is not supported",
         }
     }
@@ -148,6 +158,9 @@ pub struct Spec {
     pub vin: Option<String>,
     pub hashes: Vec<[u8; 32]>,
     pub artifact: Option<[u8; 32]>,
+    /// The request's `startDeadline` as seconds since the epoch (UTC, the fraction floored), when
+    /// it has one; the bounds against the issue time are judged in the transaction.
+    pub start_deadline: Option<i64>,
 }
 
 impl Spec {
@@ -155,7 +168,9 @@ impl Spec {
     /// order: the kind, the agent, the VCI, the VIN (presence, then value), the document hashes
     /// (count, then each) and the artifact (presence, then value). The operator is not in it:
     /// the row's own operator is compared. A property a later change adds enters the encoding
-    /// only when the request has it, so a hash made before it stays valid.
+    /// only when the request has it, so a hash made before it stays valid: the start deadline
+    /// (ADR-487) follows the artifact as a named field, its normalized seconds, so a request with
+    /// no deadline and one that names the default are different requests.
     pub fn request_hash(&self) -> [u8; 32] {
         fn put(hasher: &mut Sha256, bytes: &[u8]) {
             hasher.update((bytes.len() as u32).to_be_bytes());
@@ -183,6 +198,10 @@ impl Spec {
                 hasher.update(hash);
             }
             None => hasher.update([0]),
+        }
+        if let Some(deadline) = self.start_deadline {
+            put(&mut hasher, b"startDeadline");
+            hasher.update(deadline.to_be_bytes());
         }
         hasher.finalize().into()
     }
@@ -333,12 +352,15 @@ fn judge(raw: Raw) -> Result<Spec, ShapeError> {
         None => None,
         Some(text) => Some(parse_digest(&text).ok_or(ShapeError::ArtifactDigest)?),
     };
+    let start_deadline = match raw.start_deadline {
+        None => None,
+        Some(text) => Some(epoch_seconds(&text).ok_or(ShapeError::StartDeadline)?),
+    };
     if raw.remote == Some(true)
         || raw
             .parameters
             .is_some_and(|parameters| !parameters.is_empty())
         || raw.execution_window.is_some()
-        || raw.start_deadline.is_some()
         || raw.on_site_contact.is_some()
     {
         return Err(ShapeError::Unsupported);
@@ -350,6 +372,7 @@ fn judge(raw: Raw) -> Result<Spec, ShapeError> {
         vin: raw.vin,
         hashes,
         artifact,
+        start_deadline,
     })
 }
 
@@ -394,7 +417,9 @@ pub fn job_id(ms: u64, random: [u8; 10]) -> String {
 }
 
 /// The instruction of a new job (design 11.1): version 1, generation 1, no plan, issued at
-/// `issued_at` and startable for [`START_WINDOW_SECS`] after it.
+/// `issued_at` and startable until the request's deadline, or for [`START_WINDOW_SECS`] after the
+/// issue time when the request names none. The caller has judged the request's deadline against
+/// the bounds ([`deadline_in_bounds`]).
 pub fn instruction(id: &str, operator_id: &str, spec: &Spec, issued_at: u64) -> JobInstruction {
     JobInstruction {
         version: INSTRUCTION_VERSION,
@@ -409,8 +434,28 @@ pub fn instruction(id: &str, operator_id: &str, spec: &Spec, issued_at: u64) -> 
         artifact_hash: spec.artifact,
         plan_hash: None,
         issued_at,
-        start_deadline: issued_at + START_WINDOW_SECS,
+        start_deadline: match spec.start_deadline {
+            // The bounds are judged before signing (`deadline_in_bounds`), so a request's deadline
+            // is never negative here.
+            Some(deadline) => {
+                debug_assert!(deadline >= 0, "a deadline is checked before it is signed");
+                u64::try_from(deadline).unwrap_or(issued_at + START_WINDOW_SECS)
+            }
+            None => issued_at + START_WINDOW_SECS,
+        },
     }
+}
+
+/// Whether a request's deadline lies between [`MIN_START_SECS`] and [`MAX_START_SECS`] after the
+/// issue time, both inclusive (ADR-487). A request with no deadline is always within bounds.
+fn deadline_in_bounds(deadline: Option<i64>, issued_at: u64) -> bool {
+    let Some(deadline) = deadline else {
+        return true;
+    };
+    i64::try_from(issued_at)
+        .ok()
+        .and_then(|issued| deadline.checked_sub(issued))
+        .is_some_and(|after| (MIN_START_SECS..=MAX_START_SECS).contains(&after))
 }
 
 /// The job columns every read and the insert return, in the order of [`Stored`].
@@ -595,6 +640,9 @@ enum Outcome {
     KeyNotActive,
     /// Another job holds the vehicle's lock (design 8.8); nothing was written.
     VehicleLocked,
+    /// The request's `startDeadline` is not between 1 minute and 24 hours after the issue time
+    /// (ADR-487); nothing was written.
+    DeadlineOutOfBounds,
 }
 
 /// What a failed creation is.
@@ -667,6 +715,12 @@ pub async fn create(
             )
             .into_response()
         }
+        Ok(Outcome::DeadlineOutOfBounds) => Problem::with_code(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "startDeadline must be 1 minute to 24 hours after the issue time",
+            "START_DEADLINE_OUT_OF_BOUNDS",
+        )
+        .into_response(),
         Ok(Outcome::KeyNotActive) => {
             if inner.gates.allow(SLOT_KEY_INACTIVE, now) {
                 tracing::error!("the instruction key is not the active key; no job is created");
@@ -728,16 +782,21 @@ impl Inner {
         if let Err(reason) = authorize(facts) {
             return Ok(Outcome::Denied(reason));
         }
+        // The deadline's bounds are judged against the database's time of the permission read,
+        // after the permission and before the key (ADR-487): a refused caller learns nothing
+        // about them.
+        let now_ms = u64::try_from(now_ms).map_err(|_| JobError::Internal("clock".to_owned()))?;
+        let issued_at = now_ms / 1000;
+        if !deadline_in_bounds(spec.start_deadline, issued_at) {
+            return Ok(Outcome::DeadlineOutOfBounds);
+        }
         if !key_active {
             return Ok(Outcome::KeyNotActive);
         }
-
-        let now_ms = u64::try_from(now_ms).map_err(|_| JobError::Internal("clock".to_owned()))?;
         let random = random_32().map_err(|e| JobError::Internal(e.to_string()))?;
         let mut tail = [0u8; 10];
         tail.copy_from_slice(&random[..10]);
         let id = job_id(now_ms, tail);
-        let issued_at = now_ms / 1000;
         let instruction = instruction(&id, &operator.operator_id, spec, issued_at);
         let sealed = self
             .key
@@ -1264,7 +1323,6 @@ mod tests {
             serde_json::json!({"parameters": {"a": 1}}),
             serde_json::json!({"executionWindow": {}}),
             serde_json::json!({"executionWindow": {"from": "2030-01-01T00:00:00Z"}}),
-            serde_json::json!({"startDeadline": "2030-01-01T00:00:00Z"}),
             serde_json::json!({"onSiteContact": "x"}),
         ] {
             assert_eq!(
@@ -1318,6 +1376,121 @@ mod tests {
             assert_ne!(spec(extra.clone()), base, "{extra}");
         }
         assert_ne!(two, spec(serde_json::json!({})));
+    }
+
+    // F1: a request with no deadline hashes as it did before the field existed. The expected
+    // value is the SHA-256 of the encoding in `Spec::request_hash`'s documentation, made without
+    // this code.
+    #[test]
+    fn a_request_without_a_deadline_hashes_as_before_the_field_existed() {
+        let hash = shaped(serde_json::json!({})).unwrap().request_hash();
+        assert_eq!(
+            hex(&hash),
+            "45777d016bfcb067d6d6ef46833d13e372f29c8bc79562b15fda50dc1ea57d8a"
+        );
+    }
+
+    // F6, F7, F10: the normalized second is the field, so one instant is one request and the
+    // presence of the field is part of it.
+    #[test]
+    fn the_deadline_enters_the_hash_as_its_normalized_second_and_its_presence_counts() {
+        let spec = |at: &str| {
+            shaped(serde_json::json!({ "startDeadline": at }))
+                .unwrap()
+                .request_hash()
+        };
+        let base = spec("2030-01-01T10:00:00Z");
+        assert_eq!(spec("2030-01-01T19:00:00+09:00"), base);
+        assert_eq!(spec("2030-01-01T10:00:00-00:00"), base);
+        assert_eq!(spec("2030-01-01T10:00:00.999Z"), base);
+        assert_ne!(spec("2030-01-01T10:00:01Z"), base);
+        let absent = shaped(serde_json::json!({})).unwrap().request_hash();
+        assert_ne!(base, absent);
+        // The default's own second is another request than none at all.
+        let mut named = shaped(serde_json::json!({})).unwrap();
+        named.start_deadline = Some(1_900_000_000);
+        assert_ne!(named.request_hash(), absent);
+        assert_eq!(
+            shaped(serde_json::json!({ "startDeadline": "2030-03-17T17:46:40Z" }))
+                .unwrap()
+                .start_deadline,
+            Some(1_900_000_000)
+        );
+    }
+
+    // F5
+    #[test]
+    fn a_malformed_deadline_is_a_shape_error_and_a_well_formed_one_is_kept_as_seconds() {
+        for bad in [
+            serde_json::json!(5),
+            serde_json::json!(true),
+            serde_json::json!(["2030-01-01T00:00:00Z"]),
+            serde_json::json!(""),
+            serde_json::json!("2030-01-01"),
+            serde_json::json!("2030-01-01T00:00:00"),
+            serde_json::json!("2030-01-01t00:00:00Z"),
+            serde_json::json!("2030-01-01T00:00:00z"),
+            serde_json::json!("2030-01-01T00:00:60Z"),
+            serde_json::json!("2030-02-30T00:00:00Z"),
+            serde_json::json!("2030-01-01T00:00:00+16:00"),
+            serde_json::json!("2030-01-01T00:00:00.1234567890Z"),
+            serde_json::json!(" 2030-01-01T00:00:00Z"),
+        ] {
+            let result = shape(
+                &good_headers(),
+                &body(serde_json::json!({ "startDeadline": bad })),
+            );
+            assert_eq!(
+                result.map(|_| ()),
+                Err(if bad.is_string() {
+                    ShapeError::StartDeadline
+                } else {
+                    ShapeError::Json
+                }),
+                "{bad}"
+            );
+        }
+        // The helper drops a null property, so null is sent as raw text.
+        let null = format!(
+            r#"{{"kind":"acquire","agentId":"{AGENT}","vciId":"v","irDigests":["{DIGEST_A}"],"startDeadline":null}}"#
+        );
+        assert_eq!(shaped_raw(null.as_bytes()), Err(ShapeError::Json));
+        let twice = format!(
+            r#"{{"kind":"acquire","agentId":"{AGENT}","vciId":"v","irDigests":["{DIGEST_A}"],"startDeadline":"2030-01-01T00:00:00Z","startDeadline":"2030-01-01T00:00:00Z"}}"#
+        );
+        assert_eq!(shaped_raw(twice.as_bytes()), Err(ShapeError::Json));
+        let ok = shaped(serde_json::json!({ "startDeadline": "2030-01-01T00:00:00Z" })).unwrap();
+        assert_eq!(ok.start_deadline, Some(1_893_456_000));
+    }
+
+    // F3, F4, F7
+    #[test]
+    fn the_bounds_are_a_minute_to_a_day_after_the_issue_time_inclusive() {
+        let issued = 1_800_000_000_u64;
+        let at = |after: i64| deadline_in_bounds(Some(issued as i64 + after), issued);
+        assert!(at(60) && at(86_400) && at(900));
+        assert!(!at(59) && !at(86_401) && !at(0) && !at(-5) && !at(i64::MIN / 2));
+        assert!(deadline_in_bounds(None, issued));
+        // The year 1 and the year 9999 are well formed and out of bounds.
+        assert!(!deadline_in_bounds(Some(-62_135_596_800), issued));
+        assert!(!deadline_in_bounds(Some(253_402_300_799), issued));
+    }
+
+    // F1, F2: the instruction carries the request's second, else the default window.
+    #[test]
+    fn the_instruction_carries_the_requests_deadline_else_the_default_window() {
+        let mut spec = shaped(serde_json::json!({})).unwrap();
+        let operator = "4e475200-0000-4000-8000-000000000001";
+        let id = job_id(1, [0; 10]);
+        let issued = 1_800_000_000;
+        assert_eq!(
+            instruction(&id, operator, &spec, issued).start_deadline,
+            issued + 900
+        );
+        spec.start_deadline = Some(issued as i64 + 61);
+        let named = instruction(&id, operator, &spec, issued);
+        assert_eq!(named.start_deadline, issued + 61);
+        assert_eq!(named.issued_at, issued);
     }
 
     // R13

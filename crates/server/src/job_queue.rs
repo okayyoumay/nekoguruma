@@ -47,7 +47,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, MissedTickBehavior, interval_at};
 
 use crate::agent_events::{self, Cause, Event, Stored};
-use crate::db::{failure, statement_timeouts};
+use crate::db::{delete_own_lock, failure, statement_timeouts};
 use crate::health::may_log;
 use crate::hub::{ConnectionId, Delivery, Hub, Inbound, OUTBOUND_CAPACITY, SendError};
 use crate::session::now;
@@ -157,7 +157,8 @@ FOR UPDATE OF j SKIP LOCKED";
 /// outstanding, skipping rows another pass holds; with no active key the comparison is null and
 /// nothing is ended. Each ended job releases the vehicle lock it holds, in the same statement
 /// (design 8.8); the result counts the ended jobs, as the delete's rows do not.
-const SWEEP_SQL: &str = "\
+const SWEEP_SQL: &str = concat!(
+    "\
 WITH ended AS ( \
   UPDATE jobs SET state = 'failed', failure_code = 'instructionKeyRetired', \
       failure_detail = 'the instruction was signed by a key that is no longer active', \
@@ -169,10 +170,11 @@ WITH ended AS ( \
       AND signing_key_id <> (SELECT key_id FROM instruction_keys WHERE retired_at IS NULL) \
     FOR UPDATE SKIP LOCKED) \
   RETURNING tenant_id, id, vin), \
-released AS ( \
-  DELETE FROM vehicle_locks l USING ended e \
-  WHERE l.tenant_id = e.tenant_id AND l.vin = e.vin AND l.job_id = e.id) \
-SELECT count(*) FROM ended";
+released AS ( ",
+    delete_own_lock!(),
+    ") \
+SELECT count(*) FROM ended"
+);
 
 /// The mark is the time of the statement, not of the transaction, so that the lease counts from
 /// the moment the frame was queued; it is returned, and kept in the flight as the token the
@@ -183,14 +185,15 @@ WHERE tenant_id = $1::uuid AND id = $2::uuid \
 RETURNING delivery_sent_at::text";
 
 /// Ends the job and releases the vehicle lock it holds (design 8.8).
-const TOO_LARGE_SQL: &str = "\
+const TOO_LARGE_SQL: &str = concat!(
+    "\
 WITH ended AS ( \
   UPDATE jobs SET state = 'failed', failure_code = 'internal', \
       failure_detail = 'the instruction is too large to send', finished_at = now() \
   WHERE tenant_id = $1::uuid AND id = $2::uuid \
-  RETURNING tenant_id, id, vin) \
-DELETE FROM vehicle_locks l USING ended e \
-WHERE l.tenant_id = e.tenant_id AND l.vin = e.vin AND l.job_id = e.id";
+  RETURNING tenant_id, id, vin) ",
+    delete_own_lock!()
+);
 
 /// The condition on the row's mark and attempts that the answer's writes share, with the numbers of
 /// the parameters it uses: the attempt number this delivery recorded (n + 1), the mark the row had
@@ -240,9 +243,8 @@ const REJECTED_SQL: &str = concat!(
        WHERE tenant_id = $1::uuid AND id = $2::uuid AND state = 'received' \
          AND finished_at IS NULL AND delivered_at IS NULL ",
     mark_guard!("$4", "$5", "$6", "$7"),
-    " RETURNING tenant_id, id, vin) \
-     DELETE FROM vehicle_locks l USING ended e \
-     WHERE l.tenant_id = e.tenant_id AND l.vin = e.vin AND l.job_id = e.id"
+    " RETURNING tenant_id, id, vin) ",
+    delete_own_lock!()
 );
 
 /// Clears the mark only while it is still this delivery's (attempt number and tokens, as above).

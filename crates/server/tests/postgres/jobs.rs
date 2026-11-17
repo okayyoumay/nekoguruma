@@ -2069,3 +2069,268 @@ async fn a_replay_of_a_failed_job_shows_its_failure_code_and_procedure_code_and_
     assert!(!replay.body.contains("SECRET-DETAIL"));
     lab.finish().await;
 }
+
+// ---------------------------------------------------------------------------------------------
+// The request's start deadline (ADR-487): F2 to F15 and the creation's half of the expiry
+
+/// The database's clock in whole seconds since the epoch.
+async fn db_seconds(lab: &Lab) -> i64 {
+    lab.w
+        .sql("SELECT floor(extract(epoch FROM now()))::bigint")
+        .await
+        .parse()
+        .unwrap()
+}
+
+/// The RFC 3339 text of the instant `epoch` as the clock `offset_secs` east of UTC shows it, with
+/// `suffix` (a fraction and the offset) after the seconds.
+async fn rfc3339(lab: &Lab, epoch: i64, offset_secs: i64, suffix: &str) -> String {
+    let local = lab
+        .w
+        .sql(&format!(
+            "SELECT to_char(to_timestamp({}) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS')",
+            epoch + offset_secs
+        ))
+        .await;
+    format!("{local}{suffix}")
+}
+
+async fn utc(lab: &Lab, epoch: i64) -> String {
+    rfc3339(lab, epoch, 0, "Z").await
+}
+
+// F2, F6, F7, W1, W2: the second the request names is the row's, the instruction's and the
+// lock's base, whatever form it came in.
+#[tokio::test]
+async fn a_start_deadline_in_the_bounds_is_signed_stored_and_normalized_to_utc_seconds() {
+    let lab = Lab::new().await;
+    let cookie = lab.login("alice").await;
+    let now = db_seconds(&lab).await;
+    let deadline = now + 3600;
+    let zoned = rfc3339(&lab, deadline, 9 * 3600, ".789+09:00").await;
+    let body = lab.body(json!({ "vin": VIN, "startDeadline": zoned }));
+    let first = lab.post(&cookie, "k", &body).await;
+    let id = job_id(&first);
+    let instruction = lab.instruction(&id).await;
+    assert_eq!(instruction.start_deadline, deadline as u64);
+    assert_eq!(
+        lab.field(&id, "extract(epoch FROM start_deadline)::bigint")
+            .await,
+        deadline.to_string()
+    );
+    assert!(
+        (now as u64..=now as u64 + 5).contains(&instruction.issued_at),
+        "{}",
+        instruction.issued_at
+    );
+    // W2: the lock ends an allowance after the deadline.
+    assert_eq!(
+        lab.w
+            .sql(
+                "SELECT extract(epoch FROM l.expires_at - j.start_deadline)::bigint \
+                 FROM vehicle_locks l JOIN jobs j ON j.id = l.job_id"
+            )
+            .await,
+        "600"
+    );
+    // F6, F7: the same instant in another form, or with another fraction, is the same request.
+    let hash = lab.field(&id, "encode(request_hash, 'hex')").await;
+    for form in [
+        utc(&lab, deadline).await,
+        rfc3339(&lab, deadline, 0, ".000Z").await,
+        rfc3339(&lab, deadline, 0, "-00:00").await,
+        rfc3339(&lab, deadline, -5 * 3600, ".999999999-05:00").await,
+    ] {
+        let same = lab.body(json!({ "vin": VIN, "startDeadline": form }));
+        let again = lab.post(&cookie, "k", &same).await;
+        assert_eq!(job_id(&again), id, "{form}");
+        assert_eq!(hex_of(body_hash(same.as_bytes()).unwrap()), hash, "{form}");
+    }
+    lab.assert_jobs(1, "replays").await;
+    lab.finish().await;
+}
+
+fn hex_of(hash: [u8; 32]) -> String {
+    hash.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+// F4, F14: a deadline outside the bounds is a 422 with its own code, after the permission and
+// before the key, and leaves nothing behind.
+#[tokio::test]
+async fn a_start_deadline_outside_the_bounds_is_a_422_with_its_own_code_and_leaves_nothing() {
+    let lab = Lab::new().await;
+    lab.user("viewer", &["viewer"]).await;
+    let cookie = lab.login("alice").await;
+    let now = db_seconds(&lab).await;
+    let outside = [
+        utc(&lab, now + 10).await,
+        utc(&lab, now + 86_400 + 3600).await,
+        utc(&lab, now).await,
+        utc(&lab, now - 3600).await,
+        "0001-01-01T00:00:00Z".to_owned(),
+        "9999-12-31T23:59:59Z".to_owned(),
+    ];
+    // F14: no permission is a 403 whatever the deadline.
+    let viewer = lab.login("viewer").await;
+    for text in &outside {
+        let body = lab.body(json!({ "vin": VIN, "startDeadline": text }));
+        assert_problem(&lab.post(&viewer, "k", &body).await, 403, text);
+    }
+    for text in &outside {
+        let body = lab.body(json!({ "vin": VIN, "startDeadline": text }));
+        let r = lab.post(&cookie, "k", &body).await;
+        assert_problem(&r, 422, text);
+        assert_eq!(json(&r)["code"], "START_DEADLINE_OUT_OF_BOUNDS", "{text}");
+        assert!(!r.body.contains(VIN));
+    }
+    lab.assert_jobs(0, "refusals").await;
+    lab.assert_audits(0, "no audit row").await;
+    assert_eq!(lab.w.sql("SELECT count(*) FROM vehicle_locks").await, "0");
+    // The key is unbound: the same key creates the job with a good deadline.
+    let good = lab.body(json!({ "vin": VIN, "startDeadline": utc(&lab, now + 3600).await }));
+    job_id(&lab.post(&cookie, "k", &good).await);
+    // F14: with the instruction key not active, the bounds are judged before the key.
+    lab.exec("UPDATE instruction_keys SET retired_at = now()")
+        .await;
+    let bad = lab.body(json!({ "startDeadline": outside[0] }));
+    let r = lab.post(&cookie, "k2", &bad).await;
+    assert_problem(&r, 422, "bounds before the key");
+    assert_eq!(json(&r)["code"], "START_DEADLINE_OUT_OF_BOUNDS");
+    let ok = lab.body(json!({ "startDeadline": utc(&lab, now + 3600).await }));
+    assert_problem(&lab.post(&cookie, "k2", &ok).await, 503, "the key");
+    lab.finish().await;
+}
+
+// F5: the shape rules answer 400 and bind nothing (the rules themselves run without a database,
+// in `src/jobs.rs`).
+#[tokio::test]
+async fn a_malformed_start_deadline_is_a_400_and_creates_nothing() {
+    let lab = Lab::new().await;
+    let cookie = lab.login("alice").await;
+    for bad in [
+        json!(5),
+        json!(""),
+        json!("2030-01-01"),
+        json!("2030-01-01T00:00:00"),
+        json!("2030-01-01t00:00:00Z"),
+        json!("2030-02-30T00:00:00Z"),
+        json!("2030-01-01T00:00:60Z"),
+    ] {
+        let r = lab
+            .post(&cookie, "k", &lab.body(json!({ "startDeadline": bad })))
+            .await;
+        assert_problem(&r, 400, &bad.to_string());
+    }
+    let null = format!(
+        r#"{{"kind":"acquire","agentId":"{}","vciId":"v","irDigests":["{DIGEST_A}"],"startDeadline":null}}"#,
+        lab.agent_id
+    );
+    assert_problem(&lab.post(&cookie, "k", &null).await, 400, "null");
+    lab.assert_jobs(0, "refusals").await;
+    lab.finish().await;
+}
+
+// F9, F10: a replay with another deadline, or with the field added or dropped, is the existing
+// key conflict, a 422 with no code.
+#[tokio::test]
+async fn a_replay_with_another_deadline_or_the_field_added_or_dropped_is_a_key_conflict() {
+    let lab = Lab::new().await;
+    let cookie = lab.login("alice").await;
+    let now = db_seconds(&lab).await;
+    let named = lab.body(json!({ "startDeadline": utc(&lab, now + 3600).await }));
+    let id = job_id(&lab.post(&cookie, "k", &named).await);
+    let later = lab.body(json!({ "startDeadline": utc(&lab, now + 3601).await }));
+    let r = lab.post(&cookie, "k", &later).await;
+    assert_problem(&r, 422, "F9");
+    assert!(json(&r).get("code").is_none(), "{}", r.body);
+    assert!(!r.body.contains(&id));
+    // F10: absent, then the default's own second named.
+    let absent = lab.body(json!({}));
+    let id2 = job_id(&lab.post(&cookie, "k2", &absent).await);
+    let default = lab.instruction(&id2).await.issued_at + 900;
+    let explicit = lab.body(json!({ "startDeadline": utc(&lab, default as i64).await }));
+    assert_problem(&lab.post(&cookie, "k2", &explicit).await, 422, "F10");
+    // And the reverse: named, then absent.
+    assert_problem(&lab.post(&cookie, "k", &absent).await, 422, "F10 reverse");
+    lab.assert_jobs(2, "conflicts").await;
+    lab.finish().await;
+}
+
+// F8: a replay is answered before the bounds are judged, so it still works when its deadline has
+// come too close to the replay's own time.
+#[tokio::test]
+async fn a_replay_with_the_same_deadline_is_not_judged_against_the_bounds_again() {
+    let lab = Lab::new().await;
+    let cookie = lab.login("alice").await;
+    let now = db_seconds(&lab).await;
+    let body = lab.body(json!({ "startDeadline": utc(&lab, now + 62).await }));
+    let id = job_id(&lab.post(&cookie, "k", &body).await);
+    // Past this the deadline is under a minute from the replay's time.
+    let wait = Instant::now() + Duration::from_secs(15);
+    while db_seconds(&lab).await < now + 4 {
+        assert!(Instant::now() < wait, "the clock did not move");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(job_id(&lab.post(&cookie, "k", &body).await), id);
+    // A new key with the same body is judged, and refused.
+    let r = lab.post(&cookie, "k-new", &body).await;
+    assert_problem(&r, 422, "a new request");
+    assert_eq!(json(&r)["code"], "START_DEADLINE_OUT_OF_BOUNDS");
+    lab.finish().await;
+}
+
+// F12
+#[tokio::test]
+async fn two_requests_at_once_for_one_key_replay_on_the_same_deadline_and_conflict_on_another() {
+    let lab = Lab::new().await;
+    let cookie = lab.login("alice").await;
+    let now = db_seconds(&lab).await;
+    let one = lab.body(json!({ "startDeadline": utc(&lab, now + 3600).await }));
+    let two = lab.body(json!({ "startDeadline": utc(&lab, now + 7200).await }));
+    let (a, b) = tokio::join!(
+        lab.post(&cookie, "same", &one),
+        lab.post(&cookie, "same", &one)
+    );
+    assert_eq!(job_id(&a), job_id(&b));
+    let (c, d) = tokio::join!(
+        lab.post(&cookie, "other", &one),
+        lab.post(&cookie, "other", &two)
+    );
+    let mut statuses = [c.status, d.status];
+    statuses.sort();
+    assert_eq!(statuses, [202, 422], "{} {}", c.body, d.body);
+    lab.assert_jobs(2, "F12").await;
+    lab.assert_one_audit_per_job("F12").await;
+    lab.finish().await;
+}
+
+// R9, E7, F15, E6: an expired job frees its vehicle for the next creation, its replay shows the
+// state with no failure, and the end wrote no audit row.
+#[tokio::test]
+async fn an_expired_job_frees_its_vehicle_and_its_replay_shows_expired_with_no_failure() {
+    let lab = Lab::new().await;
+    let cookie = lab.login("alice").await;
+    let now = db_seconds(&lab).await;
+    let body = lab.body(json!({ "vin": VIN, "startDeadline": utc(&lab, now + 3600).await }));
+    let id = job_id(&lab.post(&cookie, "k1", &body).await);
+    let next = lab.body(json!({ "vin": VIN }));
+    // F15: the vehicle is locked for the job's whole window.
+    let held = lab.post(&cookie, "k2", &next).await;
+    assert_problem(&held, 409, "F15");
+    assert_eq!(json(&held)["code"], "VEHICLE_LOCKED");
+    lab.exec("UPDATE jobs SET start_deadline = now() - interval '1 second'")
+        .await;
+    assert_eq!(server::job_expiry::expire(&lab.w.pool).await.unwrap(), 1);
+    assert_eq!(lab.locks().await, "");
+    // E7: the replay says expired and has no failure member.
+    let replay = lab.post(&cookie, "k1", &body).await;
+    assert_eq!(replay.status, 202, "{}", replay.head);
+    assert_eq!(json(&replay)["jobId"], id);
+    assert_eq!(json(&replay)["state"], "expired");
+    assert!(json(&replay).get("failure").is_none(), "{}", replay.body);
+    // R9: the next job for the vehicle is accepted and takes the lock.
+    let second = job_id(&lab.post(&cookie, "k2", &next).await);
+    assert_eq!(lab.locks().await, format!("{VIN}>{second}"));
+    lab.assert_one_audit_per_job("E6").await;
+    lab.finish().await;
+}

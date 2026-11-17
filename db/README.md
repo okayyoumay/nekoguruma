@@ -160,8 +160,8 @@ the kind (the column has no default; no migration is needed):
 | `writeSettings` | 1800 seconds |
 
 A row whose `expires_at` has passed is replaced by the next take for the VIN; no sweeper deletes
-expired rows. The job's end deletes its own row, whether the delivery queue writes it (ADR-480) or
-the agent reports it (ADR-481); a reopened needsOnSiteRecovery job holds no row. A new job
+expired rows. The job's end deletes its own row, whether the server writes it (the delivery queue's ends, ADR-480, and the
+expiry of a job past its start deadline, ADR-487) or the agent reports it (ADR-481); a reopened needsOnSiteRecovery job holds no row. A new job
 kind that the route creates states its allowance in the same place as its confirmation level.
 The columns hold no foreign keys and a stale row keeps its VIN until a take replaces it.
 

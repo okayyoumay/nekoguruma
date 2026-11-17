@@ -79,6 +79,17 @@ pub(crate) fn failure(error: &sqlx::Error) -> Failure {
     }
 }
 
+/// The tail every statement that ends a job shares (design 8.8, ADR-480, ADR-397): deletes the
+/// vehicle lock the ended job holds, in the statement that ended it, from a CTE named `ended` that
+/// returns `tenant_id`, `id` and `vin`. A lock another job holds, or none, stays untouched.
+macro_rules! delete_own_lock {
+    () => {
+        "DELETE FROM vehicle_locks l USING ended e \
+         WHERE l.tenant_id = e.tenant_id AND l.vin = e.vin AND l.job_id = e.id"
+    };
+}
+pub(crate) use delete_own_lock;
+
 /// Sets the lock and statement timeouts (5 seconds) for the transaction `tx`, so that a read or
 /// write that waits on a lock or runs long fails as unavailability instead of hanging a request.
 pub(crate) async fn statement_timeouts(tx: &mut sqlx::PgConnection) -> Result<(), sqlx::Error> {

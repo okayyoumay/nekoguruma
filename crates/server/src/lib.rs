@@ -17,6 +17,7 @@ pub(crate) mod fs_guard;
 pub mod health;
 pub mod hub;
 pub mod instruction_key;
+pub mod job_expiry;
 pub mod job_queue;
 pub(crate) mod job_state;
 pub mod jobs;
@@ -196,6 +197,8 @@ pub struct Server {
     object_store: Option<Arc<LocalStore>>,
     /// The delivery queue's settings; `None` leaves the queue off (`bind`, which tests use).
     job_queue: Option<job_queue::Settings>,
+    /// The job expiry task's settings; `None` leaves it off (`bind`, which tests use).
+    job_expiry: Option<job_expiry::Settings>,
 }
 
 impl Server {
@@ -230,6 +233,7 @@ impl Server {
         let mut server = Server::bind(&config.http, pool, key).await?;
         server.object_store = Some(store);
         server.job_queue = Some(job_queue::Settings::default());
+        server.job_expiry = Some(job_expiry::Settings::default());
         Ok(server)
     }
 
@@ -237,6 +241,12 @@ impl Server {
     #[doc(hidden)]
     pub fn job_queue_enabled(&self) -> bool {
         self.job_queue.is_some()
+    }
+
+    /// Whether the job expiry task is on (ADR-487). Tests only.
+    #[doc(hidden)]
+    pub fn job_expiry_enabled(&self) -> bool {
+        self.job_expiry.is_some()
     }
 
     /// The object store `start` opened (`None` on a server made by `bind`).
@@ -290,6 +300,7 @@ impl Server {
             grace: Duration::from_secs(http.shutdown_grace_secs),
             object_store: None,
             job_queue: None,
+            job_expiry: None,
         })
     }
 
@@ -298,6 +309,14 @@ impl Server {
     #[doc(hidden)]
     pub fn with_job_queue(mut self, settings: job_queue::Settings) -> Server {
         self.job_queue = Some(settings);
+        self
+    }
+
+    /// Turns the job expiry task on with `settings` (ADR-487); `start` does so with the defaults.
+    /// Tests only.
+    #[doc(hidden)]
+    pub fn with_job_expiry(mut self, settings: job_expiry::Settings) -> Server {
+        self.job_expiry = Some(settings);
         self
     }
 
@@ -360,6 +379,7 @@ impl Server {
             grace,
             object_store: _object_store,
             job_queue,
+            job_expiry,
         } = self;
         // The revocation pass is one of the hub's tasks, so that the stop ends it before the pool
         // closes (ADR-468 item 11).
@@ -383,6 +403,10 @@ impl Server {
                 )),
                 None => tracing::warn!("the hub's inbox is taken; no job is delivered"),
             }
+        }
+        // The job expiry task is a third (ADR-487): it too ends before the pool closes.
+        if let Some(settings) = job_expiry {
+            hub.adopt(job_expiry::run(pool.clone(), hub.stopping(), settings));
         }
         let service = TowerToHyperService::new(router);
         // hyper-util's graceful watch has no implementation for a connection that allows

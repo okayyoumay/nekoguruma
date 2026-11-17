@@ -106,6 +106,11 @@ fn marks_in(dir: &std::path::Path) -> IssueMark {
     IssueMark::open_in(&dir.join("registration"), AGENT_ID).unwrap()
 }
 
+/// The received-jobs ledger of the record's agent in `dir`, as `run` opens it.
+fn ledger_in(dir: &std::path::Path) -> ReceivedJobs {
+    ReceivedJobs::open_in(&dir.join("registration"), AGENT_ID).unwrap()
+}
+
 fn unavailable() -> IdentityError {
     IdentityError::Unavailable("the key store is unavailable: test".to_owned())
 }
@@ -312,7 +317,12 @@ async fn a_session_that_ends_on_its_own_is_exit_1() {
         opened,
         move || Ok(slot.lock().unwrap().take().unwrap()),
         |opened, key| {
-            opened.start_panicking(key, outbox_in(dirs.dir.path()), marks_in(dirs.dir.path()))
+            opened.start_panicking(
+                key,
+                outbox_in(dirs.dir.path()),
+                marks_in(dirs.dir.path()),
+                ledger_in(dirs.dir.path()),
+            )
         },
         std::future::pending::<()>(),
     )
@@ -458,4 +468,58 @@ fn a_corrupt_outbox_file_does_not_open_and_maps_to_exit_1() {
     assert_eq!(outbox_error(&error).exit_code(), 1);
     drop(opened);
     dirs.open().expect("the locks are free");
+}
+
+/// ADR-489: a received-jobs ledger that does not read back is exit 1 with the advice to register
+/// again; the other failures to open it are exit 3, and none names a path.
+#[test]
+fn every_ledger_error_has_the_documented_exit() {
+    for (error, exit) in [
+        (LedgerError::Corrupt("a bad file"), 1),
+        (LedgerError::BadAgentId, 1),
+        (LedgerError::InUse, 3),
+        (LedgerError::Io(io::ErrorKind::PermissionDenied), 3),
+        (LedgerError::Poisoned, 3),
+    ] {
+        let mapped = ledger_error(&error);
+        assert_eq!(mapped.exit_code(), exit, "{mapped}");
+    }
+    assert!(
+        ledger_error(&LedgerError::Corrupt("x"))
+            .to_string()
+            .contains("register again")
+    );
+    assert!(
+        !ledger_error(&LedgerError::Io(io::ErrorKind::PermissionDenied))
+            .to_string()
+            .contains("register again")
+    );
+}
+
+/// A corrupt ledger file does not open and maps to exit 1 and is left as it is; a second store of
+/// the same directory (a session still running) is in use, which is exit 3.
+#[test]
+fn a_corrupt_ledger_file_does_not_open_and_one_in_use_is_exit_3() {
+    let key = existing_key();
+    let dirs = Dirs::new(&key);
+    let registration = dirs.dir.path().join("registration");
+    let file = registration.join(format!("{AGENT_ID}.received-jobs.v1"));
+    std::fs::write(&file, b"not a ledger").unwrap();
+    let error = ReceivedJobs::open_in(&registration, AGENT_ID)
+        .err()
+        .expect("a corrupt file does not open");
+    assert!(matches!(error, LedgerError::Corrupt(_)), "{error}");
+    assert_eq!(ledger_error(&error).exit_code(), 1);
+    assert_eq!(
+        std::fs::read(&file).unwrap(),
+        b"not a ledger",
+        "not repaired"
+    );
+    std::fs::remove_file(&file).unwrap();
+    let first = ReceivedJobs::open_in(&registration, AGENT_ID).unwrap();
+    let error = ReceivedJobs::open_in(&registration, AGENT_ID)
+        .err()
+        .expect("a second store is in use");
+    assert_eq!(ledger_error(&error).exit_code(), 3);
+    drop(first);
 }

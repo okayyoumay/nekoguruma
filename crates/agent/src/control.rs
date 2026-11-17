@@ -1,8 +1,10 @@
 //! The control channel session library (design 5.2, 5.3, 6.4, 14.1; ADR-466, ADR-467, ADR-468,
 //! ADR-470, ADR-471; `agentControl` in `api/asyncapi.yaml`): the agent's connection to the
 //! server. `ngr-agent connect` (`crate::connect`) runs it. A job
-//! command is verified by the connection's gate, handed to an [`Intake`] and answered
-//! `commandAck`, or answered `commandRejected` with the reason.
+//! command is verified by the connection's gate, recorded in the received-jobs ledger
+//! ([`crate::received_jobs`], ADR-489), handed to an [`Intake`] and answered `commandAck`, or
+//! answered `commandAck` alone when the ledger already holds the job, or answered
+//! `commandRejected` with the reason.
 //!
 //! The API has two steps, and the library never touches the key store (the caller owns the key's
 //! creation and the store's retry):
@@ -28,6 +30,7 @@
 //! command is also judged against its start deadline with the device [`Clock`] and the
 //! [`IssueMark`], the highest issue time, which is synced to its file before the answer (design
 //! 5.3, ADR-486); one past its deadline is recorded as `expired` and not handed over.
+//! A poisoned ledger is reopened before a connection, as the outbox is.
 //!
 //! Never logged: the token, a challenge, a nonce, a proof, a body, a message's text, a
 //! `commandId`, the text of a close reason, the record's path or content.
@@ -56,13 +59,14 @@ use crate::deadline::{Clock, IssueMark, MarkError};
 use crate::identity::AgentKey;
 use crate::journal::{JournalError, WriterLock};
 use crate::outbox::OutboxError;
+use crate::received_jobs::{LedgerError, ReceivedJobs};
 use crate::registration::origin::ServerOrigin;
 use crate::registration::record::{self, Record, RecordError};
 use backoff::Backoff;
 use dial::{Dial, Loopback};
 pub use events::SharedOutbox;
 use exchange::Fail;
-pub use gate::{Intake, LogIntake};
+pub use gate::{Intake, IntakeError, LogIntake, Taken};
 
 /// The sub-directory of the state directory that holds the connection lock.
 pub const DIR_NAME: &str = "control";
@@ -245,6 +249,8 @@ impl StatusTx {
 pub enum Ended {
     /// A reopen found the outbox file corrupt, or the agent ID unusable for it (ADR-478 item 4).
     OutboxUnusable,
+    /// A reopen found the received-jobs ledger corrupt, or the agent ID unusable for it (ADR-489).
+    LedgerUnusable,
 }
 
 /// The running session. Dropping it stops the session, like [`Handle::stop`].
@@ -321,6 +327,8 @@ struct Wiring {
     /// (ADR-486).
     marks: IssueMark,
     clock: Arc<dyn Clock>,
+    /// The jobs this agent has taken (ADR-489).
+    ledger: ReceivedJobs,
     audience: Audience,
     /// The `Host` header's value.
     host: String,
@@ -370,6 +378,36 @@ impl Warnings {
             tracing::warn!(class = "mark-write", %error, "the issue-time mark could not be written; the command is not acknowledged");
         } else {
             tracing::debug!(class = "mark-write", %error, "the issue-time mark could not be written; the command is not acknowledged");
+        }
+    }
+
+    /// The received-jobs ledger could not be written: one warning per class since `hello`, debug
+    /// after that. The command is not acknowledged and the connection closes with 1011.
+    fn ledger_failure(&mut self, class: &'static str, error: &LedgerError) {
+        if self.seen.insert(class) {
+            tracing::warn!(class, %error, "the received-jobs ledger could not be written; the command is not acknowledged");
+        } else {
+            tracing::debug!(class, %error, "the received-jobs ledger could not be written; the command is not acknowledged");
+        }
+    }
+
+    /// The intake could not take a recorded instruction: one warning per `hello` cycle, debug
+    /// after that. The command is not acknowledged and the connection closes with 1011.
+    fn intake_failure(&mut self, error: &IntakeError) {
+        if self.seen.insert("intake") {
+            tracing::warn!(class = "intake", %error, "the intake failed; the command is not acknowledged");
+        } else {
+            tracing::debug!(class = "intake", %error, "the intake failed; the command is not acknowledged");
+        }
+    }
+
+    /// The ledger could not be opened again: one warning per `hello` cycle, debug after that. It
+    /// stays poisoned and is tried again before the next connection.
+    fn ledger_reopen_failure(&mut self, error: &LedgerError) {
+        if self.seen.insert("ledger-reopen") {
+            tracing::warn!(class = "ledger-reopen", %error, "the received-jobs ledger could not be opened again; trying again before the next connection");
+        } else {
+            tracing::debug!(class = "ledger-reopen", %error, "the received-jobs ledger could not be opened again; trying again before the next connection");
         }
     }
 
@@ -423,6 +461,7 @@ struct Seams {
     outbox: SharedOutbox,
     marks: IssueMark,
     clock: Arc<dyn Clock>,
+    ledger: ReceivedJobs,
 }
 
 impl Opened {
@@ -444,6 +483,7 @@ impl Opened {
         outbox: SharedOutbox,
         marks: IssueMark,
         clock: Arc<dyn Clock>,
+        ledger: ReceivedJobs,
     ) -> Result<Handle, ControlError> {
         let port = self.origin()?.port();
         let seams = Seams {
@@ -454,6 +494,7 @@ impl Opened {
             outbox,
             marks,
             clock,
+            ledger,
         };
         self.start_with(&key.public_key(), seams)
     }
@@ -466,6 +507,7 @@ impl Opened {
         key: AgentKey,
         outbox: SharedOutbox,
         marks: IssueMark,
+        ledger: ReceivedJobs,
     ) -> Result<Handle, ControlError> {
         struct PanicDial;
         impl Dial for PanicDial {
@@ -481,6 +523,7 @@ impl Opened {
             outbox,
             marks,
             clock: Arc::new(crate::deadline::SystemClock),
+            ledger,
         };
         self.start_with(&key.public_key(), seams)
     }
@@ -507,6 +550,7 @@ impl Opened {
             outbox: seams.outbox,
             marks: seams.marks,
             clock: seams.clock,
+            ledger: seams.ledger,
             instruction_key,
             record: self.record,
             audience,
@@ -577,6 +621,23 @@ async fn run(wiring: Wiring, stop: Stop, status: StatusTx, ended: Arc<OnceLock<E
             }
             Err(error) => warnings.reopen_failure(&error),
         }
+        // So is the ledger (ADR-489): a file that does not read back ends the task; another
+        // failure is tried again before the next connection.
+        let reopened = tokio::select! {
+            biased;
+            () = stop.requested() => break,
+            reopened = reopen_ledger(&wiring.ledger) => reopened,
+        };
+        match reopened {
+            Ok(true) => tracing::info!("the received-jobs ledger was opened again"),
+            Ok(false) => {}
+            Err(error @ (LedgerError::Corrupt(_) | LedgerError::BadAgentId)) => {
+                tracing::error!(%error, "the received-jobs ledger cannot be opened again; the session ends");
+                let _ = ended.set(Ended::LedgerUnusable);
+                break;
+            }
+            Err(error) => warnings.ledger_reopen_failure(&error),
+        }
         match attempt(&wiring, &stop, &status, &mut warnings).await {
             Outcome::Stopped => break,
             Outcome::Failed {
@@ -609,6 +670,15 @@ async fn run(wiring: Wiring, stop: Stop, status: StatusTx, ended: Arc<OnceLock<E
         }
     }
     status.phase(Phase::Stopped);
+}
+
+/// Reopens the ledger on a blocking task when it is poisoned (see
+/// [`ReceivedJobs::reopen_if_poisoned`]).
+async fn reopen_ledger(ledger: &ReceivedJobs) -> Result<bool, LedgerError> {
+    let ledger = ledger.clone();
+    tokio::task::spawn_blocking(move || ledger.reopen_if_poisoned())
+        .await
+        .unwrap_or(Err(LedgerError::Io(std::io::ErrorKind::Other)))
 }
 
 /// One attempt: the exchange, the upgrade and the connection. A stop before the 101 drops the

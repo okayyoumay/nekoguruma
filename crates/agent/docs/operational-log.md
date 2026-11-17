@@ -115,6 +115,28 @@ throughout.
   that; the connection then closes with 1011 and the command is not acknowledged. The file's open
   is not logged: a corrupt one ends `ngr-agent connect` with its message and exit 1.
 
+- **The received-jobs ledger on the control channel** (`agent::control`, `agent::received_jobs`,
+  ADR-489): the entries hold a job ID and an ownership generation of a verified instruction, and
+  nothing else of it: never a `commandId`, an operator ID, an owner ID, a VIN, a time or a byte of
+  the envelope.
+  - A **duplicate** (the job recorded under the same generation) is one `debug` entry per
+    command, "already recorded", with the job ID and the generation. A command for an
+    **earlier generation** than the recorded one is a `warn` the first time on a connection and
+    `debug` after that. Both are acknowledged; the end-of-connection `info` line of refused
+    instructions carries the counts as `duplicate` and `earlier_generation`.
+  - A record that cannot be written warns once per `hello` cycle with the class `ledger-write`
+    (or `ledger-poisoned` for a record refused because an earlier write failed) and the
+    `LedgerError`'s own text (the kind of the I/O error; no path, no job), and is `debug` after
+    that; the connection then closes with 1011 and the command is not acknowledged. An
+    intake that fails after the record was made warns once per `hello` cycle with the class
+    `intake`, closes with 1011 and leaves the record.
+  - A ledger that cannot be opened again before a connection warns once per `hello` cycle with
+    the class `ledger-reopen`, and `debug` after that; a reopen that finds it corrupt is an
+    `error` entry, "the session ends", and `ngr-agent connect` exits 1. A reopen that succeeds
+    is one `info` entry. An open that cuts a torn last frame off is one `warn` with the byte
+    count cut and nothing of the content. The file's open at the start is otherwise not logged:
+    a corrupt one ends `ngr-agent connect` with its message and exit 1.
+
 - **The control channel session** (`agent::control`, ADR-471): the entries hold a failure
   class, an HTTP status, a close code and the heartbeat interval. They never hold the token, the
   challenge, the nonce or the proof, an HTTP body, a message's text, a `commandId`, or the reason

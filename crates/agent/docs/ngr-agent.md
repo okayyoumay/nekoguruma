@@ -252,7 +252,7 @@ The release build selects no store yet: the platform stores (a DPAPI blob on Win
 | device | Unix | `/var/lib/nekoguruma` | the installation (for example systemd's `StateDirectory=`, 0700, the service account); the agent creates only sub-directories, and a missing root is an error |
 | device | Windows | the service account's own `%LOCALAPPDATA%\nekoguruma` | the agent |
 
-Each kind of state has a sub-directory of its own: `identity` holds the key's lock file and the debug store, `registration` the registration record, its lock and the issue-time mark file `<agent-id>.issue-mark.v1.json` (below), `control` the control channel session's connection lock, `outbox` the outbox (below) and `journal` the write-job journal (`agent::journal::journal_dir`, and `JournalSetup::in_mode_dir` for a job's setup). The journal is linked into place with a hard link, so the first time a process resolves `journal` it also probes that its file system supports hard links (FAT and exFAT do not): the probe creates a file named after the process and a count, links it and removes both, so probes running at once never remove each other's files and a name already taken is skipped, and a directory that fails is refused with the reason (no path in the message). A sub-directory is created readable by its account only, and on Unix one that is writable by its group or others is refused. The operational log's directory (below) keeps its own rules.
+Each kind of state has a sub-directory of its own: `identity` holds the key's lock file and the debug store, `registration` the registration record, its lock, the issue-time mark file `<agent-id>.issue-mark.v1.json` (below) and the received-jobs ledger `<agent-id>.received-jobs.v1` ("Received-jobs ledger" below) with its lock `received-jobs.lock`, `control` the control channel session's connection lock, `outbox` the outbox (below) and `journal` the write-job journal (`agent::journal::journal_dir`, and `JournalSetup::in_mode_dir` for a job's setup). The journal is linked into place with a hard link, so the first time a process resolves `journal` it also probes that its file system supports hard links (FAT and exFAT do not): the probe creates a file named after the process and a count, links it and removes both, so probes running at once never remove each other's files and a name already taken is skipped, and a directory that fails is refused with the reason (no path in the message). A sub-directory is created readable by its account only, and on Unix one that is writable by its group or others is refused. The operational log's directory (below) keeps its own rules.
 
 ## `ngr-agent register`
 
@@ -371,11 +371,19 @@ printed, as `register` prints no argument value.
      the command with exit 1 and the advice to register again, before the key store is touched;
      a file that cannot be read, a mark open in another process or a directory that cannot be
      used is exit 3;
-  5. the agent key through `agent::identity::agent_key` (create once). A key this run had to
+  5. the received-jobs ledger of the record's agent ID (`ReceivedJobs::open`, "Received-jobs
+     ledger" below), read when present and never created by the open. A torn last frame is cut off
+     and warned about; a file that does not read back otherwise (wrong magic or version, another
+     agent ID, a bad checksum, damage followed by a whole record, numbers that are not
+     consecutive, a record that does not decode, a job ID that is not a canonical UUID, an
+     envelope that is empty or too long, or not a regular file) ends the command with exit 1 and
+     the advice to register again, before the key store is touched; a file that cannot be read,
+     a ledger open in another process or a directory that cannot be used is exit 3;
+  6. the agent key through `agent::identity::agent_key` (create once). A key this run had to
      create cannot be the registered one, so it is "register again" (the key stays, and a code can
      be issued for its fingerprint); a key whose fingerprint differs from the record's
      (`KeyMismatch`, from `Opened::start`) is the same;
-  6. `Opened::start`, then the wait for a stop signal.
+  7. `Opened::start`, then the wait for a stop signal.
 - **The key's retry** covers two classes, each logged as one `warn` per try with a fixed class
   name (`key store` or `creation lock`) and the next delay: a key store that is unavailable, and
   the creation lock held by another process past its 10-second wait. The delays are the session's
@@ -402,9 +410,9 @@ printed, as `register` prints no argument value.
 | Exit status | Meaning |
 |---|---|
 | 0 | Stopped by a signal |
-| 1 | Not registered; register again (a key just created, a key that is not the record's, a record that reads but is not valid, an outbox file or an issue-time mark file that is corrupt, at start or when a poisoned outbox is opened again); no key store (a release build, a build or mode without one, wrong debug variables); the stop handlers cannot be installed; the session ended without a stop |
+| 1 | Not registered; register again (a key just created, a key that is not the record's, a record that reads but is not valid, an outbox file, an issue-time mark file or a received-jobs ledger that is corrupt, at start or when a poisoned outbox or ledger is opened again); no key store (a release build, a build or mode without one, wrong debug variables); the stop handlers cannot be installed; the session ended without a stop |
 | 2 | Invalid command line |
-| 3 | Another session or a registration is running, a lock cannot be taken, the state directory or the identity directory is unusable, the creation lock cannot be opened, the registration record cannot be read for an I/O reason, the outbox is open elsewhere or cannot be opened, or the issue-time mark is open elsewhere or cannot be read |
+| 3 | Another session or a registration is running, a lock cannot be taken, the state directory or the identity directory is unusable, the creation lock cannot be opened, the registration record cannot be read for an I/O reason, the outbox is open elsewhere or cannot be opened, the issue-time mark is open elsewhere or cannot be read, or the received-jobs ledger is open elsewhere or cannot be read |
 | 4 | The agent key is present and cannot be used (it is not replaced) |
 
 ## Control channel session
@@ -421,18 +429,18 @@ connect`, above) loads the agent key and passes it in.
   no record is `NotRegistered`; a record that does not read, or whose `server_origin` is not
   `http://127.0.0.1` or `http://127.0.0.1:<port>`, is `Record`. Nothing of the record's path or
   content is logged. A record edited while the session runs is not read again.
-- **`Opened::start(key, intake, outbox, marks, clock)`** refuses a key whose fingerprint is not the record's
+- **`Opened::start(key, intake, outbox, marks, clock, ledger)`** refuses a key whose fingerprint is not the record's
   (`KeyMismatch`), else spawns the task and returns a `Handle`: `stop()`, `stopped()` (resolves
   once both locks are released) and `status()`, a watch of the phase, the heartbeat interval, the
   next delay and `commands_acknowledged` and `commands_rejected`, the job commands answered
   `commandAck` and `commandRejected` over all connections (a command is counted once its answer
   is written; a job refused for its operator was answered `commandAck` and counts under
-  `commands_acknowledged`, and so is a job past its start deadline). `intake` is the `Intake` trait object that takes every verified instruction whose operator
-  the gate allows (ADR-483); the default, `LogIntake`, is connected to no job runner: it logs the job ID at `debug` and drops the
+  `commands_acknowledged`, and so is a job past its start deadline). `intake` is the `Intake` trait object that takes every new verified instruction whose operator
+  the gate allows (ADR-483, ADR-489); `take` returns a future with a result, is called at most once per job ID and generation, returns promptly and tolerates being dropped; the default, `LogIntake`, is connected to no job runner: it logs the job ID at `debug` and drops the
   instruction. `outbox` is the `SharedOutbox` around the open `Outbox` of the record's agent ID
   (below); the caller opens it, and the connections send its events. `marks` is the open
   `IssueMark` of the same agent ID and `clock` the device `Clock` (`agent::deadline`, "Start
-  deadline" below); `connect` passes the system clock, and a test a clock it sets.
+  deadline" below); `connect` passes the system clock, and a test a clock it sets. `ledger` is the open `ReceivedJobs` of the same agent ID ("Received-jobs ledger" below).
 - **Both locks are held from `open` until the task ends**, waits included, and released by drop
   on every path: a stop, a dropped handle, a panic, a runtime shutdown or an `Opened` dropped
   unstarted. The lock files are never deleted. While a session runs, `ngr-agent register` exits 3.
@@ -459,12 +467,12 @@ connect`, above) loads the agent key and passes it in.
   match skips the `Intake` and has one terminal `jobState` event appended in place of `received`
   (`preconditionFailed`, failure code `operatorNotAllowed`, no detail; the same admission bound
   and failure handling as `received`), and is then answered `commandAck`: the acknowledgement
-  settles the delivery, and the refused job is never journaled. One that passes the operator
+  settles the delivery, and the refused job is never recorded in the ledger. One that passes the operator
   check is judged against its start deadline ("Start deadline" below): an expired job skips the
   `Intake` as well and has one terminal `jobState` event, `expired` (no failure code, no detail),
   appended in place of `received`, with the same admission bound and failure handling, and is
-  answered `commandAck` too. A verified instruction that passes both is handed to the `Intake`; the channel then appends a `received` event for the job to the outbox, on a blocking
-  task raced with the stop, and answers `{"type":"commandAck","commandId":...}`. A failed append
+  answered `commandAck` too. One that passes both is looked up in the received-jobs ledger ("Received-jobs ledger" below): a job ID held under the same or a later generation is a duplicate, answered `commandAck` with no event and no intake call. A new one is recorded in the ledger (a synced write on a blocking task raced with the stop), handed to the `Intake` and then has a `received` event appended to the outbox, on a blocking
+  task raced with the stop, before the channel answers `{"type":"commandAck","commandId":...}`. A failed append
   (`Full`, `Poisoned`, a write error) withholds the acknowledgement: the
   command counts as neither acknowledged nor rejected, the server delivers the job again after
   its lease, and a `warn` per failure class (`outbox-full`, `outbox-poisoned`, `outbox-write`,
@@ -473,8 +481,7 @@ connect`, above) loads the agent key and passes it in.
   (`outbox-poisoned`, `outbox-write`) close it with 1011, because the outbox takes no event
   until it is opened again, which the session does before its next connection (below). An
   `eventAck` whose rewrite poisons the outbox closes the connection with 1011 for the same reason. The append is tried once
-  per command. The intake has the instruction by then, and the intake is not idempotent on the job ID, so a
-  redelivery appends a second `received` event. A stop that comes during the append ends the
+  per command. The ledger and the intake have the job by then, so its redelivery is a duplicate and appends no second `received` event (ADR-489). A stop that comes during the append ends the
   connection as a stop with no acknowledgement written; the append, if it began, finishes. The
   event itself is sent by the connection's sender (next item), after the acknowledgement. A refusal is answered
   `{"type":"commandRejected","commandId":...,"reason":...}` on the same connection, never
@@ -503,8 +510,8 @@ connect`, above) loads the agent key and passes it in.
   moving. The server stores each event and acknowledges it after the commit
   (ADR-479), so a connection sends again only what an earlier one left unacknowledged; against a
   server that acknowledges none (a test's), every connection sends the whole outbox again.
-- **Only local facts end the task**: the `open` and `start` refusals above, an outbox that is poisoned and, when opened again
-  before an attempt, is found corrupt (`Handle::ended()`; `connect` exits 1), and a stop. Every
+- **Only local facts end the task**: the `open` and `start` refusals above, an outbox or a ledger that is poisoned and, when opened again
+  before an attempt, is found corrupt (`Handle::ended()` is `OutboxUnusable` or `LedgerUnusable`; `connect` exits 1), and a stop. Every
   answer of the server, a 403, a 429 and Close 4002 included, is retried, and nothing is erased.
   The delay before the next attempt starts at 1 second and doubles after every wait, up to 60
   seconds; 403, a 429 on the session route, and Close 4001 or 4002 set it to 60 seconds at once.
@@ -522,17 +529,27 @@ connect`, above) loads the agent key and passes it in.
   accept (2000, for example) into 1002 before the agent reads it, so such a close is logged as
   1002 at `warn`. A refused job command writes one `warn` per reason on a connection and `debug`
   for the repeats, and when the connection ends one `info` line with the count per reason, if any
-  command was refused (the operator refusals and the expired jobs are counted in it too).
+  command was refused (the operator refusals, the expired jobs, the duplicates and the commands for an earlier generation are counted in it too).
 
 ## Start deadline
 
 `agent::deadline` judges the start deadline of a verified instruction (design 5.3; ADR-486, ADR-461 Decision item 6). The deadline is expired when it is at or before `max(device clock, mark)`, where the mark is the highest issue time of the instructions verified so far (Unix seconds, no skew allowance, no check against the clock); an instruction whose own issue time is at or after its deadline is expired too.
 
 - **The file** is `<state>/registration/<agent-id>.issue-mark.v1.json`, one JSON object with `version` (1), `agent_id` and `highest_issued_at`, at most 1 KiB, mode 0600. It is written whole (a temporary file, synced, renamed over the file, the directory synced) and only when the mark in memory is above what the file holds. `IssueMark::open` takes its own lock file `issue-mark.lock` in the same directory (a second open, or one while a write still runs after a stop, is `InUse`, exit 3), then reads the file: absent is 0 and nothing is created; a symbolic link, a directory, an oversize or empty file, an unknown or missing field, another version, another agent ID or a value that is not a `u64` is corrupt (exit 1, register again; never repaired, never read as 0); a read that fails is exit 3. A file that reads back has its directory entry synced before its value counts as written (a sync that fails is exit 3), so a redelivery is never acknowledged on a rename a power loss could still undo. The mode of an existing file is not checked. A re-registration is a new agent ID and so a new file; the old one is left alone.
-- **The order on a command**: the gate verifies; the channel raises the mark to the instruction's issue time (a maximum, the one place the mark changes); the operator check; the deadline (the device clock is read once, here, and not for a rejected or an operator-refused command); the synced write when the file is behind; the intake; the first event; `commandAck`.
+- **The order on a command**: the gate verifies; the channel raises the mark to the instruction's issue time (a maximum, the one place the mark changes); the operator check; the duplicate check (ledger, below); the deadline (the device clock is read once, here, and not for a rejected, an operator-refused or a duplicate command); the synced write when the file is behind, for every verified command, a duplicate included; the ledger record; the intake; the first event; `commandAck`.
 - **A write that fails** (the write, a sync, the rename or the directory sync) withholds the intake, the event and the acknowledgement, warns once per `hello` under the class `mark-write` and closes with 1011. The mark in memory stays raised and the file's known value unchanged, so the next verified command writes again. A stop during the write ends as a stop.
 - **Status**: an expired job adds one to `commands_acknowledged`; `commands_rejected` is for the gate's refusals only.
-- **Not covered**: a deadline that passes between the acknowledgement and the real start of a job, and the resume of a journaled job (nothing starts a job from the control channel yet; those call the same raise and judgement when they land).
+- **Not covered**: a deadline that passes between the acknowledgement and the real start of a job, and the resume of a recorded job (nothing starts a job from the control channel yet; those call the same raise and judgement when they land).
+
+## Received-jobs ledger
+
+`agent::received_jobs` records the jobs the agent has taken, so that a command redelivered is acknowledged and not taken again (design 5.3; ADR-489, ADR-229, ADR-461 Decision item 9).
+
+- **The file** is `<state>/registration/<agent-id>.received-jobs.v1`: the magic `NGRRJOB\0`, the format version (`u32` LE), then frames in the journal's framing (length, CRC-32, payload): a header (agent ID, a protection word that is 0) and one record per accepted instruction (a number from 0, consecutive; the job ID; the ownership generation; the signed envelope byte for byte, at most 97 + 64 KiB). The first record creates the file (a temporary file at mode 0600, synced, renamed, the directory synced); later records are appended and synced; nothing is removed or pruned, and there is no size bound. `ReceivedJobs::open` takes its own lock file `received-jobs.lock` in the same directory, reads the file once and keeps the index from job ID to the highest generation only: absent is empty and nothing is created, a torn last frame is cut off (the cut synced, one `warn` with the byte count), a stale temporary file is ignored, the mode is not checked. Corruption (above) is exit 1 and never repaired; the agent ID must be a canonical UUID. A re-registration is a new agent ID and so a new ledger; the old file is left alone.
+- **The rule**: a verified instruction for job `J` at generation `g` is a duplicate when `J` is recorded at `g` or higher; otherwise it is new, and a higher generation adds a second record. A duplicate is answered `commandAck` and counted in `commands_acknowledged`; no event, no intake call, no ledger write, no clock read, and a job past its deadline is still a duplicate. The record is made after the deadline check and the mark's write and before the intake.
+- **A record that fails** (write, sync, rename, directory sync; or the task fails) withholds the intake, the event and the acknowledgement, warns once per `hello` under `ledger-write` and closes with 1011; the index is unchanged and the ledger then refuses records (`ledger-poisoned`, 1011) until `ReceivedJobs::reopen_if_poisoned` succeeds, which the session calls before each connection: a frame that reached the file counts, a torn one is cut, a corrupt file ends the session (`Ended::LedgerUnusable`, exit 1), another failure warns once per `hello` as `ledger-reopen` and is tried again. A duplicate is acknowledged while the ledger is poisoned. An `Intake` that fails after the record was made leaves the record, writes no event and no acknowledgement and closes with 1011 under `intake`.
+- **A stop during the write** ends as a stop; the write goes on holding the store and its lock, so a session started at once finds it in use (exit 3) until it ends.
+- **Not covered**: starting or resuming a recorded job, verifying its envelope again, and judging acceptance and the deadline again then (nothing starts a job from the control channel yet). A recorded job whose hand-over failed stays unrun until that exists.
 
 ## Job instruction gate
 

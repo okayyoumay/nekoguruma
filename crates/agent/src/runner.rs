@@ -1318,6 +1318,13 @@ fn run_job<C: WorkerApi>(
         }
         _ => None,
     };
+    // The job's own content (ADR-485) is computed once, written by a first run and compared by a
+    // resume. A job without a journal has no use for it. A program that does not encode ends the
+    // job before the communication log opens, so it leaves none (ADR-347).
+    let content = match &journal {
+        Some(_) => Some(job_content(program, document.as_ref())?),
+        None => None,
+    };
     // The communication log opens after the journal, so a job a journal turns away has none, and
     // before the link: a log that cannot be opened never steers the job (ADR-347).
     let run_kind = match (&journal, &resume_journal) {
@@ -1329,12 +1336,6 @@ fn run_job<C: WorkerApi>(
     let timings = Timings::for_link(config);
     // The artifact's hash is what the journal records (ADR-344).
     let artifact_sha256 = artifact.as_ref().map(|artifact| *artifact.sha256());
-    // And so is the job's own content (ADR-485): one value, written by a first run and compared
-    // by a resume. A job without a journal has no use for it.
-    let content = match &journal {
-        Some(_) => Some(job_content(program, document.as_ref())?),
-        None => None,
-    };
     let JobLink {
         mut host,
         open_link,
@@ -26369,6 +26370,47 @@ def main():
             std::fs::remove_dir_all(&dir).unwrap();
         }
 
+        /// A journal without the record that holds a terminal record keeps its verdict: the
+        /// terminal error is reported, not a differing content.
+        #[test]
+        fn a_journal_without_content_keeps_its_terminal_verdict() {
+            let program = flash_program_failing_after_the_erase();
+            let dir = journal_dir("content-absent-terminal");
+            drop(JobJournal::create(file_setup(&dir), None, &RECORDED).unwrap());
+            let file = journal_file(&dir);
+            let mut bytes = std::fs::read(&file).unwrap();
+            crate::journal::without_job_content(&mut bytes);
+            std::fs::write(&file, &bytes).unwrap();
+            let opened = Journal::open(&dir, &job_key()).unwrap();
+            let mut journal = JobJournal::new(opened, identity_sources());
+            let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+            let result = run_on(
+                &program,
+                &mut host,
+                JobLimits::default(),
+                &AtomicBool::new(false),
+                Some(&mut journal),
+            );
+            assert!(
+                matches!(result, Err(JobError::ProcedureFailed { .. })),
+                "{result:?}"
+            );
+            drop(journal);
+            let state = Journal::read(&dir, &job_key()).unwrap();
+            assert!(state.facts.procedure_failed.is_some());
+            assert_eq!(state.job_content, None);
+            for content in [RECORDED, JobContent::Document([0; 32])] {
+                let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+                let result = resume_given(&program, &dir, &mut host, &content);
+                assert!(
+                    matches!(&result, Err(JobError::ProcedureFailed { .. })),
+                    "{content:?}: {result:?}"
+                );
+                assert_eq!(host.sent(), []);
+            }
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+
         /// A differing content is refused before the artifact is compared, in both the
         /// refusal before a plan and the on-site ending from it.
         #[test]
@@ -26509,11 +26551,7 @@ def main():
                 ("a document of the same program", as_document),
             ] {
                 let (client, calls) = fake_worker(false).await;
-                let JobRun {
-                    result,
-                    guards: _guards,
-                    ..
-                } = resume_program_journaled(
+                let JobRun { result, guards, .. } = resume_program_journaled(
                     client,
                     &config,
                     job,
@@ -26523,6 +26561,9 @@ def main():
                 )
                 .await;
                 assert!(refused(&result), "{name}: {result:?}");
+                // The guards come back as given, and no vehicle lock was taken.
+                assert!(!guards.holds_slot() && !guards.link_unconfirmed(), "{name}");
+                assert!(!guards.holds_vehicle(), "{name}");
                 assert!(
                     !calls.lock().unwrap().contains(&"StartComPrimitive"),
                     "{name}: {:?}",
@@ -26594,11 +26635,7 @@ def main():
                 ("a program only", Job::from(original)),
             ] {
                 let (client, calls) = fake_worker(false).await;
-                let JobRun {
-                    result,
-                    guards: _guards,
-                    ..
-                } = resume_program_journaled(
+                let JobRun { result, guards, .. } = resume_program_journaled(
                     client,
                     &config,
                     job,
@@ -26608,6 +26645,9 @@ def main():
                 )
                 .await;
                 assert!(refused(&result), "{name}: {result:?}");
+                // The guards come back as given, and no vehicle lock was taken.
+                assert!(!guards.holds_slot() && !guards.link_unconfirmed(), "{name}");
+                assert!(!guards.holds_vehicle(), "{name}");
                 assert!(
                     !calls.lock().unwrap().contains(&"StartComPrimitive"),
                     "{name}"

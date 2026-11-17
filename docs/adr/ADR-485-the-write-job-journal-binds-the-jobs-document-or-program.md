@@ -4,7 +4,7 @@
 **Status:** Accepted
 **Affects:** `agent` (`journal.rs`: `Record::JobContent`, `JobContent`, `JournalState::job_content`,
 `Journal::create`; `journaling.rs`: `JobJournal::create`; `runner.rs`: `run_job`, the restart order;
-`restart.rs`: `OnSiteReason::JobContentDiffers`; `job_report.rs`), design 8.2.5 and 8.2.6;
+`restart.rs`: `OnSiteReason::JobContentDiffers`; `job_report.rs`), design 8.2.4, 8.2.5 and 11.3;
 ADR-244, ADR-261, ADR-268, ADR-318, ADR-327, ADR-344
 
 ## Context
@@ -75,6 +75,9 @@ resume compares it with the job it is given, as it does for the artifact.
 - ADR-318's consequence that a replacement of the document or program goes undetected no longer
   holds, and ADR-327's remark that a replacement is not detected before the flash plan no longer
   holds either; the guard and combination records of ADR-325 and ADR-327 stay as they are.
+- A program-only job rebuilt with only its source map or spans changed is refused too, because
+  the hash covers the program's whole encoding (the program's counterpart of a re-converted
+  document).
 - A program passed together with a document that is not its procedure is bound as the document;
   only a test builds such a job, since a document job derives its program from the document.
 - A program-only job with another sources table or link configuration is not detected: those

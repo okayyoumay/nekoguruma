@@ -2351,6 +2351,15 @@ mod tests {
 
     const VERSION: &[u8] = b"SW-2.0";
 
+    /// Appends a frame holding `record` as the journal file's next record, numbered from what
+    /// the file holds, so a test that expects a refusal gets the rule it names.
+    fn append_next(dir: &TempDir, record: Record) {
+        let records = Journal::read(&dir.0, &key())
+            .expect("a readable file")
+            .records;
+        append_entry(dir, records, record);
+    }
+
     /// Appends a frame holding `record` as sequence number `seq` to the journal file.
     fn append_entry(dir: &TempDir, seq: u64, record: Record) {
         let mut frame = Vec::new();
@@ -2681,6 +2690,60 @@ mod tests {
                 "whole {whole}"
             );
         }
+    }
+
+    /// A damaged version or artifact frame with the job content after it is not a torn tail:
+    /// a record follows the damage (ADR-485).
+    #[test]
+    fn a_damaged_version_or_artifact_frame_before_the_job_content_is_corrupt() {
+        let vin = Vin::new("WDB12345678901234".to_owned());
+        let hash = [3u8; 32];
+        // Frame index (after the header) of the record to damage.
+        for (damaged, version, artifact) in [
+            (1usize, Some(VERSION), None),
+            (2, Some(VERSION), Some(&hash)),
+        ] {
+            for whole in [false, true] {
+                let dir = TempDir::new();
+                drop(
+                    Journal::create(&dir.0, &key(), Some(&vin), version, artifact, &content())
+                        .expect("create"),
+                );
+                let mut bytes = fs::read(path(&dir)).expect("read");
+                let mut offset = PREAMBLE;
+                let mut frames = Vec::new();
+                while offset < bytes.len() {
+                    let FrameRead::Ok { next, .. } = read_frame(&bytes, offset) else {
+                        panic!("frame");
+                    };
+                    frames.push((offset, next));
+                    offset = next;
+                }
+                // Header, VIN, version, [artifact], content.
+                let (from, to) = frames[1 + damaged];
+                let from = if whole { from } else { from + FRAME_HEADER };
+                bytes[from..to].fill(0);
+                assert!(
+                    matches!(load(&bytes, &key()), Err(JournalError::Corrupt { .. })),
+                    "{damaged} {whole}"
+                );
+            }
+        }
+        // Damage in the artifact frame alone, without a version.
+        let dir = TempDir::new();
+        drop(Journal::create(&dir.0, &key(), None, None, Some(&hash), &content()).expect("create"));
+        let mut bytes = fs::read(path(&dir)).expect("read");
+        let FrameRead::Ok { next: start, .. } = read_frame(&bytes, PREAMBLE) else {
+            panic!("header");
+        };
+        let FrameRead::Ok { next: end, .. } = read_frame(&bytes, start) else {
+            panic!("artifact frame");
+        };
+        bytes[start + FRAME_HEADER..end].fill(0);
+        assert!(matches!(
+            load(&bytes, &key()),
+            Err(JournalError::Corrupt { .. })
+        ));
     }
 
     #[test]
@@ -3193,9 +3256,8 @@ mod tests {
         let mut j = Journal::create(&dir.0, &key(), None, None, None, &content()).expect("create");
         j.commit_step(at(2, 5), None).expect("step");
         drop(j);
-        append_entry(
+        append_next(
             &dir,
-            1,
             Record::RunStart {
                 at: at(0, 5),
                 vm_state: b"s".to_vec(),
@@ -3260,7 +3322,13 @@ mod tests {
         assert_eq!(Journal::open(&dir.0, &key()).expect("open").state(), &state);
 
         // A record appended to the file behind it is corrupt, not ignored.
-        append_entry(&dir, 2, Record::Block { block: 1 });
+        append_next(
+            &dir,
+            Record::Step {
+                at: at(9, 9),
+                vm_state: None,
+            },
+        );
         assert!(matches!(
             Journal::read(&dir.0, &key()),
             Err(JournalError::Corrupt { .. })
@@ -3330,7 +3398,13 @@ mod tests {
         assert_eq!(Journal::open(&dir.0, &key()).expect("open").state(), &state);
 
         // A record appended behind it is corrupt, not ignored.
-        append_entry(&dir, 2, Record::Block { block: 1 });
+        append_next(
+            &dir,
+            Record::Step {
+                at: at(9, 9),
+                vm_state: None,
+            },
+        );
         assert!(matches!(
             Journal::read(&dir.0, &key()),
             Err(JournalError::Corrupt { .. })
@@ -3417,7 +3491,13 @@ mod tests {
         assert_eq!(Journal::open(&dir.0, &key()).expect("open").state(), &state);
 
         // A record appended behind it is corrupt, not ignored.
-        append_entry(&dir, 2, Record::Block { block: 1 });
+        append_next(
+            &dir,
+            Record::Step {
+                at: at(9, 9),
+                vm_state: None,
+            },
+        );
         assert!(matches!(
             Journal::read(&dir.0, &key()),
             Err(JournalError::Corrupt { .. })
@@ -3471,9 +3551,8 @@ mod tests {
 
         let dir = TempDir::new();
         drop(Journal::create(&dir.0, &key(), None, None, None, &content()).expect("create"));
-        append_entry(
+        append_next(
             &dir,
-            0,
             Record::ProcedureFailed {
                 at: at(1, 1),
                 code: long_code,

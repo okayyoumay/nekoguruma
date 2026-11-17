@@ -489,7 +489,7 @@ Unattended devices use device mode. Each device is fixed to one mode, eliminatin
 | FW write | On-site approval |
 | FW write to an unattended device | Two-person approval + execution time window |
 
-Policies are set per "job type x agent" and cannot be looser than the organization defaults. Remote operation requires both the operator's remote operation role and remote permission on the agent side.
+The defaults of this table and of 5.1 live in the table `confirmation_defaults` (product-wide, one level per job kind; ADR-488), which a created job's level is read from; the table has no row for a firmware write to an unattended device, whose two-person approval and time window are a condition of the agent. Policies are set per "job type x agent" and cannot be looser than the organization defaults. Remote operation requires both the operator's remote operation role and remote permission on the agent side.
 
 ### 6.4 Credentials
 

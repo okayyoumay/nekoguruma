@@ -7,7 +7,8 @@
 //! the idempotency key and the shape of the JSON (400, with no database access), then one
 //! transaction: the key's row (a replay or a conflict answers here, before any permission is
 //! judged), the caller's permission (403), the bounds of a `startDeadline` against the issue time
-//! (422, ADR-487), the active instruction key (503), the signing of the instruction and the
+//! (422, ADR-487), the active instruction key (503), the kind's confirmation level from
+//! `confirmation_defaults` (500 without a row, ADR-488), the signing of the instruction and the
 //! insert, which loses to a concurrent insert of the same key and then answers like the first
 //! read. A 400 means the request can never be valid, a 422 that the key belongs to another request
 //! or that the deadline lies outside the bounds. A job's ID is made here, never taken from the client.
@@ -127,15 +128,6 @@ impl Kind {
         match self {
             Kind::Acquire => JobKind::Acquire,
             Kind::WriteSettings => JobKind::WriteSettings,
-        }
-    }
-
-    /// The confirmation level of the kind (design 6.3). A `gracePeriod` is recorded here and
-    /// not enforced.
-    fn confirmation(self) -> &'static str {
-        match self {
-            Kind::Acquire => "notifyOnly",
-            Kind::WriteSettings => "gracePeriod",
         }
     }
 
@@ -793,6 +785,23 @@ impl Inner {
         if !key_active {
             return Ok(Outcome::KeyNotActive);
         }
+        // The kind's confirmation level (design 6.3), read from the product-wide defaults in the
+        // creating transaction (ADR-488), before anything is
+        // signed. A `gracePeriod` is recorded and not enforced. A kind
+        // without a row is a fault of the installation, not a refusal of the request: it fails
+        // the creation as 500, and the transaction's end leaves nothing inserted.
+        let level: Option<(String,)> =
+            sqlx::query_as("SELECT level FROM confirmation_defaults WHERE kind = $1")
+                .bind(spec.kind.name())
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some((level,)) = level else {
+            return Err(JobError::Internal(format!(
+                "no confirmation default for kind {}",
+                spec.kind.name()
+            )));
+        };
+
         let random = random_32().map_err(|e| JobError::Internal(e.to_string()))?;
         let mut tail = [0u8; 10];
         tail.copy_from_slice(&random[..10]);
@@ -822,7 +831,7 @@ impl Inner {
         .bind(&spec.vin)
         .bind(&digests)
         .bind(spec.artifact.map(|h| hex(&h)))
-        .bind(spec.kind.confirmation())
+        .bind(&level)
         .bind(instruction.start_deadline as i64)
         .bind(&sealed)
         .bind(&key_id)
@@ -1615,8 +1624,6 @@ mod tests {
                 "progressPermille": 0, "confirmation": { "level": "notifyOnly" }
             })
         );
-        assert_eq!(Kind::Acquire.confirmation(), "notifyOnly");
-        assert_eq!(Kind::WriteSettings.confirmation(), "gracePeriod");
     }
 
     // J17 (the document's half): the failure shows its code and procedure code, never a detail.

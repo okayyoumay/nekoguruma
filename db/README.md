@@ -22,6 +22,7 @@ ADR-476).
 failed job (design 5.6, ADR-475, ADR-481).
 `migrations/0011_default_partitions.sql` gives `change_feed` and `audit_log` a default partition, so
 their first insert no longer fails for want of a partition.
+`migrations/0012_confirmation_defaults.sql` adds `confirmation_defaults` and seeds it (design 6.3, ADR-488).
 
 ## How migrations are applied
 
@@ -162,7 +163,8 @@ the kind (the column has no default; no migration is needed):
 A row whose `expires_at` has passed is replaced by the next take for the VIN; no sweeper deletes
 expired rows. The job's end deletes its own row, whether the server writes it (the delivery queue's ends, ADR-480, and the
 expiry of a job past its start deadline, ADR-487) or the agent reports it (ADR-481); a reopened needsOnSiteRecovery job holds no row. A new job
-kind that the route creates states its allowance in the same place as its confirmation level.
+kind that the route creates needs a `confirmation_defaults` row from a migration and its
+`Kind::lock_secs` arm.
 The columns hold no foreign keys and a stale row keeps its VIN until a take replaces it.
 
 **`audit_log`: one row per recorded action, written by the transaction that does it**
@@ -204,6 +206,23 @@ in that range, so those rows are moved out of it before the range partition is a
   (ADR-469): the server keeps them in memory, so a restart signs everyone out
 
 ## Column values
+
+- Seed data (ADR-488). `confirmation_defaults (kind, level)` is product-wide (no tenant ID) and
+  holds the default confirmation level of each job kind (design 6.3, 5.1): `acquire`,
+  `monitorSession` and `monitorCapture` are `notifyOnly`, `runSequence` and `writeSettings`
+  are `gracePeriod`, `reprogram` is `onSiteApproval`. `identify` has no row, since no route creates
+  it. A job creation reads its level here and fails without a row. The design's row for a firmware
+  write to an unattended device is an agent-side condition and not a kind, so it is not seeded.
+  Organization and per-agent policies may only tighten these defaults (a later item).
+- Roles stay the `CHECK` list on `operator_roles.role` and are not a table (ADR-488). Their
+  meaning (design 6.8, axis 1): `viewer` views acquired data; `worker` is the Operator role
+  (acquisition, configuration value writes, work records); `reprogrammer` writes ECU firmware;
+  `remote` executes while not on site (with the agent's own remote permission); `approver` is the
+  approving side of two-person approval; `admin` publishes artifacts, sets policy, registers
+  agents, fetches agents' operational logs, raises an agent's log level for a while and reads
+  the SOVD `logs` resource.
+- The preset default is the column default of `agents.preset`, `personal` (design 6.6, 13.3); the
+  other presets are `personalRemote` and `shared`. Relaxing a preset needs action on the device.
 
 - `ir_documents.source_format`: `odx` or `csv-starlark` (the proprietary format, ADR-254).
   The comment in `0001_init.sql` still names the earlier `csv-js`; the column is free text, so

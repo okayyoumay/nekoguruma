@@ -211,6 +211,12 @@ pub enum OnSiteReason {
     /// belong to the first file. Nothing is sent and no resume is counted (ADR-344). Before a plan the same
     /// difference is [`JobError::ArtifactDiffersFromJournal`].
     ArtifactDiffers,
+    /// The resume was given another job than the journal was created with: another document, or
+    /// another program when the job has none, or a document where the journal names a program or
+    /// the reverse. A journal that names none, written before the record existed, differs too.
+    /// Nothing is sent and no resume is counted, whatever the journal holds; the hash is not
+    /// reported (ADR-485).
+    JobContentDiffers,
     /// Test builds only: the restart order of a redone transfer passed steps 1 to 4b-3 and the
     /// tests' `resume_to_erase` stopped it there, before the erase (step 4c), so the tests can see
     /// the teardown's outcome (`teardown`), the default-session confirmation (`confirmed`) and the

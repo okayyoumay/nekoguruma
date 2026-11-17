@@ -5,7 +5,8 @@
 //! variant's declarations are what the VM decodes response fields through. The runner hands the
 //! document to the VM at every step through its host ([`Declarations`]); the document is not
 //! part of the VM state, so a restart passes the same document again, as it passes the same
-//! program.
+//! program. The journal records the document's hash ([`JobDocument::sha256`]) when a job is
+//! created and a restart given another document is refused (ADR-485).
 
 use std::sync::Arc;
 

@@ -1354,7 +1354,8 @@ step count, of the last completed step, the two transfer markers and the last re
 | no transfer-start marker | the plain procedure's classification (below): a plain start, a checkpoint-resume decision or `OnSiteInterventionRequired` |
 | transfer-start marker | `Restart`, for the plan of the marker's stage, with the VM state at its entry; `OnSiteInterventionRequired` if that plan never allows a restart |
 
-The runner then compares the journal's artifact hash with the resume's before it acts on a plain
+The runner first compares what the journal says the job is with the job the resume is given, and
+refuses another one (ADR-485, "Restart entry" below). It then compares the journal's artifact hash with the resume's before it acts on a plain
 start, a checkpoint-resume decision or a `Restart` (ADR-344, "Restart entry" below); an
 `OnSiteInterventionRequired` decision stands as it is.
 
@@ -1446,7 +1447,7 @@ A `ResumeFromCheckpoint` decision runs in this order, each failure ending the jo
    this, as for every restart, a journal another run holds ends the job (`InUse`), a recorded
    failure, identity abort or stop ends it in its own error, and a target VIN or intended
    software version that differs from the journal's is `OnSiteInterventionRequired`
-   (`TargetVinDiffers`, `IntendedVersionDiffers`), all with nothing sent; the artifact's hash is compared there too (below).
+   (`TargetVinDiffers`, `IntendedVersionDiffers`), all with nothing sent; the job's own content (`JobContentDiffers`) and the artifact's hash are compared there too (below).
 
 ## Restart entry
 
@@ -1506,6 +1507,25 @@ journal's creation prefix: the target VIN only first, the intended version only 
 after the VIN, each at most once; a file that breaks this is corrupt. An empty intended
 version is refused, since it would match an ECU that answers with an empty field. Like the VIN record, the
 version record is appended without a format version change.
+
+The job's own content is compared the same way (ADR-485): `Journal::create` always writes
+`Record::JobContent` as the last record of the creation prefix, after the VIN, the intended
+version and the artifact hash, once. It holds the SHA-256 of the job document's bytes, or, for a
+job that is a program only, of the program's postcard encoding; the kind is compared with the
+hash, so a document never matches a program. `JournalState::job_content` holds it, not
+`RecoveryFacts`, so the summary a handover sends carries no hash. A resume compares it with the
+content of the job it is given right after the VIN and the intended version and before the
+classification, and a journal with no such record (one written before it existed, or one whose
+last frame was torn), one of the other kind or one with another hash ends in
+`OnSiteInterventionRequired(JobContentDiffers)`, with nothing sent, no resume counted and no
+supply voltage read, whatever the classification would say or the artifact is. A journal that
+holds only its creation prefix is refused too. Reports and logs name the reason, never the hash.
+A resume that finds no journal at all is judged as a plain start from the given program (the
+table above), which the record cannot help, and a restart handed over from another device has no
+journal to compare with. An older agent reads the appended record as a corrupt journal
+(`UnreadableJournal`), and every journal in flight when this agent is installed is refused on its
+restart, as is a program-only job's journal after an upgrade that changes the program's
+encoding.
 
 The flash artifact is compared the same way (ADR-344): `Journal::create` takes the hash of the
 job's artifact and writes `Record::ArtifactSha256` in the creation prefix after the VIN and the

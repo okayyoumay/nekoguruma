@@ -41,7 +41,7 @@ use crate::host::{
     SendState, Timings, TransferProgress, WorkerHost,
 };
 use crate::inputs::RuntimeInputs;
-use crate::journal::{Journal, JournalError, RunStop, StepRef, StoppedRun, Store};
+use crate::journal::{JobContent, Journal, JournalError, RunStop, StepRef, StoppedRun, Store};
 use crate::journaling::{JobJournal, JournalSetup};
 use crate::link::{self, LinkConfig};
 use crate::oplog::LogSafe;
@@ -103,8 +103,8 @@ impl Default for JobLimits {
 /// A program and a document come together only from the document itself, whose procedure is
 /// the program (design 8.2.6), so a job never decodes one variant's responses with another's
 /// declarations. The caller of a restart passes the same job again, the artifact and the hash it
-/// names included: the journal records neither the program, the document nor the artifact
-/// (ADR-318).
+/// names included: the journal records no copy of the program, the document or the artifact, only
+/// their hashes, and a restart handed another one is refused (ADR-344, ADR-485).
 #[derive(Debug, Clone)]
 pub struct Job {
     program: Program,
@@ -1318,6 +1318,13 @@ fn run_job<C: WorkerApi>(
         }
         _ => None,
     };
+    // The job's own content (ADR-485) is computed once, written by a first run and compared by a
+    // resume. A job without a journal has no use for it. A program that does not encode ends the
+    // job before the communication log opens, so it leaves none (ADR-347).
+    let content = match &journal {
+        Some(_) => Some(job_content(program, document.as_ref())?),
+        None => None,
+    };
     // The communication log opens after the journal, so a job a journal turns away has none, and
     // before the link: a log that cannot be opened never steers the job (ADR-347).
     let run_kind = match (&journal, &resume_journal) {
@@ -1364,7 +1371,8 @@ fn run_job<C: WorkerApi>(
     // a torn last frame, which any later open would cut as well.
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| match journal {
         Some(JournalMode::Create(setup)) => {
-            let mut journal = JobJournal::create(setup, artifact_sha256.as_ref())?;
+            let content = content.expect("computed above for a journaled job");
+            let mut journal = JobJournal::create(setup, artifact_sha256.as_ref(), &content)?;
             run_on(program, &mut host, limits, cancelled, Some(&mut journal))
         }
         Some(JournalMode::Resume(setup)) => resume_on(
@@ -1377,6 +1385,7 @@ fn run_job<C: WorkerApi>(
             setup.vin.as_ref(),
             setup.intended_software_version.as_deref(),
             artifact_sha256.as_ref(),
+            &content.expect("computed above for a journaled job"),
             &guards,
         ),
         _ => run_on(
@@ -1396,6 +1405,21 @@ fn run_job<C: WorkerApi>(
     }
     close_job_link(host, open_link, &path_lost);
     result
+}
+
+/// What the journal binds a job to (ADR-485): the document's hash when the job has one, else the
+/// hash of the program's postcard encoding. A program that does not encode fails the job as a
+/// VM state that does not encode does (`JobJournal::run_start`).
+fn job_content(program: &Program, document: Option<&JobDocument>) -> Result<JobContent, JobError> {
+    use sha2::Digest;
+    match document {
+        Some(document) => Ok(JobContent::Document(document.sha256())),
+        None => {
+            let encoded = postcard::to_allocvec(program)
+                .map_err(|_| JournalError::Invariant("the program does not encode"))?;
+            Ok(JobContent::Program(sha2::Sha256::digest(&encoded).into()))
+        }
+    }
 }
 
 /// A job's link, open: the host that sends on it, what closes it, and what the VCI allows.
@@ -1681,7 +1705,8 @@ impl Drop for CancelOnDrop {
 /// On a read-back verification the program goes on after the plan instead
 /// ([`continue_after_plan`], ADR-271 items 3 to 5).
 /// `vin` is the job's target VIN and `intended_software_version` the software version it
-/// intends to write; `artifact_sha256` is the hash of the artifact the resume was given (ADR-344).
+/// intends to write; `artifact_sha256` is the hash of the artifact the resume was given (ADR-344)
+/// and `content` what it was given as the job (ADR-485).
 /// Once the ECU's VIN
 /// matched it, the gates promote `guards` to the per-vehicle lock (ADR-263; see
 /// [`promote_to_vehicle`]); step 3a promotes again, which takes the lock when the gates could not
@@ -1700,6 +1725,7 @@ fn resume_on<H, S>(
     vin: Option<&crate::journal::Vin>,
     intended_software_version: Option<&[u8]>,
     artifact_sha256: Option<&[u8; SHA256_LEN]>,
+    content: &JobContent,
     guards: &GuardSlot,
 ) -> Result<VmState, JobError>
 where
@@ -1720,6 +1746,7 @@ where
         vin,
         intended_software_version,
         artifact_sha256,
+        content,
         guards,
     )? {
         Restarted::Finished(state) => Ok(state),
@@ -1800,6 +1827,7 @@ fn restart_order<H, S>(
     vin: Option<&crate::journal::Vin>,
     intended_software_version: Option<&[u8]>,
     artifact_sha256: Option<&[u8; SHA256_LEN]>,
+    content: &JobContent,
     guards: &GuardSlot,
 ) -> Result<Restarted<S>, JobError>
 where
@@ -1848,6 +1876,18 @@ where
     {
         return Err(JobError::OnSiteInterventionRequired(
             OnSiteReason::IntendedVersionDiffers,
+        ));
+    }
+    // And for what the job is (ADR-485): the journal names the document or the program the first
+    // run was created with, and a resume handed another one, or a journal that names none, is
+    // refused before the classification, so another job's program never classifies this
+    // journal; a later resume with the original job gets its own decision back. Nothing is
+    // sent, no resume is counted and no voltage is read.
+    if let Ok(journal) = &opened
+        && journal.state().job_content.as_ref() != Some(content)
+    {
+        return Err(JobError::OnSiteInterventionRequired(
+            OnSiteReason::JobContentDiffers,
         ));
     }
     let decision = restart::classify(program, opened.as_ref().map(Journal::state));
@@ -2792,6 +2832,7 @@ mod tests {
             vin,
             intended_software_version,
             None,
+            &test_content(),
             guards,
         )
     }
@@ -2811,6 +2852,7 @@ mod tests {
         vin: Option<&crate::journal::Vin>,
         intended_software_version: Option<&[u8]>,
         artifact_sha256: Option<&[u8; SHA256_LEN]>,
+        content: &JobContent,
         guards: &GuardSlot,
     ) -> Result<VmState, JobError>
     where
@@ -2831,6 +2873,7 @@ mod tests {
             vin,
             intended_software_version,
             artifact_sha256,
+            content,
             guards,
         )? {
             Restarted::Finished(state) => Ok(state),
@@ -4267,6 +4310,12 @@ def main():
         .unwrap()
     }
 
+    /// The content the tests that call `resume_on` and `restart_order` directly create their
+    /// journals with and resume with.
+    fn test_content() -> JobContent {
+        JobContent::Program([0x5a; 32])
+    }
+
     fn job_key() -> crate::journal::JobKey {
         crate::journal::JobKey {
             job_id: shared_proto::JobId("0190f5a8-7c2e-7d4b-9a6e-3f1c2b4d5e6f".to_owned()),
@@ -4555,7 +4604,7 @@ def main():
             vin: None,
             intended_software_version: None,
         };
-        let mut journal = JobJournal::create(setup, None).unwrap();
+        let mut journal = JobJournal::create(setup, None, &test_content()).unwrap();
         let mut host = FlashHost::new(Rc::new(Cell::new(0)));
         let result = run_flash(&mut host, &mut journal);
         drop(journal);
@@ -6097,7 +6146,7 @@ def main():
         };
         run().await.expect("a plain program runs");
         let state = Journal::read(&dir, &job_key()).expect("the job left a journal");
-        assert_eq!(state.records, 1, "the run start");
+        assert_eq!(state.records, 2, "the job content and the run start");
         let again = run().await;
         assert!(matches!(again, Err(JobError::Journal(_))), "{again:?}");
         std::fs::remove_dir_all(&dir).unwrap();
@@ -6272,7 +6321,8 @@ def main():
     ) -> Result<VmState, JobError> {
         let mut host = FlashHost::new(Rc::new(Cell::new(0)));
         prepare(&mut host);
-        let mut journal = JobJournal::create(file_setup_for(dir, vin), None).unwrap();
+        let mut journal =
+            JobJournal::create(file_setup_for(dir, vin), None, &test_content()).unwrap();
         run_on(
             program,
             &mut host,
@@ -6295,7 +6345,9 @@ def main():
         let mut host = FlashHost::new(Rc::new(Cell::new(0)));
         host.cancel_on_service = Some((service, Arc::clone(&cancelled)));
         prepare(&mut host);
-        let mut journal = JobJournal::create(file_setup_for(dir, Some(TARGET_VIN)), None).unwrap();
+        let mut journal =
+            JobJournal::create(file_setup_for(dir, Some(TARGET_VIN)), None, &test_content())
+                .unwrap();
         run_on(program, &mut host, limits, &cancelled, Some(&mut journal))
     }
 
@@ -6465,10 +6517,22 @@ def main():
     /// A first run of `program` that targets `vin` and is cancelled once its request for
     /// `service` was sent (and its checkpoint committed), so the job is resumable.
     fn cancelled_after(program: &Program, dir: &std::path::Path, vin: Option<&str>, service: u16) {
+        cancelled_after_as(program, dir, vin, service, &test_content());
+    }
+
+    /// [`cancelled_after`] with a journal created with `content`, for a resume that goes through
+    /// the entry point and so brings the content of its own job (ADR-485).
+    fn cancelled_after_as(
+        program: &Program,
+        dir: &std::path::Path,
+        vin: Option<&str>,
+        service: u16,
+        content: &JobContent,
+    ) {
         let cancelled = Arc::new(AtomicBool::new(false));
         let mut host = FlashHost::new(Rc::new(Cell::new(0)));
         host.cancel_on_service = Some((service, Arc::clone(&cancelled)));
-        let mut journal = JobJournal::create(file_setup_for(dir, vin), None).unwrap();
+        let mut journal = JobJournal::create(file_setup_for(dir, vin), None, content).unwrap();
         let result = run_on(
             program,
             &mut host,
@@ -7583,6 +7647,7 @@ def main():
             Some(&target()),
             None,
             None,
+            &test_content(),
             &dir_slot(&dir),
         );
         assert!(
@@ -9311,7 +9376,7 @@ def main():
         let setup = file_setup(&dir);
         assert!(setup.vin.is_some());
         assert!(!format!("{setup:?}").contains(TARGET_VIN));
-        let journal = JobJournal::create(setup, None).unwrap();
+        let journal = JobJournal::create(setup, None, &test_content()).unwrap();
         let state = journal.journal().state();
         assert!(state.facts.target_vin.is_some());
         assert!(!format!("{state:?} {:?}", state.facts).contains(TARGET_VIN));
@@ -9369,7 +9434,7 @@ def main():
         setup.intended_software_version = version.map(<[u8]>::to_vec);
         let mut host = FlashHost::new(Rc::new(Cell::new(0)));
         host.lose_routine = Some(0xFF00);
-        let mut journal = JobJournal::create(setup, None).unwrap();
+        let mut journal = JobJournal::create(setup, None, &test_content()).unwrap();
         let result = run_on(
             program,
             &mut host,
@@ -9477,7 +9542,7 @@ def main():
             host.lose_routine = Some(0xFF00);
         }
         host.cancel_on_service = cancel_on.map(|service| (service, Arc::clone(&cancelled)));
-        let mut journal = JobJournal::create(file_setup(dir), artifact).unwrap();
+        let mut journal = JobJournal::create(file_setup(dir), artifact, &test_content()).unwrap();
         run_on(
             program,
             &mut host,
@@ -9504,6 +9569,7 @@ def main():
             Some(&target()),
             None,
             artifact,
+            &test_content(),
             &dir_slot(dir),
         )
     }
@@ -9568,7 +9634,7 @@ def main():
         let dir = journal_dir("artifact-differs-before-plan");
         // The job stopped right after its journal was created: nothing was sent, so the
         // classification would start it again from the beginning.
-        drop(JobJournal::create(file_setup(&dir), Some(&first)).unwrap());
+        drop(JobJournal::create(file_setup(&dir), Some(&first), &test_content()).unwrap());
         let state = Journal::read(&dir, &job_key()).unwrap();
         assert!(matches!(
             restart::classify(&program, Ok(&state)),
@@ -9745,7 +9811,8 @@ def main():
         let cancelled = Arc::new(AtomicBool::new(false));
         let mut host = FlashHost::new(Rc::new(Cell::new(0)));
         host.lose_service = Some(0x3E);
-        let mut journal = JobJournal::create(file_setup(&dir), Some(&first)).unwrap();
+        let mut journal =
+            JobJournal::create(file_setup(&dir), Some(&first), &test_content()).unwrap();
         let result = run_on(
             &program,
             &mut host,
@@ -9780,7 +9847,7 @@ def main():
     fn an_intent_inside_a_plan_counts_as_reaching_it() {
         let program = flash_program();
         let dir = journal_dir("artifact-intent-in-plan");
-        drop(JobJournal::create(file_setup(&dir), None).unwrap());
+        drop(JobJournal::create(file_setup(&dir), None, &test_content()).unwrap());
         let mut facts = Journal::read(&dir, &job_key()).unwrap().facts;
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(!restart::reached_flash_plan(&program, &facts));
@@ -9799,7 +9866,7 @@ def main():
         let hash = artifact_hash(1);
         // No hash recorded, an artifact given: refused before the plan, on-site from it.
         let dir = journal_dir("artifact-unrecorded-early");
-        drop(JobJournal::create(file_setup(&dir), None).unwrap());
+        drop(JobJournal::create(file_setup(&dir), None, &test_content()).unwrap());
         let mut host = FlashHost::new(Rc::new(Cell::new(0)));
         let result = resume_with_artifact(&program, &dir, &mut host, Some(&hash));
         assert!(
@@ -9850,9 +9917,12 @@ def main():
         let dir = journal_dir("resume-torn-version");
         let mut setup = file_setup(&dir);
         setup.intended_software_version = Some(b"SW-2.0".to_vec());
-        drop(JobJournal::create(setup, None).unwrap());
+        drop(JobJournal::create(setup, None, &test_content()).unwrap());
         let file = journal_file(&dir);
         let mut bytes = std::fs::read(&file).unwrap();
+        // The job content, the creation prefix's last record, is not part of this case: the
+        // file is cut back to the version frame, which is then the last frame and damaged.
+        crate::journal::without_job_content(&mut bytes);
         let damaged = bytes.len() - 3;
         bytes[damaged..].fill(0);
         std::fs::write(&file, &bytes).unwrap();
@@ -10514,7 +10584,7 @@ def main():
             prepare_first(&mut host);
             // A crash after a request that may not be safe to repeat: the link fails (ADR-392).
             host.link_loss = true;
-            let mut journal = JobJournal::create(setup, None).unwrap();
+            let mut journal = JobJournal::create(setup, None, &test_content()).unwrap();
             let result = run_on(
                 program,
                 &mut host,
@@ -10657,7 +10727,7 @@ def main():
     fn interrupted_at_erase(program: &Program, erase: u32, dir: &std::path::Path) -> FlashHost {
         let mut host = FlashHost::new(Rc::new(Cell::new(0)));
         host.lose_routine = Some(0xFF00);
-        let mut journal = JobJournal::create(file_setup(dir), None).unwrap();
+        let mut journal = JobJournal::create(file_setup(dir), None, &test_content()).unwrap();
         let result = run_on(
             program,
             &mut host,
@@ -11582,6 +11652,7 @@ def main():
             Some(&target()),
             None,
             None,
+            &test_content(),
             &dir_slot(&dir),
         )
         .expect("the restarted job completes");
@@ -11705,7 +11776,7 @@ def main():
         setup.sources = table();
         let mut host = FlashHost::new(Rc::new(Cell::new(0)));
         host.lose_routine = Some(0xFF00);
-        let mut journal = JobJournal::create(setup, None).unwrap();
+        let mut journal = JobJournal::create(setup, None, &test_content()).unwrap();
         let first = run_on(
             &program,
             &mut host,
@@ -11732,6 +11803,7 @@ def main():
             Some(&target()),
             None,
             None,
+            &test_content(),
             &dir_slot(&dir),
         )
         .expect("the restarted job completes");
@@ -11778,8 +11850,15 @@ def main():
         };
         for documented in [true, false] {
             let dir = journal_dir("resume-entry-document-table");
-            // The first read is not safe to repeat and completed; the run stopped after it.
-            cancelled_after(&program, &dir, Some(TARGET_VIN), 0x22);
+            let job = if documented {
+                with_document(&program)
+            } else {
+                Job::from(program.clone())
+            };
+            // The first read is not safe to repeat and completed; the run stopped after it. The
+            // journal is created with this job's own content, as the entry point would.
+            let content = job_content(&program, job.document.as_ref()).unwrap();
+            cancelled_after_as(&program, &dir, Some(TARGET_VIN), 0x22, &content);
             let state = Journal::read(&dir, &job_key()).unwrap();
             assert!(
                 matches!(
@@ -11789,11 +11868,6 @@ def main():
                 "{:?}",
                 restart::classify(&program, Ok(&state))
             );
-            let job = if documented {
-                with_document(&program)
-            } else {
-                Job::from(program.clone())
-            };
             let mut setup = file_setup(&dir);
             setup.sources = crate::inputs::ServiceSources::default();
             let (client, calls) = fake_worker(false).await;
@@ -11950,6 +12024,7 @@ def main():
             Some(&target()),
             None,
             None,
+            &test_content(),
             &dir_slot(&dir),
         );
         let state = result.expect("the redone transfer completes the job");
@@ -12003,6 +12078,7 @@ def main():
             Some(&target()),
             None,
             None,
+            &test_content(),
             &dir_slot(&dir),
         );
         let state = result.expect("the redone transfer completes within its own budget");
@@ -12038,6 +12114,7 @@ def main():
             Some(&target()),
             None,
             None,
+            &test_content(),
             &dir_slot(&dir),
         );
         assert!(matches!(result, Err(JobError::StepLimit(_))), "{result:?}");
@@ -12074,6 +12151,7 @@ def main():
             Some(&target()),
             None,
             None,
+            &test_content(),
             &dir_slot(&dir),
         );
         let state = result.expect("the plain start completes within its own budget");
@@ -12106,6 +12184,7 @@ def main():
             Some(&target()),
             None,
             None,
+            &test_content(),
             &dir_slot(&dir),
         );
         assert_eq!(from_the_erase(&host), [Sent::Routine(0xFF00)]);
@@ -12163,6 +12242,7 @@ def main():
             Some(&target()),
             None,
             None,
+            &test_content(),
             &dir_slot(&dir),
         );
         assert!(
@@ -12207,6 +12287,7 @@ def main():
             Some(&target()),
             None,
             None,
+            &test_content(),
             &dir_slot(&dir),
         );
         assert!(result.is_ok(), "{result:?}");
@@ -12245,6 +12326,7 @@ def main():
             Some(&target()),
             None,
             None,
+            &test_content(),
             &dir_slot(&dir),
         );
         assert!(matches!(result, Err(JobError::Host { .. })), "{result:?}");
@@ -12504,7 +12586,7 @@ def main():
         setup.intended_software_version = Some(b"SW02".to_vec());
         let mut host = FlashHost::new(Rc::new(Cell::new(0)));
         prepare(&mut host);
-        let mut journal = JobJournal::create(setup, None).unwrap();
+        let mut journal = JobJournal::create(setup, None, &test_content()).unwrap();
         let result = run_on(
             program,
             &mut host,
@@ -13455,7 +13537,7 @@ def main():
             setup.intended_software_version = Some(b"SW02".to_vec());
             let mut host = FlashHost::new(Rc::new(Cell::new(0)));
             lose_after_plan(&mut host);
-            let mut journal = JobJournal::create(setup, None).unwrap();
+            let mut journal = JobJournal::create(setup, None, &test_content()).unwrap();
             let result = run_on(
                 &program,
                 &mut host,
@@ -13488,7 +13570,7 @@ def main():
             setup.intended_software_version = Some(b"SW02".to_vec());
             let mut host = FlashHost::new(Rc::new(Cell::new(0)));
             lose_after_plan(&mut host);
-            let mut journal = JobJournal::create(setup, None).unwrap();
+            let mut journal = JobJournal::create(setup, None, &test_content()).unwrap();
             let _ = run_on(
                 &program,
                 &mut host,
@@ -14575,7 +14657,8 @@ def main():
                 commits: Rc::clone(&commits),
                 fail_at,
             };
-            let mut inner = crate::journal::Journal::on_store(store, job_key());
+            let mut inner = crate::journal::Journal::on_store(store, job_key())
+                .with_job_content(test_content());
             inner.commit_target_vin(&target()).unwrap();
             let mut journal = JobJournal::new(inner, identity_sources());
             let result = run_on(
@@ -14680,7 +14763,7 @@ def main():
         let mut host = FlashHost::new(Rc::new(Cell::new(0)));
         host.vin = None;
         host.cancel_on_vin_read = Some((1, Arc::clone(&cancelled)));
-        let mut journal = JobJournal::create(file_setup(&dir), None).unwrap();
+        let mut journal = JobJournal::create(file_setup(&dir), None, &test_content()).unwrap();
         let result = run_on(
             &program,
             &mut host,
@@ -14734,7 +14817,7 @@ def main():
         };
         let mut setup = file_setup(&dir);
         setup.intended_software_version = Some(b"SW02".to_vec());
-        let mut journal = JobJournal::create(setup, None).unwrap();
+        let mut journal = JobJournal::create(setup, None, &test_content()).unwrap();
         let mut host = FlashHost::new(Rc::new(Cell::new(0)));
         let result = run_on(
             &program,
@@ -14747,8 +14830,8 @@ def main():
         assert_eq!(host.sent(), []);
         drop(journal);
         let state = Journal::read(&dir, &job_key()).unwrap();
-        // The VIN, the version, the run start and the run's stop (ADR-288).
-        assert_eq!(state.records, 4);
+        // The VIN, the version, the job content, the run start and the run's stop (ADR-288).
+        assert_eq!(state.records, 5);
         assert_eq!(
             state.facts.run_stopped,
             Some(StoppedRun {
@@ -14776,7 +14859,8 @@ def main():
             commits: Rc::clone(&commits),
             fail_at: Some(1),
         };
-        let journal = crate::journal::Journal::on_store(store, job_key());
+        let journal =
+            crate::journal::Journal::on_store(store, job_key()).with_job_content(test_content());
         let mut host = FlashHost::new(Rc::clone(&commits));
         let result = resume_to_erase(
             &program,
@@ -14819,7 +14903,7 @@ def main():
         assert_eq!(host.sent(), []);
         assert!(host.session_reads.is_empty());
 
-        drop(Journal::create(&dir, &job_key(), None, None, None).unwrap());
+        drop(Journal::create(&dir, &job_key(), None, None, None, &test_content()).unwrap());
         std::fs::write(journal_file(&dir), b"not a journal").unwrap();
         let result = resume(&program, &dir, &mut host, false);
         assert!(
@@ -22477,7 +22561,12 @@ def main():
         let mut host = FlashHost::new(Rc::new(Cell::new(0)));
         host.fail_service = Some((0x3E, [vci_lost()].into()));
         host.reopen_script = [ReopenAttempt::Opened].into();
-        let mut journal = JobJournal::create(file_setup_for(&dir, Some(TARGET_VIN)), None).unwrap();
+        let mut journal = JobJournal::create(
+            file_setup_for(&dir, Some(TARGET_VIN)),
+            None,
+            &test_content(),
+        )
+        .unwrap();
         run_on(
             &program,
             &mut host,
@@ -22532,7 +22621,12 @@ def main():
         host.fail_service = Some((0x3E, [vci_lost()].into()));
         host.reopen_script = [ReopenAttempt::Opened].into();
         host.vin_script = [IdAnswer::value("WDB99999999999999")].into();
-        let mut journal = JobJournal::create(file_setup_for(&dir, Some(TARGET_VIN)), None).unwrap();
+        let mut journal = JobJournal::create(
+            file_setup_for(&dir, Some(TARGET_VIN)),
+            None,
+            &test_content(),
+        )
+        .unwrap();
         let result = run_on(
             &program,
             &mut host,
@@ -22572,7 +22666,12 @@ def main():
         ));
         host.reopen_script = [ReopenAttempt::Opened].into();
         host.vin_script = [IdAnswer::value("WDB99999999999999")].into();
-        let mut journal = JobJournal::create(file_setup_for(&dir, Some(TARGET_VIN)), None).unwrap();
+        let mut journal = JobJournal::create(
+            file_setup_for(&dir, Some(TARGET_VIN)),
+            None,
+            &test_content(),
+        )
+        .unwrap();
         let result = run_on(
             &program,
             &mut host,
@@ -22606,7 +22705,12 @@ def main():
         host.fail_service = Some((0x3E, [vci_lost()].into()));
         host.reopen_script = [ReopenAttempt::Opened].into();
         host.vin_script = [IdAnswer::Refuse].into();
-        let mut journal = JobJournal::create(file_setup_for(&dir, Some(TARGET_VIN)), None).unwrap();
+        let mut journal = JobJournal::create(
+            file_setup_for(&dir, Some(TARGET_VIN)),
+            None,
+            &test_content(),
+        )
+        .unwrap();
         let result = run_on(
             &program,
             &mut host,
@@ -22639,8 +22743,12 @@ def main():
             host.fail_service = Some((0x3E, [vci_lost()].into()));
             host.reopen_script = [ReopenAttempt::Opened].into();
             host.vin_script = [answer].into();
-            let mut journal =
-                JobJournal::create(file_setup_for(&dir, Some(TARGET_VIN)), None).unwrap();
+            let mut journal = JobJournal::create(
+                file_setup_for(&dir, Some(TARGET_VIN)),
+                None,
+                &test_content(),
+            )
+            .unwrap();
             let result = run_on(
                 &program,
                 &mut host,
@@ -22698,7 +22806,12 @@ def main():
         let mut host = FlashHost::new(Rc::new(Cell::new(0)));
         host.fail_service = Some((0x3E, [vci_lost(), vci_lost()].into()));
         host.reopen_after = ReopenAttempt::Opened;
-        let mut journal = JobJournal::create(file_setup_for(&dir, Some(TARGET_VIN)), None).unwrap();
+        let mut journal = JobJournal::create(
+            file_setup_for(&dir, Some(TARGET_VIN)),
+            None,
+            &test_content(),
+        )
+        .unwrap();
         let result = run_on(
             &program,
             &mut host,
@@ -25872,6 +25985,715 @@ def main():
                 assert_eq!(error_entries(&lines).len(), 1, "{lines:?}");
                 std::fs::remove_dir_all(&dir).unwrap();
             }
+        }
+    }
+
+    /// What a restart does with the job content its journal records (ADR-485).
+    mod job_content {
+        use super::*;
+        use crate::document::tests::{document_of, read_service};
+        use diag_ir::declaration::DataKind;
+        use sha2::Digest;
+
+        const RECORDED: JobContent = JobContent::Program([0x5a; 32]);
+
+        fn refused(result: &Result<VmState, JobError>) -> bool {
+            matches!(
+                result,
+                Err(JobError::OnSiteInterventionRequired(
+                    OnSiteReason::JobContentDiffers
+                ))
+            )
+        }
+
+        fn bytes_of(dir: &std::path::Path) -> Vec<u8> {
+            std::fs::read(journal_file(dir)).unwrap()
+        }
+
+        /// A first run of `program` whose journal is created with `content` and whose erase
+        /// response is lost, so the job is interrupted inside its transfer.
+        fn interrupted_with(program: &Program, dir: &std::path::Path, content: &JobContent) {
+            let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+            host.lose_routine = Some(0xFF00);
+            let mut journal = JobJournal::create(file_setup(dir), None, content).unwrap();
+            let result = run_on(
+                program,
+                &mut host,
+                JobLimits::default(),
+                &AtomicBool::new(false),
+                Some(&mut journal),
+            );
+            assert!(
+                matches!(result, Err(JobError::Host { pc: ERASE, .. })),
+                "{result:?}"
+            );
+        }
+
+        /// What an agent before ADR-485 left: the same interrupted run, in a journal whose
+        /// creation prefix has no content record.
+        fn interrupted_without_content(program: &Program, dir: &std::path::Path) {
+            drop(JobJournal::create(file_setup(dir), None, &RECORDED).unwrap());
+            let file = journal_file(dir);
+            let mut bytes = std::fs::read(&file).unwrap();
+            crate::journal::without_job_content(&mut bytes);
+            std::fs::write(&file, &bytes).unwrap();
+            let opened = Journal::open(dir, &job_key()).unwrap();
+            assert_eq!(opened.state().job_content, None);
+            let mut journal = JobJournal::new(opened, identity_sources());
+            let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+            host.lose_routine = Some(0xFF00);
+            let result = run_on(
+                program,
+                &mut host,
+                JobLimits::default(),
+                &AtomicBool::new(false),
+                Some(&mut journal),
+            );
+            assert!(
+                matches!(result, Err(JobError::Host { pc: ERASE, .. })),
+                "{result:?}"
+            );
+        }
+
+        /// A resume of the job in `dir` that is given `content`, naming the job's VIN.
+        fn resume_given(
+            program: &Program,
+            dir: &std::path::Path,
+            host: &mut FlashHost,
+            content: &JobContent,
+        ) -> Result<VmState, JobError> {
+            resume_to_erase_with(
+                program,
+                host,
+                JobLimits::default(),
+                &AtomicBool::new(false),
+                Journal::open(dir, &job_key()),
+                identity_sources(),
+                Some(&target()),
+                None,
+                None,
+                content,
+                &dir_slot(dir),
+            )
+        }
+
+        /// Nothing sent, no identity or voltage read, no resume counted, and the journal's bytes
+        /// as they were.
+        fn assert_refused_untouched(host: &FlashHost, dir: &std::path::Path, before: &[u8]) {
+            assert_eq!(host.sent(), []);
+            assert!(host.session_reads.is_empty());
+            assert_eq!(host.voltage_reads, 0);
+            assert_eq!(resumes(dir), 0);
+            assert_eq!(bytes_of(dir), before);
+        }
+
+        /// The job's own content goes on to the gates, for either kind.
+        #[test]
+        fn a_resume_given_the_recorded_content_goes_on() {
+            let program = flash_program();
+            for content in [JobContent::Document([1; 32]), JobContent::Program([1; 32])] {
+                let dir = journal_dir("content-same");
+                interrupted_with(&program, &dir, &content);
+                let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+                let result = resume_given(&program, &dir, &mut host, &content);
+                assert_eq!(
+                    teardown_of(&result),
+                    restart::Teardown::Reset,
+                    "{content:?}"
+                );
+                assert_eq!(resumes(&dir), 1);
+                std::fs::remove_dir_all(&dir).unwrap();
+            }
+        }
+
+        /// Another hash, or the other kind (also with the same 32 bytes), is refused, with
+        /// nothing sent and the journal untouched.
+        #[test]
+        fn a_resume_given_other_content_is_refused_untouched() {
+            let program = flash_program();
+            let h = [1u8; 32];
+            let other = [2u8; 32];
+            let cases = [
+                (
+                    "document, other hash",
+                    JobContent::Document(h),
+                    JobContent::Document(other),
+                ),
+                (
+                    "document, program of the same bytes",
+                    JobContent::Document(h),
+                    JobContent::Program(h),
+                ),
+                (
+                    "program, other hash",
+                    JobContent::Program(h),
+                    JobContent::Program(other),
+                ),
+                (
+                    "program, document of the same bytes",
+                    JobContent::Program(h),
+                    JobContent::Document(h),
+                ),
+            ];
+            for (name, recorded, given) in cases {
+                let dir = journal_dir("content-differs");
+                interrupted_with(&program, &dir, &recorded);
+                let before = bytes_of(&dir);
+                let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+                let result = resume_given(&program, &dir, &mut host, &given);
+                assert!(refused(&result), "{name}: {result:?}");
+                assert_refused_untouched(&host, &dir, &before);
+                // The journal still holds the first job's content, which is not refused.
+                let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+                let result = resume_given(&program, &dir, &mut host, &recorded);
+                assert_eq!(teardown_of(&result), restart::Teardown::Reset, "{name}");
+                std::fs::remove_dir_all(&dir).unwrap();
+            }
+        }
+
+        /// A journal without the record (an older agent's) is refused for either kind, with
+        /// the journal untouched.
+        #[test]
+        fn a_journal_without_content_is_refused_for_either_kind() {
+            let program = flash_program();
+            for given in [JobContent::Document([1; 32]), JobContent::Program([1; 32])] {
+                let dir = journal_dir("content-absent");
+                interrupted_without_content(&program, &dir);
+                let before = bytes_of(&dir);
+                let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+                let result = resume_given(&program, &dir, &mut host, &given);
+                assert!(refused(&result), "{given:?}: {result:?}");
+                assert_refused_untouched(&host, &dir, &before);
+                std::fs::remove_dir_all(&dir).unwrap();
+            }
+        }
+
+        /// A creation write whose last frame, the content, is damaged reads back without it, and
+        /// every resume is then refused, the job's own content included (ADR-485 item 5).
+        #[test]
+        fn a_torn_content_frame_makes_every_resume_differ() {
+            let program = flash_program();
+            let dir = journal_dir("content-torn");
+            drop(JobJournal::create(file_setup(&dir), None, &RECORDED).unwrap());
+            let file = journal_file(&dir);
+            let mut bytes = std::fs::read(&file).unwrap();
+            let damaged = bytes.len() - 3;
+            bytes[damaged..].fill(0);
+            std::fs::write(&file, &bytes).unwrap();
+            assert_eq!(Journal::read(&dir, &job_key()).unwrap().job_content, None);
+            let before = bytes_of(&dir);
+            let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+            let result = resume_given(&program, &dir, &mut host, &RECORDED);
+            assert!(refused(&result), "{result:?}");
+            assert_eq!(host.sent(), []);
+            // The open cut the damaged frame off, and nothing else changed.
+            assert!(bytes_of(&dir).len() < before.len());
+            assert_eq!(resumes(&dir), 0);
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+
+        /// A journal that holds only its creation prefix, nothing sent, is refused when the
+        /// content differs and starts the job again when it is equal.
+        #[test]
+        fn a_creation_prefix_alone_is_refused_when_the_content_differs() {
+            let program = flash_program();
+            let dir = journal_dir("content-prefix-only");
+            drop(JobJournal::create(file_setup(&dir), None, &RECORDED).unwrap());
+            let before = bytes_of(&dir);
+            let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+            let result = resume_given(&program, &dir, &mut host, &JobContent::Program([0; 32]));
+            assert!(refused(&result), "{result:?}");
+            assert_refused_untouched(&host, &dir, &before);
+            let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+            let result = resume_given(&program, &dir, &mut host, &RECORDED);
+            assert!(!refused(&result), "{result:?}");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+
+        /// The check holds at every restart point: a checkpoint resume of a plain procedure, a
+        /// restart in the transfer (the tests above), and one whose post-transfer steps are
+        /// complete; each of them goes on when the content is equal.
+        #[test]
+        fn the_check_holds_at_a_checkpoint_resume_and_after_the_transfer_completed() {
+            let other = JobContent::Document([9; 32]);
+            // A checkpoint resume.
+            let program = plain_steps(&[(0x22, Unsafe), (0x22, Safe)]);
+            let dir = journal_dir("content-checkpoint");
+            cancelled_after_as(&program, &dir, Some(TARGET_VIN), 0x22, &RECORDED);
+            let state = Journal::read(&dir, &job_key()).unwrap();
+            assert!(matches!(
+                restart::classify(&program, Ok(&state)),
+                RestartDecision::ResumeFromCheckpoint(_)
+            ));
+            let before = bytes_of(&dir);
+            let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+            let result = resume_given(&program, &dir, &mut host, &other);
+            assert!(refused(&result), "{result:?}");
+            assert_refused_untouched(&host, &dir, &before);
+            let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+            let result = resume_given(&program, &dir, &mut host, &RECORDED);
+            assert!(!refused(&result), "{result:?}");
+            std::fs::remove_dir_all(&dir).unwrap();
+            // The post-transfer steps are complete.
+            let program = completed_path_program();
+            let dir = journal_dir("content-completed");
+            let result = first_run(&program, &dir, JobLimits::default(), |host| {
+                host.lose_routine = Some(0xFF02);
+            });
+            assert!(result.is_err(), "{result:?}");
+            let before = bytes_of(&dir);
+            let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+            let result = resume_given(&program, &dir, &mut host, &other);
+            assert!(refused(&result), "{result:?}");
+            assert_refused_untouched(&host, &dir, &before);
+            let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+            let result = resume_given(&program, &dir, &mut host, &RECORDED);
+            assert_eq!(teardown_of(&result), restart::Teardown::CompletedPath);
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+
+        /// The comparison comes after the VIN and the version, which keep their own reasons, and
+        /// before the classification: an on-site decision of the classification does not hide
+        /// it, and a later resume with the original content gets the original reason back.
+        #[test]
+        fn the_content_comes_after_the_vin_and_version_and_before_the_classification() {
+            let program = flash_program();
+            let other = JobContent::Program([0; 32]);
+            let reason_of = |result: Result<VmState, JobError>| match result {
+                Err(JobError::OnSiteInterventionRequired(reason)) => reason,
+                other => panic!("{other:?}"),
+            };
+            // The VIN, then the version, are named first.
+            let dir = journal_dir("content-order");
+            interrupted_naming(&program, &dir, Some(TARGET_VIN), Some(b"SW-2.0"));
+            let resume_naming_given = |vin: Option<&str>, version: Option<&[u8]>, content| {
+                let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+                let result = resume_to_erase_with(
+                    &program,
+                    &mut host,
+                    JobLimits::default(),
+                    &AtomicBool::new(false),
+                    Journal::open(&dir, &job_key()),
+                    identity_sources(),
+                    vin.map(|vin| crate::journal::Vin::new(vin.to_owned()))
+                        .as_ref(),
+                    version,
+                    None,
+                    content,
+                    &dir_slot(&dir),
+                );
+                assert_eq!(host.sent(), []);
+                result
+            };
+            assert_eq!(
+                reason_of(resume_naming_given(None, Some(b"SW-2.0"), &other)),
+                OnSiteReason::TargetVinDiffers
+            );
+            assert_eq!(
+                reason_of(resume_naming_given(
+                    Some(TARGET_VIN),
+                    Some(b"SW-3.0"),
+                    &other
+                )),
+                OnSiteReason::IntendedVersionDiffers
+            );
+            assert_eq!(
+                reason_of(resume_naming_given(
+                    Some(TARGET_VIN),
+                    Some(b"SW-2.0"),
+                    &other
+                )),
+                OnSiteReason::JobContentDiffers
+            );
+            std::fs::remove_dir_all(&dir).unwrap();
+            // A job cancelled before its plan is on-site for its own reason; a differing
+            // content is reported instead, and the original reason comes back with the original.
+            let dir = journal_dir("content-keeps-classification");
+            let result = first_run_cancelled_on(&program, &dir, JobLimits::default(), 0x10, |_| {});
+            assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+            let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+            let original = reason_of(resume_given(&program, &dir, &mut host, &test_content()));
+            assert_ne!(original, OnSiteReason::JobContentDiffers);
+            let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+            let result = resume_given(&program, &dir, &mut host, &other);
+            assert!(refused(&result), "{result:?}");
+            let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+            let again = reason_of(resume_given(&program, &dir, &mut host, &test_content()));
+            assert_eq!(again, original);
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+
+        /// A declared failure the journal records is final, whatever the content is.
+        #[test]
+        fn a_recorded_failure_is_reported_before_a_differing_content() {
+            let program = flash_program_failing_after_the_erase();
+            let dir = journal_dir("content-terminal");
+            interrupted(&program, &dir);
+            // The whole restart, the erase included, records the declared failure.
+            let run = |content: &JobContent| {
+                let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+                let result = resume_on(
+                    &program,
+                    &mut host,
+                    JobLimits::default(),
+                    &AtomicBool::new(false),
+                    Journal::open(&dir, &job_key()),
+                    identity_sources(),
+                    Some(&target()),
+                    None,
+                    None,
+                    content,
+                    &dir_slot(&dir),
+                );
+                (result, host)
+            };
+            let (result, _) = run(&test_content());
+            assert!(
+                matches!(&result, Err(JobError::ProcedureFailed { .. })),
+                "{result:?}"
+            );
+            assert!(
+                Journal::read(&dir, &job_key())
+                    .unwrap()
+                    .facts
+                    .procedure_failed
+                    .is_some()
+            );
+            for content in [test_content(), JobContent::Document([0; 32])] {
+                let (result, host) = run(&content);
+                assert!(
+                    matches!(&result, Err(JobError::ProcedureFailed { .. })),
+                    "{content:?}: {result:?}"
+                );
+                assert_eq!(host.sent(), []);
+            }
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+
+        /// A journal without the record that holds a terminal record keeps its verdict: the
+        /// terminal error is reported, not a differing content.
+        #[test]
+        fn a_journal_without_content_keeps_its_terminal_verdict() {
+            let program = flash_program_failing_after_the_erase();
+            let dir = journal_dir("content-absent-terminal");
+            drop(JobJournal::create(file_setup(&dir), None, &RECORDED).unwrap());
+            let file = journal_file(&dir);
+            let mut bytes = std::fs::read(&file).unwrap();
+            crate::journal::without_job_content(&mut bytes);
+            std::fs::write(&file, &bytes).unwrap();
+            let opened = Journal::open(&dir, &job_key()).unwrap();
+            let mut journal = JobJournal::new(opened, identity_sources());
+            let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+            let result = run_on(
+                &program,
+                &mut host,
+                JobLimits::default(),
+                &AtomicBool::new(false),
+                Some(&mut journal),
+            );
+            assert!(
+                matches!(result, Err(JobError::ProcedureFailed { .. })),
+                "{result:?}"
+            );
+            drop(journal);
+            let state = Journal::read(&dir, &job_key()).unwrap();
+            assert!(state.facts.procedure_failed.is_some());
+            assert_eq!(state.job_content, None);
+            for content in [RECORDED, JobContent::Document([0; 32])] {
+                let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+                let result = resume_given(&program, &dir, &mut host, &content);
+                assert!(
+                    matches!(&result, Err(JobError::ProcedureFailed { .. })),
+                    "{content:?}: {result:?}"
+                );
+                assert_eq!(host.sent(), []);
+            }
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+
+        /// A differing content is refused before the artifact is compared, in both the
+        /// refusal before a plan and the on-site ending from it.
+        #[test]
+        fn a_differing_content_hides_a_differing_artifact() {
+            let program = flash_program();
+            let (first, other) = (artifact_hash(1), artifact_hash(2));
+            let differing = JobContent::Document([9; 32]);
+            let given = |dir: &std::path::Path, artifact: &[u8; SHA256_LEN], content| {
+                let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+                resume_to_erase_with(
+                    &program,
+                    &mut host,
+                    JobLimits::default(),
+                    &AtomicBool::new(false),
+                    Journal::open(dir, &job_key()),
+                    identity_sources(),
+                    Some(&target()),
+                    None,
+                    Some(artifact),
+                    content,
+                    &dir_slot(dir),
+                )
+            };
+            // Before a plan: the journal holds only its creation prefix.
+            let dir = journal_dir("content-artifact-early");
+            drop(JobJournal::create(file_setup(&dir), Some(&first), &RECORDED).unwrap());
+            let result = given(&dir, &other, &differing);
+            assert!(refused(&result), "{result:?}");
+            let result = given(&dir, &other, &RECORDED);
+            assert!(
+                matches!(result, Err(JobError::ArtifactDiffersFromJournal)),
+                "{result:?}"
+            );
+            std::fs::remove_dir_all(&dir).unwrap();
+            // From the plan on.
+            let dir = journal_dir("content-artifact-late");
+            interrupted_with_artifact(&program, &dir, &first);
+            let result = given(&dir, &other, &differing);
+            assert!(refused(&result), "{result:?}");
+            let result = given(&dir, &other, &RECORDED);
+            assert!(
+                matches!(
+                    result,
+                    Err(JobError::OnSiteInterventionRequired(
+                        OnSiteReason::ArtifactDiffers
+                    ))
+                ),
+                "{result:?}"
+            );
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+
+        fn interrupted_with_artifact(
+            program: &Program,
+            dir: &std::path::Path,
+            artifact: &[u8; SHA256_LEN],
+        ) {
+            first_run_with_artifact(program, dir, Some(artifact), true, None).unwrap_err();
+        }
+
+        /// A differing content is refused before the resume limit and the supply voltage are
+        /// looked at: nothing is counted and the voltage is not read.
+        #[test]
+        fn a_differing_content_is_refused_before_the_limit_and_the_voltage() {
+            let program = flash_program_with_voltage();
+            let other = JobContent::Document([9; 32]);
+            let dir = journal_dir("content-limit");
+            interrupted(&program, &dir);
+            let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+            host.voltage = Some(12_600);
+            let result = resume(&program, &dir, &mut host, false);
+            assert_eq!(teardown_of(&result), restart::Teardown::Reset);
+            assert_eq!(resumes(&dir), 1);
+            // The plan allows one resume, and it is used up; the voltage is out of range too.
+            let before = bytes_of(&dir);
+            let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+            host.voltage = Some(1);
+            let result = resume_given(&program, &dir, &mut host, &other);
+            assert!(refused(&result), "{result:?}");
+            assert_eq!(host.sent(), []);
+            assert!(host.session_reads.is_empty());
+            assert_eq!(host.voltage_reads, 0);
+            assert_eq!(resumes(&dir), 1);
+            assert_eq!(bytes_of(&dir), before);
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+
+        fn sha256_of_postcard(program: &Program) -> [u8; 32] {
+            sha2::Sha256::digest(postcard::to_allocvec(program).unwrap()).into()
+        }
+
+        /// The entry points bind a program-only job to the hash of its encoding: the first run
+        /// records it, a resume with another program is refused before anything reaches the
+        /// worker, and so is a document job whose procedure is that very program.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_entry_points_bind_a_program_only_job_to_its_programs_hash() {
+            let dir = journal_dir("entry-content-program");
+            let config = LinkConfig::iso15765(0x7E0, 0x7E8);
+            let original = program(Vec::new());
+            let (client, _calls) = fake_worker(false).await;
+            run_program_journaled(
+                client,
+                &config,
+                original.clone(),
+                JobLimits::default(),
+                file_setup_for(&dir, None),
+                vci_only_guards("entry-content-program-run"),
+            )
+            .await
+            .result
+            .expect("the job runs");
+            let state = Journal::read(&dir, &job_key()).unwrap();
+            assert_eq!(
+                state.job_content,
+                Some(JobContent::Program(sha256_of_postcard(&original)))
+            );
+            let before = bytes_of(&dir);
+            let procedure = postcard::to_allocvec(&original).unwrap();
+            let as_document = Job::from_document(
+                JobDocument::new(document_of(
+                    vec![read_service(
+                        1,
+                        "readVin",
+                        [0xF1, 0x90],
+                        DataKind::Ascii,
+                        17,
+                    )],
+                    Some(procedure),
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+            for (name, job) in [
+                (
+                    "another program",
+                    Job::from(program(vec![Op::PushI64(1), Op::Pop])),
+                ),
+                ("a document of the same program", as_document),
+            ] {
+                let (client, calls) = fake_worker(false).await;
+                let JobRun { result, guards, .. } = resume_program_journaled(
+                    client,
+                    &config,
+                    job,
+                    JobLimits::default(),
+                    file_setup_for(&dir, None),
+                    vci_only_guards("entry-content-program-resume"),
+                )
+                .await;
+                assert!(refused(&result), "{name}: {result:?}");
+                // The guards come back as given, and no vehicle lock was taken.
+                assert!(!guards.holds_slot() && !guards.link_unconfirmed(), "{name}");
+                assert!(!guards.holds_vehicle(), "{name}");
+                assert!(
+                    !calls.lock().unwrap().contains(&"StartComPrimitive"),
+                    "{name}: {:?}",
+                    calls.lock().unwrap()
+                );
+                assert_eq!(bytes_of(&dir), before, "{name}");
+            }
+            // The same program is not refused.
+            let (client, _calls) = fake_worker(false).await;
+            let JobRun {
+                result,
+                guards: _guards,
+                ..
+            } = resume_program_journaled(
+                client,
+                &config,
+                original,
+                JobLimits::default(),
+                file_setup_for(&dir, None),
+                vci_only_guards("entry-content-program-same"),
+            )
+            .await;
+            assert!(!refused(&result), "{result:?}");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+
+        /// The entry points bind a document job to the hash of the document's bytes: a document
+        /// with the same procedure and declarations but other bytes is refused, and so is a
+        /// program-only job running that procedure.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_entry_points_bind_a_document_job_to_its_documents_hash() {
+            let dir = journal_dir("entry-content-document");
+            let config = LinkConfig::iso15765(0x7E0, 0x7E8);
+            let original = program(Vec::new());
+            let procedure = postcard::to_allocvec(&original).unwrap();
+            let document = |name: &str| {
+                JobDocument::new(document_of(
+                    vec![read_service(1, name, [0xF1, 0x90], DataKind::Ascii, 17)],
+                    Some(procedure.clone()),
+                ))
+                .unwrap()
+            };
+            let first = document("readVin");
+            let (client, _calls) = fake_worker(false).await;
+            run_program_journaled(
+                client,
+                &config,
+                Job::from_document(first.clone()).unwrap(),
+                JobLimits::default(),
+                file_setup_for(&dir, None),
+                vci_only_guards("entry-content-document-run"),
+            )
+            .await
+            .result
+            .expect("the job runs");
+            let state = Journal::read(&dir, &job_key()).unwrap();
+            assert_eq!(
+                state.job_content,
+                Some(JobContent::Document(first.sha256()))
+            );
+            let reconverted = document("readVin2");
+            assert_ne!(reconverted.sha256(), first.sha256());
+            let before = bytes_of(&dir);
+            for (name, job) in [
+                (
+                    "a re-converted document",
+                    Job::from_document(reconverted).unwrap(),
+                ),
+                ("a program only", Job::from(original)),
+            ] {
+                let (client, calls) = fake_worker(false).await;
+                let JobRun { result, guards, .. } = resume_program_journaled(
+                    client,
+                    &config,
+                    job,
+                    JobLimits::default(),
+                    file_setup_for(&dir, None),
+                    vci_only_guards("entry-content-document-resume"),
+                )
+                .await;
+                assert!(refused(&result), "{name}: {result:?}");
+                // The guards come back as given, and no vehicle lock was taken.
+                assert!(!guards.holds_slot() && !guards.link_unconfirmed(), "{name}");
+                assert!(!guards.holds_vehicle(), "{name}");
+                assert!(
+                    !calls.lock().unwrap().contains(&"StartComPrimitive"),
+                    "{name}"
+                );
+                assert_eq!(bytes_of(&dir), before, "{name}");
+            }
+            let (client, _calls) = fake_worker(false).await;
+            let JobRun {
+                result,
+                guards: _guards,
+                ..
+            } = resume_program_journaled(
+                client,
+                &config,
+                Job::from_document(first).unwrap(),
+                JobLimits::default(),
+                file_setup_for(&dir, None),
+                vci_only_guards("entry-content-document-same"),
+            )
+            .await;
+            assert!(!refused(&result), "{result:?}");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+
+        /// An unreadable journal keeps its own reason whatever the content is.
+        #[test]
+        fn an_unreadable_journal_is_reported_as_such_not_as_a_differing_content() {
+            let program = flash_program();
+            let dir = journal_dir("content-unreadable");
+            interrupted_with(&program, &dir, &RECORDED);
+            let file = journal_file(&dir);
+            let mut bytes = std::fs::read(&file).unwrap();
+            bytes[8] ^= 0xFF;
+            std::fs::write(&file, &bytes).unwrap();
+            let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+            let result = resume_given(&program, &dir, &mut host, &JobContent::Document([0; 32]));
+            assert!(
+                matches!(
+                    &result,
+                    Err(JobError::OnSiteInterventionRequired(
+                        OnSiteReason::UnreadableJournal(_)
+                    ))
+                ),
+                "{result:?}"
+            );
+            std::fs::remove_dir_all(&dir).unwrap();
         }
     }
 }

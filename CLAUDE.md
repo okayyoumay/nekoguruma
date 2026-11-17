@@ -143,7 +143,8 @@ details are in `.claude/rules/generated-code.md`, which loads when you open file
 ### Path-scoped rules
 
 Rules that matter only for part of the repository live in `.claude/rules/` and load when Claude
-reads or edits a matching file: `generated-code.md`, `worker-crates.md`, `work-folder.md`.
+reads or edits a matching file: `generated-code.md`, `worker-crates.md`, `work-folder.md`,
+`web-ui.md` (browser code consults Modern Web Guidance, ADR-490).
 Personal, uncommitted instructions go in `CLAUDE.local.md` (gitignored).
 
 ## Building and testing

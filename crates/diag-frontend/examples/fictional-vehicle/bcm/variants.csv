@@ -1,0 +1,3 @@
+id,name,part_numbers,sw_versions,note
+601,bcmStandard,MK-BCM-0001,1.0.0,Standard grade
+602,bcmPremium,MK-BCM-0002,1.0.0,Premium grade with keyless entry

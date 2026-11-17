@@ -1,0 +1,13 @@
+service,nrc,text,retryable
+,0x12,nrc.subFunctionNotSupported,no
+,0x13,nrc.incorrectMessageLength,no
+,0x22,nrc.conditionsNotCorrect,no
+,0x24,nrc.requestSequenceError,no
+,0x31,nrc.requestOutOfRange,no
+,0x33,nrc.securityAccessDenied,no
+,0x7F,nrc.serviceNotSupportedInSession,no
+,0x34,nrc.authenticationRequired,no
+securityAccess,0x35,nrc.invalidKey,no
+securityAccess,0x36,nrc.exceededAttempts,no
+securityAccess,0x37,nrc.delayNotExpired,no
+steeringAngleCalibration.start,0x88,nrc.vehicleSpeedTooHigh,no

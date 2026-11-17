@@ -1,0 +1,6 @@
+conversion,lower,upper,text
+sessionName,0x01,,session.default
+sessionName,0x02,,session.programming
+sessionName,0x03,,session.extended
+lockState,0x00,,gateway.locked
+lockState,0x01,,gateway.unlocked

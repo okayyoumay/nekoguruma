@@ -1,0 +1,10 @@
+conversion,lower,upper,text
+sessionName,0x01,,session.default
+sessionName,0x02,,session.programming
+sessionName,0x03,,session.extended
+yesNo,0x00,,value.no
+yesNo,0x01,,value.yes
+calibrationState,0x00,,routine.notStarted
+calibrationState,0x01,,routine.running
+calibrationState,0x02,,routine.completed
+calibrationState,0x03,,routine.aborted

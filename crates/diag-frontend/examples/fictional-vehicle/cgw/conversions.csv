@@ -1,0 +1,4 @@
+name,kind,numerator,denominator,offset,default_text
+sessionName,text-table,,,,value.unknown
+tenMilliseconds,linear,10,1,0,
+lockState,text-table,,,,value.unknown

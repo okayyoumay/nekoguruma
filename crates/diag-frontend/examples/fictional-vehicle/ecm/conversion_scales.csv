@@ -1,0 +1,14 @@
+conversion,lower,upper,text
+sessionName,0x01,,session.default
+sessionName,0x02,,session.programming
+sessionName,0x03,,session.extended
+yesNo,0x00,,value.no
+yesNo,0x01,,value.yes
+adaptationResult,0x00,,routine.completed
+adaptationResult,0x01,0xFF,routine.failed
+learnState,0x00,,routine.notStarted
+learnState,0x01,,routine.running
+learnState,0x02,,routine.completed
+learnState,0x03,,routine.aborted
+checkResult,0x00,,check.correct
+checkResult,0x01,0xFF,check.incorrect

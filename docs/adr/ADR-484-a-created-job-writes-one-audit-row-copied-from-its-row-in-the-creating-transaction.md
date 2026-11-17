@@ -52,4 +52,4 @@ transaction it goes, and what a failed write does.
 - The detail is about 9 KiB at most (128 digests of 64 characters), plus the key ID.
 - A VIN deletion must redact `audit_log.vin`, and also `jobs.vin`, `jobs.request_hash` and
   `jobs.signed_job`, which hold the VIN or a value derived from it.
-- Rows for a job's end, approval and cancellation do not exist yet; only the start is recorded.
+- Only the start is recorded: a job's end, approval and cancellation write no row.

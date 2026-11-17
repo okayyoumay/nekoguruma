@@ -172,8 +172,7 @@ The server writes a row inside the transaction of the action, so a rolled-back a
 `tenant_id`, `operator_id`, `agent_id` and `job_id` name the job's own values; `vin` is the job's
 VIN in clear, NULL when the job has none, and is the one column a VIN deletion redacts (design
 4.3); `action` is free text with no CHECK, so a new action needs no migration; `confirmation_level`
-is the job's level; `on_site_approved` and `agent_reported_at` stay NULL until an approval and an
-agent-reported time are recorded; `offline_executed` is false; `recorded_at` is the database's
+is the job's level; `on_site_approved` and `agent_reported_at` are NULL for `jobCreated`; `offline_executed` is false; `recorded_at` is the database's
 `now()` (the job's `created_at` for `jobCreated`, since one transaction has one `now()`); `detail`
 is JSON that never holds a VIN or a value derived from it. Nothing enforces that rows are never
 updated or deleted; the server only writes them. The actions written today:

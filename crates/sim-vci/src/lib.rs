@@ -565,6 +565,9 @@ impl Bus {
             },
             Command::ReconnectEcu {} => self.change_ecu(SimEcu::reconnect),
             Command::HoldSession {} => self.change_ecu(SimEcu::hold_session),
+            Command::SetGatewayAuthentication { authenticated } => {
+                self.change_ecu(|ecu| ecu.gateway_authenticated = authenticated)
+            }
             Command::DisconnectVci {} => {
                 self.vci_present = false;
                 self.device_lost |= self.device_open;
@@ -911,7 +914,8 @@ const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// `{"command": "set_battery_voltage", "millivolts": 11500}`, `{"command": "fail_writes",
 /// "times": 1}`, `{"command": "clear_write_failures"}`, `{"command": "fail_closes", "times": 1}`,
 /// `{"command": "clear_close_failures"}`, `{"command": "crash_vci"}`,
-/// `{"command": "restart_vci"}`, `{"command": "hold_session"}`.
+/// `{"command": "restart_vci"}`, `{"command": "hold_session"}`,
+/// `{"command": "set_gateway_authentication", "authenticated": true}`.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 enum Command {
@@ -926,6 +930,10 @@ enum Command {
         #[serde(default)]
         request: Option<Vec<u8>>,
     },
+    /// Sets `SimEcu::gateway_authenticated`: what an ECU configured with `require_gateway_auth`
+    /// checks before it accepts a write, routine or download request (the simulator has no
+    /// Authentication service). Saved with the ECU's state (ADR-241).
+    SetGatewayAuthentication { authenticated: bool },
     /// `SimEcu::reconnect`: ends a power loss.
     ReconnectEcu {},
     /// Unplugs the VCI: J2534 calls return `ERR_DEVICE_NOT_CONNECTED`.

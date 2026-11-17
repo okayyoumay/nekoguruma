@@ -11,8 +11,8 @@ use diag_frontend::tables::{read_files, resolve};
 use diag_ir::declaration::{EcuVariant, load_ecu_document};
 use diag_ir::decode::{DecodedField, PhysicalValue, decode_positive_response, select_variant};
 use diag_ir::dry_run::{DryRunEnd, DryRunEvent, Script, dry_run};
-use diag_ir::encode::encode_request;
-use sim_ecu::{EcuConfig, SimEcu};
+use diag_ir::encode::{ParamValue, encode_request};
+use sim_ecu::{EcuConfig, Nrc, SimEcu, SimResponse};
 
 const MAX_STEPS: u64 = 100_000;
 
@@ -348,5 +348,247 @@ fn the_identification_procedure_runs_against_each_simulated_ecu() {
             panic!("{ecu}: the DTC records are not a list");
         };
         assert_eq!(records.len(), confirmed, "{ecu}");
+    }
+}
+
+// ------------------------------------------------------------------------- engine coding
+
+/// The ECM's coding DID (README 6.3) and the key mask of README 7.
+const CODING_DID: [u8; 2] = [0x01, 0x20];
+const ECM_KEY_MASK: u32 = 0x5A5A_5A5A;
+
+/// The ECM's DIDs the sim file declares besides the coding DID: the DID, the name of its
+/// definition and the physical value its record decodes to.
+const ECM_DIDS: [(u16, &str, f64); 7] = [
+    (0x1000, "engineSpeed", 0.0),
+    (0x1001, "coolantTemperature", 25.0),
+    (0x1002, "intakeAirTemperature", 20.0),
+    (0x1003, "vehicleSpeed", 0.0),
+    (0x1004, "throttlePosition", 5.0 * 100.0 / 255.0),
+    (0x1005, "batteryVoltage", 12.6),
+    (0x1006, "engineRunning", 0.0),
+];
+
+fn write_coding(record: [u8; 4]) -> Vec<u8> {
+    let mut request = vec![0x2E];
+    request.extend_from_slice(&CODING_DID);
+    request.extend_from_slice(&record);
+    request
+}
+
+/// The NRC of `ecu`'s negative answer to `request`; panics on any other answer.
+fn refusal(ecu: &mut SimEcu, request: &[u8]) -> Nrc {
+    match ecu.request(request) {
+        SimResponse::Negative { sid, nrc } => {
+            assert_eq!(sid, request[0], "{request:02X?}");
+            nrc
+        }
+        other => panic!("{request:02X?} was answered with {other:?}"),
+    }
+}
+
+/// Opens the extended session and unlocks security level 1 with the ECM's mask.
+fn unlock(ecu: &mut SimEcu) {
+    answer(ecu, &[0x10, 0x03]);
+    let seed = answer(ecu, &[0x27, 0x01]);
+    assert_eq!(seed.len(), 6, "{seed:02X?}");
+    let seed = u32::from_be_bytes(seed[2..6].try_into().expect("four bytes"));
+    let mut request = vec![0x27, 0x02];
+    request.extend_from_slice(&(seed ^ ECM_KEY_MASK).to_be_bytes());
+    answer(ecu, &request);
+}
+
+/// A simulated ECM that the gateway has authenticated.
+fn authenticated_ecm() -> SimEcu {
+    let mut ecu = SimEcu::new(sim_config("ecm"));
+    ecu.gateway_authenticated = true;
+    ecu
+}
+
+fn read_coding(ecu: &mut SimEcu) -> Vec<u8> {
+    let response = answer(ecu, &[0x22, 0x01, 0x20]);
+    assert_eq!(response[..3], [0x62, 0x01, 0x20]);
+    response[3..].to_vec()
+}
+
+/// The service `name` of the only variant of `document`, as its request and response.
+fn load_service<'a>(
+    loaded: &'a diag_ir::declaration::EcuDocument<'a>,
+    name: &str,
+) -> diag_ir::declaration::Service<'a> {
+    loaded
+        .variant()
+        .expect("a variant")
+        .services()
+        .into_iter()
+        .flatten()
+        .find(|service| service.short_name() == Some(name))
+        .unwrap_or_else(|| panic!("no service {name}"))
+}
+
+#[test]
+fn both_ecm_variants_declare_the_coding_did_with_its_write_conditions() {
+    let converted = convert_ecu("ecm");
+    let documents = by_variant(&converted);
+    assert_eq!(
+        documents.keys().copied().collect::<Vec<_>>(),
+        ["ecmV1", "ecmV2"]
+    );
+    for (variant, bytes) in documents {
+        let loaded = load_ecu_document(bytes).expect("the document loads");
+        let read = load_service(&loaded, "engineCoding.read");
+        let write = load_service(&loaded, "engineCoding.write");
+        // Readable in every session; writable in the extended session at security level 1.
+        assert_eq!(
+            (read.required_session(), read.required_security_level()),
+            (0, 0),
+            "{variant}"
+        );
+        assert_eq!(
+            (write.required_session(), write.required_security_level()),
+            (0x03, 0x01),
+            "{variant}"
+        );
+        // The record: market, option bits, target idle speed (4 bytes, big endian).
+        let values = HashMap::from([
+            ("market", ParamValue::Int(1)),
+            ("options", ParamValue::Int(3)),
+            ("targetIdleSpeed", ParamValue::Int(900)),
+        ]);
+        let request = write.request().expect("a request");
+        let mut message = vec![request.sid()];
+        message.extend(encode_request(&request, &values).expect("the record encodes"));
+        assert_eq!(message, write_coding([0x01, 0x03, 0x03, 0x84]), "{variant}");
+        let positive = read.positive().expect("a positive response");
+        let layouts = loaded.variant().expect("a variant").layouts();
+        let fields = decode_positive_response(
+            &positive,
+            layouts,
+            &[0x62, 0x01, 0x20, 0x00, 0x01, 0x03, 0x20],
+        )
+        .expect("the record decodes");
+        let value = |name: &str| {
+            fields
+                .iter()
+                .find(|field| field.short_name == name)
+                .unwrap_or_else(|| panic!("{variant}: no field {name}"))
+        };
+        assert_eq!(
+            value("market").value,
+            PhysicalValue::Unsigned(0),
+            "{variant}"
+        );
+        assert_ne!(value("market").text_id, 0, "{variant}: market has a text");
+        assert_eq!(
+            value("options").value,
+            PhysicalValue::Unsigned(1),
+            "{variant}"
+        );
+        assert_eq!(
+            value("targetIdleSpeed").value,
+            PhysicalValue::Unsigned(800),
+            "{variant}"
+        );
+    }
+}
+
+#[test]
+fn the_coding_did_reads_in_every_session_without_authentication() {
+    let mut ecu = SimEcu::new(sim_config("ecm"));
+    assert_eq!(read_coding(&mut ecu), [0x00, 0x01, 0x03, 0x20]);
+    answer(&mut ecu, &[0x10, 0x03]);
+    assert_eq!(read_coding(&mut ecu), [0x00, 0x01, 0x03, 0x20]);
+    answer(&mut ecu, &[0x10, 0x02]);
+    assert_eq!(read_coding(&mut ecu), [0x00, 0x01, 0x03, 0x20]);
+}
+
+#[test]
+fn a_coding_write_is_refused_outside_the_extended_session() {
+    let mut ecu = authenticated_ecm();
+    let request = write_coding([0x01, 0x03, 0x03, 0x84]);
+    assert_eq!(refusal(&mut ecu, &request), Nrc::RequestOutOfRange);
+    answer(&mut ecu, &[0x10, 0x02]);
+    assert_eq!(refusal(&mut ecu, &request), Nrc::RequestOutOfRange);
+    assert_eq!(read_coding(&mut ecu), [0x00, 0x01, 0x03, 0x20]);
+}
+
+#[test]
+fn a_coding_write_is_refused_in_the_extended_session_without_security_access() {
+    let mut ecu = authenticated_ecm();
+    answer(&mut ecu, &[0x10, 0x03]);
+    let request = write_coding([0x01, 0x03, 0x03, 0x84]);
+    assert_eq!(refusal(&mut ecu, &request), Nrc::SecurityAccessDenied);
+    assert_eq!(read_coding(&mut ecu), [0x00, 0x01, 0x03, 0x20]);
+}
+
+#[test]
+fn a_coding_write_is_refused_without_gateway_authentication() {
+    let mut ecu = SimEcu::new(sim_config("ecm"));
+    unlock(&mut ecu);
+    let request = write_coding([0x01, 0x03, 0x03, 0x84]);
+    assert_eq!(refusal(&mut ecu, &request), Nrc::AuthenticationRequired);
+    assert_eq!(read_coding(&mut ecu), [0x00, 0x01, 0x03, 0x20]);
+    // The same request goes through once the gateway has authenticated.
+    ecu.gateway_authenticated = true;
+    answer(&mut ecu, &request);
+}
+
+#[test]
+fn a_coding_write_succeeds_when_authenticated_unlocked_and_in_the_extended_session() {
+    let mut ecu = authenticated_ecm();
+    unlock(&mut ecu);
+    assert_eq!(
+        answer(&mut ecu, &write_coding([0x01, 0x03, 0x03, 0x84])),
+        [0x6E, 0x01, 0x20]
+    );
+    assert_eq!(read_coding(&mut ecu), [0x01, 0x03, 0x03, 0x84]);
+    // A record of the wrong length is refused and leaves the coding as written.
+    assert_eq!(
+        refusal(&mut ecu, &[0x2E, 0x01, 0x20, 0x00, 0x00, 0x00]),
+        Nrc::IncorrectMessageLengthOrInvalidFormat
+    );
+    assert_eq!(read_coding(&mut ecu), [0x01, 0x03, 0x03, 0x84]);
+}
+
+#[test]
+fn each_configured_ecm_did_reads_back_the_value_the_sim_file_declares() {
+    let config = sim_config("ecm");
+    // The file declares these DIDs and the coding DID, and no other (1010 is `ecmV2` only).
+    let mut declared: Vec<u16> = config.dids.iter().map(|did| did.did).collect();
+    declared.sort_unstable();
+    let mut expected: Vec<u16> = ECM_DIDS.iter().map(|(did, ..)| *did).collect();
+    expected.push(0x0120);
+    expected.sort_unstable();
+    assert_eq!(declared, expected);
+    assert_eq!(config.security_key_mask, Some(ECM_KEY_MASK));
+    assert!(config.require_gateway_auth);
+
+    let converted = convert_ecu("ecm");
+    let bytes = by_variant(&converted)["ecmV1"];
+    let loaded = load_ecu_document(bytes).expect("the document loads");
+    let layouts = loaded.variant().expect("a variant").layouts();
+    let mut ecu = SimEcu::new(config.clone());
+    for (did, name, physical) in ECM_DIDS {
+        let did_bytes = did.to_be_bytes();
+        let response = answer(&mut ecu, &[0x22, did_bytes[0], did_bytes[1]]);
+        let declared = config
+            .dids
+            .iter()
+            .find(|entry| entry.did == did)
+            .expect("declared");
+        assert_eq!(response[3..], declared.value[..], "{name}");
+        let service = load_service(&loaded, &format!("{name}.read"));
+        let fields = decode_positive_response(
+            &service.positive().expect("a positive response"),
+            layouts,
+            &response,
+        )
+        .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        let value = match &fields[0].value {
+            PhysicalValue::Unsigned(v) => *v as f64,
+            PhysicalValue::Float(v) => *v,
+            other => panic!("{name}: {other:?}"),
+        };
+        assert!((value - physical).abs() < 1e-9, "{name}: {value}");
     }
 }

@@ -192,6 +192,13 @@ endian. "Raw" gives the conversion from the transmitted value.
 | `1005` | batteryVoltage | uint16, raw / 100 V |
 | `1006` | engineRunning | uint8: 0 no, 1 yes |
 | `1010` | fuelRailPressure | uint16, raw × 10 kPa; `ecmV2` only |
+| `0120` | engineCoding | 4 bytes: market (uint8: 0 domestic, 1 export), options (uint8 bit mask: bit 0 start-stop, bit 1 cruise control, the other bits 0), target idle speed (uint16, rpm); both variants; writable (extended session, level 1) |
+
+The coding DID `0120` is the vehicle's configuration data of the engine controller: ReadDataByIdentifier
+(ISO 14229-1 (2026) 10.2) reads it in every session, and WriteDataByIdentifier (10.7) changes it in
+the extended session after security access level 1 (section 7), like the VIN, and, as every write
+(section 4), only while the gateway is unlocked (section 5). The options are one byte because the
+definition format takes a writable record's fields as whole bytes.
 
 | Routine | Name | Sub-functions | Session | Security | Result |
 |---|---|---|---|---|---|
@@ -373,6 +380,23 @@ The vehicle definition of ADR-326 (design 8.8.2), which has no supply format yet
 grade body controller), with a few stored DTCs; the ECUs behind the gateway set
 `require_gateway_auth`. `sim-ecu` answers what all of them have in common: the sessions, ECUReset,
 the DTC services, `F186`, `F187`, `F189`, `F190`, `FD00`, security access with the ECM's mask,
-and the reprogramming of section 8 with the routines `FF00` and `FF01`. It does not answer `F18C`, `F197`, the ECU-specific DIDs and routines
-of section 6, or the other ECUs' masks, and `sim-vci` simulates one ECU on the engine
-controller's identifiers; `identify.star` and the vehicle test therefore use only the common part.
+and the reprogramming of section 8 with the routines `FF00` and `FF01`.
+
+`sim/ecm.json` also declares the engine controller's own DIDs of section 6.3 as configured data
+identifiers (`crates/sim-ecu/docs/simulated-ecu.md`): `1000` to `1006` with the readings of a
+parked car with the ignition on and the engine stopped (so the reprogramming preconditions of
+section 8 hold), and the coding DID `0120` (domestic, start-stop on, cruise control off, idle
+speed 800 rpm) with its write conditions: extended session and security level 1, the mask `5A5A5A5A`
+set explicitly. `1010` is left out: a configuration serves one variant (`ecmV1`, software version
+`1.0.1`), and `1010` belongs to `ecmV2`.
+
+A coding write is answered with NRC `0x34` until the gateway authentication is set, which a test
+does with `SimEcu::gateway_authenticated` and a job through `sim-vci`'s `set_gateway_authentication`
+control command (`crates/sim-vci/docs/simulated-vci.md`). With it set, `sim-ecu` checks the session
+(NRC `0x31` outside the extended session), then the security level (NRC `0x33` while locked); a
+write that passes replaces the stored value, and a read returns it.
+
+`sim-ecu` does not answer `F18C`, `F197`, `1010`, the other ECUs' DIDs and routines of section 6,
+or the other ECUs' masks, and `sim-vci` simulates one ECU on the engine controller's identifiers;
+`identify.star` and the vehicle test therefore use the common part, and the coding tests use the
+engine controller.

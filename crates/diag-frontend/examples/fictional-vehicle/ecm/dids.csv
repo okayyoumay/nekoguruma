@@ -13,4 +13,5 @@ variants,name,did,read,write,write_session,write_security
 ,throttlePosition,0x1004,yes,no,,
 ,batteryVoltage,0x1005,yes,no,,
 ,engineRunning,0x1006,yes,no,,
+,engineCoding,0x0120,yes,yes,0x03,0x01
 ecmV2,fuelRailPressure,0x1010,yes,no,,

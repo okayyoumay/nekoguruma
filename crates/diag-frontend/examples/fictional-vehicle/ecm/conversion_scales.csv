@@ -2,6 +2,8 @@ conversion,lower,upper,text
 sessionName,0x01,,session.default
 sessionName,0x02,,session.programming
 sessionName,0x03,,session.extended
+marketName,0x00,,market.domestic
+marketName,0x01,,market.export
 yesNo,0x00,,value.no
 yesNo,0x01,,value.yes
 adaptationResult,0x00,,routine.completed

@@ -24,7 +24,7 @@
 use shared_proto::{AgentEventKind, AgentId, AgentMessage, JobState, is_canonical_uuid};
 use sqlx::PgPool;
 
-use crate::db::statement_timeouts;
+use crate::db::{delete_own_lock, statement_timeouts};
 use crate::hub::{ConnectionId, Inbound};
 use crate::job_state::{Current, Decision, Report, decide};
 
@@ -98,10 +98,17 @@ impl Event {
 }
 
 /// `text` when it is a date-time that PostgreSQL's `timestamptz` input is known to read the way
-/// the agent means it: `YYYY-MM-DDTHH:MM:SS`, optionally a fraction of one to nine digits, and `Z`
-/// or an offset `+HH:MM` / `-HH:MM`; a real calendar date, a year from 0001, an offset of at most
-/// 15:59 (what the database accepts). Anything looser is not trusted, and the column stays null.
+/// the agent means it, as [`epoch_seconds`] judges; anything looser is not trusted, and the
+/// column stays null.
 pub(crate) fn strict_device_time(text: &str) -> Option<&str> {
+    epoch_seconds(text).map(|_| text)
+}
+
+/// The seconds since the Unix epoch of `text`, when it is `YYYY-MM-DDTHH:MM:SS`, optionally a
+/// fraction of one to nine digits (floored), and `Z` or an offset `+HH:MM` / `-HH:MM` (applied):
+/// a real calendar date, a year from 0001, an offset of at most 15:59 (what the database
+/// accepts), upper-case `T` and `Z`, a second of at most 59. Anything else is `None`.
+pub(crate) fn epoch_seconds(text: &str) -> Option<i64> {
     let b = text.as_bytes();
     let digits = |from: usize, len: usize| -> Option<u32> {
         let part = b.get(from..from + len)?;
@@ -137,15 +144,35 @@ pub(crate) fn strict_device_time(text: &str) -> Option<&str> {
             return None;
         }
     }
-    match b.get(i)? {
-        b'Z' => (i + 1 == b.len()).then_some(text),
-        b'+' | b'-' => {
-            let (hours, minutes) = (digits(i + 1, 2)?, digits(i + 4, 2)?);
-            let ok = at(i + 3, b':') && i + 6 == b.len() && hours <= 15 && minutes <= 59;
-            ok.then_some(text)
+    // The offset in seconds, east of UTC positive.
+    let offset: i64 = match b.get(i)? {
+        b'Z' => {
+            if i + 1 != b.len() {
+                return None;
+            }
+            0
         }
-        _ => None,
-    }
+        sign @ (b'+' | b'-') => {
+            let (hours, minutes) = (digits(i + 1, 2)?, digits(i + 4, 2)?);
+            if !(at(i + 3, b':') && i + 6 == b.len() && hours <= 15 && minutes <= 59) {
+                return None;
+            }
+            let seconds = i64::from(hours) * 3600 + i64::from(minutes) * 60;
+            if *sign == b'-' { -seconds } else { seconds }
+        }
+        _ => return None,
+    };
+    // Days from the civil date (the proleptic Gregorian calendar, March-based years).
+    let (y, m, d) = (i64::from(year), i64::from(month), i64::from(day));
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let year_of_era = y - era * 400;
+    let day_of_year = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let epoch_days = era * 146_097 + day_of_era - 719_468;
+    let local =
+        epoch_days * 86_400 + i64::from(hour) * 3600 + i64::from(minute) * 60 + i64::from(second);
+    Some(local - offset)
 }
 
 /// What the rule says about one event.
@@ -303,14 +330,15 @@ const MOVE_SQL: &str = "UPDATE jobs SET state = $3, finished_at = NULL, failure_
 /// `$3` the state, `$4` the failure code, `$5` the procedure code, `$6` the detail. The job's own
 /// vehicle lock goes in the same statement (design 8.8, ADR-480); a lock another job took after
 /// this one's expired stays.
-const END_SQL: &str = "WITH ended AS ( \
+const END_SQL: &str = concat!(
+    "WITH ended AS ( \
        UPDATE jobs SET state = $3, failure_code = $4, procedure_code = $5, failure_detail = $6, \
            finished_at = now(), last_reported_at = now(), \
            delivered_at = coalesce(delivered_at, now()) \
        WHERE tenant_id = $1::uuid AND id = $2::uuid \
-       RETURNING tenant_id, id, vin) \
-     DELETE FROM vehicle_locks l USING ended e \
-     WHERE l.tenant_id = e.tenant_id AND l.vin = e.vin AND l.job_id = e.id";
+       RETURNING tenant_id, id, vin) ",
+    delete_own_lock!()
+);
 const CURSOR_MOVE_SQL: &str = "UPDATE agent_event_cursor SET last_seq = $3, updated_at = now() \
      WHERE tenant_id = $1::uuid AND agent_id = $2::uuid";
 
@@ -585,6 +613,30 @@ mod tests {
         ] {
             assert_eq!(strict_device_time(bad), None, "{bad:?}");
         }
+    }
+
+    // F6, F7 (the parser's half): the offset is applied and the fraction floored
+    #[test]
+    fn a_date_time_is_read_as_whole_utc_seconds_with_the_offset_applied_and_the_fraction_floored() {
+        for (text, seconds) in [
+            ("1970-01-01T00:00:00Z", 0),
+            ("2026-11-14T10:20:30Z", 1_794_651_630),
+            ("2026-11-14T10:20:30.999999999Z", 1_794_651_630),
+            ("2026-11-14T10:20:30+09:00", 1_794_619_230),
+            ("2026-11-14T10:20:30-00:00", 1_794_651_630),
+            ("2026-11-14T10:20:30-15:59", 1_794_709_170),
+            ("2024-02-29T00:00:00Z", 1_709_164_800),
+            ("2000-03-01T00:00:00Z", 951_868_800),
+            ("1999-12-31T23:59:59Z", 946_684_799),
+            ("2026-02-28T23:59:59Z", 1_772_323_199),
+            ("2026-03-01T00:00:00Z", 1_772_323_200),
+            ("0001-01-01T00:00:00Z", -62_135_596_800),
+            ("9999-12-31T23:59:59Z", 253_402_300_799),
+        ] {
+            assert_eq!(epoch_seconds(text), Some(seconds), "{text}");
+        }
+        assert_eq!(epoch_seconds("2026-11-14T10:20:60Z"), None);
+        assert_eq!(epoch_seconds("2026-11-14T10:20:30z"), None);
     }
 
     fn inbound(message: AgentMessage, text: Option<&str>) -> Inbound {

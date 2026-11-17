@@ -311,6 +311,15 @@ impl Up {
 
     /// Like [`Up::with_grace`], with the delivery queue on when `queue` has its settings.
     pub(crate) async fn with_queue(grace_secs: u64, queue: Option<Settings>) -> Up {
+        Up::with_tasks(grace_secs, queue, None).await
+    }
+
+    /// Like [`Up::with_queue`], with the job expiry task on when `expiry` has its settings.
+    pub(crate) async fn with_tasks(
+        grace_secs: u64,
+        queue: Option<Settings>,
+        expiry: Option<server::job_expiry::Settings>,
+    ) -> Up {
         let w = World::new().await;
         w.add_operator("alice").await;
         let agent = Agent::new();
@@ -324,6 +333,10 @@ impl Up {
             .unwrap();
         let server = match queue {
             Some(settings) => server.with_job_queue(settings),
+            None => server,
+        };
+        let server = match expiry {
+            Some(settings) => server.with_job_expiry(settings),
             None => server,
         };
         let sessions = server.sessions();

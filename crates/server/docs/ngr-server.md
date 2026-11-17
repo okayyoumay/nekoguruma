@@ -117,8 +117,10 @@ max_object_bytes = 4294967296              # default 4 GiB, at least 1
    let requests in flight finish and close every control channel connection with 1001, for at
    most `shutdown_grace_secs`, and exit 0. A second signal during the grace period ends the wait
    at once (still exit 0). What is still open then is aborted: the HTTP connections first, then
-   the control channel sessions, then the database pool is closed (see "The control channel"
-   below). A connection that has not delivered a complete request head is held for no longer
+   the hub's tasks (the control channel sessions, the revocation pass, the delivery queue and the
+   job expiry task), then the database pool is closed (see "The control channel" below). The
+   tasks are started by `Server::run` before it accepts a request, and each one ends at the stop,
+   so none runs against a closed pool. A connection that has not delivered a complete request head is held for no longer
    than the header-read timeout below. A Windows service stop control arrives with packaging.
 
 ## The instruction key
@@ -476,9 +478,14 @@ ngr-server user disable --config <file> --username alice
   character; `vin`, when present, well-formed (the agent's rule, `shared_proto::is_well_formed_vin`);
   `irDigests` 1 to 128 entries of 64 lowercase hex digits, in any order and with repeats (stored
   sorted and unique); `artifactDigest`, when present, 64 lowercase hex digits. `remote: true`, a
-  non-empty `parameters`, an `executionWindow`, a `startDeadline` and an `onSiteContact` are 400
-  "not supported"; `remote: false` and `parameters: {}` count as absent. A 400 means the request
-  can never be valid; a 422 only that the key is another request's.
+  non-empty `parameters`, an `executionWindow` and an `onSiteContact` are 400 "not supported";
+  `remote: false` and `parameters: {}` count as absent. `startDeadline`, when present, is a
+  string that `agent_events::epoch_seconds` reads (the grammar of the device time: upper-case `T`
+  and `Z`, an offset of at most 15:59, one to nine fractional digits, a real date from the year 1,
+  a second of at most 59), kept as UTC whole seconds with the fraction floored; anything else
+  (not a string, null, a duplicate property included) is 400 with no database access. A 400
+  means the request can never be valid; a 422 that the key is another request's or that the
+  deadline is out of bounds (next item).
 - **The transaction** (read committed, 5 second lock and statement timeouts). (a) The row of
   `(tenant, key)`: when it exists, the same operator with an equal request hash is answered with
   the stored job (202), any other request with 422 and no data of the job, whatever the
@@ -486,11 +493,14 @@ ngr-server user disable --config <file> --username alice
   the role `worker` with an empty scope, an agent row of the session's tenant that is unrevoked,
   an allow-list row, and whether the process's key is the active `instruction_keys` row, with
   the database's clock (the second is rounded down). A refusal is one 403 document; the reason (`not_worker`, `agent_unknown`,
-  `agent_revoked`, `not_allowed`) goes to the log through its own gate. A key that is not the
-  active one is 503 and one logged error. (c) The ID (UUIDv7 from the database's milliseconds
+  `agent_revoked`, `not_allowed`) goes to the log through its own gate. Then the deadline's
+  bounds, when the request names one, against the issue time (the floor of this read's second):
+  60 to 86400 seconds after it, both inclusive, else 422 with the Problem `code`
+  `START_DEADLINE_OUT_OF_BOUNDS` (nothing written, the key unbound, no audit row, no lock). A key
+  that is not the active one is 503 and one logged error, judged after the bounds. (c) The ID (UUIDv7 from the database's milliseconds
   and ten random bytes) and the instruction (version 1, generation 1, the session's operator, the
-  sorted unique hashes, no plan, issued at the database's second, start deadline 900 seconds
-  later) are sealed; a signer's failure is 500 and nothing is written. (d) `INSERT ... ON
+  sorted unique hashes, no plan, issued at the database's second, start deadline the request's
+  second or, with none, 900 seconds later) are sealed; a signer's failure is 500 and nothing is written. (d) `INSERT ... ON
   CONFLICT (tenant_id, idempotency_key) DO NOTHING RETURNING`. On a returned row, and only
   then, the winner takes these steps in this order: the `audit_log` row (`jobCreated`, ADR-484),
   the vehicle's lock (next item), then the agent's unrevoked row and the active key's row,
@@ -505,8 +515,11 @@ ngr-server user disable --config <file> --username alice
 - **The row and the answer.** The row holds the signed bytes, the key's ID, the sorted hashes as
   hex (`ir_digests`), the confirmation level (`notifyOnly` for `acquire`, `gracePeriod` for
   `writeSettings`, recorded and not enforced) and `request_hash`: SHA-256 over a tagged,
-  length-prefixed encoding of the normalized request (kind, agent, VCI, VIN, hashes, artifact),
-  with the operator left out (the row's operator is compared). The 202 body is the `Job`
+  length-prefixed encoding of the normalized request (kind, agent, VCI, VIN, hashes, artifact,
+  and, only when the request names one, the name `startDeadline` and its normalized seconds, so
+  that a request without it hashes as before and another deadline, or the field added or dropped,
+  is another request: the existing 422), with the operator left out (the row's operator is
+  compared). A replay is answered before the bounds are judged. The 202 body is the `Job`
   (`jobId`, `kind`, `state`, `progressPermille`, `confirmation.level`, and `failure.code` and
   `failure.procedureCode` when the job has a failure code, never the detail), built by one function
   from the row for a creation and a replay, which shows the current state; `Cache-Control:
@@ -516,8 +529,8 @@ ngr-server user disable --config <file> --username alice
   now() RETURNING 1`. A new row, or an expired one replaced, is the take; no returned row means a
   live lock of another job, and the transaction rolls back (no job row, the key unbound) and
   answers 409 with a Problem whose `code` is `VEHICLE_LOCKED` and which names no holder, expiry
-  or VIN. The row's `expires_at` is the instruction's start deadline plus `Kind::lock_secs`
-  (acquire 600 s, writeSettings 1800 s). The replace condition reads only the lock row, so a
+  or VIN. The row's `expires_at` is the instruction's start deadline (at most 24 hours after the
+  issue time) plus `Kind::lock_secs` (acquire 600 s, writeSettings 1800 s). The replace condition reads only the lock row, so a
   concurrent take of the same VIN waits for the other transaction and re-checks the row it left;
   a wait past the 5 second lock timeout is 503. A replay answers 202 before any lock is read,
   and a job with no VIN takes no lock. The take comes before the agent and key locks, so its wait
@@ -533,7 +546,8 @@ ngr-server user disable --config <file> --username alice
   none: they end before the insert or roll it back. The order is the insert, the audit row, the
   vehicle lock, the agent's lock, the key's lock, the commit. `audit_log` locked for more than
   the 5 second lock timeout is 503 with no job and the key unbound.
-- **Not part of creation.** The request cannot set the start deadline.
+- **Not part of creation.** The request cannot set the execution window, remote execution, an
+  on-site contact or parameters.
 - **Logging.** `job created` at info with the job and operator IDs; each refusal reason, a
   key that is not the active one, a locked vehicle, a 503 and a 500 have their own gate, once a minute. The body,
   the idempotency key, the VCI ID and the VIN are never logged.
@@ -782,6 +796,24 @@ connection with hyper's `with_upgrades()`.
   between agents. The kept events count with the buffered messages against the
   4096 bound, and past it the inbox is not read. A failed pass sends nothing and is one gated warning (60 seconds). The task ends
   when the stop begins, in its wait and in its read.
+- **The job expiry task (`job_expiry.rs`, ADR-487).** One task of the hub's set, spawned by
+  `Server::run` when it is on (`Server::start` turns it on with a 30 second period; `Server::bind`
+  leaves it off, and a test turns it on with `with_job_expiry`, which also takes the counters of
+  passes and failures a test waits on). The first tick is one period after the start, a missed
+  tick is delayed (one pass, not a burst). A pass is `expire`: one transaction with the 5 second
+  timeouts and one statement (`EXPIRE_SQL`) that sets the jobs with `state = 'received' AND
+  finished_at IS NULL AND start_deadline <= now()` to `expired` with `finished_at = now()`, chosen
+  inside `WHERE (tenant_id, id) IN (SELECT ... FOR UPDATE SKIP LOCKED)` as the retired-key sweep
+  does, and deletes the vehicle lock row that names each ended job in the same statement (the
+  fragment `db::delete_own_lock!`, shared with the queue's ends and the agent's reported end). It
+  compares only the database's clock, has no term for `delivered_at`, the mark or the lease, and
+  leaves the failure columns, `delivered_at`, `last_reported_at` and the mark as they are. It
+  writes no `agent_events` row, moves no cursor and writes no `change_feed` or `audit_log` row. A
+  row another transaction holds is skipped and ended by the next pass. A pass that ends jobs logs
+  the count at info; a failed pass writes nothing and is one gated warning (60 seconds), tried
+  again at the next tick. The task ends when the stop begins, in its wait and in its statement
+  (the dropped statement rolls back), before the pool closes. A job that an agent reports on
+  after its end is stored, acknowledged and not applied (`job_state::decide`).
 - **After a close.** The task leaves the registry first, then writes the Close frame, then the
   disconnect stamp (above), then drains (reads and discards until the peer's reply, at most `CLOSE_WAIT`, 5 seconds). After a
   read error the stack allows no read, so the task waits `CLOSE_WAIT` without reading (a stop
@@ -874,7 +906,18 @@ a new migration file rebuilds the crate. How migrations are written and applied 
   servers on one database (every job on one socket, the take skipping held rows, the plan using
   `jobs_pending`), a dropped take, a server that goes away and the lease, a dropped socket and a
   replacement, a rejection, answers that write nothing, a retired or missing key, a revoked
-  agent, a past deadline, the stop, a failing pass, and `Server::start` turning the queue on. The
+  agent, a past deadline, the stop, a failing pass, and `Server::start` turning the queue on.
+  `job_expiry.rs` covers the expiry statement and its task (ADR-487; the case names in its
+  comments are the rows of the ADR's table): a job ended from its deadline and not before,
+  delivered or not, with no failure and no write to the event, cursor, feed or audit tables; the
+  deadline's own instant against the queue's take in one transaction; every other state and every
+  finished job untouched and a second pass rewriting nothing; the lock row of the ended job
+  deleted and no other (a job with no VIN, a row naming another job, none, another tenant's); the
+  one-statement end (a deletion that fails leaves the job `received`); a row another transaction
+  holds skipped at once and ended by the next pass; two passes at once; a revoked agent's job;
+  an answer or a departure after the end writing nothing; the task's end of what was past at its
+  start, its stop during a statement, and its failing pass logged once and retried; and
+  `Server::start` turning it on. The
   agent binary's refusal of a forged stored command, and its acceptance of a job created through
   the route, are in `agent_connect.rs`, which also follows three accepted jobs' `received` events
   through a held cursor row, a kill of the agent, a restart (every event a repeat, answered) and a
@@ -899,7 +942,8 @@ a new migration file rebuilds the crate. How migrations are written and applied 
   round in both orders, a refused commit retried), `progress` and `reconcile` not stored, and
   a re-registered agent's own cursor.
   `jobs.rs` (unit tests in `src/jobs.rs` for the shape rules, the request hash, the job ID, the
-  largest request and the pure decisions) covers `POST /api/v1/jobs` over PostgreSQL: the layer
+  largest request, the deadline's bounds and the pure decisions; the parser's are in
+  `src/agent_events.rs`) covers `POST /api/v1/jobs` over PostgreSQL: the layer
   and the body bounds, creation and its row, the stored instruction verifying under the key, the
   idempotency key (replay, conflict, a key of another tenant, a replay after delivery, the key
   judged before the permission), concurrent requests (two at once, two servers, a key held by an
@@ -911,7 +955,11 @@ a new migration file rebuilds the crate. How migrations are written and applied 
   row per created job with its columns and detail, none for a replay, a conflict, a refusal or a
   rolled-back creation, one per job under concurrent requests, the same VIN in two tenants, rows
   unchanged by a job's end and by the deletion of its row, and a locked `audit_log` as a 503 that
-  leaves no job and blocks no connect stamp). The migrations are checked in
+  leaves no job and blocks no connect stamp), and the request's `startDeadline` (signed, stored
+  and the lock's base in every form of one instant, refusals outside the bounds with their code
+  and nothing left, 403 before 422 before 503, malformed values as 400, replays with another
+  deadline or the field added or dropped as the key's 422, a replay not judged again, two requests
+  at once, and an expired job freeing its vehicle with its replay showing `expired`). The migrations are checked in
   `migrations.rs`.
   `control.rs` (unit tests in `src/control.rs` and `src/hub.rs`) drives the control channel over
   TCP with `tokio-tungstenite` as the client. Refusals: every way of having no valid token is

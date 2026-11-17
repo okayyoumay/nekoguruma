@@ -70,16 +70,19 @@ paths:
         that its own instruction key is the active one; then it signs the job instruction (one
         envelope of a key fingerprint, a signature and a postcard payload that names the job's
         documents by hash, 11.1, ADR-461), stores it with the job and leaves its delivery to the
-        queue (5.3, ADR-476). The request's start deadline is 15 minutes after the instruction is
-        issued. A `writeSettings` job's `gracePeriod` confirmation level is recorded and not
+        queue (5.3, ADR-476). The job's start deadline is the request's `startDeadline` or, when it
+        names none, 15 minutes after the instruction is issued (ADR-487). A `writeSettings` job's `gracePeriod` confirmation level is recorded and not
         enforced. Operations requiring seed-key or OEM authentication must be online (5.7).
 
         The local deployment accepts `kind` `acquire` and `writeSettings` only. Other kinds, a
-        `remote` of `true`, a non-empty `parameters`, an `executionWindow`, a `startDeadline` and an
+        `remote` of `true`, a non-empty `parameters`, an `executionWindow` and an
         `onSiteContact` are **400**; `remote: false` and an empty `parameters` count as absent.
         `irDigests` is required (1 to 128 entries of 64 lowercase hex digits, in any order, repeats
         allowed). `agentId` is a lowercase UUID, `vciId` 1 to 1024 bytes of UTF-8 without a
-        control character, and `vin`, when given, a well-formed VIN. The body is one JSON object of the
+        control character, and `vin`, when given, a well-formed VIN. `startDeadline`, when given,
+        is an RFC 3339 date-time string with upper-case `T` and `Z`, a zone (`Z` or an offset of at
+        most 15:59) and at most nine fractional digits; one that does not parse is **400**. The
+        body is one JSON object of the
         names below, each at most once and none null, in at most 16384 bytes.
 
         `Idempotency-Key` (1 to 128 visible ASCII characters, compared as bytes) names the job for
@@ -94,9 +97,21 @@ paths:
         `code` `VEHICLE_LOCKED`, nothing is created and the key stays free. The lock expires on
         its own, 10 minutes (`acquire`) or 30 minutes (`writeSettings`) after the job's start
         deadline. The server deletes it when the job ends: when it ends the job itself (an agent's
-        rejection, a retired instruction key, an instruction too large to send) and when the agent
+        rejection, a retired instruction key, an instruction too large to send, a job past its start
+        deadline) and when the agent
         reports an end (5.6, ADR-481). A replay never takes a lock, and a job with no `vin`
         takes none. The answer names no holder, expiry or VIN, and there is no override.
+
+        **Start deadline** (5.3, ADR-487). The server normalizes `startDeadline` to UTC whole
+        seconds (a fraction is floored) and signs and stores that second. It must lie 60 to 86400
+        seconds after the job's issue time (the server's clock when it reads the permission), both
+        included; otherwise the request is **422** with the `code` `START_DEADLINE_OUT_OF_BOUNDS`,
+        judged after the permission (**403**) and before the instruction key (**503**), with nothing
+        created and the key still free. The deadline is part of the request: another deadline, or
+        the field added or dropped, under a used key is the key's **422**, and the same deadline
+        replays the stored job without the bounds being judged again. A job still `received` when
+        its deadline has passed is ended by the server as `expired` and its vehicle lock is
+        deleted; the replay of its creation then shows the state `expired` and no `failure`.
 
         Like every operator route the request needs a live session and, as a POST, the pinned
         Origin (**403**) before the cookie is read (**401**). The body is read within 5 seconds
@@ -161,7 +176,7 @@ paths:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
         '422':
-          description: The idempotency key belongs to another request or operator; the answer holds no data of the job
+          description: The idempotency key belongs to another request or operator (the answer holds no data of the job), or `startDeadline` is not 60 to 86400 seconds after the issue time (`code` `START_DEADLINE_OUT_OF_BOUNDS`)
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
@@ -944,6 +959,7 @@ components:
           enum:
             - DEVICE_LOCKED
             - VEHICLE_LOCKED
+            - START_DEADLINE_OUT_OF_BOUNDS
             - VIN_MISMATCH
             - VARIANT_MISMATCH
             - POWER_CONDITION
@@ -962,8 +978,8 @@ components:
       required: [kind, agentId, vciId, irDigests]
       description: |
         What `POST /v1/jobs` of the local deployment accepts: `kind` is `acquire` or
-        `writeSettings`, and `startDeadline`, `executionWindow`, `onSiteContact`, a `parameters`
-        that is not empty and a `remote` of `true` are refused (400): the server gives them no meaning.
+        `writeSettings`, and `executionWindow`, `onSiteContact`, a `parameters` that is not empty
+        and a `remote` of `true` are refused (400): the server gives them no meaning.
       properties:
         kind:
           type: string
@@ -984,7 +1000,13 @@ components:
         parameters:
           type: object
           additionalProperties: true
-        startDeadline: { type: string, format: date-time }
+        startDeadline:
+          type: string
+          format: date-time
+          description: |
+            The latest time the job may be started, 60 to 86400 seconds after its issue time;
+            default 900 seconds after it. Normalized to UTC whole seconds, signed into the
+            instruction and stored on the row (ADR-487).
         executionWindow:
           type: object
           properties:
@@ -1001,6 +1023,9 @@ components:
         kind: { type: string }
         state:
           type: string
+          description: |
+            `expired` is also the server's end of a job still `received` at its start deadline
+            (5.3, ADR-487), which has no `failure`.
           enum:
             [received, precheck, ready, running, verifying, awaitingHmi,
              cancelRequested, completed, failed, cancelled, expired,

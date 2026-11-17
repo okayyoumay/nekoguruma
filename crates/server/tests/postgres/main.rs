@@ -9,6 +9,7 @@ mod agent_register;
 mod binary;
 mod control;
 mod instruction_key;
+mod job_expiry;
 mod job_queue;
 mod jobs;
 mod local_users;

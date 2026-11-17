@@ -1582,6 +1582,50 @@ async fn a_reopened_recovery_jobs_later_end_leaves_the_lock_another_job_took() {
     r.finish().await;
 }
 
+// E1 to E4 (ADR-487): a job the server expired is final. The agent's reports on it are stored and
+// acknowledged and not applied; only a late `received` is quiet; the server's own end wrote no
+// event row and moved no cursor.
+#[tokio::test]
+async fn reports_on_a_job_the_server_expired_are_stored_acknowledged_and_not_applied() {
+    let (log, _guard) = capture();
+    let r = Rig::new().await;
+    let job = own_job(&r.u, &r.u.id, false).await;
+    hold_lock(&r.u, &job).await;
+    sqlx::query("UPDATE jobs SET start_deadline = now() - interval '1 second'")
+        .execute(&r.u.w.pool)
+        .await
+        .unwrap();
+    assert_eq!(server::job_expiry::expire(&r.u.w.pool).await.unwrap(), 1);
+    let ended = line(&r.u, &job).await;
+    assert_eq!(ended, "expired|-|-|-|true|false|false");
+    // E4: no event row, and the agent's cursor has no row yet.
+    assert_eq!(rows(&r.u, &r.u.id).await.len(), 0);
+    assert_eq!(cursor(&r.u, &r.u.id).await, -1);
+    let mut client = r.connect().await;
+    // E1: a late `received`, then E2: the agent's own `expired`, then E3: a later state.
+    say(&mut client, 1, &job, "received", "").await;
+    say(&mut client, 2, &job, "expired", "").await;
+    say(&mut client, 3, &job, "running", "").await;
+    until_logged(&log, "were not applied").await;
+    assert_eq!(line(&r.u, &job).await, ended);
+    assert_eq!(holders(&r.u).await, "", "the lock is not taken again");
+    assert_eq!(rows(&r.u, &r.u.id).await.len(), 3);
+    assert_eq!(cursor(&r.u, &r.u.id).await, 3);
+    assert_eq!(r.counts.applied.load(Ordering::Relaxed), 0);
+    // The late `received` is quiet: the one warning is about what came after it.
+    let text = log.text();
+    let warning = text
+        .lines()
+        .find(|l| l.contains("were not applied"))
+        .expect("the warning was written");
+    assert!(
+        warning.contains(&job) && warning.contains("expired"),
+        "{warning}"
+    );
+    assert!(!warning.contains("received"), "{warning}");
+    r.finish().await;
+}
+
 // A job whose agent_id is the sender's but whose tenant is another is not the sender's own.
 #[tokio::test]
 async fn a_job_of_the_sender_in_another_tenant_is_not_changed() {

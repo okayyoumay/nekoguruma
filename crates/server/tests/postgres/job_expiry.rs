@@ -473,7 +473,9 @@ async fn an_answer_or_a_departure_after_the_end_writes_nothing_to_the_job() {
 async fn the_task_ends_what_is_past_at_its_start_and_a_stop_ends_it_during_its_statement() {
     let passes = Arc::new(AtomicU64::new(0));
     let failures = Arc::new(AtomicU64::new(0));
-    let u = Up::with_tasks(2, None, Some(expiry(&passes, &failures))).await;
+    // A grace above the statement's 5 s lock timeout: a task that ignored the stop would then
+    // see its statement time out (a failure) before the hub aborted it.
+    let u = Up::with_tasks(8, None, Some(expiry(&passes, &failures))).await;
     let Up { w, s, id, .. } = u;
     let past = add_job_with(&w, &id, 0, b"x", &w.key.key_id(), -1).await;
     let future = add_job_with(&w, &id, 1, b"x", &w.key.key_id(), 3600).await;

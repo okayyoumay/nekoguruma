@@ -110,7 +110,7 @@ paths:
         created and the key still free. The deadline is part of the request: another deadline, or
         the field added or dropped, under a used key is the key's **422**, and the same deadline
         replays the stored job without the bounds being judged again. A job still `received` when
-        its deadline has passed is ended by the server as `expired` and its vehicle lock is
+        its deadline has been reached is ended by the server (within one 30-second period) as `expired` and its vehicle lock is
         deleted; the replay of its creation then shows the state `expired` and no `failure`.
 
         Like every operator route the request needs a live session and, as a POST, the pinned

@@ -434,10 +434,15 @@ pub fn instruction(id: &str, operator_id: &str, spec: &Spec, issued_at: u64) -> 
         artifact_hash: spec.artifact,
         plan_hash: None,
         issued_at,
-        start_deadline: spec
-            .start_deadline
-            .and_then(|deadline| u64::try_from(deadline).ok())
-            .unwrap_or(issued_at + START_WINDOW_SECS),
+        start_deadline: match spec.start_deadline {
+            // The bounds are judged before signing (`deadline_in_bounds`), so a request's deadline
+            // is never negative here.
+            Some(deadline) => {
+                debug_assert!(deadline >= 0, "a deadline is checked before it is signed");
+                u64::try_from(deadline).unwrap_or(issued_at + START_WINDOW_SECS)
+            }
+            None => issued_at + START_WINDOW_SECS,
+        },
     }
 }
 

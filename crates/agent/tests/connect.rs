@@ -248,6 +248,28 @@ fn a_record_that_does_not_read_is_exit_1_register_again() {
     );
 }
 
+/// ADR-486: an issue-time mark file that does not read back is exit 1 with the advice to register
+/// again, before the key store is touched, and the file is not repaired.
+#[cfg(debug_assertions)]
+#[test]
+fn a_corrupt_issue_time_mark_is_exit_1_register_again_and_is_not_repaired() {
+    let env = Env::new();
+    env.register(&"ab".repeat(32), closed_port());
+    let path = env
+        .state
+        .path()
+        .join("registration")
+        .join(format!("{AGENT_ID}.issue-mark.v1.json"));
+    for content in [&b""[..], b"not json", b"{}"] {
+        std::fs::write(&path, content).unwrap();
+        let output = run(env.connect());
+        assert_exit(&output, 1, "the issue-time mark file is corrupt");
+        assert!(text(&output.stderr).contains("register again"));
+        assert!(!env.identity_dir().exists(), "the key store was touched");
+        assert_eq!(std::fs::read(&path).unwrap(), content, "repaired");
+    }
+}
+
 /// A debug build without the store-selecting variable has no key store, like a release build:
 /// a registered agent exits 1 without a connection.
 #[cfg(debug_assertions)]

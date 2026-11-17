@@ -24,7 +24,10 @@
 //! is [`backoff`]'s.
 //!
 //! The loop sends the outbox's events and applies the server's `eventAck` ([`events`], design 5.3,
-//! ADR-478), and appends a `received` event before it answers a verified command.
+//! ADR-478), and appends a `received` event before it answers a verified command. A verified
+//! command is also judged against its start deadline with the device [`Clock`] and the
+//! [`IssueMark`], the highest issue time, which is synced to its file before the answer (design
+//! 5.3, ADR-486); one past its deadline is recorded as `expired` and not handed over.
 //!
 //! Never logged: the token, a challenge, a nonce, a proof, a body, a message's text, a
 //! `commandId`, the text of a close reason, the record's path or content.
@@ -49,6 +52,7 @@ use tokio::sync::watch;
 use tokio::time::Instant;
 use worker_host::service::OperatingMode;
 
+use crate::deadline::{Clock, IssueMark, MarkError};
 use crate::identity::AgentKey;
 use crate::journal::{JournalError, WriterLock};
 use crate::outbox::OutboxError;
@@ -313,6 +317,10 @@ struct Wiring {
     instruction_key: PublicKey,
     intake: Arc<dyn Intake>,
     outbox: SharedOutbox,
+    /// The highest issue time verified so far, and the device clock a deadline is judged with
+    /// (ADR-486).
+    marks: IssueMark,
+    clock: Arc<dyn Clock>,
     audience: Audience,
     /// The `Host` header's value.
     host: String,
@@ -352,6 +360,16 @@ impl Warnings {
             tracing::warn!(class, %error, "an event could not be recorded; the command is not acknowledged");
         } else {
             tracing::debug!(class, %error, "an event could not be recorded; the command is not acknowledged");
+        }
+    }
+
+    /// The mark file could not be written: one warning per class since `hello`, debug after that.
+    /// The command is not acknowledged and the connection closes with 1011.
+    fn mark_failure(&mut self, error: &MarkError) {
+        if self.seen.insert("mark-write") {
+            tracing::warn!(class = "mark-write", %error, "the issue-time mark could not be written; the command is not acknowledged");
+        } else {
+            tracing::debug!(class = "mark-write", %error, "the issue-time mark could not be written; the command is not acknowledged");
         }
     }
 
@@ -403,6 +421,8 @@ struct Seams {
     random: fn() -> Result<[u8; 32], RandomError>,
     intake: Arc<dyn Intake>,
     outbox: SharedOutbox,
+    marks: IssueMark,
+    clock: Arc<dyn Clock>,
 }
 
 impl Opened {
@@ -414,12 +434,16 @@ impl Opened {
     /// Step 2: compares `key`'s fingerprint with the record's and starts the loop, whose first
     /// exchange begins at once; `intake` takes every instruction the gate verifies and allows (ADR-483) and `outbox`
     /// is the open outbox of the record's agent ID, whose events each connection sends. Needs a
-    /// running tokio runtime. On an error nothing was sent and both locks are released.
+    /// running tokio runtime. `marks` is the open store of the record's agent ID (ADR-486) and
+    /// `clock` the device clock a job's start deadline is judged with. On an error nothing was
+    /// sent and both locks are released.
     pub fn start(
         self,
         key: AgentKey,
         intake: Arc<dyn Intake>,
         outbox: SharedOutbox,
+        marks: IssueMark,
+        clock: Arc<dyn Clock>,
     ) -> Result<Handle, ControlError> {
         let port = self.origin()?.port();
         let seams = Seams {
@@ -428,6 +452,8 @@ impl Opened {
             random: shared_crypto::random_32,
             intake,
             outbox,
+            marks,
+            clock,
         };
         self.start_with(&key.public_key(), seams)
     }
@@ -439,6 +465,7 @@ impl Opened {
         self,
         key: AgentKey,
         outbox: SharedOutbox,
+        marks: IssueMark,
     ) -> Result<Handle, ControlError> {
         struct PanicDial;
         impl Dial for PanicDial {
@@ -452,6 +479,8 @@ impl Opened {
             random: shared_crypto::random_32,
             intake: Arc::new(LogIntake),
             outbox,
+            marks,
+            clock: Arc::new(crate::deadline::SystemClock),
         };
         self.start_with(&key.public_key(), seams)
     }
@@ -476,6 +505,8 @@ impl Opened {
             random: seams.random,
             intake: seams.intake,
             outbox: seams.outbox,
+            marks: seams.marks,
+            clock: seams.clock,
             instruction_key,
             record: self.record,
             audience,

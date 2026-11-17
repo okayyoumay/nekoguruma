@@ -226,8 +226,10 @@ impl Fixture {
             document_hashes: vec![],
             artifact_hash: None,
             plan_hash: None,
-            issued_at: 1_000,
-            start_deadline: 2_000,
+            // The real agent judges the deadline by its clock (ADR-486): issued now, due within
+            // the hour the job row gives.
+            issued_at: now_secs(),
+            start_deadline: now_secs() + 3_600,
         };
         let mut envelope = self.world.key.seal(&instruction).await.unwrap();
         if forge {
@@ -842,4 +844,12 @@ async fn the_agents_received_event_stamps_its_job_once_and_a_resend_changes_noth
     agent.stop().await;
     f.server.take().unwrap().finish().await;
     f.world.finish().await;
+}
+
+/// The current time in Unix seconds.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("a clock after the epoch")
+        .as_secs()
 }

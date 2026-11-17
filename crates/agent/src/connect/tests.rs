@@ -101,6 +101,11 @@ fn outbox_in(dir: &std::path::Path) -> control::SharedOutbox {
     control::SharedOutbox::new(Outbox::open_in(&dir, AGENT_ID).unwrap())
 }
 
+/// The issue-time mark of the record's agent in `dir`, as `run` opens it.
+fn marks_in(dir: &std::path::Path) -> IssueMark {
+    IssueMark::open_in(&dir.join("registration"), AGENT_ID).unwrap()
+}
+
 fn unavailable() -> IdentityError {
     IdentityError::Unavailable("the key store is unavailable: test".to_owned())
 }
@@ -306,7 +311,9 @@ async fn a_session_that_ends_on_its_own_is_exit_1() {
     let result = run_opened(
         opened,
         move || Ok(slot.lock().unwrap().take().unwrap()),
-        |opened, key| opened.start_panicking(key, outbox_in(dirs.dir.path())),
+        |opened, key| {
+            opened.start_panicking(key, outbox_in(dirs.dir.path()), marks_in(dirs.dir.path()))
+        },
         std::future::pending::<()>(),
     )
     .await;
@@ -379,6 +386,54 @@ fn every_outbox_error_has_the_documented_exit() {
             .to_string()
             .contains("register again")
     );
+}
+
+/// ADR-486: an issue-time mark that does not read back is exit 1 with the advice to register
+/// again; the other failures to open it are exit 3, and none names a path.
+#[test]
+fn every_mark_error_has_the_documented_exit() {
+    for (error, exit) in [
+        (MarkError::Corrupt("a bad file"), 1),
+        (MarkError::BadAgentId, 1),
+        (MarkError::InUse, 3),
+        (MarkError::Io(io::ErrorKind::PermissionDenied), 3),
+    ] {
+        let mapped = mark_error(&error);
+        assert_eq!(mapped.exit_code(), exit, "{mapped}");
+    }
+    assert!(
+        mark_error(&MarkError::Corrupt("x"))
+            .to_string()
+            .contains("register again")
+    );
+    assert!(
+        !mark_error(&MarkError::Io(io::ErrorKind::PermissionDenied))
+            .to_string()
+            .contains("register again")
+    );
+}
+
+/// A corrupt mark file does not open, whatever the outbox did, and a second store of the same
+/// directory (a session still running) is in use, which is exit 3.
+#[test]
+fn a_corrupt_mark_file_does_not_open_and_one_in_use_is_exit_3() {
+    let key = existing_key();
+    let dirs = Dirs::new(&key);
+    let registration = dirs.dir.path().join("registration");
+    let file = registration.join(format!("{AGENT_ID}.issue-mark.v1.json"));
+    std::fs::write(&file, b"not a mark").unwrap();
+    let error = IssueMark::open_in(&registration, AGENT_ID)
+        .err()
+        .expect("a corrupt file does not open");
+    assert!(matches!(error, MarkError::Corrupt(_)), "{error}");
+    assert_eq!(mark_error(&error).exit_code(), 1);
+    std::fs::remove_file(&file).unwrap();
+    let first = IssueMark::open_in(&registration, AGENT_ID).unwrap();
+    let error = IssueMark::open_in(&registration, AGENT_ID)
+        .err()
+        .expect("a second store is in use");
+    assert_eq!(mark_error(&error).exit_code(), 3);
+    drop(first);
 }
 
 /// A corrupt outbox file ends `connect` with exit 1 before any key is loaded, and both locks are

@@ -497,8 +497,9 @@ ngr-server user disable --config <file> --username alice
   bounds, when the request names one, against the issue time (the floor of this read's second):
   60 to 86400 seconds after it, both inclusive, else 422 with the Problem `code`
   `START_DEADLINE_OUT_OF_BOUNDS` (nothing written, the key unbound, no audit row, no lock). A key
-  that is not the active one is 503 and one logged error, judged after the bounds. (c) The ID (UUIDv7 from the database's milliseconds
-  and ten random bytes) and the instruction (version 1, generation 1, the session's operator, the
+  that is not the active one is 503 and one logged error, judged after the bounds. (c) The kind's confirmation level is read from
+  `confirmation_defaults` (ADR-488); a kind without a row is 500 and nothing is signed or
+  written. The ID (UUIDv7 from the database's milliseconds and ten random bytes) and the instruction (version 1, generation 1, the session's operator, the
   sorted unique hashes, no plan, issued at the database's second, start deadline the request's
   second or, with none, 900 seconds later) are sealed; a signer's failure is 500 and nothing is written. (d) `INSERT ... ON
   CONFLICT (tenant_id, idempotency_key) DO NOTHING RETURNING`. On a returned row, and only
@@ -514,9 +515,8 @@ ngr-server user disable --config <file> --username alice
   key, is 503.
 - **The row and the answer.** The row holds the signed bytes, the key's ID, the sorted hashes as
   hex (`ir_digests`), the confirmation level (read in the same transaction from
-  `confirmation_defaults` for the kind, ADR-488: `notifyOnly` for `acquire`, `gracePeriod` for
-  `writeSettings` as seeded, recorded and not enforced; a kind without a row fails the creation
-  as 500 with nothing inserted) and `request_hash`: SHA-256 over a tagged, length-prefixed
+  `confirmation_defaults` for the kind, step (c), ADR-488: `notifyOnly` for `acquire`,
+  `gracePeriod` for `writeSettings` as seeded, recorded and not enforced) and `request_hash`: SHA-256 over a tagged, length-prefixed
   encoding of the normalized request (kind, agent, VCI, VIN, hashes, artifact, and, only when the
   request names one, the name `startDeadline` and its normalized seconds, so that a request
   without it hashes as before and another deadline, or the field added or dropped, is another

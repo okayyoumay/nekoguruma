@@ -17,7 +17,8 @@ override them later, and whether roles and the preset default become rows too.
    no tenant column, and both columns carry the same `CHECK` lists as `jobs.kind` and
    `jobs.confirmation_level`. Migration 0012 seeds it: `acquire`, `monitorSession` and
    `monitorCapture` with `notifyOnly`, `runSequence` and `writeSettings` with `gracePeriod`,
-   `reprogram` with `onSiteApproval`, as design 5.1's table gives them. `identify` has no row, since no route creates it.
+   `reprogram` with `onSiteApproval`, as design 5.1's table gives them. `identify` has no row,
+   since no route creates it.
 2. **A job creation reads its level from the table** in its own transaction, and a kind without a
    row fails the creation as 500 with nothing inserted: a missing row is a fault of the
    installation, not of the request. The constant in code is removed.
@@ -37,6 +38,9 @@ override them later, and whether roles and the preset default become rows too.
   already created keep their level.
 - A new job kind needs a migration that adds its `CHECK` entry and its row before a route may
   create it.
-- A creation replayed after its row was deleted fails as 500 only when it inserts; a replay of an
-  existing key is answered before the table is read.
+- The level is read after the active-key check and before the signing, so a request that reaches
+  that step without a row fails as 500 and signs nothing. A request that loses the key race to a
+  concurrent winner can get that 500 instead of the replay, since it reads the table before its
+  insert finds the winner's row. A replay that the first read of the key finds is answered before
+  the table is read.
 - Tightening policies are a later item.

@@ -163,7 +163,8 @@ the kind (the column has no default; no migration is needed):
 A row whose `expires_at` has passed is replaced by the next take for the VIN; no sweeper deletes
 expired rows. The job's end deletes its own row, whether the server writes it (the delivery queue's ends, ADR-480, and the
 expiry of a job past its start deadline, ADR-487) or the agent reports it (ADR-481); a reopened needsOnSiteRecovery job holds no row. A new job
-kind that the route creates states its allowance in the same place as its confirmation level.
+kind that the route creates needs a `confirmation_defaults` row from a migration and its
+`Kind::lock_secs` arm.
 The columns hold no foreign keys and a stale row keeps its VIN until a take replaces it.
 
 **`audit_log`: one row per recorded action, written by the transaction that does it**
@@ -217,8 +218,9 @@ in that range, so those rows are moved out of it before the range partition is a
   meaning (design 6.8, axis 1): `viewer` views acquired data; `worker` is the Operator role
   (acquisition, configuration value writes, work records); `reprogrammer` writes ECU firmware;
   `remote` executes while not on site (with the agent's own remote permission); `approver` is the
-  approving side of two-person approval; `admin` publishes artifacts, sets policy and registers
-  agents.
+  approving side of two-person approval; `admin` publishes artifacts, sets policy, registers
+  agents, fetches agents' operational logs, raises an agent's log level for a while and reads
+  the SOVD `logs` resource.
 - The preset default is the column default of `agents.preset`, `personal` (design 6.6, 13.3); the
   other presets are `personalRemote` and `shared`. Relaxing a preset needs action on the device.
 

@@ -165,6 +165,24 @@ the agent reports it (ADR-481); a reopened needsOnSiteRecovery job holds no row.
 kind that the route creates states its allowance in the same place as its confirmation level.
 The columns hold no foreign keys and a stale row keeps its VIN until a take replaces it.
 
+**`audit_log`: one row per recorded action, written by the transaction that does it**
+The server writes a row inside the transaction of the action, so a rolled-back action leaves none
+(ADR-484). Read the rows of a job or a tenant in the order `(recorded_at, id)`: `id` is a
+`bigserial` and breaks ties between rows of one instant. `(recorded_at, id)` is not the commit
+order: `recorded_at` is the transaction's start time, earlier than its commit by any lock waits, so a
+reader that pages by keyset must allow for rows that commit late. Columns as the server fills them:
+`tenant_id`, `operator_id`, `agent_id` and `job_id` name the job's own values; `vin` is the job's
+VIN in clear, NULL when the job has none, and is the one column a VIN deletion redacts (design
+4.3); `action` is free text with no CHECK, so a new action needs no migration; `confirmation_level`
+is the job's level; `on_site_approved` and `agent_reported_at` are NULL for `jobCreated`; `offline_executed` is false; `recorded_at` is the database's
+`now()` (the job's `created_at` for `jobCreated`, since one transaction has one `now()`); `detail`
+is JSON that never holds a VIN or a value derived from it. Nothing enforces that rows are never
+updated or deleted; the server only writes them. The actions written today:
+
+- `jobCreated` (`POST /api/v1/jobs`, one row per created job, none for a replay or a refusal):
+  `detail` has `kind`, `irDigests` (the sorted unique hex digests), `artifactDigest` when the job
+  has one and `signingKeyId`. It holds no request hash, idempotency key or VCI ID.
+
 **Version work records per item**
 The unit of 3-way merge (4.4) is the item, so `work_record_items.version` exists.
 `origin` distinguishes auto-filled values (from the vehicle, not editable) from manual entries.

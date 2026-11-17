@@ -492,8 +492,9 @@ ngr-server user disable --config <file> --username alice
   sorted unique hashes, no plan, issued at the database's second, start deadline 900 seconds
   later) are sealed; a signer's failure is 500 and nothing is written. (d) `INSERT ... ON
   CONFLICT (tenant_id, idempotency_key) DO NOTHING RETURNING`. On a returned row, and only
-  then, the agent's unrevoked row and then the active key's row are locked `FOR SHARE` before
-  the commit, so a revocation or a retirement waits for it or is seen; a row gone is a rollback
+  then, the winner takes these steps in this order: the `audit_log` row (`jobCreated`, ADR-484),
+  the vehicle's lock (next item), then the agent's unrevoked row and the active key's row,
+  locked `FOR SHARE` before the commit, and the commit, so a revocation or a retirement waits for it or is seen; a row gone is a rollback
   and the 403 `agent_revoked` or the 503 for a key that is not active. The commit is the 202.
   The locks come after the insert so that an insert waiting behind another insert of the key
   holds neither row and does not block the agent's connect stamp. Between the insert and these
@@ -521,8 +522,18 @@ ngr-server user disable --config <file> --username alice
   a wait past the 5 second lock timeout is 503. A replay answers 202 before any lock is read,
   and a job with no VIN takes no lock. The take comes before the agent and key locks, so its wait
   holds neither. No sweeper removes expired rows: the next take replaces them.
-- **Not part of creation.** The audit record is not written, and the request cannot set the start
-  deadline.
+- **The audit row** (design 8.2.3, 4.3, ADR-484). The first statement after the job insert
+  wins, before the vehicle lock is taken, in `audit.rs`: `INSERT INTO audit_log ... SELECT ...
+  FROM jobs` for the job just inserted, so the row is the job's own values: tenant, operator,
+  agent, job, `vin` (NULL when the job has none), the action `jobCreated` and the confirmation
+  level, with the database's clock as `recorded_at`. The detail is the kind, `irDigests`,
+  `artifactDigest` when there is one and `signingKeyId`; it holds no VIN, request hash,
+  idempotency key or VCI ID. A count other than one row, or a failed insert, is 500 or 503 like
+  any statement, and the transaction rolls back. A replay and every refusal (409, 403, 503) write
+  none: they end before the insert or roll it back. The order is the insert, the audit row, the
+  vehicle lock, the agent's lock, the key's lock, the commit. `audit_log` locked for more than
+  the 5 second lock timeout is 503 with no job and the key unbound.
+- **Not part of creation.** The request cannot set the start deadline.
 - **Logging.** `job created` at info with the job and operator IDs; each refusal reason, a
   key that is not the active one, a locked vehicle, a 503 and a 500 have their own gate, once a minute. The body,
   the idempotency key, the VCI ID and the VIN are never logged.
@@ -896,7 +907,11 @@ a new migration file rebuilds the crate. How migrations are written and applied 
   permission, a key that is not active, a failing signer, a locked table, and delivery to a fake
   agent, and the lock's end with the agent's reported end (held by a state that is not one,
   freed by completed or needsOnSiteRecovery, another job's later row left alone) and the replay
-  showing the failure code and procedure code and no detail. The migrations are checked in
+  showing the failure code and procedure code and no detail, and the audit row (one `jobCreated`
+  row per created job with its columns and detail, none for a replay, a conflict, a refusal or a
+  rolled-back creation, one per job under concurrent requests, the same VIN in two tenants, rows
+  unchanged by a job's end and by the deletion of its row, and a locked `audit_log` as a 503 that
+  leaves no job and blocks no connect stamp). The migrations are checked in
   `migrations.rs`.
   `control.rs` (unit tests in `src/control.rs` and `src/hub.rs`) drives the control channel over
   TCP with `tokio-tungstenite` as the client. Refusals: every way of having no valid token is

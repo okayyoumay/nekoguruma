@@ -107,7 +107,7 @@ throughout.
   per connection is a `warn`, later ones are `debug`, and the end-of-connection `info` line of
   refused instructions carries the count as `expired`. When the highest issue time and not the
   device clock decided it, one further `warn` per connection says so (the device clock is behind
-  it), with the job ID only. Like the operator entry, it is a refusal decided, not recorded.
+  it), with the job ID only. Like the operator entry, it is a refusal decided, not recorded: the count and the warning come before the mark's write and the event's append, so when the mark cannot be written or the outbox is full the command stays unacknowledged and the end-of-connection line still counts it, and its redelivery is decided and counted again (the operator refusal behaves the same).
 
 - **The issue-time mark on the control channel** (`agent::control`, ADR-486): a mark file that
   cannot be written warns once per `hello` cycle with the class `mark-write` and the

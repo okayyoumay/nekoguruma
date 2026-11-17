@@ -549,12 +549,17 @@ impl Env {
     /// Stops the session, waits for its end and starts a new one on the same state directory, as
     /// a restart of the process would: the outbox is opened again from its file.
     async fn restart(&mut self) {
+        self.restart_with_mark_probe(None).await;
+    }
+
+    /// [`Env::restart`] with a hook on the new mark store's write path.
+    async fn restart_with_mark_probe(&mut self, mark_probe: Option<Probe>) {
         self.handle.stop();
         self.handle.stopped().await;
         self.outbox = None;
         self.marks = None;
         let outbox = open_outbox(&self.fx, None);
-        let marks = open_marks(&self.fx, None);
+        let marks = open_marks(&self.fx, mark_probe);
         let seams = Seams {
             dial: self.dial.clone(),
             signer: self.fx.key.clone(),
@@ -5216,6 +5221,11 @@ async fn deadline_v1_v2_v7_a_command_that_fails_verification_leaves_the_mark_and
     // The forged issue time did not poison the mark: a genuine command is accepted.
     send(&mut ws, &timed(&env, "ok", 1_000, 2_000)).await;
     assert_eq!(settled(&mut ws).await, received_of(1));
+    assert_eq!(
+        mark_in_file(&env),
+        Some(1_000),
+        "only the genuine command wrote"
+    );
     assert_eq!(env.counts(), (1, 7));
 }
 
@@ -5397,7 +5407,13 @@ async fn deadline_x2_f11_a_failed_expiry_append_closes_with_1011_and_the_redeliv
     assert_eq!(mark_in_file(&env), Some(1_000), "synced before the append");
     fail.store(false, Ordering::SeqCst);
     // A restart after the mark was synced and before the event was recorded (F11).
-    env.restart().await;
+    // The new store's writes are counted by the same counter.
+    env.restart_with_mark_probe(Some(mark_probe(
+        &writes,
+        &Arc::new(AtomicBool::new(false)),
+        crate::outbox::Step::BeforeWrite,
+    )))
+    .await;
     let (_, mut ws) = env.connected(60).await;
     send(&mut ws, &timed(&env, "a", 1_000, 2_000)).await;
     assert_eq!(settled_after_restart(&mut ws).await, expired_of(1));
@@ -5407,6 +5423,44 @@ async fn deadline_x2_f11_a_failed_expiry_append_closes_with_1011_and_the_redeliv
         "the redelivery wrote no mark"
     );
     assert!(env.intake.0.lock().unwrap().is_empty());
+}
+
+// F12
+#[tokio::test(start_paused = true)]
+async fn deadline_f12_a_crash_after_the_append_before_the_ack_gives_a_second_event_and_no_mark_write()
+ {
+    let writes = Arc::new(AtomicUsize::new(0));
+    let mut env = Env::with(Opts {
+        mark_probe: Some(mark_probe(
+            &writes,
+            &Arc::new(AtomicBool::new(false)),
+            crate::outbox::Step::BeforeWrite,
+        )),
+        ..Opts::default()
+    });
+    env.clock.set(2_500);
+    let (_, mut ws) = env.connected(60).await;
+    // The append succeeds and the answer's write fails: the ack is lost.
+    env.dial.flags.fail_write.store(true, Ordering::SeqCst);
+    send(&mut ws, &timed(&env, "a", 1_000, 2_000)).await;
+    env.wait_phase(Phase::Waiting).await;
+    env.dial.flags.fail_write.store(false, Ordering::SeqCst);
+    assert_eq!(env.counts(), (0, 0));
+    assert_eq!(writes.load(Ordering::SeqCst), 1);
+    env.restart_with_mark_probe(Some(mark_probe(
+        &writes,
+        &Arc::new(AtomicBool::new(false)),
+        crate::outbox::Step::BeforeWrite,
+    )))
+    .await;
+    let (_, mut ws) = env.connected(60).await;
+    send(&mut ws, &timed(&env, "a", 1_000, 2_000)).await;
+    assert_eq!(settled_after_restart(&mut ws).await, expired_of(2));
+    assert_eq!(
+        writes.load(Ordering::SeqCst),
+        1,
+        "no mark write after the restart"
+    );
 }
 
 // F8, F9, X5: a mark that cannot be written withholds everything the command leads to.
@@ -5443,7 +5497,20 @@ async fn a_mark_that_cannot_be_written_withholds_the_command(
     assert_eq!(env.marks.as_ref().unwrap().highest(), 1_000);
     send(&mut ws, &command(&env, "a")).await;
     let event = settled(&mut ws).await;
-    assert_eq!(event["seq"], 1, "no event came from the failed delivery");
+    let want = match kind {
+        "refused" => operator_refusal_of(1),
+        "expired" => expired_of(1),
+        _ => received_of(1),
+    };
+    assert_eq!(
+        event, want,
+        "{step:?} {kind}: no event came from the failed delivery"
+    );
+    assert_eq!(
+        env.intake.0.lock().unwrap().len(),
+        usize::from(kind == "accepted"),
+        "{step:?} {kind}"
+    );
     assert_eq!(writes.load(Ordering::SeqCst), 2, "{step:?} {kind}");
     assert_eq!(mark_in_file(&env), Some(1_000), "{step:?} {kind}");
     assert_eq!(env.counts(), (1, 0));

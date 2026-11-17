@@ -89,7 +89,7 @@ channels:
       | 1002 | either | Protocol error: malformed text, unknown `type`, unknown or missing property, value out of range, `hello` not first or not received in time. The server also sends it for a numbered `agentEvent` that skips a number or repeats a stored number with a different text (nothing of it is stored or acknowledged; 5.3, ADR-479) |
       | 1003 | either | A binary frame |
       | 1009 | either | A message over 128 KiB |
-      | 1011 | agent | The agent's outbox failed: a verified command's `received` event could not be recorded (the command is not acknowledged), rewriting the file after an `eventAck` failed, or the agent's issue-time mark could not be written before the command was judged (ADR-486). The agent reopens the outbox before it connects again (5.3, ADR-478 item 4) |
+      | 1011 | agent | The agent's outbox failed: a verified command's `received` event could not be recorded (the command is not acknowledged), rewriting the file after an `eventAck` failed, or the agent's issue-time mark could not be written before the command was answered (ADR-486 item 5; the command is not acknowledged). After an outbox failure the agent reopens the outbox before it connects again (5.3, ADR-478 item 4); the mark's store is reused |
       | 4001 | server | Replaced by a newer connection of the same agent |
       | 4002 | server | The agent's key was revoked, or its session ended. Sent as the first frame when the row is revoked or missing at connect (nothing else precedes it, and no earlier connection is replaced), or later by the server's 30 second pass |
       | 4003 | either | No frame of any kind for three heartbeat intervals |

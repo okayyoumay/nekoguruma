@@ -2,7 +2,7 @@
 
 **Date:** 2026-11-17
 **Status:** Accepted
-**Affects:** design 5.3, 6.4; `api/asyncapi.yaml` (`jobState`, `ackCommand`); `crates/agent` (`deadline`, `control::channel`, `control::gate`, `connect`), `crates/agent/docs/ngr-agent.md`, `crates/agent/docs/operational-log.md`; details ADR-461 item 6, reuses ADR-483's path
+**Affects:** design 5.3, 6.7; `docs/glossary.md`, `api/asyncapi.yaml` (`jobState`, `ackCommand`); `crates/agent` (`deadline`, `control::channel`, `control::gate`, `connect`), `crates/agent/docs/ngr-agent.md`, `crates/agent/docs/operational-log.md`; details ADR-461 item 6, reuses ADR-483's path
 
 ## Context
 

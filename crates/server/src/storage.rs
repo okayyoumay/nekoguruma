@@ -1,26 +1,31 @@
-//! The server's object storage (design 13, 14.3; ADR-474): large bodies (artifacts, data-channel
-//! chunks, job results) that the database holds only a key for. The `storage_key` columns hold the
-//! key this module issued.
+//! The server's object storage (design 13, 14.3; ADR-474, ADR-492): large bodies (artifacts,
+//! data-channel chunks, job results) that the database holds only a key for. The `storage_key`
+//! columns hold the key this module issued.
 //!
-//! [`ObjectStore`] is the contract; [`LocalStore`] is the local profile's implementation, a
-//! directory of files. An S3-compatible store for the standard profile implements the same trait
-//! later.
+//! [`MultipartStore`] is the contract the server uses; [`S3Store`] is its implementation, a bucket
+//! on the bundled S3-compatible object server (ADR-491). The caller does not send the bytes
+//! through the store: it gets a presigned part URL ([`MultipartStore::presign_part`]) that the
+//! writer, the agent, PUTs a part to, and the store completes the upload and verifies the result
+//! ([`MultipartStore::complete`]). The steps:
 //!
-//! Writing is a resumable upload by offset:
+//! 1. [`MultipartStore::begin`] issues a key and starts a multipart upload; the caller keeps both
+//!    in its row ([`Upload`]).
+//! 2. [`MultipartStore::presign_part`] gives the URL for one part, valid for a few minutes.
+//!    Nothing is sent to the object server.
+//! 3. [`MultipartStore::list_parts`] tells what the object server holds, so that a writer that
+//!    lost its place resumes.
+//! 4. [`MultipartStore::complete`] checks the parts, completes the upload, reads the object back
+//!    and compares its length and SHA-256; a mismatch deletes the object.
 //!
-//! 1. [`ObjectStore::begin`] issues a new key and an empty, unfinished object.
-//! 2. [`ObjectStore::append`] adds bytes at an offset. It succeeds only when the offset is the
-//!    length the store holds, and answers with the new length; any other offset is refused with
-//!    the stored length, so a writer whose connection was cut (or whose answer was lost) asks
-//!    [`ObjectStore::status`] or reads the refusal, and resumes from there.
-//! 3. [`ObjectStore::finish`] checks the length and the SHA-256 of the whole content and makes the
-//!    object visible and immutable.
+//! [`MultipartStore::get`] reads a finished object, [`MultipartStore::delete`] removes an object in
+//! either state and [`MultipartStore::list_unfinished`] lists the uploads a writer left behind.
 //!
-//! Only finished objects are readable ([`ObjectStore::get`]). [`ObjectStore::delete`] removes an
-//! object in either state. [`ObjectStore::list_unfinished`] lists what a writer left behind.
+//! [`ObjectStore`] and [`LocalStore`], a directory of files with resumable append by offset, are
+//! the earlier contract (ADR-474). The server does not use them any more; they stay for their
+//! tests and as the owner of the directory-locking code the object server's data directory shares.
 //!
-//! Errors are fixed text and, for a failed file operation, the [`std::io::ErrorKind`]: never a
-//! path.
+//! Errors are fixed text, an HTTP status and, for a failed operation, the [`std::io::ErrorKind`]:
+//! never a path, a URL, a key, an upload ID or text the object server sent.
 
 use std::future::Future;
 use std::io;
@@ -30,16 +35,18 @@ use std::time::SystemTime;
 use tokio::io::AsyncRead;
 
 pub(crate) mod local;
+pub mod s3;
 
-pub use local::LocalStore;
+pub use local::{LocalStore, StorageConfig};
+pub use s3::{S3Store, Tuning as S3Tuning};
 
-/// The boxed future of an [`ObjectStore`] method. Written by hand so that the trait stays object
+/// The boxed future of an [`ObjectStore`] or [`MultipartStore`] method. Written by hand so that the trait stays object
 /// safe without a macro crate.
 pub type StoreFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, StoreError>> + Send + 'a>>;
 
 /// The key of an object: a version 4 UUID in canonical lowercase text, issued by
-/// [`ObjectStore::begin`]. It is the only text a store builds a path from, and it is validated
-/// before any file is touched.
+/// [`ObjectStore::begin`] or [`MultipartStore::begin`]. It is the only text a store builds a path
+/// or a URL from, and it is validated before any file is touched or request is made.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ObjectKey(String);
 
@@ -149,6 +156,33 @@ pub enum StoreError {
     LengthMismatch { stored: u64 },
     #[error("the SHA-256 is not that of the stored content")]
     HashMismatch,
+    /// The parts' sizes do not add up to the declared length. Answered before the upload is
+    /// completed: the upload and its parts are still there, so the writer can correct a part
+    /// and complete again.
+    #[error("the parts hold {stored} bytes, not the declared length")]
+    PartsLengthMismatch { stored: u64 },
+    #[error("the upload ID is not 1 to 1024 printable ASCII characters")]
+    InvalidUploadId,
+    #[error("the part number is not from 1 to 10000")]
+    InvalidPartNumber,
+    #[error("the upload has no parts")]
+    NoParts,
+    #[error("part {part} is missing: the parts are not numbered consecutively from 1")]
+    MissingPart { part: u16 },
+    #[error("part {part} is smaller than the minimum and is not the last")]
+    PartTooSmall { part: u16 },
+    #[error("the parts changed while the upload was being completed")]
+    PartsChanged,
+    #[error("the object would be larger than the size limit")]
+    ObjectTooLarge,
+    /// The object server turned the request down: the credentials are not accepted, or the
+    /// request is not allowed.
+    #[error("the object server refused to {op}")]
+    Refused { op: &'static str },
+    /// The object server answered with a status the operation does not expect, or with an answer
+    /// that could not be read.
+    #[error("the object server answered {status} to {op}")]
+    Server { op: &'static str, status: u16 },
     /// The store's directory, or one of its areas, is gone.
     #[error("the object store's directory is unavailable")]
     Unavailable,
@@ -159,7 +193,7 @@ pub enum StoreError {
         op: &'static str,
         kind: io::ErrorKind,
     },
-    #[error("storage.dir must be an absolute path")]
+    #[error("the object store's directory must be an absolute path")]
     DirectoryNotAbsolute,
     #[error("the object store's directory is not a directory")]
     NotADirectory,
@@ -176,6 +210,151 @@ pub enum StoreError {
     NotRegularFile,
     #[error("operating-system randomness is unavailable")]
     Random,
+}
+
+/// The ID the object server gave a multipart upload. It is a bearer of access to the upload, so
+/// `Debug` shows nothing of it and there is no `Display`; the caller keeps it in its row
+/// ([`UploadId::expose`]) and never logs it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct UploadId(String);
+
+/// The longest upload ID the store accepts, in characters.
+pub(crate) const MAX_UPLOAD_ID_LEN: usize = 1024;
+
+impl UploadId {
+    /// An ID from its text (a row read back): 1 to 1024 printable ASCII characters.
+    pub fn parse(text: &str) -> Result<UploadId, StoreError> {
+        if text.is_empty()
+            || text.len() > MAX_UPLOAD_ID_LEN
+            || !text.bytes().all(|b| (0x21..=0x7e).contains(&b))
+        {
+            return Err(StoreError::InvalidUploadId);
+        }
+        Ok(UploadId(text.to_owned()))
+    }
+
+    /// The ID as written, for the caller's row. It must not be logged.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for UploadId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("UploadId(..)")
+    }
+}
+
+/// A multipart upload: the key the object will have and the ID the object server gave the upload.
+/// [`MultipartStore::begin`] returns it and the caller's row keeps both; the store itself keeps
+/// nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Upload {
+    pub key: ObjectKey,
+    pub id: UploadId,
+}
+
+/// A presigned URL a part is PUT to. It carries its signature in the query, so `Debug` shows
+/// nothing of it and there is no `Display`; [`PartUrl::expose`] gives the text to hand to the
+/// writer, and it must not be logged.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PartUrl(String);
+
+impl PartUrl {
+    pub(crate) fn new(url: String) -> PartUrl {
+        PartUrl(url)
+    }
+
+    /// The URL as signed.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for PartUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PartUrl(..)")
+    }
+}
+
+/// A part the object server holds. The entity tags it also holds do not leave the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Part {
+    /// From 1 to 10000.
+    pub number: u16,
+    /// The part's length in bytes.
+    pub size: u64,
+}
+
+/// An upload [`MultipartStore::list_unfinished`] lists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnfinishedUpload {
+    pub key: ObjectKey,
+    pub id: UploadId,
+    /// When the upload was started.
+    pub initiated: SystemTime,
+}
+
+/// The answer of [`MultipartStore::list_unfinished`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnfinishedUploads {
+    pub uploads: Vec<UnfinishedUpload>,
+    /// How many listed uploads were left out because their key or ID is not one this store issues
+    /// or their time cannot be read (the bucket may hold others' uploads).
+    pub skipped: usize,
+}
+
+/// The most parts an upload may have.
+pub const MAX_PARTS: u16 = 10_000;
+
+/// How long a presigned part URL is valid.
+pub const PART_URL_EXPIRY: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// An object store whose writer sends the bytes itself, in parts, to presigned URLs. Calls on one
+/// key that complete or delete it are serialised (in this process only); the others run
+/// concurrently. A call whose future is dropped may have done part of its work: every step is
+/// safe to repeat.
+pub trait MultipartStore: Send + Sync {
+    /// Issues a key and starts an upload. The store records nothing: the caller's row keeps the
+    /// result.
+    fn begin(&self) -> StoreFuture<'_, Upload>;
+
+    /// The URL to PUT part `part` (from 1 to 10000, else [`StoreError::InvalidPartNumber`]) of
+    /// `upload` to, valid for [`PART_URL_EXPIRY`]. Computes a signature and does no I/O. The URL
+    /// does not bind the part's length.
+    fn presign_part(&self, upload: &Upload, part: u16) -> Result<PartUrl, StoreError>;
+
+    /// The parts the object server holds for `upload`, in part order. An upload that is gone
+    /// while its object exists is [`StoreError::AlreadyFinished`]; gone with no object,
+    /// [`StoreError::NotFound`].
+    fn list_parts<'a>(&'a self, upload: &'a Upload) -> StoreFuture<'a, Vec<Part>>;
+
+    /// Completes `upload` as an object of `length` bytes whose SHA-256 is `sha256`: the parts are
+    /// listed and checked (numbered consecutively from 1, each but the last at least the minimum
+    /// size, their sizes adding up to `length`, at most 4 GiB and 10000 parts; a refusal of the
+    /// listing, including [`StoreError::PartsLengthMismatch`], leaves the upload as it is), the
+    /// upload is completed and the object is read back and compared. A mismatch deletes the
+    /// object, and [`StoreError::HashMismatch`] or [`StoreError::LengthMismatch`] (the
+    /// read-back's length) is answered only once nothing is left; if the delete fails, its error
+    /// is answered. A retry after the upload was
+    /// completed (the answer lost, the read-back cut) reads the object back again.
+    fn complete<'a>(
+        &'a self,
+        upload: &'a Upload,
+        sha256: [u8; 32],
+        length: u64,
+    ) -> StoreFuture<'a, ()>;
+
+    /// Opens an object for reading. Nothing is verified here: the content is what the object
+    /// server holds, and a read that stalls for the idle timeout fails.
+    fn get<'a>(&'a self, key: &'a ObjectKey) -> StoreFuture<'a, ObjectBody>;
+
+    /// Removes an object, finished or not: the uploads of the key are aborted, then the object is
+    /// deleted. Deleting what is not there is `Ok`.
+    fn delete<'a>(&'a self, key: &'a ObjectKey) -> StoreFuture<'a, ()>;
+
+    /// The uploads that were started and not completed or aborted.
+    fn list_unfinished(&self) -> StoreFuture<'_, UnfinishedUploads>;
 }
 
 /// An object store. Every method is durable before it answers: a successful `append` has synced

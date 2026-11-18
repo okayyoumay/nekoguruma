@@ -1,4 +1,6 @@
-//! The local profile's object store (design 13, 14.3; ADR-474): files under `storage.dir`.
+//! The local object store (design 13, 14.3; ADR-474): files under the directory of its
+//! [`StorageConfig`]. The server no longer uses it (ADR-492); it is compiled for its tests and for
+//! the directory-locking code the object server's data directory shares.
 //!
 //! ```text
 //! <dir>/staging/<key>   an unfinished object, one file
@@ -43,8 +45,30 @@ use sha2::{Digest, Sha256};
 use super::{
     ObjectBody, ObjectKey, ObjectStatus, ObjectStore, StoreError, StoreFuture, UnfinishedObject,
 };
-use crate::config::StorageConfig;
 use crate::fs_guard::{self, DirectoryFault, check_directory, sync_directory};
+
+/// The largest object the local store accepts unless its settings say otherwise: 4 GiB.
+pub const DEFAULT_MAX_OBJECT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// The settings of a [`LocalStore`] (design 13, 14.3; ADR-474). The server's configuration file
+/// has no table for them any more (the server uses the S3 store, ADR-492); tests build them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageConfig {
+    /// An absolute path. The store creates the directory (mode 0700 on Unix) when it is absent
+    /// and its parent exists.
+    pub dir: PathBuf,
+    /// The most bytes one object may hold; an append past it is refused. Not 0.
+    pub max_object_bytes: u64,
+}
+
+impl StorageConfig {
+    pub fn new(dir: impl Into<PathBuf>) -> StorageConfig {
+        StorageConfig {
+            dir: dir.into(),
+            max_object_bytes: DEFAULT_MAX_OBJECT_BYTES,
+        }
+    }
+}
 
 /// How many keys `begin` draws before it gives up on names that are taken.
 const BEGIN_ATTEMPTS: usize = 8;

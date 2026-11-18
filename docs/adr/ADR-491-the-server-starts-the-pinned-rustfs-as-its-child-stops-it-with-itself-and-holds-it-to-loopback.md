@@ -1,7 +1,7 @@
 # ADR-491: The Server Starts the Pinned RustFS as Its Child, Stops It With Itself and Holds It to Loopback
 
 **Date:** 2026-11-18
-**Status:** Accepted
+**Status:** Accepted (item 1 loses the `storage.dir` rule; item 2's signed check is ADR-492's HeadBucket)
 **Affects:** design 13, 13.3; `crates/server` (`object_server`, `config`, `fs_guard`, `lib`, `bin/ngr-fake-object-server`, `tests/postgres/`), `crates/server/docs/ngr-server.md`, `scripts/fetch-rustfs.sh`, `scripts/rustfs-pin.txt`, `.github/workflows/ci.yml`, CLAUDE.md "Building and testing", `docs/glossary.md`; extends ADR-458's start order and ADR-462's file rule; details ADR-456 item 7
 
 ## Context

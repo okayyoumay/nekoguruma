@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use server::Server;
-use server::config::{Config, Database, Http, InstructionKeyConfig, Profile, StorageConfig};
+use server::config::{Config, Database, Http, InstructionKeyConfig, Profile};
 use server::job_expiry::{EXPIRE_SQL, Settings, expire};
 use server::job_queue::TAKE_SQL;
 
@@ -555,7 +555,6 @@ async fn start_turns_the_expiry_task_on_and_bind_leaves_it_off() {
         instruction_key: InstructionKeyConfig {
             path: pg.key_path(),
         },
-        storage: StorageConfig::new(pg.storage_path()),
         object_server: None,
     };
     let started = Server::start(&config).await.unwrap();

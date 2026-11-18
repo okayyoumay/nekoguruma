@@ -10,11 +10,10 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use server::config::{
-    Config, Database, Http, InstructionKeyConfig, ObjectServerConfig, Profile, StorageConfig,
-};
+use server::config::{Config, Database, Http, InstructionKeyConfig, ObjectServerConfig, Profile};
 use server::object_server::credentials::{ACCESS_KEY_FILE, SECRET_KEY_FILE};
 use server::object_server::{ObjectServer, ObjectServerError, Tuning};
+use server::storage::{S3Tuning, StoreError};
 use server::{RunError, Server, StartError};
 
 use crate::redeem::{Captured, capture};
@@ -59,6 +58,7 @@ impl Fixture {
                 data_dir: data,
                 credentials_dir: credentials,
                 port: Some(free_port()),
+                bucket: "nekoguruma".to_owned(),
             },
             dir,
         }
@@ -121,9 +121,16 @@ impl Fixture {
             instruction_key: InstructionKeyConfig {
                 path: pg.key_path(),
             },
-            storage: StorageConfig::new(pg.storage_path()),
             object_server: Some(self.config.clone()),
         }
+    }
+}
+
+/// The store's bounds: the defaults, with a short retry pause.
+fn store_tuning() -> S3Tuning {
+    S3Tuning {
+        retry_interval: Duration::from_millis(20),
+        ..S3Tuning::default()
     }
 }
 
@@ -998,7 +1005,11 @@ async fn start_server(
 ) -> Result<Server, StartError> {
     tokio::time::timeout(
         LIMIT,
-        Server::start_tuned(&fx.server_config(pg, http_port), tuning(5000, 1000)),
+        Server::start_tuned(
+            &fx.server_config(pg, http_port),
+            tuning(5000, 1000),
+            store_tuning(),
+        ),
     )
     .await
     .expect("Server::start must not hang")
@@ -1029,7 +1040,7 @@ async fn a_failure_before_the_object_server_leaves_no_credentials_lock_or_child(
         .path()
         .join("no-such-directory")
         .join("instruction.key");
-    let error = failed(Server::start_tuned(&config, tuning(5000, 1000)).await);
+    let error = failed(Server::start_tuned(&config, tuning(5000, 1000), store_tuning()).await);
     assert!(matches!(error, StartError::InstructionKey(_)), "{error}");
     assert!(fx.credential_names().is_empty());
     assert_eq!(fx.pid(), None);
@@ -1049,22 +1060,68 @@ async fn a_failure_in_step_five_before_the_spawn_closes_the_pool() {
     assert_eq!(pool_connections(&pg).await, "0");
 }
 
-/// S4: the object store failing to open after the child is ready stops and reaps the child,
-/// releases its data directory and closes the pool.
+/// S4: the object store failing to open after the child is ready (the bucket check is refused)
+/// stops and reaps the child, releases its data directory and closes the pool.
 #[tokio::test]
 async fn a_store_that_fails_to_open_stops_the_child_and_closes_the_pool() {
     let pg = TestPostgres::start();
-    let fx = Fixture::new("");
-    let mut config = fx.server_config(&pg, 0);
-    let file = fx.dir.path().join("storage-is-a-file");
-    std::fs::write(&file, b"x").unwrap();
-    config.storage = StorageConfig::new(file);
-    let error = failed(Server::start_tuned(&config, tuning(5000, 1000)).await);
-    assert!(matches!(error, StartError::Storage(_)), "{error}");
+    let fx = Fixture::new("s3_status 403\n");
+    let config = fx.server_config(&pg, 0);
+    let error = failed(Server::start_tuned(&config, tuning(5000, 1000), store_tuning()).await);
+    assert!(
+        matches!(error, StartError::Storage(StoreError::Refused { .. })),
+        "{error}"
+    );
     wait_ended(fx.pid().unwrap(), Duration::from_secs(5)).await;
     assert_eq!(pool_connections(&pg).await, "0");
     // The data directory's lock is free again.
+    std::fs::write(fx.data().join("fake-object-server.cfg"), "").unwrap();
     drop(started(start_server(&fx, &pg, 0).await));
+}
+
+/// S4: the child ending while the store retries ends the start at once, naming the child.
+#[tokio::test]
+async fn a_child_that_ends_while_the_store_opens_ends_the_start() {
+    let pg = TestPostgres::start();
+    let fx = Fixture::new("s3_status 503\ndie_after_ms 300\ndie_code 7\n");
+    let config = fx.server_config(&pg, 0);
+    let mut tune = store_tuning();
+    tune.ready_timeout = Duration::from_secs(20);
+    let began = Instant::now();
+    let error = failed(Server::start_tuned(&config, tuning(5000, 1000), tune).await);
+    assert!(
+        matches!(
+            error,
+            StartError::ObjectServer(ObjectServerError::ExitedBeforeReady(_))
+        ),
+        "{error}"
+    );
+    assert!(
+        began.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        began.elapsed()
+    );
+    assert_eq!(pool_connections(&pg).await, "0");
+}
+
+/// A bucket check that is refused by a 5xx is retried until the budget is spent, then fails with
+/// the status.
+#[tokio::test]
+async fn a_store_that_never_gets_a_bucket_fails_when_the_budget_is_spent() {
+    let pg = TestPostgres::start();
+    let fx = Fixture::new("s3_status 503\n");
+    let config = fx.server_config(&pg, 0);
+    let mut tune = store_tuning();
+    tune.ready_timeout = Duration::from_millis(400);
+    let error = failed(Server::start_tuned(&config, tuning(5000, 1000), tune).await);
+    assert!(
+        matches!(
+            error,
+            StartError::Storage(StoreError::Server { status: 503, .. })
+        ),
+        "{error}"
+    );
+    assert_eq!(pool_connections(&pg).await, "0");
 }
 
 /// C11: the server's own port taken stops the child and closes the pool.
@@ -1155,7 +1212,7 @@ async fn a_stop_ends_the_child_and_a_second_signal_kills_it_at_once() {
     // The child ignores SIGTERM; the second signal comes after the grace wait.
     let fx = Fixture::new("ignore_term 1\n");
     let config = fx.server_config(&pg, 0);
-    let server = started(Server::start_tuned(&config, tuning(5000, 20_000)).await);
+    let server = started(Server::start_tuned(&config, tuning(5000, 20_000), store_tuning()).await);
     let pid = server.object_server().unwrap().pid().unwrap();
     let began = Instant::now();
     tokio::time::timeout(
@@ -1193,7 +1250,7 @@ async fn a_stop_ends_the_child_and_a_second_signal_kills_it_at_once() {
     let fx = Fixture::new("ignore_term 1\n");
     let mut config = fx.server_config(&pg, 0);
     config.http.shutdown_grace_secs = 30;
-    let server = started(Server::start_tuned(&config, tuning(5000, 20_000)).await);
+    let server = started(Server::start_tuned(&config, tuning(5000, 20_000), store_tuning()).await);
     let pid = server.object_server().unwrap().pid().unwrap();
     let addr = server.local_addr();
     let _idle = tokio::net::TcpStream::connect(addr).await.unwrap();

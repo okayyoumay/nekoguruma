@@ -20,7 +20,7 @@ use crate::redeem::capture;
 use crate::support::free_port;
 
 /// The pinned binary, or a panic that names the script that fetches it.
-fn rustfs_bin() -> PathBuf {
+pub(crate) fn rustfs_bin() -> PathBuf {
     let Some(path) = std::env::var_os("NGR_TEST_RUSTFS_BIN") else {
         panic!(
             "NGR_TEST_RUSTFS_BIN is not set: the server's tests start the pinned RustFS; run \
@@ -36,13 +36,13 @@ fn rustfs_bin() -> PathBuf {
     path
 }
 
-struct Real {
+pub(crate) struct Real {
     _dir: tempfile::TempDir,
-    config: ObjectServerConfig,
+    pub(crate) config: ObjectServerConfig,
 }
 
 impl Real {
-    fn new() -> Real {
+    pub(crate) fn new() -> Real {
         let dir = tempfile::tempdir().unwrap();
         let credentials = dir.path().join("credentials");
         std::fs::create_dir(&credentials).unwrap();
@@ -57,6 +57,7 @@ impl Real {
                 data_dir: dir.path().join("data"),
                 credentials_dir: credentials,
                 port: Some(free_port()),
+                bucket: "nekoguruma".to_owned(),
             },
             _dir: dir,
         }
@@ -66,7 +67,7 @@ impl Real {
         self.config.port.unwrap()
     }
 
-    async fn start(&self) -> ObjectServer {
+    pub(crate) async fn start(&self) -> ObjectServer {
         tokio::time::timeout(
             Duration::from_secs(60),
             ObjectServer::start(&self.config, 1, &Tuning::default()),

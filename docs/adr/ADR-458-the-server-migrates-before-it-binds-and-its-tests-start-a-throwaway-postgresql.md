@@ -1,7 +1,7 @@
 # ADR-458: The Server Applies Embedded Migrations Before It Binds, and Its Tests Start a Throwaway PostgreSQL
 
 **Date:** 2026-11-11
-**Status:** Accepted (the start order extended by ADR-462: the instruction key is made ready after the migrations and before the bind; and by ADR-474: the object store opens after the instruction key and before the bind; and by ADR-491: the object server starts after the instruction key and before the object store)
+**Status:** Accepted (the start order extended by ADR-462: the instruction key is made ready after the migrations and before the bind; and by ADR-474: the object store opens after the instruction key and before the bind; and by ADR-491: the object server starts after the instruction key and before the object store; and by ADR-492: the object store is a bucket on that object server, opened once it is ready and before the bind)
 **Affects:** `crates/server` (`db.rs`, `config.rs`, `health.rs`, `build.rs`, `tests/postgres/`), `db/migrations`, `db/README.md`, `api/openapi.yaml` (health), design 12 and 13.3, `.gitattributes`, `.github/workflows/ci.yml`, CLAUDE.md "Building and testing"; extends ADR-456 items 7 and 8
 
 ## Context

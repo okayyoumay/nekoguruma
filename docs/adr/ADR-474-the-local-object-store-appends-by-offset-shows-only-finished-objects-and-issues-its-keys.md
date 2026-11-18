@@ -1,7 +1,7 @@
 # ADR-474: The Local Object Store Appends by Offset, Shows Only Finished Objects and Issues Its Keys
 
 **Date:** 2026-11-13
-**Status:** Accepted
+**Status:** Accepted (items 1, 4 and 5 describe the test store only; superseded in part by ADR-492)
 **Affects:** design 13; `crates/server` (`storage`, `config`, `lib`, the directory checks shared with `instruction_key`), `crates/server/docs/ngr-server.md`, `db/README.md`; extends ADR-458's start order
 
 ## Context

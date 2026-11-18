@@ -6,8 +6,8 @@
 //! migrations before it binds, so a listening port means a migrated schema (ADR-458). It then
 //! reads or creates the job instruction key, so a listening port also means a usable key
 //! (ADR-462), starts the bundled object server as its child and waits until it is ready
-//! (ADR-491), and opens the object store (ADR-474), whose directory it locks for the process's
-//! life. Local users sign in with a password and keep a cookie session (ADR-469).
+//! (ADR-491), and opens the object store, a bucket on that server (ADR-492), creating the bucket
+//! if it is absent. Local users sign in with a password and keep a cookie session (ADR-469).
 
 pub(crate) mod agent_events;
 pub(crate) mod audit;
@@ -58,7 +58,7 @@ pub use local_user::Hasher;
 pub use object_server::ObjectServer;
 pub use operator_session::OperatorSessions;
 pub use session::Sessions;
-pub use storage::{LocalStore, ObjectStore, StoreError};
+pub use storage::{LocalStore, MultipartStore, ObjectStore, S3Store, StoreError};
 
 /// How long a connection may take to deliver a complete request head. A client that opens a
 /// connection and sends nothing, or a head one byte at a time, is dropped after this; it also
@@ -201,9 +201,9 @@ pub struct Server {
     hasher: Hasher,
     hub: Hub,
     grace: Duration,
-    /// The object store `start` opened; `bind` leaves it empty (tests). Held so that its
-    /// directory stays locked until `run` returns.
-    object_store: Option<Arc<LocalStore>>,
+    /// The object store `start` opened on the object server; `bind` leaves it empty (tests), and
+    /// so does a `Config` with no `[object_server]`.
+    object_store: Option<Arc<S3Store>>,
     /// The object server `start` started (ADR-491); `bind` leaves it empty (tests). `run` ends
     /// it after the connections and before the pool.
     object_server: Option<ObjectServer>,
@@ -217,22 +217,29 @@ impl Server {
     /// Connects to the database (within the connect timeout), applies the migrations (within
     /// [`db::MIGRATION_TIMEOUT`]), makes the instruction key ready ([`InstructionKey::open`]),
     /// starts the object server when `[object_server]` is configured ([`ObjectServer::start`],
-    /// ADR-491), opens the object store ([`LocalStore::open`]), then binds `127.0.0.1:<port>`:
-    /// nothing listens before the schema is current (ADR-458), before the key is usable
-    /// (ADR-462), before the object server answers its readiness probe (ADR-491) or before the
-    /// store's directory is usable and locked (ADR-474). Any failure ends the start, with the
-    /// pool closed and the object server stopped; a failed migration run is never retried on its
-    /// pool (the advisory lock is per session and counts how often it was taken, so a retry
-    /// could leave it held), and neither is the key, the object server or the store.
+    /// ADR-491), opens the object store on it ([`S3Store::open`], ADR-492: the bucket is checked
+    /// and created if absent, and the wait ends if the child ends), then binds
+    /// `127.0.0.1:<port>`: nothing listens before the schema is current (ADR-458), before the
+    /// key is usable (ADR-462), before the object server answers its readiness probe (ADR-491) or
+    /// before the bucket is ready (ADR-492). Any failure ends the start, with the pool closed and
+    /// the object server stopped; a failed migration run is never retried on its pool (the
+    /// advisory lock is per session and counts how often it was taken, so a retry could leave it
+    /// held), and neither is the key, the object server or the store.
     pub async fn start(config: &Config) -> Result<Server, StartError> {
-        Server::start_tuned(config, object_server::Tuning::default()).await
+        Server::start_tuned(
+            config,
+            object_server::Tuning::default(),
+            storage::S3Tuning::default(),
+        )
+        .await
     }
 
-    /// [`Server::start`] with the object server's bounds set. Tests only.
+    /// [`Server::start`] with the object server's and the object store's bounds set. Tests only.
     #[doc(hidden)]
     pub async fn start_tuned(
         config: &Config,
         tuning: object_server::Tuning,
+        store_tuning: storage::S3Tuning,
     ) -> Result<Server, StartError> {
         let pool = db::connect(&config.database).await?;
         if let Err(error) = db::migrate(&pool).await {
@@ -246,23 +253,41 @@ impl Server {
                 return Err(error.into());
             }
         };
-        let object_server = match &config.object_server {
-            Some(object) => match ObjectServer::start(object, config.http.port, &tuning).await {
-                Ok(object_server) => Some(object_server),
-                Err(error) => {
-                    db::close(&pool).await;
-                    return Err(error.into());
+        let (object_server, store) = match &config.object_server {
+            Some(object) => {
+                let mut object_server =
+                    match ObjectServer::start(object, config.http.port, &tuning).await {
+                        Ok(object_server) => object_server,
+                        Err(error) => {
+                            db::close(&pool).await;
+                            return Err(error.into());
+                        }
+                    };
+                // The store opens while the child lives: a child that ends meanwhile ends the
+                // start at once instead of after the store's retries.
+                let open = S3Store::open(
+                    object_server.port(),
+                    object_server.credentials(),
+                    &object.bucket,
+                    store_tuning,
+                );
+                let opened = tokio::select! {
+                    biased;
+                    ended = object_server.exited() => Err(StartError::ObjectServer(
+                        object_server::ObjectServerError::ExitedBeforeReady(ended),
+                    )),
+                    opened = open => opened.map_err(StartError::from),
+                };
+                match opened {
+                    Ok(store) => (Some(object_server), Some(Arc::new(store))),
+                    Err(error) => {
+                        object_server.stop(std::future::pending()).await;
+                        db::close(&pool).await;
+                        return Err(error);
+                    }
                 }
-            },
-            None => None,
-        };
-        let store = match LocalStore::open(&config.storage) {
-            Ok(store) => Arc::new(store),
-            Err(error) => {
-                stop_object_server(object_server).await;
-                db::close(&pool).await;
-                return Err(error.into());
             }
+            None => (None, None),
         };
         let mut server = match Server::bind(&config.http, pool, key).await {
             Ok(server) => server,
@@ -273,7 +298,7 @@ impl Server {
             }
         };
         server.object_server = object_server;
-        server.object_store = Some(store);
+        server.object_store = store;
         server.job_queue = Some(job_queue::Settings::default());
         server.job_expiry = Some(job_expiry::Settings::default());
         Ok(server)
@@ -298,11 +323,12 @@ impl Server {
         self.object_server.as_ref()
     }
 
-    /// The object store `start` opened (`None` on a server made by `bind`).
-    pub fn object_store(&self) -> Option<Arc<dyn ObjectStore>> {
+    /// The object store `start` opened (`None` on a server made by `bind`, and when no
+    /// `[object_server]` is configured).
+    pub fn object_store(&self) -> Option<Arc<dyn MultipartStore>> {
         self.object_store
             .as_ref()
-            .map(|store| Arc::clone(store) as Arc<dyn ObjectStore>)
+            .map(|store| Arc::clone(store) as Arc<dyn MultipartStore>)
     }
 
     /// Binds `127.0.0.1:<port>` (the address is fixed in code) and derives the pinned origin from

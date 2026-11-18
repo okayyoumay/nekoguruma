@@ -48,9 +48,17 @@ impl TestPostgres {
             std::os::unix::fs::chown(dir.path(), Some(uid), Some(gid))
                 .expect("hand the temporary directory to the postgres account");
         }
+        // Owner-only whatever the umask: the server refuses a group-writable key directory.
+        let key_dir = tempfile::tempdir().expect("a temporary directory for the key");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(key_dir.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("make the key directory owner-only");
+        }
         let mut pg = TestPostgres {
             dir,
-            key_dir: tempfile::tempdir().expect("a temporary directory for the key"),
+            key_dir,
             bin,
             port: 0,
             password: random_password(),
@@ -273,6 +281,50 @@ pub fn refused_url(password: &str) -> String {
     )
 }
 
+/// The `[object_server]` table of a configuration file in `dir`: the fake object server
+/// (`src/bin/ngr-fake-object-server.rs`), a data directory `object-server` and a credentials
+/// directory `credentials` (made here) in `dir`, and a free port. A literal string, since a
+/// Windows path holds backslashes.
+pub fn object_server_table(dir: &Path) -> String {
+    let credentials = dir.join("credentials");
+    std::fs::create_dir_all(&credentials).expect("a credentials directory");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Owner-only whatever the umask: the server refuses a group-writable directory.
+        std::fs::set_permissions(&credentials, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    format!(
+        "[object_server]\nbinary = '{}'\ndata_dir = '{}'\ncredentials_dir = '{}'\nport = {}\n",
+        fake_binary(dir).display(),
+        dir.join("object-server").display(),
+        credentials.display(),
+        free_port()
+    )
+}
+
+/// A private copy of the fake object server inside `dir`: the server refuses a binary that
+/// group or others can write, and a build under a umask of 002 leaves the file (and the directory
+/// Cargo builds into) group-writable, so the copy, and `dir` (a temporary directory of the test,
+/// which a umask of 002 also leaves group-writable), are made owner-only.
+pub fn fake_binary(dir: &Path) -> PathBuf {
+    let source = Path::new(env!("CARGO_BIN_EXE_ngr-fake-object-server"));
+    let target = dir.join(format!("ngr-fake-object-server{EXE}"));
+    if !target.exists() {
+        std::fs::copy(source, &target).expect("copy the fake object server");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for path in [target.as_path(), dir] {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        }
+    }
+    target
+}
+
+/// A port that was free a moment ago. Another process may take it before it is used (the same
+/// race as `TestPostgres::start`'s retry loop); the tests accept it.
 pub fn free_port() -> u16 {
     std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .expect("bind a free port")

@@ -20,3 +20,4 @@ jobs:
       - run: scripts/check-adr-index.sh
       - run: scripts/check-backlog.sh
       - run: scripts/test-classify-pr-risk.sh
+      - run: scripts/test-fetch-rustfs.sh

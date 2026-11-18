@@ -1,0 +1,16 @@
+# The RustFS release that the server's bundled object server runs (ADR-491), read by
+# scripts/fetch-rustfs.sh. Changing the version is a change of this file: the asset names follow
+# RustFS's own build workflow (rustfs-<platform>-<arch>-<variant>-v<version>.zip), and the hashes
+# are those of the downloaded assets and of the one binary inside each.
+#
+#   platform <name> <asset> <SHA-256 of the asset> <member> <SHA-256 of the extracted member>
+#
+# The extracted member's hash lets the script skip a download when the file is in place. A
+# platform with no row has no pinned binary: the script refuses it and names it. Not pinned:
+# macos-x86_64 (the release has no asset for it), linux-x86_64-gnu, linux-aarch64-gnu and the
+# other variants of an asset.
+version 1.0.6
+platform linux-x86_64 rustfs-linux-x86_64-musl-v1.0.6.zip a4d109a09857c04bf5d11b2cec0fbbf0887819b9392e5d46d7d153dae6a1398f rustfs 9bb7de3922807c4e8b7c6d1b666d641ea0591b7150b966a94d68215e3d56f0f1
+platform linux-aarch64 rustfs-linux-aarch64-musl-v1.0.6.zip dcbe86dbb0c521cb6738f72bb36a2d056866667d3d137c2118ee7e2cc9475855 rustfs 21e3f324690b04b1632bfa908f0c84e192c0de91a8c847c165e355a3e35e13fb
+platform macos-aarch64 rustfs-macos-aarch64-v1.0.6.zip e0bf7e8aeee45490034576fde6513377db81844d8c40e24c57269e9bb274882f rustfs 80cb1c34190b1fcc60b4ca5fc8413f0dc11bd10b3fc40c8f2dd6c6eab585c198
+platform windows-x86_64 rustfs-windows-x86_64-v1.0.6.zip d718157c08ffcbc32e667176f941d6d36b37c7d73335b9f82d4d30a2d5ea5393 rustfs.exe 88573093162143aa0469ba721540aebee91412a924d05a238c6054062f664464

@@ -117,6 +117,7 @@ impl Running {
                 path: pg.key_path(),
             },
             storage: StorageConfig::new(pg.storage_path()),
+            object_server: None,
         };
         let server = Server::start(&config).await.unwrap();
         Running::spawn(server)

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use crate::support::{TestPostgres, random_password, refused_url};
 
-fn server(args: &[&str]) -> Command {
+pub(crate) fn server(args: &[&str]) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_ngr-server"));
     c.args(args)
         .stdin(Stdio::null())
@@ -18,7 +18,7 @@ fn server(args: &[&str]) -> Command {
     c
 }
 
-fn free_port() -> u16 {
+pub(crate) fn free_port() -> u16 {
     TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .unwrap()
         .local_addr()
@@ -26,7 +26,7 @@ fn free_port() -> u16 {
         .port()
 }
 
-fn wait_exit(child: &mut Child, limit: Duration) -> std::process::ExitStatus {
+pub(crate) fn wait_exit(child: &mut Child, limit: Duration) -> std::process::ExitStatus {
     let deadline = Instant::now() + limit;
     loop {
         if let Some(status) = child.try_wait().unwrap() {
@@ -40,7 +40,7 @@ fn wait_exit(child: &mut Child, limit: Duration) -> std::process::ExitStatus {
     }
 }
 
-fn get_health(port: u16) -> Option<String> {
+pub(crate) fn get_health(port: u16) -> Option<String> {
     let mut s = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).ok()?;
     s.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
     write!(
@@ -55,7 +55,7 @@ fn get_health(port: u16) -> Option<String> {
 
 /// A configuration whose key file is `instruction.key` and whose object store is `storage` in
 /// `dir`.
-fn write_config(dir: &Path, port: u16, database_url: &str) -> std::path::PathBuf {
+pub(crate) fn write_config(dir: &Path, port: u16, database_url: &str) -> std::path::PathBuf {
     write_config_with(
         dir,
         port,
@@ -88,10 +88,11 @@ fn write_config_with(
         format!(
             "[http]\nport = {port}\nshutdown_grace_secs = 2\n\
              [instruction_key]\npath = '{}'\n\
-             [storage]\ndir = '{}'\n\
+             [storage]\ndir = '{}'\n{}\
              [database]\nurl = \"{database_url}\"\nconnect_timeout_secs = 2\n",
             key.display(),
-            storage.display()
+            storage.display(),
+            crate::support::object_server_table(dir)
         ),
     )
     .unwrap();
@@ -391,7 +392,25 @@ fn group_writable_directory(dir: &Path) -> Option<std::path::PathBuf> {
 }
 
 /// Kills and reaps the server when dropped, so that a failed assertion leaves none running.
-struct KillOnDrop(Child);
+pub(crate) struct KillOnDrop(Child);
+
+impl KillOnDrop {
+    pub(crate) fn new(child: Child) -> KillOnDrop {
+        KillOnDrop(child)
+    }
+
+    /// Ends the server the way a service manager does (SIGTERM; elsewhere a kill) and waits.
+    pub(crate) fn stop_with_sigterm(&mut self) {
+        #[cfg(unix)]
+        // SAFETY: signals the test's own child.
+        unsafe {
+            libc::kill(self.0.id() as libc::pid_t, libc::SIGTERM);
+        }
+        #[cfg(not(unix))]
+        let _ = self.0.kill();
+        wait_exit(&mut self.0, Duration::from_secs(30));
+    }
+}
 
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
@@ -407,7 +426,14 @@ fn a_storage_directory_in_use_exits_1_and_never_listens() {
     let dir = tempfile::tempdir().unwrap();
     let (first, _port, _reply) = start_server(dir.path(), &pg);
     let _first = KillOnDrop(first);
+    // The second server has an object server data directory of its own, so that the object
+    // store is what finds its directory in use.
     let path = write_config(dir.path(), free_port(), &pg.url());
+    let text = std::fs::read_to_string(&path).unwrap().replace(
+        "object-server'\ncredentials_dir",
+        "object-server-2'\ncredentials_dir",
+    );
+    std::fs::write(&path, text).unwrap();
     let mut command = server(&["--config", path.to_str().unwrap()]);
     command.stderr(Stdio::piped());
     let output = wait_output(command.spawn().unwrap(), Duration::from_secs(30));
@@ -420,7 +446,7 @@ fn a_storage_directory_in_use_exits_1_and_never_listens() {
     );
 }
 
-fn wait_output(child: Child, limit: Duration) -> std::process::Output {
+pub(crate) fn wait_output(child: Child, limit: Duration) -> std::process::Output {
     let id = child.id();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {

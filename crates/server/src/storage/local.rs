@@ -84,7 +84,7 @@ enum State {
 
 /// The exclusive lock on `.lock`. Unlocking before the close releases it for every handle to the
 /// open file description, which a child process spawned meanwhile may share.
-struct ProcessLock(File);
+pub(crate) struct ProcessLock(File);
 
 impl Drop for ProcessLock {
     fn drop(&mut self) {
@@ -120,7 +120,7 @@ fn is_missing(error: &io::Error) -> bool {
 }
 
 /// Creates a directory, mode 0700 on Unix; its parent must exist.
-fn create_directory(path: &Path) -> io::Result<()> {
+pub(crate) fn create_directory(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
@@ -133,7 +133,7 @@ fn create_directory(path: &Path) -> io::Result<()> {
 }
 
 /// Opens (creating) the file whose lock makes the store's process its directory's only user.
-fn take_process_lock(path: &Path) -> Result<ProcessLock, StoreError> {
+pub(crate) fn take_process_lock(path: &Path) -> Result<ProcessLock, StoreError> {
     let mut options = OpenOptions::new();
     options.write(true).create(true).truncate(false);
     #[cfg(unix)]
@@ -170,7 +170,7 @@ fn take_process_lock(path: &Path) -> Result<ProcessLock, StoreError> {
 }
 
 /// Makes sure the area at `path` exists as a directory the server may trust.
-fn ensure_area(path: &Path) -> Result<(), StoreError> {
+pub(crate) fn ensure_area(path: &Path) -> Result<(), StoreError> {
     match std::fs::metadata(path) {
         Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -181,6 +181,27 @@ fn ensure_area(path: &Path) -> Result<(), StoreError> {
     check_directory(path).map_err(directory_error)
 }
 
+/// Makes `dir` ready to be held by one process: it must be absolute, is created when absent (its
+/// parent must exist, and is synced), must pass the directory check, and is locked through its
+/// `.lock` file. Shared by the object store and the object server's data directory.
+pub(crate) fn open_locked_dir(dir: &Path) -> Result<ProcessLock, StoreError> {
+    if !dir.is_absolute() {
+        return Err(StoreError::DirectoryNotAbsolute);
+    }
+    match std::fs::metadata(dir) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            create_directory(dir).map_err(io_error("create the directory"))?;
+            if let Some(parent) = dir.parent() {
+                sync_directory(parent).map_err(io_error("sync the parent directory"))?;
+            }
+        }
+        Err(error) => return Err(io_error("inspect the directory")(error)),
+    }
+    check_directory(dir).map_err(directory_error)?;
+    take_process_lock(&dir.join(".lock"))
+}
+
 impl LocalStore {
     /// Opens the store at `config.dir`, creating what is missing: the directory itself (its
     /// parent must exist), the two areas and the lock file. The directory and the areas must not
@@ -188,21 +209,7 @@ impl LocalStore {
     /// second store on the directory, in this process or another, is [`StoreError::InUse`].
     pub fn open(config: &StorageConfig) -> Result<LocalStore, StoreError> {
         let dir = config.dir.as_path();
-        if !dir.is_absolute() {
-            return Err(StoreError::DirectoryNotAbsolute);
-        }
-        match std::fs::metadata(dir) {
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                create_directory(dir).map_err(io_error("create the directory"))?;
-                if let Some(parent) = dir.parent() {
-                    sync_directory(parent).map_err(io_error("sync the parent directory"))?;
-                }
-            }
-            Err(error) => return Err(io_error("inspect the directory")(error)),
-        }
-        check_directory(dir).map_err(directory_error)?;
-        let process_lock = take_process_lock(&dir.join(".lock"))?;
+        let process_lock = open_locked_dir(dir)?;
         let staging = dir.join("staging");
         let objects = dir.join("objects");
         ensure_area(&staging)?;

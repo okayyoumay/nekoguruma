@@ -29,7 +29,7 @@ use std::time::SystemTime;
 
 use tokio::io::AsyncRead;
 
-mod local;
+pub(crate) mod local;
 
 pub use local::LocalStore;
 

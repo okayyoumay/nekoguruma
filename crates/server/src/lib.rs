@@ -5,7 +5,8 @@
 //! request guard of design 13.3 (ADR-456). It connects to PostgreSQL and applies the embedded
 //! migrations before it binds, so a listening port means a migrated schema (ADR-458). It then
 //! reads or creates the job instruction key, so a listening port also means a usable key
-//! (ADR-462), and opens the object store (ADR-474), whose directory it locks for the process's
+//! (ADR-462), starts the bundled object server as its child and waits until it is ready
+//! (ADR-491), and opens the object store (ADR-474), whose directory it locks for the process's
 //! life. Local users sign in with a password and keep a cookie session (ADR-469).
 
 pub(crate) mod agent_events;
@@ -23,6 +24,7 @@ pub(crate) mod job_state;
 pub mod jobs;
 pub mod local_guard;
 pub mod local_user;
+pub mod object_server;
 pub mod operator_session;
 pub mod problem;
 pub mod register;
@@ -53,6 +55,7 @@ pub use config::{Config, ConfigError, Profile};
 pub use hub::{Delivery, Hub, Inbound, SendError};
 pub use instruction_key::InstructionKey;
 pub use local_user::Hasher;
+pub use object_server::ObjectServer;
 pub use operator_session::OperatorSessions;
 pub use session::Sessions;
 pub use storage::{LocalStore, ObjectStore, StoreError};
@@ -170,6 +173,8 @@ pub enum StartError {
     #[error(transparent)]
     InstructionKey(#[from] instruction_key::KeyError),
     #[error(transparent)]
+    ObjectServer(#[from] object_server::ObjectServerError),
+    #[error(transparent)]
     Storage(#[from] storage::StoreError),
     #[error("cannot listen on 127.0.0.1:{port}: {source}")]
     Bind { port: u16, source: std::io::Error },
@@ -180,6 +185,10 @@ pub enum StartError {
 pub enum RunError {
     #[error("the listener failed: {0}")]
     Serve(std::io::Error),
+    /// The object server ended while the server ran and no stop signal had been received. The
+    /// server stopped as for a signal first; the service manager restarts it (ADR-491).
+    #[error("the object server ended while the server ran: {0}")]
+    ObjectServerExited(String),
 }
 
 /// A bound server that is not serving yet.
@@ -195,6 +204,9 @@ pub struct Server {
     /// The object store `start` opened; `bind` leaves it empty (tests). Held so that its
     /// directory stays locked until `run` returns.
     object_store: Option<Arc<LocalStore>>,
+    /// The object server `start` started (ADR-491); `bind` leaves it empty (tests). `run` ends
+    /// it after the connections and before the pool.
+    object_server: Option<ObjectServer>,
     /// The delivery queue's settings; `None` leaves the queue off (`bind`, which tests use).
     job_queue: Option<job_queue::Settings>,
     /// The job expiry task's settings; `None` leaves it off (`bind`, which tests use).
@@ -204,13 +216,24 @@ pub struct Server {
 impl Server {
     /// Connects to the database (within the connect timeout), applies the migrations (within
     /// [`db::MIGRATION_TIMEOUT`]), makes the instruction key ready ([`InstructionKey::open`]),
-    /// opens the object store ([`LocalStore::open`]), then binds `127.0.0.1:<port>`: nothing
-    /// listens before the schema is current (ADR-458), before the key is usable (ADR-462) or
-    /// before the store's directory is usable and locked (ADR-474). Any failure ends the start; a
-    /// failed migration run is never retried on its pool (the advisory lock is per session and
-    /// counts how often it was taken, so a retry could leave it held), and neither is the key or
-    /// the store.
+    /// starts the object server when `[object_server]` is configured ([`ObjectServer::start`],
+    /// ADR-491), opens the object store ([`LocalStore::open`]), then binds `127.0.0.1:<port>`:
+    /// nothing listens before the schema is current (ADR-458), before the key is usable
+    /// (ADR-462), before the object server answers its readiness probe (ADR-491) or before the
+    /// store's directory is usable and locked (ADR-474). Any failure ends the start, with the
+    /// pool closed and the object server stopped; a failed migration run is never retried on its
+    /// pool (the advisory lock is per session and counts how often it was taken, so a retry
+    /// could leave it held), and neither is the key, the object server or the store.
     pub async fn start(config: &Config) -> Result<Server, StartError> {
+        Server::start_tuned(config, object_server::Tuning::default()).await
+    }
+
+    /// [`Server::start`] with the object server's bounds set. Tests only.
+    #[doc(hidden)]
+    pub async fn start_tuned(
+        config: &Config,
+        tuning: object_server::Tuning,
+    ) -> Result<Server, StartError> {
         let pool = db::connect(&config.database).await?;
         if let Err(error) = db::migrate(&pool).await {
             db::close(&pool).await;
@@ -223,14 +246,33 @@ impl Server {
                 return Err(error.into());
             }
         };
+        let object_server = match &config.object_server {
+            Some(object) => match ObjectServer::start(object, config.http.port, &tuning).await {
+                Ok(object_server) => Some(object_server),
+                Err(error) => {
+                    db::close(&pool).await;
+                    return Err(error.into());
+                }
+            },
+            None => None,
+        };
         let store = match LocalStore::open(&config.storage) {
             Ok(store) => Arc::new(store),
             Err(error) => {
+                stop_object_server(object_server).await;
                 db::close(&pool).await;
                 return Err(error.into());
             }
         };
-        let mut server = Server::bind(&config.http, pool, key).await?;
+        let mut server = match Server::bind(&config.http, pool, key).await {
+            Ok(server) => server,
+            Err(error) => {
+                // `bind` closed the pool.
+                stop_object_server(object_server).await;
+                return Err(error);
+            }
+        };
+        server.object_server = object_server;
         server.object_store = Some(store);
         server.job_queue = Some(job_queue::Settings::default());
         server.job_expiry = Some(job_expiry::Settings::default());
@@ -247,6 +289,13 @@ impl Server {
     #[doc(hidden)]
     pub fn job_expiry_enabled(&self) -> bool {
         self.job_expiry.is_some()
+    }
+
+    /// The object server `start` started (`None` on a server made by `bind`, and when no
+    /// `[object_server]` is configured). Tests only.
+    #[doc(hidden)]
+    pub fn object_server(&self) -> Option<&ObjectServer> {
+        self.object_server.as_ref()
     }
 
     /// The object store `start` opened (`None` on a server made by `bind`).
@@ -299,6 +348,7 @@ impl Server {
             hub,
             grace: Duration::from_secs(http.shutdown_grace_secs),
             object_store: None,
+            object_server: None,
             job_queue: None,
             job_expiry: None,
         })
@@ -378,6 +428,7 @@ impl Server {
             hub,
             grace,
             object_store: _object_store,
+            mut object_server,
             job_queue,
             job_expiry,
         } = self;
@@ -415,9 +466,24 @@ impl Server {
         // Dropping the set aborts the connections that are still open.
         let mut connections: JoinSet<()> = JoinSet::new();
         let mut shutdown = std::pin::pin!(shutdown);
+        let mut immediate = std::pin::pin!(immediate);
+        let mut second_signal = false;
+        // How the object server ended before a stop signal, if it did.
+        let mut object_ended: Option<String> = None;
         loop {
             tokio::select! {
+                biased;
                 () = &mut shutdown => break,
+                ended = async {
+                    match object_server.as_mut() {
+                        Some(object) => object.exited().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    tracing::error!(%ended, "the object server ended; stopping");
+                    object_ended = Some(ended);
+                    break;
+                },
                 accepted = listener.accept() => match accepted {
                     Ok((stream, _)) => {
                         let mut builder = http1::Builder::new();
@@ -456,8 +522,9 @@ impl Server {
                      period; stopping"
                 );
             }
-            () = immediate => {
+            () = &mut immediate => {
                 tracing::warn!("second stop signal; stopping at once");
+                second_signal = true;
             }
         }
         // What is still open at the end of the grace period (or of a second signal) is aborted
@@ -466,8 +533,26 @@ impl Server {
         // of handing the hub a socket.
         connections.shutdown().await;
         sockets.shutdown().await;
+        // The object server goes after what could still use it and before the pool closes.
+        if let Some(object) = object_server.take() {
+            if second_signal {
+                object.stop(std::future::ready(())).await;
+            } else {
+                object.stop(immediate.as_mut()).await;
+            }
+        }
         db::close(&pool).await;
-        Ok(())
+        match object_ended {
+            Some(ended) => Err(RunError::ObjectServerExited(ended)),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Stops the object server of a start that failed after it started it.
+async fn stop_object_server(object: Option<ObjectServer>) {
+    if let Some(object) = object {
+        object.stop(std::future::pending()).await;
     }
 }
 

@@ -21,20 +21,17 @@
 //! Errors are fixed text and, for a failed file operation, the [`std::io::ErrorKind`]: never key
 //! bytes and never the file's contents.
 
-use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::path::Path;
 use std::sync::Arc;
 
 use shared_crypto::registration::{Preset, RegistrationCode, ResponseTranscript};
-use shared_crypto::{PublicKey, Signature, Signer, SigningKey, Zeroizing, random_32};
+use shared_crypto::{PublicKey, Signature, Signer, SigningKey, Zeroizing};
 use shared_proto::{InstructionError, JobInstruction};
 use sqlx::PgPool;
 
 use crate::config::InstructionKeyConfig;
-#[cfg(unix)]
-use crate::fs_guard::euid;
-use crate::fs_guard::{self, DirectoryFault, check_directory, sync_directory};
+use crate::fs_guard::{self, DirectoryFault, FileFault, check_directory, sync_directory};
 
 /// The most bytes read from the key file; a P-256 PKCS#8 document is about a hundred.
 const MAX_KEY_FILE_LEN: u64 = 4096;
@@ -290,48 +287,13 @@ fn directory_error(fault: DirectoryFault) -> KeyError {
     }
 }
 
-/// Refuses an opened file that is not a regular file or, on Unix, that is not the server
-/// account's own or has any group or other permission bit; on Windows, a reparse point. Judged on
-/// the open handle, so the file cannot change between check and read.
-#[cfg(unix)]
-fn check_file(meta: &std::fs::Metadata) -> Result<(), KeyError> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    if !meta.is_file() {
-        return Err(KeyError::NotRegularFile);
-    }
-    if meta.uid() != euid() {
-        return Err(KeyError::FileNotOwned);
-    }
-    if meta.permissions().mode() & 0o077 != 0 {
-        return Err(KeyError::FileTooOpen);
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn check_file(meta: &std::fs::Metadata) -> Result<(), KeyError> {
-    if !fs_guard::is_plain_file(meta) {
-        return Err(KeyError::NotRegularFile);
-    }
-    Ok(())
-}
-
-#[cfg(not(any(unix, windows)))]
-fn check_file(meta: &std::fs::Metadata) -> Result<(), KeyError> {
-    if !meta.is_file() {
-        return Err(KeyError::NotRegularFile);
-    }
-    Ok(())
-}
-
-/// Opens the key file for reading without following a symbolic link and without blocking on a
-/// FIFO (the same open as the agent's lock files, ADR-262 item 6); [`check_file`] then requires
-/// a regular file. A link, dangling or not, is refused.
-fn open_key_file(path: &Path) -> Result<File, KeyError> {
-    match fs_guard::no_follow(OpenOptions::new().read(true)).open(path) {
-        Ok(file) => Ok(file),
-        Err(error) if fs_guard::is_link_refusal(&error) => Err(KeyError::NotRegularFile),
-        Err(error) => Err(io_error("open")(error)),
+/// The instruction key's error for a file the shared check refused.
+fn file_error(fault: FileFault) -> KeyError {
+    match fault {
+        FileFault::Io { op, kind } => KeyError::Io { op, kind },
+        FileFault::NotRegular => KeyError::NotRegularFile,
+        FileFault::NotOwned => KeyError::FileNotOwned,
+        FileFault::TooOpen => KeyError::FileTooOpen,
     }
 }
 
@@ -339,15 +301,9 @@ fn open_key_file(path: &Path) -> Result<File, KeyError> {
 /// a file is never overwritten here.
 pub(crate) fn read_key(path: &Path) -> Result<Option<SigningKey>, KeyError> {
     check_directory(directory(path)?).map_err(directory_error)?;
-    let file = match open_key_file(path) {
-        Ok(file) => file,
-        Err(KeyError::Io {
-            kind: io::ErrorKind::NotFound,
-            ..
-        }) => return Ok(None),
-        Err(error) => return Err(error),
+    let Some(file) = fs_guard::open_private(path).map_err(file_error)? else {
+        return Ok(None);
     };
-    check_file(&file.metadata().map_err(io_error("inspect"))?)?;
     let mut bytes = Zeroizing::new(Vec::new());
     file.take(MAX_KEY_FILE_LEN + 1)
         .read_to_end(&mut bytes)
@@ -361,78 +317,36 @@ pub(crate) fn read_key(path: &Path) -> Result<Option<SigningKey>, KeyError> {
 }
 
 /// Creates the key file if it is still absent and returns the key that ends up in it, and whether
-/// this call created it. The bytes go to a temporary file of a name no other attempt has (mode
-/// 0600 on Unix), are synced, and are then hard-linked to the final name, which fails when the
-/// name exists: so the file appears complete or not at all, and of any number of creators one
-/// wins and the others load its key.
+/// this call created it ([`fs_guard::create_by_link`]: of any number of creators one wins and the
+/// others load its key).
 pub(crate) fn create_or_load(path: &Path) -> Result<(SigningKey, bool), KeyError> {
     let dir = directory(path)?;
     check_directory(dir).map_err(directory_error)?;
     let key = SigningKey::generate().map_err(|_| KeyError::Random)?;
     let bytes = key.to_pkcs8_der();
-    let suffix: String = random_32()
-        .map_err(|_| KeyError::Random)?
-        .iter()
-        .take(16)
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    let tmp = dir.join(format!(".instruction-key-{suffix}.tmp"));
-
-    #[cfg(unix)]
-    let options = {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true).mode(0o600);
-        options
+    let created = match fs_guard::create_by_link(dir, path, ".instruction-key-", &bytes) {
+        Ok(created) => created,
+        Err(fs_guard::LinkFault::Random) => return Err(KeyError::Random),
+        Err(fs_guard::LinkFault::Io { op, error }) => return Err(io_error(op)(error)),
     };
-    #[cfg(not(unix))]
-    let options = {
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        options
-    };
-
-    let written = (|| {
-        let mut file = options.open(&tmp)?;
-        file.write_all(&bytes)?;
-        file.sync_all()
-    })();
-    if let Err(error) = written {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(io_error("write")(error));
-    }
-    let linked = std::fs::hard_link(&tmp, path);
-    let _ = std::fs::remove_file(&tmp);
-    match linked {
-        Ok(()) => {
-            sync_directory(dir).map_err(io_error("sync the directory of"))?;
-            // What the file holds is what was just written; read it back as every start does.
-            match read_key(path)? {
-                Some(read) => Ok((read, true)),
-                None => Err(KeyError::Io {
-                    op: "read back",
-                    kind: io::ErrorKind::NotFound,
-                }),
-            }
-        }
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            // Someone else created it first: theirs is the key.
-            match read_key(path)? {
-                Some(read) => Ok((read, false)),
-                None => Err(KeyError::Io {
-                    op: "read",
-                    kind: io::ErrorKind::NotFound,
-                }),
-            }
-        }
-        Err(error) => Err(io_error("link")(error)),
+    // What the file holds is what was just written, or what the winner wrote; read it back as
+    // every start does.
+    match read_key(path)? {
+        Some(read) => Ok((read, created)),
+        None => Err(KeyError::Io {
+            op: if created { "read back" } else { "read" },
+            kind: io::ErrorKind::NotFound,
+        }),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::fs_guard::euid;
     use shared_crypto::instruction::{Envelope, verify};
+    use shared_crypto::random_32;
     use shared_proto::{AgentId, INSTRUCTION_VERSION, JobId, JobKind, VciId};
 
     fn instruction() -> JobInstruction {

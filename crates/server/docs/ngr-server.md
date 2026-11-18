@@ -7,7 +7,8 @@ agent's connection proof and control channel, the local users' login and the cre
 request guard are in ADR-456; the database, the migrations and the test database are in ADR-458;
 the job instruction key is in ADR-462; registration codes and their command are in ADR-463 and
 ADR-465; local users, their command and the operator session are in ADR-469; the object store is in
-ADR-474; job creation is in ADR-477.
+ADR-474; job creation is in ADR-477; the bundled object server, which the server starts as its
+child, is in ADR-491.
 
 ## Running
 
@@ -27,7 +28,8 @@ below); `registration-code` is a subcommand only as the first argument, so
 The `user` forms manage local users ("Local users" below), with the same rule for `user`.
 Exit codes: 0 after a graceful stop, an issued code or a user change, 1 when the configuration is refused or the
 server cannot start or run (including a database that cannot be reached or migrated and an
-instruction key or an object store directory that is refused), or when a code cannot be issued or a user changed, 2 for a
+instruction key, an object store directory or an object server that is refused, and an object server
+that ends before a stop signal), or when a code cannot be issued or a user changed, 2 for a
 usage error (for `user add` and `set-password`, also a terminal on standard input).
 
 ## Configuration
@@ -52,6 +54,12 @@ path = "/etc/nekoguruma/instruction.key"   # absolute; Windows: use a TOML liter
 [storage]                    # required
 dir = "/var/lib/nekoguruma/objects"        # absolute; created when absent
 max_object_bytes = 4294967296              # default 4 GiB, at least 1
+
+[object_server]              # required in a file
+binary = "/opt/nekoguruma/rustfs"          # absolute; what scripts/fetch-rustfs.sh prints
+data_dir = "/var/lib/nekoguruma/object-server"   # absolute; created when absent
+credentials_dir = "/etc/nekoguruma/object-server"   # absolute; must exist; not the key's directory
+port = 8081                  # default: http.port + 1
 ```
 
 - The `[database]` table is required, and the file holds the database password: make it readable
@@ -77,6 +85,15 @@ max_object_bytes = 4294967296              # default 4 GiB, at least 1
   account (or, on Unix, to root) and, on Unix, not be writable by group or others; a symbolic
   link to such a directory is accepted. Put it on one file system, apart from the database's
   data directory and from the instruction key.
+- The `[object_server]` table is required in a file (a `Config` built in code may leave it out and
+  then starts no child): `binary`, `data_dir` and `credentials_dir` are absolute paths, with no
+  search of `PATH` ("The object server" below, ADR-491). `port` is the object server's loopback
+  port; the default is `http.port` plus one, and 0, the server's own port and an overflow of the
+  default (`http.port` 65535) are refused. There is no address, bind, access-key or secret-key key
+  (an unknown key is a parse error), the listener is `127.0.0.1` in code, and the table holds no
+  credential. `data_dir` may not be `storage.dir`, and `credentials_dir` may not be the directory
+  of `instruction_key.path`; one directory nested in another is not detected, so keep the four
+  apart.
 - There is no bind-address key. The listener is `127.0.0.1:<port>` in code, so no configuration
   can make the local profile listen elsewhere, and `[::1]` is not bound (design 13.3).
 - There is no pinned-host key. The pinned origin is `http://127.0.0.1:<port>`. Changing the port
@@ -106,22 +123,100 @@ max_object_bytes = 4294967296              # default 4 GiB, at least 1
    back is the service manager's job.
 4. Make the instruction key ready (below). A failure ends the process with exit 1 and nothing
    is retried.
-5. Open the object store (below): create what is missing in `storage.dir`, check it and lock it
-   for the life of the process. A failure closes the database pool and ends the process with
-   exit 1; nothing is retried. The commands `registration-code` and `user` never open, create
-   or lock the store.
-6. Bind `127.0.0.1:<port>`, install the signal handlers, then log the pinned origin: a stop
-   signal sent once the log line appears is never lost. A listening port means a migrated
-   schema, a usable instruction key and a usable, locked object store.
-7. Serve until SIGTERM or SIGINT (Unix) or Ctrl-C or Ctrl-Break (Windows). Then stop accepting,
+5. Start the object server (below): check its binary, create and lock its data directory, read
+   or create its credential files, try its port, spawn it and wait until it answers its readiness
+   probe, at most 30 seconds. A failure closes the database pool, stops what was started and ends
+   the process with exit 1; nothing is retried. The commands `registration-code` and `user` never
+   read the credentials, lock the data directory or spawn the child.
+6. Open the object store (below): create what is missing in `storage.dir`, check it and lock it
+   for the life of the process. A failure stops the object server, closes the database pool and
+   ends the process with exit 1; nothing is retried. The commands `registration-code` and `user`
+   never open, create or lock the store.
+7. Bind `127.0.0.1:<port>` (a failure stops the object server and closes the pool), install the
+   signal handlers, then log the pinned origin: a stop signal sent once the log line appears is
+   never lost. A listening port means a migrated schema, a usable instruction key, a ready object
+   server and a usable, locked object store. A stop signal during the steps before this one has
+   the default disposition and ends the server, and the child ends with it (below).
+8. Serve until SIGTERM or SIGINT (Unix) or Ctrl-C or Ctrl-Break (Windows). Then stop accepting,
    let requests in flight finish and close every control channel connection with 1001, for at
    most `shutdown_grace_secs`, and exit 0. A second signal during the grace period ends the wait
    at once (still exit 0). What is still open then is aborted: the HTTP connections first, then
    the hub's tasks (the control channel sessions, the revocation pass, the delivery queue and the
-   job expiry task), then the database pool is closed (see "The control channel" below). The
-   tasks are started by `Server::run` before it accepts a request, and each one ends at the stop,
-   so none runs against a closed pool. A connection that has not delivered a complete request head is held for no longer
-   than the header-read timeout below. A Windows service stop control arrives with packaging.
+   job expiry task), then the object server is stopped (SIGTERM, at most 10 seconds, then SIGKILL;
+   a second signal kills it at once), then the database pool is closed (see "The control channel"
+   below). The tasks are started by `Server::run` before it accepts a request, and each one ends
+   at the stop, so none runs against a closed pool. A connection that has not delivered a complete
+   request head is held for no longer than the header-read timeout below. If the object server
+   ends while the server runs and no stop signal has been received, the server stops as for a
+   signal and exits 1 (a stop signal and the child's end together is exit 0). A Windows service
+   stop control arrives with packaging.
+
+## The object server
+
+`object_server.rs` and `object_server/`; the decision and its alternatives are in ADR-491. The
+local profile bundles RustFS, an S3-compatible server, pinned to a release in `scripts/rustfs-pin.txt`,
+and runs it as the server's child. Nothing reads or writes through it yet: the S3 object store and
+the signed-request readiness check come with later work, and the object store above is still
+`LocalStore`.
+
+- **Getting the binary.** `scripts/fetch-rustfs.sh` reads the pin file (the version, and per
+  platform the asset name, the asset's SHA-256, the archive member and the member's SHA-256),
+  downloads the asset, checks both hashes, extracts only the named member with mode 0755 into
+  `target/rustfs/<version>/` (or `NGR_RUSTFS_DIR`) and prints the binary's path; when the binary
+  is in place with the right hash it downloads nothing. Platforms: linux-x86_64, linux-aarch64,
+  macos-aarch64, windows-x86_64 (the release has no macOS x86_64 asset; that platform is refused by
+  name). `scripts/test-fetch-rustfs.sh` tests the script. The server never hashes the binary; it
+  refuses, on Unix, a binary (a symbolic link is followed and the target judged and run) or its
+  directory that group or others can write or that belongs to neither its account nor root.
+- **Credentials.** Two owner-only files in `credentials_dir`, `object-server-access-key` (20
+  upper-case hexadecimal characters) and `object-server-secret-key` (40 lower-case), made at the
+  first start by a temporary file, a hard link and a directory sync, as the instruction key is
+  (ADR-462, `fs_guard.rs`): "object server credential files created" is logged, without values.
+  The directory must exist and, on Unix, belong to the server's account or root and not be
+  writable by group or others; it is never created. A symbolic link, FIFO or directory in place
+  of a file, a foreign owner or a group or other bit (Unix) ends the start; so does a file that is
+  not the shape above (empty, short, long, extra lines, another alphabet, not UTF-8), and it is
+  never overwritten or regenerated. Windows checks no ACL: the directory's ACL, set when the
+  service is installed, is the protection. A `.tmp` file left by a crash between the link and its
+  removal is ignored; delete it. There is no rotation: to reset, stop the server, delete the two
+  files and start it (RustFS accepted new keys over its old data in the tests). The server gives
+  the child the two paths as `RUSTFS_ACCESS_KEY_FILE` and `RUSTFS_SECRET_KEY_FILE`; that is the
+  child's own interface and not configuration of the server by environment (ADR-456 item 7). The
+  secret is in no configuration, environment, argument or log line.
+- **The data directory** holds `.lock` (the object store's lock code: a second server on the
+  directory exits 1 before it spawns anything) and `volume/`, which the child is given as its
+  volume. The server creates the directory (mode 0700 on Unix) when it is absent and its parent
+  exists, and checks it as it checks the store's directory.
+- **The child.** The binary's `server` subcommand, with a cleared environment holding
+  `RUSTFS_ADDRESS=127.0.0.1:<port>`, `RUSTFS_VOLUMES`, the two `_FILE` variables,
+  `RUSTFS_CONSOLE_ENABLE=false` (RustFS 1.0.6 otherwise opens its console on `0.0.0.0:9001`) and the
+  minimum a process needs (`HOME` and `PATH` on Unix, `SystemRoot` on Windows); standard input
+  null; the data directory as working directory; its own process group on Unix and no console on
+  Windows, so a Ctrl-C at a terminal reaches the server alone, which orders the stop; no
+  inherited descriptor. Its standard output and error are drained and forwarded to the log, one
+  event per line (target `object_server`), at most 1024 characters, control characters replaced
+  and the secret key redacted. The listener is fixed to loopback: the tests check that the host's
+  other IPv4 address and `[::1]` refuse, that the child has one listening socket, and that an
+  anonymous request is answered 403.
+- **Readiness.** After the spawn, `GET /health/ready` on the loopback port every 100 ms, each
+  probe at most 1 second, until it answers 200, the child ends or 30 seconds pass. The failure
+  names the last probe ("status 503", "cannot connect", "no answer within 1 s", "unparseable
+  answer") or how the child ended, and the output the child wrote is in the log above it. Another
+  process that answers on the port between the port check and the child's bind is an accepted
+  residual.
+- **Ending with the server.** The server stops the child in its own stop (above) and in every
+  failed start. If the server is killed or aborted instead: on Linux the child has a parent-death
+  SIGKILL, bound to the thread that spawned it, which is why a thread of its own spawns it and lives
+  as long as the handle; on Windows the server joins a kill-on-close job object before it spawns
+  (the stop there is a termination, and the job covers the server's death only); other Unix systems
+  can leave an orphan, and the next start fails at the port check, naming `object_server.port`.
+  A service manager should signal the server alone first: with systemd, `KillMode=mixed` (SIGTERM
+  to the server, SIGKILL to what remains in the control group after the stop timeout).
+- **The stop's tail.** After the child is reaped the server kills its process group (Unix), so a
+  grandchild that holds the child's pipes or port does not outlive the stop, and then joins the
+  two log forwarders together for at most 1 second, aborting what is left.
+- **Not covered.** A hung child is not detected (no probe after the start), and a stranger on the
+  object server's port is not told from it.
 
 ## The instruction key
 
@@ -859,6 +954,15 @@ a new migration file rebuilds the crate. How migrations are written and applied 
   missing PostgreSQL fails the test and never skips it. When the tests run as root, the helper
   runs PostgreSQL as the `postgres` account, which then needs access to the temporary directory
   (`TMPDIR` and its parents). A test killed by a timeout can leave its postmaster behind.
+- The object server's tests need the pinned RustFS binary: run `scripts/fetch-rustfs.sh` and set
+  `NGR_TEST_RUSTFS_BIN` to the path it prints (CI does this in the `core-linux` and
+  `core-windows` jobs). A missing binary fails the real-binary tests with one message that names
+  the script. The tests of the child's lifecycle run against a fake child, the second binary of
+  this package, `ngr-fake-object-server` (`src/bin/`; an installation does not use it), which
+  takes RustFS's arguments and environment and is steered by `fake-object-server.cfg` in its data
+  directory: late or never ready, garbage or no answer, ending at once or later (by a code or a
+  signal), ignoring SIGTERM, printing the secret, leaving a grandchild on its pipes, reporting
+  its environment and descriptors.
 - The tests are one test binary, `postgres` (`tests/postgres/`). `migrations.rs` covers the
   migrations: applying them, a second start as a no-op, a changed, unknown or half-applied
   migration refusing the start, two starts at once, and the connect and migration timeouts.
@@ -872,6 +976,21 @@ a new migration file rebuilds the crate. How migrations are written and applied 
   owner, two issuances at once, and the command as a process (one JSON line that matches the row,
   usage errors with no connection, a database never migrated and left untouched, behind, ahead,
   changed and half-applied migrations, a database that is down, no key file read or created).
+  `object_server.rs` covers the child against the fake (ADR-491): the binary and data directory
+  checks before anything is made, the credential files at a start, readiness (never ready, 503,
+  garbage, hung probes, just under the bound), a child that ends early or later or by a signal,
+  the stop sequence (TERM, the bound, KILL, a second signal, a failing wait, a pipe held by a
+  grandchild), what the child inherits (environment, working directory, descriptors, process
+  group), the output forwarded without the secret, the guards (a failure after the spawn, a
+  dropped handle or start future, a thread that ends), the start with the server (a failure
+  before, in and after step 5, a taken port, the run ending with the child, the stop signal and
+  the child's end together), and the server as a process (the commands touching nothing, the
+  listening line after readiness, a signal during the start and a kill taking the child with it,
+  on Linux). `object_server_rustfs.rs` runs the real binary: readiness, 403 for an anonymous
+  request, the stop, the loopback-only listener, the one listening socket, no secret in the
+  command line, environment or log, new keys after the files are deleted, and a killed server
+  taking the child. Units are in `src/` (`config.rs`, `object_server/credentials.rs`,
+  `object_server/forward.rs`, `object_server.rs`).
   `redeem.rs` covers the route over TCP. Without a database (a pool that points at nothing): a 400
   for each shape rule, 405, 4096 and 4097 bytes, the 408 after 5 seconds, eleven bad proofs giving
   ten identical 403s and then a 429 with `Retry-After` while 400, 405 and 413 stay as they were,

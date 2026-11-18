@@ -102,6 +102,13 @@ jobs:
           bin=$(ls -d /usr/lib/postgresql/*/bin | sort -V | tail -n 1)
           echo "NGR_TEST_PG_BIN=$bin" >> "$GITHUB_ENV"
           "$bin/postgres" --version
+      # The server's tests start the pinned RustFS as the server's child (ADR-491); the script
+      # downloads it and checks its recorded SHA-256. A missing binary fails the tests with one
+      # message that names the script.
+      - name: Fetch RustFS
+        run: |
+          bin=$(scripts/fetch-rustfs.sh)
+          echo "NGR_TEST_RUSTFS_BIN=$bin" >> "$GITHUB_ENV"
       # fuzz/ is a workspace of its own whose seeds depend on this workspace's crates, so a
       # dependency added here can leave fuzz/Cargo.lock stale. The fuzz job runs on main only, so
       # this resolves the fuzz workspace against its lock on every pull request; nothing is built.
@@ -145,6 +152,13 @@ jobs:
         run: |
           "NGR_TEST_PG_BIN=$env:PGBIN" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           & "$env:PGBIN\postgres.exe" --version
+      # The pinned RustFS for the server's tests (ADR-491); the path is converted to a Windows one,
+      # which the test processes need.
+      - name: Fetch RustFS
+        shell: bash
+        run: |
+          bin=$(scripts/fetch-rustfs.sh)
+          echo "NGR_TEST_RUSTFS_BIN=$(cygpath -w "$bin")" >> "$GITHUB_ENV"
       - shell: bash
         run: cargo nextest run --workspace --locked $EXCLUDE --profile ci-windows-parallel -E "$AGENT_TESTS"
       - shell: bash

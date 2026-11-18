@@ -40,6 +40,8 @@ use crate::serving::Running;
 
 const LIMIT: Duration = Duration::from_secs(30);
 const JOB_ID: &str = "0194f0a2-7c3e-7d11-8a52-3f6f9b1c2d4f";
+/// A second job, for a test that needs a command that is not a redelivery of `JOB_ID`.
+const OTHER_JOB_ID: &str = "0194f0a2-7c3e-7d11-8a52-3f6f9b1c2d50";
 
 /// A world with a registered agent, a server whose hub the test holds and the agent's surroundings.
 struct Fixture {
@@ -293,6 +295,11 @@ impl Fixture {
 
     /// The next message must be the agent's `received` event of `JOB_ID` with number `seq`.
     async fn expect_received(&mut self, seq: u64) {
+        self.expect_received_of(seq, JOB_ID).await;
+    }
+
+    /// The next message must be the agent's `received` event of `job` with number `seq`.
+    async fn expect_received_of(&mut self, seq: u64, job: &str) {
         match self.next().await.message {
             AgentMessage::AgentEvent(AgentEventMessage {
                 seq: Some(got),
@@ -301,7 +308,7 @@ impl Fixture {
             }) => {
                 assert_eq!(
                     (got, job_id.0.as_str(), state.as_str()),
-                    (seq, JOB_ID, "received")
+                    (seq, job, "received")
                 );
             }
             other => panic!("the received event {seq} expected, got {other:?}"),
@@ -493,7 +500,8 @@ async fn a_registered_agent_connects_answers_commands_and_stops_on_a_signal() {
 
 /// The agent's `received` event follows `commandAck` with its outbox number, and the server, which
 /// acknowledges no event yet, gets it again after a reconnection, before the next command's
-/// answer and event (design 5.3, ADR-478).
+/// answer and event (design 5.3, ADR-478). A redelivery of the first job is acknowledged by the
+/// agent's ledger and adds no event, so the next job's event is number 2 (ADR-489).
 #[tokio::test(flavor = "multi_thread")]
 async fn the_received_event_follows_the_ack_and_is_sent_again_after_a_reconnect() {
     let mut f = Fixture::new().await;
@@ -515,6 +523,7 @@ async fn the_received_event_follows_the_ack_and_is_sent_again_after_a_reconnect(
     f.wait_connected(Some(&mut agent), false).await;
     f.wait_connected(Some(&mut agent), true).await;
     f.expect_received(1).await;
+    // The redelivery of the first job: acknowledged, with no event and no intake call.
     let sent = f
         .hub
         .send_job_command(&id, f.signed_job(false).await)
@@ -523,7 +532,15 @@ async fn the_received_event_follows_the_ack_and_is_sent_again_after_a_reconnect(
         AgentMessage::CommandAck { command_id } => assert_eq!(command_id, sent.command_id),
         other => panic!("commandAck expected, got {other:?}"),
     }
-    f.expect_received(2).await;
+    // Another job is new: its answer comes next, which a second event for the first job would
+    // have preceded, and then its event.
+    let other = STANDARD.encode(f.envelope(OTHER_JOB_ID, false).await);
+    let sent = f.hub.send_job_command(&id, other).unwrap();
+    match f.next().await.message {
+        AgentMessage::CommandAck { command_id } => assert_eq!(command_id, sent.command_id),
+        other => panic!("commandAck expected, got {other:?}"),
+    }
+    f.expect_received_of(2, OTHER_JOB_ID).await;
 
     agent.stop().await;
     f.server.take().unwrap().finish().await;

@@ -14,19 +14,24 @@
 //! and counts as a received frame; one above the highest number assigned closes with 1002.
 //!
 //! What ends a connection is an [`End`]: the close to send (or none), how the loop backs off and
-//! what the log says. A job command goes to the connection's [`Gate`]: a verified instruction is
-//! handed to the [`Intake`], recorded as a `received` event in the outbox and then answered
-//! `commandAck` (an append that fails withholds the answer, and one that finds the outbox
-//! poisoned or fails to write closes the connection with 1011: the session reopens the outbox
-//! before its next connection); one whose operator the gate does not allow skips the intake, is
-//! recorded as a `preconditionFailed` event with the code `operatorNotAllowed` instead and is
-//! answered `commandAck` the same way (ADR-483); one past its start deadline likewise skips the
-//! intake and is recorded as an `expired` event (ADR-486). Every verified instruction raises the
-//! highest issue time first, and the file that holds it is synced, when it is behind, before the
-//! intake, the append and the answer; a sync that fails withholds the answer and closes with
-//! 1011 too. A refusal is answered
-//! `commandRejected` with its reason and records nothing. Answers are written on this connection
-//! through the one writer and under the write bound.
+//! what the log says. A job command goes to the connection's [`Gate`], and what follows is
+//! [`job_command`]'s order (design 5.3, ADR-461 item 9, ADR-489): verify, raise the highest issue
+//! time, the operator check, the duplicate check against the received-jobs ledger, the deadline
+//! check, sync the mark, record the job in the ledger, hand it to the [`Intake`], append the
+//! `received` event, answer `commandAck`. A verified instruction for a job the ledger holds under
+//! the same or a later generation is a duplicate: answered `commandAck` and nothing else. One
+//! whose operator the gate does not allow skips the ledger and the intake, is recorded as a
+//! `preconditionFailed` event with the code `operatorNotAllowed` instead and is answered
+//! `commandAck` the same way (ADR-483); one past its start deadline likewise skips them and is
+//! recorded as an `expired` event (ADR-486). Every verified instruction raises the highest issue
+//! time first, and the file that holds it is synced, when it is behind, before the record, the
+//! intake, the append and the answer, a duplicate's included; a sync that fails withholds the
+//! answer and closes with 1011. So does a ledger record that fails, an intake that fails and an
+//! append that finds the outbox poisoned or fails to write (the session reopens the outbox and
+//! the ledger before its next connection); an append refused as full keeps the connection and
+//! leaves the command unanswered. A refusal is answered `commandRejected` with its reason and
+//! records nothing. Answers are written on this connection through the one writer and under the
+//! write bound.
 //! Sending an answer does not reset the idle deadline; only a frame received does. Never logged:
 //! the token, a message's text, a `commandId`, a close reason the server sent.
 
@@ -49,11 +54,12 @@ use super::backoff::lived;
 use super::dial::{self, ConnectError, Stream};
 use super::events::{Acked, Sender};
 use super::exchange::Token;
-use super::gate::{Admitted, Gate};
+use super::gate::{Admitted, Gate, IntakeError};
 use super::{Fail, Outcome, Phase, SessionState, Stop, Wiring};
 use crate::deadline::{MarkError, Verdict};
 use crate::instruction::VerifiedInstruction;
 use crate::outbox::{Kind, OutboxError};
+use crate::received_jobs::LedgerError;
 use crate::server_http;
 
 /// The standard close code (RFC 6455 section 7.4.1) for an endpoint that cannot go on because of
@@ -504,96 +510,17 @@ async fn connected(
                         // connection's life is measured to here (the backoff reset rule).
                         last_frame_at = Instant::now();
                         let lived_now = lived(hello_at, last_frame_at);
-                        // A `commandId` whose longest possible answer the codec refuses (one
-                        // near the size limit) is not usable, as a missing one is not: the
-                        // gate and the intake see nothing and the connection closes with 1002.
-                        let longest = AgentMessage::CommandRejected {
-                            command_id: command_id.clone(),
-                            reason: LONGEST_REASON,
-                        };
-                        if longest.encode().is_err() {
-                            return End::close(CLOSE_CODE_PROTOCOL, "command-id", lived_now);
-                        }
-                        let (rejected, admitted) = match gate.admit(signed_job.as_deref()) {
-                            Ok(admitted) => (None, Some(admitted)),
-                            Err(reason) => (Some(reason), None),
-                        };
-                        let answer = match rejected {
-                            None => AgentMessage::CommandAck { command_id },
-                            Some(reason) => AgentMessage::CommandRejected { command_id, reason },
-                        };
-                        let Ok(text) = answer.encode() else {
-                            // Not reachable once the longest answer encodes.
-                            return End::close(CLOSE_CODE_PROTOCOL, "command-id", lived_now);
-                        };
-                        // The highest issue time rises with every instruction that verified,
-                        // whatever becomes of it (ADR-486).
-                        let judged = admitted.map(|admitted| {
-                            w.marks.raise(admitted.issued_at());
-                            judge(w, gate, admitted)
-                        });
-                        // The mark is synced before anything the command leads to is handed
-                        // over, recorded or answered.
-                        if judged.is_some() {
-                            match sync_marks(w, state.stop).await {
-                                Synced::Done => {}
-                                Synced::Stopped => return End::stop(),
-                                Synced::Failed(error) => {
-                                    state.warnings.mark_failure(&error);
-                                    return End::close(
-                                        CLOSE_CODE_INTERNAL,
-                                        MARK_WRITE,
-                                        lived_now,
-                                    );
-                                }
-                            }
-                        }
-                        // The intake has the instruction before the ack is written, and the
-                        // outbox has the `received` event before it too (ADR-478 item 5). An
-                        // instruction whose operator is not allowed skips the intake and gets one
-                        // terminal event instead of `received`, under the same bound and with the
-                        // same failure handling (ADR-483); so does one past its deadline
-                        // (ADR-486).
-                        let recorded = match judged {
-                            None => None,
-                            Some(Judged::Accepted(verified)) => {
-                                let job_id = verified.instruction().job_id.0.clone();
-                                w.intake.take(*verified);
-                                Some(record_job_state(w, state.stop, job_id, JobState::Received).await)
-                            }
-                            Some(Judged::Refused { job_id }) => {
-                                let refused = JobState::PreconditionFailed {
-                                    code: FailureCode::OperatorNotAllowed,
-                                    detail: String::new(),
-                                };
-                                Some(record_job_state(w, state.stop, job_id, refused).await)
-                            }
-                            Some(Judged::Expired { job_id }) => {
-                                Some(record_job_state(w, state.stop, job_id, JobState::Expired).await)
-                            }
-                        };
-                        match recorded {
-                            None | Some(Recorded::Done) => {}
-                            Some(Recorded::Stopped) => return End::stop(),
-                            Some(Recorded::Failed(class, error)) => {
-                                state.warnings.event_failure(class, &error);
-                                // A poisoned outbox cannot take any event until it is
-                                // reopened, which the session does before its next
-                                // connection (ADR-478 item 4): end this one.
-                                if matches!(class, "outbox-poisoned" | "outbox-write") {
-                                    return End::close(CLOSE_CODE_INTERNAL, class, lived_now);
-                                }
-                                continue;
-                            }
-                        }
-                        if let Err(end) =
-                            write_or_stop(socket, &text, state.stop, lived_now).await
+                        if let Err(end) = job_command(
+                            socket,
+                            state,
+                            gate,
+                            command_id,
+                            signed_job.as_deref(),
+                            lived_now,
+                        )
+                        .await
                         {
                             return end;
-                        }
-                        match rejected {
-                            None => state.status.command_acknowledged(),
-                            Some(_) => state.status.command_rejected(),
                         }
                     }
                     Ok(ServerMessage::EventAck { seq }) => {
@@ -650,24 +577,46 @@ async fn connected(
 
 /// The class of a mark file that could not be written.
 const MARK_WRITE: &str = "mark-write";
+/// The class of a ledger record that could not be written.
+const LEDGER_WRITE: &str = "ledger-write";
+/// The class of a ledger that refuses records until it is opened again.
+const LEDGER_POISONED: &str = "ledger-poisoned";
+/// The class of an intake that could not take a recorded instruction.
+const INTAKE: &str = "intake";
 
-/// What a verified instruction comes to once its operator and its deadline are judged.
+/// What a verified instruction comes to once its operator, its ledger record and its deadline are
+/// judged.
 enum Judged {
-    /// Handed to the intake, with a `received` event.
+    /// New: recorded, handed to the intake, with a `received` event.
     Accepted(Box<VerifiedInstruction>),
     /// The operator is not allowed (ADR-483).
     Refused { job_id: String },
     /// Past the start deadline (ADR-486).
     Expired { job_id: String },
+    /// The ledger holds the job ID under the same or a later generation (ADR-489): acknowledged,
+    /// nothing else.
+    Duplicate,
 }
 
-/// The operator check's verdict, then the deadline's. The device clock is read only for an
-/// instruction whose operator is allowed, and once.
+/// The operator check's verdict, then the ledger's, then the deadline's. The device clock is read
+/// only for an instruction whose operator is allowed and which the ledger does not hold, and once.
 fn judge(w: &Wiring, gate: &mut Gate<'_>, admitted: Admitted) -> Judged {
     match admitted {
         Admitted::OperatorNotAllowed { job_id, .. } => Judged::Refused { job_id },
         Admitted::Accepted(verified) => {
-            let deadline = verified.instruction().start_deadline;
+            let instruction = verified.instruction();
+            let generation = instruction.ownership_generation;
+            if let Some(recorded) = w.ledger.highest(&instruction.job_id.0) {
+                if generation == recorded {
+                    gate.duplicate(&instruction.job_id.0, generation);
+                    return Judged::Duplicate;
+                }
+                if generation < recorded {
+                    gate.earlier_generation(&instruction.job_id.0, generation);
+                    return Judged::Duplicate;
+                }
+            }
+            let deadline = instruction.start_deadline;
             match w.marks.judge(&*w.clock, deadline) {
                 Verdict::Open => Judged::Accepted(verified),
                 Verdict::Expired { by_mark } => {
@@ -678,6 +627,173 @@ fn judge(w: &Wiring, gate: &mut Gate<'_>, admitted: Admitted) -> Judged {
             }
         }
     }
+}
+
+/// One job command, from its verification to its answer (design 5.3, ADR-461 Decision item 9,
+/// ADR-489). The order is: verify, raise the mark, the operator check, the duplicate check, the
+/// deadline check, sync the mark, record the job, hand it to the intake, append the event, write
+/// the answer. `Err` is the end of the connection; `Ok` is a command that was answered, or that
+/// was left unanswered with the connection standing (its redelivery is the retry).
+async fn job_command(
+    socket: &mut Socket,
+    state: &mut SessionState<'_>,
+    gate: &mut Gate<'_>,
+    command_id: String,
+    signed_job: Option<&str>,
+    lived_now: bool,
+) -> Result<(), End> {
+    let w = state.wiring;
+    // A `commandId` whose longest possible answer the codec refuses (one near the size limit) is
+    // not usable, as a missing one is not: the gate and the intake see nothing and the
+    // connection closes with 1002.
+    let longest = AgentMessage::CommandRejected {
+        command_id: command_id.clone(),
+        reason: LONGEST_REASON,
+    };
+    if longest.encode().is_err() {
+        return Err(End::close(CLOSE_CODE_PROTOCOL, "command-id", lived_now));
+    }
+    let (rejected, admitted) = match gate.admit(signed_job) {
+        Ok(admitted) => (None, Some(admitted)),
+        Err(reason) => (Some(reason), None),
+    };
+    let answer = match rejected {
+        None => AgentMessage::CommandAck { command_id },
+        Some(reason) => AgentMessage::CommandRejected { command_id, reason },
+    };
+    let Ok(text) = answer.encode() else {
+        // Not reachable once the longest answer encodes.
+        return Err(End::close(CLOSE_CODE_PROTOCOL, "command-id", lived_now));
+    };
+    // The highest issue time rises with every instruction that verified, whatever becomes of it
+    // (ADR-486).
+    let judged = admitted.map(|admitted| {
+        w.marks.raise(admitted.issued_at());
+        judge(w, gate, admitted)
+    });
+    // The mark is synced before anything the command leads to is recorded, handed over or
+    // answered, a duplicate included.
+    if judged.is_some() {
+        match sync_marks(w, state.stop).await {
+            Synced::Done => {}
+            Synced::Stopped => return Err(End::stop()),
+            Synced::Failed(error) => {
+                state.warnings.mark_failure(&error);
+                return Err(End::close(CLOSE_CODE_INTERNAL, MARK_WRITE, lived_now));
+            }
+        }
+    }
+    // A new job is recorded in the ledger first, then the intake has it, and the outbox has the
+    // `received` event, all before the ack is written (ADR-489, ADR-478 item 5). An instruction
+    // whose operator is not allowed skips both and gets one terminal event instead of
+    // `received`, under the same bound and with the same failure handling (ADR-483); so does one
+    // past its deadline (ADR-486). Neither is recorded. A duplicate gets none of this.
+    let handled = match judged {
+        None | Some(Judged::Duplicate) => Handled::Done,
+        Some(Judged::Accepted(verified)) => take_job(w, state.stop, verified).await,
+        Some(Judged::Refused { job_id }) => {
+            let refused = JobState::PreconditionFailed {
+                code: FailureCode::OperatorNotAllowed,
+                detail: String::new(),
+            };
+            Handled::from(record_job_state(w, state.stop, job_id, refused).await)
+        }
+        Some(Judged::Expired { job_id }) => {
+            Handled::from(record_job_state(w, state.stop, job_id, JobState::Expired).await)
+        }
+    };
+    match handled {
+        Handled::Done => {}
+        Handled::Stopped => return Err(End::stop()),
+        Handled::Ledger(class, error) => {
+            state.warnings.ledger_failure(class, &error);
+            // A ledger that failed to write refuses records until it is opened again, which the
+            // session does before its next connection: end this one.
+            return Err(End::close(CLOSE_CODE_INTERNAL, class, lived_now));
+        }
+        Handled::Intake(error) => {
+            state.warnings.intake_failure(&error);
+            return Err(End::close(CLOSE_CODE_INTERNAL, INTAKE, lived_now));
+        }
+        Handled::Event(class, error) => {
+            state.warnings.event_failure(class, &error);
+            // A poisoned outbox cannot take any event until it is reopened, which the session
+            // does before its next connection (ADR-478 item 4): end this one.
+            if matches!(class, "outbox-poisoned" | "outbox-write") {
+                return Err(End::close(CLOSE_CODE_INTERNAL, class, lived_now));
+            }
+            return Ok(());
+        }
+    }
+    write_or_stop(socket, &text, state.stop, lived_now).await?;
+    match rejected {
+        None => state.status.command_acknowledged(),
+        Some(_) => state.status.command_rejected(),
+    }
+    Ok(())
+}
+
+/// What the work between the mark and the answer came to.
+enum Handled {
+    Done,
+    /// The stop came first: a write that started goes on unobserved.
+    Stopped,
+    /// The ledger record failed: the class and the error.
+    Ledger(&'static str, LedgerError),
+    /// The intake failed after the record was made.
+    Intake(IntakeError),
+    /// The event could not be appended: the class and the error.
+    Event(&'static str, OutboxError),
+}
+
+impl From<Recorded> for Handled {
+    fn from(recorded: Recorded) -> Handled {
+        match recorded {
+            Recorded::Done => Handled::Done,
+            Recorded::Stopped => Handled::Stopped,
+            Recorded::Failed(class, error) => Handled::Event(class, error),
+        }
+    }
+}
+
+/// A new job: its record in the ledger, made durable on a blocking task raced with the stop; then
+/// the intake, raced with the stop; then the `received` event. A step that fails stops the
+/// sequence, and a record that was made stays (the redelivery is a duplicate, ADR-489).
+async fn take_job(w: &Wiring, stop: &Stop, verified: Box<VerifiedInstruction>) -> Handled {
+    let job_id = verified.instruction().job_id.0.clone();
+    let generation = verified.instruction().ownership_generation;
+    let ledger = w.ledger.clone();
+    let (record_id, envelope) = (job_id.clone(), verified.envelope().to_vec());
+    let write =
+        tokio::task::spawn_blocking(move || ledger.record(&record_id, generation, &envelope));
+    let done = tokio::select! {
+        biased;
+        () = stop.requested() => return Handled::Stopped,
+        done = write => done,
+    };
+    match done {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            let class = match error {
+                LedgerError::Poisoned => LEDGER_POISONED,
+                _ => LEDGER_WRITE,
+            };
+            return Handled::Ledger(class, error);
+        }
+        Err(_) => {
+            let error = LedgerError::Io(std::io::ErrorKind::Other);
+            return Handled::Ledger(LEDGER_WRITE, error);
+        }
+    }
+    let taken = tokio::select! {
+        biased;
+        () = stop.requested() => return Handled::Stopped,
+        taken = w.intake.take(*verified) => taken,
+    };
+    if let Err(error) = taken {
+        return Handled::Intake(error);
+    }
+    Handled::from(record_job_state(w, stop, job_id, JobState::Received).await)
 }
 
 /// What making the mark durable came to.

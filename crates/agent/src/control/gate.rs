@@ -21,8 +21,16 @@
 //! per connection is a `warn` with the job ID, the repeats are `debug`, and the connection's end
 //! gives the count. An entry holds no time, no operator and no `commandId`.
 //!
+//! The channel checks a verified instruction's job ID against the received-jobs ledger next
+//! (ADR-489); a duplicate is counted here ([`Gate::duplicate`], [`Gate::earlier_generation`]) and
+//! logged with the job ID and the generation only, the first one for an earlier generation per
+//! connection as a `warn`, the rest as `debug`.
+//!
 //! What a verified instruction goes to is an [`Intake`]. The gate opens no link and keeps no job
 //! state; the answer to the server is the caller's.
+
+use std::future::Future;
+use std::pin::Pin;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -32,16 +40,29 @@ use shared_proto::{FailureCode, InstructionRejectReason};
 
 use crate::instruction::{self, Refusal, VerifiedInstruction};
 
-/// Where a verified job instruction goes. The control channel hands it over before it answers
-/// `commandAck`. An instruction whose operator the gate does not allow (ADR-483), or whose start
-/// deadline has passed (ADR-486), is not handed over: the intake never sees it.
+/// Why an [`Intake`] could not take an instruction. It carries nothing: the cause is the intake's
+/// own to log, and the channel's entry names no job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("the intake could not take the instruction")]
+pub struct IntakeError;
+
+/// What [`Intake::take`] returns: a future the channel awaits, raced with the agent's stop.
+pub type Taken<'a> = Pin<Box<dyn Future<Output = Result<(), IntakeError>> + Send + 'a>>;
+
+/// Where a verified job instruction goes. The control channel hands it over after the job's record
+/// in the received-jobs ledger is durable (ADR-489) and before the `received` event and the
+/// `commandAck`. An instruction whose operator the gate does not allow (ADR-483), whose start
+/// deadline has passed (ADR-486) or whose job ID the ledger holds under the same or a later
+/// generation is not handed over: the intake never sees it.
 ///
-/// An intake can receive the same verified instruction twice: the hand-over succeeded, then the
-/// ack was lost (the write failed or the connection ended) and the server redelivers the command
-/// on the next connection. An implementation must therefore be idempotent on the job ID.
+/// An intake is called at most once per job ID and generation, returns promptly (the channel's
+/// loop waits for it, so a call that blocks stalls every connection's frames, though not the
+/// agent's stop) and tolerates being dropped before it finishes, which a stop does. An error
+/// leaves the job recorded and ends the connection with 1011; the same command is not handed
+/// over again, as its redelivery is a duplicate.
 pub trait Intake: Send + Sync {
     /// Takes the instruction.
-    fn take(&self, instruction: VerifiedInstruction);
+    fn take(&self, instruction: VerifiedInstruction) -> Taken<'_>;
 }
 
 /// The default intake, connected to no job runner: it logs the job ID at `debug` and drops the
@@ -49,11 +70,12 @@ pub trait Intake: Send + Sync {
 pub struct LogIntake;
 
 impl Intake for LogIntake {
-    fn take(&self, instruction: VerifiedInstruction) {
+    fn take(&self, instruction: VerifiedInstruction) -> Taken<'_> {
         tracing::debug!(
             job_id = %instruction.instruction().job_id.0,
             "a verified job instruction was dropped: no job runner is connected"
         );
+        Box::pin(std::future::ready(Ok(())))
     }
 }
 
@@ -111,6 +133,11 @@ struct Refused {
     operator_not_allowed: u64,
     /// Verified, allowed instructions past their start deadline (not a command refusal).
     expired: u64,
+    /// Verified instructions whose job ID the ledger holds under the same generation (not a
+    /// command refusal: the command is acknowledged).
+    duplicate: u64,
+    /// Verified instructions whose job ID the ledger holds under a later generation.
+    earlier_generation: u64,
 }
 
 impl Refused {
@@ -135,6 +162,8 @@ impl Refused {
             && self.not_for_this_agent == 0
             && self.operator_not_allowed == 0
             && self.expired == 0
+            && self.duplicate == 0
+            && self.earlier_generation == 0
     }
 }
 
@@ -230,6 +259,25 @@ impl<'a> Gate<'a> {
         }
     }
 
+    /// Counts a command whose job ID the ledger holds under the same generation (ADR-489) and
+    /// writes its entry at `debug`: a redelivery is routine. The entry holds the job ID and the
+    /// generation only.
+    pub(super) fn duplicate(&mut self, job_id: &str, generation: u64) {
+        self.refused.duplicate += 1;
+        tracing::debug!(job_id = %job_id, generation, "a duplicate job command: the job is already recorded");
+    }
+
+    /// Counts a command whose job ID the ledger holds under a later generation: a `warn` the first
+    /// time on the connection (the server should not send one), `debug` after that.
+    pub(super) fn earlier_generation(&mut self, job_id: &str, generation: u64) {
+        self.refused.earlier_generation += 1;
+        if self.refused.earlier_generation == 1 {
+            tracing::warn!(job_id = %job_id, generation, "a duplicate job command: a later generation of the job is recorded");
+        } else {
+            tracing::debug!(job_id = %job_id, generation, "a duplicate job command: a later generation of the job is recorded");
+        }
+    }
+
     /// Counts the refusal, writes its entry (a warning the first time per reason) and returns
     /// the reason.
     fn refuse(&mut self, refusal: Refusal, envelope_len: usize) -> InstructionRejectReason {
@@ -252,6 +300,8 @@ impl<'a> Gate<'a> {
             not_for_this_agent,
             operator_not_allowed,
             expired,
+            duplicate,
+            earlier_generation,
         } = self.refused;
         tracing::info!(
             malformed,
@@ -261,6 +311,8 @@ impl<'a> Gate<'a> {
             not_for_this_agent,
             operator_not_allowed,
             expired,
+            duplicate,
+            earlier_generation,
             "job instructions refused on this connection"
         );
     }

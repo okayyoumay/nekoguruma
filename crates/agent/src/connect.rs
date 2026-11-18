@@ -13,14 +13,19 @@
 //!    agent ID in the registration directory, read when present and not created. One that does
 //!    not read back is corrupt and the owner registers again (exit 1); another process holding it,
 //!    an unusable directory or a read that fails is exit 3.
-//! 4. The agent key, through [`crate::identity::agent_key`] (the create-once routine). A key
+//! 4. The received-jobs ledger ([`crate::received_jobs::ReceivedJobs::open`], ADR-489): the file
+//!    of the record's agent ID in the registration directory, read when present and not created,
+//!    a torn last frame cut off. One that does not read back is corrupt and the owner registers
+//!    again (exit 1); another process holding it, an unusable directory or a read that fails is
+//!    exit 3.
+//! 5. The agent key, through [`crate::identity::agent_key`] (the create-once routine). A key
 //!    store that is unavailable, or a creation lock held past its wait, is tried again with the
 //!    session's delays until the stop signal; any other error (a refused identity directory, a
 //!    lock that cannot be opened) ends the command at once. A key this run had to create, or one
 //!    that is not the record's, means registering again.
-//! 5. [`crate::control::Opened::start`], then a wait for the stop signal or for the task to end
-//!    (a task that ends alone is an error: exit 1 when its outbox, poisoned and opened again,
-//!    was corrupt, otherwise the same exit with a generic text), then [`crate::control::Handle::stop`] (Close 1001)
+//! 6. [`crate::control::Opened::start`], then a wait for the stop signal or for the task to end
+//!    (a task that ends alone is an error: exit 1 when its outbox or its ledger, poisoned and
+//!    opened again, was corrupt, otherwise the same exit with a generic text), then [`crate::control::Handle::stop`] (Close 1001)
 //!    and a wait for the task to end.
 //!
 //! The command prints and logs nothing the server sent and no token; its messages are fixed
@@ -36,6 +41,7 @@ use crate::control::{self, ControlError, LogIntake, SharedOutbox};
 use crate::deadline::{IssueMark, MarkError, SystemClock};
 use crate::identity::{AgentKey, IdentityError, agent_key};
 use crate::outbox::{Outbox, OutboxError};
+use crate::received_jobs::{LedgerError, ReceivedJobs};
 use crate::registration::record::RecordError;
 
 /// The first wait before the key store is tried again, as the session's own delay starts.
@@ -183,6 +189,31 @@ fn mark_error(error: &MarkError) -> ConnectError {
     }
 }
 
+/// The exit and the text of an error that ends the open of the received-jobs ledger. The texts
+/// are NGR's own.
+fn ledger_error(error: &LedgerError) -> ConnectError {
+    match error {
+        LedgerError::Corrupt(_) => fail(
+            Exit::CannotConnect,
+            "the received-jobs ledger is corrupt and is not repaired; register again with `ngr-agent register --replace`",
+        ),
+        LedgerError::BadAgentId => fail(
+            Exit::CannotConnect,
+            "the registration record cannot be used; register again with `ngr-agent register --replace`",
+        ),
+        LedgerError::InUse => fail(
+            Exit::Unavailable,
+            "the received-jobs ledger is open in another process; nothing changed, try again",
+        ),
+        other => fail(
+            Exit::Unavailable,
+            format!(
+                "the received-jobs ledger cannot be opened: {other}; nothing changed, try again"
+            ),
+        ),
+    }
+}
+
 /// The exit and the text of a key error that ends the load, as `register` reports it. The retried
 /// errors ([`IdentityError::retry_class`]) never get here.
 fn identity_error(error: &IdentityError) -> ConnectError {
@@ -209,6 +240,8 @@ pub async fn run(mode: OperatingMode, stop: impl Future<Output = ()>) -> Result<
     let outbox = SharedOutbox::new(outbox);
     let marks =
         IssueMark::open(mode, &opened.record().agent_id).map_err(|error| mark_error(&error))?;
+    let ledger = ReceivedJobs::open(mode, &opened.record().agent_id)
+        .map_err(|error| ledger_error(&error))?;
     run_opened(
         opened,
         move || agent_key(mode),
@@ -219,6 +252,7 @@ pub async fn run(mode: OperatingMode, stop: impl Future<Output = ()>) -> Result<
                 outbox,
                 marks,
                 Arc::new(SystemClock),
+                ledger,
             )
         },
         stop,
@@ -250,8 +284,14 @@ async fn run_opened(
         biased;
         () = stop.as_mut() => {}
         () = handle.stopped() => {
-            if handle.ended() == Some(control::Ended::OutboxUnusable) {
-                return Err(outbox_error(&OutboxError::Corrupt("reopen")));
+            match handle.ended() {
+                Some(control::Ended::OutboxUnusable) => {
+                    return Err(outbox_error(&OutboxError::Corrupt("reopen")));
+                }
+                Some(control::Ended::LedgerUnusable) => {
+                    return Err(ledger_error(&LedgerError::Corrupt("reopen")));
+                }
+                None => {}
             }
             return Err(fail(
                 Exit::CannotConnect,

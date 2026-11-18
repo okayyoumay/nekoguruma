@@ -1,7 +1,7 @@
 # ADR-473: The Agent Answers a Verified Job Command With an Acknowledgement Alone Until the Outbox Numbers Events
 
 **Date:** 2026-11-13
-**Status:** Accepted (item 1 superseded by ADR-478 item 5: a verified command's `received` event precedes its acknowledgement)
+**Status:** Accepted (item 1 superseded by ADR-478 item 5: a verified command's `received` event precedes its acknowledgement; item 4's duplicate check and journal record done by ADR-489: the ledger records the job and the intake is no longer called twice for one)
 **Affects:** design 5.3; `api/asyncapi.yaml` (`agentControl`); `crates/agent` (`control`, `instruction`), `crates/agent/docs/ngr-agent.md`, `crates/agent/docs/operational-log.md`; details ADR-466 items 10 and 13 and ADR-461 items 9 and 10 for the agent's side, and ADR-471 item 5's job command
 
 ## Context

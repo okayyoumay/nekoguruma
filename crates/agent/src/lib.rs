@@ -59,6 +59,7 @@ pub mod logging;
 mod oplog;
 pub mod outbox;
 pub mod policy;
+pub mod received_jobs;
 pub mod registration;
 pub mod restart;
 pub mod runner;

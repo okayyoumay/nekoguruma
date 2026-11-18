@@ -49,6 +49,7 @@ use crate::identity::load_or_create;
 use crate::identity::store::{MemoryStore, SecretName};
 use crate::instruction::VerifiedInstruction;
 use crate::outbox::{Kind, Outbox, Probe};
+use crate::received_jobs::ReceivedJobs;
 use crate::registration::{Request as RegisterRequest, register_in};
 use crate::server_http::Timeouts;
 
@@ -352,6 +353,8 @@ struct Opts {
     probe: Option<Probe>,
     /// A hook on the issue-time mark's write path.
     mark_probe: Option<Probe>,
+    /// A hook on the received-jobs ledger's write path.
+    ledger_probe: Option<Probe>,
 }
 
 impl Default for Opts {
@@ -363,6 +366,7 @@ impl Default for Opts {
             preset: "personal",
             probe: None,
             mark_probe: None,
+            ledger_probe: None,
         }
     }
 }
@@ -415,16 +419,43 @@ fn open_marks(fx: &Fixture, probe: Option<Probe>) -> IssueMark {
     IssueMark::open_with(&fx.registration_dir(), AGENT_ID, probe).unwrap()
 }
 
-/// An intake that keeps what it was given: the job ID and the envelope.
+/// The received-jobs ledger of the fixture's agent in its registration directory.
+fn open_ledger(fx: &Fixture, probe: Option<Probe>) -> ReceivedJobs {
+    let probe = probe.unwrap_or_else(|| Box::new(|_| Ok(())));
+    ReceivedJobs::open_with(&fx.registration_dir(), AGENT_ID, probe).unwrap()
+}
+
+/// An intake that keeps what it was given: the job ID and the envelope. It can be made to fail
+/// (the instruction is still kept, so a test sees what was handed over) or to never finish.
 #[derive(Default)]
-struct RecordingIntake(Mutex<Vec<(String, Vec<u8>)>>);
+struct RecordingIntake {
+    taken: Mutex<Vec<(String, Vec<u8>)>>,
+    fail: AtomicBool,
+    hang: AtomicBool,
+}
+
+impl RecordingIntake {
+    fn calls(&self) -> usize {
+        self.taken.lock().unwrap().len()
+    }
+}
 
 impl Intake for RecordingIntake {
-    fn take(&self, instruction: VerifiedInstruction) {
-        self.0.lock().unwrap().push((
+    fn take(&self, instruction: VerifiedInstruction) -> Taken<'_> {
+        self.taken.lock().unwrap().push((
             instruction.instruction().job_id.0.clone(),
             instruction.envelope().to_vec(),
         ));
+        let (fail, hang) = (
+            self.fail.load(Ordering::SeqCst),
+            self.hang.load(Ordering::SeqCst),
+        );
+        Box::pin(async move {
+            if hang {
+                std::future::pending::<()>().await;
+            }
+            if fail { Err(IntakeError) } else { Ok(()) }
+        })
     }
 }
 
@@ -435,6 +466,8 @@ struct Env {
     outbox: Option<SharedOutbox>,
     /// `None` only while a restart has the mark store closed.
     marks: Option<IssueMark>,
+    /// `None` only while a restart has the ledger closed.
+    ledger: Option<ReceivedJobs>,
     clock: Arc<TestClock>,
     handle: Handle,
     conns: mpsc::UnboundedReceiver<Dialed>,
@@ -506,6 +539,7 @@ impl Env {
         let intake = Arc::new(RecordingIntake::default());
         let outbox = open_outbox(&fx, opts.probe);
         let marks = open_marks(&fx, opts.mark_probe);
+        let ledger = open_ledger(&fx, opts.ledger_probe);
         let clock = TestClock::at(DEVICE_NOW);
         let seams = Seams {
             dial: dial.clone(),
@@ -515,6 +549,7 @@ impl Env {
             outbox: outbox.clone(),
             marks: marks.clone(),
             clock: clock.clone(),
+            ledger: ledger.clone(),
         };
         let started = Instant::now();
         let handle = fx
@@ -527,6 +562,7 @@ impl Env {
             intake,
             outbox: Some(outbox),
             marks: Some(marks),
+            ledger: Some(ledger),
             clock,
             handle,
             conns: rx,
@@ -549,17 +585,27 @@ impl Env {
     /// Stops the session, waits for its end and starts a new one on the same state directory, as
     /// a restart of the process would: the outbox is opened again from its file.
     async fn restart(&mut self) {
-        self.restart_with_mark_probe(None).await;
+        self.restart_with_probes(None, None).await;
     }
 
     /// [`Env::restart`] with a hook on the new mark store's write path.
     async fn restart_with_mark_probe(&mut self, mark_probe: Option<Probe>) {
+        self.restart_with_probes(mark_probe, None).await;
+    }
+
+    async fn restart_with_probes(
+        &mut self,
+        mark_probe: Option<Probe>,
+        ledger_probe: Option<Probe>,
+    ) {
         self.handle.stop();
         self.handle.stopped().await;
         self.outbox = None;
         self.marks = None;
+        self.ledger = None;
         let outbox = open_outbox(&self.fx, None);
         let marks = open_marks(&self.fx, mark_probe);
+        let ledger = open_ledger(&self.fx, ledger_probe);
         let seams = Seams {
             dial: self.dial.clone(),
             signer: self.fx.key.clone(),
@@ -568,6 +614,7 @@ impl Env {
             outbox: outbox.clone(),
             marks: marks.clone(),
             clock: self.clock.clone(),
+            ledger: ledger.clone(),
         };
         self.handle = self
             .fx
@@ -577,6 +624,7 @@ impl Env {
             .unwrap();
         self.outbox = Some(outbox);
         self.marks = Some(marks);
+        self.ledger = Some(ledger);
     }
 
     /// The commands answered `commandAck` and `commandRejected` so far.
@@ -1002,13 +1050,46 @@ fn signed_command_at(
     id: &str,
     agent: &str,
     tamper: Tamper,
+    times: (u64, u64),
+) -> Signed {
+    signed_job_at(fx, id, (JOB_ID, GENERATION), agent, tamper, times)
+}
+
+/// The ownership generation every fixture signs unless a test names another.
+const GENERATION: u64 = 7;
+
+/// A job ID other than [`JOB_ID`], one per `n` (a canonical UUID).
+fn job_n(n: u32) -> String {
+    format!("0194f0a2-7c3e-7d11-8a52-{n:012x}")
+}
+
+/// A command for the job `job_id` at `generation`, signed with the instruction key and otherwise
+/// as [`signed_command`] makes it.
+fn signed_job(fx: &Fixture, id: &str, job_id: &str, generation: u64) -> Signed {
+    signed_job_at(
+        fx,
+        id,
+        (job_id, generation),
+        AGENT_ID,
+        Tamper::None,
+        (1_000, 2_000),
+    )
+}
+
+/// The general form: the job ID and generation, the agent, the tamper, the times.
+fn signed_job_at(
+    fx: &Fixture,
+    id: &str,
+    (job_id, generation): (&str, u64),
+    agent: &str,
+    tamper: Tamper,
     (issued_at, start_deadline): (u64, u64),
 ) -> Signed {
     use shared_crypto::instruction as envelope;
     let body = JobInstruction {
         version: INSTRUCTION_VERSION,
-        job_id: JobId(JOB_ID.to_owned()),
-        ownership_generation: 7,
+        job_id: JobId(job_id.to_owned()),
+        ownership_generation: generation,
         agent_id: AgentId(match tamper {
             Tamper::OtherAgent | Tamper::OtherAgentAndOperator => "other-agent".to_owned(),
             _ => agent.to_owned(),
@@ -1415,6 +1496,7 @@ async fn a7_a_key_with_another_fingerprint_is_a_key_mismatch() {
         outbox: open_outbox(&fx, None),
         marks: open_marks(&fx, None),
         clock: TestClock::at(DEVICE_NOW),
+        ledger: open_ledger(&fx, None),
     };
     let error = fx.open().unwrap().start_with(&other, seams).unwrap_err();
     assert!(matches!(error, ControlError::KeyMismatch));
@@ -1485,6 +1567,7 @@ async fn a11_a_second_open_in_the_same_process_is_already_running() {
         outbox: open_outbox(&fx, None),
         marks: open_marks(&fx, None),
         clock: TestClock::at(DEVICE_NOW),
+        ledger: open_ledger(&fx, None),
     };
     let handle = first.start_with(&fx.key.public_key(), seams).unwrap();
     assert!(matches!(fx.open(), Err(ControlError::AlreadyRunning)));
@@ -1548,6 +1631,7 @@ fn a12_runtime_shutdown_and_an_unstarted_opened_release_both_locks() {
             outbox: open_outbox(&fx, None),
             marks: open_marks(&fx, None),
             clock: TestClock::at(DEVICE_NOW),
+            ledger: open_ledger(&fx, None),
         };
         let handle = fx
             .open()
@@ -2511,7 +2595,7 @@ async fn job_command_at_60_s_then_the_answer_write_goes_wrong(stall: bool) {
     env.dial.flags.fail_write.store(false, Ordering::SeqCst);
     env.dial.flags.stall_write.store(false, Ordering::SeqCst);
     assert_eq!(env.counts(), (0, 0));
-    assert_eq!(env.intake.0.lock().unwrap().len(), 1);
+    assert_eq!(env.intake.taken.lock().unwrap().len(), 1);
     // RST: the delay is 1 s, not 8; then ORD: the next failure doubles it.
     let (next, mut stream, _) = env.request().await;
     assert_eq!(gaps(&[ended, next]), vec![1], "reset to 1 s, not 8");
@@ -2596,7 +2680,8 @@ async fn f8_a_verified_job_command_is_answered_with_an_ack_and_the_answer_is_no_
     assert_after(hello_at, heartbeat(&mut ws).await, 20, "tick 2");
     until(hello_at + secs(25)).await;
     let first = signed_command(&env.fx, "cmd-1", AGENT_ID, Tamper::None);
-    let second = signed_command(&env.fx, "cmd-2", AGENT_ID, Tamper::None);
+    let second_job = job_n(2);
+    let second = signed_job(&env.fx, "cmd-2", &second_job, GENERATION);
     send(&mut ws, &first.text).await;
     send(&mut ws, &second.text).await;
     // Each ack is followed by its `received` event (numbers 1 and 2), the second ack may come
@@ -2629,10 +2714,10 @@ async fn f8_a_verified_job_command_is_answered_with_an_ack_and_the_answer_is_no_
     assert_eq!(env.counts(), (2, 0));
     // The intake had both, byte for byte, before the acks.
     assert_eq!(
-        *env.intake.0.lock().unwrap(),
+        *env.intake.taken.lock().unwrap(),
         vec![
             (JOB_ID.to_owned(), first.envelope),
-            (JOB_ID.to_owned(), second.envelope)
+            (second_job, second.envelope)
         ]
     );
     // The answers did not reset the idle deadline, and the next message is the tick at 30. The
@@ -2681,7 +2766,10 @@ async fn f9_every_refusal_reason_is_answered_with_a_rejection_and_logged() {
             "{word}"
         );
     }
-    assert!(env.intake.0.lock().unwrap().is_empty(), "nothing was taken");
+    assert!(
+        env.intake.taken.lock().unwrap().is_empty(),
+        "nothing was taken"
+    );
     assert_eq!(env.status().phase, Phase::Connected);
     // The unknown key's entry names the fingerprint it offered, which is a hash.
     assert!(env.log.contains("offered_key="));
@@ -2809,9 +2897,10 @@ async fn f9_a_stalled_answer_is_dropped_after_10_seconds_and_counts_nothing() {
     assert_eq!(got(&mut ws).await.1, Got::Eof, "nothing was written");
     assert_eq!(env.counts(), (0, 0));
     // F8b: the intake took the instruction before the ack, which was lost.
-    assert_eq!(env.intake.0.lock().unwrap().len(), 1);
-    // The server redelivers it under a new commandId; the intake gets it a second time. The
-    // first delivery's `received` event is in the outbox and is sent first.
+    assert_eq!(env.intake.taken.lock().unwrap().len(), 1);
+    // The server redelivers it under a new commandId; it is a duplicate (ADR-489): acknowledged,
+    // not handed to the intake again. The first delivery's `received` event is in the outbox and
+    // is sent first.
     let (_, mut ws) = env.connected(60).await;
     assert_eq!(event(&mut ws).await.1, 1);
     send(
@@ -2824,10 +2913,11 @@ async fn f9_a_stalled_answer_is_dropped_after_10_seconds_and_counts_nothing() {
         got,
         serde_json::json!({"type": "commandAck", "commandId": "c-again"})
     );
-    // C14: the second delivery of the same job is a second `received` event.
-    assert_eq!(event(&mut ws).await.1, 2);
+    // C14: the second delivery of the same job is acknowledged and adds no event: the next
+    // message is the heartbeat, not a second `received`.
+    heartbeat(&mut ws).await;
     assert_eq!(env.counts(), (1, 0));
-    assert_eq!(env.intake.0.lock().unwrap().len(), 2);
+    assert_eq!(env.intake.taken.lock().unwrap().len(), 1);
 }
 
 #[tokio::test(start_paused = true)]
@@ -2851,7 +2941,7 @@ async fn f9_a_stop_during_a_stalled_answer_drops_the_connection_at_once() {
     assert_eq!(got(&mut ws).await.1, Got::Eof, "no answer and no Close");
     assert_eq!(env.counts(), (0, 0));
     // F8b: the intake took the instruction before the ack.
-    assert_eq!(env.intake.0.lock().unwrap().len(), 1);
+    assert_eq!(env.intake.taken.lock().unwrap().len(), 1);
 }
 
 #[tokio::test(start_paused = true)]
@@ -2867,7 +2957,7 @@ async fn f9_a_command_that_comes_after_the_stop_is_not_answered() {
     close_of(&mut ws, 1001, true).await;
     env.handle.stopped().await;
     assert_eq!(env.counts(), (0, 0));
-    assert!(env.intake.0.lock().unwrap().is_empty());
+    assert!(env.intake.taken.lock().unwrap().is_empty());
 }
 
 #[tokio::test(start_paused = true)]
@@ -2885,7 +2975,7 @@ async fn f9_a_command_behind_the_peers_close_is_not_answered() {
         .await;
     env.wait_phase(Phase::Waiting).await;
     assert_eq!(env.counts(), (0, 0));
-    assert!(env.intake.0.lock().unwrap().is_empty());
+    assert!(env.intake.taken.lock().unwrap().is_empty());
     while let (_, Got::Text(text)) = got(&mut ws).await {
         assert!(!text.contains("commandAck"), "{text}");
     }
@@ -2955,7 +3045,7 @@ async fn f9c_a_command_id_whose_answer_cannot_be_encoded_closes_with_1002() {
     close_of(&mut ws, 1002, true).await;
     env.wait_phase(Phase::Waiting).await;
     assert_eq!(env.counts(), (0, 1));
-    assert!(env.intake.0.lock().unwrap().is_empty());
+    assert!(env.intake.taken.lock().unwrap().is_empty());
     // The gate saw the first command only.
     let summary = env.log.lines("refused on this connection");
     assert_eq!(summary.len(), 1, "{summary:?}");
@@ -2990,7 +3080,7 @@ async fn f_drain_a_job_command_during_the_agents_own_close_is_discarded() {
         assert_eq!(got_code, Some(code));
         env.wait_phase(Phase::Waiting).await;
         assert_eq!(env.counts(), (0, 0));
-        assert!(env.intake.0.lock().unwrap().is_empty());
+        assert!(env.intake.taken.lock().unwrap().is_empty());
         // The stack stops reading at the agent's Close; whatever the agent wrote after it is
         // still in the pipe. There must be none: the command was not answered.
         let mut rest = Vec::new();
@@ -3625,8 +3715,20 @@ fn received_of(seq: u64) -> serde_json::Value {
     })
 }
 
+/// [`received_of`] for the job [`job_n`]`(n)`.
+fn received_of_n(seq: u64, n: u32) -> serde_json::Value {
+    serde_json::json!({
+        "type": "agentEvent", "seq": seq, "kind": "jobState", "jobId": job_n(n), "state": "received"
+    })
+}
+
 fn verified(env: &Env, id: &str) -> String {
     signed_command(&env.fx, id, AGENT_ID, Tamper::None).text
+}
+
+/// A verified command for the job [`job_n`]`(n)` at the fixtures' generation.
+fn verified_job(env: &Env, id: &str, n: u32) -> String {
+    signed_job(&env.fx, id, &job_n(n), GENERATION).text
 }
 
 /// C1: events pending at `hello` are sent in order after it and nothing before it.
@@ -3971,7 +4073,7 @@ async fn outbox_c12_a_verified_command_is_recorded_before_it_is_acknowledged() {
         file.windows(10).any(|w| w == b"\"received\""),
         "the event is durable"
     );
-    assert_eq!(env.intake.0.lock().unwrap().len(), 1);
+    assert_eq!(env.intake.taken.lock().unwrap().len(), 1);
     let (_, seq, state) = event(&mut ws).await;
     assert_eq!((seq, state.as_str()), (1, "received"));
     send(&mut ws, &ack(1)).await;
@@ -4018,7 +4120,7 @@ async fn outbox_c13_a_failed_append_withholds_the_ack_and_closes_with_1011() {
     close_of(&mut ws, 1011, true).await;
     assert_eq!(env.counts(), (0, 0));
     assert_eq!(
-        env.intake.0.lock().unwrap().len(),
+        env.intake.taken.lock().unwrap().len(),
         1,
         "handed over before the append"
     );
@@ -4027,7 +4129,7 @@ async fn outbox_c13_a_failed_append_withholds_the_ack_and_closes_with_1011() {
 }
 
 /// A write failure on the `received` append ends the connection; the next one reopens the
-/// outbox, the redelivered command is recorded and acknowledged, and the event is sent.
+/// outbox; the redelivered command is a duplicate (the job was recorded before the append failed), acknowledged with no event, and a new job gets the event.
 #[tokio::test(start_paused = true)]
 async fn outbox_reopen_a_write_failure_closes_with_1011_and_the_next_connection_reopens() {
     let fail = Arc::new(AtomicBool::new(false));
@@ -4052,9 +4154,20 @@ async fn outbox_reopen_a_write_failure_closes_with_1011_and_the_next_connection_
     send(&mut ws, &verified(&env, "a")).await;
     let (_, answered) = answer(&mut ws).await;
     assert_eq!(answered["type"], "commandAck");
-    let (_, seq, state) = event(&mut ws).await;
-    assert_eq!((seq, state.as_str()), (1, "received"));
+    // The job was recorded before the append failed: its redelivery is a duplicate (ADR-489),
+    // acknowledged with no `received` event, not one more intake call.
+    assert_eq!(env.intake.calls(), 1);
     assert_eq!(env.counts(), (1, 0));
+    let (_, mut ws) = env.connected(60).await;
+    send(&mut ws, &verified_job(&env, "b", 2)).await;
+    assert_eq!(answer(&mut ws).await.1["type"], "commandAck");
+    let (_, seq, state) = event(&mut ws).await;
+    assert_eq!(
+        (seq, state.as_str()),
+        (1, "received"),
+        "a new job gets the event"
+    );
+    assert_eq!(env.counts(), (2, 0));
 }
 
 /// An acknowledgement whose rewrite poisons the outbox (the sync after the rename fails) closes the
@@ -4121,19 +4234,23 @@ async fn outbox_reopen_an_io_failure_keeps_the_session_reconnecting_until_it_cle
     close_of(&mut ws, 1011, true).await;
     // The reopen fails before this connection: the command finds the outbox poisoned.
     let (_, mut ws) = env.connected(60).await;
+    // A redelivery of the first job is a duplicate, acknowledged even while the outbox is
+    // poisoned (ADR-489); a new job is what finds the outbox poisoned.
     send(&mut ws, &verified(&env, "a")).await;
+    assert_eq!(answer(&mut ws).await.1["type"], "commandAck");
+    send(&mut ws, &verified_job(&env, "b", 2)).await;
     close_of(&mut ws, 1011, true).await;
-    assert_eq!(env.counts(), (0, 0));
+    assert_eq!(env.counts(), (1, 0));
     assert!(env.log.warns("outbox-reopen") >= 1);
     assert_eq!(env.log.warns("outbox-poisoned"), 1);
     write_fails.store(false, Ordering::SeqCst);
     open_fails.store(false, Ordering::SeqCst);
     let (_, mut ws) = env.connected(60).await;
-    send(&mut ws, &verified(&env, "a")).await;
+    send(&mut ws, &verified_job(&env, "c", 3)).await;
     let (_, answered) = answer(&mut ws).await;
     assert_eq!(answered["type"], "commandAck");
     assert_eq!(events(&mut ws, 1).await, [1]);
-    assert_eq!(env.counts(), (1, 0));
+    assert_eq!(env.counts(), (2, 0));
 }
 
 /// A reopen that finds the file corrupt ends the session as a local fact: no more connections,
@@ -4186,23 +4303,47 @@ async fn outbox_c13_a_full_outbox_withholds_the_ack() {
         let _ = got(&mut ws).await;
     }
     send(&mut ws, &verified(&env, "a")).await;
-    send(&mut ws, &verified(&env, "b")).await;
+    send(&mut ws, &verified_job(&env, "b", 2)).await;
     assert_after(hello_at, heartbeat(&mut ws).await, 60, "tick");
     assert_eq!(env.counts(), (0, 0));
     assert_eq!(env.log.warns("outbox-full"), 1);
+    // C7: both jobs were recorded and handed over before the append was refused; the connection
+    // stands, and the redelivery of the first is a duplicate, acknowledged though the outbox is
+    // still full, with no event (the admission bound delays the ack, it no longer refuses a job).
+    assert_eq!(env.intake.calls(), 2);
+    send(&mut ws, &verified(&env, "a-again")).await;
+    assert_eq!(answer(&mut ws).await.1["type"], "commandAck");
+    assert_eq!(env.counts(), (1, 0));
+    assert_eq!(env.intake.calls(), 2, "not handed over again");
+    assert_eq!(
+        env.log.warns("outbox-full"),
+        1,
+        "no second append was tried"
+    );
 }
 
-/// C14: the same job delivered twice is recorded twice (until the intake is idempotent).
+/// C14 (ADR-489): the same job delivered twice gets one `received` event and one intake call; both
+/// deliveries are acknowledged.
 #[tokio::test(start_paused = true)]
-async fn outbox_c14_the_same_job_delivered_twice_gets_a_second_received_event() {
+async fn outbox_c14_the_same_job_delivered_twice_gets_one_received_event_and_two_acks() {
     let mut env = Env::new();
-    let (_, mut ws) = env.connected(60).await;
+    let (hello_at, mut ws) = env.connected(60).await;
     send(&mut ws, &verified(&env, "first")).await;
     let _ = answer(&mut ws).await;
     assert_eq!(events(&mut ws, 1).await, [1]);
     send(&mut ws, &verified(&env, "second")).await;
-    let _ = answer(&mut ws).await;
-    assert_eq!(events(&mut ws, 1).await, [2]);
+    assert_eq!(
+        answer(&mut ws).await.1,
+        serde_json::json!({"type": "commandAck", "commandId": "second"})
+    );
+    assert_after(
+        hello_at,
+        heartbeat(&mut ws).await,
+        60,
+        "tick: no second event",
+    );
+    assert_eq!(env.counts(), (2, 0));
+    assert_eq!(env.intake.calls(), 1);
 }
 
 /// C15: a refused command is answered and records nothing.
@@ -4263,7 +4404,10 @@ async fn an_operator_who_is_not_the_owner_is_refused_by_event(preset: &'static s
         answered,
         serde_json::json!({"type": "commandAck", "commandId": "cmd-1"})
     );
-    assert!(env.intake.0.lock().unwrap().is_empty(), "nothing was taken");
+    assert!(
+        env.intake.taken.lock().unwrap().is_empty(),
+        "nothing was taken"
+    );
     assert_eq!(event_json(&mut ws).await, operator_refusal_of(1));
     send(&mut ws, &ack(1)).await;
     // Exactly one event: the next message is the heartbeat tick.
@@ -4297,7 +4441,7 @@ async fn operator_o4_a_shared_agent_takes_another_operator() {
     send(&mut ws, &foreign_operator(&env, "cmd-1")).await;
     let (_, answered) = answer(&mut ws).await;
     assert_eq!(answered["type"], "commandAck");
-    assert_eq!(env.intake.0.lock().unwrap().len(), 1);
+    assert_eq!(env.intake.taken.lock().unwrap().len(), 1);
     assert_eq!(event_json(&mut ws).await, received_of(1));
 }
 
@@ -4353,7 +4497,7 @@ async fn operator_o7_a_forged_command_is_rejected_for_its_signature_not_its_oper
         60,
         "tick: no event came",
     );
-    assert!(env.intake.0.lock().unwrap().is_empty());
+    assert!(env.intake.taken.lock().unwrap().is_empty());
     assert_eq!(env.counts(), (0, 4));
 }
 
@@ -4377,7 +4521,7 @@ async fn operator_o8_a_failed_refusal_append_withholds_the_ack_and_closes_with_1
     send(&mut ws, &foreign_operator(&env, "a")).await;
     close_of(&mut ws, 1011, true).await;
     assert_eq!(env.counts(), (0, 0));
-    assert!(env.intake.0.lock().unwrap().is_empty());
+    assert!(env.intake.taken.lock().unwrap().is_empty());
     assert_eq!(env.log.warns("outbox-write"), 1);
     // The next connection reopens the outbox and the redelivered command is settled.
     fail.store(false, Ordering::SeqCst);
@@ -4405,7 +4549,7 @@ async fn operator_o8_a_full_outbox_withholds_the_ack_of_a_refusal() {
     send(&mut ws, &foreign_operator(&env, "a")).await;
     assert_after(hello_at, heartbeat(&mut ws).await, 60, "tick");
     assert_eq!(env.counts(), (0, 0));
-    assert!(env.intake.0.lock().unwrap().is_empty());
+    assert!(env.intake.taken.lock().unwrap().is_empty());
     assert_eq!(env.log.warns("outbox-full"), 1);
 }
 
@@ -4439,7 +4583,7 @@ async fn operator_o8_a_stop_during_the_refusal_append_ends_as_a_stop_and_writes_
     env.handle.stopped().await;
     assert_eq!(got(&mut ws).await.1, Got::Eof, "no ack");
     assert_eq!(env.counts(), (0, 0));
-    assert!(env.intake.0.lock().unwrap().is_empty());
+    assert!(env.intake.taken.lock().unwrap().is_empty());
     env.outbox = None;
     hold.store(false, Ordering::SeqCst);
     let dir = env.fx.dir.path().join("outbox");
@@ -4485,7 +4629,7 @@ async fn operator_o8_a_poisoned_outbox_withholds_the_ack_of_a_refusal_with_1011(
     send(&mut ws, &foreign_operator(&env, "a")).await;
     close_of(&mut ws, 1011, true).await;
     assert_eq!(env.counts(), (0, 0));
-    assert!(env.intake.0.lock().unwrap().is_empty());
+    assert!(env.intake.taken.lock().unwrap().is_empty());
     assert!(env.log.warns("outbox-poisoned") >= 1);
     write_fails.store(false, Ordering::SeqCst);
     open_fails.store(false, Ordering::SeqCst);
@@ -4634,7 +4778,7 @@ async fn outbox_c18_a_server_that_never_acks_events_gets_them_again_and_commands
     drop(ws);
     let (_, mut ws) = env.connected(60).await;
     assert_eq!(texts(&mut ws, 1).await, first, "sent again");
-    send(&mut ws, &verified(&env, "two")).await;
+    send(&mut ws, &verified_job(&env, "two", 2)).await;
     assert_eq!(answer(&mut ws).await.1["type"], "commandAck");
     assert_eq!(events(&mut ws, 1).await, [2]);
     assert_eq!(env.counts(), (2, 0));
@@ -4808,6 +4952,7 @@ async fn r1_over_real_loopback_an_exchange_an_upgrade_a_heartbeat_and_a_stop() {
             open_outbox(&fx, None),
             open_marks(&fx, None),
             Arc::new(crate::deadline::SystemClock),
+            open_ledger(&fx, None),
         )
         .unwrap();
     tokio::time::timeout(secs(30), async {
@@ -4865,6 +5010,7 @@ async fn r1_over_real_loopback_a_refused_connection_and_then_the_server_appears(
             open_outbox(&fx, None),
             open_marks(&fx, None),
             Arc::new(crate::deadline::SystemClock),
+            open_ledger(&fx, None),
         )
         .unwrap();
     tokio::time::timeout(secs(30), async {
@@ -4904,6 +5050,20 @@ fn timed(env: &Env, id: &str, issued_at: u64, deadline: u64) -> String {
     signed_command_at(&env.fx, id, AGENT_ID, Tamper::None, (issued_at, deadline)).text
 }
 
+/// [`timed`] for the job [`job_n`]`(n)`: a test that delivers several accepted commands names a
+/// job for each, since a job ID the ledger holds is a duplicate (ADR-489).
+fn timed_n(env: &Env, id: &str, n: u32, issued_at: u64, deadline: u64) -> String {
+    signed_job_at(
+        &env.fx,
+        id,
+        (&job_n(n), GENERATION),
+        AGENT_ID,
+        Tamper::None,
+        (issued_at, deadline),
+    )
+    .text
+}
+
 /// [`timed`] for an operator who is not the owner.
 fn timed_foreign(env: &Env, id: &str, issued_at: u64, deadline: u64) -> String {
     signed_command_at(
@@ -4920,6 +5080,13 @@ fn timed_foreign(env: &Env, id: &str, issued_at: u64, deadline: u64) -> String {
 fn expired_of(seq: u64) -> serde_json::Value {
     serde_json::json!({
         "type": "agentEvent", "seq": seq, "kind": "jobState", "jobId": JOB_ID, "state": "expired"
+    })
+}
+
+/// [`expired_of`] for the job [`job_n`]`(n)`.
+fn expired_of_n(seq: u64, n: u32) -> serde_json::Value {
+    serde_json::json!({
+        "type": "agentEvent", "seq": seq, "kind": "jobState", "jobId": job_n(n), "state": "expired"
     })
 }
 
@@ -5011,15 +5178,15 @@ async fn deadline_t1_t3_a_deadline_after_the_clock_and_the_mark_is_accepted_and_
         Some(1_000),
         "synced before the answer was read"
     );
-    assert_eq!(env.intake.0.lock().unwrap().len(), 1);
+    assert_eq!(env.intake.taken.lock().unwrap().len(), 1);
     assert_eq!(event_json(&mut ws).await, received_of(1));
     // T3: one second before the deadline.
     env.clock.set(1_999);
-    send(&mut ws, &timed(&env, "b", 1_000, 2_000)).await;
+    send(&mut ws, &timed_n(&env, "b", 2, 1_000, 2_000)).await;
     let (_, answered) = answer(&mut ws).await;
     assert_eq!(answered["type"], "commandAck");
-    assert_eq!(event_json(&mut ws).await, received_of(2));
-    assert_eq!(env.intake.0.lock().unwrap().len(), 2);
+    assert_eq!(event_json(&mut ws).await, received_of_n(2, 2));
+    assert_eq!(env.intake.taken.lock().unwrap().len(), 2);
     assert_eq!(env.counts(), (2, 0));
 }
 
@@ -5035,7 +5202,10 @@ async fn deadline_t2_t4_a_deadline_at_or_before_the_device_clock_is_expired_and_
         assert_eq!(answered["type"], "commandAck", "now {now}");
         assert_eq!(event_json(&mut ws).await, expired_of(k as u64 + 1));
     }
-    assert!(env.intake.0.lock().unwrap().is_empty(), "nothing was taken");
+    assert!(
+        env.intake.taken.lock().unwrap().is_empty(),
+        "nothing was taken"
+    );
     // The status counts an expired job as acknowledged, not as rejected (D6).
     assert_eq!(env.counts(), (2, 0));
     // The clock decided, not the mark: no warning about the clock being behind.
@@ -5050,11 +5220,12 @@ async fn deadline_t5_a_mark_past_the_deadline_expires_the_job_though_the_clock_i
     send(&mut ws, &timed(&env, "a", 3_000, 5_000)).await;
     assert_eq!(settled(&mut ws).await, received_of(1));
     // The device clock still reads 500: only the mark (3000) is past this deadline.
+    // The expired job is not recorded, so its redelivery is judged again.
     for (k, id) in ["b", "c"].into_iter().enumerate() {
-        send(&mut ws, &timed(&env, id, 1_000, 2_500)).await;
-        assert_eq!(settled(&mut ws).await, expired_of(k as u64 + 2));
+        send(&mut ws, &timed_n(&env, id, 2, 1_000, 2_500)).await;
+        assert_eq!(settled(&mut ws).await, expired_of_n(k as u64 + 2, 2));
     }
-    assert_eq!(env.intake.0.lock().unwrap().len(), 1);
+    assert_eq!(env.intake.taken.lock().unwrap().len(), 1);
     // One warning for the connection, not one per expiry.
     assert_eq!(env.log.warns("highest issue time"), 1);
     assert_eq!(env.counts(), (3, 0));
@@ -5069,16 +5240,16 @@ async fn deadline_t6_t7_t10_t11_the_later_of_clock_and_mark_decides_and_a_lower_
     // T6: the mark (1500) is after the clock (500) and before the deadline.
     send(&mut ws, &timed(&env, "a", 1_500, 2_000)).await;
     assert_eq!(settled(&mut ws).await, received_of(1));
-    send(&mut ws, &timed(&env, "b", 2_000, 9_000)).await;
-    assert_eq!(settled(&mut ws).await, received_of(2));
+    send(&mut ws, &timed_n(&env, "b", 2, 2_000, 9_000)).await;
+    assert_eq!(settled(&mut ws).await, received_of_n(2, 2));
     assert_eq!(writes.load(Ordering::SeqCst), 2);
     // T7 and T11: the mark equals the deadline, and this instruction's issue time is lower.
-    send(&mut ws, &timed(&env, "c", 1_000, 2_000)).await;
-    assert_eq!(settled(&mut ws).await, expired_of(3));
+    send(&mut ws, &timed_n(&env, "c", 3, 1_000, 2_000)).await;
+    assert_eq!(settled(&mut ws).await, expired_of_n(3, 3));
     // T10: a lower issue time with a later deadline is accepted; the mark is not lowered and
     // nothing is written (it is not a replay check).
-    send(&mut ws, &timed(&env, "d", 1_000, 9_000)).await;
-    assert_eq!(settled(&mut ws).await, received_of(4));
+    send(&mut ws, &timed_n(&env, "d", 4, 1_000, 9_000)).await;
+    assert_eq!(settled(&mut ws).await, received_of_n(4, 4));
     assert_eq!(mark_in_file(&env), Some(2_000));
     assert_eq!(
         writes.load(Ordering::SeqCst),
@@ -5123,7 +5294,7 @@ async fn deadline_t13_r1_r2_a_far_future_mark_is_taken_as_is_and_survives_a_rest
     let (_, mut ws) = env.connected(60).await;
     send(&mut ws, &timed(&env, "c", 1_000, 9_000)).await;
     assert_eq!(settled_after_restart(&mut ws).await, expired_of(3));
-    assert!(env.intake.0.lock().unwrap().is_empty());
+    assert!(env.intake.taken.lock().unwrap().is_empty());
     assert_eq!(env.marks.as_ref().unwrap().highest(), u64::MAX);
 }
 
@@ -5137,12 +5308,12 @@ async fn deadline_r1_r2_a_restart_keeps_the_mark_and_a_clock_reset_does_not_revi
     env.restart().await;
     let (_, mut ws) = env.connected(60).await;
     // The device clock reads 500 (as after a reset to 1970); the mark in the file is 3000.
-    send(&mut ws, &timed(&env, "b", 1_000, 2_500)).await;
-    assert_eq!(settled_after_restart(&mut ws).await, expired_of(2));
+    send(&mut ws, &timed_n(&env, "b", 2, 1_000, 2_500)).await;
+    assert_eq!(settled_after_restart(&mut ws).await, expired_of_n(2, 2));
     // A deadline after the mark and the clock is accepted (R2's residual: a stale deadline
     // beyond the mark passes).
-    send(&mut ws, &timed(&env, "c", 1_000, 9_000)).await;
-    assert_eq!(settled(&mut ws).await, received_of(3));
+    send(&mut ws, &timed_n(&env, "c", 3, 1_000, 9_000)).await;
+    assert_eq!(settled(&mut ws).await, received_of_n(3, 3));
     assert_eq!(env.marks.as_ref().unwrap().highest(), 3_000);
     assert_eq!(mark_in_file(&env), Some(3_000));
 }
@@ -5156,8 +5327,8 @@ async fn deadline_t14_the_clock_is_read_once_per_judged_command_and_never_for_a_
     assert_eq!(settled(&mut ws).await, received_of(1));
     assert_eq!(env.clock.reads(), 1, "accepted");
     env.clock.set(2_500);
-    send(&mut ws, &timed(&env, "b", 1_000, 2_000)).await;
-    assert_eq!(settled(&mut ws).await, expired_of(2));
+    send(&mut ws, &timed_n(&env, "b", 2, 1_000, 2_000)).await;
+    assert_eq!(settled(&mut ws).await, expired_of_n(2, 2));
     assert_eq!(env.clock.reads(), 2, "expired");
     // An operator who is not allowed: refused before the clock is read, though also expired.
     send(&mut ws, &timed_foreign(&env, "c", 1_000, 2_000)).await;
@@ -5244,7 +5415,7 @@ async fn deadline_v3_v4_an_operator_refusal_raises_and_syncs_the_mark_and_is_nev
     send(&mut ws, &timed_foreign(&env, "b", 1_300, 2_000)).await;
     assert_eq!(settled(&mut ws).await, operator_refusal_of(2));
     assert_eq!(mark_in_file(&env), Some(1_300));
-    assert!(env.intake.0.lock().unwrap().is_empty());
+    assert!(env.intake.taken.lock().unwrap().is_empty());
 }
 
 // V5
@@ -5258,9 +5429,21 @@ async fn deadline_v5_a_shared_agent_applies_the_time_rules_alone() {
     send(&mut ws, &timed_foreign(&env, "a", 1_000, 2_000)).await;
     assert_eq!(settled(&mut ws).await, received_of(1));
     env.clock.set(2_500);
-    send(&mut ws, &timed_foreign(&env, "b", 1_000, 2_000)).await;
-    assert_eq!(settled(&mut ws).await, expired_of(2));
-    assert_eq!(env.intake.0.lock().unwrap().len(), 1);
+    send(
+        &mut ws,
+        &signed_job_at(
+            &env.fx,
+            "b",
+            (&job_n(2), GENERATION),
+            AGENT_ID,
+            Tamper::OtherOperator,
+            (1_000, 2_000),
+        )
+        .text,
+    )
+    .await;
+    assert_eq!(settled(&mut ws).await, expired_of_n(2, 2));
+    assert_eq!(env.intake.taken.lock().unwrap().len(), 1);
 }
 
 // D1
@@ -5278,29 +5461,47 @@ async fn deadline_d1_an_expired_command_delivered_twice_gets_two_events_and_one_
     assert_eq!(env.counts(), (2, 0));
 }
 
-// D3
+// D3, inverted by ADR-489: the duplicate check comes before the deadline check, so a job the agent
+// recorded is never reported as expired by its own redelivery.
 #[tokio::test(start_paused = true)]
-async fn deadline_d3_a_redelivery_after_the_deadline_or_after_the_mark_is_expired_without_a_second_intake()
- {
+async fn deadline_d3_a_redelivery_of_a_recorded_job_after_the_deadline_or_the_mark_is_a_duplicate()
+{
     let mut env = Env::new();
-    let (_, mut ws) = env.connected(60).await;
+    let (hello_at, mut ws) = env.connected(60).await;
     send(&mut ws, &timed(&env, "first", 1_000, 2_000)).await;
     assert_eq!(settled(&mut ws).await, received_of(1));
-    // The ack was lost; the clock has since reached the deadline.
+    let reads = env.clock.reads();
+    // The ack was lost; the clock has since reached the deadline. The redelivery is acknowledged
+    // and is neither `expired` nor handed over again, and the clock is not read.
     env.clock.set(2_000);
     send(&mut ws, &timed(&env, "again", 1_000, 2_000)).await;
-    assert_eq!(settled(&mut ws).await, expired_of(2));
-    // Or the mark has: the clock is back, a later instruction raised it.
-    env.clock.set(500);
-    send(&mut ws, &timed(&env, "other", 3_000, 9_000)).await;
-    assert_eq!(settled(&mut ws).await, received_of(3));
-    send(&mut ws, &timed(&env, "third", 1_000, 2_000)).await;
-    assert_eq!(settled(&mut ws).await, expired_of(4));
     assert_eq!(
-        env.intake.0.lock().unwrap().len(),
-        2,
-        "the expired deliveries were not handed over"
+        answer(&mut ws).await.1,
+        serde_json::json!({"type": "commandAck", "commandId": "again"})
     );
+    // Or the mark has passed it: the clock is back, a later instruction raised the mark.
+    env.clock.set(500);
+    send(&mut ws, &timed_n(&env, "other", 2, 3_000, 9_000)).await;
+    assert_eq!(settled(&mut ws).await, received_of_n(2, 2));
+    send(&mut ws, &timed(&env, "third", 1_000, 2_000)).await;
+    assert_eq!(answer(&mut ws).await.1["type"], "commandAck");
+    assert_eq!(
+        env.intake.taken.lock().unwrap().len(),
+        2,
+        "the duplicates were not handed over"
+    );
+    assert_eq!(
+        env.clock.reads(),
+        reads + 1,
+        "only the new job read the clock"
+    );
+    assert_after(
+        hello_at,
+        heartbeat(&mut ws).await,
+        60,
+        "tick: no `expired` event",
+    );
+    assert_eq!(env.counts(), (4, 0));
 }
 
 // D5
@@ -5422,7 +5623,7 @@ async fn deadline_x2_f11_a_failed_expiry_append_closes_with_1011_and_the_redeliv
         1,
         "the redelivery wrote no mark"
     );
-    assert!(env.intake.0.lock().unwrap().is_empty());
+    assert!(env.intake.taken.lock().unwrap().is_empty());
 }
 
 // F12
@@ -5487,7 +5688,10 @@ async fn a_mark_that_cannot_be_written_withholds_the_command(
     // No ack: the close is the next thing the agent writes.
     close_of(&mut ws, 1011, true).await;
     assert_eq!(env.counts(), (0, 0), "{step:?} {kind}");
-    assert!(env.intake.0.lock().unwrap().is_empty(), "{step:?} {kind}");
+    assert!(
+        env.intake.taken.lock().unwrap().is_empty(),
+        "{step:?} {kind}"
+    );
     assert_eq!(env.log.warns("mark-write"), 1, "{step:?} {kind}");
     assert!(!env.log.contains("commandId"));
     // The mark in memory stays raised; the next verified command writes again, though its issue
@@ -5507,7 +5711,7 @@ async fn a_mark_that_cannot_be_written_withholds_the_command(
         "{step:?} {kind}: no event came from the failed delivery"
     );
     assert_eq!(
-        env.intake.0.lock().unwrap().len(),
+        env.intake.taken.lock().unwrap().len(),
         usize::from(kind == "accepted"),
         "{step:?} {kind}"
     );
@@ -5596,7 +5800,7 @@ async fn deadline_f10_f16_a_stop_during_the_mark_write_ends_as_a_stop_and_the_st
     env.handle.stopped().await;
     assert_eq!(got(&mut ws).await.1, Got::Eof, "no ack");
     assert_eq!(env.counts(), (0, 0));
-    assert!(env.intake.0.lock().unwrap().is_empty(), "no intake");
+    assert!(env.intake.taken.lock().unwrap().is_empty(), "no intake");
     // The write is still running: the store is in use until it ends (F16).
     env.marks = None;
     assert!(matches!(
@@ -5614,4 +5818,671 @@ async fn deadline_f10_f16_a_stop_during_the_mark_write_ends_as_a_stop_and_the_st
     };
     // Whether the old or the new file is there, it is valid.
     assert!(matches!(marks.highest(), 0 | 1_000));
+}
+
+// ---------------------------------------------------------------------------------------------
+// The received-jobs ledger (ADR-489; the row's letter and number begin each test's name)
+
+/// The ledger file of the fixture's agent.
+fn ledger_path(env: &Env) -> PathBuf {
+    env.fx
+        .registration_dir()
+        .join(format!("{AGENT_ID}.received-jobs.v1"))
+}
+
+/// The answer to a command, which must be `commandAck` for `id` with nothing else behind it.
+async fn acked(ws: &mut Ws, id: &str) {
+    assert_eq!(
+        answer(ws).await.1,
+        serde_json::json!({"type": "commandAck", "commandId": id})
+    );
+}
+
+/// A ledger probe that fails at `step` while the flag is set, and counts the writes that begin.
+fn ledger_probe(failing: &Arc<AtomicBool>, step: crate::outbox::Step) -> Probe {
+    mark_probe(&Arc::new(AtomicUsize::new(0)), failing, step)
+}
+
+// B1, B3, B9, F1, F4
+#[tokio::test(start_paused = true)]
+async fn ledger_b1_b3_b9_a_new_job_is_recorded_and_its_redelivery_is_acknowledged_and_nothing_else()
+{
+    let mut env = Env::new();
+    let (_, mut ws) = env.connected(60).await;
+    let first = signed_job(&env.fx, "first", JOB_ID, GENERATION);
+    send(&mut ws, &first.text).await;
+    assert_eq!(settled(&mut ws).await, received_of(1));
+    assert_eq!(
+        env.ledger.as_ref().unwrap().highest(JOB_ID),
+        Some(GENERATION)
+    );
+    assert_eq!(env.clock.reads(), 1, "B1 reads the clock once");
+    let file = std::fs::read(ledger_path(&env)).unwrap();
+    assert!(
+        file.windows(first.envelope.len())
+            .any(|window| window == first.envelope),
+        "the envelope is in the ledger byte for byte"
+    );
+    // B3, same connection: acknowledged, nothing handed over, the clock not read.
+    send(
+        &mut ws,
+        &signed_job(&env.fx, "second", JOB_ID, GENERATION).text,
+    )
+    .await;
+    acked(&mut ws, "second").await;
+    assert_eq!(env.clock.reads(), 1, "an ignored command reads no clock");
+    assert_eq!(env.counts(), (2, 0));
+    // B9, B3 after a restart: the index is read back from the file.
+    env.restart().await;
+    let (hello_at, mut ws) = env.connected(60).await;
+    send(
+        &mut ws,
+        &signed_job(&env.fx, "third", JOB_ID, GENERATION).text,
+    )
+    .await;
+    acked(&mut ws, "third").await;
+    assert_after(
+        hello_at,
+        heartbeat(&mut ws).await,
+        60,
+        "tick: no event came",
+    );
+    assert_eq!(env.counts(), (1, 0));
+    assert_eq!(env.intake.calls(), 1, "handed over once in all");
+    assert_eq!(env.clock.reads(), 1);
+}
+
+// B4, B5, B6, F1, F2, F3
+#[tokio::test(start_paused = true)]
+async fn ledger_b4_b5_b6_a_recorded_job_is_ignored_past_its_deadline_with_other_bytes_or_an_earlier_generation()
+ {
+    let mut env = Env::new();
+    let (hello_at, mut ws) = env.connected(60).await;
+    send(&mut ws, &timed(&env, "first", 1_000, 2_000)).await;
+    assert_eq!(settled(&mut ws).await, received_of(1));
+    let before = std::fs::read(ledger_path(&env)).unwrap();
+    env.clock.set(2_500);
+    // B4: the same instruction after its deadline is never `expired`.
+    send(&mut ws, &timed(&env, "dup-1", 1_000, 2_000)).await;
+    acked(&mut ws, "dup-1").await;
+    // B5: the same job and generation with other verified bytes; the first envelope stays.
+    let other = signed_job_at(
+        &env.fx,
+        "dup-2",
+        (JOB_ID, GENERATION),
+        AGENT_ID,
+        Tamper::None,
+        (1_100, 9_000),
+    );
+    send(&mut ws, &other.text).await;
+    acked(&mut ws, "dup-2").await;
+    // B6: an earlier generation, twice: a warning the first time on the connection.
+    for id in ["old-1", "old-2"] {
+        send(&mut ws, &signed_job(&env.fx, id, JOB_ID, 3).text).await;
+        acked(&mut ws, id).await;
+    }
+    assert_after(
+        hello_at,
+        heartbeat(&mut ws).await,
+        60,
+        "tick: no event came",
+    );
+    assert_eq!(env.intake.calls(), 1);
+    assert_eq!(
+        std::fs::read(ledger_path(&env)).unwrap(),
+        before,
+        "no write"
+    );
+    assert_eq!(
+        env.ledger.as_ref().unwrap().highest(JOB_ID),
+        Some(GENERATION)
+    );
+    assert_eq!(env.counts(), (5, 0));
+    let debug = |word: &str| {
+        env.log
+            .lines("DEBUG")
+            .iter()
+            .filter(|line| line.contains(word))
+            .count()
+    };
+    assert_eq!(
+        debug("the job is already recorded"),
+        2,
+        "one entry per duplicate"
+    );
+    for line in env.log.lines("DEBUG") {
+        if line.contains("the job is already recorded") {
+            assert!(
+                line.contains(&format!("job_id={JOB_ID}")) && line.contains("generation=7"),
+                "{line}"
+            );
+        }
+    }
+    assert_eq!(env.log.warns("later generation"), 1);
+    assert_eq!(debug("later generation"), 1);
+    drop(ws);
+    env.wait_phase(Phase::Waiting).await;
+    let lines: Vec<String> = env
+        .log
+        .lines("INFO")
+        .into_iter()
+        .filter(|line| line.contains("refused on this connection"))
+        .collect();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("duplicate=2"), "{}", lines[0]);
+    assert!(lines[0].contains("earlier_generation=2"), "{}", lines[0]);
+    // F3: the job and the generation, and nothing else of the instruction.
+    let text = env.log.text();
+    assert!(text.contains(JOB_ID) && text.contains("generation=3"));
+    for forbidden in [
+        "first",
+        "dup-",
+        "old-",
+        OWNER_ID,
+        OTHER_OPERATOR,
+        "VIN-UNDER-TEST",
+    ] {
+        assert!(!text.contains(forbidden), "{forbidden} in the log");
+    }
+}
+
+// B7, B8
+#[tokio::test(start_paused = true)]
+async fn ledger_b7_b8_a_higher_generation_is_new_unless_it_is_past_its_deadline() {
+    let mut env = Env::new();
+    let (_, mut ws) = env.connected(60).await;
+    send(&mut ws, &signed_job(&env.fx, "g7", JOB_ID, 7).text).await;
+    assert_eq!(settled(&mut ws).await, received_of(1));
+    // B7: a later generation with its deadline open is a second record, handed over again.
+    send(&mut ws, &signed_job(&env.fx, "g8", JOB_ID, 8).text).await;
+    assert_eq!(settled(&mut ws).await, received_of(2));
+    assert_eq!(env.intake.calls(), 2);
+    assert_eq!(env.ledger.as_ref().unwrap().highest(JOB_ID), Some(8));
+    // B8: a later generation past its deadline is `expired` and not recorded.
+    env.clock.set(2_500);
+    send(&mut ws, &signed_job(&env.fx, "g9", JOB_ID, 9).text).await;
+    assert_eq!(settled(&mut ws).await, expired_of(3));
+    assert_eq!(env.ledger.as_ref().unwrap().highest(JOB_ID), Some(8));
+    // ... which a redelivery with the deadline open then shows: it is still new.
+    env.clock.set(500);
+    send(&mut ws, &signed_job(&env.fx, "g9-again", JOB_ID, 9).text).await;
+    assert_eq!(settled(&mut ws).await, received_of(4));
+    assert_eq!(env.ledger.as_ref().unwrap().highest(JOB_ID), Some(9));
+    // Both records are in the file: a restart reads the highest.
+    env.restart().await;
+    assert_eq!(env.ledger.as_ref().unwrap().highest(JOB_ID), Some(9));
+    assert_eq!(env.ledger.as_ref().unwrap().jobs(), 1);
+}
+
+// A2, A3, A4
+#[tokio::test(start_paused = true)]
+async fn ledger_a2_a3_a4_a_forged_command_is_rejected_and_leaves_the_ledger_and_the_real_job_alone()
+{
+    let mut env = Env::new();
+    let (hello_at, mut ws) = env.connected(60).await;
+    send(&mut ws, &signed_job(&env.fx, "real", JOB_ID, 1).text).await;
+    assert_eq!(settled(&mut ws).await, received_of(1));
+    let reads = env.clock.reads();
+    let before = std::fs::read(ledger_path(&env)).unwrap();
+    // A3: the recorded job's ID with a higher generation, forged three ways.
+    let other_job = job_n(2);
+    for (k, tamper) in [Tamper::ForeignKey, Tamper::FlipPayload, Tamper::OtherAgent]
+        .into_iter()
+        .enumerate()
+    {
+        for (job, generation) in [(JOB_ID, 5), (other_job.as_str(), 9)] {
+            let id = format!("forged-{k}-{generation}");
+            let forged = signed_job_at(
+                &env.fx,
+                &id,
+                (job, generation),
+                AGENT_ID,
+                tamper,
+                (u64::MAX, 2_000),
+            );
+            send(&mut ws, &forged.text).await;
+            let (_, rejected) = answer(&mut ws).await;
+            assert_eq!(rejected["type"], "commandRejected", "{id}");
+        }
+    }
+    assert_eq!(env.clock.reads(), reads, "the clock was not read");
+    assert_eq!(
+        env.marks.as_ref().unwrap().highest(),
+        1_000,
+        "the mark is not raised"
+    );
+    assert_eq!(std::fs::read(ledger_path(&env)).unwrap(), before);
+    assert_eq!(env.ledger.as_ref().unwrap().highest(&other_job), None, "A4");
+    // The genuine command of the same job and generation is a duplicate (B3); the genuine next
+    // generation is new (B7); the other job's first one is new (B1).
+    send(&mut ws, &signed_job(&env.fx, "real-again", JOB_ID, 1).text).await;
+    acked(&mut ws, "real-again").await;
+    send(&mut ws, &signed_job(&env.fx, "real-2", JOB_ID, 2).text).await;
+    assert_eq!(settled(&mut ws).await, received_of(2));
+    send(&mut ws, &signed_job(&env.fx, "other-1", &other_job, 1).text).await;
+    assert_eq!(settled(&mut ws).await, received_of_n(3, 2));
+    assert_after(
+        hello_at,
+        heartbeat(&mut ws).await,
+        60,
+        "tick: no more events",
+    );
+    assert_eq!(env.counts(), (4, 6));
+}
+
+// A6, A7, B2, C9
+#[tokio::test(start_paused = true)]
+async fn ledger_a6_a7_b2_an_operator_refused_or_expired_job_is_not_recorded_and_a_recorded_one_stays()
+ {
+    let mut env = Env::new();
+    let (_, mut ws) = env.connected(60).await;
+    // A6: refused, not recorded; its redelivery gets a second terminal event.
+    for k in 0..2 {
+        send(
+            &mut ws,
+            &timed_foreign(&env, &format!("f{k}"), 1_000, 2_000),
+        )
+        .await;
+        assert_eq!(settled(&mut ws).await, operator_refusal_of(k + 1));
+    }
+    assert_eq!(env.ledger.as_ref().unwrap().highest(JOB_ID), None);
+    assert!(!ledger_path(&env).exists(), "no record, so no file");
+    // B2: expired, not recorded; its redelivery is judged again.
+    env.clock.set(2_500);
+    for k in 0..2 {
+        send(&mut ws, &timed_n(&env, &format!("e{k}"), 2, 1_000, 2_000)).await;
+        assert_eq!(settled(&mut ws).await, expired_of_n(k + 3, 2));
+    }
+    assert_eq!(env.ledger.as_ref().unwrap().highest(&job_n(2)), None);
+    assert!(!ledger_path(&env).exists());
+    // A7: the owner's command records the job; the operator check still comes first for a
+    // command of another operator, and the record stays.
+    env.clock.set(500);
+    send(
+        &mut ws,
+        &signed_job(&env.fx, "mine", JOB_ID, GENERATION).text,
+    )
+    .await;
+    assert_eq!(settled(&mut ws).await, received_of(5));
+    send(&mut ws, &timed_foreign(&env, "foreign", 1_000, 2_000)).await;
+    assert_eq!(settled(&mut ws).await, operator_refusal_of(6));
+    assert_eq!(
+        env.ledger.as_ref().unwrap().highest(JOB_ID),
+        Some(GENERATION)
+    );
+    assert_eq!(env.intake.calls(), 1);
+}
+
+// E8
+#[tokio::test(start_paused = true)]
+async fn ledger_e8_two_commands_back_to_back_for_one_job_are_taken_once() {
+    let mut env = Env::new();
+    let (hello_at, mut ws) = env.connected(60).await;
+    send(
+        &mut ws,
+        &signed_job(&env.fx, "one", JOB_ID, GENERATION).text,
+    )
+    .await;
+    send(
+        &mut ws,
+        &signed_job(&env.fx, "two", JOB_ID, GENERATION).text,
+    )
+    .await;
+    let mut acks = Vec::new();
+    let mut events = 0;
+    while acks.len() < 2 || events < 1 {
+        let (_, message) = got(&mut ws).await;
+        let Got::Text(text) = message else {
+            panic!("{message:?}")
+        };
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        if value["type"] == "commandAck" {
+            acks.push(value["commandId"].as_str().unwrap().to_owned());
+        } else {
+            events += 1;
+        }
+    }
+    assert_eq!(acks, ["one", "two"]);
+    assert_after(
+        hello_at,
+        heartbeat(&mut ws).await,
+        60,
+        "tick: exactly one event",
+    );
+    assert_eq!(env.intake.calls(), 1);
+}
+
+/// A record that cannot be written withholds everything the command leads to (E3, C10's twin).
+async fn a_first_record_that_cannot_be_written_withholds_the_command(step: crate::outbox::Step) {
+    let failing = Arc::new(AtomicBool::new(true));
+    let mut env = Env::with(Opts {
+        ledger_probe: Some(ledger_probe(&failing, step)),
+        ..Opts::default()
+    });
+    let (_, mut ws) = env.connected(60).await;
+    send(&mut ws, &verified(&env, "a")).await;
+    // No ack: the close is the next thing the agent writes.
+    close_of(&mut ws, 1011, true).await;
+    assert_eq!(env.counts(), (0, 0), "{step:?}");
+    assert_eq!(env.intake.calls(), 0, "{step:?}");
+    assert_eq!(env.log.warns("ledger-write"), 1, "{step:?}");
+    assert!(!env.log.contains("commandId"));
+    assert_eq!(
+        env.ledger.as_ref().unwrap().highest(JOB_ID),
+        None,
+        "{step:?}"
+    );
+    // The next connection opens the ledger again first. A file that did not get in place leaves
+    // the redelivery new (E4); one that did counts, and the redelivery is a duplicate.
+    failing.store(false, Ordering::SeqCst);
+    let (hello_at, mut ws) = env.connected(60).await;
+    assert!(
+        !env.ledger.as_ref().unwrap().is_poisoned(),
+        "{step:?}: reopened"
+    );
+    send(&mut ws, &verified(&env, "a")).await;
+    if step == crate::outbox::Step::AfterRename {
+        acked(&mut ws, "a").await;
+        assert_after(hello_at, heartbeat(&mut ws).await, 60, "tick: no event");
+        assert_eq!(
+            env.intake.calls(),
+            0,
+            "{step:?}: recorded, never handed over"
+        );
+    } else {
+        assert_eq!(settled(&mut ws).await, received_of(1), "{step:?}");
+        assert_eq!(env.intake.calls(), 1, "{step:?}");
+    }
+    assert_eq!(
+        env.ledger.as_ref().unwrap().highest(JOB_ID),
+        Some(GENERATION)
+    );
+    assert_eq!(env.counts(), (1, 0));
+}
+
+// E3, E4, E7
+#[tokio::test(start_paused = true)]
+async fn ledger_e3_e4_a_ledger_file_that_cannot_be_created_withholds_the_ack_and_the_reopen_decides_the_redelivery()
+ {
+    use crate::outbox::Step;
+    for step in [
+        Step::BeforeWrite,
+        Step::AfterWrite,
+        Step::AfterSync,
+        Step::BeforeRename,
+        Step::AfterRename,
+    ] {
+        a_first_record_that_cannot_be_written_withholds_the_command(step).await;
+    }
+}
+
+// E3, E4 (a frame that reached the file counts)
+#[tokio::test(start_paused = true)]
+async fn ledger_e4_an_appended_frame_whose_sync_failed_counts_at_the_reopen() {
+    let failing = Arc::new(AtomicBool::new(false));
+    let mut env = Env::with(Opts {
+        ledger_probe: Some(ledger_probe(&failing, crate::outbox::Step::AfterSync)),
+        ..Opts::default()
+    });
+    let (_, mut ws) = env.connected(60).await;
+    send(&mut ws, &verified_job(&env, "one", 1)).await;
+    assert_eq!(settled(&mut ws).await, received_of_n(1, 1));
+    failing.store(true, Ordering::SeqCst);
+    send(&mut ws, &verified_job(&env, "two", 2)).await;
+    close_of(&mut ws, 1011, true).await;
+    assert_eq!(
+        env.ledger.as_ref().unwrap().highest(&job_n(2)),
+        None,
+        "index unchanged"
+    );
+    failing.store(false, Ordering::SeqCst);
+    let (hello_at, mut ws) = env.connected(60).await;
+    assert_eq!(
+        env.ledger.as_ref().unwrap().highest(&job_n(2)),
+        Some(GENERATION)
+    );
+    send(&mut ws, &verified_job(&env, "two-again", 2)).await;
+    acked(&mut ws, "two-again").await;
+    assert_after(hello_at, heartbeat(&mut ws).await, 60, "tick: no event");
+    assert_eq!(
+        env.intake.calls(),
+        1,
+        "the job whose frame counted was never handed over"
+    );
+}
+
+// E3, E5, C8: no records until the reopen; duplicates are still acknowledged
+#[tokio::test(start_paused = true)]
+async fn ledger_e3_e5_c8_a_poisoned_ledger_refuses_new_jobs_and_acknowledges_duplicates_until_it_reopens()
+ {
+    let write_fails = Arc::new(AtomicBool::new(false));
+    let open_fails = Arc::new(AtomicBool::new(false));
+    let (write_flag, open_flag) = (write_fails.clone(), open_fails.clone());
+    let mut env = Env::with(Opts {
+        ledger_probe: Some(Box::new(move |step| {
+            let failing = match step {
+                crate::outbox::Step::BeforeWrite => write_flag.load(Ordering::SeqCst),
+                crate::outbox::Step::AfterRename => open_flag.load(Ordering::SeqCst),
+                _ => false,
+            };
+            if failing {
+                return Err(io::Error::other("a scripted failure"));
+            }
+            Ok(())
+        })),
+        ..Opts::default()
+    });
+    let (_, mut ws) = env.connected(60).await;
+    send(&mut ws, &verified_job(&env, "one", 1)).await;
+    assert_eq!(settled(&mut ws).await, received_of_n(1, 1));
+    write_fails.store(true, Ordering::SeqCst);
+    open_fails.store(true, Ordering::SeqCst);
+    send(&mut ws, &verified_job(&env, "two", 2)).await;
+    close_of(&mut ws, 1011, true).await;
+    // The reopen fails before this connection: the ledger is still poisoned.
+    let (_, mut ws) = env.connected(60).await;
+    assert!(env.ledger.as_ref().unwrap().is_poisoned());
+    send(&mut ws, &verified_job(&env, "one-again", 1)).await;
+    acked(&mut ws, "one-again").await;
+    send(&mut ws, &verified_job(&env, "three", 3)).await;
+    close_of(&mut ws, 1011, true).await;
+    assert!(env.log.warns("ledger-reopen") >= 1);
+    assert_eq!(env.log.warns("ledger-poisoned"), 1);
+    assert_eq!(env.counts(), (2, 0));
+    assert_eq!(env.intake.calls(), 1);
+    write_fails.store(false, Ordering::SeqCst);
+    open_fails.store(false, Ordering::SeqCst);
+    let (_, mut ws) = env.connected(60).await;
+    send(&mut ws, &verified_job(&env, "two-again", 2)).await;
+    assert_eq!(settled(&mut ws).await, received_of_n(2, 2));
+    assert_eq!(env.counts(), (3, 0));
+}
+
+// E5: a ledger the reopen finds corrupt ends the session
+#[tokio::test(start_paused = true)]
+async fn ledger_e5_a_reopen_that_finds_the_file_corrupt_ends_the_session() {
+    let failing = Arc::new(AtomicBool::new(false));
+    let mut env = Env::with(Opts {
+        ledger_probe: Some(ledger_probe(&failing, crate::outbox::Step::BeforeWrite)),
+        ..Opts::default()
+    });
+    let (_, mut ws) = env.connected(60).await;
+    send(&mut ws, &verified_job(&env, "one", 1)).await;
+    assert_eq!(settled(&mut ws).await, received_of_n(1, 1));
+    failing.store(true, Ordering::SeqCst);
+    send(&mut ws, &verified_job(&env, "two", 2)).await;
+    close_of(&mut ws, 1011, true).await;
+    // The agent waits out its delay before it reopens, so this lands first.
+    let mut bytes = std::fs::read(ledger_path(&env)).unwrap();
+    bytes[0] ^= 0xFF;
+    std::fs::write(ledger_path(&env), bytes).unwrap();
+    tokio::time::timeout(DEADLINE, env.handle.stopped())
+        .await
+        .expect("the session ended by itself");
+    assert_eq!(env.handle.ended(), Some(Ended::LedgerUnusable));
+    assert_eq!(env.status().phase, Phase::Stopped);
+    assert!(env.conns.try_recv().is_err(), "no connection was made");
+}
+
+// C4
+#[tokio::test(start_paused = true)]
+async fn ledger_c4_an_intake_error_keeps_the_record_withholds_the_ack_and_closes_with_1011() {
+    let mut env = Env::new();
+    env.intake.fail.store(true, Ordering::SeqCst);
+    let (_, mut ws) = env.connected(60).await;
+    send(&mut ws, &verified(&env, "a")).await;
+    close_of(&mut ws, 1011, true).await;
+    assert_eq!(env.counts(), (0, 0));
+    assert_eq!(
+        env.ledger.as_ref().unwrap().highest(JOB_ID),
+        Some(GENERATION)
+    );
+    assert_eq!(env.log.warns("class=\"intake\""), 1);
+    assert!(!env.log.contains("commandId"));
+    // The redelivery is a duplicate: acknowledged, no event, not handed over again.
+    env.intake.fail.store(false, Ordering::SeqCst);
+    let (hello_at, mut ws) = env.connected(60).await;
+    send(&mut ws, &verified(&env, "a")).await;
+    acked(&mut ws, "a").await;
+    assert_after(hello_at, heartbeat(&mut ws).await, 60, "tick: no event");
+    assert_eq!(env.intake.calls(), 1);
+}
+
+// C1, C5, C6
+#[tokio::test(start_paused = true)]
+async fn ledger_c1_c5_c6_a_stop_during_a_slow_intake_ends_as_a_stop_and_the_record_stays() {
+    let mut env = Env::new();
+    env.intake.hang.store(true, Ordering::SeqCst);
+    let (_, mut ws) = env.connected(60).await;
+    send(&mut ws, &verified(&env, "a")).await;
+    while env.intake.calls() == 0 {
+        tokio::task::yield_now().await;
+    }
+    env.handle.stop();
+    close_of(&mut ws, 1001, true).await;
+    env.handle.stopped().await;
+    assert_eq!(env.counts(), (0, 0), "no ack");
+    assert_eq!(
+        env.ledger.as_ref().unwrap().highest(JOB_ID),
+        Some(GENERATION)
+    );
+    // The restarted agent finds the record: the redelivery is a duplicate, and `received` is
+    // never sent for the job.
+    env.intake.hang.store(false, Ordering::SeqCst);
+    env.restart().await;
+    let (hello_at, mut ws) = env.connected(60).await;
+    send(&mut ws, &verified(&env, "a")).await;
+    acked(&mut ws, "a").await;
+    assert_after(hello_at, heartbeat(&mut ws).await, 60, "tick: no event");
+    assert_eq!(env.intake.calls(), 1);
+}
+
+// C2, C3
+#[tokio::test(start_paused = true)]
+async fn ledger_c2_c3_a_lost_ack_after_the_append_leaves_one_event_and_a_duplicate_redelivery() {
+    let mut env = Env::new();
+    let (_, mut ws) = env.connected(60).await;
+    env.dial.flags.fail_write.store(true, Ordering::SeqCst);
+    send(&mut ws, &verified(&env, "a")).await;
+    env.wait_phase(Phase::Waiting).await;
+    env.dial.flags.fail_write.store(false, Ordering::SeqCst);
+    assert_eq!(env.counts(), (0, 0));
+    env.restart().await;
+    // The stored `received` event is sent first; the redelivery adds nothing to it.
+    let (_, mut ws) = env.connected(60).await;
+    assert_eq!(event(&mut ws).await.1, 1);
+    send(&mut ws, &ack(1)).await;
+    send(&mut ws, &verified(&env, "a-again")).await;
+    acked(&mut ws, "a-again").await;
+    assert_eq!(env.intake.calls(), 1);
+    assert_eq!(env.counts(), (1, 0));
+}
+
+// C10: a duplicate owes the mark write, too
+#[tokio::test(start_paused = true)]
+async fn ledger_c10_a_duplicate_that_raises_the_mark_is_acknowledged_only_once_the_mark_is_written()
+{
+    let writes = Arc::new(AtomicUsize::new(0));
+    let failing = Arc::new(AtomicBool::new(false));
+    let mut env = Env::with(Opts {
+        mark_probe: Some(mark_probe(
+            &writes,
+            &failing,
+            crate::outbox::Step::BeforeRename,
+        )),
+        ..Opts::default()
+    });
+    let (_, mut ws) = env.connected(60).await;
+    send(&mut ws, &timed(&env, "first", 1_000, 9_000)).await;
+    assert_eq!(settled(&mut ws).await, received_of(1));
+    failing.store(true, Ordering::SeqCst);
+    // The same job, with a later issue time: the mark rises and cannot be written.
+    send(&mut ws, &timed(&env, "dup", 1_500, 9_000)).await;
+    close_of(&mut ws, 1011, true).await;
+    assert_eq!(env.log.warns("mark-write"), 1);
+    assert_eq!(mark_in_file(&env), Some(1_000));
+    failing.store(false, Ordering::SeqCst);
+    let (hello_at, mut ws) = env.connected(60).await;
+    send(&mut ws, &timed(&env, "dup-again", 1_500, 9_000)).await;
+    acked(&mut ws, "dup-again").await;
+    assert_eq!(mark_in_file(&env), Some(1_500), "written before the ack");
+    assert_after(hello_at, heartbeat(&mut ws).await, 60, "tick: no event");
+    assert_eq!(env.intake.calls(), 1);
+    assert_eq!(env.counts(), (2, 0));
+}
+
+// E6, C6: a stop during the ledger write
+#[tokio::test(start_paused = true)]
+async fn ledger_e6_a_stop_during_the_ledger_write_ends_as_a_stop_and_the_write_finishes_holding_the_store()
+ {
+    let hold = Arc::new(AtomicBool::new(false));
+    let entered = Arc::new(AtomicBool::new(false));
+    let (probe_hold, probe_entered) = (hold.clone(), entered.clone());
+    let mut env = Env::with(Opts {
+        ledger_probe: Some(Box::new(move |step| {
+            if step == crate::outbox::Step::BeforeWrite && probe_hold.load(Ordering::SeqCst) {
+                probe_entered.store(true, Ordering::SeqCst);
+                while probe_hold.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            Ok(())
+        })),
+        ..Opts::default()
+    });
+    let (_, mut ws) = env.connected(60).await;
+    hold.store(true, Ordering::SeqCst);
+    send(&mut ws, &verified(&env, "a")).await;
+    while !entered.load(Ordering::SeqCst) {
+        tokio::task::yield_now().await;
+    }
+    env.handle.stop();
+    close_of(&mut ws, 1001, true).await;
+    env.handle.stopped().await;
+    assert_eq!(got(&mut ws).await.1, Got::Eof, "no ack");
+    assert_eq!(env.counts(), (0, 0));
+    assert_eq!(env.intake.calls(), 0, "no intake");
+    // The write is still running: the store is in use until it ends.
+    env.ledger = None;
+    assert!(matches!(
+        ReceivedJobs::open_in(&env.fx.registration_dir(), AGENT_ID),
+        Err(crate::received_jobs::LedgerError::InUse)
+    ));
+    hold.store(false, Ordering::SeqCst);
+    let ledger = loop {
+        match ReceivedJobs::open_in(&env.fx.registration_dir(), AGENT_ID) {
+            Err(crate::received_jobs::LedgerError::InUse) => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            other => break other.unwrap(),
+        }
+    };
+    // The write finished: the record counts, and the redelivery is a duplicate.
+    assert_eq!(ledger.highest(JOB_ID), Some(GENERATION));
+    drop(ledger);
+    env.restart().await;
+    let (_, mut ws) = env.connected(60).await;
+    send(&mut ws, &verified(&env, "a")).await;
+    acked(&mut ws, "a").await;
+    assert_eq!(env.intake.calls(), 0);
 }

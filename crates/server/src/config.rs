@@ -20,8 +20,9 @@ pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 /// The longest connect timeout the file may ask for; a longer one is refused.
 pub const MAX_CONNECT_TIMEOUT_SECS: u64 = 300;
 
-/// The largest object the local store accepts unless the file says otherwise: 4 GiB.
-pub const DEFAULT_MAX_OBJECT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+/// The bucket the object store uses in the bundled object server unless the file names another
+/// (ADR-492).
+pub const DEFAULT_BUCKET: &str = "nekoguruma";
 
 /// The deployment profile (design 13). This build serves the local profile only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -142,34 +143,8 @@ pub struct InstructionKeyConfig {
     pub path: PathBuf,
 }
 
-/// The `[storage]` table (design 13, 14.3; ADR-474): the local profile's object store, a
-/// directory of files. There is no default path (ADR-456 item 7).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct StorageConfig {
-    /// An absolute path. The server creates the directory (mode 0700 on Unix) when it is absent
-    /// and its parent exists.
-    pub dir: PathBuf,
-    /// The most bytes one object may hold; an append past it is refused. Not 0.
-    #[serde(default = "default_max_object_bytes")]
-    pub max_object_bytes: u64,
-}
-
-fn default_max_object_bytes() -> u64 {
-    DEFAULT_MAX_OBJECT_BYTES
-}
-
-impl StorageConfig {
-    pub fn new(dir: impl Into<PathBuf>) -> StorageConfig {
-        StorageConfig {
-            dir: dir.into(),
-            max_object_bytes: DEFAULT_MAX_OBJECT_BYTES,
-        }
-    }
-}
-
-/// The `[object_server]` table (design 13, 13.3; ADR-491): the S3-compatible server the server
-/// starts as its child and stops with itself. Every path is absolute and there is no search of
+/// The `[object_server]` table (design 13, 13.3; ADR-491, ADR-492): the S3-compatible server the
+/// server starts as its child and stops with itself, and whose bucket is the object store. Every path is absolute and there is no search of
 /// `PATH` (ADR-456 item 7). There is no bind-address key, no access-key key and no secret-key
 /// key: the listener is `127.0.0.1` in code, and the credentials live in files in
 /// `credentials_dir`, which the server creates.
@@ -190,6 +165,27 @@ pub struct ObjectServerConfig {
     /// The loopback port the object server listens on; the default is `http.port` plus one.
     #[serde(default)]
     pub port: Option<u16>,
+    /// The bucket the object store keeps its objects in; the server creates it when it is absent.
+    /// 3 to 63 characters, lower-case letters, digits and hyphens, not starting or ending with a
+    /// hyphen, and not `health`, `minio` or `rustfs` (names the object server reserves). The
+    /// default is `nekoguruma`.
+    #[serde(default = "default_bucket")]
+    pub bucket: String,
+}
+
+fn default_bucket() -> String {
+    DEFAULT_BUCKET.to_owned()
+}
+
+/// Whether `name` is a bucket name the object store accepts (`object_server.bucket`).
+pub fn is_valid_bucket(name: &str) -> bool {
+    (3..=63).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && !matches!(name, "health" | "minio" | "rustfs")
 }
 
 impl ObjectServerConfig {
@@ -204,6 +200,7 @@ impl ObjectServerConfig {
             data_dir: data_dir.into(),
             credentials_dir: credentials_dir.into(),
             port: None,
+            bucket: default_bucket(),
         }
     }
 
@@ -238,8 +235,6 @@ pub struct Config {
     pub database: Database,
     /// Required: the server does not start without its instruction key.
     pub instruction_key: InstructionKeyConfig,
-    /// Required: the server does not start without its object store.
-    pub storage: StorageConfig,
     /// Required in a file (`Config::load` refuses a file without it). `None` only in a `Config`
     /// built in code, which starts no object server (tests).
     #[serde(default)]
@@ -281,10 +276,6 @@ pub enum ConfigError {
     DatabaseUrl,
     #[error("invalid configuration: instruction_key.path must be an absolute path")]
     InstructionKeyPath,
-    #[error("invalid configuration: storage.dir must be an absolute path")]
-    StorageDir,
-    #[error("invalid configuration: storage.max_object_bytes must not be 0")]
-    StorageMaxObjectBytes,
     #[error("invalid configuration: the [object_server] table is required")]
     ObjectServerMissing,
     #[error(
@@ -298,8 +289,14 @@ pub enum ConfigError {
     )]
     ObjectServerPort,
     #[error(
-        "invalid configuration: object_server.data_dir must not be storage.dir, and \
-         object_server.credentials_dir must not be the directory of instruction_key.path"
+        "invalid configuration: object_server.bucket must be 3 to 63 characters (lower-case \
+         letters, digits and hyphens, not starting or ending with a hyphen) and not health, minio \
+         or rustfs"
+    )]
+    ObjectServerBucket,
+    #[error(
+        "invalid configuration: object_server.credentials_dir must not be the directory of \
+         instruction_key.path"
     )]
     ObjectServerShared,
 }
@@ -383,12 +380,6 @@ impl Config {
         if !config.instruction_key.path.is_absolute() {
             return Err(ConfigError::InstructionKeyPath);
         }
-        if !config.storage.dir.is_absolute() {
-            return Err(ConfigError::StorageDir);
-        }
-        if config.storage.max_object_bytes == 0 {
-            return Err(ConfigError::StorageMaxObjectBytes);
-        }
         config.check_object_server()?;
         Ok(config)
     }
@@ -407,9 +398,12 @@ impl Config {
             return Err(ConfigError::ObjectServerPath);
         }
         object.resolved_port(self.http.port)?;
-        if object.data_dir == self.storage.dir
-            || self.instruction_key.path.parent() == Some(object.credentials_dir.as_path())
-        {
+        if !is_valid_bucket(&object.bucket) {
+            return Err(ConfigError::ObjectServerBucket);
+        }
+        // The object server's credential files never sit in the instruction key's directory
+        // (ADR-491 item 1).
+        if self.instruction_key.path.parent() == Some(object.credentials_dir.as_path()) {
             return Err(ConfigError::ObjectServerShared);
         }
         Ok(())
@@ -432,14 +426,12 @@ mod tests {
                       [object_server]\nbinary = \"/opt/nekoguruma/rustfs\"\n\
                       data_dir = \"/srv/nekoguruma/object-server\"\n\
                       credentials_dir = \"/etc/nekoguruma\"\n\
-                      [storage]\ndir = \"/srv/nekoguruma/objects\"\n\
                       [database]\nurl = \"postgres://ngr:pw@127.0.0.1:5432/nekoguruma\"\n";
     #[cfg(windows)]
     const DB: &str = "[instruction_key]\npath = 'C:\\srv\\nekoguruma\\instruction.key'\n\
                       [object_server]\nbinary = 'C:\\opt\\nekoguruma\\rustfs.exe'\n\
                       data_dir = 'C:\\srv\\nekoguruma\\object-server'\n\
                       credentials_dir = 'C:\\etc\\nekoguruma'\n\
-                      [storage]\ndir = 'C:\\srv\\nekoguruma\\objects'\n\
                       [database]\nurl = \"postgres://ngr:pw@127.0.0.1:5432/nekoguruma\"\n";
 
     /// The tables of `DB` before `[database]`.
@@ -470,11 +462,8 @@ mod tests {
 
     #[test]
     fn the_instruction_key_table_and_its_path_are_required() {
-        let db_only = format!(
-            "{}[database]\nurl = \"postgres://ngr:pw@127.0.0.1:5432/nekoguruma\"\n",
-            storage_table()
-        );
-        assert!(Config::parse(&db_only).is_err());
+        let db_only = "[database]\nurl = \"postgres://ngr:pw@127.0.0.1:5432/nekoguruma\"\n";
+        assert!(Config::parse(db_only).is_err());
         assert!(Config::parse(&format!("[instruction_key]\n{db_only}")).is_err());
         assert!(
             Config::parse(&format!(
@@ -490,7 +479,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("key.toml");
         let text = "[instruction_key]\npath = \"keys/instruction.key\"\n\
-                    [storage]\ndir = \"/srv/objects\"\n\
                     [database]\nurl = \"postgres://ngr:pw@127.0.0.1:5432/nekoguruma\"\n";
         std::fs::write(&path, text).unwrap();
         assert!(matches!(
@@ -501,66 +489,73 @@ mod tests {
         assert!(Config::load(&path).is_ok());
     }
 
-    // T15: the `[storage]` table.
+    // The `[storage]` table is gone (ADR-492): the object store is a bucket of the object server.
     #[test]
-    fn the_storage_table_and_its_dir_are_required() {
-        let without = DB.replace(&storage_table(), "");
-        assert!(Config::parse(&without).is_err());
-        let empty = DB.replace(&storage_table(), "[storage]\n");
-        assert!(Config::parse(&empty).is_err());
-        let unknown = format!("{}extra = 1\n", storage_table());
-        assert!(Config::parse(&DB.replace(&storage_table(), &unknown)).is_err());
+    fn a_storage_table_is_refused() {
+        let text = format!("[storage]\ndir = \"/srv/objects\"\n{DB}");
+        assert!(Config::parse(&text).is_err());
     }
 
-    /// The `[storage]` table of `DB`, with its key line.
-    fn storage_table() -> String {
-        let from = DB.find("[storage]").unwrap();
-        let to = DB.find("[database]").unwrap();
-        DB[from..to].to_owned()
-    }
-
+    // The bucket of the object store.
     #[test]
-    fn the_object_size_limit_defaults_to_4_gib() {
-        let c = Config::parse(DB).unwrap();
-        assert_eq!(c.storage.max_object_bytes, 4 * 1024 * 1024 * 1024);
-        let set = DB.replace(
-            &storage_table(),
-            &format!("{}max_object_bytes = 16\n", storage_table()),
+    fn the_bucket_defaults_to_nekoguruma_and_is_validated() {
+        let c = load(DB).unwrap();
+        assert_eq!(c.object_server.unwrap().bucket, "nekoguruma");
+        assert_eq!(
+            ObjectServerConfig::new("/b", "/d", "/c").bucket,
+            DEFAULT_BUCKET
         );
-        assert_eq!(Config::parse(&set).unwrap().storage.max_object_bytes, 16);
-    }
-
-    #[test]
-    fn load_refuses_a_relative_storage_dir_and_a_zero_limit() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("storage.toml");
-        let relative = DB.replace(&storage_table(), "[storage]\ndir = \"objects\"\n");
-        std::fs::write(&path, relative).unwrap();
-        assert!(matches!(Config::load(&path), Err(ConfigError::StorageDir)));
-        let zero = DB.replace(
-            &storage_table(),
-            &format!("{}max_object_bytes = 0\n", storage_table()),
+        let with_bucket = |bucket: &str| {
+            let table = format!("{}bucket = \"{bucket}\"\n", object_server_table());
+            with_object_server(&table)
+        };
+        assert_eq!(
+            load(&with_bucket("my-bucket-2"))
+                .unwrap()
+                .object_server
+                .unwrap()
+                .bucket,
+            "my-bucket-2"
         );
-        std::fs::write(&path, zero).unwrap();
-        assert!(matches!(
-            Config::load(&path),
-            Err(ConfigError::StorageMaxObjectBytes)
-        ));
-        std::fs::write(&path, DB).unwrap();
-        assert!(Config::load(&path).is_ok());
+        let long = "a".repeat(64);
+        for bad in [
+            "",
+            "ab",
+            "-abc",
+            "abc-",
+            "Abc",
+            "a_b",
+            "a.b",
+            "a b",
+            "health",
+            "minio",
+            "rustfs",
+            long.as_str(),
+        ] {
+            assert!(
+                matches!(
+                    load(&with_bucket(bad)),
+                    Err(ConfigError::ObjectServerBucket)
+                ),
+                "{bad}"
+            );
+        }
+        assert!(load(&with_bucket(&"a".repeat(63))).is_ok());
+        assert!(load(&with_bucket("abc")).is_ok());
+        assert!(is_valid_bucket("health-check"));
     }
 
     /// `DB` with its `[object_server]` table replaced by `table` (empty: removed).
     fn with_object_server(table: &str) -> String {
         let from = DB.find("[object_server]").unwrap();
-        let to = DB.find("[storage]").unwrap();
+        let to = DB.find("[database]").unwrap();
         format!("{}{table}{}", &DB[..from], &DB[to..])
     }
 
     /// The `[object_server]` table of `DB`.
     fn object_server_table() -> String {
         let from = DB.find("[object_server]").unwrap();
-        let to = DB.find("[storage]").unwrap();
+        let to = DB.find("[database]").unwrap();
         DB[from..to].to_owned()
     }
 
@@ -677,15 +672,7 @@ mod tests {
 
     // C5
     #[test]
-    fn load_refuses_the_data_dir_of_the_store_and_the_key_directory_as_credentials() {
-        let same_data = DB.replace(
-            &object_server_table(),
-            &object_server_table().replace("object-server", "objects"),
-        );
-        assert!(matches!(
-            load(&same_data),
-            Err(ConfigError::ObjectServerShared)
-        ));
+    fn load_refuses_the_key_directory_as_credentials() {
         let key_dir = if cfg!(windows) {
             "C:\\srv\\nekoguruma"
         } else {

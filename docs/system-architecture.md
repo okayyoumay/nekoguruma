@@ -1544,7 +1544,7 @@ Signature verification is needed on both server and agent, and is consolidated i
 | DB | PostgreSQL (sqlx). Also bundled for personal deployments, for uniformity. The server embeds the migrations of `db/migrations` and applies them at start, before it listens; a database whose migrations differ from the binary's refuses the start (ADR-458) |
 | Job creation | `POST /api/v1/jobs` behind the operator session; one transaction reads the idempotency key's row, judges permission, signs the instruction with the active key, inserts the job and takes the vehicle's lock (8.8, ADR-480), so that a concurrent request for the same key replays or conflicts instead of creating a second job (5.1, ADR-477) |
 | Job queue | PostgreSQL `SELECT ... FOR UPDATE SKIP LOCKED`; one task of the server polls the `jobs` table and delivers to its own connections (5.3, 14.1, ADR-476) |
-| Object storage | S3-compatible storage abstracted behind a trait, swappable with a local file implementation |
+| Object storage | S3-compatible storage abstracted behind a trait; the local deployment uses the bundled S3-compatible server (ADR-492) |
 | Authentication | OIDC (`openidconnect`). Personal deployments use bundled simple authentication |
 | WebRTC | `webrtc-rs` (agent side) |
 | Agent local listener | axum (enabled only when offline; 5.7.1) |
@@ -1594,14 +1594,14 @@ The same code is switched by configuration. Profile differences are limited to s
 |---|---|---|
 | Web delivery / API | Server | Local service on 127.0.0.1 |
 | RDB | PostgreSQL | Bundled PostgreSQL |
-| Object storage | S3-compatible | Local files |
+| Object storage | S3-compatible | The bundled S3-compatible server |
 | Authentication | OIDC | Local users |
 | TURN | coturn as needed | Not required |
 | Distribution form | Container | OS service |
 
-On the local deployment the object store is a directory the server's configuration names (`[storage]`, ADR-474). An object is begun, appended to at the offset the store holds, and finished with its whole length and SHA-256, and only then can it be read; the store issues each object's key, which the row that names the object records as its `storage_key`, and one server process holds the directory. How design 14.3's direct upload fits this contract on the standard deployment is decided with the data channel.
+On both deployments the object store is a bucket of an S3-compatible server (ADR-492); on the local deployment that is the bundled server below, and the bucket is `object_server.bucket` (default `nekoguruma`), which the server creates at its start if it is absent. The server does not carry the bytes: it issues each object's key and starts a multipart upload (the row that names the object records the key and the upload ID, and the key is its `storage_key`), hands out a presigned URL for each part (valid 300 seconds, signed for the object server's loopback address), and when the writer says it is done it lists the parts, checks them itself, completes the upload, reads the object back and compares its length and SHA-256 with what the writer declared; a mismatch deletes the object. Only a completed, verified object is read. The earlier local-file store (ADR-474) remains in the code for its tests and is no longer what the server uses. Design 14.3 describes the upload path.
 
-The local deployment also bundles an S3-compatible server, RustFS, pinned to one release, which the server starts as its child before it opens the object store and stops with itself (`[object_server]`, ADR-491). It listens on `127.0.0.1` only (the address is fixed in code and its console is off) and authenticates with an access key and a secret key that the server creates at its first start in two owner-only files, as it does the instruction key (ADR-462); the configuration never holds them. A pinned binary is fetched and hash-checked by one script for installations and CI. Nothing reads or writes through it yet; the S3 implementation of the object-storage trait and the data channel's use of it are later work.
+The local deployment bundles an S3-compatible server, RustFS, pinned to one release, which the server starts as its child before it opens the object store and stops with itself (`[object_server]`, ADR-491). It listens on `127.0.0.1` only (the address is fixed in code and its console is off) and authenticates with an access key and a secret key that the server creates at its first start in two owner-only files, as it does the instruction key (ADR-462); the configuration never holds them. A pinned binary is fetched and hash-checked by one script for installations and CI. The server opens the object store on it as the last step before it listens (ADR-492); the data channel's use of the store is later work. An external S3 service over HTTPS is not configurable yet.
 
 ### 13.1 Functional Limitations of the Personal Deployment
 
@@ -1627,7 +1627,7 @@ Such operations are hidden in the UI from the outset and are also stated explici
 - In the personal deployment, backup is the user's responsibility, so provide an export function
 - Registration needs no login, since the agent has no session, and on this profile it runs over plain HTTP to the pinned origin. What authorizes it is the registration code (6.7, 14.4); the code is issued by a command that trusts its own database connection as the server does, so whoever can reach the database is the Administrator. A process that holds the port during registration could answer the agent, so the agent takes the instruction key only when its fingerprint equals the server key ID that the operator passed out of band (ADR-463)
 - The job instruction key is an owner-only file beside the server's configuration, not in the database: it is in neither a database dump nor the export above, and losing it costs re-registration of the agents, not data (ADR-462)
-- The bundled object server (RustFS) is the server's child, bound to `127.0.0.1` with its console off, and ends with the server: the server stops it in its own stop, and if the server dies a parent-death signal (Linux) or a kill-on-close job object (Windows) ends it. Its credentials are two owner-only files created by the server at its first start, handed to it as file paths and never held in the configuration, an environment, an argument or a log (ADR-491). Another OS user cannot connect with no credentials (an anonymous request is refused), but one who can read the credential files, or the server's account, can; the files' protection is the directory's and the file's mode (Unix) or ACL (Windows)
+- The bundled object server (RustFS) is the server's child, bound to `127.0.0.1` with its console off, and ends with the server: the server stops it in its own stop, and if the server dies a parent-death signal (Linux) or a kill-on-close job object (Windows) ends it. Its credentials are two owner-only files created by the server at its first start, handed to it as file paths and never held in the configuration, an environment, an argument or a log (ADR-491). The server's own requests to it are signed with those credentials and sent over loopback HTTP, one request per connection; a presigned part URL is a bearer for its 300 seconds and is not bound to a length, so a revoked agent's URLs stay usable for up to five minutes (ADR-492). Another OS user cannot connect with no credentials (an anonymous request is refused), but one who can read the credential files, or the server's account, can; the files' protection is the directory's and the file's mode (Unix) or ACL (Windows)
 
 ### 13.4 Testing Use
 
@@ -1727,7 +1727,7 @@ The UI is served as a static directory (9.6), so it is by default served from ob
 
 ### 14.3 Large Data
 
-Uploads of captured data and downloads of artifacts go directly to storage via pre-signed URLs, not via the application container. URL expiry is kept short. Uploads are resumable with S3 multipart.
+Uploads of captured data and downloads of artifacts go directly to storage via pre-signed URLs, not via the application container. URL expiry is kept short. Uploads are resumable with S3 multipart. The server issues the key, starts the upload, signs a URL per part (300 seconds, at most 10000 parts of at least 5 MiB except the last, at most 4 GiB in all), lists the parts on request so that a cut upload resumes, and on completion checks the parts, completes the upload and reads the object back to compare its length and SHA-256 with the writer's declaration, deleting the object on a mismatch (ADR-492). A part URL does not bind the length of the body sent to it; the completion's read-back is the check.
 
 ### 14.4 Devices over the Internet
 

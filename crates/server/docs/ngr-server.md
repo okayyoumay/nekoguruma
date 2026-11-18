@@ -6,9 +6,10 @@ PostgreSQL through sqlx and serves the health probe, the redemption of registrat
 agent's connection proof and control channel, the local users' login and the creation of jobs. The rules of the listener and the
 request guard are in ADR-456; the database, the migrations and the test database are in ADR-458;
 the job instruction key is in ADR-462; registration codes and their command are in ADR-463 and
-ADR-465; local users, their command and the operator session are in ADR-469; the object store is in
-ADR-474; job creation is in ADR-477; the bundled object server, which the server starts as its
-child, is in ADR-491.
+ADR-465; local users, their command and the operator session are in ADR-469; job creation is in
+ADR-477; the bundled object server, which the server starts as its child, is in ADR-491; the
+object store, a bucket on that server, is in ADR-492 (ADR-474's local-file store is the test
+store).
 
 ## Running
 
@@ -28,7 +29,7 @@ below); `registration-code` is a subcommand only as the first argument, so
 The `user` forms manage local users ("Local users" below), with the same rule for `user`.
 Exit codes: 0 after a graceful stop, an issued code or a user change, 1 when the configuration is refused or the
 server cannot start or run (including a database that cannot be reached or migrated and an
-instruction key, an object store directory or an object server that is refused, and an object server
+instruction key, an object server or an object store bucket that is refused, and an object server
 that ends before a stop signal), or when a code cannot be issued or a user changed, 2 for a
 usage error (for `user add` and `set-password`, also a terminal on standard input).
 
@@ -51,15 +52,12 @@ connect_timeout_secs = 10    # default 10, 1-300
 [instruction_key]            # required
 path = "/etc/nekoguruma/instruction.key"   # absolute; Windows: use a TOML literal string
 
-[storage]                    # required
-dir = "/var/lib/nekoguruma/objects"        # absolute; created when absent
-max_object_bytes = 4294967296              # default 4 GiB, at least 1
-
 [object_server]              # required in a file
 binary = "/opt/nekoguruma/rustfs"          # absolute; what scripts/fetch-rustfs.sh prints
 data_dir = "/var/lib/nekoguruma/object-server"   # absolute; created when absent
 credentials_dir = "/etc/nekoguruma/object-server"   # absolute; must exist; not the key's directory
 port = 8081                  # default: http.port + 1
+bucket = "nekoguruma"        # default; the object store's bucket
 ```
 
 - The `[database]` table is required, and the file holds the database password: make it readable
@@ -77,23 +75,22 @@ port = 8081                  # default: http.port + 1
   others; the server
   creates only the file. Put it beside the configuration, not in the database's data directory,
   and not in a directory that a backup of the database covers.
-- The `[storage]` table is required: `dir` is the absolute path of the object store's directory
-  ("The object store" below, ADR-474), and `max_object_bytes` (default 4 GiB, not 0) is the
-  most one object may hold. There is no default path. The server creates the directory (mode
-  0700 on Unix) when it is absent and its parent exists; it never creates the parent. The
-  directory, and the `staging` and `objects` directories inside it, must belong to the server's
-  account (or, on Unix, to root) and, on Unix, not be writable by group or others; a symbolic
-  link to such a directory is accepted. Put it on one file system, apart from the database's
-  data directory and from the instruction key.
 - The `[object_server]` table is required in a file (a `Config` built in code may leave it out and
   then starts no child): `binary`, `data_dir` and `credentials_dir` are absolute paths, with no
   search of `PATH` ("The object server" below, ADR-491). `port` is the object server's loopback
   port; the default is `http.port` plus one, and 0, the server's own port and an overflow of the
   default (`http.port` 65535) are refused. There is no address, bind, access-key or secret-key key
   (an unknown key is a parse error), the listener is `127.0.0.1` in code, and the table holds no
-  credential. `data_dir` may not be `storage.dir`, and `credentials_dir` may not be the directory
-  of `instruction_key.path`; one directory nested in another is not detected, so keep the four
-  apart.
+  credential. `credentials_dir` may not be the directory of `instruction_key.path`; one directory
+  nested in another is not detected, so keep the directories apart. `bucket` is the bucket the
+  object store keeps its objects in ("The object store" below, ADR-492): 3 to 63 characters of
+  lower-case letters, digits and hyphens, not starting or ending with a hyphen, and not `health`,
+  `minio` or `rustfs`; the default is `nekoguruma`. The server creates the bucket when it is
+  absent. The size limit of an object (4 GiB) is a constant of the code, not a key.
+- There is no `[storage]` table any more (ADR-492): a file that still has one is refused as an
+  unknown key. **Migration:** delete the `[storage]` table from existing files. Objects that
+  `LocalStore` wrote into its directory are not moved; nothing in this build wrote any (no route
+  used the store).
 - There is no bind-address key. The listener is `127.0.0.1:<port>` in code, so no configuration
   can make the local profile listen elsewhere, and `[::1]` is not bound (design 13.3).
 - There is no pinned-host key. The pinned origin is `http://127.0.0.1:<port>`. Changing the port
@@ -128,14 +125,16 @@ port = 8081                  # default: http.port + 1
    probe, at most 30 seconds. A failure closes the database pool, stops what was started and ends
    the process with exit 1; nothing is retried. The commands `registration-code` and `user` never
    read the credentials, lock the data directory or spawn the child.
-6. Open the object store (below): create what is missing in `storage.dir`, check it and lock it
-   for the life of the process. A failure stops the object server, closes the database pool and
-   ends the process with exit 1; nothing is retried. The commands `registration-code` and `user`
-   never open, create or lock the store.
+6. Open the object store (below): check the bucket on the object server and create it when it is
+   absent, retrying a connection that fails or a 5xx every 100 ms within 30 seconds, and stopping
+   at once if the object server ends meanwhile. A failure (a refusal of the credentials, a status
+   the store does not expect, the budget spent, the child ending) stops the object server, closes
+   the database pool and ends the process with exit 1. The commands `registration-code` and `user`
+   never open the store.
 7. Bind `127.0.0.1:<port>` (a failure stops the object server and closes the pool), install the
    signal handlers, then log the pinned origin: a stop signal sent once the log line appears is
    never lost. A listening port means a migrated schema, a usable instruction key, a ready object
-   server and a usable, locked object store. A stop signal during the steps before this one has
+   server and a bucket that is ready. A stop signal during the steps before this one has
    the default disposition and ends the server, and the child ends with it (below).
 8. Serve until SIGTERM or SIGINT (Unix) or Ctrl-C or Ctrl-Break (Windows). Then stop accepting,
    let requests in flight finish and close every control channel connection with 1001, for at
@@ -155,9 +154,8 @@ port = 8081                  # default: http.port + 1
 
 `object_server.rs` and `object_server/`; the decision and its alternatives are in ADR-491. The
 local profile bundles RustFS, an S3-compatible server, pinned to a release in `scripts/rustfs-pin.txt`,
-and runs it as the server's child. Nothing reads or writes through it yet: the S3 object store and
-the signed-request readiness check come with later work, and the object store above is still
-`LocalStore`.
+and runs it as the server's child. The object store (below) is a bucket on it, opened after the
+readiness probe.
 
 - **Getting the binary.** `scripts/fetch-rustfs.sh` reads the pin file (the version, and per
   platform the asset name, the asset's SHA-256, the archive member and the member's SHA-256),
@@ -183,10 +181,10 @@ the signed-request readiness check come with later work, and the object store ab
   the child the two paths as `RUSTFS_ACCESS_KEY_FILE` and `RUSTFS_SECRET_KEY_FILE`; that is the
   child's own interface and not configuration of the server by environment (ADR-456 item 7). The
   secret is in no configuration, environment, argument or log line.
-- **The data directory** holds `.lock` (the object store's lock code: a second server on the
+- **The data directory** holds `.lock` (the local store's lock code: a second server on the
   directory exits 1 before it spawns anything) and `volume/`, which the child is given as its
   volume. The server creates the directory (mode 0700 on Unix) when it is absent and its parent
-  exists, and checks it as it checks the store's directory.
+  exists, and checks it as it checked the local store's directory.
 - **The child.** The binary's `server` subcommand, with a cleared environment holding
   `RUSTFS_ADDRESS=127.0.0.1:<port>`, `RUSTFS_VOLUMES`, the two `_FILE` variables,
   `RUSTFS_CONSOLE_ENABLE=false` (RustFS 1.0.6 otherwise opens its console on `0.0.0.0:9001`) and the
@@ -270,85 +268,74 @@ command that does this is not written.
 
 ## The object store
 
-`storage.rs` (the `ObjectStore` trait and its types) and `storage/local.rs` (`LocalStore`); the
-decision is in ADR-474. The store holds the large bodies that the database refers to by key (the
-`storage_key` columns, `db/README.md`): the local profile keeps them as files; `LocalStore` is the only
-implementation, and the standard profile's S3-compatible store is not written (design 13). The
-trait's futures are boxed by hand, so `Arc<dyn ObjectStore>` works, and `Server::object_store()`
-returns the store `Server::start` opened. No route or task of the server uses the store.
+`storage.rs` (the `MultipartStore` trait and its types), `storage/s3.rs` with `s3/http.rs` and
+`s3/xml.rs` (`S3Store`); the decision, the alternatives and the known limits are in ADR-492. The
+store holds the large bodies that the database refers to by key (the `storage_key` columns,
+`db/README.md`) in the bucket `object_server.bucket` of the bundled object server. The server does
+not carry the bytes: the writer PUTs each part to a presigned URL. The trait's futures are boxed by
+hand, so `Arc<dyn MultipartStore>` works, and `Server::object_store()` returns the store
+`Server::start` opened (`None` for a `Config` with no `[object_server]`, and for a server made by
+`bind`). No route or task of the server uses the store yet.
 
-A write is a resumable upload by offset:
+- `begin()` issues the key (a version 4 UUID in lowercase text) and starts a multipart upload;
+  the result is `Upload { key, id }`, which the caller's row keeps whole, since the store records
+  nothing. The upload ID is a bearer of access to the upload: its `Debug` shows nothing, it has
+  no `Display`, and it is never logged.
+- `presign_part(upload, part)` computes a presigned PUT URL for part 1 to 10000 (else
+  `InvalidPartNumber`), valid 300 seconds, signed for `127.0.0.1:<port>` and the object server's
+  region `us-east-1`, path style. It does no I/O. `PartUrl` has a redacting `Debug` and no
+  `Display`; `expose()` gives the text for the writer. The URL does not bind the length of what is
+  sent (ADR-492's known limits).
+- `list_parts(upload)` pages through the object server's listing (1000 a page) and returns each
+  part's number and size, not its entity tag. A listing that is not strictly ascending within 1 to
+  10000, or a continuation that does not advance, is `PartsChanged`. An upload that is gone is
+  `AlreadyFinished` if the object exists and `NotFound` if not.
+- `complete(upload, sha256, length)` takes the key's lock, lists the parts and checks them itself
+  (`NoParts`; numbered consecutively from 1, else `MissingPart`; each but the last at least
+  5 MiB, else `PartTooSmall`; the sizes add up to `length`, else `LengthMismatch` with the sum; at
+  most 4 GiB, else `ObjectTooLarge`), sends CompleteMultipartUpload with the entity tags the
+  listing gave (a refusal of a part is `PartsChanged`), then reads the object back, streaming its
+  SHA-256, and compares length and digest. A mismatch deletes the object (the delete order below)
+  and is answered as `LengthMismatch` or `HashMismatch` only once the delete has succeeded; a
+  failed delete answers its own error, since the object is still there. A read-back that fails
+  (cut, idle for 30 seconds) is an I/O error and deletes nothing. A retry after the upload was
+  completed finds the upload gone and the object present and reads the object back again, so a
+  completion whose answer was lost is finished by calling it again; with no object it is
+  `NotFound`.
+- `get(key)` returns the object's length (from its `content-length`) and an `AsyncRead` that
+  fails after 30 seconds without a byte and has no total bound. It verifies nothing; `NotFound`
+  for a missing key.
+- `delete(key)` takes the key's lock, lists the uploads whose key starts with the key, aborts
+  those whose key is exactly it, repeats while any were found (at most 3 rounds), then deletes
+  the object. Deleting what is not there is `Ok`.
+- `list_unfinished()` pages through the uploads of every key in the bucket and returns the
+  ones this store could have issued (key, ID, start time); the others are counted in `skipped`
+  and not returned. The listing request is built by hand (rusty-s3 has no action for it).
 
-- `begin()` issues the key, a version 4 UUID in lowercase text, and an empty unfinished object.
-  The caller records the key in its `storage_key` column. A key of any other form is
-  `InvalidKey`, before any file is touched: no path is built from caller text but a validated
-  key.
-- `append(key, offset, bytes)` writes only when `offset` is the stored length, syncs the file and
-  returns the new length. Any other offset is `OffsetMismatch` carrying the stored length and
-  writes nothing, so a writer cut off mid-chunk, or one whose answer was lost, resumes from the
-  length in the refusal or from `status`. An append that would pass `max_object_bytes` is
-  `TooLarge` and writes nothing (exactly the limit is accepted); appending nothing at the stored
-  length returns it. An append never creates an object (`NotFound`), and a finished one is
-  `AlreadyFinished`.
-- `finish(key, sha256, length)` checks the length against the stored length, then the SHA-256 of
-  the whole content, and moves the file from the staging area to the finished area (rename, then
-  both directories synced). A mismatch (`LengthMismatch`, `HashMismatch`) leaves the object
-  unfinished and writable. A finished object is immutable: no append, no second finish. A
-  zero-length object can be finished. The size limit is not applied at finish.
-- `get(key)` opens a finished object and returns its length and an `AsyncRead`; an unfinished
-  object is `NotFinished`. A read that began before a `delete` stays complete on Unix; on Windows std unlinks with
-  POSIX delete semantics where the file system has them (the name is freed at once), and
-  elsewhere the name may persist until the reader closes, so the key may read finished or an
-  I/O error until then (not special-cased).
-- `delete(key)` removes an object, finished or not (`NotFound` when there is none). A key in
-  both areas loses both copies before the directories are synced: the staging copy first, and
-  the first failed unlink stops the delete with an I/O error and nothing else removed. An I/O
-  error after the unlink (the directory sync) leaves the object gone: the retry syncs both
-  areas before it answers `NotFound`, so that answer is durable and means it is gone. The key's
-  failed-sync mark is cleared whenever no unlink failed.
-- `list_unfinished()` returns each unfinished object's key, stored length and last write time,
-  for a caller that cleans up abandoned uploads. Names in the staging area that are not keys are
-  ignored; an entry that is not a regular file is skipped with a warning. An object that is
-  also finished (a hand-made copy) is not listed.
+The rules the implementation keeps:
 
-The directory holds `staging/<key>`, `objects/<key>` and `.lock`, flat, on one file system. The
-rules the implementation keeps:
+- Every request is a presigned URL built by rusty-s3 and sent over its own HTTP/1 connection to
+  `127.0.0.1:<port>` (`connection: close`): no pool, no retry, no redirect, no HTTP/2. A request
+  with a body always sends `content-length`, `0` included. A control request is bounded by 30
+  seconds, a presigned URL of the store's own is valid 60 seconds, an XML answer is read up to
+  4 MiB and an error body up to 64 KiB (the rest is not read).
+- Nothing logs or puts into an error a URL (it carries a signature), an object key, an upload ID
+  or text the object server sent. An error is a fixed message, an operation name and an HTTP
+  status or an `ErrorKind`. A 401 or 403 is `Refused`; any other status the operation does not
+  expect is `Server`.
+- The key lock serialises `complete` and `delete` on one key within this process; other calls
+  take none. It does not cross processes.
+- At open the bucket is checked (HeadBucket) and created if absent (409 "owned by you" counts as
+  present); a refusal or an unexpected 4xx ends the open at once, a connection failure or a 5xx is
+  retried.
+- The bounds above are the constants of a hidden `Tuning` that tests shorten; the store has no
+  configuration key.
 
-- The stored length is the length of the staging file after one `sync_all`, read under the key's
-  lock by the one function every operation uses. It is not recorded anywhere, so after a crash
-  it is what reached the disk, and a chunk cut part way leaves a prefix that the writer resumes
-  after. Nothing truncates, preallocates or repairs a file.
-- A key whose `sync_all` failed answers an I/O error to everything but `delete` until the process
-  restarts, because a failed sync can drop data the operating system had accepted.
-- A key is finished if `objects/<key>` exists (it wins when the key is in both areas, and
-  `delete` removes both), else unfinished if `staging/<key>` exists, else not found. If the
-  directory or an area is gone, the answer is `Unavailable`, never not found (a missing key is
-  answered only after the areas are checked again, so an area removed during the call counts),
-  and nothing is recreated until the server restarts.
-- A staging or object file is judged on its open handle like the instruction key's file: a
-  non-regular file is `NotRegularFile`; on Unix a file owned by another account or open to
-  group or others is an I/O error for that key (`PermissionDenied`). The same rule applies to
-  `.lock` at start: a file system that fakes owners or mode bits makes the start fail (exit 1)
-  with that error, instead of refusing every key later. The listing skips such a
-  key, and one whose sync fails, with a warning.
-- Calls on one key are serialised by a per-key mutex whose guard moves into the one blocking task
-  that does the work, so a caller that drops its future does not free the key while its write
-  runs. Different keys run concurrently. File I/O runs on the blocking pool.
-- Every call is durable before it answers: `begin` syncs the file and the staging directory,
-  `append` the file, `finish` the directories of the rename, `delete` the directory it removed
-  from, and the start both areas. A rename across devices fails with an I/O error and leaves the
-  object unfinished; the file is never copied and deleted. A failed directory sync after the
-  rename is an I/O error, and the object is finished.
-- One process per directory: the store holds an exclusive lock on `.lock` for its life; a second
-  server on the directory (or a second `LocalStore` in the process) is refused with `InUse` and
-  exits 1. The file is never deleted. The operating system drops the lock when the process dies.
-- Files are created mode 0600 and opened with `O_NOFOLLOW` and `O_NONBLOCK` (a link or a FIFO in
-  the directory is refused, as for the instruction key's file), and the open handle must be a
-  regular file. Windows opens staging files for read and write, because a sync may be refused on
-  a read-only handle; it locks only `.lock`, and checks no ACL and syncs no directory.
-- The directory checks (ownership, group and other write bits, a path that is a directory) are
-  the instruction key's, in `fs_guard.rs`, which both call.
-- Errors are fixed text plus the `ErrorKind` of a failed file operation, never a path.
+`ObjectStore` and `LocalStore` (`storage/local.rs`, ADR-474: resumable append by offset into a
+directory) stay in the code with their unit tests (`storage/local/tests.rs`); the server does not
+use them, but the object server's data directory shares their directory-locking code (`.lock`,
+`ensure_area`, `open_locked_dir`). Their settings, `StorageConfig`, are built in code and are not
+read from the configuration file.
 
 ## Issuing a registration code
 
@@ -1135,18 +1122,36 @@ a new migration file rebuilds the crate. How migrations are written and applied 
   removed file with a row, a file of another key and a file that is no key are refused and left as
   they were, a retired record, one active row only, two starts with one path (both succeed, one
   key) and two starts with different paths (exactly one succeeds). `binary.rs` also checks that a
-  refused key gives exit 1 and nothing listens. Every server test config names a key path and a
-  storage directory; the tests that start several servers on one cluster share the key path
-  (`TestPostgres::key_path`) and each take a storage directory of their own
-  (`TestPostgres::storage_path`), since a store's directory is locked.
-- `storage.rs` (database) covers the store at start: the first start creates the directory (mode
-  0700 on Unix), its areas and the lock file and binds, the store from `Server::object_store`
-  writes and finishes an object that a restart still finds, a group-writable directory and a
-  missing parent refuse the start and leave the directory as it was, and a second server on one
-  directory is refused until the first has stopped. `binary.rs` also checks that a refused
-  storage directory (a file; on Unix, a group-writable directory) and one in use give exit 1
-  with nothing listening, and `registration.rs` and `local_users.rs` that their commands create
-  no storage directory.
+  refused key gives exit 1 and nothing listens. Every server test config names a key path; the tests
+  that start several servers on one cluster share the key path (`TestPostgres::key_path`).
+- `storage.rs` (database) tests the S3 store on the real pinned RustFS (`NGR_TEST_RUSTFS_BIN`, as
+  `object_server_rustfs.rs`), with a plain HTTP client PUTting to the part URLs: an upload in two
+  parts that completes and reads back (and no signature or secret in the child's log); a resume
+  that re-sends a part and a second completion that verifies again; a digest mismatch that leaves
+  neither object nor upload and the same on a retry; the store's own part checks (none, a gap, a
+  small part, a wrong length) with the upload still usable; one empty part; delete of an
+  unfinished upload, of a finished object, twice and of a key that never was; the unfinished
+  listing; an edited part URL and an anonymous read refused; the bucket made once and separate by
+  name; an upload that survives a restart of the object server; and `Server::start` opening the
+  store, a restart finding the object, and a `Config` with no `[object_server]` having no store.
+  `object_server.rs` checks with the fake child's `s3_status` key that a refused bucket stops the
+  child and closes the pool, that the child ending while the store retries ends the start, and
+  that a 5xx is retried until the budget is spent. `binary.rs` checks that a refused bucket gives
+  exit 1 with nothing listening, and `registration.rs` and `local_users.rs` that their commands
+  never create the object server's data directory.
+- The S3 store's unit tests (`storage/s3/tests.rs`) need no database and no RustFS: a scripted
+  loopback listener stands in for the object server and records each request. They cover the open
+  (existing, created, owned by us, refused, retried, spent, unreachable, a bad bucket name), the
+  HTTP rules (`content-length: 0`, one connection per request, no redirect, the control timeout,
+  the XML and error bounds, garbled answers), that no error or `Debug` holds a URL, key, upload ID
+  or server text, the part URL (300 seconds, the part number signed, 1 to 10000, no I/O), the
+  listings (paging, the markers, a listing that goes backwards or stalls, a gone upload, the
+  skipped foreign uploads and the sorted signed query), every check of `complete` and that it
+  sends nothing then, the read-back (a mismatch deletes, a failed delete is answered instead, a
+  length mismatch, a cut read-back deletes nothing, the idle timeout, a retry after completion,
+  an upload lost to a race, the object server's own refusal of a part), the key lock (two
+  completions, a delete behind a completion, another key free), `get` and the delete order (the
+  exact key, three rounds, nothing to delete, a failed abort).
 - The object store's unit tests (`storage/local/tests.rs`) need no database and run on every
   platform, the Unix-only ones gated by `cfg(unix)`. They cover every operation on a key nobody
   issued, an unfinished, a finished and a deleted object; the key syntax table; the size limit
@@ -1163,8 +1168,8 @@ a new migration file rebuilds the crate. How migrations are written and applied 
   delete (Unix); two stores on one directory, also while a call is still running; a directory
   removed under a live store; a retried delete that syncs before `NotFound`; a failed unlink; a `.lock` or staging file of another account (Unix; the second as root); and the listing with sizes and times.
 - The unit tests need no database: the guard's decision table, the configuration (including that
-  no error shows the URL, that the key path is required and absolute, and that the storage
-  directory is required and absolute and its limit defaults to 4 GiB and is not 0), the key file (create,
+  no error shows the URL, that the key path is required and absolute, that `[storage]` is refused and
+  that the bucket defaults to `nekoguruma` and is validated), the key file (create,
   reload, garbage, a directory, too-open modes and directories on Unix, sixteen threads creating at
   one path, no secret in `Debug`), a sealed instruction that splits, verifies and decodes with
   `shared_crypto::instruction` and `shared_proto::JobInstruction`, and that the embedded

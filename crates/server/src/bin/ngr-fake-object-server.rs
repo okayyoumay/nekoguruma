@@ -10,6 +10,9 @@
 //! - `ready_after_ms <n>`: 503 until that long after the start;
 //! - `die_after_ms <n>` with `die_code <n>` or `die_signal 1`: ends by itself that long after
 //!   its first 200 (so after the server's readiness probe succeeded) (`die_signal`: killed by SIGKILL on Unix);
+//! - `s3_status <n>`: answers every request outside `/health/` with that status and no body
+//!   (the default is 200, which the store's HeadBucket accepts as "the bucket exists"), so that a
+//!   test can make the store's open fail (403) or retry (503);
 //! - `ignore_term 1`: ignores SIGTERM (Unix); otherwise SIGTERM ends it with code 0;
 //! - `print_secret 1`: prints the secret key it reads from its file, with a long line and a
 //!   control character, to standard output and standard error;
@@ -88,6 +91,7 @@ fn main() {
     println!("fake object server up on {address}");
     let mode = get("mode").unwrap_or("ok").to_owned();
     let ready_after = Duration::from_millis(number("ready_after_ms").unwrap_or(0));
+    let s3_status = number("s3_status");
     // `die_after_ms` counts from the first 200 the fake gives, so that a test's delay holds
     // however long the server took to reach it.
     let die = number("die_after_ms").map(|ms| {
@@ -99,7 +103,15 @@ fn main() {
     });
     for stream in listener.incoming().flatten() {
         let mode = mode.clone();
-        std::thread::spawn(move || answer(stream, &mode, started.elapsed() >= ready_after, die));
+        std::thread::spawn(move || {
+            answer(
+                stream,
+                &mode,
+                started.elapsed() >= ready_after,
+                die,
+                s3_status,
+            )
+        });
     }
 }
 
@@ -111,7 +123,13 @@ fn read_config() -> HashMap<String, String> {
         .collect()
 }
 
-fn answer(mut stream: TcpStream, mode: &str, ready: bool, die: Option<(u64, bool, i32)>) {
+fn answer(
+    mut stream: TcpStream,
+    mode: &str,
+    ready: bool,
+    die: Option<(u64, bool, i32)>,
+    s3_status: Option<u64>,
+) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let mut head = Vec::new();
     let mut buf = [0u8; 512];
@@ -120,6 +138,19 @@ fn answer(mut stream: TcpStream, mode: &str, ready: bool, die: Option<(u64, bool
             Ok(0) | Err(_) => break,
             Ok(n) => head.extend_from_slice(&buf[..n]),
         }
+    }
+    // The request target: the second word of the request line.
+    let target = head
+        .split(|&b| b == b' ')
+        .nth(1)
+        .map(|t| t.to_vec())
+        .unwrap_or_default();
+    if let Some(status) = s3_status.filter(|_| !target.starts_with(b"/health/")) {
+        let _ = stream.write_all(
+            format!("HTTP/1.1 {status} Steered\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .as_bytes(),
+        );
+        return;
     }
     let reply: &[u8] = match mode {
         "hang" => {

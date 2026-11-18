@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use server::config::{Config, Database, Http, InstructionKeyConfig, Profile, StorageConfig};
+use server::config::{Config, Database, Http, InstructionKeyConfig, Profile};
 use server::db::{self, DbError};
 use server::{Server, StartError};
 use sqlx::migrate::{Migration, MigrationType, Migrator};
@@ -27,7 +27,6 @@ fn config(pg: &TestPostgres) -> Config {
         instruction_key: InstructionKeyConfig {
             path: pg.key_path(),
         },
-        storage: StorageConfig::new(pg.storage_path()),
         object_server: None,
     }
 }
@@ -160,7 +159,6 @@ async fn a_start_against_a_database_that_is_down_fails_within_the_connect_timeou
         instruction_key: InstructionKeyConfig {
             path: std::env::temp_dir().join("never-created.key"),
         },
-        storage: StorageConfig::new(std::env::temp_dir().join("never-created-storage")),
         object_server: None,
     };
     let started = std::time::Instant::now();

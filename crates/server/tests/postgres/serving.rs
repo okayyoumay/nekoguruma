@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use std::sync::Arc;
 
-use server::config::{Config, Database, Http, InstructionKeyConfig, Profile, StorageConfig};
+use server::config::{Config, Database, Http, InstructionKeyConfig, Profile};
 use server::{InstructionKey, Server, db};
 use shared_crypto::SigningKey;
 use sqlx::postgres::{PgConnectOptions, PgSslMode};
@@ -116,7 +116,6 @@ impl Running {
             instruction_key: InstructionKeyConfig {
                 path: pg.key_path(),
             },
-            storage: StorageConfig::new(pg.storage_path()),
             object_server: None,
         };
         let server = Server::start(&config).await.unwrap();

@@ -43,9 +43,21 @@ argon2 = { version = "0.5", default-features = false, features = ["alloc", "pass
 http-body-util = "0.1"
 # The server serves HTTP/1 only (ADR-456), so it drives hyper directly instead of `axum::serve`,
 # which also accepts HTTP/2 whenever another crate in the build turns that feature on.
-hyper = { version = "1", features = ["http1", "server"] }
+# The `client` feature is for the object store's requests to the bundled object server: one HTTP/1
+# connection per request, driven directly (ADR-492), so no pool and no HTTP/2.
+hyper = { version = "1", features = ["http1", "server", "client"] }
 hyper-util = { version = "0.1", features = ["tokio", "service"] }
 tower = { version = "0.5", default-features = false }
+# Builds and signs the requests to the object server (SigV4 presigned URLs) and parses its XML
+# answers, without a client of its own (ADR-492). Only the RustCrypto signing and the XML actions:
+# no base64, MD5 or JSON parts, and no aws-lc.
+rusty-s3 = { version = "0.11", default-features = false, features = ["rustcrypto", "xml"] }
+# The timestamp type of rusty-s3's `signing::sign`, which the hand-written ListMultipartUploads
+# request calls directly. The version rusty-s3 itself uses, so the build holds one copy.
+jiff = { version = "0.2", default-features = false, features = ["std"] }
+# The XML reader of rusty-s3, used for the ListMultipartUploads answer, which rusty-s3 has no
+# action for (ADR-492). The version rusty-s3 uses.
+instant-xml = "0.7"
 # Only its error types: the control channel tells a message over the limit from other read errors
 # by the stack's own error (ADR-468). It must stay the version axum's WebSocket uses.
 tungstenite = { version = "0.29", default-features = false }

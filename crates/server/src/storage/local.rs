@@ -84,7 +84,7 @@ enum State {
 
 /// The exclusive lock on `.lock`. Unlocking before the close releases it for every handle to the
 /// open file description, which a child process spawned meanwhile may share.
-struct ProcessLock(File);
+pub(crate) struct ProcessLock(File);
 
 impl Drop for ProcessLock {
     fn drop(&mut self) {
@@ -120,7 +120,7 @@ fn is_missing(error: &io::Error) -> bool {
 }
 
 /// Creates a directory, mode 0700 on Unix; its parent must exist.
-fn create_directory(path: &Path) -> io::Result<()> {
+pub(crate) fn create_directory(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
@@ -133,7 +133,7 @@ fn create_directory(path: &Path) -> io::Result<()> {
 }
 
 /// Opens (creating) the file whose lock makes the store's process its directory's only user.
-fn take_process_lock(path: &Path) -> Result<ProcessLock, StoreError> {
+pub(crate) fn take_process_lock(path: &Path) -> Result<ProcessLock, StoreError> {
     let mut options = OpenOptions::new();
     options.write(true).create(true).truncate(false);
     #[cfg(unix)]
@@ -170,7 +170,7 @@ fn take_process_lock(path: &Path) -> Result<ProcessLock, StoreError> {
 }
 
 /// Makes sure the area at `path` exists as a directory the server may trust.
-fn ensure_area(path: &Path) -> Result<(), StoreError> {
+pub(crate) fn ensure_area(path: &Path) -> Result<(), StoreError> {
     match std::fs::metadata(path) {
         Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {

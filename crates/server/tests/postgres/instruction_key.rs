@@ -26,6 +26,7 @@ fn config(pg: &TestPostgres, key: PathBuf) -> Config {
         database,
         instruction_key: InstructionKeyConfig { path: key },
         storage: StorageConfig::new(pg.storage_path()),
+        object_server: None,
     }
 }
 

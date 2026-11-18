@@ -27,6 +27,7 @@ fn config(pg: &TestPostgres, storage: &Path) -> Config {
             path: pg.key_path(),
         },
         storage: StorageConfig::new(storage),
+        object_server: None,
     }
 }
 

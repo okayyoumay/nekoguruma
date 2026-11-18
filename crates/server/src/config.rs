@@ -168,6 +168,64 @@ impl StorageConfig {
     }
 }
 
+/// The `[object_server]` table (design 13, 13.3; ADR-491): the S3-compatible server the server
+/// starts as its child and stops with itself. Every path is absolute and there is no search of
+/// `PATH` (ADR-456 item 7). There is no bind-address key, no access-key key and no secret-key
+/// key: the listener is `127.0.0.1` in code, and the credentials live in files in
+/// `credentials_dir`, which the server creates.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectServerConfig {
+    /// The pinned RustFS executable (`scripts/fetch-rustfs.sh` fetches and checks it). The
+    /// server does not hash it; on Unix it refuses one, or its directory, that group or others
+    /// can write or that belongs to neither its account nor root.
+    pub binary: PathBuf,
+    /// The directory the object server keeps its data in. The server creates it (mode 0700 on
+    /// Unix) when it is absent and its parent exists, locks it for its life and hands the
+    /// `volume` directory inside it to the object server.
+    pub data_dir: PathBuf,
+    /// The directory of the two credential files the server creates (access key, secret key). It
+    /// must exist; the server never creates it.
+    pub credentials_dir: PathBuf,
+    /// The loopback port the object server listens on; the default is `http.port` plus one.
+    #[serde(default)]
+    pub port: Option<u16>,
+}
+
+impl ObjectServerConfig {
+    /// A table with the default port.
+    pub fn new(
+        binary: impl Into<PathBuf>,
+        data_dir: impl Into<PathBuf>,
+        credentials_dir: impl Into<PathBuf>,
+    ) -> ObjectServerConfig {
+        ObjectServerConfig {
+            binary: binary.into(),
+            data_dir: data_dir.into(),
+            credentials_dir: credentials_dir.into(),
+            port: None,
+        }
+    }
+
+    /// The port the object server listens on, given the server's own: `port`, else
+    /// `http_port + 1`. Refused: 0, the server's own port, and an overflow of the default. A
+    /// server port of 0 (a `Config` built in code that lets the system pick) is not compared,
+    /// and needs an explicit `port`.
+    pub fn resolved_port(&self, http_port: u16) -> Result<u16, ConfigError> {
+        let port = match self.port {
+            Some(port) => port,
+            None => http_port
+                .checked_add(1)
+                .filter(|_| http_port != 0)
+                .ok_or(ConfigError::ObjectServerPort)?,
+        };
+        if port == 0 || (http_port != 0 && port == http_port) {
+            return Err(ConfigError::ObjectServerPort);
+        }
+        Ok(port)
+    }
+}
+
 /// The whole configuration file.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -182,6 +240,10 @@ pub struct Config {
     pub instruction_key: InstructionKeyConfig,
     /// Required: the server does not start without its object store.
     pub storage: StorageConfig,
+    /// Required in a file (`Config::load` refuses a file without it). `None` only in a `Config`
+    /// built in code, which starts no object server (tests).
+    #[serde(default)]
+    pub object_server: Option<ObjectServerConfig>,
 }
 
 /// Why a configuration file was refused.
@@ -223,6 +285,23 @@ pub enum ConfigError {
     StorageDir,
     #[error("invalid configuration: storage.max_object_bytes must not be 0")]
     StorageMaxObjectBytes,
+    #[error("invalid configuration: the [object_server] table is required")]
+    ObjectServerMissing,
+    #[error(
+        "invalid configuration: object_server.binary, object_server.data_dir and \
+         object_server.credentials_dir must be absolute paths"
+    )]
+    ObjectServerPath,
+    #[error(
+        "invalid configuration: object_server.port must be from 1 to 65535 and differ from \
+         http.port (the default is http.port plus one, which must fit)"
+    )]
+    ObjectServerPort,
+    #[error(
+        "invalid configuration: object_server.data_dir must not be storage.dir, and \
+         object_server.credentials_dir must not be the directory of instruction_key.path"
+    )]
+    ObjectServerShared,
 }
 
 fn at(line: Option<usize>, column: Option<usize>) -> String {
@@ -310,7 +389,30 @@ impl Config {
         if config.storage.max_object_bytes == 0 {
             return Err(ConfigError::StorageMaxObjectBytes);
         }
+        config.check_object_server()?;
         Ok(config)
+    }
+
+    /// The checks of `[object_server]` that need no file system. Nesting of one directory in
+    /// another is not detected.
+    fn check_object_server(&self) -> Result<(), ConfigError> {
+        let object = self
+            .object_server
+            .as_ref()
+            .ok_or(ConfigError::ObjectServerMissing)?;
+        if ![&object.binary, &object.data_dir, &object.credentials_dir]
+            .iter()
+            .all(|path| path.is_absolute())
+        {
+            return Err(ConfigError::ObjectServerPath);
+        }
+        object.resolved_port(self.http.port)?;
+        if object.data_dir == self.storage.dir
+            || self.instruction_key.path.parent() == Some(object.credentials_dir.as_path())
+        {
+            return Err(ConfigError::ObjectServerShared);
+        }
+        Ok(())
     }
 
     /// Parses the text without validating values.
@@ -327,14 +429,20 @@ mod tests {
     /// `[database]`. The path is absolute on the platform the test runs on.
     #[cfg(unix)]
     const DB: &str = "[instruction_key]\npath = \"/srv/nekoguruma/instruction.key\"\n\
+                      [object_server]\nbinary = \"/opt/nekoguruma/rustfs\"\n\
+                      data_dir = \"/srv/nekoguruma/object-server\"\n\
+                      credentials_dir = \"/etc/nekoguruma\"\n\
                       [storage]\ndir = \"/srv/nekoguruma/objects\"\n\
                       [database]\nurl = \"postgres://ngr:pw@127.0.0.1:5432/nekoguruma\"\n";
     #[cfg(windows)]
     const DB: &str = "[instruction_key]\npath = 'C:\\srv\\nekoguruma\\instruction.key'\n\
+                      [object_server]\nbinary = 'C:\\opt\\nekoguruma\\rustfs.exe'\n\
+                      data_dir = 'C:\\srv\\nekoguruma\\object-server'\n\
+                      credentials_dir = 'C:\\etc\\nekoguruma'\n\
                       [storage]\ndir = 'C:\\srv\\nekoguruma\\objects'\n\
                       [database]\nurl = \"postgres://ngr:pw@127.0.0.1:5432/nekoguruma\"\n";
 
-    /// The `[instruction_key]` and `[storage]` tables of `DB`.
+    /// The tables of `DB` before `[database]`.
     fn key_table() -> &'static str {
         &DB[..DB.find("[database]").unwrap()]
     }
@@ -440,6 +548,156 @@ mod tests {
         ));
         std::fs::write(&path, DB).unwrap();
         assert!(Config::load(&path).is_ok());
+    }
+
+    /// `DB` with its `[object_server]` table replaced by `table` (empty: removed).
+    fn with_object_server(table: &str) -> String {
+        let from = DB.find("[object_server]").unwrap();
+        let to = DB.find("[storage]").unwrap();
+        format!("{}{table}{}", &DB[..from], &DB[to..])
+    }
+
+    /// The `[object_server]` table of `DB`.
+    fn object_server_table() -> String {
+        let from = DB.find("[object_server]").unwrap();
+        let to = DB.find("[storage]").unwrap();
+        DB[from..to].to_owned()
+    }
+
+    /// Loads `text` from a file.
+    fn load(text: &str) -> Result<Config, ConfigError> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.toml");
+        std::fs::write(&path, text).unwrap();
+        Config::load(&path)
+    }
+
+    // C1: the table is required in a file and optional in a `Config` built in code.
+    #[test]
+    fn load_requires_the_object_server_table_and_parse_does_not() {
+        let without = with_object_server("");
+        assert_eq!(Config::parse(&without).unwrap().object_server, None);
+        assert!(matches!(
+            load(&without),
+            Err(ConfigError::ObjectServerMissing)
+        ));
+        let c = load(DB).unwrap();
+        assert!(c.object_server.is_some());
+        // The three paths are required keys of the table.
+        for key in ["binary", "data_dir", "credentials_dir"] {
+            let text: String = object_server_table()
+                .lines()
+                .filter(|line| !line.starts_with(key))
+                .map(|line| format!("{line}\n"))
+                .collect();
+            assert!(Config::parse(&with_object_server(&text)).is_err(), "{key}");
+        }
+    }
+
+    // C2: no key can move the listener or carry a credential.
+    #[test]
+    fn the_object_server_table_has_no_bind_address_or_secret_keys() {
+        for key in [
+            "bind = \"0.0.0.0\"",
+            "address = \"0.0.0.0:9000\"",
+            "host = \"0.0.0.0\"",
+            "access_key = \"a\"",
+            "secret_key = \"s3cret-value\"",
+            "secret = \"s3cret-value\"",
+        ] {
+            let text = format!("{}{key}\n", object_server_table());
+            assert!(Config::parse(&with_object_server(&text)).is_err(), "{key}");
+            // `load` words the error without the source line.
+            let error = load(&with_object_server(&text)).unwrap_err();
+            let shown = format!("{error} / {error:?}");
+            assert!(!shown.contains("s3cret-value"), "{key}: {shown}");
+        }
+    }
+
+    // C3
+    #[test]
+    fn load_refuses_a_relative_object_server_path() {
+        for key in ["binary", "data_dir", "credentials_dir"] {
+            let text: String = object_server_table()
+                .lines()
+                .map(|line| {
+                    if line.starts_with(key) {
+                        format!("{key} = \"relative/path\"\n")
+                    } else {
+                        format!("{line}\n")
+                    }
+                })
+                .collect();
+            assert!(
+                matches!(
+                    load(&with_object_server(&text)),
+                    Err(ConfigError::ObjectServerPath)
+                ),
+                "{key}"
+            );
+        }
+    }
+
+    // C4
+    #[test]
+    fn the_object_server_port_defaults_to_the_servers_plus_one_and_refuses_the_rest() {
+        let object = ObjectServerConfig::new("/b", "/d", "/c");
+        assert_eq!(object.resolved_port(8080).unwrap(), 8081);
+        assert_eq!(load(DB).unwrap().object_server.unwrap().port, None);
+        // The default overflows at 65535; 0 and the server's own port are refused.
+        assert!(object.resolved_port(65535).is_err());
+        let with = |port: u16| ObjectServerConfig {
+            port: Some(port),
+            ..object.clone()
+        };
+        assert_eq!(with(9000).resolved_port(8080).unwrap(), 9000);
+        assert_eq!(with(9000).resolved_port(65535).unwrap(), 9000);
+        assert!(with(0).resolved_port(8080).is_err());
+        assert!(with(8080).resolved_port(8080).is_err());
+        // A server port of 0 (code-built) needs an explicit port, and is not compared.
+        assert!(object.resolved_port(0).is_err());
+        assert_eq!(with(9000).resolved_port(0).unwrap(), 9000);
+        // The same rules apply when a file is loaded.
+        for (http, port) in [
+            ("[http]\nport = 65535\n", ""),
+            ("", "port = 0\n"),
+            ("[http]\nport = 9000\n", "port = 9000\n"),
+        ] {
+            let table = format!("{}{port}", object_server_table());
+            let text = format!("{http}{}", with_object_server(&table));
+            assert!(
+                matches!(load(&text), Err(ConfigError::ObjectServerPort)),
+                "{http}{port}"
+            );
+        }
+        let ok = format!("{}port = 9100\n", object_server_table());
+        let loaded = load(&with_object_server(&ok)).unwrap();
+        assert_eq!(loaded.object_server.unwrap().port, Some(9100));
+    }
+
+    // C5
+    #[test]
+    fn load_refuses_the_data_dir_of_the_store_and_the_key_directory_as_credentials() {
+        let same_data = DB.replace(
+            &object_server_table(),
+            &object_server_table().replace("object-server", "objects"),
+        );
+        assert!(matches!(
+            load(&same_data),
+            Err(ConfigError::ObjectServerShared)
+        ));
+        let key_dir = if cfg!(windows) {
+            "C:\\srv\\nekoguruma"
+        } else {
+            "/srv/nekoguruma"
+        };
+        let table = object_server_table();
+        let (head, _) = table.split_once("credentials_dir").unwrap();
+        let shared = DB.replace(&table, &format!("{head}credentials_dir = '{key_dir}'\n"));
+        assert!(matches!(
+            load(&shared),
+            Err(ConfigError::ObjectServerShared)
+        ));
     }
 
     #[test]

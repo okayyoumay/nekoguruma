@@ -1227,6 +1227,7 @@ async fn start_turns_the_queue_on_and_bind_leaves_it_off() {
             path: pg.key_path(),
         },
         storage: StorageConfig::new(pg.storage_path()),
+        object_server: None,
     };
     let started = Server::start(&config).await.unwrap();
     assert!(started.job_queue_enabled());

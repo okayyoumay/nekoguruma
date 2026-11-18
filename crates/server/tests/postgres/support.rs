@@ -273,6 +273,22 @@ pub fn refused_url(password: &str) -> String {
     )
 }
 
+/// The `[object_server]` table of a configuration file in `dir`: the fake object server
+/// (`src/bin/ngr-fake-object-server.rs`), a data directory `object-server` and a credentials
+/// directory `credentials` (made here) in `dir`, and a free port. A literal string, since a
+/// Windows path holds backslashes.
+pub fn object_server_table(dir: &Path) -> String {
+    let credentials = dir.join("credentials");
+    std::fs::create_dir_all(&credentials).expect("a credentials directory");
+    format!(
+        "[object_server]\nbinary = '{}'\ndata_dir = '{}'\ncredentials_dir = '{}'\nport = {}\n",
+        env!("CARGO_BIN_EXE_ngr-fake-object-server"),
+        dir.join("object-server").display(),
+        credentials.display(),
+        free_port()
+    )
+}
+
 pub fn free_port() -> u16 {
     std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .expect("bind a free port")

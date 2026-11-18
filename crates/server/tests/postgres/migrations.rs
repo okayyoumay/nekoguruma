@@ -28,6 +28,7 @@ fn config(pg: &TestPostgres) -> Config {
             path: pg.key_path(),
         },
         storage: StorageConfig::new(pg.storage_path()),
+        object_server: None,
     }
 }
 
@@ -160,6 +161,7 @@ async fn a_start_against_a_database_that_is_down_fails_within_the_connect_timeou
             path: std::env::temp_dir().join("never-created.key"),
         },
         storage: StorageConfig::new(std::env::temp_dir().join("never-created-storage")),
+        object_server: None,
     };
     let started = std::time::Instant::now();
     let result = tokio::time::timeout(LIMIT, Server::start(&config))

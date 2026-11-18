@@ -273,10 +273,11 @@ fn write_config(dir: &Path, database_url: &str) -> PathBuf {
         &path,
         format!(
             "[instruction_key]\npath = '{}'\n\
-             [storage]\ndir = '{}'\n\
+             [storage]\ndir = '{}'\n{}\
              [database]\nurl = \"{database_url}\"\nconnect_timeout_secs = 2\n",
             dir.join("instruction.key").display(),
-            dir.join("storage").display()
+            dir.join("storage").display(),
+            crate::support::object_server_table(dir)
         ),
     )
     .unwrap();

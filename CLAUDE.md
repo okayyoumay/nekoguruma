@@ -164,6 +164,11 @@ tests start a throwaway cluster per test, and a missing PostgreSQL fails them. T
 in `NGR_TEST_PG_BIN`, then on `PATH`, then in the highest `/usr/lib/postgresql/<version>/bin`,
 then in `PGBIN` (ADR-458); CI sets `NGR_TEST_PG_BIN` from the runner image. As root the helper
 runs PostgreSQL as the `postgres` account, so `TMPDIR` must be a directory that account can enter.
+The server's tests also start the pinned RustFS, its bundled object server (ADR-491): run
+`scripts/fetch-rustfs.sh` (it downloads the release, checks its recorded SHA-256 and prints the
+binary's path) and set `NGR_TEST_RUSTFS_BIN` to that path; CI does so in `core-linux` and
+`core-windows`, and a missing binary fails the real-binary tests with one message naming the script.
+`scripts/test-fetch-rustfs.sh` tests the script and runs in `repo-checks.yml`.
 
 CI runs the tests with [cargo-nextest](https://nexte.st/) instead. The `core-linux` job runs
 `cargo nextest run --workspace --locked --profile ci`, then

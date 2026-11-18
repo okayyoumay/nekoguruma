@@ -1601,6 +1601,8 @@ The same code is switched by configuration. Profile differences are limited to s
 
 On the local deployment the object store is a directory the server's configuration names (`[storage]`, ADR-474). An object is begun, appended to at the offset the store holds, and finished with its whole length and SHA-256, and only then can it be read; the store issues each object's key, which the row that names the object records as its `storage_key`, and one server process holds the directory. How design 14.3's direct upload fits this contract on the standard deployment is decided with the data channel.
 
+The local deployment also bundles an S3-compatible server, RustFS, pinned to one release, which the server starts as its child before it opens the object store and stops with itself (`[object_server]`, ADR-491). It listens on `127.0.0.1` only (the address is fixed in code and its console is off) and authenticates with an access key and a secret key that the server creates at its first start in two owner-only files, as it does the instruction key (ADR-462); the configuration never holds them. A pinned binary is fetched and hash-checked by one script for installations and CI. Nothing reads or writes through it yet; the S3 implementation of the object-storage trait and the data channel's use of it are later work.
+
 ### 13.1 Functional Limitations of the Personal Deployment
 
 | | Details |
@@ -1625,6 +1627,7 @@ Such operations are hidden in the UI from the outset and are also stated explici
 - In the personal deployment, backup is the user's responsibility, so provide an export function
 - Registration needs no login, since the agent has no session, and on this profile it runs over plain HTTP to the pinned origin. What authorizes it is the registration code (6.7, 14.4); the code is issued by a command that trusts its own database connection as the server does, so whoever can reach the database is the Administrator. A process that holds the port during registration could answer the agent, so the agent takes the instruction key only when its fingerprint equals the server key ID that the operator passed out of band (ADR-463)
 - The job instruction key is an owner-only file beside the server's configuration, not in the database: it is in neither a database dump nor the export above, and losing it costs re-registration of the agents, not data (ADR-462)
+- The bundled object server (RustFS) is the server's child, bound to `127.0.0.1` with its console off, and ends with the server: the server stops it in its own stop, and if the server dies a parent-death signal (Linux) or a kill-on-close job object (Windows) ends it. Its credentials are two owner-only files created by the server at its first start, handed to it as file paths and never held in the configuration, an environment, an argument or a log (ADR-491). Another OS user cannot connect with no credentials (an anonymous request is refused), but one who can read the credential files, or the server's account, can; the files' protection is the directory's and the file's mode (Unix) or ACL (Windows)
 
 ### 13.4 Testing Use
 

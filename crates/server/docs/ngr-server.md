@@ -126,7 +126,7 @@ bucket = "nekoguruma"        # default; the object store's bucket
    the process with exit 1; nothing is retried. The commands `registration-code` and `user` never
    read the credentials, lock the data directory or spawn the child.
 6. Open the object store (below): check the bucket on the object server and create it when it is
-   absent, retrying a connection that fails or a 5xx every 100 ms within 30 seconds, and stopping
+   absent, retrying a connection that fails or a 5xx every 100 ms within 30 seconds of its own (after step 5's wait), and stopping
    at once if the object server ends meanwhile. A failure (a refusal of the credentials, a status
    the store does not expect, the budget spent, the child ending) stops the object server, closes
    the database pool and ends the process with exit 1. The commands `registration-code` and `user`
@@ -292,9 +292,9 @@ hand, so `Arc<dyn MultipartStore>` works, and `Server::object_store()` returns t
   `AlreadyFinished` if the object exists and `NotFound` if not.
 - `complete(upload, sha256, length)` takes the key's lock, lists the parts and checks them itself
   (`NoParts`; numbered consecutively from 1, else `MissingPart`; each but the last at least
-  5 MiB, else `PartTooSmall`; the sizes add up to `length`, else `PartsLengthMismatch` with the sum, answered before anything is completed so the upload
-  stays as it is; at
-  most 4 GiB, else `ObjectTooLarge`), sends CompleteMultipartUpload with the entity tags the
+  5 MiB, else `PartTooSmall`; the sizes add up to `length`, else `PartsLengthMismatch` with the sum,
+  answered before anything is completed so the upload stays as it is; at most 10000 parts,
+  else `PartsChanged`; at most 4 GiB, else `ObjectTooLarge`), sends CompleteMultipartUpload with the entity tags the
   listing gave (a refusal of a part is `PartsChanged`), then reads the object back, streaming its
   SHA-256, and compares length and digest. A mismatch deletes the object (the delete order below)
   and is answered as `LengthMismatch` (the read-back's length) or `HashMismatch` only once the delete has succeeded; a
@@ -1155,7 +1155,7 @@ a new migration file rebuilds the crate. How migrations are written and applied 
   an upload lost to a race, the object server's own refusal of a part), the key lock (two
   completions, a delete behind a completion, another key free), `get` and the delete order (the
   exact key, three rounds, nothing to delete, a failed abort).
-- The object store's unit tests (`storage/local/tests.rs`) need no database and run on every
+- The local store's unit tests (`storage/local/tests.rs`) need no database and run on every
   platform, the Unix-only ones gated by `cfg(unix)`. They cover every operation on a key nobody
   issued, an unfinished, a finished and a deleted object; the key syntax table; the size limit
   (exactly the limit, one past it, a limit lowered across a restart, finish unaffected); the

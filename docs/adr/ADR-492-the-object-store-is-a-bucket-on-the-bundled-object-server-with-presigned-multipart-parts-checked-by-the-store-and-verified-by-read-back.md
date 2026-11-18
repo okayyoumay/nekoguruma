@@ -28,7 +28,7 @@ Consequences).
 2. **The server opens the store after the object server is ready** (ADR-491's step 5, then this
    one). It checks the bucket with HeadBucket and creates it when absent (a 409 that says the
    bucket is ours counts as present), retrying a failed connection or a 5xx every 100 ms within
-   the 30 seconds of the ready budget, and giving up at once if the child ends meanwhile; a
+   30 seconds, a budget of its own after ADR-491's readiness wait, and giving up at once if the child ends meanwhile; a
    refusal (401, 403) or an unexpected 4xx ends the open. A failure stops the child, closes the
    pool and exits 1, as ADR-491's other failures. ADR-491's signed readiness check is this
    HeadBucket. The subcommands never open the store.
@@ -75,12 +75,12 @@ Consequences).
    `Debug` would show it), the upload ID is a bearer for the upload, and the object server's
    messages repeat keys: no URL, key text, upload ID or server message goes into an error or a
    log line. An error is a fixed message, an operation name, an HTTP status or an `ErrorKind`.
-   A 404 means gone only with the code that says so (`NoSuchKey`, `NoSuchUpload`); a missing
+   A 404 means gone only with the code that says so (`NoSuchKey`, `NoSuchUpload`; a HEAD has no body, so its 404 alone means missing); a missing
    bucket or any other code is a `Server` error, so a deleted bucket is never read as an empty store.
    `PartUrl` and `UploadId` have a redacting `Debug` and no `Display`.
 10. **Errors.** `InvalidPartNumber`, `InvalidUploadId`, `NoParts`, `MissingPart { part }`,
-    `PartTooSmall { part }`, `PartsChanged` (a listing that is not ascending or does not advance,
-    or the object server's complaint about a part), `ObjectTooLarge`, `PartsLengthMismatch { stored }` (the listing's sizes, before any completion) and
+    `PartTooSmall { part }`, `PartsChanged` (a listing that is not ascending, does not advance or
+    holds more than 10000 parts, or the object server's complaint about a part), `ObjectTooLarge`, `PartsLengthMismatch { stored }` (the listing's sizes, before any completion) and
     `LengthMismatch { stored }` (the read-back's length, after the delete), `HashMismatch`, `AlreadyFinished` and `NotFound` (a gone upload, the first when the object
     exists), `Refused { op }`, `Server { op, status }` and `Io { op, kind }`.
 11. **Tests.** The store's units run against a scripted loopback listener; the real RustFS tests

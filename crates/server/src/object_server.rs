@@ -573,17 +573,17 @@ fn command(
             // orders the stop.
             .process_group(0);
         #[cfg(target_os = "linux")]
-        {
-            let parent = std::process::id() as libc::pid_t;
-            // The descriptor limit is read here, before the fork, so that the closure's loop
-            // (the fallback for a kernel without `close_range`) needs no call that is unsafe
-            // after a fork.
-            let fd_limit = descriptor_limit();
-            // SAFETY: the closure runs between fork and exec and calls only `prctl`, `getppid`,
-            // `_exit`, the `close_range` system call and `fcntl`, which are async-signal-safe, and
-            // allocates nothing.
-            unsafe {
-                command.pre_exec(move || {
+        let parent = std::process::id() as libc::pid_t;
+        // The descriptor limit is read here, before the fork, so that the closure's loop needs
+        // no call that is unsafe after a fork.
+        let fd_limit = descriptor_limit();
+        // SAFETY: the closure runs between fork and exec and calls only `prctl`, `getppid`,
+        // `_exit`, the `close_range` system call and `fcntl`, which are async-signal-safe, and
+        // allocates nothing.
+        unsafe {
+            command.pre_exec(move || {
+                #[cfg(target_os = "linux")]
+                {
                     // The signal fires when the thread that spawned the child ends (the spawning
                     // thread outlives the server's use of the child).
                     if libc::prctl(
@@ -600,26 +600,31 @@ fn command(
                     if libc::getppid() != parent {
                         libc::_exit(1);
                     }
-                    // No descriptor but 0, 1 and 2 reaches the child (R11): one the server
-                    // inherited without close-on-exec (a test harness's or a service manager's)
-                    // would otherwise pass to it. Marking them close-on-exec, rather than closing
-                    // them, keeps the pipe through which the standard library reports a failed
-                    // exec. `close_range` needs Linux 5.11; older kernels get the same by a loop.
+                }
+                // No descriptor but 0, 1 and 2 reaches the child (R11), on every Unix: one the
+                // server inherited without close-on-exec (a test harness's or a service
+                // manager's) would otherwise pass to it. Marking them close-on-exec, rather than
+                // closing them, keeps the pipe through which the standard library reports a
+                // failed exec. Linux 5.11 and later do it in one call; elsewhere a loop does.
+                #[cfg(target_os = "linux")]
+                let marked = {
                     const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
-                    if libc::syscall(
+                    libc::syscall(
                         libc::SYS_close_range,
                         3 as libc::c_uint,
                         libc::c_uint::MAX,
                         CLOSE_RANGE_CLOEXEC,
-                    ) != 0
-                    {
-                        for fd in 3..fd_limit {
-                            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
-                        }
+                    ) == 0
+                };
+                #[cfg(not(target_os = "linux"))]
+                let marked = false;
+                if !marked {
+                    for fd in 3..fd_limit {
+                        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
                     }
-                    Ok(())
-                });
-            }
+                }
+                Ok(())
+            });
         }
     }
     #[cfg(windows)]
@@ -637,7 +642,7 @@ fn command(
 
 /// How many descriptors a process may have open: the soft `RLIMIT_NOFILE`, at most 65 536 (the
 /// loop that uses it runs in the child and must stay short), and 4096 if it cannot be read.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn descriptor_limit() -> libc::c_int {
     let mut limit = libc::rlimit {
         rlim_cur: 0,

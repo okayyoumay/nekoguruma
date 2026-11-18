@@ -22,7 +22,9 @@ Each ECU is one ECU definition directory in the CSV format of `../../docs/csv-ta
 `identify.star` is one read procedure that every ECU declares the services for. `sim/` holds a
 `sim-ecu` configuration (`EcuConfig`) for each ECU of one example vehicle, and
 `crates/diag-frontend/tests/fictional_vehicle.rs` converts every directory, checks the vehicle-wide
-rules below and runs the identification against `sim-ecu`.
+rules below and runs the identification against `sim-ecu`. `write-coding.star` is the engine
+controller's coding change (section 11); only the engine controller's tables declare the
+`requestSeed` and `sendKey` services it needs.
 
 ## 1. Vehicle Identification
 
@@ -124,6 +126,10 @@ Every ECU supports these services. A service not listed gets NRC `0x11`.
 | `0x36` | TransferData (14.4) | ECM, TCM | programming | level 1 | refused |
 | `0x37` | RequestTransferExit (14.5) | ECM, TCM | programming | level 1 | refused |
 | `0x3E` | TesterPresent (9.7) | `00` | all | none | allowed |
+
+The engine controller's tables declare the two SecurityAccess sub-functions as the services
+`requestSeed` and `sendKey` (besides the bare `securityAccess` service), so that a procedure can
+send them with `diag.request` (section 11).
 
 Negative responses (ISO 14229-1 (2026) Annex A.1) every ECU may give: `0x12`, `0x13`, `0x22`,
 `0x24`, `0x31`, `0x33` and `0x7F`; for SecurityAccess also `0x35`, `0x36` and `0x37`; behind the
@@ -346,7 +352,9 @@ the ECU's mask, big endian:
 
 The third false key in a row returns NRC `0x36` and starts a 10 s delay, during which requestSeed
 returns NRC `0x37` (ISO 14229-1 (2026) 9.4.1 leaves the length to the manufacturer). A power cycle
-or ECU reset clears the counter. The ECM's mask is the one `sim-ecu` uses.
+or ECU reset clears the counter. The ECM's mask is the one `sim-ecu` uses; its tables declare
+`requestSeed` (seed, 4 bytes; NRC `0x37`) and `sendKey` (key, 4 bytes; NRC `0x35`, `0x36`), which
+`write-coding.star` sends (section 11).
 
 ## 8. Reprogramming (ECM, TCM)
 
@@ -399,8 +407,78 @@ so the answer is the DID-level one of ISO 14229-1 (2026) 10.7.4), then the recor
 value, and a read returns it. The simulator does not check the values: a market other than 0 or 1,
 or a reserved option bit, is stored as written.
 
+The ECM's tables declare `requestSeed` and `sendKey` for `write-coding.star` (section 11);
+`sim-ecu` already answers the requests.
+
 `sim-ecu` does not answer `F18C`, `F197`, `1010`, the engine controller's routines `0201` and `0202`,
 the other ECUs' DIDs and routines of section 6,
 or the other ECUs' masks, and `sim-vci` simulates one ECU on the engine controller's identifiers;
 `identify.star` and the vehicle test therefore use the common part, and the coding tests use the
 engine controller.
+
+## 11. Procedures
+
+`identify.star` (section 1) only reads. `write-coding.star` is the one procedure of the vehicle
+that changes configuration data: it sets the cruise-control option (bit 1 of the options byte of
+DID `0120`, section 6.3) of the engine controller and leaves the market and the target idle speed
+as they are. It is converted with the ECM definition (both variants) and run as a configuration
+write job; the gateway's authentication (section 5) is the job's precondition, not a step of the
+procedure.
+
+Steps:
+
+1. Read the coding in the default session and keep it as the saved value. A refused read, or
+   one whose response is not the full 7 bytes (SID, DID and the 4-byte record), ends the
+   procedure as `READ_CODING`; every read of the coding checks the length before it takes a field.
+2. If the cruise-control bit is already set, finish; nothing is sent.
+3. Open the extended session (`SESSION` when refused).
+4. Request the seed and, unless it is all zero (the level is already unlocked, ISO 14229-1 (2026)
+   9.4.1), send the key, the seed XOR `5A5A5A5A` (section 7). A refusal of either is `SECURITY`.
+5. Write the coding with the bit set and the other fields as read, then read it back. When the
+   read-back is the written value the procedure finishes.
+6. Otherwise decide. A refused write gets a read first: when the coding equals the saved value
+   the procedure ends as `WRITE_REFUSED` and nothing more is sent; any other state (changed,
+   unreadable, or a read of the wrong length) is rolled back. The roll-back writes the saved value
+   and reads it back: a refused roll-back write ends the procedure as `ROLLBACK_REFUSED`, a
+   read-back that is not the saved value as `ROLLBACK_UNCONFIRMED`, and a confirmed one as
+   `CODING_ROLLED_BACK`.
+
+Outcome codes (`diag.fail`), in order of occurrence:
+
+| Code | Meaning | Coding afterwards |
+|---|---|---|
+| `READ_CODING` | the first read failed | untouched |
+| `SESSION` | the extended session was refused | untouched |
+| `SECURITY` | the seed or the key was refused | untouched |
+| `WRITE_REFUSED` | the write was refused and the coding reads as saved | as saved |
+| `CODING_ROLLED_BACK` | the new value did not read back (or the write was refused with the coding changed); the saved value is back and confirmed | as saved |
+| `ROLLBACK_REFUSED` | the saved value could not be written back | unknown, needs a person |
+| `ROLLBACK_UNCONFIRMED` | the saved value was written back but did not read back | unknown, needs a person |
+
+Steps 1 to 4 come before the first write, in `main`; from the
+first write to the end, the write, the read-back, the roll-back, the confirming read and every
+`diag.fail` after the write are one `# @section uninterruptible` function that returns nothing and
+is the last statement of `main` (ADR-330). Consequences:
+
+- A cancel set during the section is taken after it: the procedure ends on its own outcome, so a
+  cancelled job never leaves a half-written coding behind. A cancel before the first write is taken
+  at the next interruptible point and the coding is untouched.
+- A crash of the agent or the worker inside the section: the restart does not continue from a
+  checkpoint inside an uninterruptible section of a plain procedure (ADR-335 item 5), so the job is
+  not resumed into the middle of it, and the coding may be the new, the saved or an unconfirmed
+  value. A new run reads the coding first (step 1): one that already has the bit finishes at step
+  2, one that has not runs again from the start.
+- The ECU leaves the extended session after S3server without a request (section 3); the worker's
+  tester present keeps it while the procedure runs. A session lost between the unlock and the write
+  shows as a refused write, which the decision of step 6 handles.
+
+The seed and the key are raw `0x27` requests (`diag.request` of the `requestSeed` and `sendKey`
+services), not `diag.security_access`: the agent refuses the SecurityAccess instruction until the
+host has a key source (ADR-259), and for a simulator the key rule is the ECM's mask above. When the
+host computes keys, the two requests become one `diag.security_access(0x01)`.
+
+Tests: `crates/diag-frontend/tests/fictional_vehicle.rs` converts the procedure for both ECM
+variants, checks its shape and dry-runs every path with scripted answers; the job against the
+simulators (gateway not authenticated, authenticated, repeated) is
+`crates/j2534-0404-service/tests/agent_write_coding.rs`. The roll-back path is not run against the
+simulators yet.

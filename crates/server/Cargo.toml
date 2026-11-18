@@ -48,7 +48,7 @@ hyper-util = { version = "0.1", features = ["tokio", "service"] }
 tower = { version = "0.5", default-features = false }
 # Only its error types: the control channel tells a message over the limit from other read errors
 # by the stack's own error (ADR-468). It must stay the version axum's WebSocket uses.
-tungstenite = { version = "0.29", default-features = false }
+tungstenite = { version = "0.30", default-features = false }
 
 # Unix only: the open flags and the effective user ID that the key file's checks use, and the
 # signal and parent-death calls of the object server child (ADR-491).

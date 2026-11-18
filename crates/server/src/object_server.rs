@@ -173,6 +173,10 @@ pub struct ObjectServer {
     // Field order is drop order: the child is killed first, then the lock is released, and the
     // spawning thread, whose end is what Linux's parent-death signal is bound to, ends last.
     child: Child,
+    /// The child's process ID, which is also its process group's (it leads a group of its own),
+    /// kept from the spawn: once the child is reaped `Child::id` is gone, and the group may still
+    /// hold its descendants.
+    group: Option<u32>,
     port: u16,
     credentials: Credentials,
     forwarders: Vec<JoinHandle<()>>,
@@ -213,8 +217,10 @@ impl ObjectServer {
         }
         let command = command(&binary, &config.data_dir, &volume, port, &credentials);
         let (child, spawner) = spawn(command).await?;
+        let group = child.id();
         let mut server = ObjectServer {
             child,
+            group,
             port,
             credentials,
             forwarders: Vec::new(),
@@ -319,7 +325,7 @@ impl ObjectServer {
     /// second stop signal) skips the wait. Then the forwarders are joined for at most one second
     /// and aborted after that. Failures are logged and do not change the caller's exit code.
     pub async fn stop(mut self, force: impl Future<Output = ()>) {
-        let group = self.child.id();
+        let group = self.group;
         stop_child(&mut self.child, self.stop_timeout, force).await;
         // Whatever the child left in its process group (Unix) goes with it, so that nothing
         // that holds its pipes or its port outlives the stop.

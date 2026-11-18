@@ -956,6 +956,27 @@ async fn a_grandchild_in_the_childs_group_is_killed_with_it() {
     wait_ended(pid, Duration::from_secs(2)).await;
 }
 
+/// Codex review: a child that ended and was reaped before the stop still has its group killed,
+/// since the group's ID is kept from the spawn.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_grandchild_outlives_no_stop_after_its_parent_was_reaped() {
+    let fx = Fixture::new("grandchild same\ndie_after_ms 100\n");
+    let mut server = fx.start(5000, 1000).await.unwrap();
+    // The child ends after its first ready answer; `exited` reaps it.
+    let how = tokio::time::timeout(Duration::from_secs(5), server.exited())
+        .await
+        .expect("the child ends");
+    assert!(!how.is_empty());
+    let pid: u32 = std::fs::read_to_string(fx.data().join("grandchild.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    server.stop(std::future::pending()).await;
+    wait_ended(pid, Duration::from_secs(2)).await;
+}
+
 // ---------------------------------------------------------------------------------------------
 // With the server: S1, S2, S4, S7, C11, C1, R1, R3, T1, T3
 

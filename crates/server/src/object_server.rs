@@ -558,8 +558,9 @@ fn command(
         #[cfg(target_os = "linux")]
         {
             let parent = std::process::id() as libc::pid_t;
-            // SAFETY: the closure runs between fork and exec and calls only `prctl`, `getppid`
-            // and `_exit`, which are async-signal-safe, and allocates nothing.
+            // SAFETY: the closure runs between fork and exec and calls only `prctl`, `getppid`,
+            // `_exit`, the `close_range` system call and `fcntl`, which are async-signal-safe, and
+            // allocates nothing.
             unsafe {
                 command.pre_exec(move || {
                     // The signal fires when the thread that spawned the child ends (the spawning
@@ -577,6 +578,23 @@ fn command(
                     // The parent may have died before the signal was armed.
                     if libc::getppid() != parent {
                         libc::_exit(1);
+                    }
+                    // No descriptor but 0, 1 and 2 reaches the child (R11): one the server
+                    // inherited without close-on-exec (a test harness's or a service manager's)
+                    // would otherwise pass to it. Marking them close-on-exec, rather than closing
+                    // them, keeps the pipe through which the standard library reports a failed
+                    // exec. `close_range` needs Linux 5.11; older kernels get the same by a loop.
+                    const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
+                    if libc::syscall(
+                        libc::SYS_close_range,
+                        3 as libc::c_uint,
+                        libc::c_uint::MAX,
+                        CLOSE_RANGE_CLOEXEC,
+                    ) != 0
+                    {
+                        for fd in 3..4096 {
+                            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                        }
                     }
                     Ok(())
                 });

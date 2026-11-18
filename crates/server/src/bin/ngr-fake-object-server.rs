@@ -53,12 +53,15 @@ fn main() {
     if get("grandchild") == Some("1") {
         let _ = std::process::Command::new("sleep").arg("4").spawn();
     }
+    // Echoes the text of the file the server names, the redaction tests' input (the server
+    // must replace it in what it forwards). A test binary only: it holds no credentials of
+    // its own.
     if get("print_secret") == Some("1") {
         let path = std::env::var_os("RUSTFS_SECRET_KEY_FILE").unwrap_or_default();
-        let secret = std::fs::read_to_string(path).unwrap_or_default();
-        println!("secret is {secret}");
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        println!("echo is {text}");
         eprintln!(
-            "\u{1b}[31msecret again {secret}\u{1b}[0m {}",
+            "\u{1b}[31mecho again {text}\u{1b}[0m {}",
             "z".repeat(20_000)
         );
     }

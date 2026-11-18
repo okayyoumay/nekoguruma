@@ -745,8 +745,8 @@ async fn the_output_is_forwarded_bounded_and_without_the_secret() {
     let fx = Fixture::new("print_secret 1\nreport 1\n");
     let server = fx.start(5000, 1000).await.unwrap();
     let secret = fx.secret();
-    log_has(&log, "secret again").await;
-    log_has(&log, "secret is [redacted]").await;
+    log_has(&log, "echo again").await;
+    log_has(&log, "echo is [redacted]").await;
     let text = log.text();
     assert!(!text.contains(&secret), "the secret is in the log");
     // Colour codes are replaced, and the 20 000-character line is cut.
@@ -754,10 +754,7 @@ async fn the_output_is_forwarded_bounded_and_without_the_secret() {
         !text.contains('\u{1b}') || text.contains("\u{1b}["),
         "{text}"
     );
-    let forwarded: Vec<&str> = text
-        .lines()
-        .filter(|l| l.contains("secret again"))
-        .collect();
+    let forwarded: Vec<&str> = text.lines().filter(|l| l.contains("echo again")).collect();
     assert_eq!(forwarded.len(), 1);
     assert!(forwarded[0].len() < 1400, "{}", forwarded[0].len());
     assert!(forwarded[0].contains("?[31m"), "{}", forwarded[0]);

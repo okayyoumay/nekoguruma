@@ -58,7 +58,7 @@ max_object_bytes = 4294967296              # default 4 GiB, at least 1
 [object_server]              # required in a file
 binary = "/opt/nekoguruma/rustfs"          # absolute; what scripts/fetch-rustfs.sh prints
 data_dir = "/var/lib/nekoguruma/object-server"   # absolute; created when absent
-credentials_dir = "/etc/nekoguruma"        # absolute; must exist
+credentials_dir = "/etc/nekoguruma/object-server"   # absolute; must exist; not the key's directory
 port = 8081                  # default: http.port + 1
 ```
 
@@ -212,6 +212,9 @@ the signed-request readiness check come with later work, and the object store ab
   can leave an orphan, and the next start fails at the port check, naming `object_server.port`.
   A service manager should signal the server alone first: with systemd, `KillMode=mixed` (SIGTERM
   to the server, SIGKILL to what remains in the control group after the stop timeout).
+- **The stop's tail.** After the child is reaped the server kills its process group (Unix), so a
+  grandchild that holds the child's pipes or port does not outlive the stop, and then joins the
+  two log forwarders together for at most 1 second, aborting what is left.
 - **Not covered.** A hung child is not detected (no probe after the start), and a stranger on the
   object server's port is not told from it.
 

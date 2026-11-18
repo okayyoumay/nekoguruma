@@ -53,9 +53,9 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::config::{ConfigError, ObjectServerConfig};
-use crate::fs_guard::{DirectoryFault, check_directory};
+use crate::fs_guard::sync_directory;
 use crate::storage::StoreError;
-use crate::storage::local::{ProcessLock, create_directory, ensure_area, take_process_lock};
+use crate::storage::local::{ProcessLock, ensure_area, open_locked_dir};
 pub use credentials::{Credentials, CredentialsError};
 
 /// How long the server waits for the object server to answer its readiness probe.
@@ -64,6 +64,10 @@ pub const READY_TIMEOUT: Duration = Duration::from_secs(30);
 pub const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 /// The longest one readiness probe may take, connect and answer together.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+/// The longest the connect of one probe may take. A connect to a port nothing listens on can take
+/// about two seconds to be refused (Windows), which would eat the readiness budget before the child
+/// has bound; a cut connect is retried at once instead.
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 /// The pause between two probes.
 const PROBE_INTERVAL: Duration = Duration::from_millis(100);
 /// How long the stop sequence waits for the log forwarders after the child ended.
@@ -80,7 +84,8 @@ pub const VOLUME_DIR: &str = "volume";
 pub struct Tuning {
     pub ready_timeout: Duration,
     pub stop_timeout: Duration,
-    /// Makes the step after the spawn fail, to prove that a child is then stopped and reaped.
+    /// Makes the start fail once the child is ready, to prove that a ready child is then stopped
+    /// and reaped.
     pub fail_after_spawn: bool,
 }
 
@@ -126,6 +131,10 @@ pub enum ObjectServerError {
     },
     #[error("object_server.data_dir is not a directory")]
     DataDirNotADirectory,
+    #[error(
+        "the lock file in object_server.data_dir is not a regular file (a symbolic link is refused)"
+    )]
+    DataDirFileNotRegular,
     #[error("object_server.data_dir is owned by neither the account the server runs as nor root")]
     DataDirNotOwned,
     #[error(
@@ -213,7 +222,7 @@ impl ObjectServer {
             _lock: lock,
             _spawner: spawner,
         };
-        if let Err(error) = server.after_spawn(tuning) {
+        if let Err(error) = server.after_spawn() {
             server.stop(std::future::pending()).await;
             return Err(error);
         }
@@ -221,13 +230,19 @@ impl ObjectServer {
             server.stop(std::future::pending()).await;
             return Err(error);
         }
+        if tuning.fail_after_spawn {
+            server.stop(std::future::pending()).await;
+            return Err(ObjectServerError::Setup(
+                "a step after the start failed (test hook)",
+            ));
+        }
         tracing::info!(port, "object server ready");
         Ok(server)
     }
 
     /// Takes the child's pipes into the log forwarders. A failure here, or the test hook, is a
     /// failure after the spawn.
-    fn after_spawn(&mut self, tuning: &Tuning) -> Result<(), ObjectServerError> {
+    fn after_spawn(&mut self) -> Result<(), ObjectServerError> {
         let secret = Arc::new(Zeroizing::new(self.credentials.expose_secret().to_owned()));
         let stdout = self.child.stdout.take();
         let stderr = self.child.stderr.take();
@@ -239,7 +254,7 @@ impl ObjectServer {
             self.forwarders
                 .push(forward::spawn("stderr", stderr, Arc::clone(&secret)));
         }
-        if tuning.fail_after_spawn || self.forwarders.len() != 2 {
+        if self.forwarders.len() != 2 {
             return Err(ObjectServerError::Setup("the child's output is not piped"));
         }
         Ok(())
@@ -304,17 +319,39 @@ impl ObjectServer {
     /// second stop signal) skips the wait. Then the forwarders are joined for at most one second
     /// and aborted after that. Failures are logged and do not change the caller's exit code.
     pub async fn stop(mut self, force: impl Future<Output = ()>) {
+        let group = self.child.id();
         stop_child(&mut self.child, self.stop_timeout, force).await;
-        for forwarder in std::mem::take(&mut self.forwarders) {
-            let abort = forwarder.abort_handle();
-            if tokio::time::timeout(FORWARDER_JOIN, forwarder)
-                .await
-                .is_err()
-            {
+        // Whatever the child left in its process group (Unix) goes with it, so that nothing
+        // that holds its pipes or its port outlives the stop.
+        kill_group(group);
+        let mut forwarders = std::mem::take(&mut self.forwarders);
+        let aborts: Vec<_> = forwarders.iter().map(JoinHandle::abort_handle).collect();
+        // One bound for all of them, not one each.
+        let joined = tokio::time::timeout(FORWARDER_JOIN, async {
+            for forwarder in &mut forwarders {
+                let _ = forwarder.await;
+            }
+        })
+        .await;
+        if joined.is_err() {
+            for abort in aborts {
                 abort.abort();
             }
         }
     }
+}
+
+/// Kills the process group of the child with ID `pid` (its group ID, since it leads its own
+/// group). The child is reaped already; a group with no member is not an error.
+fn kill_group(pid: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(pid) = pid {
+        // SAFETY: `kill` with a negative ID signals a process group and has no other
+        // precondition.
+        unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+    }
+    #[cfg(not(unix))]
+    let _ = pid;
 }
 
 /// How a child ended, or why that is not known.
@@ -459,25 +496,16 @@ fn binary_fault(
     None
 }
 
-/// The error for a directory the shared check refused, named for the data directory.
-fn data_dir_fault(fault: DirectoryFault) -> ObjectServerError {
-    match fault {
-        DirectoryFault::Io(kind) => ObjectServerError::DataDirIo {
-            op: "inspect",
-            kind,
-        },
-        DirectoryFault::NotADirectory => ObjectServerError::DataDirNotADirectory,
-        DirectoryFault::NotOwned => ObjectServerError::DataDirNotOwned,
-        DirectoryFault::Writable => ObjectServerError::DataDirWritable,
-    }
-}
-
 fn data_dir_store_error(error: StoreError) -> ObjectServerError {
     match error {
         StoreError::InUse => ObjectServerError::DataDirInUse,
         StoreError::NotADirectory => ObjectServerError::DataDirNotADirectory,
         StoreError::DirectoryNotOwned => ObjectServerError::DataDirNotOwned,
         StoreError::DirectoryWritable => ObjectServerError::DataDirWritable,
+        StoreError::DirectoryNotAbsolute => {
+            ObjectServerError::Config(ConfigError::ObjectServerPath)
+        }
+        StoreError::NotRegularFile => ObjectServerError::DataDirFileNotRegular,
         StoreError::Io { op, kind } => ObjectServerError::DataDirIo { op, kind },
         _ => ObjectServerError::DataDirIo {
             op: "use",
@@ -486,37 +514,20 @@ fn data_dir_store_error(error: StoreError) -> ObjectServerError {
     }
 }
 
-/// Creates the data directory if it is absent (its parent must exist), checks it, locks it and
-/// makes the volume directory in it. Returns the lock, which the object server holds for its life,
-/// and the volume's path.
+/// Creates the data directory if it is absent (its parent must exist), checks it, locks it
+/// ([`open_locked_dir`], the object store's code) and makes the volume directory in it, syncing
+/// the new entries. Returns the lock, which the object server holds for its life, and the
+/// volume's path.
 fn prepare_data_dir(dir: &Path) -> Result<(ProcessLock, PathBuf), ObjectServerError> {
-    match std::fs::metadata(dir) {
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            create_directory(dir).map_err(|error| ObjectServerError::DataDirIo {
-                op: "create",
-                kind: error.kind(),
-            })?;
-            if let Some(parent) = dir.parent() {
-                crate::fs_guard::sync_directory(parent).map_err(|error| {
-                    ObjectServerError::DataDirIo {
-                        op: "sync the parent of",
-                        kind: error.kind(),
-                    }
-                })?;
-            }
-        }
-        Err(error) => {
-            return Err(ObjectServerError::DataDirIo {
-                op: "inspect",
-                kind: error.kind(),
-            });
-        }
-    }
-    check_directory(dir).map_err(data_dir_fault)?;
-    let lock = take_process_lock(&dir.join(".lock")).map_err(data_dir_store_error)?;
+    let lock = open_locked_dir(dir).map_err(data_dir_store_error)?;
     let volume = dir.join(VOLUME_DIR);
     ensure_area(&volume).map_err(data_dir_store_error)?;
+    for synced in [volume.as_path(), dir] {
+        sync_directory(synced).map_err(|error| ObjectServerError::DataDirIo {
+            op: "sync",
+            kind: error.kind(),
+        })?;
+    }
     Ok((lock, volume))
 }
 
@@ -558,6 +569,10 @@ fn command(
         #[cfg(target_os = "linux")]
         {
             let parent = std::process::id() as libc::pid_t;
+            // The descriptor limit is read here, before the fork, so that the closure's loop
+            // (the fallback for a kernel without `close_range`) needs no call that is unsafe
+            // after a fork.
+            let fd_limit = descriptor_limit();
             // SAFETY: the closure runs between fork and exec and calls only `prctl`, `getppid`,
             // `_exit`, the `close_range` system call and `fcntl`, which are async-signal-safe, and
             // allocates nothing.
@@ -592,7 +607,7 @@ fn command(
                         CLOSE_RANGE_CLOEXEC,
                     ) != 0
                     {
-                        for fd in 3..4096 {
+                        for fd in 3..fd_limit {
                             libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
                         }
                     }
@@ -612,6 +627,21 @@ fn command(
         }
     }
     command
+}
+
+/// How many descriptors a process may have open: the soft `RLIMIT_NOFILE`, at most 65 536 (the
+/// loop that uses it runs in the child and must stay short), and 4096 if it cannot be read.
+#[cfg(target_os = "linux")]
+fn descriptor_limit() -> libc::c_int {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `getrlimit` writes into the structure it is given.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return 4096;
+    }
+    libc::c_int::try_from(limit.rlim_cur.min(65_536)).unwrap_or(65_536)
 }
 
 /// Spawns the child on a thread of its own that lives until the returned sender is dropped: on
@@ -647,10 +677,20 @@ async fn spawn(
 /// One readiness probe: `GET /health/ready` on the loopback port, answered 200 or not. The
 /// error is a short description for the log and the start's error.
 async fn probe(port: u16) -> Result<(), String> {
+    // One bound for the whole probe, and a shorter one for its connect (CONNECT_TIMEOUT), so a
+    // connect that is slow to be refused is cut and the next probe is made soon.
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    let connected = tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        TcpStream::connect((Ipv4Addr::LOCALHOST, port)),
+    )
+    .await;
+    let mut stream = match connected {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(error)) => return Err(format!("cannot connect: {}", error.kind())),
+        Err(_) => return Err("cannot connect (timed out)".to_owned()),
+    };
     let attempt = async {
-        let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
-            .await
-            .map_err(|error| format!("cannot connect: {}", error.kind()))?;
         let request = format!(
             "GET /health/ready HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
         );
@@ -673,7 +713,7 @@ async fn probe(port: u16) -> Result<(), String> {
         }
         parse_status(&head)
     };
-    match tokio::time::timeout(PROBE_TIMEOUT, attempt).await {
+    match tokio::time::timeout_at(deadline, attempt).await {
         Ok(Ok(200)) => Ok(()),
         Ok(Ok(status)) => Err(format!("status {status}")),
         Ok(Err(outcome)) => Err(outcome),

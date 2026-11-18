@@ -80,8 +80,8 @@ with exit code 0 at once; it does not print its secret.
    prints the environment.
 7. **The stop sequence and the exit codes.** One function stops the child (used by a failed start
    and by the run's end): SIGTERM (Windows: terminate), wait up to 10 s, SIGKILL, reap; a second
-   stop signal skips the wait; the log forwarders are joined for at most 1 s and aborted after
-   that; a failure is logged and changes no exit code. `Server::run` stops the child after the
+   stop signal skips the wait; the child's process group is killed after the reap (Unix); the log forwarders are
+   joined together for at most 1 s and aborted after that; a failure is logged and changes no exit code. `Server::run` stops the child after the
    connections and before it closes the pool. The server exits 1 when the child ends before a stop
    signal was received (after stopping as for a signal; restarts are the service manager's job),
    and 0 when a stop signal and the child's end come together. One wait owner: `run` polls the

@@ -106,7 +106,9 @@ jobs:
       # downloads it and checks its recorded SHA-256. A missing binary fails the tests with one
       # message that names the script.
       - name: Fetch RustFS
-        run: echo "NGR_TEST_RUSTFS_BIN=$(scripts/fetch-rustfs.sh)" >> "$GITHUB_ENV"
+        run: |
+          bin=$(scripts/fetch-rustfs.sh)
+          echo "NGR_TEST_RUSTFS_BIN=$bin" >> "$GITHUB_ENV"
       # fuzz/ is a workspace of its own whose seeds depend on this workspace's crates, so a
       # dependency added here can leave fuzz/Cargo.lock stale. The fuzz job runs on main only, so
       # this resolves the fuzz workspace against its lock on every pull request; nothing is built.
@@ -154,7 +156,9 @@ jobs:
       # which the test processes need.
       - name: Fetch RustFS
         shell: bash
-        run: echo "NGR_TEST_RUSTFS_BIN=$(cygpath -w "$(scripts/fetch-rustfs.sh)")" >> "$GITHUB_ENV"
+        run: |
+          bin=$(scripts/fetch-rustfs.sh)
+          echo "NGR_TEST_RUSTFS_BIN=$(cygpath -w "$bin")" >> "$GITHUB_ENV"
       - shell: bash
         run: cargo nextest run --workspace --locked $EXCLUDE --profile ci-windows-parallel -E "$AGENT_TESTS"
       - shell: bash

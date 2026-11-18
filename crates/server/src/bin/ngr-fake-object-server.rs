@@ -9,11 +9,12 @@
 //!   the code of `code`, default 3);
 //! - `ready_after_ms <n>`: 503 until that long after the start;
 //! - `die_after_ms <n>` with `die_code <n>` or `die_signal 1`: ends by itself that long after
-//!   the start (`die_signal`: killed by SIGKILL on Unix);
+//!   its first 200 (so after the server's readiness probe succeeded) (`die_signal`: killed by SIGKILL on Unix);
 //! - `ignore_term 1`: ignores SIGTERM (Unix); otherwise SIGTERM ends it with code 0;
 //! - `print_secret 1`: prints the secret key it reads from its file, with a long line and a
 //!   control character, to standard output and standard error;
-//! - `grandchild 1`: starts a `sleep 4` (Unix) that inherits its output pipes and outlives it;
+//! - `grandchild same` or `grandchild group`: starts a `sleep 4` (Unix) that inherits its output
+//!   pipes and outlives it, in its group or in one of its own; its PID is written to `grandchild.pid`;
 //! - `report 1`: writes `report.txt` (its arguments, its environment, its working directory and,
 //!   on Linux, its open descriptors).
 //!
@@ -50,8 +51,17 @@ fn main() {
         report();
     }
     #[cfg(unix)]
-    if get("grandchild") == Some("1") {
-        let _ = std::process::Command::new("sleep").arg("4").spawn();
+    if get("grandchild").is_some() {
+        use std::os::unix::process::CommandExt;
+        let mut sleeper = std::process::Command::new("sleep");
+        sleeper.arg("4");
+        // `grandchild group`: in a group of its own, out of reach of a kill of the child's group.
+        if get("grandchild") == Some("group") {
+            sleeper.process_group(0);
+        }
+        if let Ok(sleeper) = sleeper.spawn() {
+            let _ = std::fs::write("grandchild.pid", sleeper.id().to_string());
+        }
     }
     // Echoes the text of the file the server names, the redaction tests' input (the server
     // must replace it in what it forwards). A test binary only: it holds no credentials of
@@ -64,20 +74,6 @@ fn main() {
             "\u{1b}[31mecho again {text}\u{1b}[0m {}",
             "z".repeat(20_000)
         );
-    }
-    if let Some(ms) = number("die_after_ms") {
-        let signal = get("die_signal") == Some("1");
-        let code = number("die_code").unwrap_or(4) as i32;
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(ms));
-            #[cfg(unix)]
-            if signal {
-                // SAFETY: raises SIGKILL on this process.
-                unsafe { libc::raise(libc::SIGKILL) };
-            }
-            let _ = signal;
-            std::process::exit(code);
-        });
     }
     match get("mode").unwrap_or("ok") {
         "exit" => std::process::exit(number("code").unwrap_or(3) as i32),
@@ -92,9 +88,18 @@ fn main() {
     println!("fake object server up on {address}");
     let mode = get("mode").unwrap_or("ok").to_owned();
     let ready_after = Duration::from_millis(number("ready_after_ms").unwrap_or(0));
+    // `die_after_ms` counts from the first 200 the fake gives, so that a test's delay holds
+    // however long the server took to reach it.
+    let die = number("die_after_ms").map(|ms| {
+        (
+            ms,
+            get("die_signal") == Some("1"),
+            number("die_code").unwrap_or(4) as i32,
+        )
+    });
     for stream in listener.incoming().flatten() {
         let mode = mode.clone();
-        std::thread::spawn(move || answer(stream, &mode, started.elapsed() >= ready_after));
+        std::thread::spawn(move || answer(stream, &mode, started.elapsed() >= ready_after, die));
     }
 }
 
@@ -106,7 +111,7 @@ fn read_config() -> HashMap<String, String> {
         .collect()
 }
 
-fn answer(mut stream: TcpStream, mode: &str, ready: bool) {
+fn answer(mut stream: TcpStream, mode: &str, ready: bool, die: Option<(u64, bool, i32)>) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let mut head = Vec::new();
     let mut buf = [0u8; 512];
@@ -129,6 +134,23 @@ fn answer(mut stream: TcpStream, mode: &str, ready: bool) {
         _ => b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
     };
     let _ = stream.write_all(reply);
+    if ready && mode != "garbage" && mode != "never-ready" {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        if let Some((ms, signal, code)) = die {
+            ONCE.call_once(|| {
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(ms));
+                    #[cfg(unix)]
+                    if signal {
+                        // SAFETY: raises SIGKILL on this process.
+                        unsafe { libc::raise(libc::SIGKILL) };
+                    }
+                    let _ = signal;
+                    std::process::exit(code);
+                });
+            });
+        }
+    }
 }
 
 fn report() {

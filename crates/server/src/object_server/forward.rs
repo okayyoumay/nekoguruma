@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use shared_crypto::Zeroizing;
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 use tokio::task::JoinHandle;
 
 /// The most bytes of one line the forwarder keeps before it throws the rest of the line away. It
@@ -29,8 +29,15 @@ pub(crate) fn spawn(
         loop {
             let (used, ended_line) = {
                 let chunk = match reader.fill_buf().await {
-                    Ok([]) | Err(_) => break,
+                    Ok([]) => break,
                     Ok(chunk) => chunk,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => {
+                        // Keep emptying the pipe, so that a child that goes on writing never
+                        // blocks on a full one.
+                        drain(&mut reader).await;
+                        break;
+                    }
                 };
                 let (part, ended_line) = match chunk.iter().position(|&b| b == b'\n') {
                     Some(at) => (&chunk[..at], true),
@@ -54,6 +61,19 @@ pub(crate) fn spawn(
             emit(stream, &line, cut, secret.as_str());
         }
     })
+}
+
+/// Reads and discards to the end of the stream (or to a second error).
+async fn drain(reader: &mut (impl AsyncBufRead + Unpin)) {
+    let mut sink = [0u8; 4096];
+    loop {
+        match reader.read(&mut sink).await {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
 }
 
 fn emit(stream: &'static str, raw: &[u8], cut: bool, secret: &str) {

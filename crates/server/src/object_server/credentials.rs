@@ -432,7 +432,9 @@ mod tests {
         );
     }
 
-    // K6
+    // K6. Runs only as root: a chown to another account needs it, so under an ordinary account
+    // (and in the CI runner's) the test returns at once; the same owner rule is judged on
+    // synthetic metadata for the object server's binary in `object_server.rs`.
     #[cfg(unix)]
     #[test]
     fn a_file_or_directory_of_another_account_is_refused() {

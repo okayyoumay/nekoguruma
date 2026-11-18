@@ -332,7 +332,9 @@ fn a_killed_server_takes_the_real_child_with_it() {
     let port = free_port();
     let path = crate::binary::write_config(dir.path(), port, &pg.url());
     let text = std::fs::read_to_string(&path).unwrap().replace(
-        env!("CARGO_BIN_EXE_ngr-fake-object-server"),
+        &crate::support::fake_binary(dir.path())
+            .display()
+            .to_string(),
         &rustfs_bin().display().to_string(),
     );
     std::fs::write(&path, text).unwrap();

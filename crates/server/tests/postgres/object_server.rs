@@ -20,7 +20,6 @@ use server::{RunError, Server, StartError};
 use crate::redeem::{Captured, capture};
 use crate::support::{TestPostgres, free_port};
 
-const FAKE: &str = env!("CARGO_BIN_EXE_ngr-fake-object-server");
 const LIMIT: Duration = Duration::from_secs(30);
 
 // ---------------------------------------------------------------------------------------------
@@ -56,7 +55,7 @@ impl Fixture {
         private(&credentials);
         Fixture {
             config: ObjectServerConfig {
-                binary: FAKE.into(),
+                binary: crate::support::fake_binary(dir.path()),
                 data_dir: data,
                 credentials_dir: credentials,
                 port: Some(free_port()),
@@ -224,6 +223,12 @@ async fn a_binary_that_cannot_run_is_refused_before_any_file_is_made() {
     {
         let plain = fx.dir.path().join("not-executable");
         std::fs::write(&plain, b"x").unwrap();
+        // Written owner-only whatever the umask, so that it is the missing execute bit that is
+        // refused and not a writable file.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         config.binary = plain;
         assert!(matches!(
             refused(try_start(&config).await),
@@ -281,7 +286,7 @@ async fn a_writable_binary_directory_is_refused_and_a_symbolic_link_is_followed(
     std::fs::create_dir(&open).unwrap();
     std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o770)).unwrap();
     let copy = open.join("fake");
-    std::fs::copy(FAKE, &copy).unwrap();
+    std::fs::copy(crate::support::fake_binary(fx.dir.path()), &copy).unwrap();
     let mut config = fx.config.clone();
     config.binary = copy;
     let error = refused(ObjectServer::start(&config, 1, &tuning(2000, 500)).await);
@@ -293,7 +298,7 @@ async fn a_writable_binary_directory_is_refused_and_a_symbolic_link_is_followed(
     assert!(fx.credential_names().is_empty());
 
     let link = fx.dir.path().join("link");
-    std::os::unix::fs::symlink(FAKE, &link).unwrap();
+    std::os::unix::fs::symlink(crate::support::fake_binary(fx.dir.path()), &link).unwrap();
     config.binary = link;
     let server = ObjectServer::start(&config, 1, &tuning(5000, 1000))
         .await
@@ -389,6 +394,8 @@ async fn a_second_server_on_one_data_directory_is_refused_before_the_spawn() {
     first.stop(std::future::pending()).await;
 
     // Two first starts at once: one serves, the other is refused, and both files are one pair.
+    // (K8, the link race of the credential files themselves, is covered by the 16-thread unit
+    // test in `object_server/credentials.rs`; here the data directory's lock decides first.)
     let fx = Fixture::new("");
     let mut other = fx.config.clone();
     other.port = Some(free_port());
@@ -488,6 +495,10 @@ async fn a_server_that_is_ready_in_time_is_started_and_answers_on_loopback() {
 /// Q2: a child that is never ready is stopped and reaped, and the error names the last probe.
 #[tokio::test]
 async fn a_server_that_never_becomes_ready_is_stopped_and_the_start_names_the_last_probe() {
+    // On Windows a connect to a port nothing listens on takes about two seconds to be refused,
+    // so a probe made before the fake listens is cut by the one-second bound ("cannot connect
+    // (timed out)"); the bound is longer there so that a later probe reaches the fake.
+    let ready_ms: u64 = if cfg!(windows) { 4000 } else { 1000 };
     for (cfg, last) in [
         ("mode never-ready\n", "status 503"),
         ("mode garbage\n", "unparseable answer"),
@@ -495,7 +506,7 @@ async fn a_server_that_never_becomes_ready_is_stopped_and_the_start_names_the_la
     ] {
         let fx = Fixture::new(cfg);
         let began = Instant::now();
-        let error = refused(fx.start(1000, 500).await);
+        let error = refused(fx.start(ready_ms, 500).await);
         let took = began.elapsed();
         match &error {
             ObjectServerError::NotReady { last: seen, .. } => {
@@ -503,8 +514,14 @@ async fn a_server_that_never_becomes_ready_is_stopped_and_the_start_names_the_la
             }
             other => panic!("{cfg}: {other}"),
         }
-        assert!(took >= Duration::from_millis(900), "{cfg}: {took:?}");
-        assert!(took < Duration::from_secs(5), "{cfg}: {took:?}");
+        assert!(
+            took >= Duration::from_millis(ready_ms - 100),
+            "{cfg}: {took:?}"
+        );
+        assert!(
+            took < Duration::from_millis(ready_ms) + Duration::from_secs(4),
+            "{cfg}: {took:?}"
+        );
         wait_ended(fx.pid().unwrap(), Duration::from_secs(5)).await;
     }
 }
@@ -577,9 +594,8 @@ async fn readiness_just_under_the_bound_is_accepted_and_a_hung_probe_is_cut() {
 // ---------------------------------------------------------------------------------------------
 // S3, S5: guards
 
-/// S3: a failure after the spawn kills and reaps the child: when the start returns, no process
-/// of the fake is left, not even one waiting to be reaped (Linux: the `/proc` entries whose
-/// working directory is the data directory).
+/// S3: a failure once the child is ready (the test hook) stops and reaps it: when the start
+/// returns, its `/proc` entry is gone, not a zombie that nobody waited for (Linux).
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_failure_after_the_spawn_kills_and_reaps_the_child() {
@@ -588,19 +604,11 @@ async fn a_failure_after_the_spawn_kills_and_reaps_the_child() {
     hooked.fail_after_spawn = true;
     let error = refused(ObjectServer::start(&fx.config, 1, &hooked).await);
     assert!(matches!(error, ObjectServerError::Setup(_)), "{error}");
-    assert_eq!(processes_in(fx.data()), Vec::<u32>::new());
-}
-
-/// The processes whose working directory is `dir` (Linux).
-#[cfg(target_os = "linux")]
-fn processes_in(dir: &Path) -> Vec<u32> {
-    let dir = std::fs::canonicalize(dir).unwrap();
-    std::fs::read_dir("/proc")
-        .unwrap()
-        .flatten()
-        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
-        .filter(|pid| std::fs::read_link(format!("/proc/{pid}/cwd")).is_ok_and(|cwd| cwd == dir))
-        .collect()
+    let pid = fx.pid().expect("the child was ready, so it wrote its pid");
+    assert!(
+        !Path::new(&format!("/proc/{pid}")).exists(),
+        "the child was not reaped"
+    );
 }
 
 /// S5: dropping the handle, or the start future, kills the child.
@@ -749,11 +757,8 @@ async fn the_output_is_forwarded_bounded_and_without_the_secret() {
     log_has(&log, "echo is [redacted]").await;
     let text = log.text();
     assert!(!text.contains(&secret), "the secret is in the log");
-    // Colour codes are replaced, and the 20 000-character line is cut.
-    assert!(
-        !text.contains('\u{1b}') || text.contains("\u{1b}["),
-        "{text}"
-    );
+    // Colour codes are replaced (checked on the forwarded line below), and the 20 000-character
+    // line is cut.
     let forwarded: Vec<&str> = text.lines().filter(|l| l.contains("echo again")).collect();
     assert_eq!(forwarded.len(), 1);
     assert!(forwarded[0].len() < 1400, "{}", forwarded[0].len());
@@ -907,18 +912,48 @@ async fn a_failing_wait_is_logged_and_the_stop_returns() {
     assert!(log.text().contains("ERROR"), "{}", log.text());
 }
 
-/// T7: the forwarders end at the end of the stream; one that a grandchild keeps open is aborted
-/// after one second.
+/// T7: the forwarders end at the end of the stream; one that a grandchild in a group of its own
+/// keeps open is aborted after one second.
 #[cfg(unix)]
 #[tokio::test]
 async fn a_forwarder_held_open_by_a_grandchild_is_aborted_after_a_second() {
-    let fx = Fixture::new("grandchild 1\n");
+    let fx = Fixture::new("grandchild group\n");
     let server = fx.start(5000, 1000).await.unwrap();
     let began = Instant::now();
     server.stop(std::future::pending()).await;
     let took = began.elapsed();
     assert!(took >= Duration::from_millis(900), "{took:?}");
-    assert!(took < Duration::from_secs(4), "{took:?}");
+    assert!(took < Duration::from_secs(3), "{took:?}");
+    // Kill what the test left behind.
+    if let Some(pid) = std::fs::read_to_string(fx.data().join("grandchild.pid"))
+        .ok()
+        .and_then(|t| t.trim().parse::<libc::pid_t>().ok())
+    {
+        // SAFETY: kills the test's own sleeper.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+}
+
+/// A grandchild in the child's own group does not outlive the stop: the group is killed after the
+/// reap, so the pipes close and nothing is left.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_grandchild_in_the_childs_group_is_killed_with_it() {
+    let fx = Fixture::new("grandchild same\n");
+    let server = fx.start(5000, 1000).await.unwrap();
+    let began = Instant::now();
+    server.stop(std::future::pending()).await;
+    assert!(
+        began.elapsed() < Duration::from_millis(900),
+        "{:?}",
+        began.elapsed()
+    );
+    let pid: u32 = std::fs::read_to_string(fx.data().join("grandchild.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    wait_ended(pid, Duration::from_secs(2)).await;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1057,14 +1092,16 @@ async fn a_child_that_ends_while_the_server_runs_ends_the_run_with_an_error() {
 
 /// R3: a stop signal together with the child's end is a stop (exit 0), not a failure. The
 /// select between the two is biased towards the stop, so the outcome does not depend on luck;
-/// several rounds guard against a change to a random choice.
+/// 32 rounds guard against a change to a random choice (a coin flip passes them all with
+/// probability 2^-32).
 #[tokio::test]
 async fn a_stop_signal_together_with_the_childs_end_is_a_clean_stop() {
     let pg = TestPostgres::start();
-    for round in 0..8 {
-        let fx = Fixture::new("die_after_ms 200\n");
+    for round in 0..32 {
+        let fx = Fixture::new("die_after_ms 450\n");
         let server = started(start_server(&fx, &pg, 0).await);
-        tokio::time::sleep(Duration::from_millis(700)).await;
+        let pid = server.object_server().unwrap().pid().unwrap();
+        wait_ended(pid, Duration::from_secs(5)).await;
         let result = tokio::time::timeout(LIMIT, server.run(async {}, std::future::pending()))
             .await
             .expect("the run ends");
@@ -1077,6 +1114,7 @@ async fn a_stop_signal_together_with_the_childs_end_is_a_clean_stop() {
 #[cfg(unix)]
 #[tokio::test]
 async fn a_stop_ends_the_child_and_a_second_signal_kills_it_at_once() {
+    let (log, _guard) = capture();
     let pg = TestPostgres::start();
     // The first signal alone: the child obeys SIGTERM.
     let fx = Fixture::new("");
@@ -1085,6 +1123,13 @@ async fn a_stop_ends_the_child_and_a_second_signal_kills_it_at_once() {
     server.run(async {}, std::future::pending()).await.unwrap();
     assert!(ended(pid));
     assert_eq!(pool_connections(&pg).await, "0");
+    // `stop` ran (a drop would log nothing): the child obeyed SIGTERM with exit status 0.
+    let text = log.text();
+    assert!(
+        text.lines()
+            .any(|l| l.contains("object server stopped") && l.contains("exit status: 0")),
+        "{text}"
+    );
 
     // The child ignores SIGTERM; the second signal comes after the grace wait.
     let fx = Fixture::new("ignore_term 1\n");
@@ -1101,12 +1146,26 @@ async fn a_stop_ends_the_child_and_a_second_signal_kills_it_at_once() {
     .await
     .expect("the run ends")
     .unwrap();
+    // The force future was waited for (a drop would be at once) and then ended the wait.
+    assert!(
+        began.elapsed() >= Duration::from_millis(300),
+        "{:?}",
+        began.elapsed()
+    );
     assert!(
         began.elapsed() < Duration::from_secs(8),
         "{:?}",
         began.elapsed()
     );
     assert!(ended(pid));
+    assert_eq!(
+        log.text()
+            .matches("second stop signal; killing the object server")
+            .count(),
+        1,
+        "{}",
+        log.text()
+    );
 
     // The second signal comes during the grace period, while a connection that sends nothing
     // keeps it open.
@@ -1134,6 +1193,14 @@ async fn a_stop_ends_the_child_and_a_second_signal_kills_it_at_once() {
         began.elapsed()
     );
     assert!(ended(pid));
+    assert_eq!(
+        log.text()
+            .matches("second stop signal; killing the object server")
+            .count(),
+        2,
+        "{}",
+        log.text()
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1145,6 +1212,15 @@ fn steer(dir: &Path, cfg: &str) -> PathBuf {
     private(&data);
     std::fs::write(data.join("fake-object-server.cfg"), cfg).unwrap();
     data
+}
+
+/// Whether something accepts a connection on the loopback port within 300 ms.
+fn listening(port: u16) -> bool {
+    std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)),
+        Duration::from_millis(300),
+    )
+    .is_ok()
 }
 
 fn read_pid(data: &Path, limit: Duration) -> u32 {
@@ -1225,7 +1301,7 @@ fn the_commands_never_touch_the_object_server() {
 fn the_server_listens_only_after_the_object_server_is_ready() {
     let pg = TestPostgres::start();
     let dir = tempfile::tempdir().unwrap();
-    let data = steer(dir.path(), "ready_after_ms 1500\n");
+    let data = steer(dir.path(), "ready_after_ms 3000\n");
     let port = free_port();
     let path = crate::binary::write_config(dir.path(), port, &pg.url());
     let log_path = dir.path().join("server.log");
@@ -1234,9 +1310,11 @@ fn the_server_listens_only_after_the_object_server_is_ready() {
     let child = command.spawn().unwrap();
     let mut child = crate::binary::KillOnDrop::new(child);
     read_pid(&data, Duration::from_secs(30));
+    // Not `get_health`: a connect to a closed port takes about two seconds to be refused on
+    // Windows, long enough for the server to get ready and bind meanwhile.
     assert!(
-        crate::binary::get_health(port).is_none(),
-        "the server answered before the object server was ready"
+        !listening(port),
+        "the server listened before the object server was ready"
     );
     let deadline = Instant::now() + Duration::from_secs(30);
     while crate::binary::get_health(port).is_none() {

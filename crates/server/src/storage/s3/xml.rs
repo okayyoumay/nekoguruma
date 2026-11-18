@@ -48,6 +48,7 @@ pub(super) fn parse_uploads(text: &str) -> Option<UploadsPage> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ErrorCode {
     NoSuchUpload,
+    NoSuchKey,
     InvalidPart,
     BucketAlreadyOwnedByYou,
     Other,
@@ -68,6 +69,7 @@ pub(super) fn error_code(body: &[u8]) -> ErrorCode {
     };
     match &rest[..end] {
         "NoSuchUpload" => ErrorCode::NoSuchUpload,
+        "NoSuchKey" => ErrorCode::NoSuchKey,
         "InvalidPart" | "InvalidPartOrder" => ErrorCode::InvalidPart,
         "BucketAlreadyOwnedByYou" => ErrorCode::BucketAlreadyOwnedByYou,
         _ => ErrorCode::Other,

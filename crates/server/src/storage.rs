@@ -156,6 +156,11 @@ pub enum StoreError {
     LengthMismatch { stored: u64 },
     #[error("the SHA-256 is not that of the stored content")]
     HashMismatch,
+    /// The parts' sizes do not add up to the declared length. Answered before the upload is
+    /// completed: the upload and its parts are still there, so the writer can correct a part
+    /// and complete again.
+    #[error("the parts hold {stored} bytes, not the declared length")]
+    PartsLengthMismatch { stored: u64 },
     #[error("the upload ID is not 1 to 1024 printable ASCII characters")]
     InvalidUploadId,
     #[error("the part number is not from 1 to 10000")]
@@ -326,10 +331,12 @@ pub trait MultipartStore: Send + Sync {
 
     /// Completes `upload` as an object of `length` bytes whose SHA-256 is `sha256`: the parts are
     /// listed and checked (numbered consecutively from 1, each but the last at least the minimum
-    /// size, their sizes adding up to `length`, at most 4 GiB and 10000 parts), the upload is
-    /// completed and the object is read back and compared. A mismatch deletes the object, and
-    /// [`StoreError::HashMismatch`] or [`StoreError::LengthMismatch`] is answered only once
-    /// nothing is left; if the delete fails, its error is answered. A retry after the upload was
+    /// size, their sizes adding up to `length`, at most 4 GiB and 10000 parts; a refusal of the
+    /// listing, including [`StoreError::PartsLengthMismatch`], leaves the upload as it is), the
+    /// upload is completed and the object is read back and compared. A mismatch deletes the
+    /// object, and [`StoreError::HashMismatch`] or [`StoreError::LengthMismatch`] (the
+    /// read-back's length) is answered only once nothing is left; if the delete fails, its error
+    /// is answered. A retry after the upload was
     /// completed (the answer lost, the read-back cut) reads the object back again.
     fn complete<'a>(
         &'a self,

@@ -167,7 +167,8 @@ pub struct ObjectServerConfig {
     pub port: Option<u16>,
     /// The bucket the object store keeps its objects in; the server creates it when it is absent.
     /// 3 to 63 characters, lower-case letters, digits and hyphens, not starting or ending with a
-    /// hyphen, and not `health`, `minio` or `rustfs` (names the object server reserves). The
+    /// hyphen, not starting with `xn--`, and not `health`, `minio` or `rustfs` (names the object
+    /// server reserves or refuses). The
     /// default is `nekoguruma`.
     #[serde(default = "default_bucket")]
     pub bucket: String,
@@ -184,6 +185,7 @@ pub fn is_valid_bucket(name: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
         && !name.starts_with('-')
+        && !name.starts_with("xn--")
         && !name.ends_with('-')
         && !matches!(name, "health" | "minio" | "rustfs")
 }
@@ -290,8 +292,8 @@ pub enum ConfigError {
     ObjectServerPort,
     #[error(
         "invalid configuration: object_server.bucket must be 3 to 63 characters (lower-case \
-         letters, digits and hyphens, not starting or ending with a hyphen) and not health, minio \
-         or rustfs"
+         letters, digits and hyphens, not starting or ending with a hyphen or starting with xn--) and \
+         not health, minio or rustfs"
     )]
     ObjectServerBucket,
     #[error(
@@ -523,6 +525,7 @@ mod tests {
             "ab",
             "-abc",
             "abc-",
+            "xn--abc",
             "Abc",
             "a_b",
             "a.b",

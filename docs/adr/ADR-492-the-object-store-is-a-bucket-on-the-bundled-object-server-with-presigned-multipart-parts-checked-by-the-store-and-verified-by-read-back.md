@@ -33,7 +33,8 @@ Consequences).
    pool and exits 1, as ADR-491's other failures. ADR-491's signed readiness check is this
    HeadBucket. The subcommands never open the store.
 3. **Bucket and configuration.** `object_server.bucket`, default `nekoguruma`, is 3 to 63 of
-   `[a-z0-9-]`, not starting or ending with a hyphen, and not `health`, `minio` or `rustfs`. The
+   `[a-z0-9-]`, not starting or ending with a hyphen, not starting with `xn--` (RustFS answers 400 to it), and not
+   `health`, `minio` or `rustfs`. The
    `[storage]` table is removed: an existing file that has one is refused as an unknown key, and
    the migration is to delete it. ADR-491 item 1's rule that `data_dir` may not be `storage.dir`
    goes with the table; the rule on `credentials_dir` stays. The size limit of an object, 4 GiB,
@@ -43,7 +44,8 @@ Consequences).
    supported yet.
 5. **`complete` is checked by the store.** Under the key's lock the store lists the parts (paged
    by 1000) and checks them itself: at least one, numbered consecutively from 1, each but the last
-   at least 5 MiB, the sizes adding up to the length the caller names, at most 4 GiB and at most
+   at least 5 MiB, the sizes adding up to the length the caller names (else `PartsLengthMismatch`, answered with
+   the upload and its parts untouched, so the writer can correct a part and complete again), at most 4 GiB and at most
    10000 parts. Only then does it send CompleteMultipartUpload, with the entity tags of the
    listing in part order, and then it reads the object back with GetObject, streaming its SHA-256
    and counting its bytes, and compares both with what the caller declared (the end-to-end check
@@ -73,11 +75,13 @@ Consequences).
    `Debug` would show it), the upload ID is a bearer for the upload, and the object server's
    messages repeat keys: no URL, key text, upload ID or server message goes into an error or a
    log line. An error is a fixed message, an operation name, an HTTP status or an `ErrorKind`.
+   A 404 means gone only with the code that says so (`NoSuchKey`, `NoSuchUpload`); a missing
+   bucket or any other code is a `Server` error, so a deleted bucket is never read as an empty store.
    `PartUrl` and `UploadId` have a redacting `Debug` and no `Display`.
 10. **Errors.** `InvalidPartNumber`, `InvalidUploadId`, `NoParts`, `MissingPart { part }`,
     `PartTooSmall { part }`, `PartsChanged` (a listing that is not ascending or does not advance,
-    or the object server's complaint about a part), `ObjectTooLarge`, `LengthMismatch { stored }`,
-    `HashMismatch`, `AlreadyFinished` and `NotFound` (a gone upload, the first when the object
+    or the object server's complaint about a part), `ObjectTooLarge`, `PartsLengthMismatch { stored }` (the listing's sizes, before any completion) and
+    `LengthMismatch { stored }` (the read-back's length, after the delete), `HashMismatch`, `AlreadyFinished` and `NotFound` (a gone upload, the first when the object
     exists), `Refused { op }`, `Server { op, status }` and `Io { op, kind }`.
 11. **Tests.** The store's units run against a scripted loopback listener; the real RustFS tests
     use a plain HTTP client to PUT parts to the presigned URLs. The fake object server has a
@@ -119,7 +123,7 @@ Known limits, accepted:
   and the rule keeps the failure handling simple.
 
 Follow-up work, kept in the backlog: an external S3 service over HTTPS (endpoint, TLS,
-credentials, and a crypto provider that builds for the Windows worker targets and passes
-ADR-283's DLL check), part URLs that bind `Content-Length`, a cap on concurrent read-backs, the
+credentials, and a crypto provider that builds for the server's Windows target with
+llvm-mingw and passes ADR-283's DLL check), part URLs that bind `Content-Length`, a cap on concurrent read-backs, the
 key lock across several server instances, abandoned-upload cleanup and the data channel's use of
 the store.

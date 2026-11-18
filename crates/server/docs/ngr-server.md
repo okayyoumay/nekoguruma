@@ -84,8 +84,8 @@ bucket = "nekoguruma"        # default; the object store's bucket
   credential. `credentials_dir` may not be the directory of `instruction_key.path`; one directory
   nested in another is not detected, so keep the directories apart. `bucket` is the bucket the
   object store keeps its objects in ("The object store" below, ADR-492): 3 to 63 characters of
-  lower-case letters, digits and hyphens, not starting or ending with a hyphen, and not `health`,
-  `minio` or `rustfs`; the default is `nekoguruma`. The server creates the bucket when it is
+  lower-case letters, digits and hyphens, not starting or ending with a hyphen, not starting with
+  `xn--` (RustFS refuses it), and not `health`, `minio` or `rustfs`; the default is `nekoguruma`. The server creates the bucket when it is
   absent. The size limit of an object (4 GiB) is a constant of the code, not a key.
 - There is no `[storage]` table any more (ADR-492): a file that still has one is refused as an
   unknown key. **Migration:** delete the `[storage]` table from existing files. Objects that
@@ -292,11 +292,12 @@ hand, so `Arc<dyn MultipartStore>` works, and `Server::object_store()` returns t
   `AlreadyFinished` if the object exists and `NotFound` if not.
 - `complete(upload, sha256, length)` takes the key's lock, lists the parts and checks them itself
   (`NoParts`; numbered consecutively from 1, else `MissingPart`; each but the last at least
-  5 MiB, else `PartTooSmall`; the sizes add up to `length`, else `LengthMismatch` with the sum; at
+  5 MiB, else `PartTooSmall`; the sizes add up to `length`, else `PartsLengthMismatch` with the sum, answered before anything is completed so the upload
+  stays as it is; at
   most 4 GiB, else `ObjectTooLarge`), sends CompleteMultipartUpload with the entity tags the
   listing gave (a refusal of a part is `PartsChanged`), then reads the object back, streaming its
   SHA-256, and compares length and digest. A mismatch deletes the object (the delete order below)
-  and is answered as `LengthMismatch` or `HashMismatch` only once the delete has succeeded; a
+  and is answered as `LengthMismatch` (the read-back's length) or `HashMismatch` only once the delete has succeeded; a
   failed delete answers its own error, since the object is still there. A read-back that fails
   (cut, idle for 30 seconds) is an I/O error and deletes nothing. A retry after the upload was
   completed finds the upload gone and the object present and reads the object back again, so a
@@ -322,7 +323,9 @@ The rules the implementation keeps:
 - Nothing logs or puts into an error a URL (it carries a signature), an object key, an upload ID
   or text the object server sent. An error is a fixed message, an operation name and an HTTP
   status or an `ErrorKind`. A 401 or 403 is `Refused`; any other status the operation does not
-  expect is `Server`.
+  expect is `Server`. A 404 means gone only with the code that says so (`NoSuchKey`, `NoSuchUpload`, or an
+  empty answer to a HEAD); `NoSuchBucket` or any other code is `Server`. An error answer is read
+  up to the error bound whatever the operation's XML bound.
 - The key lock serialises `complete` and `delete` on one key within this process; other calls
   take none. It does not cross processes.
 - At open the bucket is checked (HeadBucket) and created if absent (409 "owned by you" counts as

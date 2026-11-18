@@ -124,6 +124,23 @@ async fn open(server: &ObjectServer, bucket: &str) -> S3Store {
     .unwrap_or_else(|error| panic!("the store must open: {error}"))
 }
 
+/// A store on the same object server whose listings are one entry a page, so that every
+/// continuation marker is signed and sent.
+async fn paging_store(run: &Running) -> S3Store {
+    let tuning = S3Tuning {
+        page_size: 1,
+        ..S3Tuning::default()
+    };
+    S3Store::open(
+        run.server.as_ref().unwrap().port(),
+        run.server.as_ref().unwrap().credentials(),
+        "nekoguruma",
+        tuning,
+    )
+    .await
+    .unwrap()
+}
+
 async fn read_all(store: &S3Store, key: &ObjectKey) -> Result<Vec<u8>, StoreError> {
     let body = store.get(key).await?;
     let length = body.length;
@@ -277,8 +294,10 @@ async fn the_stores_part_checks_refuse_before_the_object_server_would() {
     // The length the caller names must be the sum.
     assert!(matches!(
         store.complete(&upload, sha256(b""), 5).await,
-        Err(StoreError::LengthMismatch { stored }) if stored == (5 * MIB + 10) as u64
+        Err(StoreError::PartsLengthMismatch { stored }) if stored == (5 * MIB + 10) as u64
     ));
+    // The refusal left the upload as it was: its parts are still listed.
+    assert_eq!(store.list_parts(&upload).await.unwrap().len(), 2);
     let whole: Vec<u8> = [first, content(7, 10)].concat();
     store
         .complete(&upload, sha256(&whole), whole.len() as u64)
@@ -480,4 +499,74 @@ async fn a_config_without_an_object_server_has_no_store() {
     let server = server::Server::start(&config).await.unwrap();
     assert!(server.object_store().is_none());
     server.run(async {}, std::future::pending()).await.unwrap();
+}
+
+/// Listing parts one a page sends the part-number marker, which the object server checks
+/// against the signature.
+#[tokio::test]
+async fn parts_are_listed_one_page_at_a_time_against_the_real_server() {
+    let run = Running::start().await;
+    let store = paging_store(&run).await;
+    let upload = store.begin().await.unwrap();
+    for number in 1..=3u16 {
+        put_part(
+            &store,
+            &upload,
+            number,
+            content(number as u8, 10 * number as usize),
+        )
+        .await;
+    }
+    let parts = store.list_parts(&upload).await.unwrap();
+    assert_eq!(
+        parts.iter().map(|p| (p.number, p.size)).collect::<Vec<_>>(),
+        [(1, 10), (2, 20), (3, 30)]
+    );
+    run.stop().await;
+}
+
+/// Three uploads, two of them of one key, listed one a page: the key and upload-ID markers are
+/// signed and sent, and deleting the doubled key aborts both of its uploads.
+#[tokio::test]
+async fn unfinished_uploads_are_listed_one_page_at_a_time_against_the_real_server() {
+    let run = Running::start().await;
+    let store = paging_store(&run).await;
+    let first = store.begin().await.unwrap();
+    let other = store.begin().await.unwrap();
+    // A second upload of the first key, started by hand.
+    let server = run.server.as_ref().unwrap();
+    let credentials = rusty_s3::Credentials::new(
+        server.credentials().access_key(),
+        server.credentials().expose_secret(),
+    );
+    let bucket = rusty_s3::Bucket::new(
+        format!("http://127.0.0.1:{}", server.port())
+            .parse()
+            .unwrap(),
+        rusty_s3::UrlStyle::Path,
+        "nekoguruma",
+        "us-east-1",
+    )
+    .unwrap();
+    let url = rusty_s3::S3Action::sign(
+        &bucket.create_multipart_upload(Some(&credentials), first.key.as_str()),
+        Duration::from_secs(60),
+    );
+    assert_eq!(request("POST", url.as_str(), Vec::new()).await.0, 200);
+    let listed = store.list_unfinished().await.unwrap();
+    assert_eq!(listed.skipped, 0);
+    let of_first: Vec<_> = listed
+        .uploads
+        .iter()
+        .filter(|u| u.key == first.key)
+        .collect();
+    assert_eq!(of_first.len(), 2);
+    assert_ne!(of_first[0].id, of_first[1].id);
+    assert!(listed.uploads.iter().any(|u| u.key == other.key));
+    assert_eq!(listed.uploads.len(), 3);
+    store.delete(&first.key).await.unwrap();
+    let after = store.list_unfinished().await.unwrap();
+    assert_eq!(after.uploads.len(), 1);
+    assert_eq!(after.uploads[0].key, other.key);
+    run.stop().await;
 }

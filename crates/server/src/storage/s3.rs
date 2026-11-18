@@ -141,6 +141,13 @@ enum Listing<T> {
     Gone,
 }
 
+/// An upload of the listing; the start time is `None` if it did not read.
+struct ListedUpload {
+    key: ObjectKey,
+    id: UploadId,
+    initiated: Option<std::time::SystemTime>,
+}
+
 /// A part with the entity tag that completing the upload names; the tag never leaves the store.
 struct RawPart {
     number: u16,
@@ -224,6 +231,12 @@ impl Inner {
         let work = async {
             let response = self.client.send(op, method, &url, body).await?;
             let status = response.status;
+            // An error answer is read up to the error bound, whatever the success bound.
+            let limit = if status == 200 {
+                limit
+            } else {
+                limit.min(self.tuning.max_error_bytes)
+            };
             let (body, truncated) = response.collect(limit).await?;
             Ok(Reply {
                 status,
@@ -503,7 +516,7 @@ impl Inner {
             .try_fold(0u64, |sum, part| sum.checked_add(part.size))
             .ok_or(StoreError::ObjectTooLarge)?;
         if sum != length {
-            return Err(StoreError::LengthMismatch { stored: sum });
+            return Err(StoreError::PartsLengthMismatch { stored: sum });
         }
         if sum > self.tuning.max_object_bytes {
             return Err(StoreError::ObjectTooLarge);
@@ -653,7 +666,27 @@ impl Inner {
             })??;
         match response.status {
             200 => {}
-            404 => return Err(StoreError::NotFound),
+            404 => {
+                let read = tokio::time::timeout(
+                    self.tuning.request_timeout,
+                    response.collect(self.tuning.max_error_bytes),
+                )
+                .await;
+                return match read {
+                    Ok(Ok((body, _))) if xml::error_code(&body) == ErrorCode::NoSuchKey => {
+                        Err(StoreError::NotFound)
+                    }
+                    Ok(Ok(_)) => Err(StoreError::Server {
+                        op: OP,
+                        status: 404,
+                    }),
+                    Ok(Err(error)) => Err(error),
+                    Err(_) => Err(StoreError::Io {
+                        op: OP,
+                        kind: std::io::ErrorKind::TimedOut,
+                    }),
+                };
+            }
             status => return Err(Inner::unexpected(OP, status)),
         }
         let length = response.content_length().ok_or(StoreError::Server {
@@ -676,9 +709,8 @@ impl Inner {
     /// The delete order of the module's documentation, with the key's lock held by the caller.
     async fn delete_locked(&self, key: &ObjectKey) -> Result<(), StoreError> {
         for _ in 0..DELETE_ROUNDS {
-            let listed = self.list_uploads(Some(key.as_str())).await?;
-            let mine: Vec<UnfinishedUpload> = listed
-                .uploads
+            let (listed, _) = self.list_uploads_raw(Some(key.as_str())).await?;
+            let mine: Vec<ListedUpload> = listed
                 .into_iter()
                 .filter(|upload| upload.key == *key)
                 .collect();
@@ -700,7 +732,8 @@ impl Inner {
             .sign(self.expiry());
         let reply = self.exchange_status(OP, Method::DELETE, url, None).await?;
         match reply.status {
-            200 | 204 | 404 => Ok(()),
+            200 | 204 => Ok(()),
+            404 if xml::error_code(&reply.body) == ErrorCode::NoSuchUpload => Ok(()),
             status => Err(Inner::unexpected(OP, status)),
         }
     }
@@ -713,7 +746,8 @@ impl Inner {
             .sign(self.expiry());
         let reply = self.exchange_status(OP, Method::DELETE, url, None).await?;
         match reply.status {
-            200 | 204 | 404 => Ok(()),
+            200 | 204 => Ok(()),
+            404 if xml::error_code(&reply.body) == ErrorCode::NoSuchKey => Ok(()),
             status => Err(Inner::unexpected(OP, status)),
         }
     }
@@ -724,6 +758,28 @@ impl Inner {
     /// it): the signed query is `key-marker`, `max-uploads`, `prefix`, `upload-id-marker` and
     /// `uploads`, in that order, which is sorted by name.
     async fn list_uploads(&self, prefix: Option<&str>) -> Result<UnfinishedUploads, StoreError> {
+        let (listed, mut skipped) = self.list_uploads_raw(prefix).await?;
+        let mut uploads = Vec::new();
+        for upload in listed {
+            match upload.initiated {
+                Some(initiated) => uploads.push(UnfinishedUpload {
+                    key: upload.key,
+                    id: upload.id,
+                    initiated,
+                }),
+                None => skipped += 1,
+            }
+        }
+        Ok(UnfinishedUploads { uploads, skipped })
+    }
+
+    /// The listing as the object server gives it: every upload whose key and ID this store could
+    /// have issued, with its start time if that reads, and the count of the others. The delete
+    /// goes by key and ID only, so an upload with an unreadable time is still aborted.
+    async fn list_uploads_raw(
+        &self,
+        prefix: Option<&str>,
+    ) -> Result<(Vec<ListedUpload>, usize), StoreError> {
         const OP: &str = "list the uploads";
         let bad = |status| StoreError::Server { op: OP, status };
         let max_uploads = self.tuning.page_size.to_string();
@@ -770,20 +826,17 @@ impl Inner {
                 let initiated = entry.initiated.parse::<Timestamp>().ok();
                 let key = ObjectKey::parse(&entry.key).ok();
                 let id = UploadId::parse(&entry.upload_id).ok();
-                match (key, id, initiated) {
-                    (Some(key), Some(id), Some(initiated)) => found.push(UnfinishedUpload {
+                match (key, id) {
+                    (Some(key), Some(id)) => found.push(ListedUpload {
                         key,
                         id,
-                        initiated: initiated.into(),
+                        initiated: initiated.map(Into::into),
                     }),
                     _ => skipped += 1,
                 }
             }
             if !page.is_truncated {
-                return Ok(UnfinishedUploads {
-                    uploads: found,
-                    skipped,
-                });
+                return Ok((found, skipped));
             }
             let next_key = page.next_key_marker.filter(|key| !key.is_empty());
             let next_id = page.next_upload_id_marker.unwrap_or_default();

@@ -93,6 +93,7 @@ enum Step {
     /// An answer whose body is `length` bytes long, of which `send` is sent; then the connection is
     /// held open (`hold`) or closed.
     Stream {
+        status: u16,
         length: usize,
         send: Vec<u8>,
         hold: bool,
@@ -230,9 +231,14 @@ async fn serve(
                 stream.shutdown().await?;
                 return Ok(());
             }
-            Step::Stream { length, send, hold } => {
+            Step::Stream {
+                status,
+                length,
+                send,
+                hold,
+            } => {
                 let head = format!(
-                    "HTTP/1.1 200 X\r\ncontent-length: {length}\r\nconnection: close\r\n\r\n"
+                    "HTTP/1.1 {status} X\r\ncontent-length: {length}\r\nconnection: close\r\n\r\n"
                 );
                 stream.write_all(head.as_bytes()).await?;
                 stream.write_all(&send).await?;
@@ -276,9 +282,12 @@ fn fast() -> Tuning {
 }
 
 fn store_with(port: u16, tuning: Tuning) -> S3Store {
-    let creds = credentials();
+    store_with_credentials(port, &credentials(), tuning)
+}
+
+fn store_with_credentials(port: u16, creds: &Credentials, tuning: Tuning) -> S3Store {
     S3Store {
-        inner: Arc::new(Inner::new(port, &creds, "nekoguruma", tuning).unwrap()),
+        inner: Arc::new(Inner::new(port, creds, "nekoguruma", tuning).unwrap()),
     }
 }
 
@@ -499,15 +508,47 @@ async fn a_server_that_stays_down_fails_when_the_budget_is_spent() {
 
 #[tokio::test]
 async fn a_port_nothing_listens_on_fails_with_an_io_error() {
-    // A socket that is bound and never listens keeps the port taken (a refused connect to a
-    // closed port takes seconds on Windows, so the budget is what ends this).
-    let held = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let port = held.local_addr().unwrap().port();
+    // A socket that is bound and never listens refuses connects and keeps the port taken (the
+    // refusal of a connect to a closed port takes seconds on Windows, so there the budget is
+    // what ends this).
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket
+        .bind((std::net::Ipv4Addr::LOCALHOST, 0).into())
+        .unwrap();
+    let port = socket.local_addr().unwrap().port();
     let error = S3Store::open(port, &credentials(), "nekoguruma", fast())
         .await
         .unwrap_err();
     assert!(matches!(error, StoreError::Io { .. }), "{error}");
-    drop(held);
+    #[cfg(unix)]
+    assert!(
+        matches!(
+            error,
+            StoreError::Io {
+                kind: ErrorKind::ConnectionRefused,
+                ..
+            }
+        ),
+        "{error}"
+    );
+    // The same port starts listening after a while: the refused connects were retried.
+    let server = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let listener = socket.listen(16).unwrap();
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 2048];
+        let _ = stream.read(&mut buf).await;
+        stream
+            .write_all(b"HTTP/1.1 200 X\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+            .await
+            .unwrap();
+    });
+    let mut tuning = fast();
+    tuning.ready_timeout = Duration::from_secs(5);
+    S3Store::open(port, &credentials(), "nekoguruma", tuning)
+        .await
+        .unwrap();
+    server.await.unwrap();
 }
 
 #[tokio::test]
@@ -590,26 +631,43 @@ async fn a_control_request_is_bounded_by_the_request_timeout() {
 
 #[tokio::test]
 async fn an_xml_answer_over_the_bound_is_refused_and_an_error_body_over_its_bound_is_cut() {
-    let big = "x".repeat(200 * 1024);
-    let body = big.clone();
-    let fake = Fake::start(move |seen, _| match seen.op() {
-        "create-upload" => reply(200, body.clone()),
-        _ => reply(500, body.clone()),
-    })
-    .await;
-    let store = store(&fake);
-    let error = store.begin().await.unwrap_err();
+    // A valid answer padded past the XML bound (64 KiB here) with a comment: it would parse
+    // without the bound.
+    let padded = create_xml("abc123").replace(
+        "<Bucket>",
+        &format!("<!-- {} --><Bucket>", "x".repeat(100 * 1024)),
+    );
+    assert!(CreateMultipartUpload::parse_response(&padded).is_ok());
+    let fake = Fake::start(move |_, _| reply(200, padded.clone())).await;
+    let error = store(&fake).begin().await.unwrap_err();
     assert!(
         matches!(error, StoreError::Server { status: 200, .. }),
         "{error}"
     );
-    let error = store
+    // An error answer that promises 10 MB and holds the connection after 8 KiB: with the 4 KiB
+    // error bound it is a quick status; without it the read would wait for the control timeout.
+    let fake = Fake::start(|_, _| Step::Stream {
+        status: 500,
+        length: 10_000_000,
+        send: vec![b'x'; 8 * 1024],
+        hold: true,
+    })
+    .await;
+    let mut tuning = fast();
+    tuning.request_timeout = Duration::from_secs(2);
+    let began = std::time::Instant::now();
+    let error = store_with(fake.port, tuning)
         .delete(&ObjectKey::generate().unwrap())
         .await
         .unwrap_err();
     assert!(
         matches!(error, StoreError::Server { status: 500, .. }),
         "{error}"
+    );
+    assert!(
+        began.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        began.elapsed()
     );
 }
 
@@ -644,9 +702,10 @@ async fn errors_hold_no_url_key_upload_id_or_server_text() {
         )
     })
     .await;
-    let store = store(&fake);
+    let creds = credentials();
+    let store = store_with_credentials(fake.port, &creds, fast());
     let up = upload();
-    let secret = credentials().expose_secret().to_owned();
+    let secret = creds.expose_secret().to_owned();
     let mut errors = vec![store.begin().await.unwrap_err()];
     errors.push(store.list_parts(&up).await.unwrap_err());
     errors.push(store.complete(&up, [0; 32], 1).await.unwrap_err());
@@ -943,7 +1002,7 @@ async fn complete_refuses_what_the_store_checks_itself_and_never_sends_the_compl
             matches!(e, StoreError::PartTooSmall { part: 1 })
         }),
         ("sum is not the length", vec![(1, 10), (2, 10)], 21, |e| {
-            matches!(e, StoreError::LengthMismatch { stored: 20 })
+            matches!(e, StoreError::PartsLengthMismatch { stored: 20 })
         }),
         (
             "over the object limit",
@@ -1142,6 +1201,7 @@ async fn a_read_back_that_is_cut_is_an_io_error_and_deletes_nothing() {
     let inner = object_fake(vec![(1, 10)], Vec::new());
     let fake = Fake::start(move |seen, index| match seen.op() {
         "get-object" => Step::Stream {
+            status: 200,
             length: 10,
             send: b"abc".to_vec(),
             hold: false,
@@ -1163,6 +1223,7 @@ async fn a_read_back_that_stalls_is_cut_by_the_idle_timeout() {
     let inner = object_fake(vec![(1, 10)], Vec::new());
     let fake = Fake::start(move |seen, index| match seen.op() {
         "get-object" => Step::Stream {
+            status: 200,
             length: 10,
             send: b"abc".to_vec(),
             hold: true,
@@ -1298,7 +1359,7 @@ async fn get_maps_the_status() {
         (500, "server"),
         (206, "server"),
     ] {
-        let fake = Fake::start(move |_, _| reply(status, error_body("X"))).await;
+        let fake = Fake::start(move |_, _| reply(status, error_body("NoSuchKey"))).await;
         let error = store(&fake).get(&key).await.unwrap_err();
         let kind = match error {
             StoreError::NotFound => "not found",
@@ -1314,6 +1375,7 @@ async fn get_maps_the_status() {
 async fn a_get_body_that_stalls_fails_with_a_timeout_and_one_that_is_cut_fails_too() {
     let key = ObjectKey::generate().unwrap();
     let stalled = Fake::start(|_, _| Step::Stream {
+        status: 200,
         length: 10,
         send: b"abc".to_vec(),
         hold: true,
@@ -1323,6 +1385,7 @@ async fn a_get_body_that_stalls_fails_with_a_timeout_and_one_that_is_cut_fails_t
     let error = read_all(body).await.unwrap_err();
     assert_eq!(error.kind(), ErrorKind::TimedOut);
     let cut = Fake::start(|_, _| Step::Stream {
+        status: 200,
         length: 10,
         send: b"abc".to_vec(),
         hold: false,
@@ -1504,4 +1567,80 @@ async fn a_failed_abort_keeps_the_object_and_is_answered() {
         "{error}"
     );
     assert!(!fake.ops().contains(&"delete-object"));
+}
+
+#[tokio::test]
+async fn a_404_is_gone_only_with_the_code_that_says_so() {
+    let key = ObjectKey::generate().unwrap();
+    let kt = key.to_string();
+    // get
+    let fake = Fake::start(|_, _| reply(404, error_body("NoSuchBucket"))).await;
+    let error = store(&fake).get(&key).await.unwrap_err();
+    assert!(
+        matches!(error, StoreError::Server { status: 404, .. }),
+        "{error}"
+    );
+    // delete of the object
+    let fake = Fake::start(|seen, _| match seen.op() {
+        "list-uploads" => reply(200, empty_uploads()),
+        _ => reply(404, error_body("NoSuchBucket")),
+    })
+    .await;
+    let error = store(&fake).delete(&key).await.unwrap_err();
+    assert!(
+        matches!(error, StoreError::Server { status: 404, .. }),
+        "{error}"
+    );
+    // abort
+    let fake = Fake::start(move |seen, _| match seen.op() {
+        "list-uploads" => reply(200, uploads_xml(&[(&kt, "id-a")], None)),
+        _ => reply(404, error_body("NoSuchBucket")),
+    })
+    .await;
+    let error = store(&fake).delete(&key).await.unwrap_err();
+    assert!(
+        matches!(error, StoreError::Server { status: 404, .. }),
+        "{error}"
+    );
+    assert!(!fake.ops().contains(&"delete-object"));
+    // complete
+    let fake = Fake::start(|seen, _| match seen.op() {
+        "list-parts" => reply(200, parts_xml(&[(1, 2)], None)),
+        _ => reply(404, error_body("NoSuchBucket")),
+    })
+    .await;
+    let error = store(&fake)
+        .complete(&upload(), [0; 32], 2)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, StoreError::Server { status: 404, .. }),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn an_upload_of_the_key_is_aborted_whatever_its_start_time_reads_as() {
+    let key = ObjectKey::generate().unwrap();
+    let kt = key.to_string();
+    let listing =
+        uploads_xml(&[(&kt, "id-a")], None).replace("2026-11-18T10:00:00.000Z", "not a time");
+    let fake = Fake::start({
+        let listing = listing.clone();
+        move |seen, index| match seen.op() {
+            "list-uploads" if index == 0 => reply(200, listing.clone()),
+            "list-uploads" => reply(200, empty_uploads()),
+            _ => reply(204, ""),
+        }
+    })
+    .await;
+    store(&fake).delete(&key).await.unwrap();
+    assert_eq!(
+        fake.ops(),
+        ["list-uploads", "abort", "list-uploads", "delete-object"]
+    );
+    // The unfinished listing counts it as skipped: its time is unknown.
+    let fake = Fake::start(move |_, _| reply(200, listing.clone())).await;
+    let listed = store(&fake).list_unfinished().await.unwrap();
+    assert_eq!((listed.uploads.len(), listed.skipped), (0, 1));
 }

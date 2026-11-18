@@ -595,6 +595,18 @@ async fn an_event_whose_commit_went_through_though_reported_as_failed_is_a_repea
         .execute(&mut *tx)
         .await
         .unwrap();
+    // The cursor row first, then the event: the order the store takes them in (the cursor row,
+    // its lock, the event). The queue keeps retrying on its tick while this runs, and staging
+    // them the other way round could leave each transaction waiting on a key the other inserted
+    // (a deadlock, seen once on main).
+    sqlx::query(
+        "INSERT INTO agent_event_cursor (tenant_id, agent_id, last_seq) \
+         SELECT tenant_id, id, 1 FROM agents WHERE id = $1::uuid",
+    )
+    .bind(&r.u.id)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
     sqlx::query(
         "INSERT INTO agent_events (tenant_id, agent_id, seq, kind, job_id, body) \
          SELECT tenant_id, id, 1, 'jobState', $2::uuid, $3 FROM agents WHERE id = $1::uuid",
@@ -602,14 +614,6 @@ async fn an_event_whose_commit_went_through_though_reported_as_failed_is_a_repea
     .bind(&r.u.id)
     .bind(JOB)
     .bind(frame(1))
-    .execute(&mut *tx)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO agent_event_cursor (tenant_id, agent_id, last_seq) \
-         SELECT tenant_id, id, 1 FROM agents WHERE id = $1::uuid",
-    )
-    .bind(&r.u.id)
     .execute(&mut *tx)
     .await
     .unwrap();

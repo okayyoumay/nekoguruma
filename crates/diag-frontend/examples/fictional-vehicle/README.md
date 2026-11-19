@@ -433,7 +433,7 @@ Steps:
 2. If the cruise-control bit is already set, finish; nothing is sent.
 3. Open the extended session (`SESSION` when refused).
 4. Request the seed and, unless it is all zero (the level is already unlocked, ISO 14229-1 (2026)
-   9.4.1), send the key, the seed XOR `5A5A5A5A` (section 7). A refusal of either is `SECURITY`.
+   9.4.1), send the key, the seed XOR `5A5A5A5A` (section 7). A refusal of either, or a seed answer that is not the full 6 bytes (SID, level and the 4-byte seed), is `SECURITY`.
 5. Write the coding with the bit set and the other fields as read, then read it back. When the
    read-back is the written value the procedure finishes.
 6. Otherwise decide. A refused write gets a read first: when the coding equals the saved value
@@ -463,11 +463,16 @@ is the last statement of `main` (ADR-330). Consequences:
 - A cancel set during the section is taken after it: the procedure ends on its own outcome, so a
   cancelled job never leaves a half-written coding behind. A cancel before the first write is taken
   at the next interruptible point and the coding is untouched.
+- A lost answer to the write (it may have reached the ECU) ends the job on site with the runner's
+  unconfirmed-request ending (ADR-392), and a read-back or confirming read whose repeats run out
+  ends the job with the host error; in both the coding is unknown.
 - A crash of the agent or the worker inside the section: the restart does not continue from a
   checkpoint inside an uninterruptible section of a plain procedure (ADR-335 item 5), so the job is
-  not resumed into the middle of it, and the coding may be the new, the saved or an unconfirmed
-  value. A new run reads the coding first (step 1): one that already has the bit finishes at step
-  2, one that has not runs again from the start.
+  not resumed into the middle of it; the crashed job ends on site and a person starts a new job,
+  and the coding may be the new, the saved or an unconfirmed value. A crash between the raw `0x27`
+  requests and the write also ends on site, since those requests are unsafe outside every section
+  (Starlark subset 4.6). A new run reads the coding first (step 1): one that already has the bit
+  finishes at step 2, one that has not runs again from the start.
 - The ECU leaves the extended session after S3server without a request (section 3); the worker's
   tester present keeps it while the procedure runs. A session lost between the unlock and the write
   shows as a refused write, which the decision of step 6 handles.

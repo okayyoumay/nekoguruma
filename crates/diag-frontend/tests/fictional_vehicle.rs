@@ -820,6 +820,16 @@ fn the_coding_program_writes_and_decides_inside_one_uninterruptible_section() {
         assert_eq!(writes, 2, "{variant}");
         assert_eq!(post_write_fails, 4, "{variant}");
         assert_eq!(calls, 1, "{variant}");
+        // From the first write to the end of the program (the section function is the tail of
+        // the code, and the section is split at each `diag` call's own section, ADR-332) nothing
+        // is interruptible, so no cancel is taken between the write and the decision.
+        let first_write = first_write.expect("a write");
+        for (pc, held) in held.iter().enumerate().skip(first_write) {
+            assert!(
+                held,
+                "{variant}: pc {pc} after the first write is interruptible"
+            );
+        }
     }
 }
 
@@ -916,6 +926,27 @@ fn p5_a_refused_seed_request_fails_with_security_and_sends_no_key() {
             let report = run_coding(variant, &answers);
             assert_eq!(failed_with(&report), "SECURITY", "{variant} {nrc:#X}");
             assert_eq!(sent(&report), unlock_requests()[..3], "{variant} {nrc:#X}");
+        }
+    }
+}
+
+#[test]
+fn p5b_a_short_or_long_positive_seed_answer_fails_with_security() {
+    for variant in ECM_VARIANTS {
+        for seed in [
+            vec![0x67, 0x01],
+            vec![0x67, 0x01, 0x12, 0x34],
+            vec![0x67, 0x01, 1, 2, 3, 4, 5],
+        ] {
+            let mut answers = Answers::new(&[coding_read(0x01)], &[]);
+            answers.seed = seed.clone();
+            let report = run_coding(variant, &answers);
+            assert_eq!(failed_with(&report), "SECURITY", "{variant} {seed:02X?}");
+            assert_eq!(
+                sent(&report),
+                unlock_requests()[..3],
+                "{variant} {seed:02X?}"
+            );
         }
     }
 }
@@ -1146,8 +1177,9 @@ fn refused_write_requests(rolled_back: bool) -> Vec<Vec<u8>> {
 #[test]
 fn w8_a_refused_write_with_the_coding_unchanged_fails_with_write_refused() {
     for variant in ECM_VARIANTS {
-        // The refusals the ECM gives for a session, security, authentication and a bad length.
-        for nrc in [0x7F, 0x33, 0x34, 0x13, 0x22] {
+        // The refusals the ECM gives: a session (0x7F), security (0x33), authentication (0x34), a bad
+        // length (0x13), the sequence (0x22) and a value outside the field's range (0x31).
+        for nrc in [0x7F, 0x33, 0x34, 0x13, 0x22, 0x31] {
             let answers = Answers::new(
                 &[coding_read(0x01), coding_read(0x01)],
                 &[negative(0x2E, nrc)],

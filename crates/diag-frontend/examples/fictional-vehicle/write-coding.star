@@ -12,6 +12,7 @@
 KEY_MASK = 0x5A5A5A5A
 CRUISE_CONTROL = 0x02
 RECORD_LENGTH = 7  # the positive response: SID, the DID and the four-byte record
+SEED_LENGTH = 6  # the positive response: SID, the level and the four-byte seed
 
 # True when the coding reads back as the given record. A read that fails or is not the full
 # record is not a match.
@@ -55,8 +56,8 @@ def main():
     if not session["ok"]:
         diag.fail("SESSION", "the extended session was refused")
     seed = diag.request(0x27, {"sub": 0x01})
-    if not seed["ok"]:
-        diag.fail("SECURITY", "the seed request was refused")
+    if not seed["ok"] or len(seed["raw"]) != SEED_LENGTH:
+        diag.fail("SECURITY", "the seed request was refused or its answer is not a seed")
     value = seed["fields"]["seed"]
     if value != 0:
         key = diag.request(0x27, {"sub": 0x02, "key": value ^ KEY_MASK})

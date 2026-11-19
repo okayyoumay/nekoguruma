@@ -273,8 +273,11 @@ async fn run_the_jobs(dir: &Path) {
     );
     requests_since(&trace, &mut seen);
 
-    // R1: the gateway has not authenticated, so the write is refused (NRC 0x34); the coding
-    // reads as saved, so the procedure ends as refused without a roll-back write.
+    // R1: the gateway has not authenticated, so the ECU refuses the write; the coding reads as
+    // saved, so the procedure ends as refused without a roll-back write. Nothing observable
+    // carries the refusal's code: the trace lists requests only and the failure's message is the
+    // procedure's fixed text, so the test cannot tell NRC 0x34 from another refusal; the dry-run
+    // tests cover each NRC.
     let refused = change_coding(&worker, &journal_dir, 1).await;
     match refused {
         Err(JobError::ProcedureFailed { code, .. }) => assert_eq!(code, "WRITE_REFUSED"),

@@ -17,7 +17,7 @@
 //! store's answer decides, ADR-493 items 6 and 19 to 21); the request handlers of the other
 //! routes only read.
 //!
-//! The completion of an upload is one task per upload in this process ([`Uploads::completion`]),
+//! The completion of an upload is one task per upload in this process (`Uploads::completion`),
 //! adopted by the hub so that the stop ends it, which outlives the request that started it: the
 //! requests only wait for its outcome (ADR-493 items 20 and 21).
 //!
@@ -103,6 +103,33 @@ pub struct Backend {
     store: Option<Arc<dyn MultipartStore>>,
     part_bytes: u64,
     complete_wait: Duration,
+    pause: Arc<Mutex<Option<Arc<Pause>>>>,
+}
+
+/// A request held between its read of the row and the start of its completion, until a test lets
+/// it go. Tests only.
+#[doc(hidden)]
+pub struct Pause {
+    entered: tokio::sync::Notify,
+    gate: tokio::sync::Semaphore,
+}
+
+impl Pause {
+    pub fn new() -> Arc<Pause> {
+        Arc::new(Pause {
+            entered: tokio::sync::Notify::new(),
+            gate: tokio::sync::Semaphore::new(0),
+        })
+    }
+
+    /// Resolves once a request is held.
+    pub async fn entered(&self) {
+        self.entered.notified().await;
+    }
+
+    pub fn release(&self) {
+        self.gate.add_permits(1000);
+    }
 }
 
 impl Backend {
@@ -113,7 +140,16 @@ impl Backend {
             store,
             part_bytes: PART_BYTES,
             complete_wait: COMPLETE_WAIT,
+            pause: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Holds the next completion request that needs a task between its read of the row and the
+    /// task's start, so that a test can let the task finish in between. Tests only.
+    #[doc(hidden)]
+    pub fn with_pause(self, pause: Arc<Pause>) -> Backend {
+        *self.pause.lock().unwrap_or_else(|e| e.into_inner()) = Some(pause);
+        self
     }
 
     /// Another wait of a completion request for its task, so that a test sees the 202 without
@@ -315,12 +351,15 @@ impl Uploads {
         let tenant = tenant.to_owned();
         let id = id.to_owned();
         self.hub.adopt(async move {
-            let _registered = registered;
+            let registered = registered;
             tokio::select! {
                 // The stop ends the task at once; the row stays as it is and the next request
                 // resumes (ADR-493 item 22).
                 _ = async { let _ = stopping.wait_for(|stop| *stop).await; } => {}
                 outcome = u.run_completion(&tenant, &id, store.as_ref(), &job) => {
+                    // The entry goes before the outcome is published, so a request that
+                    // starts after a waiter saw the outcome finds no stale entry.
+                    drop(registered);
                     let _ = sender.send(Some(outcome));
                 }
             }
@@ -447,6 +486,12 @@ fn store_failure(u: &Uploads, error: &StoreError) -> Response {
             "The object store is unavailable",
         ),
     }
+}
+
+/// A stored key, upload ID or digest that does not parse is the server's fault.
+fn unparsable(u: &Uploads) -> Response {
+    u.warn("a stored upload does not parse", "");
+    problem(StatusCode::INTERNAL_SERVER_ERROR, "The request failed")
 }
 
 fn no_store() -> Response {
@@ -1162,8 +1207,7 @@ pub async fn part_url(State(u): State<Uploads>, request: Request) -> Response {
         return no_store();
     };
     let Some(upload) = row.upload() else {
-        u.warn("a stored upload does not parse", "");
-        return problem(StatusCode::INTERNAL_SERVER_ERROR, "The request failed");
+        return unparsable(&u);
     };
     match store.presign_part(&upload, part) {
         Ok(url) => json_answer(
@@ -1224,8 +1268,7 @@ pub async fn status(
             return no_store();
         };
         let Some(upload) = row.upload() else {
-            u.warn("a stored upload does not parse", "");
-            return problem(StatusCode::INTERNAL_SERVER_ERROR, "The request failed");
+            return unparsable(&u);
         };
         match store.list_parts(&upload).await {
             Ok(listed) => answer["partsHeld"] = parts_held(&listed, &row).into(),
@@ -1233,7 +1276,7 @@ pub async fn status(
             // on: the row is read once more. A row that is not `open` any more is answered as
             // it is now; one that still is `open` is a 503 and nothing is written (ADR-493
             // items 17 and 23).
-            Err(StoreError::NotFound | StoreError::AlreadyFinished) => {
+            Err(error @ (StoreError::NotFound | StoreError::AlreadyFinished)) => {
                 match upload_row(&u.pool, &caller.tenant, &caller.agent.0, &id).await {
                     Ok(Some(now)) if now.state != "open" => {
                         return json_answer(
@@ -1246,7 +1289,7 @@ pub async fn status(
                         );
                     }
                     Ok(_) => {
-                        return store_failure(&u, &StoreError::NotFound);
+                        return store_failure(&u, &error);
                     }
                     Err(error) => return db_failure(&u, &error),
                 }
@@ -1293,14 +1336,25 @@ pub async fn complete(
         return no_store();
     };
     let (Some(upload), Some(sha256)) = (row.upload(), parse_sha256(&row.digest)) else {
-        u.warn("a stored upload does not parse", "");
-        return problem(StatusCode::INTERNAL_SERVER_ERROR, "The request failed");
+        return unparsable(&u);
     };
     let job = CompletionJob {
         upload,
         sha256,
         size: row.size_bytes,
     };
+    let pause = u
+        .backend
+        .pause
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+    if let Some(pause) = pause {
+        pause.entered.notify_one();
+        if let Ok(permit) = pause.gate.acquire().await {
+            permit.forget();
+        }
+    }
     let mut outcome = u.completion(&caller.tenant, &row.id, store, job);
     match tokio::time::timeout(
         u.backend.complete_wait,
@@ -1319,6 +1373,25 @@ pub async fn complete(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_guard_removes_the_registry_entry_however_the_task_ends() {
+        let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
+        let key = ("t".to_owned(), "u".to_owned());
+        let (_sender, receiver) = watch::channel(None);
+        registry.lock().unwrap().insert(key.clone(), receiver);
+        let guard = Registered {
+            registry: Arc::clone(&registry),
+            key,
+        };
+        assert_eq!(registry.lock().unwrap().len(), 1);
+        // A future that is dropped unpolled drops what it captured.
+        let never_polled = async move {
+            let _guard = guard;
+        };
+        drop(never_polled);
+        assert!(registry.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn a_digest_is_32_bytes_and_anything_else_is_none() {

@@ -17,7 +17,7 @@ use server::storage::{
     MultipartStore, ObjectBody, ObjectKey, Part, PartUrl, S3Store, S3Tuning, StoreError,
     StoreFuture, UnfinishedUploads, Upload, UploadId,
 };
-use server::uploads::{Backend, PART_BYTES};
+use server::uploads::{Backend, PART_BYTES, Pause};
 use sha2::{Digest, Sha256};
 use shared_proto::{AgentId, INSTRUCTION_VERSION, JobId, JobInstruction, JobKind, VciId};
 use tokio::io::AsyncReadExt;
@@ -146,6 +146,8 @@ struct Wrap {
     delete_fail: Mutex<Option<Fail>>,
     presign_fail: Mutex<Option<Fail>>,
     complete_fail: Mutex<Option<Fail>>,
+    /// Makes `complete` panic, as a fault in the task would.
+    complete_panics: std::sync::atomic::AtomicBool,
     /// Holds every `complete` before it answers.
     complete_hold: Mutex<Option<Arc<Hold>>>,
     /// Holds every `list_parts` before it lists.
@@ -234,6 +236,10 @@ impl MultipartStore for Wrap {
     ) -> StoreFuture<'a, ()> {
         Box::pin(async move {
             self.completes.fetch_add(1, Ordering::SeqCst);
+            assert!(
+                !self.complete_panics.load(Ordering::SeqCst),
+                "the fake's completion panics"
+            );
             let hold = self.complete_hold.lock().unwrap().clone();
             if let Some(hold) = hold {
                 hold.wait().await;
@@ -309,15 +315,25 @@ impl Fx {
     }
 
     async fn sized(with: With, part_bytes: Option<u64>) -> Fx {
-        Fx::build(with, part_bytes, None).await
+        Fx::build(with, part_bytes, None, None).await
     }
 
     /// A fixture whose completion requests wait `wait` for the task before they answer 202.
     async fn waiting(with: With, wait: Duration) -> Fx {
-        Fx::build(with, None, Some(wait)).await
+        Fx::build(with, None, Some(wait), None).await
     }
 
-    async fn build(with: With, part_bytes: Option<u64>, wait: Option<Duration>) -> Fx {
+    /// A fixture whose next completion request is held by `pause` before it starts a task.
+    async fn paused(with: With, pause: Arc<Pause>) -> Fx {
+        Fx::build(with, None, None, Some(pause)).await
+    }
+
+    async fn build(
+        with: With,
+        part_bytes: Option<u64>,
+        wait: Option<Duration>,
+        pause: Option<Arc<Pause>>,
+    ) -> Fx {
         let mut real = None;
         let mut wrap = Wrap::default();
         if with == With::Real {
@@ -346,6 +362,9 @@ impl Fx {
         }
         if let Some(wait) = wait {
             backend = backend.with_complete_wait(wait);
+        }
+        if let Some(pause) = pause {
+            backend = backend.with_pause(pause);
         }
         let u = Up::with_backend(2, None, None, backend).await;
         let token = token(&u).await;
@@ -856,6 +875,7 @@ async fn a_revoked_agent_is_401_and_loses_its_tokens() {
     let t1 = token(&fx.u).await;
     let t2 = token(&fx.u).await;
     let t3 = token(&fx.u).await;
+    let t4 = token(&fx.u).await;
     sqlx::query(sqlx::AssertSqlSafe(revoke.clone()))
         .execute(&fx.u.w.pool)
         .await
@@ -865,6 +885,9 @@ async fn a_revoked_agent_is_401_and_loses_its_tokens() {
     assert_eq!(fx.begin_as(Some(&t1), "{}").await.status, 400);
     assert_eq!(fx.part_as(Some(&t1), &id, "0").await.status, 400);
     assert_eq!(fx.part_as(Some(&t1), &id, "1%FF").await.status, 400);
+    let target = format!("/api/v1/agent/uploads/{id}/complete");
+    let body = fx.send("POST", &target, Some(&t1), None, "x").await;
+    assert_eq!(body.status, 400);
     sqlx::query(sqlx::AssertSqlSafe(restore.clone()))
         .execute(&fx.u.w.pool)
         .await
@@ -885,6 +908,7 @@ async fn a_revoked_agent_is_401_and_loses_its_tokens() {
     problem(&fx.part_as(Some(&t2), &id, "1").await, 401, "part");
     let revoked = fx.status_as(Some(&t3), &id).await;
     problem(&revoked, 401, "status");
+    problem(&fx.complete_as(Some(&t4), &id).await, 401, "complete");
     // The same bytes as a token that is unknown.
     assert_eq!(bytes_of(&revoked), bytes_of(&unknown_token));
     // The row is live again, and every token of the agent is gone, also the ones not used.
@@ -892,7 +916,13 @@ async fn a_revoked_agent_is_401_and_loses_its_tokens() {
         .execute(&fx.u.w.pool)
         .await
         .unwrap();
-    for (name, t) in [("t1", &t1), ("t2", &t2), ("t3", &t3), ("main", &fx.token)] {
+    for (name, t) in [
+        ("t1", &t1),
+        ("t2", &t2),
+        ("t3", &t3),
+        ("t4", &t4),
+        ("main", &fx.token),
+    ] {
         problem(&fx.status_as(Some(t), &id).await, 401, name);
     }
     // A new exchange works again.
@@ -944,6 +974,12 @@ async fn another_agents_job_or_upload_is_404_like_an_unknown_one() {
         assert_eq!(
             bytes_of(&part),
             bytes_of(&fx.part_as(Some(token), &unknown, "1").await)
+        );
+        let complete = fx.complete_as(Some(token), &id).await;
+        problem(&complete, 404, "complete");
+        assert_eq!(
+            bytes_of(&complete),
+            bytes_of(&fx.complete_as(Some(token), &unknown).await)
         );
         let status = fx.status_as(Some(token), &id).await;
         problem(&status, 404, "status");
@@ -1287,6 +1323,7 @@ async fn the_database_being_down_is_503() {
     problem(&fx.begin(&result_of(&job, 10)).await, 503, "begin");
     problem(&fx.part(&id, "1").await, 503, "part");
     problem(&fx.status(&id).await, 503, "status");
+    problem(&fx.complete(&id).await, 503, "complete");
     fx.finish().await;
 }
 
@@ -2072,6 +2109,116 @@ async fn the_stop_ends_a_running_completion_and_a_later_request_finishes_it() {
     fx.finish().await;
 }
 
+/// Case C3: a request reads the row before the task wrote `finished` and starts its own task
+/// after the first one left the registry: its compare-and-set changes no row, it re-reads
+/// `finished` and answers 200 with no second store call.
+#[tokio::test]
+async fn a_request_that_starts_a_task_after_the_first_finished_answers_the_state() {
+    let pause = Pause::new();
+    let fx = Fx::paused(With::Fake, Arc::clone(&pause)).await;
+    let job = fx.job().await;
+    let id = fx
+        .row(&job, 1, "result", 10, "open", PART_BYTES as i64)
+        .await;
+    let addr = fx.addr();
+    let raw = fx.request_text(
+        "POST",
+        &format!("/api/v1/agent/uploads/{id}/complete"),
+        Some(&fx.token),
+        None,
+        "",
+    );
+    // The first request has read the `open` row and waits before it starts a task.
+    let held = tokio::spawn(async move { exchange(addr, &raw).await });
+    tokio::time::timeout(Duration::from_secs(20), pause.entered())
+        .await
+        .expect("the request is held");
+    // Another request runs the whole completion, which leaves the registry before it answers.
+    let r = fx.complete(&id).await;
+    assert_eq!(r.status, 200, "{}", r.head);
+    assert_eq!(fx.wrap.completes.load(Ordering::SeqCst), 1);
+    pause.release();
+    let r = held.await.unwrap();
+    assert_eq!(r.status, 200, "{}", r.head);
+    assert_eq!(json(&r), serde_json::json!({"state": "finished"}));
+    assert_eq!(fx.wrap.completes.load(Ordering::SeqCst), 1);
+    fx.finish().await;
+}
+
+/// Case T: a task that panics answers its waiters 503 and leaves the registry, so the repeat
+/// starts a new task, which finds the row `completing` and finishes it.
+#[tokio::test]
+async fn a_task_that_panics_is_503_and_the_repeat_starts_a_new_one() {
+    let fx = Fx::new(With::Fake).await;
+    let job = fx.job().await;
+    let id = fx
+        .row(&job, 1, "result", 10, "open", PART_BYTES as i64)
+        .await;
+    fx.wrap.complete_panics.store(true, Ordering::SeqCst);
+    problem(&fx.complete(&id).await, 503, "the task panicked");
+    assert_eq!(fx.state(&id).await, "completing");
+    fx.wrap.complete_panics.store(false, Ordering::SeqCst);
+    let r = fx.complete(&id).await;
+    assert_eq!(r.status, 200, "{}", r.head);
+    assert_eq!(fx.state(&id).await, "finished");
+    fx.finish().await;
+}
+
+/// Case D: no pooled connection is held while a completion waits in the store: more held
+/// completions than the pool has connections, and the database is still served.
+#[tokio::test]
+async fn no_pooled_connection_is_held_while_a_completion_waits_for_the_store() {
+    let fx = Fx::new(With::Fake).await;
+    const N: usize = 12;
+    let hold = Hold::new();
+    *fx.wrap.complete_hold.lock().unwrap() = Some(Arc::clone(&hold));
+    let addr = fx.addr();
+    let mut tasks = Vec::new();
+    for _ in 0..N {
+        let job = fx.job().await;
+        let id = fx
+            .row(&job, 1, "result", 10, "open", PART_BYTES as i64)
+            .await;
+        let raw = fx.request_text(
+            "POST",
+            &format!("/api/v1/agent/uploads/{id}/complete"),
+            Some(&fx.token),
+            None,
+            "",
+        );
+        tasks.push(tokio::spawn(
+            async move { exchange(addr, &raw).await.status },
+        ));
+    }
+    for _ in 0..1000 {
+        if fx.wrap.completes.load(Ordering::SeqCst) == N {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        fx.wrap.completes.load(Ordering::SeqCst),
+        N,
+        "all are in the store"
+    );
+    // The server's sessions are idle, and a request that needs the database is served.
+    assert_eq!(
+        fx.sql(
+            "SELECT count(*) FROM pg_stat_activity WHERE application_name = 'ngr-server' \
+             AND state <> 'idle'"
+        )
+        .await,
+        "0"
+    );
+    let job = fx.job().await;
+    assert_eq!(fx.begin(&result_of(&job, 1)).await.status, 201);
+    hold.release();
+    for task in tasks {
+        assert_eq!(task.await.unwrap(), 200);
+    }
+    fx.finish().await;
+}
+
 /// Case O1: the order of the judgment. The body before the token, the token before the upload,
 /// a foreign upload is the unknown one's 404, and then the store and the row.
 #[tokio::test]
@@ -2247,9 +2394,12 @@ async fn the_log_of_a_failed_completion_holds_no_upload_id_key_digest_or_databas
     fx.finish().await;
     let text = log.text();
     assert!(
-        text.contains("failed to complete an upload") && text.contains("a statement failed")
-            || text.contains("the database is unavailable"),
-        "both failures are logged: {text}"
+        text.contains("the object store failed to complete an upload"),
+        "the store's failure is logged: {text}"
+    );
+    assert!(
+        text.contains("the database is unavailable") || text.contains("a statement failed"),
+        "the database's failure is logged: {text}"
     );
     for secret in &secrets {
         assert!(!text.contains(secret.as_str()), "a secret is in the log");

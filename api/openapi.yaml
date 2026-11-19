@@ -831,9 +831,10 @@ paths:
         deleted and answers **409** with state `failed`, and the agent begins again; when the
         upload and the object are both gone (a stop between a mismatch's delete and the row's
         update), the row also becomes `failed` with **409**. Any other store error, a failed
-        delete included, and a database failure leave the row as it is (`completing` once the
-        task began) and answer **503** (**500** for a stored value that does not parse), to be
-        repeated. A stop of the server ends the task and leaves the row `completing`; the next
+        delete included, and a database failure write nothing more and answer **503**: the row
+        is `completing` once the task began (a failed compare-and-set leaves it `open`), and
+        the agent repeats the request. **500** is a stored value that does not parse, a store
+        without randomness or a database error that is a fault of the server. A stop of the server ends the task and leaves the row `completing`; the next
         request resumes it.
       security:
         - agentSession: []

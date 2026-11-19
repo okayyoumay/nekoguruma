@@ -422,8 +422,8 @@ engine controller.
 that changes configuration data: it sets the cruise-control option (bit 1 of the options byte of
 DID `0120`, section 6.3) of the engine controller and leaves the market and the target idle speed
 as they are. It is converted with the ECM definition (both variants) and run as a configuration
-write job; the gateway's authentication (section 5) is the job's precondition, not a step of the
-procedure.
+write job; the gateway's authentication (section 5) is a prerequisite the procedure does not
+establish: it is not one of its steps.
 
 Steps:
 

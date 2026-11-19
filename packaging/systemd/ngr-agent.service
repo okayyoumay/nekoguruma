@@ -1,0 +1,28 @@
+# The device-mode agent on Linux (design 6.2, 6.5). Installation and the exit statuses the
+# restart policy rests on: crates/agent/docs/ngr-agent.md ("Installation (Linux)").
+# The agent key's encrypted credential is added by the device key store, not here.
+[Unit]
+Description=Nekoguruma agent (device mode)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# A static account, created by sysusers.d/ngr-agent.conf; no DynamicUser=, since the state
+# directory and the agent key must belong to the same account across restarts.
+User=ngr-agent
+Group=ngr-agent
+# systemd creates /var/lib/nekoguruma owned by the account above. The agent's built-in device
+# state root is that path (crates/agent/src/state.rs) and it creates only sub-directories.
+StateDirectory=nekoguruma
+StateDirectoryMode=0700
+ExecStart=/usr/bin/ngr-agent connect --mode device
+# Exit 3 (a lock, the state directory or the registration record unavailable) is worth a retry,
+# and so is a crash. Exit 1 (not registered, no key store), 2 (invalid command line) and 4
+# (the key is present and unusable) repeat until an administrator acts; exit 0 is a stop.
+Restart=on-failure
+RestartSec=10
+RestartPreventExitStatus=1 2 4
+
+[Install]
+WantedBy=multi-user.target

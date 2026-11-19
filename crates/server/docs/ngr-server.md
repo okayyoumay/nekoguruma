@@ -50,12 +50,12 @@ url = "postgres://ngr:<password>@127.0.0.1:5432/nekoguruma"
 connect_timeout_secs = 10    # default 10, 1-300
 
 [instruction_key]            # required
-path = "/etc/nekoguruma/instruction.key"   # absolute; Windows: use a TOML literal string
+path = "/etc/nekoguruma-server/instruction.key"   # absolute; Windows: use a TOML literal string
 
 [object_server]              # required in a file
 binary = "/opt/nekoguruma/rustfs"          # absolute; what scripts/fetch-rustfs.sh prints
-data_dir = "/var/lib/nekoguruma/object-server"   # absolute; created when absent
-credentials_dir = "/etc/nekoguruma/object-server"   # absolute; must exist; not the key's directory
+data_dir = "/var/lib/nekoguruma-server/object-server"   # absolute; created when absent
+credentials_dir = "/etc/nekoguruma-server/object-server"   # absolute; must exist; not the key's directory
 port = 8081                  # default: http.port + 1
 bucket = "nekoguruma"        # default; the object store's bucket
 ```

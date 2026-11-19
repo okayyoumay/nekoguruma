@@ -33,9 +33,10 @@ pub const STATE_DIR_VAR: &str = "NGR_AGENT_STATE_DIR";
 /// The directory name under the platform's state location.
 const ROOT_NAME: &str = "nekoguruma";
 
-/// The Unix device root, which the installation creates.
-#[cfg(unix)]
-const DEVICE_ROOT: &str = "/var/lib/nekoguruma";
+/// The Unix device root, which the installation creates (the shipped systemd unit's
+/// `StateDirectory=`; `tests/packaging.rs` keeps the two equal). Defined on every platform so
+/// that a test can read it; only Unix uses it.
+pub const DEVICE_ROOT: &str = "/var/lib/nekoguruma";
 
 /// Why a state directory cannot be had. The text holds no path that names a user.
 #[derive(Debug, Clone, PartialEq, Eq)]

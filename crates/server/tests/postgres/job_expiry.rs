@@ -526,8 +526,12 @@ async fn a_failing_pass_is_logged_once_and_retried_at_every_tick_until_it_works(
          FOR EACH ROW EXECUTE FUNCTION refuse_delete()",
     )
     .await;
-    let job = job(&u, -1).await;
+    // The job is made past its deadline only once it holds the lock: the task is already ticking,
+    // and a pass that ran between a past-deadline insert and the lock would end the job with no
+    // lock to delete, so no pass would ever fail.
+    let job = job(&u, 3600).await;
     hold(&u, &job, VIN_A).await;
+    set(&u, &job, "start_deadline = now() - interval '1 second'").await;
     until_at_least(&failures, 3, "the pass failed three times").await;
     until_logged(&log, "the job expiry pass failed").await;
     assert_eq!(log.text().matches("the job expiry pass failed").count(), 1);

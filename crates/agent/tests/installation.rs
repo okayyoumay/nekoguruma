@@ -1,5 +1,5 @@
-//! The installation file at the three commands that read it (design 6.7, ADR-494): `identity`,
-//! `register` and `connect`, each in both modes, as processes. The unit tests of
+//! The installation file at the five commands that read it (design 6.7, ADR-494): `run`,
+//! `identify`, `identity`, `register` and `connect`, each in both modes, as processes. The unit tests of
 //! `crates/agent/src/installation/tests.rs` hold the case table of the file itself; these tests
 //! show what the commands do with each outcome: the exit status, the fixed message, and that
 //! nothing was touched (no state directory, no key, no lock, no connection) before the file was
@@ -54,10 +54,17 @@ impl Env {
     }
 
     /// The directory the installation file is written in: a child of the home, so that it is a
-    /// private directory the test owns.
+    /// private directory the test owns. The check of design 7.2 judges the file's directory and
+    /// those above it, and both directories take their mode from the umask (0775 under 0002), so
+    /// they are made private here.
     fn dir(&self) -> PathBuf {
         let dir = self.home.path().join("installation");
         std::fs::create_dir_all(&dir).unwrap();
+        #[cfg(unix)]
+        for private in [self.home.path(), dir.as_path()] {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(private, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         dir
     }
 
@@ -81,9 +88,28 @@ fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
-/// The three commands with `mode`, as the argument lists they are started with.
-fn commands(mode: &'static str) -> [(&'static str, Vec<&'static str>); 3] {
+/// The five commands with `mode`, as the argument lists they are started with. `run` and
+/// `identify` name inputs that do not exist: the file is read before they are.
+fn commands(mode: &'static str) -> [(&'static str, Vec<&'static str>); 5] {
     [
+        (
+            "run",
+            vec![
+                "run",
+                "--vci",
+                "none",
+                "--mode",
+                mode,
+                "--document",
+                "none.dir",
+            ],
+        ),
+        (
+            "identify",
+            vec![
+                "identify", "--vci", "none", "--mode", mode, "--plan", "none.bin",
+            ],
+        ),
         ("identity", vec!["identity", "--mode", mode]),
         (
             "register",
@@ -386,6 +412,17 @@ fn a_valid_file_lets_each_command_go_on_in_both_modes() {
             &env.dir(),
             &installation_file::text(mode, "http://127.0.0.1:1"),
         );
+        // `run` and `identify` go on to their inputs, which they cannot read; neither touches the
+        // key store or the state directory.
+        for (name, args, message) in [
+            ("run", commands(mode)[0].1.clone(), "cannot read"),
+            ("identify", commands(mode)[1].1.clone(), "cannot read"),
+        ] {
+            let output = env.command(&file, &args).output().unwrap();
+            assert_eq!(output.status.code(), Some(1), "{name}");
+            assert!(text(&output.stderr).contains(message), "{name}");
+            assert!(!env.touched(), "{name} touched the state");
+        }
         // `connect` finds no record, before the key store is touched.
         let output = env
             .command(&file, &["connect", "--mode", mode])
@@ -514,5 +551,32 @@ fn a_release_build_ignores_the_location_override() {
             assert_refused(&output, name, "there is no installation file");
             assert!(!env.touched(), "{name} touched the state");
         }
+    }
+}
+
+/// `run` and `identify` on a device with no installed mode (ADR-494): exit 1 before the log
+/// directory, a lock, the state directory or a worker; the worker directory is never looked at.
+/// Runs in both builds: a debug build is pointed at a path with no file, a release build reads
+/// the fixed location, where a test machine has none.
+#[test]
+fn run_and_identify_without_an_installed_mode_start_no_worker() {
+    let env = Env::new();
+    let missing = env.dir().join("agent.toml");
+    let logs = env.home.path().join("logs");
+    let locks = env.home.path().join("locks");
+    let workers = env.home.path().join("workers");
+    for (name, args) in commands("user").into_iter().take(2) {
+        let mut command = env.command(&missing, &args);
+        command
+            .arg("--comm-log")
+            .arg(&logs)
+            .arg("--locks")
+            .arg(&locks)
+            .arg("--workers")
+            .arg(&workers);
+        let output = command.output().unwrap();
+        assert_refused(&output, name, "there is no installation file");
+        assert!(!logs.exists() && !locks.exists(), "{name} made a directory");
+        assert!(!env.touched(), "{name} touched the state");
     }
 }

@@ -61,10 +61,12 @@ key, or the debug variables are wrong; 2 a usage error; 3 the installation file 
 (nothing changed, try again); 4 the stored key cannot be used (nothing changed; register again
 after an explicit reset).
 
-identity, register and connect first read the installation file (agent.toml, beside the
-configuration file in the system directory; crates/agent/docs/ngr-agent.md): the device's mode,
-the server's origin and the distribution root key come from it, and --mode must equal its mode.
-They read it after the log starts and before the key, a lock or a connection.
+Every command first reads the installation file (agent.toml, beside the configuration file in
+the system directory; crates/agent/docs/ngr-agent.md): the device's mode, the server's origin
+and the distribution root key come from it, and --mode must equal its mode. run and identify use
+only the mode. A command reads it after the log starts and before the key, a lock, a worker or a
+connection; when it is absent, refused, not valid or for the other mode, run and identify exit
+1, and when it cannot be read for another reason, 3.
 
 register: registers the agent with the server the installation file names and stores the
 registration record in the agent's state directory. --server (http://127.0.0.1[:port]) is
@@ -219,12 +221,13 @@ fn main() -> ExitCode {
         _ => None,
     };
     // The installation file (design 6.7, ADR-494): read once, after the log starts and before
-    // the key, a lock or a connection, by the three commands that act for the registered agent.
+    // the key, a lock or a connection, by every command (`run` and `identify` use its mode only).
     let installation = match &command {
         Command::Identity(mode) => Some(installed("identity", *mode)),
         Command::Register(args) => Some(installed("register", args.mode)),
         Command::Connect(mode) => Some(installed("connect", *mode)),
-        Command::Run(_) | Command::Identify(_) => None,
+        Command::Run(args) => Some(installed("run", args.mode)),
+        Command::Identify(args) => Some(installed("identify", args.mode)),
     };
     let installation = match installation.transpose() {
         Ok(installation) => installation,

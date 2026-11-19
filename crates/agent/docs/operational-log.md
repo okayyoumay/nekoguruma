@@ -163,8 +163,8 @@ throughout.
   after that, and the reopen is tried again before the next attempt; a corrupt file is an `error`
   line and ends the session.
 
-- **The installation file** (`agent::installation`, ADR-494), read by `identity`, `register` and
-  `connect` after the log starts:
+- **The installation file** (`agent::installation`, ADR-494), read by `run`, `identify`,
+  `identity`, `register` and `connect` after the log starts:
   - A valid file is one `info` entry, "installation file read", with the mode, the profile, the
     startup method and the root key's fingerprint (hex of a hash) as fields. The path and the
     server's origin are in its `external` field, as `file {path} server {origin}`, and only

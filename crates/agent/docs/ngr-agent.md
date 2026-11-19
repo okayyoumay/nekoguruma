@@ -20,7 +20,7 @@ ngr-agent run --vci <name> --mode <device|user> --document <file> [--artifact <f
 |---|---|
 | `--vci` | The library name, resolved the same way by the agent (step 3) and the worker service (design 7.1.1). For J2534 v04.04: the registry key name on Windows, the `Name` of a registration definition on Linux. For the D-PDU API: the `SHORT_NAME` of an implementation in the root description file |
 | `--api` | The API the VCI's library implements: `j2534` (J2534 v04.04, `j2534-0404-service`; the default) or `dpdu` (the D-PDU API, `iso22900-service`). The names are those of a VCI profile's `standard.kind` (`schemas/vci-profile.schema.json`) |
-| `--mode` | The device's operating mode (design 6.2), `device` or `user`. Required: the mode is fixed per device at installation, and this command, which has no installation of its own, takes it from the command line rather than defaulting to either. It is passed to the worker (ADR-281 Decision item 2); design 7.2 gives it its meaning for a failed library check: device mode refuses the library, user mode reports the findings and loads it. Both worker services apply it to the checks they run before loading |
+| `--mode` | The device's operating mode (design 6.2), `device` or `user`. Required, and it must equal the mode of the installation file ("Installation file" below, ADR-494): the mode is fixed per device at installation, so the command line names it only to be checked, and a difference is exit status 1 before any lock, state directory or worker. It is passed to the worker (ADR-281 Decision item 2); design 7.2 gives it its meaning for a failed library check: device mode refuses the library, user mode reports the findings and loads it. Both worker services apply it to the checks they run before loading |
 | `--document` | A variant's document (design 8.2.6, `.dir`): its procedure is the program, and the job decodes response fields through its variant's declarations (`agent::JobDocument`). The document is checked as `diag_ir::declaration::load_ecu_document` checks it (ADR-296), and one without a procedure, or whose procedure is not exactly one program, is refused (ADR-318). Required, given once. The options `--program`, `--tx-id` and `--rx-id` of earlier versions are gone: they are refused as unknown options (exit status 2) |
 | `--artifact`, `--artifact-sha256` | The flash artifact a procedure reads its blocks from (`Op::FlashBlock`, design 8.2.5, 11.3, ADR-336 items 1 and 12), and the SHA-256 the job names for it, 64 hexadecimal digits in either case. Both or neither, each at most once. The file is read once, before any worker starts, and its bytes stay in memory for the job (`agent::Artifact`), so a file changed on disk after the check cannot change a block. See step 1 for the check |
 | `--workers` | Directory of worker builds, laid out as `<dir>/<ABI name>/j2534-0404-service[.exe]` and `<dir>/<ABI name>/iso22900-service[.exe]` (design 7.3). Default: `workers` next to the `ngr-agent` executable |
@@ -171,8 +171,9 @@ commits 0 (ADR-252).
 | Exit status | Meaning | Output |
 |---|---|---|
 | 0 | The program ran to its end | The final `diag_ir::VmState` as one line of JSON on stdout. A negative response is a value on the stack, not a failure, and neither is the silence of a request whose positive response is suppressed (an empty value, ADR-408; for a request longer than one classic CAN frame only with a confirmed send, and never with an error event bound to the primitive) |
-| 1 | Reading the document, launching the worker or the job failed (including a procedure that ended itself as failed, `JobError::ProcedureFailed`), the worker may still hold the VCI after a failed link close, or the final state holds a non-finite float (infinity or NaN), which JSON cannot represent | The reason on stderr |
+| 1 | The installation file is absent, refused, not valid or not readable by the agent's account, or `--mode` is not its mode ("Installation file" below; nothing else has happened yet); reading the document, launching the worker or the job failed (including a procedure that ended itself as failed, `JobError::ProcedureFailed`), the worker may still hold the VCI after a failed link close, or the final state holds a non-finite float (infinity or NaN), which JSON cannot represent | The reason on stderr |
 | 2 | Invalid command line | The error and the usage on stderr |
+| 3 | The installation file cannot be read for a reason other than a refusal of access ("Installation file" below); nothing else has happened yet, and a retry may help | The reason on stderr |
 
 The worker's own log goes to stderr.
 
@@ -199,7 +200,7 @@ release. The differences:
 | `--document` | A document the plan names, by its hash. Any number, including none. The same file twice is one document. A document the plan does not name is ignored, with a warning on stderr. A document the plan names and that is not supplied refuses the plan |
 | `--artifact`, `--artifact-sha256` | Not accepted: the job reads no artifact (unknown options, exit status 2) |
 
-The plan and the documents are read and checked (`load_plan`, `check_plan`) before the log
+The installation file is read first, as for `run`. The plan and the documents are read and checked (`load_plan`, `check_plan`) before the log
 directory is made, a lock is taken or a worker starts. The job takes the per-VCI lock
 (`JobGuards::take_vci_only`), since it sends only the presence request and read-only requests
 (the VIN and the ECU definitions' identification requests), and the lock of the vehicle whose VIN it established (below, ADR-399); it keeps a
@@ -210,14 +211,15 @@ API and the width as a procedure's does.
 | Exit status | Meaning | Output |
 |---|---|---|
 | 0 | The job ended: the report, including a run whose presence section is interrupted (`presence_interrupted`), whose VIN phase is interrupted (`vin_interrupted`), whose ECU phase is interrupted (`ecu_reads_interrupted`) or whose tables the VCI refused | The `IdentificationReport` as one line of JSON on stdout (it holds the VIN when one was established, the ECU reads and entry states, ADR-401, and the rule fields and component values, ADR-403) |
-| 1 | The plan or a document cannot be read (`cannot read <path>`) or the plan is refused (`plan refused: ...`), both before the VCI; the job failed (`job failed: ...`, nothing on stdout; among them guards still marked after the VIN phase's last close when an ECU read remains, `LinkUnconfirmed`); or the worker may still hold the VCI after a failed link close | The reason on stderr |
+| 1 | The installation file is absent, refused, not valid or not readable by the agent's account, or `--mode` is not its mode ("Installation file" below), before the plan is read; the plan or a document cannot be read (`cannot read <path>`) or the plan is refused (`plan refused: ...`), both before the VCI; the job failed (`job failed: ...`, nothing on stdout; among them guards still marked after the VIN phase's last close when an ECU read remains, `LinkUnconfirmed`); or the worker may still hold the VCI after a failed link close | The reason on stderr |
 | 2 | Invalid command line | The error and the usage on stderr |
+| 3 | The installation file cannot be read for a reason other than a refusal of access ("Installation file" below); nothing else has happened yet, and a retry may help | The reason on stderr |
 
 ## Installation file
 
-What the installation decides for this device (design 6.2, 6.5, 6.7; ADR-494) is one TOML file, `agent.toml`, which `ngr-agent identity`, `register` and `connect` read (`agent::installation`). `run` and `identify` do not.
+What the installation decides for this device (design 6.2, 6.5, 6.7; ADR-494) is one TOML file, `agent.toml`, which every command reads (`agent::installation`): `run` and `identify` use its mode only, and `identity`, `register` and `connect` also use the server and the root key as described under each.
 
-**Location.** Beside the worker's `config.toml` in the fixed system directory: `/etc/nekoguruma/agent.toml` on Linux, `%ProgramData%\nekoguruma\agent.toml` on Windows. `vci_service_config::agent_installation_file()` gives it: the build-time `NGR_AGENT_INSTALLATION_FILE` (default `nekoguruma/agent.toml`, relative to the fixed system directory or absolute), and, in debug builds only, a non-empty runtime variable of the same name (ADR-228, ADR-073). A release build reads no variable, so a test machine without the file at the fixed location exits 1 from all three commands.
+**Location.** Beside the worker's `config.toml` in the fixed system directory: `/etc/nekoguruma/agent.toml` on Linux, `%ProgramData%\nekoguruma\agent.toml` on Windows. `vci_service_config::agent_installation_file()` gives it: the build-time `NGR_AGENT_INSTALLATION_FILE` (default `nekoguruma/agent.toml`, relative to the fixed system directory or absolute), and, in debug builds only, a non-empty runtime variable of the same name (ADR-228, ADR-073). A release build reads no variable, so a test machine without the file at the fixed location exits 1 from every command.
 
 **Check.** Before it reads a byte the agent runs the design 7.2 writability check (`Policy::system`) on the file and its ancestors, in both modes: unlike the worker's configuration file there is no lenient user mode, so a user-mode account cannot change what its own agent installed. A file or directory that a regular user can change, an owner that is not a system principal, a path that is not a regular file and an entry that cannot be inspected are refusals. A symbolic link is judged by the check's own rule: a link owned by a trusted owner to a file that passes is accepted. Only a debug build that has the location override also trusts the user it runs as to own the file. The directory `/etc/nekoguruma` therefore must be owned by root; a server that runs as another account keeps its own files elsewhere (`crates/server/docs/ngr-server.md`).
 
@@ -234,7 +236,7 @@ What the installation decides for this device (design 6.2, 6.5, 6.7; ADR-494) is
 
 An unknown key is refused. The first problem found decides, in a fixed order: the syntax, an unknown key, then `mode`, `server_url`, `distribution_root_pem`, `profile`, `startup` and `lock_dir`.
 
-**The order in `main`.** The command line is parsed (exit 2), the operational log starts, `register`'s terminal check on standard input runs (exit 2), and then the file is read, once, before the key, a lock or a connection. `--mode` stays required and must equal the file's `mode` (exit 1 on a difference, with both modes named: they are fixed words). The commands use the installed mode and origin: `register` takes the server from the file (`--server` is optional and must be the same origin), and `connect` compares the record's origin with the installed one (below).
+**The order in `main`.** The command line is parsed (exit 2), the operational log starts, `register`'s terminal check on standard input runs (exit 2), and then the file is read, once, before the key, a lock, a worker, the communication log directory or a connection. `--mode` stays required and must equal the file's `mode` (exit 1 on a difference, with both modes named: they are fixed words). `run` and `identify` use the installed mode only (no server check) and pass it to the worker. The other commands use the installed mode and origin: `register` takes the server from the file (`--server` is optional and must be the same origin), and `connect` compares the record's origin with the installed one (below).
 
 | Exit status | Meaning |
 |---|---|
@@ -249,7 +251,7 @@ An unknown key is refused. The first problem found decides, in a fixed order: th
 ngr-agent identity --mode <device|user>
 ```
 
-Loads the agent key (design 6.4, ADR-459) from the key store of the build and mode, creating it once when the store holds none, and prints one line of JSON on stdout: `public_key_pem` (the SPKI document as PEM), `fingerprint` (the SHA-256 of the SPKI DER as 64 lowercase hexadecimal digits) and `created` (true only for the process that created the key). `--mode` is required and the only option: the key's name, the store and the state directory depend on the mode, and it must be the mode of the installation file ("Installation file" above), which the command reads first. The command needs no worker and no VCI, and `run` and `identify` never touch the store.
+Loads the agent key (design 6.4, ADR-459) from the key store of the build and mode, creating it once when the store holds none, and prints one line of JSON on stdout: `public_key_pem` (the SPKI document as PEM), `fingerprint` (the SHA-256 of the SPKI DER as 64 lowercase hexadecimal digits) and `created` (true only for the process that created the key). `--mode` is required and the only option: the key's name, the store and the state directory depend on the mode, and it must be the mode of the installation file ("Installation file" above), which the command reads first. The command needs no worker and no VCI, and `run` and `identify` never touch the store (they read the installation file, as every command does).
 
 | Exit status | Meaning | Output |
 |---|---|---|

@@ -1,6 +1,19 @@
 //! `ngr-agent` failures that end the run before a worker starts. A run against a worker is
 //! tested end to end in `crates/j2534-0404-service/tests/ngr_agent_end_to_end.rs`, which also
 //! relies on this file: cargo builds the `ngr-agent` binary for a package's integration tests.
+//!
+//! `run` and `identify` read the installation file first (design 6.7, ADR-494). A debug agent
+//! reads the one these tests plant where `NGR_AGENT_INSTALLATION_FILE` points; a release agent
+//! ignores the variable and finds none at the fixed system location, so the tests that go on past
+//! the file run in debug builds only (`crates/agent/tests/installation.rs` has the release one).
+
+#![cfg_attr(
+    not(debug_assertions),
+    expect(
+        dead_code,
+        reason = "the helpers belong to the tests that go on past the installation file, which run in debug builds only"
+    )
+)]
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -8,8 +21,34 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use diag_ir::{IR_SCHEMA_VERSION, Op, Program};
 
+#[path = "support/installation_file.rs"]
+mod installation_file;
+
+/// The installation file of every test in this file: a user-mode device, planted once per
+/// process in a temporary directory of its own, named afresh so that no other process or
+/// account shares it. The directory lives as long as the process: a static is never dropped, so it is
+/// left behind, as small as one file.
+fn installation() -> &'static Path {
+    static FILE: std::sync::OnceLock<(tempfile::TempDir, PathBuf)> = std::sync::OnceLock::new();
+    let (_, path) = FILE.get_or_init(|| {
+        let dir = tempfile::Builder::new()
+            .prefix("ngr-agent-cli-installation-")
+            .tempdir()
+            .expect("the installation directory should be created");
+        let path = installation_file::write(
+            dir.path(),
+            &installation_file::text("user", "http://127.0.0.1:1"),
+        );
+        (dir, path)
+    });
+    path
+}
+
+/// `ngr-agent` for a device installed in user mode.
 fn ngr_agent() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_ngr-agent"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ngr-agent"));
+    installation_file::point(&mut command, installation());
+    command
 }
 
 /// A fresh temporary directory, removed however the test ends.
@@ -110,6 +149,7 @@ fn a_run_without_a_document_is_a_usage_error() {
     assert!(output.stdout.is_empty());
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn refused_program_exits_with_1_before_resolving_the_vci() {
     let temp = TempDir::new("refused");
@@ -151,6 +191,7 @@ fn write_document(dir: &Path, procedure: Option<Vec<u8>>) -> PathBuf {
     path
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn a_document_that_cannot_run_exits_with_1_before_resolving_the_vci() {
     let temp = TempDir::new("document");
@@ -195,6 +236,7 @@ fn a_document_that_cannot_run_exits_with_1_before_resolving_the_vci() {
 
 /// The flash artifact is read and compared with the hash the command line names before a worker
 /// starts (ADR-336 item 1); the options come together.
+#[cfg(debug_assertions)]
 #[test]
 fn a_bad_artifact_exits_before_resolving_the_vci() {
     let temp = TempDir::new("artifact");
@@ -227,43 +269,37 @@ fn a_bad_artifact_exits_before_resolving_the_vci() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("must be given together"));
 }
 
-/// A release build refuses every write before a worker starts (ADR-235 item 8, ADR-247); a
-/// debug build allows them on the simulator, so it cannot refuse them up front.
-#[cfg(not(debug_assertions))]
+/// `--mode` must be the installed mode (ADR-494): `run` and `identify` for a device installed in
+/// user mode refuse `--mode device` with exit 1, before their inputs are read.
+#[cfg(debug_assertions)]
 #[test]
-fn a_write_is_refused_before_resolving_the_vci_in_a_release_build() {
-    let temp = TempDir::new("refused-write");
-    // WriteDataByIdentifier is outside the read-only policy.
-    let program = write_program(
-        &temp.0,
-        vec![Op::PushBytes(0), Op::ServiceRequest { service: 0x2E }],
-    );
-    let output = ngr_agent()
-        .args(["run", "--vci", "none", "--mode", "user", "--document"])
-        .arg(program)
-        .output()
-        .expect("ngr-agent should run");
-    assert_fails_with(output, "refused");
-}
-
-/// A release build refuses TesterPresent in a procedure, as it refuses every request outside the
-/// read-only set, before a worker starts. Only the identification job's presence request sends
-/// it (ADR-396); a debug build allows any request on the simulator (ADR-247), so it cannot
-/// refuse it up front.
-#[cfg(not(debug_assertions))]
-#[test]
-fn tester_present_is_refused_before_resolving_the_vci_in_a_release_build() {
-    let temp = TempDir::new("refused-tester-present");
-    let program = write_program(
-        &temp.0,
-        vec![Op::PushBytes(0), Op::ServiceRequest { service: 0x3E }],
-    );
-    let output = ngr_agent()
-        .args(["run", "--vci", "none", "--mode", "user", "--document"])
-        .arg(program)
-        .output()
-        .expect("ngr-agent should run");
-    assert_fails_with(output, "refused");
+fn run_and_identify_refuse_a_mode_other_than_the_installed_one() {
+    for args in [
+        &[
+            "run",
+            "--vci",
+            "none",
+            "--mode",
+            "device",
+            "--document",
+            "none.dir",
+        ][..],
+        &[
+            "identify", "--vci", "none", "--mode", "device", "--plan", "none.bin",
+        ],
+    ] {
+        let output = ngr_agent()
+            .args(args)
+            .output()
+            .expect("ngr-agent should run");
+        assert_fails_with(
+            output,
+            &format!(
+                "ngr-agent: {}: --mode device is not the installed mode (user)",
+                args[0]
+            ),
+        );
+    }
 }
 
 /// `ngr-agent identify`'s usage errors exit with 2 and print nothing on stdout (design 8.8.2).
@@ -307,6 +343,7 @@ fn identify_usage_errors_exit_with_2() {
 /// A plan or a document that cannot be read or is refused ends the run with 1 before the VCI:
 /// no log directory, no lock directory and no worker (design 8.8.2). The VCI is not resolvable
 /// here, so reaching it would fail with another message.
+#[cfg(debug_assertions)]
 #[test]
 fn identify_refuses_a_bad_plan_before_the_vci() {
     use diag_ir::plan::{IdentificationPlan, PLAN_SCHEMA_VERSION, PlanDefinition, Selection};

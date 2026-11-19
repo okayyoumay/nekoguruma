@@ -2,7 +2,7 @@
 
 **Date:** 2026-11-19
 **Status:** Accepted
-**Affects:** design 6.2, 6.5, 6.7, 7.2, 11.1, 13; `crates/agent` (`installation`, `ngr-agent identity`, `register` and `connect`), `crates/vci-service-config` (`agent_installation_file()`), `crates/agent/docs/ngr-agent.md`; annotates ADR-228, ADR-285, ADR-460, ADR-463, ADR-470, ADR-471
+**Affects:** design 6.2, 6.5, 6.7, 7.2, 11.1, 13; `crates/agent` (`installation`, `ngr-agent run`, `identify`, `identity`, `register` and `connect`), `crates/vci-service-config` (`agent_installation_file()`), `crates/agent/docs/ngr-agent.md`; annotates ADR-228, ADR-285, ADR-460, ADR-463, ADR-470, ADR-471
 
 ## Context
 
@@ -55,14 +55,13 @@ origin decides who receives the registration code and the agent's proof.
 
    The first problem found decides, in a fixed order: the syntax, an unknown key, then `mode`,
    `server_url`, `distribution_root_pem`, `profile`, `startup` and `lock_dir`.
-4. **Three commands read it, once, early.** `ngr-agent identity`, `register` and `connect` read the
+4. **Three commands read it, once, early (item 7 adds two).** `ngr-agent identity`, `register` and `connect` read the
    file in `main`, after the operational log starts and after every usage check (a terminal on
    standard input for `register` included), and before the key, a lock or a connection. `--mode`
    stays required and must equal the file's mode; a difference is exit 1. A file that is absent,
    refused, not UTF-8, larger than the limit, not valid, incomplete or invalid is exit 1. A read
    error is exit 3, except that a refusal of access to a file that passed the check is exit 1: the
-   account the agent runs as cannot read it, and a restart does not change that. `run` and
-   `identify` do not read the file.
+   account the agent runs as cannot read it, and a restart does not change that.
 5. **The installed origin is the authority.** `register` takes the server from the file;
    `--server` is optional and must canonicalise to the installed origin, else exit 1 before the key.
    `connect` compares the registration record's origin with the installed one byte for byte inside
@@ -74,18 +73,28 @@ origin decides who receives the registration code and the agent's proof.
    (ADR-348 item 6). A refusal logs its findings, which name paths, in `external` only; the
    standard error message is fixed wording.
 
+7. **`run` and `identify` read the installed mode too.** They read the file at the same place as
+   the three commands of item 4 (after the log starts and every usage check, before a lock, the
+   communication log directory, the state directory or a worker), once, and use its mode only: no
+   server or key check. `--mode` stays required and must equal the file's mode, a difference is
+   exit 1, an absent, refused or invalid file is exit 1 and any other read error exit 3, with the
+   same messages as the three commands, so a device with no installed
+   mode starts no worker and a caller cannot run a job in the other mode than the installation
+   chose.
+
 ## Consequences
 
 - A device is installed by writing one root-owned file. The directory `/etc/nekoguruma` must also
   be owned by a system principal: a server that runs as another account and owns that directory
   makes the file refused, so the server's configuration examples keep its files under `/etc/nekoguruma-server` and `/var/lib/nekoguruma-server`.
 - Because a release agent has no override, a release test machine without a file at the fixed
-  location exits 1 from all three commands; tests that go on past the file run in debug builds, and
+  location exits 1 from every command that reads it; tests that go on past the file run in debug builds, and
   one release test shows that the override is ignored.
 - Moving an installation to another server needs a new `register --replace`: `connect` refuses the
   old record, which is what ADR-463's pinned out-of-band server key ID already assumed.
 - `distribution_root_pem`, `profile`, `startup` and `lock_dir` are validated and recorded; the
   extension-package check (M6), the standard profile, the startup artifacts and the lock area use
   them later. A key a later version adds is refused by an older agent as an unknown key.
-- `run` and `identify` still take `--mode` from the command line, so a caller can run a job in
-  either mode; reading the installed mode there is later work.
+- A release `run` on a test machine stops at the missing installation file before it checks the
+  program, so its up-front refusal of a write and of TesterPresent is shown by a release-only test
+  of the job check it makes (`check_job` with the build's ceiling) rather than through the binary.

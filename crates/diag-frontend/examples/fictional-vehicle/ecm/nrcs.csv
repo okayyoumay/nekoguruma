@@ -13,3 +13,6 @@ securityAccess,0x37,nrc.delayNotExpired,no
 throttleAdaptationReset.start,0x83,nrc.engineIsRunning,no
 idleSpeedLearn.start,0x88,nrc.vehicleSpeedTooHigh,no
 checkProgrammingDependencies.start,0x24,nrc.requestSequenceError,no
+requestSeed,0x37,nrc.delayNotExpired,no
+sendKey,0x35,nrc.invalidKey,no
+sendKey,0x36,nrc.exceededAttempts,no

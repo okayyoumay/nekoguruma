@@ -13,8 +13,9 @@ use diag_frontend::convert::{Converted, lower_procedures, to_ir};
 use diag_frontend::tables::{read_files, resolve};
 use diag_ir::declaration::{EcuVariant, load_ecu_document};
 use diag_ir::decode::{DecodedField, PhysicalValue, decode_positive_response, select_variant};
-use diag_ir::dry_run::{DryRunEnd, DryRunEvent, Script, dry_run};
+use diag_ir::dry_run::{DryRunEnd, DryRunEvent, DryRunReport, Script, dry_run};
 use diag_ir::encode::{ParamValue, encode_request};
+use diag_ir::{Failure, Interruptible, Op, Program};
 use sim_ecu::{EcuConfig, Nrc, SimEcu, SimResponse};
 
 const MAX_STEPS: u64 = 100_000;
@@ -604,5 +605,639 @@ fn each_configured_ecm_did_reads_back_the_value_the_sim_file_declares() {
             other => panic!("{name}: {other:?}"),
         };
         assert!((value - physical).abs() < 1e-9, "{name}: {value}");
+    }
+}
+
+// ------------------------------------------------------------------------- write-coding.star
+
+/// The configuration-change procedure for the ECM (README 11), attached to the ECM here only.
+const WRITE_CODING: &str = "write-coding.star";
+
+fn convert_coding() -> Converted {
+    convert(&vehicle().join("ecm"), Some(WRITE_CODING))
+}
+
+/// The ECM's coding record as the read service answers it: market 0, `options`, idle speed 800.
+fn coding_read(options: u8) -> Vec<u8> {
+    vec![0x62, 0x01, 0x20, 0x00, options, 0x03, 0x20]
+}
+
+/// The write service's request for the record `coding_read(options)` stands for.
+fn coding_write(options: u8) -> Vec<u8> {
+    write_coding([0x00, options, 0x03, 0x20])
+}
+
+const WRITE_OK: [u8; 3] = [0x6E, 0x01, 0x20];
+
+/// A negative answer to the request with SID `sid`.
+fn negative(sid: u8, nrc: u8) -> Vec<u8> {
+    vec![0x7F, sid, nrc]
+}
+
+/// The answers a dry run of the procedure is scripted with: one list per service name, each
+/// repeating its last answer. The three coding reads share `engineCoding.read` and the two writes
+/// `engineCoding.write`, so the lists are in the order the procedure sends them.
+struct Answers {
+    reads: Vec<Vec<u8>>,
+    writes: Vec<Vec<u8>>,
+    session: Vec<u8>,
+    seed: Vec<u8>,
+    key: Vec<u8>,
+}
+
+impl Answers {
+    fn new(reads: &[Vec<u8>], writes: &[Vec<u8>]) -> Self {
+        Self {
+            reads: reads.to_vec(),
+            writes: writes.to_vec(),
+            session: vec![0x50, 0x03, 0x00, 0x32, 0x01, 0xF4],
+            seed: vec![0x67, 0x01, 0x12, 0x34, 0x56, 0x78],
+            key: vec![0x67, 0x02],
+        }
+    }
+
+    fn script(&self) -> Script {
+        let mut script = Script::new()
+            .response("extendedSession", self.session.clone())
+            .response("requestSeed", self.seed.clone())
+            .response("sendKey", self.key.clone());
+        for read in &self.reads {
+            script = script.response("engineCoding.read", read.clone());
+        }
+        for write in &self.writes {
+            script = script.response("engineCoding.write", write.clone());
+        }
+        script
+    }
+}
+
+/// The program of `variant` among `converted`'s documents.
+fn coding_program(converted: &Converted, variant: &str) -> Program {
+    let loaded = load_ecu_document(by_variant(converted)[variant]).expect("the document loads");
+    postcard::from_bytes(loaded.procedure().expect("a procedure").bytes()).expect("a program")
+}
+
+/// The dry run of `variant`'s program with `answers`, within the step limit.
+fn run_coding(variant: &str, answers: &Answers) -> DryRunReport {
+    let converted = convert_coding();
+    let loaded = load_ecu_document(by_variant(&converted)[variant]).expect("the document loads");
+    let program: Program =
+        postcard::from_bytes(loaded.procedure().expect("a procedure").bytes()).expect("a program");
+    dry_run(
+        &program,
+        &loaded.variant().expect("a variant"),
+        &answers.script(),
+        MAX_STEPS,
+    )
+}
+
+/// Every request the run sent, whole.
+fn sent(report: &DryRunReport) -> Vec<Vec<u8>> {
+    report
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            DryRunEvent::Request { request, .. } => Some(request.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn failed_with(report: &DryRunReport) -> &str {
+    match &report.end {
+        DryRunEnd::Failed(Failure { code, .. }) => code,
+        other => panic!("the run did not fail: {other:?}\n{report:#?}"),
+    }
+}
+
+/// The requests of a run that unlocks and writes: the first read, the session, the seed and the
+/// key (the seed of `Answers::new` xor the mask), in the order the procedure sends them.
+fn unlock_requests() -> Vec<Vec<u8>> {
+    vec![
+        vec![0x22, 0x01, 0x20],
+        vec![0x10, 0x03],
+        vec![0x27, 0x01],
+        vec![0x27, 0x02, 0x48, 0x6E, 0x0C, 0x22],
+    ]
+}
+
+fn with(mut head: Vec<Vec<u8>>, tail: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    head.extend_from_slice(tail);
+    head
+}
+
+fn read_request() -> Vec<u8> {
+    vec![0x22, 0x01, 0x20]
+}
+
+/// Both ECM variants, since the one procedure is lowered for each.
+const ECM_VARIANTS: [&str; 2] = ["ecmV1", "ecmV2"];
+
+#[test]
+fn the_coding_procedure_converts_for_both_ecm_variants() {
+    let converted = convert_coding();
+    assert_eq!(
+        by_variant(&converted).keys().copied().collect::<Vec<_>>(),
+        ECM_VARIANTS
+    );
+    for document in &converted.documents {
+        assert_eq!(
+            document.procedure.as_deref(),
+            Some(WRITE_CODING),
+            "{}",
+            document.name
+        );
+    }
+}
+
+/// Per instruction, whether it lies in a section that holds a cancel.
+fn held(program: &Program) -> Vec<bool> {
+    let mut held = vec![false; program.code.len()];
+    for section in &program.sections {
+        if matches!(section.interruptible, Interruptible::Yes) {
+            continue;
+        }
+        for at in held
+            .iter_mut()
+            .take(section.end_pc as usize)
+            .skip(section.start_pc as usize)
+        {
+            *at = true;
+        }
+    }
+    held
+}
+
+#[test]
+fn the_coding_program_writes_and_decides_inside_one_uninterruptible_section() {
+    let converted = convert_coding();
+    for variant in ECM_VARIANTS {
+        let program = coding_program(&converted, variant);
+        let held = held(&program);
+        let (mut writes, mut post_write_fails, mut calls) = (0, 0, 0);
+        let mut first_write = None;
+        for (pc, op) in program.code.iter().enumerate() {
+            match op {
+                Op::SecurityAccess { .. } => panic!("{variant}: the program uses SecurityAccess"),
+                Op::ServiceRequest { service } => {
+                    let sid = *service;
+                    if sid == 0x2E {
+                        writes += 1;
+                        first_write.get_or_insert(pc);
+                        assert!(held[pc], "{variant}: the write at {pc} is interruptible");
+                    }
+                }
+                Op::Fail { code } => {
+                    let code = std::str::from_utf8(&program.constants[*code as usize])
+                        .expect("a UTF-8 code");
+                    if matches!(
+                        code,
+                        "WRITE_REFUSED"
+                            | "CODING_ROLLED_BACK"
+                            | "ROLLBACK_REFUSED"
+                            | "ROLLBACK_UNCONFIRMED"
+                    ) {
+                        post_write_fails += 1;
+                        assert!(held[pc], "{variant}: the fail {code} is interruptible");
+                    }
+                }
+                Op::Call(target) => {
+                    // The call into the section: the one whose target is held.
+                    if held[*target as usize] && !held[pc] {
+                        calls += 1;
+                        // Main's last statement: a return follows it at once.
+                        let next = program.code.get(pc + 1);
+                        assert!(
+                            matches!(next, Some(Op::Ret)),
+                            "{variant}: the section call is followed by {next:?}"
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        // The write and the roll-back, four outcomes that fail after a write, one entry.
+        assert_eq!(writes, 2, "{variant}");
+        assert_eq!(post_write_fails, 4, "{variant}");
+        assert_eq!(calls, 1, "{variant}");
+        // From the first write to the end of the program (the section function is the tail of
+        // the code, and the section is split at each `diag` call's own section, ADR-332) nothing
+        // is interruptible, so no cancel is taken between the write and the decision.
+        let first_write = first_write.expect("a write");
+        for (pc, held) in held.iter().enumerate().skip(first_write) {
+            assert!(
+                held,
+                "{variant}: pc {pc} after the first write is interruptible"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_ecm_tables_declare_the_seed_and_key_services() {
+    let converted = convert_coding();
+    for variant in ECM_VARIANTS {
+        let loaded = load_ecu_document(by_variant(&converted)[variant]).expect("loads");
+        let layouts = loaded.variant().expect("a variant").layouts();
+        let seed = load_service(&loaded, "requestSeed");
+        let key = load_service(&loaded, "sendKey");
+        let values = HashMap::from([("key", ParamValue::Int(0x486E_0C22))]);
+        let mut message = vec![0x27];
+        message.extend(encode_request(&key.request().expect("a request"), &values).expect("key"));
+        assert_eq!(message, [0x27, 0x02, 0x48, 0x6E, 0x0C, 0x22], "{variant}");
+        let fields = decode_positive_response(
+            &seed.positive().expect("a positive response"),
+            layouts,
+            &[0x67, 0x01, 0x12, 0x34, 0x56, 0x78],
+        )
+        .expect("the seed decodes");
+        let seed_field = fields
+            .iter()
+            .find(|f| f.short_name == "seed")
+            .expect("seed");
+        assert_eq!(seed_field.value, PhysicalValue::Unsigned(0x1234_5678));
+    }
+}
+
+// P rows: before the write.
+
+#[test]
+fn p1_a_coding_with_cruise_control_finishes_with_only_the_read_sent() {
+    for variant in ECM_VARIANTS {
+        // Bit 1 set, among other bits.
+        for options in [0x02, 0x03, 0x07] {
+            let answers = Answers::new(&[coding_read(options)], &[]);
+            let report = run_coding(variant, &answers);
+            assert_eq!(report.end, DryRunEnd::Finished, "{variant}: {report:#?}");
+            assert_eq!(sent(&report), [read_request()], "{variant} {options:#X}");
+        }
+    }
+}
+
+#[test]
+fn p2_a_refused_first_read_fails_with_read_coding_and_sends_nothing_more() {
+    for variant in ECM_VARIANTS {
+        let answers = Answers::new(&[negative(0x22, 0x31)], &[]);
+        let report = run_coding(variant, &answers);
+        assert_eq!(failed_with(&report), "READ_CODING", "{variant}");
+        assert_eq!(sent(&report), [read_request()], "{variant}");
+    }
+}
+
+#[test]
+fn p3_a_first_read_of_the_wrong_length_fails_with_read_coding() {
+    for variant in ECM_VARIANTS {
+        let long = {
+            let mut read = coding_read(0x01);
+            read.push(0x00);
+            read
+        };
+        for read in [
+            coding_read(0x01)[..5].to_vec(),
+            vec![0x62, 0x01, 0x20],
+            long,
+        ] {
+            let answers = Answers::new(std::slice::from_ref(&read), &[]);
+            let report = run_coding(variant, &answers);
+            assert_eq!(failed_with(&report), "READ_CODING", "{variant} {read:02X?}");
+            assert_eq!(sent(&report), [read_request()], "{variant} {read:02X?}");
+        }
+    }
+}
+
+#[test]
+fn p4_a_refused_extended_session_fails_with_session_before_any_security_request() {
+    for variant in ECM_VARIANTS {
+        let mut answers = Answers::new(&[coding_read(0x01)], &[]);
+        answers.session = negative(0x10, 0x12);
+        let report = run_coding(variant, &answers);
+        assert_eq!(failed_with(&report), "SESSION", "{variant}");
+        assert_eq!(sent(&report), unlock_requests()[..2], "{variant}");
+    }
+}
+
+#[test]
+fn p5_a_refused_seed_request_fails_with_security_and_sends_no_key() {
+    for variant in ECM_VARIANTS {
+        // Not unlocking in this session, and the attempt delay still running.
+        for nrc in [0x22, 0x37] {
+            let mut answers = Answers::new(&[coding_read(0x01)], &[]);
+            answers.seed = negative(0x27, nrc);
+            let report = run_coding(variant, &answers);
+            assert_eq!(failed_with(&report), "SECURITY", "{variant} {nrc:#X}");
+            assert_eq!(sent(&report), unlock_requests()[..3], "{variant} {nrc:#X}");
+        }
+    }
+}
+
+#[test]
+fn p5b_a_short_or_long_positive_seed_answer_fails_with_security() {
+    for variant in ECM_VARIANTS {
+        for seed in [
+            vec![0x67, 0x01],
+            vec![0x67, 0x01, 0x12, 0x34],
+            vec![0x67, 0x01, 1, 2, 3, 4, 5],
+        ] {
+            let mut answers = Answers::new(&[coding_read(0x01)], &[]);
+            answers.seed = seed.clone();
+            let report = run_coding(variant, &answers);
+            assert_eq!(failed_with(&report), "SECURITY", "{variant} {seed:02X?}");
+            assert_eq!(
+                sent(&report),
+                unlock_requests()[..3],
+                "{variant} {seed:02X?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn p6_a_refused_key_fails_with_security_and_writes_nothing() {
+    for variant in ECM_VARIANTS {
+        for nrc in [0x35, 0x36] {
+            let mut answers = Answers::new(&[coding_read(0x01)], &[]);
+            answers.key = negative(0x27, nrc);
+            let report = run_coding(variant, &answers);
+            assert_eq!(failed_with(&report), "SECURITY", "{variant} {nrc:#X}");
+            assert_eq!(sent(&report), unlock_requests(), "{variant} {nrc:#X}");
+        }
+    }
+}
+
+#[test]
+fn p7_a_zero_seed_means_unlocked_and_no_key_is_sent() {
+    for variant in ECM_VARIANTS {
+        let mut answers = Answers::new(
+            &[coding_read(0x01), coding_read(0x03), coding_read(0x03)],
+            &[WRITE_OK.to_vec()],
+        );
+        answers.seed = vec![0x67, 0x01, 0x00, 0x00, 0x00, 0x00];
+        let report = run_coding(variant, &answers);
+        assert_eq!(report.end, DryRunEnd::Finished, "{variant}: {report:#?}");
+        assert_eq!(
+            sent(&report),
+            [
+                read_request(),
+                vec![0x10, 0x03],
+                vec![0x27, 0x01],
+                coding_write(0x03),
+                read_request(),
+            ],
+            "{variant}"
+        );
+    }
+}
+
+#[test]
+fn p8_the_key_is_the_seed_xor_the_mask_and_only_the_cruise_bit_changes() {
+    for variant in ECM_VARIANTS {
+        for seed in [0x1234_5678_u32, 0xFFFF_FFFF, 0x5A5A_5A5A, 0x0000_0001] {
+            let mut answers = Answers::new(
+                &[coding_read(0x05), coding_read(0x07)],
+                &[WRITE_OK.to_vec()],
+            );
+            answers.seed = [vec![0x67, 0x01], seed.to_be_bytes().to_vec()].concat();
+            let report = run_coding(variant, &answers);
+            assert_eq!(report.end, DryRunEnd::Finished, "{variant}: {report:#?}");
+            let requests = sent(&report);
+            let mut key = vec![0x27, 0x02];
+            key.extend_from_slice(&(seed ^ ECM_KEY_MASK).to_be_bytes());
+            assert_eq!(requests[3], key, "{variant} {seed:#X}");
+            // Options 0x05 become 0x07; the market and the idle speed stay.
+            assert_eq!(requests[4], coding_write(0x07), "{variant}");
+        }
+    }
+}
+
+// W rows: after the first write.
+
+#[test]
+fn w1_a_write_that_reads_back_finishes_after_one_write_and_one_read() {
+    for variant in ECM_VARIANTS {
+        let answers = Answers::new(
+            &[coding_read(0x01), coding_read(0x03)],
+            &[WRITE_OK.to_vec()],
+        );
+        let report = run_coding(variant, &answers);
+        assert_eq!(report.end, DryRunEnd::Finished, "{variant}: {report:#?}");
+        assert_eq!(
+            sent(&report),
+            with(unlock_requests(), &[coding_write(0x03), read_request()]),
+            "{variant}"
+        );
+    }
+}
+
+/// The requests of a run that wrote the new coding, read it back and then rolled back.
+fn rollback_requests(confirm: bool) -> Vec<Vec<u8>> {
+    let mut requests = with(
+        unlock_requests(),
+        &[coding_write(0x03), read_request(), coding_write(0x01)],
+    );
+    if confirm {
+        requests.push(read_request());
+    }
+    requests
+}
+
+#[test]
+fn w2_a_read_back_that_differs_is_rolled_back_and_confirmed() {
+    for variant in ECM_VARIANTS {
+        // Each field of the record differing from what was written, and the old coding.
+        let differing = [
+            coding_read(0x01),
+            coding_read(0x02),
+            coding_read(0x07),
+            vec![0x62, 0x01, 0x20, 0x01, 0x03, 0x03, 0x20],
+            vec![0x62, 0x01, 0x20, 0x00, 0x03, 0x04, 0x20],
+        ];
+        for back in differing {
+            let answers = Answers::new(
+                &[coding_read(0x01), back.clone(), coding_read(0x01)],
+                &[WRITE_OK.to_vec()],
+            );
+            let report = run_coding(variant, &answers);
+            assert_eq!(
+                failed_with(&report),
+                "CODING_ROLLED_BACK",
+                "{variant} {back:02X?}"
+            );
+            assert_eq!(sent(&report), rollback_requests(true), "{variant}");
+        }
+    }
+}
+
+#[test]
+fn w3_a_refused_read_back_is_rolled_back() {
+    for variant in ECM_VARIANTS {
+        let answers = Answers::new(
+            &[coding_read(0x01), negative(0x22, 0x31), coding_read(0x01)],
+            &[WRITE_OK.to_vec()],
+        );
+        let report = run_coding(variant, &answers);
+        assert_eq!(failed_with(&report), "CODING_ROLLED_BACK", "{variant}");
+        assert_eq!(sent(&report), rollback_requests(true), "{variant}");
+    }
+}
+
+#[test]
+fn w4_a_rolled_back_coding_is_the_saved_one_with_the_other_fields_as_read() {
+    for variant in ECM_VARIANTS {
+        // Saved coding: other option bits, another idle speed.
+        let saved = vec![0x62, 0x01, 0x20, 0x00, 0x05, 0x04, 0xB0];
+        let answers = Answers::new(
+            &[saved.clone(), coding_read(0x05), saved],
+            &[WRITE_OK.to_vec()],
+        );
+        let report = run_coding(variant, &answers);
+        assert_eq!(failed_with(&report), "CODING_ROLLED_BACK", "{variant}");
+        let requests = sent(&report);
+        assert_eq!(
+            requests[4],
+            write_coding([0x00, 0x07, 0x04, 0xB0]),
+            "{variant}"
+        );
+        assert_eq!(
+            requests[6],
+            write_coding([0x00, 0x05, 0x04, 0xB0]),
+            "{variant}"
+        );
+    }
+}
+
+#[test]
+fn w5_a_read_back_of_the_wrong_length_is_rolled_back() {
+    for variant in ECM_VARIANTS {
+        // A record cut short, even when the bytes it has match what was written.
+        let short = coding_read(0x03)[..5].to_vec();
+        let mut long = coding_read(0x03);
+        long.push(0x00);
+        for back in [short, long] {
+            let answers = Answers::new(
+                &[coding_read(0x01), back.clone(), coding_read(0x01)],
+                &[WRITE_OK.to_vec()],
+            );
+            let report = run_coding(variant, &answers);
+            assert_eq!(
+                failed_with(&report),
+                "CODING_ROLLED_BACK",
+                "{variant} {back:02X?}: {report:#?}"
+            );
+            assert_eq!(sent(&report), rollback_requests(true), "{variant}");
+        }
+    }
+}
+
+#[test]
+fn w6_a_refused_roll_back_fails_with_rollback_refused_and_reads_nothing_more() {
+    for variant in ECM_VARIANTS {
+        let answers = Answers::new(
+            &[coding_read(0x01), coding_read(0x02)],
+            &[WRITE_OK.to_vec(), negative(0x2E, 0x22)],
+        );
+        let report = run_coding(variant, &answers);
+        assert_eq!(failed_with(&report), "ROLLBACK_REFUSED", "{variant}");
+        assert_eq!(sent(&report), rollback_requests(false), "{variant}");
+    }
+}
+
+#[test]
+fn w7_a_roll_back_that_does_not_read_back_fails_with_rollback_unconfirmed() {
+    for variant in ECM_VARIANTS {
+        let differing = [
+            coding_read(0x02),
+            negative(0x22, 0x31),
+            coding_read(0x01)[..5].to_vec(),
+        ];
+        for confirm in differing {
+            let answers = Answers::new(
+                &[coding_read(0x01), coding_read(0x02), confirm.clone()],
+                &[WRITE_OK.to_vec()],
+            );
+            let report = run_coding(variant, &answers);
+            assert_eq!(
+                failed_with(&report),
+                "ROLLBACK_UNCONFIRMED",
+                "{variant} {confirm:02X?}"
+            );
+            assert_eq!(sent(&report), rollback_requests(true), "{variant}");
+        }
+    }
+}
+
+/// The requests of a run whose first write was refused: it then reads before deciding.
+fn refused_write_requests(rolled_back: bool) -> Vec<Vec<u8>> {
+    let mut requests = with(unlock_requests(), &[coding_write(0x03), read_request()]);
+    if rolled_back {
+        requests.extend([coding_write(0x01), read_request()]);
+    }
+    requests
+}
+
+#[test]
+fn w8_a_refused_write_with_the_coding_unchanged_fails_with_write_refused() {
+    for variant in ECM_VARIANTS {
+        // The refusals the ECM gives: a session (0x7F), security (0x33), authentication (0x34), a bad
+        // length (0x13), the sequence (0x22) and a value outside the field's range (0x31).
+        for nrc in [0x7F, 0x33, 0x34, 0x13, 0x22, 0x31] {
+            let answers = Answers::new(
+                &[coding_read(0x01), coding_read(0x01)],
+                &[negative(0x2E, nrc)],
+            );
+            let report = run_coding(variant, &answers);
+            assert_eq!(failed_with(&report), "WRITE_REFUSED", "{variant} {nrc:#X}");
+            assert_eq!(sent(&report), refused_write_requests(false), "{variant}");
+        }
+    }
+}
+
+#[test]
+fn w9_a_refused_write_that_changed_the_coding_is_rolled_back() {
+    for variant in ECM_VARIANTS {
+        // Partly or wholly applied, and left as something that is neither value.
+        for read in [coding_read(0x03), coding_read(0x07)] {
+            let answers = Answers::new(
+                &[coding_read(0x01), read.clone(), coding_read(0x01)],
+                &[negative(0x2E, 0x22), WRITE_OK.to_vec()],
+            );
+            let report = run_coding(variant, &answers);
+            assert_eq!(
+                failed_with(&report),
+                "CODING_ROLLED_BACK",
+                "{variant} {read:02X?}"
+            );
+            assert_eq!(sent(&report), refused_write_requests(true), "{variant}");
+        }
+    }
+}
+
+#[test]
+fn w10_a_refused_write_whose_coding_cannot_be_read_is_rolled_back() {
+    for variant in ECM_VARIANTS {
+        for read in [negative(0x22, 0x31), coding_read(0x01)[..5].to_vec()] {
+            let answers = Answers::new(
+                &[coding_read(0x01), read.clone(), coding_read(0x01)],
+                &[negative(0x2E, 0x22), WRITE_OK.to_vec()],
+            );
+            let report = run_coding(variant, &answers);
+            assert_eq!(
+                failed_with(&report),
+                "CODING_ROLLED_BACK",
+                "{variant} {read:02X?}"
+            );
+            assert_eq!(sent(&report), refused_write_requests(true), "{variant}");
+        }
+        // A refused write and a roll-back that is refused too.
+        let answers = Answers::new(
+            &[coding_read(0x01), negative(0x22, 0x31)],
+            &[negative(0x2E, 0x22)],
+        );
+        let report = run_coding(variant, &answers);
+        assert_eq!(failed_with(&report), "ROLLBACK_REFUSED", "{variant}");
+        assert_eq!(
+            sent(&report),
+            refused_write_requests(true)[..7],
+            "{variant}"
+        );
     }
 }

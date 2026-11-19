@@ -85,8 +85,11 @@ proposed. It is a specification: none of it is implemented when this record is w
    the row to `open` and answers 409 (the upload and its parts are untouched, so the agent
    reads the status and sends again); `HashMismatch`, `LengthMismatch` and `ObjectTooLarge`
    (the object is already deleted) make the row `failed` and answer 409, and the agent begins
-   again, which the partial unique index allows; any other error leaves the row `completing`
-   and answers 503, to be repeated. The mapping of the store's errors to these answers is the
+   again, which the partial unique index allows; `NotFound` (the upload and the object are both
+   gone, as when the server stopped after a mismatch's delete and before the row was written)
+   also makes the row `failed` and answers 409, so a row can never stay `completing` with
+   nothing left to complete; any other error leaves the row `completing` and answers 503, to
+   be repeated. The mapping of the store's errors to these answers is the
    server work's to confirm; it is not verified.
 
 ### The row

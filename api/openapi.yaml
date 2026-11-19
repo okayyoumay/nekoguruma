@@ -788,7 +788,9 @@ paths:
         request. A repeat on a `finished` row is **200**. A part problem (the parts are not as
         expected) returns the row to `open` and answers **409**; a length or digest mismatch
         makes the row `failed` with the object deleted and answers **409**, and the agent
-        begins again; any other store error leaves the row `completing` and answers **503**.
+        begins again; when the upload and the object are both gone (a stop between a
+        mismatch's delete and the row's update), the row also becomes `failed` with **409**;
+        any other store error leaves the row `completing` and answers **503**.
         Token and agent row are judged as for begin.
       security:
         - agentSession: []

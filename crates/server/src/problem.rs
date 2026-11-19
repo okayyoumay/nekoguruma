@@ -10,6 +10,7 @@ pub struct Problem {
     status: StatusCode,
     title: &'static str,
     code: Option<&'static str>,
+    state: Option<String>,
 }
 
 impl Problem {
@@ -18,6 +19,7 @@ impl Problem {
             status,
             title,
             code: None,
+            state: None,
         }
     }
 
@@ -26,6 +28,19 @@ impl Problem {
             status,
             title,
             code: Some(code),
+            state: None,
+        }
+    }
+}
+
+impl Problem {
+    /// A problem that names the state of the resource the request found (the upload routes' 409).
+    pub fn with_state(status: StatusCode, title: &'static str, state: String) -> Problem {
+        Problem {
+            status,
+            title,
+            code: None,
+            state: Some(state),
         }
     }
 }
@@ -39,6 +54,9 @@ impl IntoResponse for Problem {
         });
         if let Some(code) = self.code {
             body["code"] = code.into();
+        }
+        if let Some(state) = self.state {
+            body["state"] = state.into();
         }
         let mut response = (self.status, body.to_string()).into_response();
         let headers = response.headers_mut();

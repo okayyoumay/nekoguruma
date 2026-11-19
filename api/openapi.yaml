@@ -674,22 +674,26 @@ paths:
   # ------------------------------------------------------------ Data channel (5.2, 14.3, ADR-493)
   /v1/agent/uploads:
     post:
-      x-ngr-status: planned
       tags: [agents]
       summary: Begin an upload of a job's object (5.2, 14.3, ADR-493)
       description: |
-        The first of the four data-channel routes. The agent presents its session token (the
-        one of `/v1/agent/session`) as a bearer header. Every request of these routes judges
-        the token and then reads the agent's row: a missing or expired token, and a revoked or
+        The first of the four data-channel routes (this one, the part URL and the status are
+        served; the completion is planned). The agent presents its session token (the one of
+        `/v1/agent/session`) as a bearer header. Every request of these routes judges the
+        token and then reads the agent's row: a missing or expired token, and a revoked or
         missing row, are all **401** (the same answer), and a revoked agent's tokens are
         dropped. A failed read is **503**. The body is a strict JSON object of at most 4 KiB
-        read within 5 seconds; a wrong shape is **400** before any lookup, and a larger body is
-        **413**.
+        read within 5 seconds (**408** when it does not arrive, **413** when it is larger); a
+        wrong shape is **400**, judged before the token, and so is the length (**413**): both
+        before any lookup. A malformed request does not drop any token.
 
         The body declares the object: the job, the ownership generation, the kind, the length
         (0 to 4 GiB) and the SHA-256 as 64 lowercase hex digits. There is no free-form
-        metadata. A job that does not exist or is another agent's is **404**; a length over
-        4 GiB is **413**. Begin is idempotent per job, generation and kind: a row that is not
+        metadata. A job that does not exist, is another agent's or whose stored instruction
+        names another ownership generation than the one declared is **404**, in any state of
+        the job; a length over 4 GiB is **413**. A number written in a form that is not an
+        integer is a **400**, except one of 2^64 or more, which is a length over the limit.
+        Begin is idempotent per job, generation and kind: a row that is not
         `failed` and declares the same length and digest is answered **200**, one that declares
         another length or digest is **409**. Otherwise the server starts the multipart upload,
         inserts the row and answers **201**. Begin is allowed before the job's terminal event
@@ -715,18 +719,26 @@ paths:
         '400': { $ref: '#/components/responses/Problem' }
         '401': { $ref: '#/components/responses/AgentSessionRefused' }
         '404': { $ref: '#/components/responses/Problem' }
+        '405':
+          description: A method other than POST
+          headers:
+            Allow: { schema: { type: string }, description: '`POST`' }
+        '408': { $ref: '#/components/responses/Problem' }
         '409': { $ref: '#/components/responses/Problem' }
         '413': { $ref: '#/components/responses/Problem' }
+        '500': { $ref: '#/components/responses/Problem' }
         '503': { $ref: '#/components/responses/Problem' }
 
   /v1/agent/uploads/{uploadId}/parts/{part}:
     post:
-      x-ngr-status: planned
       tags: [agents]
       summary: Get the URL for one part of an upload (14.3, ADR-493)
       description: |
-        The body is empty. `part` runs from 1 to the upload's `partCount`, else **400**. The
-        row must be `open`, else **409**; an upload of another agent or tenant is **404**. The
+        The body is empty (a byte of one is **400**, more than 4 KiB **413**). `part` is a
+        number in canonical decimal, from 1 to 10000 and not past the upload's `partCount`,
+        else **400**; the number is judged before the token. An upload ID that is not a UUID,
+        that is unknown or that belongs to another agent or tenant is **404**. The row must be
+        `open`, else **409**, which carries the row's `state`. The
         answer is one presigned PUT URL, valid 300 seconds, for that part. Asking again for a
         part already held is allowed and gives another URL. The agent sends the part only to a
         URL whose scheme and host are those of the origin it registered with (ADR-493 item 13).
@@ -735,7 +747,7 @@ paths:
         - agentSession: []
       parameters:
         - { name: uploadId, in: path, required: true, schema: { type: string, format: uuid } }
-        - { name: part, in: path, required: true, schema: { type: integer, minimum: 1, maximum: 820 } }
+        - { name: part, in: path, required: true, schema: { type: integer, minimum: 1, maximum: 10000 } }
       responses:
         '200':
           description: The URL of the part
@@ -745,12 +757,22 @@ paths:
         '400': { $ref: '#/components/responses/Problem' }
         '401': { $ref: '#/components/responses/AgentSessionRefused' }
         '404': { $ref: '#/components/responses/Problem' }
-        '409': { $ref: '#/components/responses/Problem' }
+        '405':
+          description: A method other than POST
+          headers:
+            Allow: { schema: { type: string }, description: '`POST`' }
+        '408': { $ref: '#/components/responses/Problem' }
+        '409':
+          description: The upload is not `open`; the body is a problem document with the row's `state`
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '413': { $ref: '#/components/responses/Problem' }
+        '500': { $ref: '#/components/responses/Problem' }
         '503': { $ref: '#/components/responses/Problem' }
 
   /v1/agent/uploads/{uploadId}:
     get:
-      x-ngr-status: planned
       tags: [agents]
       summary: The state of an upload and the parts the store holds (14.3, ADR-493)
       description: |
@@ -758,7 +780,10 @@ paths:
         the store lists with the expected size (`partBytes` for each, the remainder for the
         last), counted up to the first part that is missing or has another size. The agent
         resumes from part `partsHeld + 1`. In any other state `partsHeld` is absent. An upload
-        of another agent or tenant is **404**. Token and agent row are judged as for begin.
+        of another agent or tenant, an ID that is not a UUID and an unknown one are **404**.
+        The body is empty, as for the part URL. Token and agent row are judged as for begin. An
+        `open` row whose upload the store lists as gone, or whose listing fails, is **503** and
+        the row is not changed. `HEAD` is answered like `GET`, without a body.
       security:
         - agentSession: []
       parameters:
@@ -769,8 +794,16 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/UploadStatus' }
+        '400': { $ref: '#/components/responses/Problem' }
         '401': { $ref: '#/components/responses/AgentSessionRefused' }
         '404': { $ref: '#/components/responses/Problem' }
+        '405':
+          description: A method other than GET and HEAD
+          headers:
+            Allow: { schema: { type: string }, description: '`GET,HEAD`' }
+        '408': { $ref: '#/components/responses/Problem' }
+        '413': { $ref: '#/components/responses/Problem' }
+        '500': { $ref: '#/components/responses/Problem' }
         '503': { $ref: '#/components/responses/Problem' }
 
   /v1/agent/uploads/{uploadId}/complete:
@@ -1178,6 +1211,10 @@ components:
         title: { type: string }
         status: { type: integer }
         detail: { type: string }
+        state:
+          description: The state of the upload the request found; present on the part URL's 409 only
+          allOf:
+            - { $ref: '#/components/schemas/UploadState' }
         code:
           type: string
           enum:

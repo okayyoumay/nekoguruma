@@ -32,6 +32,7 @@ pub mod registration;
 pub(crate) mod revocation;
 pub mod session;
 pub mod storage;
+pub mod uploads;
 
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -82,6 +83,9 @@ pub struct AppState {
     pub operator_sessions: OperatorSessions,
     /// The password hashing, one at a time (ADR-469).
     pub hasher: Hasher,
+    /// The object store and part size of the data channel's routes (ADR-493); the routes are
+    /// built from it, so it is set before the router is.
+    pub uploads: uploads::Backend,
 }
 
 /// A route the server serves: the HTTP method and the path, as a client sends them. The control
@@ -191,6 +195,32 @@ pub fn routes_unguarded(state: AppState) -> (Router, Vec<ServedRoute>) {
         )
         .merge(signed_in)
         .with_state(auth);
+    // The data channel's routes judge the session token and read the agent's row on every
+    // request (ADR-493 item 2).
+    let uploads = mounts.mount(
+        Router::new(),
+        Method::POST,
+        uploads::BEGIN_PATH,
+        post(uploads::begin),
+    );
+    let uploads = mounts.mount(
+        uploads,
+        Method::POST,
+        uploads::PART_PATH,
+        post(uploads::part_url),
+    );
+    let uploads = mounts
+        .mount(
+            uploads,
+            Method::GET,
+            uploads::STATUS_PATH,
+            get(uploads::status),
+        )
+        .with_state(uploads::Uploads::new(
+            state.pool.clone(),
+            state.sessions.clone(),
+            state.uploads,
+        ));
     // The redemption route keeps its own limiter and log gates: one set per router.
     let register = mounts
         .mount(
@@ -236,6 +266,7 @@ pub fn routes_unguarded(state: AppState) -> (Router, Vec<ServedRoute>) {
     let routes = health
         .merge(operator)
         .merge(jobs)
+        .merge(uploads)
         .merge(register)
         .merge(exchange)
         .merge(control)
@@ -367,7 +398,12 @@ impl Server {
             }
             None => (None, None),
         };
-        let mut server = match Server::bind(&config.http, pool, key).await {
+        let backend = uploads::Backend::new(
+            store
+                .as_ref()
+                .map(|store| Arc::clone(store) as Arc<dyn MultipartStore>),
+        );
+        let mut server = match Server::bind_with_store(&config.http, pool, key, backend).await {
             Ok(server) => server,
             Err(error) => {
                 // `bind` closed the pool.
@@ -418,6 +454,20 @@ impl Server {
         pool: PgPool,
         instruction_key: Arc<InstructionKey>,
     ) -> Result<Server, StartError> {
+        Server::bind_with_store(http, pool, instruction_key, uploads::Backend::default()).await
+    }
+
+    /// [`Server::bind`] with the object store and part size the data channel's routes use. They
+    /// are part of the router's state, so they are given here, before the router is built; a store
+    /// set afterwards would not reach the routes. Tests only: `start` calls it with the store it
+    /// opened.
+    #[doc(hidden)]
+    pub async fn bind_with_store(
+        http: &config::Http,
+        pool: PgPool,
+        instruction_key: Arc<InstructionKey>,
+        uploads: uploads::Backend,
+    ) -> Result<Server, StartError> {
         let port = http.port;
         let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await {
             Ok(listener) => listener,
@@ -444,6 +494,7 @@ impl Server {
                 hub: hub.clone(),
                 operator_sessions: operator_sessions.clone(),
                 hasher: hasher.clone(),
+                uploads,
             }),
             pool,
             sessions,

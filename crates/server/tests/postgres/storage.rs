@@ -21,23 +21,23 @@ use crate::object_server_rustfs::Real;
 use crate::redeem::capture;
 use crate::support::TestPostgres;
 
-const MIB: usize = 1024 * 1024;
+pub(crate) const MIB: usize = 1024 * 1024;
 
-fn sha256(bytes: &[u8]) -> [u8; 32] {
+pub(crate) fn sha256(bytes: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     out.copy_from_slice(&Sha256::digest(bytes));
     out
 }
 
 /// Deterministic content of `len` bytes that differs from part to part.
-fn content(seed: u8, len: usize) -> Vec<u8> {
+pub(crate) fn content(seed: u8, len: usize) -> Vec<u8> {
     (0..len)
         .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
         .collect()
 }
 
 /// A plain HTTP PUT of `body` to a presigned URL: the status and the answer's `etag`.
-async fn put(url: &str, body: Vec<u8>) -> (u16, Option<String>) {
+pub(crate) async fn put(url: &str, body: Vec<u8>) -> (u16, Option<String>) {
     let (status, headers) = request("PUT", url, body).await;
     (status, headers)
 }

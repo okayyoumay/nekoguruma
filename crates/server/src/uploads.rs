@@ -756,10 +756,12 @@ pub async fn begin(State(u): State<Uploads>, request: Request) -> Response {
             db_failure(&u, &error)
         }
         Err(InsertFailure::Commit(error)) => {
-            // The commit's answer was lost, so the row may exist: aborting the upload now could
-            // leave a row whose upload is gone. Look for a row that names the key, and abort only
-            // when none does. When that read fails too, the upload is left for the cleanup of
-            // unfinished uploads (a logged warning), never aborted on a guess.
+            // The commit's answer was lost, so the row may exist, or may still come to exist: the
+            // database can be finishing the commit while another connection reads. Aborting the
+            // upload could then leave a row whose upload is gone, so it is never aborted here.
+            // A row that names the key is answered; otherwise the upload is left for the cleanup
+            // of unfinished uploads (a logged warning), and the agent's repeated begin finds the
+            // row if the commit took effect.
             match row_of_key(&u.pool, &caller.tenant, upload.key.as_str()).await {
                 Ok(Some(id)) => json_answer(
                     StatusCode::CREATED,
@@ -771,7 +773,10 @@ pub async fn begin(State(u): State<Uploads>, request: Request) -> Response {
                     }),
                 ),
                 Ok(None) => {
-                    abort(store, &upload).await;
+                    u.warn(
+                        "an upload may be left without a row after a failed commit",
+                        "the commit failed and no row named the upload yet",
+                    );
                     db_failure(&u, &error)
                 }
                 Err(_) => {

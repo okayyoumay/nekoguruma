@@ -72,7 +72,10 @@ pub enum PlanRefused {
     InstructionNamesNoPlan,
     /// The plan's bytes are not the ones the verified instruction names.
     #[error("the plan's SHA-256 differs from the plan hash of the verified instruction")]
-    PlanNotSigned,
+    PlanHashMismatch,
+    /// The verified instruction is of another job kind than identification.
+    #[error("the instruction is not an identification job's")]
+    InstructionNotIdentify,
     #[error("the plan names document {0}, which was not supplied")]
     MissingDocument(String),
     #[error("a document supplied as {named} has the SHA-256 {actual}")]
@@ -306,22 +309,25 @@ pub struct LoadedPlan {
 /// With a verified `instruction` (the server-connected path), the plan must be the one its
 /// plan hash names: the instruction's signature covers that hash, so the check is that the
 /// SHA-256 of `plan_bytes` equals it (design 8.8.2, ADR-461 Decision item 13). An instruction
-/// with no plan hash, or a plan that hashes differently, is refused here, before anything
-/// opens or is written. With `None` (`ngr-agent identify`, ADR-398) an unsigned plan is
+/// of another job kind, one with no plan hash, or a plan that hashes differently, is refused
+/// here, before anything opens or is written. With `None` (`ngr-agent identify`, ADR-398) an unsigned plan is
 /// accepted as a development path.
 pub fn load_plan(
     plan_bytes: &[u8],
     supplied: Vec<(Sha256, Vec<u8>)>,
     instruction: Option<&VerifiedInstruction>,
 ) -> Result<LoadedPlan, PlanRefused> {
+    let plan_sha256: Sha256 = sha2::Sha256::digest(plan_bytes).into();
     if let Some(instruction) = instruction {
+        let instruction = instruction.instruction();
+        if instruction.kind != shared_proto::JobKind::Identify {
+            return Err(PlanRefused::InstructionNotIdentify);
+        }
         let want = instruction
-            .instruction()
             .plan_hash
             .ok_or(PlanRefused::InstructionNamesNoPlan)?;
-        let actual: Sha256 = sha2::Sha256::digest(plan_bytes).into();
-        if actual != want {
-            return Err(PlanRefused::PlanNotSigned);
+        if plan_sha256 != want {
+            return Err(PlanRefused::PlanHashMismatch);
         }
     }
     let plan = IdentificationPlan::decode(plan_bytes)?;
@@ -347,7 +353,7 @@ pub fn load_plan(
     }
     Ok(LoadedPlan {
         plan,
-        plan_sha256: sha2::Sha256::digest(plan_bytes).into(),
+        plan_sha256,
         documents,
     })
 }
@@ -3961,15 +3967,22 @@ mod tests {
     /// A verified instruction (signed with a throwaway key and opened through the gate) whose
     /// plan hash is `plan_hash`.
     pub(super) fn verified(plan_hash: Option<Sha256>) -> VerifiedInstruction {
+        verified_of_kind(shared_proto::JobKind::Identify, plan_hash)
+    }
+
+    fn verified_of_kind(
+        kind: shared_proto::JobKind,
+        plan_hash: Option<Sha256>,
+    ) -> VerifiedInstruction {
         use shared_crypto::{Signer, SigningKey, instruction as envelope};
-        use shared_proto::{AgentId, INSTRUCTION_VERSION, JobId, JobInstruction, JobKind, VciId};
+        use shared_proto::{AgentId, INSTRUCTION_VERSION, JobId, JobInstruction, VciId};
         let instruction = JobInstruction {
             version: INSTRUCTION_VERSION,
             job_id: JobId("0193c8a0-7b1e-7c2d-9a4f-3e5d6c7b8a90".to_owned()),
             ownership_generation: 1,
             agent_id: AgentId("agent-under-test".to_owned()),
             operator_id: "operator-1".to_owned(),
-            kind: JobKind::RunSequence,
+            kind,
             vci: VciId("vci-a".to_owned()),
             vin: None,
             document_hashes: Vec::new(),
@@ -3983,17 +3996,19 @@ mod tests {
         crate::instruction::open(&sealed, &key.public_key(), "agent-under-test").unwrap()
     }
 
-    /// [`checked`] for a plan a verified instruction vouches for (the plan hash is its SHA-256).
+    /// [`checked`] for a plan a verified instruction vouches for, with the plan hash the
+    /// instruction carries (the plan's SHA-256).
     pub(super) fn checked_signed(
         documents: &[(Sha256, Vec<u8>)],
-    ) -> Result<CheckedPlan, PlanRefused> {
+    ) -> Result<(CheckedPlan, Sha256), PlanRefused> {
         let hashes: Vec<Sha256> = documents.iter().map(|(hash, _)| *hash).collect();
         let bytes = plan(&hashes).encode().unwrap();
-        let instruction = verified(Some(sha2::Sha256::digest(&bytes).into()));
+        let plan_hash: Sha256 = sha2::Sha256::digest(&bytes).into();
+        let instruction = verified(Some(plan_hash));
         let mut checked = check_plan(&load_plan(&bytes, documents.to_vec(), Some(&instruction))?)?;
         checked.ecu_reads.clear();
         checked.rule_fields.clear();
-        Ok(checked)
+        Ok((checked, plan_hash))
     }
 
     #[test]
@@ -4018,7 +4033,7 @@ mod tests {
         let instruction = verified(Some(sha2::Sha256::digest(other.encode().unwrap()).into()));
         assert!(matches!(
             load_plan(&bytes, vec![doc], Some(&instruction)),
-            Err(PlanRefused::PlanNotSigned)
+            Err(PlanRefused::PlanHashMismatch)
         ));
     }
 
@@ -4029,6 +4044,42 @@ mod tests {
         assert!(matches!(
             load_plan(&bytes, vec![doc], Some(&verified(None))),
             Err(PlanRefused::InstructionNamesNoPlan)
+        ));
+    }
+
+    #[test]
+    fn an_instruction_of_another_kind_refuses_the_plan_even_with_its_hash() {
+        let doc = named(document(0x90, 0x7E0, 0x7E8, |_| {}));
+        let bytes = plan(&[doc.0]).encode().unwrap();
+        for kind in [
+            shared_proto::JobKind::RunSequence,
+            shared_proto::JobKind::Reprogram,
+        ] {
+            let instruction = verified_of_kind(kind, Some(sha2::Sha256::digest(&bytes).into()));
+            assert!(matches!(
+                load_plan(&bytes, vec![doc.clone()], Some(&instruction)),
+                Err(PlanRefused::InstructionNotIdentify)
+            ));
+        }
+    }
+
+    #[test]
+    fn the_hash_check_comes_before_the_plan_is_decoded() {
+        let instruction = verified(Some([7; 32]));
+        assert!(matches!(
+            load_plan(b"not a plan", Vec::new(), Some(&instruction)),
+            Err(PlanRefused::PlanHashMismatch)
+        ));
+    }
+
+    #[test]
+    fn a_matching_hash_does_not_hide_a_missing_document() {
+        let doc = named(document(0x90, 0x7E0, 0x7E8, |_| {}));
+        let bytes = plan(&[doc.0]).encode().unwrap();
+        let instruction = verified(Some(sha2::Sha256::digest(&bytes).into()));
+        assert!(matches!(
+            load_plan(&bytes, Vec::new(), Some(&instruction)),
+            Err(PlanRefused::MissingDocument(_))
         ));
     }
 

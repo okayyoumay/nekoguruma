@@ -2027,14 +2027,15 @@ async fn a_manual_plan_with_a_vin_rule_reads_reports_and_takes_the_lock() {
 /// any other, and the plan's SHA-256 is in the communication log's header.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_plan_the_verified_instruction_names_runs() {
-    let plan = checked_signed(&[reader(0x90, A)]).unwrap();
+    let (plan, plan_hash) = checked_signed(&[reader(0x90, A)]).unwrap();
     let ran = run(plan, fake_with(&[(A.0, VIN_A)])).await;
     ran.report();
-    assert!(
-        ran.log
-            .iter()
-            .any(|entry| entry.to_string().contains("plan_sha256"))
-    );
+    let header = ran
+        .log
+        .iter()
+        .find(|line| line["event"] == "header")
+        .expect("a header");
+    assert_eq!(header["job"]["plan_sha256"], hex(&plan_hash).as_str());
 }
 
 /// A run that reads the VIN while another job (of another VCI) holds the vehicle's lock, stopped

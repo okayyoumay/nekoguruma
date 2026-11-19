@@ -57,8 +57,9 @@ adapter refuses (ADR-129) and a native-mixed identifier collision (ADR-162).
    job always does (ADR-396 item 7).
 7. **`ngr-agent identify`.** Options: `--plan <file>` (once) and `--document <file>` (any
    number), with `--vci`, `--api`, `--mode`, `--workers`, `--locks` and `--comm-log` as for
-   `run`. The report is one line of JSON on stdout. An unsigned plan is accepted until the
-   plan's signature is verified. A document the plan does not name is ignored with a warning on
+   `run`. The report is one line of JSON on stdout. An unsigned plan is accepted by the
+   command (it passes no instruction; `load_plan` verifies the plan against a verified
+   instruction's plan hash, see Consequences). A document the plan does not name is ignored with a warning on
    stderr; the same file twice is one document. The plan and documents are read and checked
    before the log directory, the lock or the worker. Exit status: 0 for a report (an
    interrupted presence section and refused tables included), 1 for an unreadable plan or
@@ -137,6 +138,7 @@ adapter refuses (ADR-129) and a native-mixed identifier collision (ADR-162).
 - ADR-039 and ADR-068 describe filter installation as best-effort; for the connect that is
   replaced by item 1 (their annotations say so). ADR-396 item 8 is realized.
 - `ngr-agent identify` still accepts an unsigned plan (item 7), as a development path.
-  The server-connected path passes its verified instruction to `load_plan`, which refuses an
-  instruction with no plan hash and a plan whose SHA-256 differs from it, before any link
-  opens (ADR-395 item 2, ADR-461 Decision item 13).
+  `load_plan` given a verified instruction refuses one that is not an identification
+  instruction or has no plan hash, and a plan whose SHA-256 differs from the plan hash, before
+  any link opens (ADR-395 item 2, ADR-461 Decision item 13); the server-connected intake is to
+  pass the instruction, and no production caller does yet.

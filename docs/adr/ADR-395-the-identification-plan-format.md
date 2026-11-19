@@ -141,5 +141,5 @@ step implements.
   the definitions agree; this is stricter than ADR-324 alone, which judges one link at a time.
 - A resource declared at two baud rates cannot be identified in one job; the plan is refused
   rather than split.
-- The signature check, the presence request, the collecting mode, the halving, the job kind and
+- The signature check (now in `identification::load_plan`, given a verified instruction, ADR-461 item 13; the server-connected intake is to pass it), the presence request, the collecting mode, the halving, the job kind and
   its CLI are follow-up work, in the backlog.

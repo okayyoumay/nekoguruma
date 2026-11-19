@@ -196,7 +196,7 @@ release. The differences:
 
 | Option | Meaning |
 |---|---|
-| `--plan` | The identification plan (`diag_ir::plan::IdentificationPlan`, ADR-395). Required, given once. The command passes no job instruction, so an unsigned plan is accepted as a development path; the server-connected agent passes its verified instruction to `load_plan`, which then refuses a plan the instruction's plan hash does not name (below) |
+| `--plan` | The identification plan (`diag_ir::plan::IdentificationPlan`, ADR-395). Required, given once. The command passes no job instruction, so an unsigned plan is accepted as a development path; given a verified instruction, `load_plan` refuses a plan its plan hash does not name (below); the server-connected intake is to pass one, and no production caller does yet |
 | `--document` | A document the plan names, by its hash. Any number, including none. The same file twice is one document. A document the plan does not name is ignored, with a warning on stderr. A document the plan names and that is not supplied refuses the plan |
 | `--artifact`, `--artifact-sha256` | Not accepted: the job reads no artifact (unknown options, exit status 2) |
 
@@ -2078,7 +2078,7 @@ and reads the ECU definitions (`run_identification`, ADR-396, ADR-399, ADR-401).
   postcard struct with its own schema version; a chosen-definition plan holds one candidate and
   an every-ECU plan none) and takes the documents it names from `supplied`,
   each given with the hash it is named by. A missing document, a document whose bytes hash to
-  something else and a document that does not load refuse the plan. With a verified instruction (`Some`), the plan's SHA-256 must equal the instruction's plan hash (ADR-461 item 13): an instruction with no plan hash (`PlanRefused::InstructionNamesNoPlan`) or a different hash (`PlanRefused::PlanNotSigned`) refuses the plan here, before any link, worker or communication log exists. `ngr-agent identify` passes `None`.
+  something else and a document that does not load refuse the plan. With a verified instruction (`Some`), it must be an identification instruction (`PlanRefused::InstructionNotIdentify` otherwise) and the plan's SHA-256 must equal its plan hash (ADR-461 item 13): an instruction with no plan hash (`PlanRefused::InstructionNamesNoPlan`) or a different hash (`PlanRefused::PlanHashMismatch`) refuses the plan here, before any link, worker or communication log exists. `ngr-agent identify` passes `None`.
 - `check_plan` refuses a plan that names, in a variant pattern or a rule source, a service that
   is not declared or not in the read-only set of the variant's layer (a variant with no protocol
   or layer judges nothing read-only), or a field the response lacks; a VIN rule's source that is

@@ -292,9 +292,14 @@ pub fn parse(bytes: &[u8]) -> Result<Installation, InstallationError> {
     let table: toml::Table =
         text.parse()
             .map_err(|error: toml::de::Error| InstallationError::Syntax {
-                line: error
-                    .span()
-                    .map(|span| text[..span.start.min(text.len())].matches('\n').count() + 1),
+                line: error.span().map(|span| {
+                    let end = span.start.min(text.len());
+                    text.as_bytes()[..end]
+                        .iter()
+                        .filter(|&&b| b == b'\n')
+                        .count()
+                        + 1
+                }),
             })?;
     if let Some(key) = table.keys().find(|key| !KEYS.contains(&key.as_str())) {
         return Err(InstallationError::UnknownKey {

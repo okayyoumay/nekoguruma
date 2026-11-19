@@ -55,7 +55,7 @@ established.
 identity: loads the agent's key from its key store, creating it once when the store has none,
 and prints public_key_pem, fingerprint and created as JSON on stdout. It takes no option
 but --mode. Exit status: 0 the key is there; 1 the installation file is absent, refused, not
-valid or for the other mode, this build or mode has no key store, the store cannot create the
+valid, not readable by the agent's account or for the other mode, this build or mode has no key store, the store cannot create the
 key, or the debug variables are wrong; 2 a usage error; 3 the installation file cannot be read
 (other than for lack of access), the store, its lock or the state directory is unavailable
 (nothing changed, try again); 4 the stored key cannot be used (nothing changed; register again
@@ -75,8 +75,8 @@ hexadecimal digits. A key the agent has to create first stops the command (exit 
 fingerprint to issue a code for. --replace lets a registration replace an existing record.
 It prints agent_id, owner_id, preset, allow_remote, server_origin, instruction_key_id,
 agent_key_fingerprint and replaced as one JSON line on stdout. Exit status: 0 registered and
-stored; 1 it cannot register as asked (the installation file is absent, refused, not valid or
-for the other mode, --server is not the installed server, no key store, an unusable code, a key
+stored; 1 it cannot register as asked (the installation file is absent, refused, not valid,
+not readable by the agent's account or for the other mode, --server is not the installed server, no key store, an unusable code, a key
 just created, a refusal by the server, an answer that is not a registration answer); 2 a usage
 error; 3 the installation file cannot be read (other than for lack of access), the server, the
 state directory or a lock is unavailable, or the outcome is unknown (the local record
@@ -89,7 +89,7 @@ connect: keeps the agent's control channel session to the server its registratio
 but --mode and prints nothing on stdout. Exit status: 0 stopped by a signal; 1 the agent is not
 registered, or must register again (the key was just created, is not the registered one, or the
 record is not valid, or names another server than the installation file), the installation file
-is absent, refused, not valid or for the other mode, there is no key store, the stop handlers
+is absent, refused, not valid, not readable by the agent's account or for the other mode, there is no key store, the stop handlers
 cannot be installed, or the session ended without a stop; 2 a usage error; 3 the installation
 file cannot be read (other than for lack of access), another session or a registration is
 running, a lock, the state or identity directory is unusable, or the record cannot be read; 4 the

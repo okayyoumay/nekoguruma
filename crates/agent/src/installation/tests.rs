@@ -129,6 +129,19 @@ fn c5_a_file_over_64_kib_is_refused() {
     assert_eq!(InstallationError::TooLarge.exit_code(), 1);
 }
 
+/// C5: the read itself stops at the limit: a file of two bytes more is `TooLarge` without being
+/// read whole.
+#[cfg(unix)]
+#[test]
+fn c5_the_read_stops_at_the_limit() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("big.toml");
+    std::fs::write(&path, vec![b'#'; MAX_SIZE as usize + 2]).unwrap();
+    assert_eq!(read_bytes(&path), Err(InstallationError::TooLarge));
+    std::fs::write(&path, vec![b'#'; MAX_SIZE as usize]).unwrap();
+    assert_eq!(read_bytes(&path).unwrap().len() as u64, MAX_SIZE);
+}
+
 /// C6: an empty file lacks the mode, the first required key.
 #[test]
 fn c6_an_empty_file_lacks_the_mode() {
@@ -670,11 +683,18 @@ fn b1_a_file_regular_users_can_change_is_refused_in_both_modes() {
         let temp = tempfile::tempdir().unwrap();
         let path = file_in(temp.path(), &text);
         make_writable_by_regular_users(&path);
-        let error = load(&path, &Policy::system()).unwrap_err();
+        // Debug builds trust the test's own user, so the refusal is for the mode bits alone.
+        #[cfg(debug_assertions)]
+        let policy = trusting();
+        #[cfg(not(debug_assertions))]
+        let policy = Policy::system();
+        let error = load(&path, &policy).unwrap_err();
         let InstallationError::Refused { findings } = &error else {
             panic!("{error}");
         };
         assert!(findings.contains(path.to_str().unwrap()), "{findings}");
+        #[cfg(debug_assertions)]
+        assert!(findings.contains("writable by regular users"), "{findings}");
         assert_eq!(error.exit_code(), 1);
     }
 }
@@ -736,7 +756,7 @@ fn b3_b4_a_writable_ancestor_is_refused_unless_it_is_sticky() {
     // B4: sticky, as /tmp is: others may add entries but not replace the file.
     set_mode(&dir, 0o1777);
     assert!(load(&path, &trusting()).is_ok());
-    // The directory that holds the file directly may not be add-only for others.
+    // A directory that only its owner can write is accepted.
     set_mode(&dir, 0o755);
     assert!(load(&path, &trusting()).is_ok());
 }

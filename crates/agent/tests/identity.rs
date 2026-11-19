@@ -120,16 +120,24 @@ fn without_a_store_the_exit_is_1_and_nothing_is_written() {
         installation_file::install(&mut command, home.path(), mode, SERVER);
         let output = command.output().unwrap();
         assert_exit(&output, 1);
-        if cfg!(debug_assertions) {
-            assert!(String::from_utf8_lossy(&output.stderr).contains("no key store"));
-        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(if cfg!(debug_assertions) {
+                "no key store"
+            } else {
+                "there is no installation file"
+            }),
+            "{stderr}"
+        );
     }
     assert!(is_empty_dir(state.path()));
 }
 
 /// E2: a release build reads neither variable and writes no plain key file; a debug build does
 /// not either when a variable is missing or wrong (E3). The invariant is the same: the override
-/// directory stays empty.
+/// directory stays empty. In a release build the command now stops at the missing installation
+/// file; that build's store selection is covered by `identity/tests.rs`'s
+/// `a_release_build_ignores_both_variables`.
 #[test]
 fn a_missing_or_wrong_variable_selects_no_store_and_writes_no_key() {
     let home = tempfile::tempdir().unwrap();
@@ -160,7 +168,8 @@ fn a_missing_or_wrong_variable_selects_no_store_and_writes_no_key() {
 }
 
 /// A release build ignores both variables even when they are right (E2), and the installation
-/// file's location as well (ADR-494), so it exits 1 for want of the file.
+/// file's location as well (ADR-494), so it exits 1 for want of the file. The store selection
+/// itself is covered by `identity/tests.rs`'s `a_release_build_ignores_both_variables`.
 #[cfg(not(debug_assertions))]
 #[test]
 fn a_release_build_has_no_file_store() {
@@ -175,6 +184,7 @@ fn a_release_build_has_no_file_store() {
         installation_file::install(&mut command, home.path(), mode, SERVER);
         let output = command.output().unwrap();
         assert_exit(&output, 1);
+        assert!(String::from_utf8_lossy(&output.stderr).contains("there is no installation file"));
     }
     assert!(is_empty_dir(state.path()));
 }

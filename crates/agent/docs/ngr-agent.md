@@ -239,7 +239,7 @@ An unknown key is refused. The first problem found decides, in a fixed order: th
 | Exit status | Meaning |
 |---|---|
 | 1 | The file is absent (also when it is removed between the check and the open), refused by the check, not readable by the agent's account (a refusal of access after the check passed: a restart does not give the account access), larger than 64 KiB, not UTF-8, not valid TOML, has an unknown key, lacks a required key or has a value that breaks its rule; or `--mode` is not the installed mode |
-| 3 | Any other read error (a device error, a file that is not a regular file when read): nothing was changed and a retry may help |
+| 3 | Any other read error (a device error, a file swapped for a non-regular one after the check; a non-regular file at the check is a refusal, exit 1): nothing was changed and a retry may help |
 
 **Log.** A valid file is logged at `info` with the mode, the profile, the startup method and the root key's fingerprint; its path and the origin appear only in the entry's `external` field. A refusal is logged at `error` with the findings, which name paths, in `external`; the message on standard error is fixed wording (`operational-log.md`).
 
@@ -254,7 +254,7 @@ Loads the agent key (design 6.4, ADR-459) from the key store of the build and mo
 | Exit status | Meaning | Output |
 |---|---|---|
 | 0 | The key was found or created | The JSON line |
-| 1 | The installation file is absent, refused, not valid or for the other mode ("Installation file" above); this build or mode has no key store (every release build until the platform stores land), the store holds no key and cannot create one (an administrator provisions it), randomness is unavailable, or the debug variables are wrong | The reason on stderr |
+| 1 | The installation file is absent, refused, not readable by the agent's account, not valid or for the other mode ("Installation file" above); this build or mode has no key store (every release build until the platform stores land), the store holds no key and cannot create one (an administrator provisions it), randomness is unavailable, or the debug variables are wrong | The reason on stderr |
 | 2 | Invalid command line | The error and the usage on stderr |
 | 3 | The installation file cannot be read for a reason other than a refusal of access; the store, the creation lock or the state directory is unavailable or cannot be used; nothing changed. A store that is unavailable or a creation lock held by another process may pass on a retry; a state directory or lock file that cannot be used needs its cause fixed first | The reason on stderr |
 | 4 | A key is present and cannot be used (the store cannot decrypt it, or it is not a P-256 private key); the store is untouched, and registering again needs an explicit reset | The reason on stderr |
@@ -381,7 +381,7 @@ as the registration record. `registration.rs` holds the flow, the record and the
 | Exit status | Meaning |
 |---|---|
 | 0 | Registered and stored |
-| 1 | Cannot register as asked: the installation file is absent, refused, not valid or for the other mode, or `--server` is not the installed server; no key store, a code that is not one, a key just created, a refusal (403, 429 and any other 4xx, a redirect, an unexpected status; a 421 adds that `--server` is not the server's own origin), or a 201 that is not a registration answer |
+| 1 | Cannot register as asked: the installation file is absent, refused, not readable by the agent's account, not valid or for the other mode, or `--server` is not the installed server; no key store, a code that is not one, a key just created, a refusal (403, 429 and any other 4xx, a redirect, an unexpected status; a 421 adds that `--server` is not the server's own origin), or a 201 that is not a registration answer |
 | 2 | Invalid command line, including a terminal on standard input |
 | 3 | Unavailable or the outcome is unknown, with the local record unchanged. The text says which: nothing was sent (the installation file cannot be read for a reason other than a refusal of access, no connection, the lock held by another registration or a running control channel session, the state directory unusable); the outcome is unknown (408, 5xx, no complete answer), in which case issue a new code if the same one is refused; or registered at the server but not stored, in which case a new code is needed |
 | 4 | The agent key is present and cannot be used |
@@ -468,7 +468,7 @@ printed, as `register` prints no argument value.
 | Exit status | Meaning |
 |---|---|
 | 0 | Stopped by a signal |
-| 1 | The installation file is absent, refused, not valid or for the other mode; not registered; register again (a record for another server than the installation file's, a key just created, a key that is not the record's, a record that reads but is not valid, an outbox file, an issue-time mark file or a received-jobs ledger that is corrupt, at start or when a poisoned outbox or ledger is opened again); no key store (a release build, a build or mode without one, wrong debug variables); the stop handlers cannot be installed; the session ended without a stop |
+| 1 | The installation file is absent, refused, not readable by the agent's account, not valid or for the other mode; not registered; register again (a record for another server than the installation file's, a key just created, a key that is not the record's, a record that reads but is not valid, an outbox file, an issue-time mark file or a received-jobs ledger that is corrupt, at start or when a poisoned outbox or ledger is opened again); no key store (a release build, a build or mode without one, wrong debug variables); the stop handlers cannot be installed; the session ended without a stop |
 | 2 | Invalid command line |
 | 3 | The installation file cannot be read for a reason other than a refusal of access, another session or a registration is running, a lock cannot be taken, the state directory or the identity directory is unusable, the creation lock cannot be opened, the registration record cannot be read for an I/O reason, the outbox is open elsewhere or cannot be opened, the issue-time mark is open elsewhere or cannot be read, or the received-jobs ledger is open elsewhere or cannot be read |
 | 4 | The agent key is present and cannot be used (it is not replaced) |

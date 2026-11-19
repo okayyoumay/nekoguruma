@@ -25,6 +25,13 @@ fn main() {
         non_empty_var("NGR_PDU_API_ROOT_FILE").unwrap_or_else(|| "pdu_api_root.xml".to_owned());
     println!("cargo:rustc-env=NGR_PDU_API_ROOT_FILE={root_file}");
     println!("cargo:rerun-if-env-changed=NGR_PDU_API_ROOT_FILE");
+    // NGR_AGENT_INSTALLATION_FILE: the agent's installation file (design 6.7, ADR-494), relative
+    // to the same fixed system directory or absolute.
+    // Default: "nekoguruma/agent.toml"
+    let installation = non_empty_var("NGR_AGENT_INSTALLATION_FILE")
+        .unwrap_or_else(|| "nekoguruma/agent.toml".to_owned());
+    println!("cargo:rustc-env=NGR_AGENT_INSTALLATION_FILE={installation}");
+    println!("cargo:rerun-if-env-changed=NGR_AGENT_INSTALLATION_FILE");
 }
 
 fn non_empty_var(name: &str) -> Option<String> {

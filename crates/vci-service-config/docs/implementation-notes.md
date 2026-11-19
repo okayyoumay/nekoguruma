@@ -19,6 +19,9 @@ ADR-228 — `/etc/nekoguruma/j2534` by default, fixed at build time through
 directory as `system_config_dir()`, never against a `config-root-*` root),
 the D-PDU API root description file (`pdu_api_root_file()`, `NGR_PDU_API_ROOT_FILE`,
 default `pdu_api_root.xml` in the same fixed directory, so `/etc/pdu_api_root.xml`),
+the agent's installation file (`agent_installation_file()`, `NGR_AGENT_INSTALLATION_FILE`,
+default `nekoguruma/agent.toml` in the same fixed directory, so `/etc/nekoguruma/agent.toml`;
+ADR-494),
 and a fixed, platform-specific system config directory
 (`system_config_dir()`, ADR-226 SS3 amendment — `%ProgramData%\vci-service-launcher`
 on Windows, `/private/etc/vci-service-launcher` on macOS,
@@ -99,6 +102,10 @@ configuration, not a running service.
   builds); the J2534 resolver reads that directory instead of the registry on
   Windows when it is set (ADR-282). `pdu_api_root_file_override()` does the same
   for the D-PDU API root description file, which the D-PDU API resolver then
-  uses instead of the registry's `Root File` on Windows. Before ADR-228 the default was
+  uses instead of the registry's `Root File` on Windows. The agent's installation file
+  (`agent_installation_file()`, `NGR_AGENT_INSTALLATION_FILE`, default `nekoguruma/agent.toml`,
+  so `/etc/nekoguruma/agent.toml`; ADR-494) is fixed the same way, and
+  `agent_installation_file_override()` reports its override alone: the agent trusts its own
+  user as the file's owner only while that is set. Before ADR-228 the default was
   `vci-service-launcher/config.toml`, which the Linux root `/` turned into
   `/vci-service-launcher/config.toml`.

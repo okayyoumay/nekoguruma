@@ -1,7 +1,7 @@
 # ADR-493: The Data Channel Is Four Session-Token Routes to Presigned Multipart Uploads, Driven by the Agent's Upload Ledger
 
 **Date:** 2026-11-19
-**Status:** Accepted
+**Status:** Accepted (items 15 to 18 added with the begin, part URL and status routes)
 **Affects:** design 5.2, 5.4, 13, 13.3, 14.3, 14.4; `crates/server` (the upload routes, a migration for `job_objects`, `db/README.md`), `crates/agent` (the uploader, the ledger, `connect`, a debug-only enqueue command), `crates/shared-proto` if the route bodies are shared, `api/openapi.yaml` (the four operations, marked planned until served), `docs/glossary.md`; uses ADR-492's `MultipartStore` and ADR-466's session token; fixes the acknowledgement ADR-455 left
 
 ## Context
@@ -146,6 +146,51 @@ proposed. It is a specification: none of it is implemented when this record is w
     its objects were delivered; a failed or slow upload never changes a job's state and is not
     an event of the job.
 
+### Decisions taken with the begin, part URL and status routes
+
+15. **Begin compares the declared generation with the job's stored instruction.** The server
+    decodes the `signed_job` it stored for the job (the envelope's payload; it wrote the
+    envelope itself, so the signature is not checked again) and compares its ownership
+    generation with the one begin declares. A difference is a 404, the answer for a job that
+    does not exist or is another agent's, so a caller learns nothing of a job it does not own;
+    an instruction that does not decode is a 500. The job's state plays no part (item 3: begin
+    is allowed before the terminal event arrives, and after the job has ended). A row that is
+    not `failed` for the same job, generation and kind but belongs to another agent is a 409,
+    as a different declaration is.
+16. **The shape and the length are judged before the token, and the token before every
+    lookup.** The order is the guard, the method (405), the body (413, 408, 400), the shape
+    (400: the JSON object of begin, the part number, an empty body where there is none), begin's
+    length (413), the token (401), the agent's row (401 with the agent's tokens dropped, 503,
+    500), the job or the upload (404), the request against the row (400 for a part past the
+    count, then 409) and the object store (503, 500). A request that is malformed is therefore
+    answered without a lookup and drops no token, and a body is never read on behalf of an
+    unauthenticated caller beyond the 4 KiB bound. The begin body is read by a visitor of the
+    server's own: a property twice, an unknown or a null one is a 400, and a number is an
+    integer written as one; an integer of 2^64 or more (which the JSON reader turns into a
+    float, as does an exponent form of that size) is a length over the limit and a 413, not a
+    malformed number. The part number is canonical decimal text from 1 to 10000, taken as text
+    from the path, and an upload ID that is not a canonical UUID is a 404 after the token.
+17. **A status that finds the store without the upload answers 503 and writes nothing.** An
+    `open` row whose upload `list_parts` reports as not found or already finished is a state the
+    completion decides (item 6), not the status: the status answers 503, leaves the row as it
+    is, and the agent repeats it. A part URL for a row that is not `open` is never issued and
+    asks the store nothing; the status of such a row has no `partsHeld` and asks the store
+    nothing either.
+18. **Settings and details.** The part size is a constant of the code, 5 MiB, with an override
+    that only tests use; a build-time check keeps the largest object within 10000 parts and
+    its last part between one byte and a whole part. The part count is `max(1, ceil(length /
+    part size))` and the last part holds `length - (count - 1) * part size` bytes, so an empty
+    object is one empty part (which the pinned object server lists with size 0, and the status
+    counts). The 409 of the part URL carries the row's state as a `state` member of the problem
+    document. `job_objects` has foreign keys to the tenant, the agent and the job (with no
+    cascade: nothing that has objects is deleted under them), a unique `storage_key`, a CHECK for
+    each column's range and for `finished_at` being set exactly when the state is `finished`;
+    this route writes the state `open` only. The loser of two racing begins deletes the upload
+    it began (a failed delete is a warning and does not change the answer) and answers the
+    winner's row, or a 409 for another declaration. No database connection is held while the
+    store is called, and nothing from a request that could identify an upload, a URL, a
+    key or a digest, and no database error text, is logged.
+
 ## Consequences
 
 - A revoked agent that is offline cannot get a new URL or complete an upload (item 2); the
@@ -177,6 +222,5 @@ proposed. It is a specification: none of it is implemented when this record is w
 - The part-URL host rule is the registration origin's host, which fits the bundled object
   server and not an external one, and the agent's source bytes can change between hashing and
   the last part (a log is appended by later runs): both are decided with the work that builds
-  them. Whether begin checks the generation against the signed instruction, and how an
-  operator's explicit upload of a log (ADR-455 item 1) reaches the agent, are likewise left to
-  that work.
+  them. How an operator's explicit upload of a log (ADR-455 item 1) reaches the agent is likewise
+  left to that work; whether begin checks the generation against the signed instruction is item 15.

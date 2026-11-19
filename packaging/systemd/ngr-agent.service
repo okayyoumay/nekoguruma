@@ -18,8 +18,9 @@ StateDirectory=nekoguruma
 StateDirectoryMode=0700
 ExecStart=/usr/bin/ngr-agent connect --mode device
 # Exit 3 (a lock, the state directory or the registration record unavailable) is worth a retry,
-# and so is a crash. Exit 1 (not registered, no key store), 2 (invalid command line) and 4
-# (the key is present and unusable) repeat until an administrator acts; exit 0 is a stop.
+# and so is a crash. Exit 1 (no installation file at /etc/nekoguruma/agent.toml or one that is
+# refused, not valid or for user mode, not registered, no key store), 2 (invalid command line)
+# and 4 (the key is present and unusable) repeat until an administrator acts; exit 0 is a stop.
 Restart=on-failure
 RestartSec=10
 RestartPreventExitStatus=1 2 4

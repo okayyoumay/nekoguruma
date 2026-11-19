@@ -1,7 +1,7 @@
 # ADR-471: The Agent's Control Channel Session Is One Task Between Two Locks, and No Answer of the Server Ends It
 
 **Date:** 2026-11-12
-**Status:** Accepted (item 5's job command answered through the gate, ADR-473)
+**Status:** Accepted (item 5's job command answered through the gate, ADR-473; item 1's first step compares the record's origin with the installation file's, ADR-494)
 **Affects:** design 5.2, 5.3, 6.4, 14.1; `api/asyncapi.yaml` (`agentControl`: the 1001 row, the idle rule), `api/openapi.yaml` (`ConnectionChallenge`, `AgentSession`); `crates/agent` (`control`, `server_http`, `registration`), `crates/shared-proto` (`control`: the close codes), `crates/server` (`control`), `crates/agent/docs/ngr-agent.md`; details ADR-466 items 1 to 4 and 6 to 13 for the agent's side and settles ADR-470's Consequence on `register` during a session
 
 ## Context

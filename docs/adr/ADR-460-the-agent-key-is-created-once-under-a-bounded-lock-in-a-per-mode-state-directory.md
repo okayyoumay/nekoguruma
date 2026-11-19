@@ -1,7 +1,7 @@
 # ADR-460: The Agent Key Is Created Once Under a Bounded Lock in a Per-Mode State Directory
 
 **Date:** 2026-11-11
-**Status:** Accepted
+**Status:** Accepted (the mode the state directory is chosen for is the installation file's, ADR-494)
 **Affects:** design 6.2, 6.4; `crates/agent` (`state`, `identity`, the `ngr-agent identity` command); ADR-459 (Decision item 4); ADR-255 (the lock's waiting rule differs); the journal-location, Windows, Linux user-mode and Linux device-mode key store work
 
 ## Context

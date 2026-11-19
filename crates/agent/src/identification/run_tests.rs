@@ -17,9 +17,9 @@ use vci_service_interface::{
 use worker_host::client::WorkerClient;
 
 use super::tests::{
-    CandidateEntries, CandidateFieldRule, checked, checked_vin, checked_vin_reading, document,
-    document_reading, ecu_plan, ecu_plan_of, ecu_plan_ruled, ecu_plan_with_rules, edited,
-    identified_by, named, two_field_service, with_service,
+    CandidateEntries, CandidateFieldRule, checked, checked_signed, checked_vin,
+    checked_vin_reading, document, document_reading, ecu_plan, ecu_plan_of, ecu_plan_ruled,
+    ecu_plan_with_rules, edited, identified_by, named, two_field_service, with_service,
 };
 use super::*;
 use crate::comm_log::{CommLogSetup, VciFacts};
@@ -2021,6 +2021,20 @@ async fn a_manual_plan_with_a_vin_rule_reads_reports_and_takes_the_lock() {
     let results: Vec<_> = report.vin_rules().iter().map(|r| r.outcome).collect();
     assert_eq!(results, [RuleOutcome::Matched, RuleOutcome::NotMatched]);
     assert!(report.vehicle_lock_held() && ran.run.guards.holds_vehicle());
+}
+
+/// Design 8.8.2, ADR-461 item 13: a plan the verified instruction's plan hash names runs like
+/// any other, and the plan's SHA-256 is in the communication log's header.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plan_the_verified_instruction_names_runs() {
+    let plan = checked_signed(&[reader(0x90, A)]).unwrap();
+    let ran = run(plan, fake_with(&[(A.0, VIN_A)])).await;
+    ran.report();
+    assert!(
+        ran.log
+            .iter()
+            .any(|entry| entry.to_string().contains("plan_sha256"))
+    );
 }
 
 /// A run that reads the VIN while another job (of another VCI) holds the vehicle's lock, stopped

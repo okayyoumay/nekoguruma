@@ -196,7 +196,7 @@ release. The differences:
 
 | Option | Meaning |
 |---|---|
-| `--plan` | The identification plan (`diag_ir::plan::IdentificationPlan`, ADR-395). Required, given once. Unsigned plans are accepted until the plan's signature is verified |
+| `--plan` | The identification plan (`diag_ir::plan::IdentificationPlan`, ADR-395). Required, given once. The command passes no job instruction, so an unsigned plan is accepted as a development path; the server-connected agent passes its verified instruction to `load_plan`, which then refuses a plan the instruction's plan hash does not name (below) |
 | `--document` | A document the plan names, by its hash. Any number, including none. The same file twice is one document. A document the plan does not name is ignored, with a warning on stderr. A document the plan names and that is not supplied refuses the plan |
 | `--artifact`, `--artifact-sha256` | Not accepted: the job reads no artifact (unknown options, exit status 2) |
 
@@ -2074,11 +2074,11 @@ The `identification` module (design 8.8.2, ADR-327, ADR-395) loads and checks th
 identification job, derives its endpoints, sends its functional presence requests, reads the VIN
 and reads the ECU definitions (`run_identification`, ADR-396, ADR-399, ADR-401). `ngr-agent identify` runs it; the server does not yet.
 
-- `load_plan(plan_bytes, supplied)` decodes the plan (`diag_ir::plan::IdentificationPlan`, a
+- `load_plan(plan_bytes, supplied, instruction)` decodes the plan (`diag_ir::plan::IdentificationPlan`, a
   postcard struct with its own schema version; a chosen-definition plan holds one candidate and
   an every-ECU plan none) and takes the documents it names from `supplied`,
   each given with the hash it is named by. A missing document, a document whose bytes hash to
-  something else and a document that does not load refuse the plan.
+  something else and a document that does not load refuse the plan. With a verified instruction (`Some`), the plan's SHA-256 must equal the instruction's plan hash (ADR-461 item 13): an instruction with no plan hash (`PlanRefused::InstructionNamesNoPlan`) or a different hash (`PlanRefused::PlanNotSigned`) refuses the plan here, before any link, worker or communication log exists. `ngr-agent identify` passes `None`.
 - `check_plan` refuses a plan that names, in a variant pattern or a rule source, a service that
   is not declared or not in the read-only set of the variant's layer (a variant with no protocol
   or layer judges nothing read-only), or a field the response lacks; a VIN rule's source that is

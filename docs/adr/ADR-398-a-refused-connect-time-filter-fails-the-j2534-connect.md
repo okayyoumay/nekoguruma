@@ -136,4 +136,7 @@ adapter refuses (ADR-129) and a native-mixed identifier collision (ADR-162).
   the table's is a failed connect the agent does not halve on.
 - ADR-039 and ADR-068 describe filter installation as best-effort; for the connect that is
   replaced by item 1 (their annotations say so). ADR-396 item 8 is realized.
-- The plan's signature is still unverified (ADR-395 item 2); a backlog item tracks it.
+- `ngr-agent identify` still accepts an unsigned plan (item 7), as a development path.
+  The server-connected path passes its verified instruction to `load_plan`, which refuses an
+  instruction with no plan hash and a plan whose SHA-256 differs from it, before any link
+  opens (ADR-395 item 2, ADR-461 Decision item 13).

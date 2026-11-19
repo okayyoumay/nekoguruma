@@ -54,10 +54,17 @@ impl Env {
     }
 
     /// The directory the installation file is written in: a child of the home, so that it is a
-    /// private directory the test owns.
+    /// private directory the test owns. The check of design 7.2 judges the file's directory and
+    /// those above it, and both directories take their mode from the umask (0775 under 0002), so
+    /// they are made private here.
     fn dir(&self) -> PathBuf {
         let dir = self.home.path().join("installation");
         std::fs::create_dir_all(&dir).unwrap();
+        #[cfg(unix)]
+        for private in [self.home.path(), dir.as_path()] {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(private, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         dir
     }
 

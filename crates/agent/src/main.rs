@@ -65,7 +65,8 @@ Every command first reads the installation file (agent.toml, beside the configur
 the system directory; crates/agent/docs/ngr-agent.md): the device's mode, the server's origin
 and the distribution root key come from it, and --mode must equal its mode. run and identify use
 only the mode. A command reads it after the log starts and before the key, a lock, a worker or a
-connection; when it is absent, refused, not valid or for the other mode, run and identify exit 1.
+connection; when it is absent, refused, not valid or for the other mode, run and identify exit
+1, and when it cannot be read for another reason, 3.
 
 register: registers the agent with the server the installation file names and stores the
 registration record in the agent's state directory. --server (http://127.0.0.1[:port]) is

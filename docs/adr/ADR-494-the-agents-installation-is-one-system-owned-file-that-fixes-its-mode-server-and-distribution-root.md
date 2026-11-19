@@ -75,9 +75,10 @@ origin decides who receives the registration code and the agent's proof.
 
 7. **`run` and `identify` read the installed mode too.** They read the file at the same place as
    the three commands of item 4 (after the log starts and every usage check, before a lock, the
-   log directory, the state directory or a worker), once, and use its mode only: no server or key
-   check. `--mode` stays required and must equal the file's mode, a difference is exit 1, and an
-   absent, refused or invalid file is exit 1 with the same messages, so a device with no installed
+   communication log directory, the state directory or a worker), once, and use its mode only: no
+   server or key check. `--mode` stays required and must equal the file's mode, a difference is
+   exit 1, an absent, refused or invalid file is exit 1 and any other read error exit 3, with the
+   same messages as the three commands, so a device with no installed
    mode starts no worker and a caller cannot run a job in the other mode than the installation
    chose.
 
@@ -96,4 +97,4 @@ origin decides who receives the registration code and the agent's proof.
   them later. A key a later version adds is refused by an older agent as an unknown key.
 - A release `run` on a test machine stops at the missing installation file before it checks the
   program, so its up-front refusal of a write and of TesterPresent is shown by a release-only test
-  of the request policy with the build's ceiling rather than through the binary.
+  of the job check it makes (`check_job` with the build's ceiling) rather than through the binary.

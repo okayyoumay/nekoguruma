@@ -3131,6 +3131,26 @@ mod tests {
         ));
     }
 
+    /// A release build refuses a write and TesterPresent in a procedure at `check_job` with the
+    /// build's ceiling, the check `ngr-agent run` makes before it resolves the VCI (ADR-247,
+    /// ADR-396). A release binary stops at its installation file first on a test machine
+    /// (ADR-494), so this is where the refusal is shown for a release build.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn a_release_build_refuses_a_write_and_tester_present_at_the_job_check() {
+        for service in [0x2E, 0x3E] {
+            let job: Job = program(vec![Op::PushBytes(0), Op::ServiceRequest { service }]).into();
+            let refused = check_job(&job, crate::policy::build_ceiling());
+            assert!(
+                matches!(
+                    refused,
+                    Err(JobError::Refused { pc: 1, source: HostError::NotAllowed(s) }) if s == service
+                ),
+                "{service:#x}: {refused:?}"
+            );
+        }
+    }
+
     /// ADR-410: a source on a target the program does not list is refused by both entry points
     /// before any worker starts.
     #[test]

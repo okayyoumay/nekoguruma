@@ -1,7 +1,9 @@
 //! The agent's installation file `agent.toml` for the tests that start `ngr-agent` (design 6.7,
 //! ADR-494), shared through `#[path]`: `crates/agent/tests/installation.rs`, `identity.rs`,
-//! `register.rs` and `connect.rs`, and the server's `crates/server/tests/postgres/agent_register.rs`
-//! and `agent_connect.rs`.
+//! `register.rs`, `connect.rs` and `cli.rs`, the server's
+//! `crates/server/tests/postgres/agent_register.rs` and `agent_connect.rs`, and the worker crates'
+//! tests that run the agent binary (`crates/j2534-0404-service/tests/ngr_agent_end_to_end.rs`,
+//! `crates/iso22900-service/tests/ngr_agent_*.rs`).
 //!
 //! A debug `ngr-agent` reads the file where `NGR_AGENT_INSTALLATION_FILE` points and then trusts
 //! the user it runs as to own it, so a test writes the file in a temporary directory it owns.
@@ -40,8 +42,20 @@ pub fn text(mode: &str, server_url: &str) -> String {
 /// Writes `contents` as `agent.toml` in `dir`, readable by everyone and writable by its owner
 /// alone, and returns the path. The file is written aside and renamed into place, so a process
 /// that reads it while a test writes it again never sees half of it.
+///
+/// The agent refuses a file in a directory that others may write to (design 7.2), and a
+/// directory a test creates takes its mode from the umask (`tempfile` and `create_dir_all`
+/// alike; 0775 under a umask of 0002), so `dir` loses its group and other write bits here.
 pub fn write(dir: &Path, contents: &str) -> PathBuf {
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(dir).unwrap().permissions().mode();
+        if mode & 0o022 != 0 {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode & !0o022)).unwrap();
+        }
+    }
     let path = dir.join("agent.toml");
     let aside = dir.join(format!(
         "agent.toml.{}.{}",

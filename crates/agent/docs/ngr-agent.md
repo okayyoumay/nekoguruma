@@ -173,6 +173,7 @@ commits 0 (ADR-252).
 | 0 | The program ran to its end | The final `diag_ir::VmState` as one line of JSON on stdout. A negative response is a value on the stack, not a failure, and neither is the silence of a request whose positive response is suppressed (an empty value, ADR-408; for a request longer than one classic CAN frame only with a confirmed send, and never with an error event bound to the primitive) |
 | 1 | The installation file is absent, refused, not valid or not readable by the agent's account, or `--mode` is not its mode ("Installation file" below; nothing else has happened yet); reading the document, launching the worker or the job failed (including a procedure that ended itself as failed, `JobError::ProcedureFailed`), the worker may still hold the VCI after a failed link close, or the final state holds a non-finite float (infinity or NaN), which JSON cannot represent | The reason on stderr |
 | 2 | Invalid command line | The error and the usage on stderr |
+| 3 | The installation file cannot be read for a reason other than a refusal of access ("Installation file" below); nothing else has happened yet, and a retry may help | The reason on stderr |
 
 The worker's own log goes to stderr.
 
@@ -212,6 +213,7 @@ API and the width as a procedure's does.
 | 0 | The job ended: the report, including a run whose presence section is interrupted (`presence_interrupted`), whose VIN phase is interrupted (`vin_interrupted`), whose ECU phase is interrupted (`ecu_reads_interrupted`) or whose tables the VCI refused | The `IdentificationReport` as one line of JSON on stdout (it holds the VIN when one was established, the ECU reads and entry states, ADR-401, and the rule fields and component values, ADR-403) |
 | 1 | The installation file is absent, refused, not valid or not readable by the agent's account, or `--mode` is not its mode ("Installation file" below), before the plan is read; the plan or a document cannot be read (`cannot read <path>`) or the plan is refused (`plan refused: ...`), both before the VCI; the job failed (`job failed: ...`, nothing on stdout; among them guards still marked after the VIN phase's last close when an ECU read remains, `LinkUnconfirmed`); or the worker may still hold the VCI after a failed link close | The reason on stderr |
 | 2 | Invalid command line | The error and the usage on stderr |
+| 3 | The installation file cannot be read for a reason other than a refusal of access ("Installation file" below); nothing else has happened yet, and a retry may help | The reason on stderr |
 
 ## Installation file
 
@@ -234,7 +236,7 @@ What the installation decides for this device (design 6.2, 6.5, 6.7; ADR-494) is
 
 An unknown key is refused. The first problem found decides, in a fixed order: the syntax, an unknown key, then `mode`, `server_url`, `distribution_root_pem`, `profile`, `startup` and `lock_dir`.
 
-**The order in `main`.** The command line is parsed (exit 2), the operational log starts, `register`'s terminal check on standard input runs (exit 2), and then the file is read, once, before the key, a lock, a worker, the log directory or a connection. `--mode` stays required and must equal the file's `mode` (exit 1 on a difference, with both modes named: they are fixed words). `run` and `identify` use the installed mode only (no server check) and pass it to the worker. The other commands use the installed mode and origin: `register` takes the server from the file (`--server` is optional and must be the same origin), and `connect` compares the record's origin with the installed one (below).
+**The order in `main`.** The command line is parsed (exit 2), the operational log starts, `register`'s terminal check on standard input runs (exit 2), and then the file is read, once, before the key, a lock, a worker, the communication log directory or a connection. `--mode` stays required and must equal the file's `mode` (exit 1 on a difference, with both modes named: they are fixed words). `run` and `identify` use the installed mode only (no server check) and pass it to the worker. The other commands use the installed mode and origin: `register` takes the server from the file (`--server` is optional and must be the same origin), and `connect` compares the record's origin with the installed one (below).
 
 | Exit status | Meaning |
 |---|---|

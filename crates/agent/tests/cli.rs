@@ -25,16 +25,23 @@ use diag_ir::{IR_SCHEMA_VERSION, Op, Program};
 mod installation_file;
 
 /// The installation file of every test in this file: a user-mode device, planted once per
-/// process in a directory named after the process, so that no other process or account shares
-/// it (the file's content never changes).
+/// process in a temporary directory of its own, named afresh so that no other process or
+/// account shares it. The directory lives as long as the process: a static is never dropped, so it is
+/// left behind, as small as one file.
 fn installation() -> &'static Path {
-    static FILE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    FILE.get_or_init(|| {
-        let dir =
-            std::env::temp_dir().join(format!("ngr-agent-cli-installation-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("installation directory should be writable");
-        installation_file::write(&dir, &installation_file::text("user", "http://127.0.0.1:1"))
-    })
+    static FILE: std::sync::OnceLock<(tempfile::TempDir, PathBuf)> = std::sync::OnceLock::new();
+    let (_, path) = FILE.get_or_init(|| {
+        let dir = tempfile::Builder::new()
+            .prefix("ngr-agent-cli-installation-")
+            .tempdir()
+            .expect("the installation directory should be created");
+        let path = installation_file::write(
+            dir.path(),
+            &installation_file::text("user", "http://127.0.0.1:1"),
+        );
+        (dir, path)
+    });
+    path
 }
 
 /// `ngr-agent` for a device installed in user mode.

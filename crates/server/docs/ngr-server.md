@@ -641,6 +641,12 @@ ngr-server user disable --config <file> --username alice
 
 ## Routes
 
+Every route is mounted through `Mounts::mount` in `lib.rs`, which records its method and path.
+`tests/postgres/api_spec.rs` checks the recorded routes against `api/openapi.yaml` (and the
+control route against `api/asyncapi.yaml`): an operation the server does not serve carries
+`x-ngr-status: planned` there, and every other one must be served (`api/README.md`). The test
+also refuses a route mounted any other way.
+
 - `GET /api/v1/health` (`api/openapi.yaml`): runs `SELECT 1` on the pool. 200
   `{"status":"ok"}` when it succeeds within 2 seconds, otherwise 503 `application/problem+json`
   with no detail (the cause goes to the log, in a field named `external`). Both carry

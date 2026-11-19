@@ -90,7 +90,7 @@ pub struct AppState {
 pub type ServedRoute = (Method, &'static str);
 
 /// The routes as they are mounted, so that the list of what is served is the router's own and
-/// cannot drift from it. `api/openapi.yaml` is checked against it (`tests/api_spec.rs`).
+/// cannot drift from it. `api/openapi.yaml` is checked against it (`tests/postgres/api_spec.rs`).
 struct Mounts(Vec<ServedRoute>);
 
 impl Mounts {
@@ -122,15 +122,17 @@ pub fn router(state: AppState) -> Router {
 /// the same; tests use the list to check what is served against `api/openapi.yaml`.
 #[doc(hidden)]
 pub fn router_with_routes(state: AppState) -> (Router, Vec<ServedRoute>) {
-    let (routes, served) = routes(state.clone());
+    let (routes, served) = routes_unguarded(state.clone());
     // The standard profile supplies its own ingress layer here (design 13).
     let guarded = middleware::from_fn_with_state(state.port, local_guard::guard).layer(routes);
     (Router::new().fallback_service(guarded), served)
 }
 
-/// The route table without the guard, with the list of its routes.
+/// The route table WITHOUT the request guard, with the list of its routes. Tests only: it must
+/// never be served, since the guard's Host and Origin rules (design 13.3) are what keep other
+/// local users and web pages from reaching these routes.
 #[doc(hidden)]
-pub fn routes(state: AppState) -> (Router, Vec<ServedRoute>) {
+pub fn routes_unguarded(state: AppState) -> (Router, Vec<ServedRoute>) {
     let mut mounts = Mounts(Vec::new());
     let health = mounts
         .mount(

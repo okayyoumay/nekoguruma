@@ -63,7 +63,7 @@ vci-service-launcher = { path = "crates/vci-service-launcher" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Reads the Web API and channel descriptions in `api/` in the tests that check them against the
-# code (`crates/server/tests/api_spec.rs`). Dev-dependency only.
+# code (`crates/server/tests/postgres/api_spec.rs`). Dev-dependency only.
 serde_norway = "0.9"
 postcard = { version = "1", features = ["alloc"] }
 flatbuffers = "25.12.19"

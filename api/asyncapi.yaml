@@ -13,6 +13,10 @@ info:
     with the same structure as `monitorFrame` in this spec (10.1).
     Signaling goes through the server (10.4).
 
+    A message the build does not implement yet carries `x-ngr-status: planned`; every other
+    message is one of `shared-proto`'s control messages, with the same properties. A test checks
+    this (`api/README.md`).
+
 servers:
   agentGateway:
     host: example.com
@@ -543,6 +547,7 @@ components:
         - payload: {"type": "reconcile", "openJobs": [{"jobId": "j-1", "state": "running", "checkpoint": {"section": 2, "vin": "WVWZZZ1KZAW000001", "artifactDigest": "ab12"}}]}
 
     JobStateEvent:
+      x-ngr-status: planned
       name: jobState
       payload:
         type: object
@@ -552,6 +557,7 @@ components:
           progressPermille: { type: integer }
 
     MonitorFrame:
+      x-ngr-status: planned
       name: monitorFrame
       contentType: application/octet-stream
       description: |
@@ -567,6 +573,7 @@ components:
         format: binary
 
     ChangeFeedEvent:
+      x-ngr-status: planned
       name: changeFeed
       description: Change feed (4.4). Subscriptions are aggregated per dataset (15.3)
       payload:

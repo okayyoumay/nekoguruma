@@ -691,8 +691,10 @@ paths:
         (0 to 4 GiB) and the SHA-256 as 64 lowercase hex digits. There is no free-form
         metadata. A job that does not exist, is another agent's or whose stored instruction
         names another ownership generation than the one declared is **404**, in any state of
-        the job; a length over 4 GiB is **413**. A number written in a form that is not an
-        integer is a **400**, except one of 2^64 or more, which is a length over the limit.
+        the job; a length over 4 GiB is **413**. A length written
+        with a fraction or an exponent is judged as a double: an integral value of 2^64 or more
+        (`18446744073709551616`, `1e30`) is over the limit (**413**), any other (`1.5`, `5e9`, a
+        negative number) and a number beyond a double (`1e400`) is **400**.
         Begin is idempotent per job, generation and kind: a row that is not
         `failed` and declares the same length and digest is answered **200**, one that declares
         another length or digest is **409**. Otherwise the server starts the multipart upload,
@@ -1166,7 +1168,7 @@ components:
       required: [jobId, generation, kind, sizeBytes, sha256]
       properties:
         jobId: { type: string, format: uuid }
-        generation: { type: integer, minimum: 0, description: The job's ownership generation (ADR-229) }
+        generation: { type: integer, format: int64, minimum: 0, maximum: 9223372036854775807, description: The job's ownership generation (ADR-229); the job's stored instruction must name it, else 404 }
         kind:
           type: string
           enum: [result, commLog]

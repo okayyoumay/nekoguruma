@@ -357,6 +357,13 @@ fn instruction_generation(signed: &[u8]) -> Option<u64> {
     Some(instruction.ownership_generation)
 }
 
+/// Why [`insert_row`] failed. The two differ in what is known of the row: a failed statement (or
+/// one that never ran) left nothing, while a failed commit may have committed, the answer lost.
+enum InsertFailure {
+    Statement(sqlx::Error),
+    Commit(sqlx::Error),
+}
+
 /// Inserts the row as `open`. The conflict is the partial unique index's: a row that is not
 /// `failed` already holds the declaration, which `DO NOTHING` answers as no row, whatever the
 /// concurrent transaction's progress (READ COMMITTED waits for it to end). `Some` is the new ID.
@@ -367,9 +374,21 @@ async fn insert_row(
     declared: &Declared,
     upload: &Upload,
     part_bytes: u64,
-) -> Result<Option<String>, sqlx::Error> {
-    let mut tx = pool.begin().await?;
-    db::statement_timeouts(&mut tx).await?;
+) -> Result<Option<String>, InsertFailure> {
+    insert_statement(pool, tenant, agent, declared, upload, part_bytes).await
+}
+
+async fn insert_statement(
+    pool: &PgPool,
+    tenant: &str,
+    agent: &str,
+    declared: &Declared,
+    upload: &Upload,
+    part_bytes: u64,
+) -> Result<Option<String>, InsertFailure> {
+    use InsertFailure::{Commit, Statement};
+    let mut tx = pool.begin().await.map_err(Statement)?;
+    db::statement_timeouts(&mut tx).await.map_err(Statement)?;
     let id: Option<(String,)> = sqlx::query_as(
         "INSERT INTO job_objects (tenant_id, id, job_id, generation, kind, agent_id, storage_key, \
              upload_id, part_bytes, size_bytes, digest, state) \
@@ -388,8 +407,27 @@ async fn insert_row(
     .bind(declared.size as i64)
     .bind(&declared.digest)
     .fetch_optional(&mut *tx)
+    .await
+    .map_err(Statement)?;
+    tx.commit().await.map_err(Commit)?;
+    Ok(id.map(|(id,)| id))
+}
+
+/// The ID of the row that names `storage_key`, if one does.
+async fn row_of_key(
+    pool: &PgPool,
+    tenant: &str,
+    storage_key: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    db::statement_timeouts(&mut tx).await?;
+    let id: Option<(String,)> = sqlx::query_as(
+        "SELECT id::text FROM job_objects WHERE tenant_id = $1::uuid AND storage_key = $2",
+    )
+    .bind(tenant)
+    .bind(storage_key)
+    .fetch_optional(&mut *tx)
     .await?;
-    tx.commit().await?;
     Ok(id.map(|(id,)| id))
 }
 
@@ -470,7 +508,8 @@ async fn empty_body(body: axum::body::Body) -> Result<(), Box<Response>> {
 // The shape of begin
 
 /// A number of the body as the visitor sees it: serde_json turns an integer past `u64` into a
-/// float, and a length that large is over the limit, not malformed.
+/// float, and a length that large is over the limit, not malformed. A number beyond a double is
+/// refused by the reader itself, which makes the whole body a 400.
 enum Number {
     Int(u64),
     /// An integral value of 2^64 or more (written as a big integer or in exponent form).
@@ -711,9 +750,38 @@ pub async fn begin(State(u): State<Uploads>, request: Request) -> Response {
                 Err(error) => db_failure(&u, &error),
             }
         }
-        Err(error) => {
+        Err(InsertFailure::Statement(error)) => {
+            // The statement did not insert: nothing names the upload.
             abort(store, &upload).await;
             db_failure(&u, &error)
+        }
+        Err(InsertFailure::Commit(error)) => {
+            // The commit's answer was lost, so the row may exist: aborting the upload now could
+            // leave a row whose upload is gone. Look for a row that names the key, and abort only
+            // when none does. When that read fails too, the upload is left for the cleanup of
+            // unfinished uploads (a logged warning), never aborted on a guess.
+            match row_of_key(&u.pool, &caller.tenant, upload.key.as_str()).await {
+                Ok(Some(id)) => json_answer(
+                    StatusCode::CREATED,
+                    json!({
+                        "uploadId": id,
+                        "partBytes": part_bytes,
+                        "partCount": part_count(declared.size, part_bytes),
+                        "state": "open",
+                    }),
+                ),
+                Ok(None) => {
+                    abort(store, &upload).await;
+                    db_failure(&u, &error)
+                }
+                Err(_) => {
+                    u.warn(
+                        "an upload may be left without a row after a failed commit",
+                        "the commit and the read after it failed",
+                    );
+                    db_failure(&u, &error)
+                }
+            }
         }
     }
 }
@@ -735,6 +803,18 @@ fn parse_part(text: &str) -> Option<u16> {
     (1..=MAX_PARTS).contains(&part).then_some(part)
 }
 
+/// The upload ID and the part of the part URL's path, as sent; an empty text for a segment the
+/// path does not have (the router matched the path, so this does not happen).
+fn path_segments(path: &str) -> (&str, &str) {
+    let rest = path
+        .strip_prefix("/api/v1/agent/uploads/")
+        .unwrap_or_default();
+    let mut segments = rest.split('/');
+    let id = segments.next().unwrap_or_default();
+    let part = segments.nth(1).unwrap_or_default();
+    (id, part)
+}
+
 /// The row an upload ID names for the caller, or the answer. An ID that is not a canonical UUID
 /// names nothing.
 async fn find(u: &Uploads, caller: &Caller, id: &str) -> Result<Row, Box<Response>> {
@@ -749,26 +829,23 @@ async fn find(u: &Uploads, caller: &Caller, id: &str) -> Result<Row, Box<Respons
 }
 
 /// `POST /api/v1/agent/uploads/{uploadId}/parts/{part}`.
-pub async fn part_url(
-    State(u): State<Uploads>,
-    path: Result<Path<(String, String)>, PathRejection>,
-    request: Request,
-) -> Response {
+pub async fn part_url(State(u): State<Uploads>, request: Request) -> Response {
     let (parts, body) = request.into_parts();
     if let Err(response) = empty_body(body).await {
         return *response;
     }
-    let Ok(Path((id, part))) = path else {
-        return bad_request("The path is not valid");
-    };
-    let Some(part) = parse_part(&part) else {
+    // The segments are taken as sent, not decoded: a percent-encoded byte that is not UTF-8 in
+    // the upload ID is then a name that is no UUID (404 after the token), as in the status route,
+    // and one in the part is not a canonical number (400 before it).
+    let (id, part) = path_segments(parts.uri.path());
+    let Some(part) = parse_part(part) else {
         return bad_request("The part must be a number from 1 to 10000");
     };
     let caller = match authenticate(&u, &parts.headers).await {
         Ok(caller) => caller,
         Err(response) => return *response,
     };
-    let row = match find(&u, &caller, &id).await {
+    let row = match find(&u, &caller, id).await {
         Ok(row) => row,
         Err(response) => return *response,
     };
@@ -923,7 +1000,21 @@ mod tests {
         assert!(shaped("18446744073709551616").unwrap().over);
         assert!(shaped("99999999999999999999999999").unwrap().over);
         assert!(shaped("1e30").unwrap().over);
-        for bad in ["-1", "1.5", "1.0", "1e3", "\"5\"", "null", "true", "[1]"] {
+        // Beyond a double the reader refuses the number whole: a 400, not a length over the limit.
+        let huge_integer = "9".repeat(400);
+        for bad in [
+            "-1",
+            "1.5",
+            "1.0",
+            "1e3",
+            "5e9",
+            "1e400",
+            huge_integer.as_str(),
+            "\"5\"",
+            "null",
+            "true",
+            "[1]",
+        ] {
             assert!(shaped(bad).is_none(), "{bad}");
         }
     }

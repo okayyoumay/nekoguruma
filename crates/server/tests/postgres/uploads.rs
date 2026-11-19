@@ -646,6 +646,7 @@ async fn a_body_that_does_not_arrive_within_five_seconds_is_408() {
     for (method, target) in [
         ("POST", "/api/v1/agent/uploads".to_owned()),
         ("POST", format!("/api/v1/agent/uploads/{}/parts/1", v4())),
+        ("GET", format!("/api/v1/agent/uploads/{}", v4())),
     ] {
         let raw = format!(
             "{method} {target} HTTP/1.1\r\n{}\r\nContent-Type: application/json\r\n\
@@ -712,9 +713,22 @@ async fn a_revoked_agent_is_401_and_loses_its_tokens() {
         .execute(&fx.u.w.pool)
         .await
         .unwrap();
-    // A malformed request is answered before the row is read: it drops nothing.
+    // A malformed request is answered before the row is read: it drops nothing. With the row
+    // live again, t1 still reaches the routes.
     assert_eq!(fx.begin_as(Some(&t1), "{}").await.status, 400);
     assert_eq!(fx.part_as(Some(&t1), &id, "0").await.status, 400);
+    assert_eq!(fx.part_as(Some(&t1), &id, "1%FF").await.status, 400);
+    sqlx::query(sqlx::AssertSqlSafe(restore.clone()))
+        .execute(&fx.u.w.pool)
+        .await
+        .unwrap();
+    assert_eq!(fx.status_as(Some(&t1), &id).await.status, 200);
+    assert_eq!(fx.part_as(Some(&t1), &id, "9").await.status, 400);
+    let unknown_token = fx.status_as(Some("x"), &id).await;
+    sqlx::query(sqlx::AssertSqlSafe(revoke.clone()))
+        .execute(&fx.u.w.pool)
+        .await
+        .unwrap();
     // Each route sees the revoked row.
     problem(
         &fx.begin_as(Some(&t1), &result_of(&job, 10)).await,
@@ -722,7 +736,10 @@ async fn a_revoked_agent_is_401_and_loses_its_tokens() {
         "begin",
     );
     problem(&fx.part_as(Some(&t2), &id, "1").await, 401, "part");
-    problem(&fx.status_as(Some(&t3), &id).await, 401, "status");
+    let revoked = fx.status_as(Some(&t3), &id).await;
+    problem(&revoked, 401, "status");
+    // The same bytes as a token that is unknown.
+    assert_eq!(bytes_of(&revoked), bytes_of(&unknown_token));
     // The row is live again, and every token of the agent is gone, also the ones not used.
     sqlx::query(sqlx::AssertSqlSafe(restore))
         .execute(&fx.u.w.pool)
@@ -1156,11 +1173,20 @@ async fn the_part_number_is_judged_before_the_token_and_the_upload_after_it() {
     // A good number with no token is a 401, whatever the upload.
     problem(&fx.part_as(None, "garbage", "1").await, 401, "no token");
     // After the token the upload: not a UUID, unknown and another's are a 404.
-    for upload in ["garbage", "0192F3A4-5B6C-7D8E-8F90-123456789ABC", &v4()] {
+    for upload in [
+        "garbage",
+        "%FF",
+        "0192F3A4-5B6C-7D8E-8F90-123456789ABC",
+        &v4(),
+    ] {
         problem(&fx.part_as(Some(&fx.token), upload, "1").await, 404, upload);
     }
+    problem(&fx.status_as(Some(&fx.token), "%FF").await, 404, "status");
     // A part past the row's count is a 400, the last one is allowed (or refused by the store).
+    let before = fx.wrap.calls()[1];
     assert_eq!(fx.part(&id, "615").await.status, 503);
+    // The last part reached the store (which the fake refuses).
+    assert_eq!(fx.wrap.calls()[1], before + 1);
     assert_eq!(fx.part(&id, "616").await.status, 400);
     // The part that is in range is not in a state to be asked for, either way: 400 comes first.
     let done = fx

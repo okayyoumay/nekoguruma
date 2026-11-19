@@ -166,9 +166,12 @@ proposed. It is a specification: none of it is implemented when this record is w
     answered without a lookup and drops no token, and a body is never read on behalf of an
     unauthenticated caller beyond the 4 KiB bound. The begin body is read by a visitor of the
     server's own: a property twice, an unknown or a null one is a 400, and a number is an
-    integer written as one; an integer of 2^64 or more (which the JSON reader turns into a
-    float, as does an exponent form of that size) is a length over the limit and a 413, not a
-    malformed number. The part number is canonical decimal text from 1 to 10000, taken as text
+    integer written as one. The JSON reader turns an integer of 2^64 or more into a float, so
+    for `sizeBytes` a value written with a fraction or an exponent is judged as that float: an
+    integral value of 2^64 or more (`18446744073709551616`, `1e30`) is a length over the limit and
+    a 413, and any other (`1.5`, `5e9`, a negative number) is a 400, as is a number beyond the
+    range of a double (`1e400`, an integer of over 308 digits), which the reader refuses whole.
+    `generation` is an integer from 0 to 9223372036854775807 (the column's range), else a 400. The part number is canonical decimal text from 1 to 10000, taken as text
     from the path, and an upload ID that is not a canonical UUID is a 404 after the token.
 17. **A status that finds the store without the upload answers 503 and writes nothing.** An
     `open` row whose upload `list_parts` reports as not found or already finished is a state the

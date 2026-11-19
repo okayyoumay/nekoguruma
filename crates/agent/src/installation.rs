@@ -1,6 +1,7 @@
 //! The agent's installation file `agent.toml` (design 6.2, 6.7, ADR-494): what the installation
-//! decides for this device, read by `ngr-agent identity`, `register` and `connect` once, after
-//! the operational log starts and before the key, a lock or a connection.
+//! decides for this device, read by `ngr-agent run`, `identify`, `identity`, `register` and
+//! `connect` once, after the operational log starts and before the key, a lock, a worker or a
+//! connection (`run` and `identify` use only its mode).
 //!
 //! The file lives beside the worker configuration file under the fixed system directory
 //! ([`vci_service_config::agent_installation_file`]) and passes the design 7.2 writability check

@@ -24,8 +24,9 @@ def coding_is(market, options, idle):
             res["fields"]["options"] == options and
             res["fields"]["targetIdleSpeed"] == idle)
 
-# Everything after the first write is one section, so that a cancel or a crash is not taken
-# between the write and the decision about the roll-back, and the outcome is reported inside it.
+# Everything after the first write is one section, so that a cancel is held between the write
+# and the decision about the roll-back, and the outcome is reported inside it (a crash there ends
+# the job on site, README 11).
 # @section uninterruptible expected=2000
 def change(market, saved, wanted, idle):
     written = diag.request(0x2E, {"did": 0x0120, "market": market, "options": wanted, "targetIdleSpeed": idle})

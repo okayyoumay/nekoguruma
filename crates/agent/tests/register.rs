@@ -29,6 +29,9 @@ use shared_crypto::registration::{Preset, RegistrationCode, ResponseTranscript, 
 #[cfg(debug_assertions)]
 use shared_crypto::{PublicKey, Signer, SigningKey};
 
+#[path = "support/installation_file.rs"]
+mod installation_file;
+
 const KEY_STORE_VAR: &str = "NGR_AGENT_KEY_STORE";
 const STATE_DIR_VAR: &str = "NGR_AGENT_STATE_DIR";
 #[cfg(debug_assertions)]
@@ -46,11 +49,23 @@ struct Env {
 }
 
 impl Env {
+    /// An environment whose installation file names a server at port 1, in user mode;
+    /// [`register_args`] installs the stub's port.
     fn new() -> Env {
-        Env {
+        let env = Env {
             home: tempfile::tempdir().unwrap(),
             state: tempfile::tempdir().unwrap(),
-        }
+        };
+        env.install(1);
+        env
+    }
+
+    /// Writes the installation file (user mode) for a server at `port` (ADR-494).
+    fn install(&self, port: u16) {
+        installation_file::write(
+            self.home.path(),
+            &installation_file::text("user", &format!("http://127.0.0.1:{port}")),
+        );
     }
 
     /// `ngr-agent` with the account's state redirected into the temporary directories. The
@@ -62,7 +77,8 @@ impl Env {
             .env("XDG_STATE_HOME", self.home.path().join("xdg"))
             .env("LOCALAPPDATA", self.home.path().join("local"))
             .env_remove(KEY_STORE_VAR)
-            .env_remove(STATE_DIR_VAR);
+            .env_remove(STATE_DIR_VAR)
+            .env(installation_file::VAR, self.home.path().join("agent.toml"));
         if cfg!(debug_assertions) {
             command
                 .env(KEY_STORE_VAR, "file")
@@ -155,8 +171,11 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// The `register` arguments for a stub on `port`, with the server key `key_id`.
-fn register_args(port: u16, key_id: &str) -> Vec<String> {
+/// The `register` arguments for a stub on `port`, with the server key `key_id`; `env`'s
+/// installation file names the same server, and `--server` repeats it (it may be left out, and
+/// when given it must be the installed one).
+fn register_args(env: &Env, port: u16, key_id: &str) -> Vec<String> {
+    env.install(port);
     [
         "register",
         "--mode",
@@ -412,10 +431,9 @@ fn a_bad_command_line_is_exit_2_and_nothing_happens() {
     };
     let server = "http://127.0.0.1:9";
     let mut cases: Vec<Vec<String>> = vec![
-        // A2: each required flag missing.
+        // A2: each required flag missing (`--server` is optional, ADR-494).
         vec!["register".into()],
         ok(server)[..5].to_vec(),
-        [&ok(server)[..3], &ok(server)[5..]].concat(),
         ok(server)[..ok(server).len() - 2].to_vec(),
         // A3: a flag twice.
         [ok(server), vec!["--mode".into(), "user".into()]].concat(),
@@ -548,7 +566,7 @@ fn https_is_refused_with_its_reason() {
     let env = Env::new();
     let output = env
         .command()
-        .args(register_args(1, KEY))
+        .args(register_args(&env, 1, KEY))
         .args(["--server", "https://127.0.0.1:1"])
         .stdin(Stdio::null())
         .output()
@@ -616,7 +634,7 @@ fn a_terminal_on_stdin_is_exit_2() {
     let stub = silent();
     let output = env
         .command()
-        .args(register_args(stub.port, KEY))
+        .args(register_args(&env, stub.port, KEY))
         .stdin(Stdio::from(slave))
         .output()
         .unwrap();
@@ -641,7 +659,7 @@ fn without_a_store_the_exit_is_1_with_no_connection_and_an_empty_state() {
     // A debug build keeps the state directory override and loses only the store selection, so
     // that the binary would write into `env.state` if it touched the state at all.
     command.env_remove(KEY_STORE_VAR);
-    command.args(register_args(stub.port, KEY));
+    command.args(register_args(&env, stub.port, KEY));
     // Standard input stays open and unread: the command must not wait for it.
     let mut child = command
         .stdin(Stdio::piped())
@@ -655,7 +673,15 @@ fn without_a_store_the_exit_is_1_with_no_connection_and_an_empty_state() {
     let stderr = text(&output.stderr);
     assert_eq!(output.status.code(), Some(1), "{stderr}");
     assert!(output.stdout.is_empty());
-    assert!(stderr.contains("register: no key store"), "{stderr}");
+    // A release build stops earlier, at the installation file it cannot find (ADR-494).
+    assert!(
+        stderr.contains(if cfg!(debug_assertions) {
+            "register: no key store"
+        } else {
+            "register: there is no installation file"
+        }),
+        "{stderr}"
+    );
     assert!(stub.finish().is_none());
     assert!(is_empty_dir(env.state.path()));
     // The state root the build really uses: the override's directory in a debug build, the
@@ -686,7 +712,9 @@ mod with_store {
     /// Runs `register` against `stub` with `code` on standard input.
     fn register(env: &Env, stub: &Stub, key_id: &str, code: &str, extra: &[&str]) -> Output {
         let mut command = env.command();
-        command.args(register_args(stub.port, key_id)).args(extra);
+        command
+            .args(register_args(env, stub.port, key_id))
+            .args(extra);
         run_with(command, code.as_bytes())
     }
 
@@ -812,7 +840,7 @@ mod with_store {
         let env = Env::new();
         let stub = silent();
         let mut command = env.command();
-        command.args(register_args(stub.port, KEY));
+        command.args(register_args(&env, stub.port, KEY));
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -877,7 +905,7 @@ mod with_store {
         let stub = honest(&server, |_| {});
         let mut command = env.command();
         command
-            .args(register_args(stub.port, &key_id(&server)))
+            .args(register_args(&env, stub.port, &key_id(&server)))
             .arg("--code-file")
             .arg(&file);
         // Standard input is a terminal-less garbage pipe, held open and unread.
@@ -931,7 +959,7 @@ mod with_store {
             let output = register(&env, &stub, KEY, &text(&input), &[]);
             let output = if std::str::from_utf8(&input).is_err() {
                 let mut command = env.command();
-                command.args(register_args(stub.port, KEY));
+                command.args(register_args(&env, stub.port, KEY));
                 run_with(command, &input)
             } else {
                 output
@@ -954,7 +982,7 @@ mod with_store {
             let stub = silent();
             let mut command = env.command();
             command
-                .args(register_args(stub.port, KEY))
+                .args(register_args(&env, stub.port, KEY))
                 .arg("--code-file")
                 .arg(&path);
             let output = run_with(command, b"");
@@ -980,10 +1008,12 @@ mod with_store {
     fn a_standard_input_that_never_ends_makes_the_command_wait_without_a_lock() {
         let env = Env::new();
         env.fingerprint();
-        let silent_stub = silent();
+        // One server for both commands: the installation file names a single one (ADR-494). The
+        // first never reaches it, so it serves the second's request alone.
+        let refusing = Stub::raw(http(403, &[], b""));
         let mut first = env
             .command()
-            .args(register_args(silent_stub.port, KEY))
+            .args(register_args(&env, refusing.port, KEY))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -994,10 +1024,9 @@ mod with_store {
         let outside = tempfile::tempdir().unwrap();
         let file = outside.path().join("code.txt");
         std::fs::write(&file, code().as_str()).unwrap();
-        let refusing = Stub::raw(http(403, &[], b""));
         let mut command = env.command();
         command
-            .args(register_args(refusing.port, KEY))
+            .args(register_args(&env, refusing.port, KEY))
             .arg("--code-file")
             .arg(&file);
         let second = run_with(command, b"");
@@ -1013,7 +1042,6 @@ mod with_store {
         drop(held);
         let first = finish(first);
         assert_exit(&first, 1, "no registration code on standard input");
-        assert!(silent_stub.finish().is_none());
     }
 
     /// L2: a second registration finds the lock held, exits 3 and sends nothing. L3: when the
@@ -1035,7 +1063,7 @@ mod with_store {
             })
         };
         let mut command = env.command();
-        command.args(register_args(held.port, &key_id(&server)));
+        command.args(register_args(&env, held.port, &key_id(&server)));
         let first = spawn_with(command, code.as_str().as_bytes());
         reached_rx
             .recv_timeout(LIMIT)
@@ -1217,7 +1245,7 @@ mod with_store {
         held.bind((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
         let port = held.local_addr().unwrap().port();
         let mut command = env.command();
-        command.args(register_args(port, KEY));
+        command.args(register_args(&env, port, KEY));
         let output = run_with(command, code().as_str().as_bytes());
         assert_exit(&output, 3, "cannot connect to the server");
         assert!(text(&output.stderr).contains("nothing was sent"));
@@ -1472,7 +1500,7 @@ mod with_store {
             })
         };
         let mut command = env.command();
-        command.args(register_args(stub.port, &key_id(&server)));
+        command.args(register_args(&env, stub.port, &key_id(&server)));
         let mut child = spawn_with(command, code().as_str().as_bytes());
         reached_rx.recv_timeout(LIMIT).unwrap();
         drop(child.stderr.take());
@@ -1523,7 +1551,7 @@ mod with_store {
             })
         };
         let mut command = env.command();
-        command.args(register_args(stub.port, &key_id(&server)));
+        command.args(register_args(&env, stub.port, &key_id(&server)));
         let mut child = spawn_with(command, code().as_str().as_bytes());
         reached_rx.recv_timeout(LIMIT).unwrap();
         // The reader of standard output goes away before the command prints.

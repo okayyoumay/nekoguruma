@@ -112,12 +112,12 @@ impl Fixture {
         let issued = server::registration::issue(&world.pool, &request)
             .await
             .unwrap();
+        // The installation file names the server (ADR-494); `connect` reads it too.
+        env.install(server.addr.port());
         let args: Vec<String> = [
             "register",
             "--mode",
             "user",
-            "--server",
-            &format!("http://127.0.0.1:{}", server.addr.port()),
             "--server-key",
             &issued.server_key_id,
         ]

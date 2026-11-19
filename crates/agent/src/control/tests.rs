@@ -292,8 +292,21 @@ impl Fixture {
         .unwrap();
     }
 
+    /// Step 1 with the installed origin the fixture's record names, so the comparison with the
+    /// installation file passes; the origin tests give their own ([`Fixture::open_installed`]).
     fn open(&self) -> Result<Opened, ControlError> {
-        open_in(&self.control_dir(), &self.registration_dir())
+        let installed = std::fs::read(self.record_path())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|json| json["server_origin"].as_str().map(str::to_owned))
+            .and_then(|text| ServerOrigin::parse(&text).ok())
+            .unwrap_or_else(|| ServerOrigin::parse(ORIGIN).unwrap());
+        self.open_installed(&installed)
+    }
+
+    /// Step 1 against the origin `installed` that the installation file names.
+    fn open_installed(&self, installed: &ServerOrigin) -> Result<Opened, ControlError> {
+        open_in(&self.control_dir(), &self.registration_dir(), installed)
     }
 
     /// Whether both lock files can be taken now (and are released again at once).
@@ -1476,6 +1489,47 @@ fn a6_only_the_loopback_origin_in_canonical_form_is_accepted() {
         fx.write(&record_for(&public, good));
         assert!(fx.open().is_ok(), "{good}");
     }
+}
+
+/// H3 (ADR-494): a record for another server than the installation file names ends `open` before
+/// anything else, with both locks released; the comparison is of the canonical text, so the
+/// spellings the origin parser unifies match, and the record's own validity is judged first.
+#[test]
+fn h3_a_record_for_another_server_is_a_server_mismatch() {
+    let fx = Fixture::new();
+    let installed = |text: &str| ServerOrigin::parse(text).unwrap();
+    // The record names ORIGIN (port 8080).
+    assert!(fx.open_installed(&installed(ORIGIN)).is_ok());
+    assert!(
+        fx.open_installed(&installed("HTTP://127.0.0.1:8080/"))
+            .is_ok()
+    );
+    for other in [
+        "http://127.0.0.1:8081",
+        "http://127.0.0.1",
+        "http://127.0.0.1:1",
+    ] {
+        let error = fx.open_installed(&installed(other)).unwrap_err();
+        assert!(
+            matches!(error, ControlError::ServerMismatch),
+            "{other}: {error}"
+        );
+        assert!(fx.locks_are_free(), "both locks are released: {other}");
+    }
+    // The default port in either spelling is the same origin.
+    fx.write(&record_for(&fx.key.public_key(), "http://127.0.0.1"));
+    assert!(fx.open_installed(&installed("http://127.0.0.1:80")).is_ok());
+    // A missing or an invalid record is reported as such, not as a mismatch.
+    fx.write(&record_for(&fx.key.public_key(), "http://localhost:1"));
+    assert!(matches!(
+        fx.open_installed(&installed("http://127.0.0.1:2")),
+        Err(ControlError::Record(RecordError::Field("server_origin")))
+    ));
+    std::fs::remove_file(fx.record_path()).unwrap();
+    assert!(matches!(
+        fx.open_installed(&installed("http://127.0.0.1:2")),
+        Err(ControlError::NotRegistered)
+    ));
 }
 
 #[tokio::test(start_paused = true)]

@@ -95,6 +95,10 @@ pub enum ControlError {
     /// The key's fingerprint is not the one the record was registered with: register again.
     #[error("the agent key is not the one the registration record names")]
     KeyMismatch,
+    /// The record names another server than the installation file does (ADR-494): the
+    /// installation changed after the registration, and the agent registers again.
+    #[error("the registration record names another server than the installation file")]
+    ServerMismatch,
 }
 
 /// Both locks and the record: the first step's result, not yet running. Dropping it releases the
@@ -118,20 +122,26 @@ impl std::fmt::Debug for Opened {
     }
 }
 
-/// Step 1 for `mode`: the lock directories are the mode's state sub-directories, created when
-/// missing (`crate::state`).
-pub fn open(mode: OperatingMode) -> Result<Opened, ControlError> {
+/// Step 1 for `mode`, to the server `installed` that the installation file names: the lock
+/// directories are the mode's state sub-directories, created when missing (`crate::state`).
+pub fn open(mode: OperatingMode, installed: &ServerOrigin) -> Result<Opened, ControlError> {
     let dir = |name| {
         crate::state::private_subdir(mode, name)
             .map_err(|error| ControlError::Lock(error.to_string()))
     };
     let control = dir(DIR_NAME)?;
     let registration = dir(record::DIR_NAME)?;
-    open_in(&control, &registration)
+    open_in(&control, &registration, installed)
 }
 
-/// Step 1 in the existing directories `control_dir` and `registration_dir`.
-pub fn open_in(control_dir: &Path, registration_dir: &Path) -> Result<Opened, ControlError> {
+/// Step 1 in the existing directories `control_dir` and `registration_dir`. The record's origin
+/// must be, byte for byte, the canonical text of the `installed` origin: a record written for
+/// another server is [`ControlError::ServerMismatch`], and the locks are released.
+pub fn open_in(
+    control_dir: &Path,
+    registration_dir: &Path,
+    installed: &ServerOrigin,
+) -> Result<Opened, ControlError> {
     let connection = take(&control_dir.join(LOCK_FILE), ControlError::AlreadyRunning)?;
     let registration = take(
         &registration_dir.join(record::LOCK_FILE),
@@ -144,6 +154,9 @@ pub fn open_in(control_dir: &Path, registration_dir: &Path) -> Result<Opened, Co
         }
         Err(error) => return Err(error.into()),
     };
+    if record.server_origin != installed.as_str() {
+        return Err(ControlError::ServerMismatch);
+    }
     Ok(Opened {
         locks: Locks {
             _registration: registration,

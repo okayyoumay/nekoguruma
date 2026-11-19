@@ -25,6 +25,9 @@ use agent::registration::record::{RECORD_FILE, Record};
 #[cfg(debug_assertions)]
 use shared_crypto::{Signer, SigningKey};
 
+#[path = "support/installation_file.rs"]
+mod installation_file;
+
 const KEY_STORE_VAR: &str = "NGR_AGENT_KEY_STORE";
 const STATE_DIR_VAR: &str = "NGR_AGENT_STATE_DIR";
 #[cfg(debug_assertions)]
@@ -37,11 +40,23 @@ struct Env {
 }
 
 impl Env {
+    /// An environment whose installation file names a server at port 1, in user mode; a test
+    /// that plants a record installs the record's port ([`Env::install`]).
     fn new() -> Env {
-        Env {
+        let env = Env {
             home: tempfile::tempdir().unwrap(),
             state: tempfile::tempdir().unwrap(),
-        }
+        };
+        env.install(1);
+        env
+    }
+
+    /// Writes the installation file for a server at `port`: user mode, with the loopback origin.
+    fn install(&self, port: u16) {
+        installation_file::write(
+            self.home.path(),
+            &installation_file::text("user", &format!("http://127.0.0.1:{port}")),
+        );
     }
 
     /// `ngr-agent` with the account's state redirected into the temporary directories. The
@@ -54,6 +69,7 @@ impl Env {
             .env("LOCALAPPDATA", self.home.path().join("local"))
             .env_remove(KEY_STORE_VAR)
             .env_remove(STATE_DIR_VAR)
+            .env(installation_file::VAR, self.home.path().join("agent.toml"))
             .stdin(Stdio::null());
         if cfg!(debug_assertions) {
             command
@@ -103,6 +119,8 @@ impl Env {
         make_private_dir(self.state.path());
         make_private_dir(&dir);
         std::fs::write(dir.join(RECORD_FILE), serde_json::to_vec(&record).unwrap()).unwrap();
+        // The installation file names the same server (ADR-494).
+        self.install(port);
     }
 }
 
@@ -209,13 +227,79 @@ fn a_bad_command_line_is_exit_2() {
     assert!(!env.identity_dir().exists());
 }
 
-/// Without a record the command ends with "not registered", before the key store is touched.
+/// Without a record the command ends with "not registered", before the key store is touched. A
+/// release build ignores the installation file's location, so it stops at the missing file
+/// (ADR-494) and creates no state directory at all.
 #[test]
 fn an_unregistered_agent_is_exit_1_and_the_key_is_not_created() {
     let env = Env::new();
     let output = run(env.connect());
-    assert_exit(&output, 1, "not registered");
+    if cfg!(debug_assertions) {
+        assert_exit(&output, 1, "not registered");
+    } else {
+        assert_exit(&output, 1, "there is no installation file");
+        assert!(!env.state_root().join("control").exists());
+        assert!(!env.state_root().join("registration").exists());
+    }
     assert!(!env.identity_dir().exists(), "the key store was touched");
+}
+
+/// H3 (ADR-494): a record for another server than the installation file names is exit 1 with the
+/// advice to register again. Both locks were taken and are released; the outbox, the issue-time
+/// mark, the received-jobs ledger and the key store are not touched; nothing connects and no
+/// message repeats an origin.
+#[cfg(debug_assertions)]
+#[test]
+fn a_record_for_another_server_is_exit_1_register_again_before_anything_else() {
+    let env = Env::new();
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    env.register(&"ab".repeat(32), port);
+    for installed in [
+        format!("http://127.0.0.1:{}", port.wrapping_add(1).max(1)),
+        "http://127.0.0.1".to_owned(),
+    ] {
+        installation_file::write(
+            env.home.path(),
+            &installation_file::text("user", &installed),
+        );
+        let output = run(env.connect());
+        assert_exit(
+            &output,
+            1,
+            "register again: the registration record names another server than the installation \
+             file",
+        );
+        let stderr = text(&output.stderr);
+        assert!(!stderr.contains("127.0.0.1"), "{stderr}");
+        assert!(!stderr.contains(&port.to_string()), "{stderr}");
+        assert!(!env.identity_dir().exists(), "the key store was touched");
+        assert!(
+            !env.state.path().join("outbox").exists(),
+            "the outbox was opened"
+        );
+        let mut kept: Vec<String> = std::fs::read_dir(env.state.path().join("registration"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        kept.sort();
+        assert_eq!(
+            kept,
+            ["registration.lock", "registration.v1.json"],
+            "a mark or a ledger was created"
+        );
+        assert!(listener.accept().is_err(), "the agent connected");
+    }
+    // The locks are free again: the same origin in another spelling goes past the comparison,
+    // as far as the missing key store.
+    installation_file::write(
+        env.home.path(),
+        &installation_file::text("user", &format!("HTTP://127.0.0.1:{port}/")),
+    );
+    let mut command = env.connect();
+    command.env_remove(KEY_STORE_VAR);
+    assert_exit(&run(command), 1, "no key store");
 }
 
 /// A record that does not read says to register again. (A release build ignores the state
@@ -455,8 +539,6 @@ mod with_store {
                 "register",
                 "--mode",
                 "user",
-                "--server",
-                "http://127.0.0.1:1",
                 "--server-key",
                 &"ab".repeat(32),
                 "--replace",

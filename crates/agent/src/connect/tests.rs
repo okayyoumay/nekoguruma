@@ -57,6 +57,9 @@ impl Log {
     }
 }
 
+/// The origin the fixture's record names, which the installation file names too.
+const RECORD_ORIGIN: &str = "http://127.0.0.1:1";
+
 /// The state directories with a record naming `key`, as `open_in` wants them.
 struct Dirs {
     dir: tempfile::TempDir,
@@ -73,7 +76,7 @@ impl Dirs {
             owner_id: "owner-1".to_owned(),
             preset: "personal".to_owned(),
             allow_remote: false,
-            server_origin: "http://127.0.0.1:1".to_owned(),
+            server_origin: RECORD_ORIGIN.to_owned(),
             instruction_key_pem: instruction.to_spki_pem(),
             instruction_key_id: instruction.fingerprint_hex(),
             agent_key_fingerprint: key.public_key().fingerprint_hex(),
@@ -90,6 +93,7 @@ impl Dirs {
         control::open_in(
             &self.dir.path().join("control"),
             &self.dir.path().join("registration"),
+            &ServerOrigin::parse(RECORD_ORIGIN).unwrap(),
         )
     }
 }
@@ -351,6 +355,7 @@ fn every_control_error_has_the_documented_exit() {
         (ControlError::NotRegistered, 1),
         (ControlError::Record(record), 1),
         (ControlError::KeyMismatch, 1),
+        (ControlError::ServerMismatch, 1),
     ] {
         let mapped = control_error(&error);
         assert_eq!(mapped.exit_code(), exit, "{mapped}");
@@ -372,6 +377,11 @@ fn every_control_error_has_the_documented_exit() {
             .to_string()
             .contains("register again")
     );
+    // H3: a record for another server says to register again, and names no origin.
+    let mismatch = control_error(&ControlError::ServerMismatch).to_string();
+    assert!(mismatch.contains("register again"), "{mismatch}");
+    assert!(mismatch.contains("register --replace"), "{mismatch}");
+    assert!(!mismatch.contains("127.0.0.1"), "{mismatch}");
 }
 
 /// ADR-478: an outbox that does not read back is exit 1 with the advice to register again; the

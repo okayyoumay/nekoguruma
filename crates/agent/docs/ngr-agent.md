@@ -213,20 +213,50 @@ API and the width as a procedure's does.
 | 1 | The plan or a document cannot be read (`cannot read <path>`) or the plan is refused (`plan refused: ...`), both before the VCI; the job failed (`job failed: ...`, nothing on stdout; among them guards still marked after the VIN phase's last close when an ECU read remains, `LinkUnconfirmed`); or the worker may still hold the VCI after a failed link close | The reason on stderr |
 | 2 | Invalid command line | The error and the usage on stderr |
 
+## Installation file
+
+What the installation decides for this device (design 6.2, 6.5, 6.7; ADR-494) is one TOML file, `agent.toml`, which `ngr-agent identity`, `register` and `connect` read (`agent::installation`). `run` and `identify` do not.
+
+**Location.** Beside the worker's `config.toml` in the fixed system directory: `/etc/nekoguruma/agent.toml` on Linux, `%ProgramData%\nekoguruma\agent.toml` on Windows. `vci_service_config::agent_installation_file()` gives it: the build-time `NGR_AGENT_INSTALLATION_FILE` (default `nekoguruma/agent.toml`, relative to the fixed system directory or absolute), and, in debug builds only, a non-empty runtime variable of the same name (ADR-228, ADR-073). A release build reads no variable, so a test machine without the file at the fixed location exits 1 from all three commands.
+
+**Check.** Before it reads a byte the agent runs the design 7.2 writability check (`Policy::system`) on the file and its ancestors, in both modes: unlike the worker's configuration file there is no lenient user mode, so a user-mode account cannot change what its own agent installed. A file or directory that a regular user can change, an owner that is not a system principal, a path that is not a regular file and an entry that cannot be inspected are refusals. A symbolic link is judged by the check's own rule: a link owned by a trusted owner to a file that passes is accepted. Only a debug build that has the location override also trusts the user it runs as to own the file. The directory `/etc/nekoguruma` therefore must be owned by root; a server that runs as another account keeps its own files elsewhere (`crates/server/docs/ngr-server.md`).
+
+**Reading.** The file is read as bytes, at most 64 KiB, checked as UTF-8 (a leading byte order mark is accepted, CRLF line endings too) and parsed to a TOML table that the agent validates by hand. No message repeats a value from the file, a syntax error names its line only, and an unknown key is named only when it is a short word of lower-case letters, digits, `_` and `-`.
+
+| Key | Rule |
+|---|---|
+| `mode` | Required: `device` or `user` |
+| `server_url` | Required: the pinned origin `http://127.0.0.1[:port]` (the `--server` form, any spelling the origin parser unifies, kept in its canonical text) |
+| `distribution_root_pem` | Required: one P-256 public key in SPKI PEM form (design 11.1). Parsed only, its fingerprint is logged, and the agent holds the parsed key; nothing verifies against it before M6 |
+| `profile` | Optional: `local` (the default); `standard` is refused until it exists |
+| `startup` | Optional: `explicit` or `auto`; `auto` for a device and `explicit` for a user by default; `explicit` with `device` is refused |
+| `lock_dir` | Optional: an absolute path; validated only |
+
+An unknown key is refused. The first problem found decides, in a fixed order: the syntax, an unknown key, then `mode`, `server_url`, `distribution_root_pem`, `profile`, `startup` and `lock_dir`.
+
+**The order in `main`.** The command line is parsed (exit 2), the operational log starts, `register`'s terminal check on standard input runs (exit 2), and then the file is read, once, before the key, a lock or a connection. `--mode` stays required and must equal the file's `mode` (exit 1 on a difference, with both modes named: they are fixed words). The commands use the installed mode and origin: `register` takes the server from the file (`--server` is optional and must be the same origin), and `connect` compares the record's origin with the installed one (below).
+
+| Exit status | Meaning |
+|---|---|
+| 1 | The file is absent (also when it is removed between the check and the open), refused by the check, not readable by the agent's account (a refusal of access after the check passed: a restart does not give the account access), larger than 64 KiB, not UTF-8, not valid TOML, has an unknown key, lacks a required key or has a value that breaks its rule; or `--mode` is not the installed mode |
+| 3 | Any other read error (a device error, a file that is not a regular file when read): nothing was changed and a retry may help |
+
+**Log.** A valid file is logged at `info` with the mode, the profile, the startup method and the root key's fingerprint; its path and the origin appear only in the entry's `external` field. A refusal is logged at `error` with the findings, which name paths, in `external`; the message on standard error is fixed wording (`operational-log.md`).
+
 ## `ngr-agent identity`
 
 ```sh
 ngr-agent identity --mode <device|user>
 ```
 
-Loads the agent key (design 6.4, ADR-459) from the key store of the build and mode, creating it once when the store holds none, and prints one line of JSON on stdout: `public_key_pem` (the SPKI document as PEM), `fingerprint` (the SHA-256 of the SPKI DER as 64 lowercase hexadecimal digits) and `created` (true only for the process that created the key). `--mode` is required and the only option: the key's name, the store and the state directory depend on the mode. The command needs no worker and no VCI, and `run` and `identify` never touch the store.
+Loads the agent key (design 6.4, ADR-459) from the key store of the build and mode, creating it once when the store holds none, and prints one line of JSON on stdout: `public_key_pem` (the SPKI document as PEM), `fingerprint` (the SHA-256 of the SPKI DER as 64 lowercase hexadecimal digits) and `created` (true only for the process that created the key). `--mode` is required and the only option: the key's name, the store and the state directory depend on the mode, and it must be the mode of the installation file ("Installation file" above), which the command reads first. The command needs no worker and no VCI, and `run` and `identify` never touch the store.
 
 | Exit status | Meaning | Output |
 |---|---|---|
 | 0 | The key was found or created | The JSON line |
-| 1 | This build or mode has no key store (every release build until the platform stores land), the store holds no key and cannot create one (an administrator provisions it), randomness is unavailable, or the debug variables are wrong | The reason on stderr |
+| 1 | The installation file is absent, refused, not valid or for the other mode ("Installation file" above); this build or mode has no key store (every release build until the platform stores land), the store holds no key and cannot create one (an administrator provisions it), randomness is unavailable, or the debug variables are wrong | The reason on stderr |
 | 2 | Invalid command line | The error and the usage on stderr |
-| 3 | The store, the creation lock or the state directory is unavailable or cannot be used; nothing changed. A store that is unavailable or a creation lock held by another process may pass on a retry; a state directory or lock file that cannot be used needs its cause fixed first | The reason on stderr |
+| 3 | The installation file cannot be read for a reason other than a refusal of access; the store, the creation lock or the state directory is unavailable or cannot be used; nothing changed. A store that is unavailable or a creation lock held by another process may pass on a retry; a state directory or lock file that cannot be used needs its cause fixed first | The reason on stderr |
 | 4 | A key is present and cannot be used (the store cannot decrypt it, or it is not a P-256 private key); the store is untouched, and registering again needs an explicit reset | The reason on stderr |
 
 ### Agent key
@@ -254,9 +284,11 @@ The release build selects no store yet: the platform stores (a DPAPI blob on Win
 
 #### Installation (Linux)
 
-Two files in `packaging/` install the device-mode agent on Linux: `systemd/ngr-agent.service` (runs `/usr/bin/ngr-agent connect --mode device` as `ngr-agent`, with `StateDirectory=nekoguruma` and `StateDirectoryMode=0700`, so systemd creates the device root above) and `sysusers.d/ngr-agent.conf` (creates that system account without a login shell). The unit has no `DynamicUser=`: the state directory and the agent key must belong to one account across restarts. The unit restarts the agent after exit 3 and after a crash, and not after exit 1, 2 or 4 (see "`ngr-agent connect`" for the statuses), since a restart cannot repair those. `crates/agent/tests/packaging.rs` checks that the unit, the sysusers file and `agent::state::DEVICE_ROOT` agree. To install, with the agent binary at `/usr/bin/ngr-agent`:
+Two files in `packaging/` install the device-mode agent on Linux: `systemd/ngr-agent.service` (runs `/usr/bin/ngr-agent connect --mode device` as `ngr-agent`, with `StateDirectory=nekoguruma` and `StateDirectoryMode=0700`, so systemd creates the device root above) and `sysusers.d/ngr-agent.conf` (creates that system account without a login shell). The unit has no `DynamicUser=`: the state directory and the agent key must belong to one account across restarts. The unit restarts the agent after exit 3 and after a crash, and not after exit 1, 2 or 4 (see "`ngr-agent connect`" for the statuses), since a restart cannot repair those. `crates/agent/tests/packaging.rs` checks that the unit, the sysusers file and `agent::state::DEVICE_ROOT` agree. The installation file ("Installation file" above) is part of the installation: `/etc/nekoguruma/agent.toml`, owned by root and not writable by anyone else, in a directory owned by root, with `mode = "device"`, the server's origin and the distribution root key. The unit's `connect --mode device` exits 1 without it, and the unit does not restart after exit 1. To install, with the agent binary at `/usr/bin/ngr-agent` and an `agent.toml` written for this device:
 
 ```sh
+install -d -m 0755 -o root -g root /etc/nekoguruma
+install -m 0644 -o root -g root agent.toml /etc/nekoguruma/agent.toml
 install -m 0644 packaging/sysusers.d/ngr-agent.conf /usr/lib/sysusers.d/ngr-agent.conf
 install -m 0644 packaging/systemd/ngr-agent.service /etc/systemd/system/ngr-agent.service
 systemd-sysusers
@@ -264,14 +296,14 @@ systemctl daemon-reload
 systemctl enable --now ngr-agent.service
 ```
 
-systemd creates the device root when the unit first starts, and `connect` then exits 1 (not registered) without a restart. Register after that first start, as the `ngr-agent` account (for example `runuser -u ngr-agent -- ngr-agent register --mode device ...`), and start the unit again (`systemctl restart ngr-agent.service`). The unit does not yet provide the agent key (the Linux device key store comes with its own change).
+systemd creates the device root when the unit first starts, and `connect` then exits 1 (not registered) without a restart. Register after that first start, as the `ngr-agent` account (for example `runuser -u ngr-agent -- ngr-agent register --mode device --server-key <hex> < code.txt`; the server is the installation file's), and start the unit again (`systemctl restart ngr-agent.service`). The unit does not yet provide the agent key (the Linux device key store comes with its own change).
 
 Each kind of state has a sub-directory of its own: `identity` holds the key's lock file and the debug store, `registration` the registration record, its lock, the issue-time mark file `<agent-id>.issue-mark.v1.json` (below) and the received-jobs ledger `<agent-id>.received-jobs.v1` ("Received-jobs ledger" below) with its lock `received-jobs.lock`, `control` the control channel session's connection lock, `outbox` the outbox (below) and `journal` the write-job journal (`agent::journal::journal_dir`, and `JournalSetup::in_mode_dir` for a job's setup). The journal is linked into place with a hard link, so the first time a process resolves `journal` it also probes that its file system supports hard links (FAT and exFAT do not): the probe creates a file named after the process and a count, links it and removes both, so probes running at once never remove each other's files and a name already taken is skipped, and a directory that fails is refused with the reason (no path in the message). A sub-directory is created readable by its account only, and on Unix one that is writable by its group or others is refused. The operational log's directory (below) keeps its own rules.
 
 ## `ngr-agent register`
 
 ```sh
-ngr-agent register --mode <device|user> --server <origin> --server-key <hex> \
+ngr-agent register --mode <device|user> [--server <origin>] --server-key <hex> \
     [--code-file <file>] [--replace] < code.txt
 ```
 
@@ -282,24 +314,29 @@ as the registration record. `registration.rs` holds the flow, the record and the
 `ngr-agent identity` prints.
 
 - **The order** (ADR-470 item 1), where the first step that fails decides:
-  1. the command line;
-  2. the agent key (`agent::identity::agent_key`), where a key this run had to create stops the
+  1. the command line, and a terminal on standard input (exit 2);
+  2. the installation file ("Installation file" above): the mode must be `--mode`'s, and the
+     server is the file's, which `--server`, when given, must equal (exit 1 otherwise);
+  3. the agent key (`agent::identity::agent_key`), where a key this run had to create stops the
      command with exit 1 and its fingerprint, since no code can be issued for it yet;
-  3. the code;
-  4. the lock `registration/registration.lock`, tried once, which a running control channel
+  4. the code;
+  5. the lock `registration/registration.lock`, tried once, which a running control channel
      session also holds ("Control channel session" below), so `register` and `register --replace`
      both exit 3 while the agent is connected (ADR-471);
-  5. the existing record;
-  6. the temporary file;
-  7. one `POST /api/v1/agents/register`;
-  8. the answer's checks;
-  9. the write.
+  6. the existing record;
+  7. the temporary file;
+  8. one `POST /api/v1/agents/register`;
+  9. the answer's checks;
+  10. the write.
 
   Everything that can fail without the server comes before the request, so a code is spent only
   when the agent can store what it gets back.
-- **`--server`** must canonicalise (`Audience::canonicalise`) to exactly `http://127.0.0.1:<port>`,
-  or `http://127.0.0.1` for port 80. `localhost`, another address, a host name, a path and
-  `https` are refused (exit 2), and a redirect is never followed. `--server-key` is 64
+- **The server** is the installation file's `server_url`. `--server` is optional; when given it
+  must canonicalise (`Audience::canonicalise`) to exactly `http://127.0.0.1:<port>`, or
+  `http://127.0.0.1` for port 80 (`localhost`, another address, a host name, a path and `https`
+  are refused with exit 2), and it must be the same origin as the installed one, in any spelling
+  the origin parser unifies, else exit 1 before the key, a lock or a connection. A redirect is
+  never followed. `--server-key` is 64
   hexadecimal digits in either case.
 - **The code** comes from standard input or the file given with `--code-file`, never an argument:
   - at most 256 bytes;
@@ -336,16 +373,17 @@ as the registration record. `registration.rs` holds the flow, the record and the
   the answer has passed every check.
 - **Standard output** on success is one JSON line: `agent_id`, `owner_id`, `preset`,
   `allow_remote`, `server_origin`, `instruction_key_id`, `agent_key_fingerprint` and `replaced`.
-- **A release build** has no key store yet, so the command exits 1 there without a connection
-  and without creating any registration or identity state (the operational log's directory is
-  created at start, as for every command).
+- **A release build** has no installation file at its fixed location on a test machine and no
+  key store yet, so the command exits 1 there without a connection and without creating any
+  registration or identity state (the operational log's directory is created at start, as for
+  every command).
 
 | Exit status | Meaning |
 |---|---|
 | 0 | Registered and stored |
-| 1 | Cannot register as asked: no key store, a code that is not one, a key just created, a refusal (403, 429 and any other 4xx, a redirect, an unexpected status; a 421 adds that `--server` is not the server's own origin), or a 201 that is not a registration answer |
+| 1 | Cannot register as asked: the installation file is absent, refused, not valid or for the other mode, or `--server` is not the installed server; no key store, a code that is not one, a key just created, a refusal (403, 429 and any other 4xx, a redirect, an unexpected status; a 421 adds that `--server` is not the server's own origin), or a 201 that is not a registration answer |
 | 2 | Invalid command line, including a terminal on standard input |
-| 3 | Unavailable or the outcome is unknown, with the local record unchanged. The text says which: nothing was sent (no connection, the lock held by another registration or a running control channel session, the state directory unusable); the outcome is unknown (408, 5xx, no complete answer), in which case issue a new code if the same one is refused; or registered at the server but not stored, in which case a new code is needed |
+| 3 | Unavailable or the outcome is unknown, with the local record unchanged. The text says which: nothing was sent (the installation file cannot be read for a reason other than a refusal of access, no connection, the lock held by another registration or a running control channel session, the state directory unusable); the outcome is unknown (408, 5xx, no complete answer), in which case issue a new code if the same one is refused; or registered at the server but not stored, in which case a new code is needed |
 | 4 | The agent key is present and cannot be used |
 | 5 | A record exists and `--replace` was not given |
 | 6 | The answer is not authentic: the returned instruction key is not `--server-key`'s, or the signature does not verify |
@@ -360,7 +398,7 @@ ngr-agent connect --mode <device|user>
 ```
 
 Keeps the agent's control channel session ("Control channel session" below) with the server its
-registration record names, until a stop signal (design 5.3, 6.4; ADR-466, ADR-471). `connect.rs`
+registration record names, which must be the installation file's, until a stop signal (design 5.3, 6.4; ADR-466, ADR-471). `connect.rs`
 holds the flow. It takes no option but `--mode`, prints nothing on standard output, and prints and
 logs nothing the server sent and no token; its messages are fixed wording, plus the reason of a
 key store or state directory error (as `identity` and `register` print it) and the kind of a
@@ -369,23 +407,28 @@ printed, as `register` prints no argument value.
 
 - **The order**, where the first step that fails decides:
   1. the command line;
-  2. `agent::control::open(mode)`: the connection lock, then the registration lock, then the
-     registration record. No record ends the command with "not registered" before the key store is
-     touched; a record that reads but is not valid (or whose origin is not `http://127.0.0.1[:port]`,
-     so `https` too) says to register again; a record that cannot be read for an I/O reason
+  2. the installation file ("Installation file" above): the mode must be `--mode`'s;
+  3. `agent::control::open(mode, installed origin)`: the connection lock, then the registration
+     lock, then the registration record. No record ends the command with "not registered" before
+     the key store is touched; a record that reads but is not valid (or whose origin is not
+     `http://127.0.0.1[:port]`, so `https` too) says to register again; a record whose origin is
+     not the installation file's, byte for byte (the installation moved to another server), is
+     exit 1 with the advice to register again, with both locks released and before the outbox,
+     the mark, the ledger or the key store are touched; a record that cannot be read for an I/O
+     reason
      (permission, a device error) is exit 3 with the error kind, since registering again would not
      help;
-  3. the outbox of the record's agent ID (`Outbox::open`, below), created when missing. A file that
+  4. the outbox of the record's agent ID (`Outbox::open`, below), created when missing. A file that
      does not read back is corrupt and ends the command with exit 1 and the advice to register
      again (`register --replace` gives a new agent ID and a new outbox); an outbox open in another
      process, or a directory that cannot be used, is exit 3;
-  4. the issue-time mark of the record's agent ID (`IssueMark::open`, "Start deadline" below),
+  5. the issue-time mark of the record's agent ID (`IssueMark::open`, "Start deadline" below),
      read when present and never created or repaired by the open. A file that does not read back
      (not a regular file, over 1 KiB, not the expected object, another agent ID or version) ends
      the command with exit 1 and the advice to register again, before the key store is touched;
      a file that cannot be read, a mark open in another process or a directory that cannot be
      used is exit 3;
-  5. the received-jobs ledger of the record's agent ID (`ReceivedJobs::open`, "Received-jobs
+  6. the received-jobs ledger of the record's agent ID (`ReceivedJobs::open`, "Received-jobs
      ledger" below), read when present and never created by the open. A torn last frame is cut off
      and warned about; a file that does not read back otherwise (wrong magic or version, another
      agent ID, a bad checksum, damage followed by a whole record, numbers that are not
@@ -393,11 +436,11 @@ printed, as `register` prints no argument value.
      envelope that is empty or too long, or not a regular file) ends the command with exit 1 and
      the advice to register again, before the key store is touched; a file that cannot be read,
      a ledger open in another process or a directory that cannot be used is exit 3;
-  6. the agent key through `agent::identity::agent_key` (create once). A key this run had to
+  7. the agent key through `agent::identity::agent_key` (create once). A key this run had to
      create cannot be the registered one, so it is "register again" (the key stays, and a code can
      be issued for its fingerprint); a key whose fingerprint differs from the record's
      (`KeyMismatch`, from `Opened::start`) is the same;
-  7. `Opened::start`, then the wait for a stop signal.
+  8. `Opened::start`, then the wait for a stop signal.
 - **The key's retry** covers two classes, each logged as one `warn` per try with a fixed class
   name (`key store` or `creation lock`) and the next delay: a key store that is unavailable, and
   the creation lock held by another process past its 10-second wait. The delays are the session's
@@ -418,15 +461,16 @@ printed, as `register` prints no argument value.
   locks are free by then.
 - **The locks** make a second `connect` exit 3 ("a control channel session is already running")
   and `register` exit 3 while a session lives.
-- **A release build** has no key store yet, so the command exits 1 there without connecting
-  (after the record check: an unregistered agent says "not registered").
+- **A release build** on a machine without an installation file at the fixed location exits 1
+  at the second step, and a release build has no key store yet, so it exits 1 without connecting
+  at the latest after the record check (an unregistered agent says "not registered").
 
 | Exit status | Meaning |
 |---|---|
 | 0 | Stopped by a signal |
-| 1 | Not registered; register again (a key just created, a key that is not the record's, a record that reads but is not valid, an outbox file, an issue-time mark file or a received-jobs ledger that is corrupt, at start or when a poisoned outbox or ledger is opened again); no key store (a release build, a build or mode without one, wrong debug variables); the stop handlers cannot be installed; the session ended without a stop |
+| 1 | The installation file is absent, refused, not valid or for the other mode; not registered; register again (a record for another server than the installation file's, a key just created, a key that is not the record's, a record that reads but is not valid, an outbox file, an issue-time mark file or a received-jobs ledger that is corrupt, at start or when a poisoned outbox or ledger is opened again); no key store (a release build, a build or mode without one, wrong debug variables); the stop handlers cannot be installed; the session ended without a stop |
 | 2 | Invalid command line |
-| 3 | Another session or a registration is running, a lock cannot be taken, the state directory or the identity directory is unusable, the creation lock cannot be opened, the registration record cannot be read for an I/O reason, the outbox is open elsewhere or cannot be opened, the issue-time mark is open elsewhere or cannot be read, or the received-jobs ledger is open elsewhere or cannot be read |
+| 3 | The installation file cannot be read for a reason other than a refusal of access, another session or a registration is running, a lock cannot be taken, the state directory or the identity directory is unusable, the creation lock cannot be opened, the registration record cannot be read for an I/O reason, the outbox is open elsewhere or cannot be opened, the issue-time mark is open elsewhere or cannot be read, or the received-jobs ledger is open elsewhere or cannot be read |
 | 4 | The agent key is present and cannot be used (it is not replaced) |
 
 ## Control channel session

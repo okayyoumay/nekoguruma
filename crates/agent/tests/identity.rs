@@ -14,6 +14,9 @@ use std::process::{Child, Stdio};
 #[cfg(debug_assertions)]
 use shared_crypto::PublicKey;
 
+#[path = "support/installation_file.rs"]
+mod installation_file;
+
 const KEY_STORE_VAR: &str = "NGR_AGENT_KEY_STORE";
 const STATE_DIR_VAR: &str = "NGR_AGENT_STATE_DIR";
 
@@ -29,7 +32,11 @@ fn ngr_agent(home: &Path) -> Command {
     command
 }
 
-/// The identity command with the plain-file store in `state`.
+/// The server the fixtures' installation files name; `identity` does not connect to it.
+const SERVER: &str = "http://127.0.0.1:1";
+
+/// The identity command with the plain-file store in `state`, and an installation file for
+/// `mode` in `home` (design 6.7, ADR-494).
 #[cfg(debug_assertions)]
 fn identity(home: &Path, state: &Path, mode: &str) -> Command {
     let mut command = ngr_agent(home);
@@ -37,6 +44,7 @@ fn identity(home: &Path, state: &Path, mode: &str) -> Command {
         .args(["identity", "--mode", mode])
         .env(KEY_STORE_VAR, "file")
         .env(STATE_DIR_VAR, state);
+    installation_file::install(&mut command, home, mode, SERVER);
     command
 }
 
@@ -98,18 +106,23 @@ fn a_bad_command_line_exits_with_2() {
 }
 
 /// S8: with no debug variables no store is selected, in either build, and nothing is written.
+/// A debug build reads the installation file first and then finds no store; a release build
+/// ignores the file's location and stops at the missing installation file (ADR-494).
 #[test]
 fn without_a_store_the_exit_is_1_and_nothing_is_written() {
     let home = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
     for mode in ["device", "user"] {
-        let output = ngr_agent(home.path())
+        let mut command = ngr_agent(home.path());
+        command
             .args(["identity", "--mode", mode])
-            .env(STATE_DIR_VAR, state.path())
-            .output()
-            .unwrap();
+            .env(STATE_DIR_VAR, state.path());
+        installation_file::install(&mut command, home.path(), mode, SERVER);
+        let output = command.output().unwrap();
         assert_exit(&output, 1);
-        assert!(String::from_utf8_lossy(&output.stderr).contains("no key store"));
+        if cfg!(debug_assertions) {
+            assert!(String::from_utf8_lossy(&output.stderr).contains("no key store"));
+        }
     }
     assert!(is_empty_dir(state.path()));
 }
@@ -136,6 +149,7 @@ fn a_missing_or_wrong_variable_selects_no_store_and_writes_no_key() {
     for envs in cases {
         let mut command = ngr_agent(home.path());
         command.args(["identity", "--mode", "user"]);
+        installation_file::install(&mut command, home.path(), "user", SERVER);
         for (name, value) in &envs {
             command.env(name, value);
         }
@@ -145,19 +159,21 @@ fn a_missing_or_wrong_variable_selects_no_store_and_writes_no_key() {
     assert!(!Path::new(relative).exists());
 }
 
-/// A release build ignores both variables even when they are right (E2).
+/// A release build ignores both variables even when they are right (E2), and the installation
+/// file's location as well (ADR-494), so it exits 1 for want of the file.
 #[cfg(not(debug_assertions))]
 #[test]
 fn a_release_build_has_no_file_store() {
     let home = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
     for mode in ["device", "user"] {
-        let output = ngr_agent(home.path())
+        let mut command = ngr_agent(home.path());
+        command
             .args(["identity", "--mode", mode])
             .env(KEY_STORE_VAR, "file")
-            .env(STATE_DIR_VAR, state.path())
-            .output()
-            .unwrap();
+            .env(STATE_DIR_VAR, state.path());
+        installation_file::install(&mut command, home.path(), mode, SERVER);
+        let output = command.output().unwrap();
         assert_exit(&output, 1);
     }
     assert!(is_empty_dir(state.path()));

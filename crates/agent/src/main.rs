@@ -36,7 +36,7 @@ usage: ngr-agent run --vci <name> --mode <device|user> --document <file> [option
        ngr-agent identify --vci <name> --mode <device|user> --plan <file> [--document <file>]...
                           [options]
        ngr-agent identity --mode <device|user>
-       ngr-agent register --mode <device|user> --server <origin> --server-key <hex>
+       ngr-agent register --mode <device|user> [--server <origin>] --server-key <hex>
                           [--code-file <file>] [--replace]
        ngr-agent connect --mode <device|user>
 
@@ -54,34 +54,46 @@ established.
 
 identity: loads the agent's key from its key store, creating it once when the store has none,
 and prints public_key_pem, fingerprint and created as JSON on stdout. It takes no option
-but --mode. Exit status: 0 the key is there; 1 this build or mode has no key store, the store
-cannot create the key, or the debug variables are wrong; 2 a usage error; 3 the store, its lock
-or the state directory is unavailable (nothing changed, try again); 4 the stored key cannot be
-used (nothing changed; register again after an explicit reset).
+but --mode. Exit status: 0 the key is there; 1 the installation file is absent, refused, not
+valid or for the other mode, this build or mode has no key store, the store cannot create the
+key, or the debug variables are wrong; 2 a usage error; 3 the installation file cannot be read
+(other than for lack of access), the store, its lock or the state directory is unavailable
+(nothing changed, try again); 4 the stored key cannot be used (nothing changed; register again
+after an explicit reset).
 
-register: registers the agent with the server at --server (http://127.0.0.1[:port]) and stores
-the registration record in the agent's state directory. The registration code is read from
+identity, register and connect first read the installation file (agent.toml, beside the
+configuration file in the system directory; crates/agent/docs/ngr-agent.md): the device's mode,
+the server's origin and the distribution root key come from it, and --mode must equal its mode.
+They read it after the log starts and before the key, a lock or a connection.
+
+register: registers the agent with the server the installation file names and stores the
+registration record in the agent's state directory. --server (http://127.0.0.1[:port]) is
+optional and must name that same server. The registration code is read from
 standard input (a pipe or a redirect; a terminal is refused) or from --code-file, never from an
 argument. --server-key is the server key ID that `ngr-server registration-code` printed: 64
 hexadecimal digits. A key the agent has to create first stops the command (exit 1) with the
 fingerprint to issue a code for. --replace lets a registration replace an existing record.
 It prints agent_id, owner_id, preset, allow_remote, server_origin, instruction_key_id,
 agent_key_fingerprint and replaced as one JSON line on stdout. Exit status: 0 registered and
-stored; 1 it cannot register as asked (no key store, an unusable code, a key just created, a
-refusal by the server, an answer that is not a registration answer); 2 a usage error; 3 the
-server, the state directory or a lock is unavailable, or the outcome is unknown (the local record
+stored; 1 it cannot register as asked (the installation file is absent, refused, not valid or
+for the other mode, --server is not the installed server, no key store, an unusable code, a key
+just created, a refusal by the server, an answer that is not a registration answer); 2 a usage
+error; 3 the installation file cannot be read (other than for lack of access), the server, the
+state directory or a lock is unavailable, or the outcome is unknown (the local record
 is unchanged; if the same code is then refused, issue a new one); 4 the stored key cannot be
 used; 5 a record exists and --replace was not given; 6 the answer is not authentic (its key is
 not the --server-key one, or its signature does not verify).
 
-connect: keeps the agent's control channel session to the server its registration record names,
-until SIGINT or SIGTERM (Ctrl-C or the console closing on Windows) stops it. It takes no option
+connect: keeps the agent's control channel session to the server its registration record names
+(which must be the installation file's server), until SIGINT or SIGTERM (Ctrl-C or the console closing on Windows) stops it. It takes no option
 but --mode and prints nothing on stdout. Exit status: 0 stopped by a signal; 1 the agent is not
 registered, or must register again (the key was just created, is not the registered one, or the
-record is not valid), there is no key store, the stop handlers cannot be installed, or the session
-ended without a stop; 2 a usage error; 3 another session or a registration is running, a lock, the
-state or identity directory is unusable, or the record cannot be read; 4 the stored key cannot be
-used. A key store that is unavailable, or a creation lock held too long, is retried until the
+record is not valid, or names another server than the installation file), the installation file
+is absent, refused, not valid or for the other mode, there is no key store, the stop handlers
+cannot be installed, or the session ended without a stop; 2 a usage error; 3 the installation
+file cannot be read (other than for lack of access), another session or a registration is
+running, a lock, the state or identity directory is unusable, or the record cannot be read; 4 the
+stored key cannot be used. A key store that is unavailable, or a creation lock held too long, is retried until the
 signal.
 
 options:
@@ -162,7 +174,13 @@ enum Command {
 /// What `ngr-agent register` takes, checked before any file or socket is touched.
 #[derive(Debug, PartialEq, Eq)]
 struct RegisterArgs {
-    request: agent::registration::Request,
+    mode: OperatingMode,
+    /// `--server`: when given it must be the installation file's server, which the request
+    /// takes.
+    server: Option<agent::registration::origin::ServerOrigin>,
+    /// `--server-key`, as bytes.
+    server_key: [u8; 32],
+    replace: bool,
     /// The file that holds the code; the code is read from standard input without it.
     code_file: Option<PathBuf>,
 }
@@ -173,7 +191,7 @@ impl Command {
             Command::Run(args) => args.mode,
             Command::Identify(args) => args.mode,
             Command::Identity(mode) => *mode,
-            Command::Register(args) => args.request.mode,
+            Command::Register(args) => args.mode,
             Command::Connect(mode) => *mode,
         }
     }
@@ -191,12 +209,36 @@ fn main() -> ExitCode {
     // rotated file, with the settings of the configuration file checked for the device's mode
     // (`crates/agent/docs/ngr-agent.md`).
     let _logging = agent::logging::install(command.mode());
+    // The code source of `register` is checked before the installation file is read: a
+    // terminal on standard input is a usage error (exit 2), which comes before every other check.
+    let code_source = match &command {
+        Command::Register(args) => match code_source(args) {
+            Ok(source) => Some(source),
+            Err(code) => return code,
+        },
+        _ => None,
+    };
+    // The installation file (design 6.7, ADR-494): read once, after the log starts and before
+    // the key, a lock or a connection, by the three commands that act for the registered agent.
+    let installation = match &command {
+        Command::Identity(mode) => Some(installed("identity", *mode)),
+        Command::Register(args) => Some(installed("register", args.mode)),
+        Command::Connect(mode) => Some(installed("connect", *mode)),
+        Command::Run(_) | Command::Identify(_) => None,
+    };
+    let installation = match installation.transpose() {
+        Ok(installation) => installation,
+        Err(code) => return code,
+    };
     // The identity command needs no runtime and no worker.
     if let Command::Identity(mode) = command {
         return identity(mode);
     }
     if let Command::Register(args) = command {
-        return register(args);
+        let (Some(source), Some(installation)) = (code_source, installation) else {
+            unreachable!("read before the command runs")
+        };
+        return register(args, &source, &installation);
     }
     // The job's VM runs on a blocking thread that blocks on the runtime for every primitive,
     // so the runtime must be multi-threaded (ADR-235).
@@ -214,7 +256,10 @@ fn main() -> ExitCode {
         Command::Run(args) => runtime.block_on(run(args)),
         Command::Identify(args) => runtime.block_on(identify(args)),
         Command::Connect(mode) => {
-            let code = runtime.block_on(connect(mode));
+            let Some(installation) = installation else {
+                unreachable!("read before the command runs")
+            };
+            let code = runtime.block_on(connect(mode, installation.server()));
             // A key load that a stop interrupted is a blocking task, which dropping the runtime
             // would wait for; give it a moment and let the process end.
             runtime.shutdown_timeout(std::time::Duration::from_secs(2));
@@ -234,6 +279,30 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Reads the installation file for `command` and checks that `mode`, the command line's, is the
+/// installed one. The message is fixed wording; the exit status is 1, or 3 for a read error that
+/// a retry may clear ([`agent::installation::InstallationError::exit_code`]).
+fn installed(
+    command: &str,
+    mode: OperatingMode,
+) -> Result<agent::installation::Installation, ExitCode> {
+    use std::io::Write;
+    let installation = agent::installation::read_installed().map_err(|error| {
+        // A closed standard error keeps the documented exit status.
+        let _ = writeln!(std::io::stderr(), "ngr-agent: {command}: {error}");
+        ExitCode::from(error.exit_code())
+    })?;
+    if installation.mode() != mode {
+        let _ = writeln!(
+            std::io::stderr(),
+            "ngr-agent: {command}: --mode {mode} is not the installed mode ({})",
+            installation.mode()
+        );
+        return Err(ExitCode::from(1));
+    }
+    Ok(installation)
 }
 
 /// `ngr-agent identity`: prints the key as one JSON line. The exit status says why there is none
@@ -268,12 +337,16 @@ fn identity(mode: OperatingMode) -> ExitCode {
     }
 }
 
-/// `ngr-agent register`: prints the registration as one JSON line. Nothing it prints or logs
-/// holds the code, an argument or text from the server (`agent::registration`).
-fn register(args: RegisterArgs) -> ExitCode {
+/// Where `register` reads the code from: the file, or standard input when that is not a
+/// terminal (exit 2).
+fn code_source(
+    args: &RegisterArgs,
+) -> Result<agent::registration::code_input::CodeSource, ExitCode> {
     use std::io::{IsTerminal, Write};
-    let source = match args.code_file {
-        Some(path) => agent::registration::code_input::CodeSource::File(path),
+    match &args.code_file {
+        Some(path) => Ok(agent::registration::code_input::CodeSource::File(
+            path.clone(),
+        )),
         None => {
             // A terminal would show the code as it is typed and keep it in the shell's history
             // of the session; the code comes from a pipe, a redirect or a file.
@@ -283,12 +356,40 @@ fn register(args: RegisterArgs) -> ExitCode {
                     "ngr-agent: register: standard input is a terminal; pipe or redirect the \
                      code to it, or use --code-file\n\n{USAGE}"
                 );
-                return ExitCode::from(2);
+                return Err(ExitCode::from(2));
             }
-            agent::registration::code_input::CodeSource::Stdin
+            Ok(agent::registration::code_input::CodeSource::Stdin)
         }
+    }
+}
+
+/// `ngr-agent register`: prints the registration as one JSON line. The server is the
+/// installation file's; `--server`, when given, must name it. Nothing it prints or logs holds the
+/// code, an argument or text from the server (`agent::registration`).
+fn register(
+    args: RegisterArgs,
+    source: &agent::registration::code_input::CodeSource,
+    installation: &agent::installation::Installation,
+) -> ExitCode {
+    use std::io::Write;
+    if args
+        .server
+        .as_ref()
+        .is_some_and(|server| server != installation.server())
+    {
+        let _ = writeln!(
+            std::io::stderr(),
+            "ngr-agent: register: --server is not the server the installation file names"
+        );
+        return ExitCode::from(1);
+    }
+    let request = agent::registration::Request {
+        mode: args.mode,
+        server: installation.server().clone(),
+        server_key: args.server_key,
+        replace: args.replace,
     };
-    match agent::registration::register(&args.request, &source) {
+    match agent::registration::register(&request, source) {
         Ok(done) => {
             tracing::info!(agent_id = %done.record.agent_id, "agent registered");
             if done.durability == agent::registration::record::Durability::DirectoryNotSynced {
@@ -310,9 +411,13 @@ fn register(args: RegisterArgs) -> ExitCode {
     }
 }
 
-/// `ngr-agent connect`: runs the control channel session until a stop signal (ADR-471). Nothing
+/// `ngr-agent connect`: runs the control channel session until a stop signal (ADR-471), to the
+/// registration record's server, which must be the installation file's `server`. Nothing
 /// the server sent and no token is printed or logged; the status lines are the errors below.
-async fn connect(mode: OperatingMode) -> ExitCode {
+async fn connect(
+    mode: OperatingMode,
+    server: &agent::registration::origin::ServerOrigin,
+) -> ExitCode {
     use std::io::Write;
     // The handlers come first, so a signal while the session starts is a stop, not a kill.
     let stop = match agent::connect::stop_signal() {
@@ -325,7 +430,7 @@ async fn connect(mode: OperatingMode) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    match agent::connect::run(mode, stop).await {
+    match agent::connect::run(mode, server, stop).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             // A closed standard error keeps the documented exit status.
@@ -499,8 +604,8 @@ fn flag_name(flag: &str) -> Option<&str> {
     .then_some(name)
 }
 
-/// The options of `ngr-agent register` (ADR-470): `--mode`, `--server` and `--server-key`, each
-/// once and in any order, `--code-file <file>` and `--replace`. No message repeats a value, and
+/// The options of `ngr-agent register` (ADR-470, ADR-494): `--mode` and `--server-key`, each
+/// once and in any order, the optional `--server`, `--code-file <file>` and `--replace`. No message repeats a value, and
 /// a stray argument is never echoed.
 fn parse_register(args: impl Iterator<Item = OsString>) -> Result<Command, String> {
     use agent::registration::origin::{ServerOrigin, parse_server_key};
@@ -566,12 +671,10 @@ fn parse_register(args: impl Iterator<Item = OsString>) -> Result<Command, Strin
         }
     }
     Ok(Command::Register(RegisterArgs {
-        request: agent::registration::Request {
-            mode: mode.ok_or("--mode is required")?,
-            server: server.ok_or("--server is required")?,
-            server_key: server_key.ok_or("--server-key is required")?,
-            replace,
-        },
+        mode: mode.ok_or("--mode is required")?,
+        server,
+        server_key: server_key.ok_or("--server-key is required")?,
+        replace,
         code_file,
     }))
 }
@@ -992,21 +1095,19 @@ mod tests {
         }
     }
 
-    /// A1: the three required options in any order, with the optional two.
+    /// A1: the two required options in any order, with the optional three.
     #[test]
     fn parses_a_register_in_any_order() {
         let key = "ab".repeat(32);
         let expected = |replace: bool, file: Option<&str>| {
             Ok(Command::Register(RegisterArgs {
-                request: agent::registration::Request {
-                    mode: OperatingMode::Device,
-                    server: agent::registration::origin::ServerOrigin::parse(
-                        "http://127.0.0.1:8080",
-                    )
-                    .unwrap(),
-                    server_key: [0xab; 32],
-                    replace,
-                },
+                mode: OperatingMode::Device,
+                server: Some(
+                    agent::registration::origin::ServerOrigin::parse("http://127.0.0.1:8080")
+                        .unwrap(),
+                ),
+                server_key: [0xab; 32],
+                replace,
                 code_file: file.map(PathBuf::from),
             }))
         };
@@ -1036,6 +1137,31 @@ mod tests {
                 "device",
             ]),
             expected(true, Some("code.txt"))
+        );
+    }
+
+    /// G1: `--server` is optional now that the installation file names the server; `--mode` and
+    /// `--server-key` stay required.
+    #[test]
+    fn a_register_needs_no_server_option() {
+        let key = "ab".repeat(32);
+        assert_eq!(
+            parse_command(&["register", "--mode", "user", "--server-key", &key]),
+            Ok(Command::Register(RegisterArgs {
+                mode: OperatingMode::User,
+                server: None,
+                server_key: [0xab; 32],
+                replace: false,
+                code_file: None,
+            }))
+        );
+        assert_eq!(
+            parse_command(&["register", "--server-key", &key]),
+            Err("--mode is required".to_owned())
+        );
+        assert_eq!(
+            parse_command(&["register", "--mode", "user"]),
+            Err("--server-key is required".to_owned())
         );
     }
 

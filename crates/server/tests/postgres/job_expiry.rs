@@ -490,6 +490,25 @@ async fn the_task_ends_what_is_past_at_its_start_and_a_stop_ends_it_during_its_s
         .execute(&mut *tx)
         .await
         .unwrap();
+    // The counter is read only once a pass waits on the lock: the passes run one after another,
+    // and each is counted after its commit, so a pass that committed just before the lock was
+    // granted could otherwise be counted after the read.
+    let deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity WHERE pid <> pg_backend_pid() \
+             AND wait_event_type = 'Lock' AND query = $1",
+        )
+        .bind(EXPIRE_SQL)
+        .fetch_one(&w.pool)
+        .await
+        .unwrap();
+        if waiting > 0 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "no pass is waiting on the lock");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     let seen = passes.load(Ordering::Relaxed);
     tokio::time::sleep(PERIOD * 4).await;
     assert_eq!(

@@ -56,10 +56,15 @@ Working rules:
     close; a wall clock with 100 ns resolution (times that compare equal on
     Linux); and a helper used only by `#[cfg(unix)]` code, which is dead
     code under `-D warnings` on Windows.
-  - **Test ports**: a test that binds port 0, releases it and then relies on
-    nothing listening there (or on getting the same port back) races any
-    other test process that binds it meanwhile. Holding the port with a
-    socket that is bound and never listens keeps connects refused.
+  - **Test setup races**: setup that something else running can overtake.
+    A test that binds port 0, releases it and then relies on nothing
+    listening there (or on getting the same port back) races any other test
+    process that binds it meanwhile; holding the port with a socket that is
+    bound and never listens keeps connects refused. A test on a task that
+    ticks while it sets up (`Up::with_queue`, `Up::with_tasks`, `Rig`) that
+    stages rows in several statements, or in another order than the task
+    locks them, can have a tick act on the half-made state; stage the state
+    before the task can act on it, or in one transaction.
 - **Parity check**, when the change adds a path that builds what an existing
   path already builds (a second settlement, encoder or conversion producing
   the same entry or output). The caller names the existing path; find it

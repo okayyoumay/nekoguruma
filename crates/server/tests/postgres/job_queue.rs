@@ -1291,10 +1291,19 @@ async fn a_rejection_frees_the_vehicle_lock_of_the_job_it_ends() {
 #[tokio::test]
 async fn the_sweep_of_a_retired_key_frees_the_vehicle_lock_of_each_job_it_ends() {
     let u = up(LONG).await;
-    let stale = add_job_with(&u.w, &u.id, 1, b"stale", &"0".repeat(64), 3600).await;
+    // The sweep runs at every tick, connected agent or not, so the job's key is retired only
+    // once the job holds its lock: a sweep between a retired-key insert and the lock would end
+    // the job with no lock to free, and the test would prove nothing.
+    let stale = add_job(&u.w, &u.id, 1, b"stale").await;
     let fresh = add_job(&u.w, &u.id, 2, b"fresh").await;
     hold_lock(&u.w, &stale, LOCK_VIN).await;
     hold_lock(&u.w, &fresh, "WVWZZZ1JZXW000001").await;
+    sqlx::query("UPDATE jobs SET signing_key_id = $2 WHERE id = $1::uuid")
+        .bind(&stale)
+        .bind("0".repeat(64))
+        .execute(&u.w.pool)
+        .await
+        .unwrap();
     let mut client = open(u.s.addr, &token(&u).await).await;
     assert_eq!(command(&mut client).await.1, b"fresh");
     until_row(&u.w, &stale, RETIRED).await;

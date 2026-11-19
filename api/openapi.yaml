@@ -1136,7 +1136,7 @@ components:
           type: string
           enum: [result, commLog]
           description: The run's final VM state as JSON, or the job's communication log (8.11)
-        sizeBytes: { type: integer, minimum: 0, maximum: 4294967296, description: The length the agent declares; over 4 GiB is refused }
+        sizeBytes: { type: integer, minimum: 0, description: The length the agent declares; over 4 GiB (4294967296 bytes) is refused with 413, after the shape is judged }
         sha256: { type: string, pattern: '^[0-9a-f]{64}$', description: SHA-256 of the object, lowercase hex }
     Upload:
       type: object

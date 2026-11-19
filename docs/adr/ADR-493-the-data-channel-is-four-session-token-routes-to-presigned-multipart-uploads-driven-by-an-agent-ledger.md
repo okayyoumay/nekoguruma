@@ -2,7 +2,7 @@
 
 **Date:** 2026-11-19
 **Status:** Accepted
-**Affects:** design 5.2, 5.4, 13, 13.3, 14.3, 14.4; `crates/server` (the upload routes, a migration for `job_objects`, `db/README.md`), `crates/agent` (the uploader, the ledger, `connect`, a debug-only enqueue command), `crates/shared-proto` if the route bodies are shared, `api/openapi.yaml` (the four operations, added when they are served), `docs/glossary.md`; uses ADR-492's `MultipartStore` and ADR-466's session token; fixes the acknowledgement ADR-455 left
+**Affects:** design 5.2, 5.4, 13, 13.3, 14.3, 14.4; `crates/server` (the upload routes, a migration for `job_objects`, `db/README.md`), `crates/agent` (the uploader, the ledger, `connect`, a debug-only enqueue command), `crates/shared-proto` if the route bodies are shared, `api/openapi.yaml` (the four operations, marked planned until served), `docs/glossary.md`; uses ADR-492's `MultipartStore` and ADR-466's session token; fixes the acknowledgement ADR-455 left
 
 ## Context
 
@@ -50,7 +50,7 @@ proposed. It is a specification: none of it is implemented when this record is w
    ownership generation, `result` or `commLog`, the length the agent declares (0 to 4 GiB,
    4294967296 bytes) and the SHA-256 of the object as 64 lowercase hex digits. These fields are
    the object's metadata: there is no free-form metadata object. A job that does not exist, or
-   is another agent's, is a 404; a length over 4 GiB is a 413. Begin is idempotent per job,
+   is another agent's, is a 404; a length over 4 GiB is a 413. The shape is judged first (400), then the length (413), both before the job is looked up. Begin is idempotent per job,
    generation and kind: when a row that is not `failed` exists for them and declares the same
    length and digest, begin answers that row (200); one that declares a different length or
    digest is a 409. Otherwise the server calls `MultipartStore::begin` and then inserts the row
@@ -168,11 +168,12 @@ proposed. It is a specification: none of it is implemented when this record is w
   the length of one begin-to-finished cycle under the 20-second completion bound for a large
   object (the read-back runs at the object server's speed).
 
-Open items, kept in the backlog: the download leg (documents and artifacts to the agent through
-presigned GET, which the store lacks), a bandwidth limit for uploads (design 5.4, 15.3),
-abandoned-upload cleanup (a period of 7 days is proposed), a bound on the length of what is PUT
-(ADR-492), the server's authentication on the local profile, a probe of URL expiry on slow
-links, the part-URL host rule for an external object store (the standard deployment names
-another host), the stability of the agent's source bytes between hashing and the last part
-(the log is appended by later runs), whether begin checks the generation against the signed
-instruction, and how an operator's explicit upload of a log (ADR-455 item 1) reaches the agent.
+- The channel carries uploads only: documents and artifacts reach the agent by another leg,
+  and the store has no presigned GET for it. Uploads have no bandwidth limit. Abandoned uploads
+  are not cleaned up, and a part URL does not bind the length of what is PUT (ADR-492).
+- The part-URL host rule is the registration origin's host, which fits the bundled object
+  server and not an external one, and the agent's source bytes can change between hashing and
+  the last part (a log is appended by later runs): both are decided with the work that builds
+  them. Whether begin checks the generation against the signed instruction, and how an
+  operator's explicit upload of a log (ADR-455 item 1) reaches the agent, are likewise left to
+  that work.

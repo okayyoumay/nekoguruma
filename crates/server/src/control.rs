@@ -110,7 +110,8 @@ pub(crate) fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     (!token.is_empty()).then_some(token)
 }
 
-fn unauthorized() -> Response {
+/// The 401 of every route that judges a session token: one answer whatever the reason.
+pub(crate) fn unauthorized() -> Response {
     let mut response =
         Problem::new(StatusCode::UNAUTHORIZED, "A session token is required").into_response();
     response

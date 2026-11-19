@@ -664,6 +664,38 @@ also refuses a route mounted any other way.
   in" above.
 - `POST /api/v1/jobs` (`api/openapi.yaml`; `jobs.rs`; ADR-477): creates an acquisition or a
   configuration write job behind the operator session. See "Creating a job" above.
+- `POST /api/v1/agent/uploads`, `POST /api/v1/agent/uploads/{uploadId}/parts/{part}` and
+  `GET /api/v1/agent/uploads/{uploadId}` (`api/openapi.yaml`; `uploads.rs`; ADR-493): the data
+  channel's begin, part URL and status. See "The data channel" below. The completion
+  (`POST .../complete`) is planned and not served.
+
+## The data channel
+
+`uploads.rs` serves begin, the part URL and the status (ADR-493 items 1 to 5 and 15 to 18). The
+routes are built from `AppState::uploads` (`uploads::Backend`: the object store, which is `None`
+on a server without `[object_server]`, and the part size), so a store set after the router is
+built does not reach them; `Server::start` passes the store it opened, and tests use
+`Server::bind_with_store`.
+
+A request is judged in this order: the guard, the method (405), the body (4 KiB, within 5
+seconds: 413, 408, 400; the part URL and the status take no body), the shape (400), begin's length
+(over 4 GiB: 413), the token (401 with `WWW-Authenticate: Bearer`, the same answer as for control
+and for a revoked or missing agent row), the agent's row (a revoked or missing row drops the
+agent's tokens; 503 when it cannot be read), the job or the upload (404, also for another
+agent's or tenant's), the request against the row (a part past the count 400, a row that is not
+`open` 409 with its `state`) and the store (503, or 500 for a stored key or upload ID that does not
+parse and for a store without randomness). Begin compares the declared generation with the one in
+the job's stored instruction (404 on a difference) and does so in any job state. Every database
+call is a short transaction of its own, and none is held while the store is called; the row is
+inserted with `ON CONFLICT ... DO NOTHING` on the partial unique index, and the loser of a race
+deletes the upload it began and answers the winner's row.
+
+The status counts the leading parts the store lists with the expected size. The part size of a row
+is the 5 MiB the server had when the row was begun (`uploads::PART_BYTES`; the test override is
+`Backend::with_part_bytes`).
+
+Never logged: the token, the body, the digest, the job, an object key, an upload ID, a URL and the
+text of a database error (the SQLSTATE only).
 
 ## The agent's connection proof
 

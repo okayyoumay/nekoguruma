@@ -96,6 +96,18 @@ duplicates, the list the signed instruction's document hashes were made from; it
 single `ir_digest`, which nothing wrote or read. `jobs_kind_check` also allows `identify`, a kind
 the protocol has (design 16.3).
 
+**Uploaded objects: `job_objects` (migration 0013, ADR-493 item 7)**
+One row per upload of a job's `result` or `commLog` object, kept after it finishes. It names the
+object (`storage_key`, unique, the key the store issued) and the multipart upload (`upload_id`,
+the store's, a bearer: never answered or logged), the declared length (0 to 4 GiB) and SHA-256,
+the part size the upload was begun with, and a state: `open`, `completing`, `finished` or `failed`.
+The begin route writes `open`; the others are the completion's. `finished_at` is set exactly when
+the state is `finished` (a CHECK). A partial unique index on `(tenant_id, job_id, generation,
+kind) WHERE state <> 'failed'` holds the idempotency of begin: two racing begins insert one row
+(`ON CONFLICT ... DO NOTHING` names that index), and a `failed` row leaves the slot free for a new
+begin. The foreign keys (tenant, agent, and the job through `(tenant_id, job_id)`) have no cascade:
+a job, an agent or a tenant that has objects cannot be deleted under them.
+
 **Do not store raw data bodies in the DB**
 `dataset_chunks` holds only object storage keys and hashes.
 A `storage_key` column holds the key the object store issued (`begin()`), a lowercase version 4

@@ -23,3 +23,4 @@ mod serving;
 mod session;
 mod storage;
 mod support;
+mod uploads;

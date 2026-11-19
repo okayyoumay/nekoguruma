@@ -320,6 +320,16 @@ impl Up {
         queue: Option<Settings>,
         expiry: Option<server::job_expiry::Settings>,
     ) -> Up {
+        Up::with_backend(grace_secs, queue, expiry, Default::default()).await
+    }
+
+    /// Like [`Up::with_tasks`], with the data channel's object store and part size.
+    pub(crate) async fn with_backend(
+        grace_secs: u64,
+        queue: Option<Settings>,
+        expiry: Option<server::job_expiry::Settings>,
+        backend: server::uploads::Backend,
+    ) -> Up {
         let w = World::new().await;
         w.add_operator("alice").await;
         let agent = Agent::new();
@@ -328,7 +338,7 @@ impl Up {
             port: 0,
             shutdown_grace_secs: grace_secs,
         };
-        let server = Server::bind(&http, w.pg.pool(), w.key.clone())
+        let server = Server::bind_with_store(&http, w.pg.pool(), w.key.clone(), backend)
             .await
             .unwrap();
         let server = match queue {

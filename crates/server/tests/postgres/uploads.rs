@@ -1,0 +1,1620 @@
+//! The data channel's first three routes (ADR-493 items 1 to 5, 7, 8, 15 to 18): begin, the part
+//! URL and the status, with the `job_objects` rows they write. PostgreSQL throughout; the object
+//! store is the real pinned RustFS where the store's answers matter (`NGR_TEST_RUSTFS_BIN`, as
+//! `storage.rs` has it) and a wrapper of the `MultipartStore` that scripts failures, counts calls
+//! and holds a call at a barrier where they do not. Tokens and keys are made at run time; no
+//! assertion message prints one.
+
+use std::io;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use server::object_server::ObjectServer;
+use server::storage::{
+    MultipartStore, ObjectBody, ObjectKey, Part, PartUrl, S3Store, S3Tuning, StoreError,
+    StoreFuture, UnfinishedUploads, Upload, UploadId,
+};
+use server::uploads::{Backend, PART_BYTES};
+use shared_proto::{AgentId, INSTRUCTION_VERSION, JobId, JobInstruction, JobKind, VciId};
+use tokio::sync::Barrier;
+
+use crate::control::token;
+use crate::redeem::{Agent, bytes_of, capture, json};
+use crate::serving::{Reply, exchange};
+use crate::session::Up;
+use crate::storage::{MIB, content, put};
+
+const SMALL: u64 = 512 * 1024;
+
+fn digest() -> String {
+    "ab".repeat(32)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A random version 4 UUID in canonical text.
+fn v4() -> String {
+    let mut b = [0u8; 16];
+    getrandom::fill(&mut b).unwrap();
+    b[6] = b[6] & 0x0f | 0x40;
+    b[8] = b[8] & 0x3f | 0x80;
+    let h = hex(&b);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &h[..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..]
+    )
+}
+
+// ---------------------------------------------------------------------------------------------
+// The store wrapper
+
+#[derive(Clone, Copy)]
+enum Fail {
+    Io,
+    Random,
+    NotFound,
+    AlreadyFinished,
+}
+
+impl Fail {
+    fn error(self) -> StoreError {
+        match self {
+            Fail::Io => StoreError::Io {
+                op: "test",
+                kind: io::ErrorKind::Other,
+            },
+            Fail::Random => StoreError::Random,
+            Fail::NotFound => StoreError::NotFound,
+            Fail::AlreadyFinished => StoreError::AlreadyFinished,
+        }
+    }
+}
+
+/// A store that forwards to the real one when it has one, and otherwise issues uploads of its own
+/// that hold no parts (and no URL: `presign_part` of such an upload is refused).
+#[derive(Default)]
+struct Wrap {
+    inner: Option<Arc<S3Store>>,
+    begins: AtomicUsize,
+    presigns: AtomicUsize,
+    lists: AtomicUsize,
+    deletes: AtomicUsize,
+    begin_fail: Mutex<Option<Fail>>,
+    list_fail: Mutex<Option<Fail>>,
+    delete_fail: Mutex<Option<Fail>>,
+    presign_fail: Mutex<Option<Fail>>,
+    /// Awaited by every `begin` after the upload exists and before it returns.
+    begin_barrier: Mutex<Option<Arc<Barrier>>>,
+    issued: Mutex<Vec<String>>,
+    deleted: Mutex<Vec<String>>,
+}
+
+impl Wrap {
+    fn calls(&self) -> [usize; 4] {
+        [
+            self.begins.load(Ordering::SeqCst),
+            self.presigns.load(Ordering::SeqCst),
+            self.lists.load(Ordering::SeqCst),
+            self.deletes.load(Ordering::SeqCst),
+        ]
+    }
+
+    fn set(slot: &Mutex<Option<Fail>>, fail: Option<Fail>) {
+        *slot.lock().unwrap() = fail;
+    }
+
+    fn fail(slot: &Mutex<Option<Fail>>) -> Option<StoreError> {
+        slot.lock().unwrap().map(Fail::error)
+    }
+}
+
+impl MultipartStore for Wrap {
+    fn begin(&self) -> StoreFuture<'_, Upload> {
+        Box::pin(async move {
+            self.begins.fetch_add(1, Ordering::SeqCst);
+            if let Some(error) = Wrap::fail(&self.begin_fail) {
+                return Err(error);
+            }
+            let upload = match &self.inner {
+                Some(inner) => inner.begin().await?,
+                None => Upload {
+                    key: ObjectKey::parse(&v4()).unwrap(),
+                    id: UploadId::parse(&format!("fake-{}", v4())).unwrap(),
+                },
+            };
+            self.issued.lock().unwrap().push(upload.key.to_string());
+            let barrier = self.begin_barrier.lock().unwrap().clone();
+            if let Some(barrier) = barrier {
+                barrier.wait().await;
+            }
+            Ok(upload)
+        })
+    }
+
+    fn presign_part(&self, upload: &Upload, part: u16) -> Result<PartUrl, StoreError> {
+        self.presigns.fetch_add(1, Ordering::SeqCst);
+        if let Some(error) = Wrap::fail(&self.presign_fail) {
+            return Err(error);
+        }
+        match &self.inner {
+            Some(inner) => inner.presign_part(upload, part),
+            None => Err(StoreError::InvalidKey),
+        }
+    }
+
+    fn list_parts<'a>(&'a self, upload: &'a Upload) -> StoreFuture<'a, Vec<Part>> {
+        Box::pin(async move {
+            self.lists.fetch_add(1, Ordering::SeqCst);
+            if let Some(error) = Wrap::fail(&self.list_fail) {
+                return Err(error);
+            }
+            match &self.inner {
+                Some(inner) => inner.list_parts(upload).await,
+                None => Ok(Vec::new()),
+            }
+        })
+    }
+
+    fn complete<'a>(
+        &'a self,
+        upload: &'a Upload,
+        sha256: [u8; 32],
+        length: u64,
+    ) -> StoreFuture<'a, ()> {
+        match &self.inner {
+            Some(inner) => inner.complete(upload, sha256, length),
+            None => Box::pin(async { Err(StoreError::Unavailable) }),
+        }
+    }
+
+    fn get<'a>(&'a self, key: &'a ObjectKey) -> StoreFuture<'a, ObjectBody> {
+        match &self.inner {
+            Some(inner) => inner.get(key),
+            None => Box::pin(async { Err(StoreError::Unavailable) }),
+        }
+    }
+
+    fn delete<'a>(&'a self, key: &'a ObjectKey) -> StoreFuture<'a, ()> {
+        Box::pin(async move {
+            self.deletes.fetch_add(1, Ordering::SeqCst);
+            self.deleted.lock().unwrap().push(key.to_string());
+            if let Some(error) = Wrap::fail(&self.delete_fail) {
+                return Err(error);
+            }
+            match &self.inner {
+                Some(inner) => inner.delete(key).await,
+                None => Ok(()),
+            }
+        })
+    }
+
+    fn list_unfinished(&self) -> StoreFuture<'_, UnfinishedUploads> {
+        match &self.inner {
+            Some(inner) => inner.list_unfinished(),
+            None => Box::pin(async {
+                Ok(UnfinishedUploads {
+                    uploads: Vec::new(),
+                    skipped: 0,
+                })
+            }),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The fixture
+
+struct Fx {
+    u: Up,
+    wrap: Arc<Wrap>,
+    real: Option<(crate::object_server_rustfs::Real, ObjectServer)>,
+    /// The agent's session token.
+    token: String,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum With {
+    /// No store at all.
+    Nothing,
+    /// The wrapper with no real store behind it.
+    Fake,
+    /// The wrapper over the real object server.
+    Real,
+}
+
+impl Fx {
+    async fn new(with: With) -> Fx {
+        Fx::sized(with, None).await
+    }
+
+    async fn sized(with: With, part_bytes: Option<u64>) -> Fx {
+        let mut real = None;
+        let mut wrap = Wrap::default();
+        if with == With::Real {
+            let r = crate::object_server_rustfs::Real::new();
+            let server = r.start().await;
+            let store = tokio::time::timeout(
+                Duration::from_secs(60),
+                S3Store::open(
+                    server.port(),
+                    server.credentials(),
+                    "nekoguruma",
+                    S3Tuning::default(),
+                ),
+            )
+            .await
+            .expect("open must not hang")
+            .unwrap();
+            wrap.inner = Some(Arc::new(store));
+            real = Some((r, server));
+        }
+        let wrap = Arc::new(wrap);
+        let store = (with != With::Nothing).then(|| Arc::clone(&wrap) as Arc<dyn MultipartStore>);
+        let mut backend = Backend::new(store);
+        if let Some(bytes) = part_bytes {
+            backend = backend.with_part_bytes(bytes);
+        }
+        let u = Up::with_backend(2, None, None, backend).await;
+        let token = token(&u).await;
+        Fx {
+            u,
+            wrap,
+            real,
+            token,
+        }
+    }
+
+    async fn finish(self) {
+        self.u.finish().await;
+        if let Some((_real, server)) = self.real {
+            server.stop(std::future::pending()).await;
+        }
+    }
+
+    fn addr(&self) -> std::net::SocketAddr {
+        self.u.s.addr
+    }
+
+    async fn send(
+        &self,
+        method: &str,
+        target: &str,
+        token: Option<&str>,
+        content_type: Option<&str>,
+        body: &str,
+    ) -> Reply {
+        exchange(
+            self.addr(),
+            &self.request_text(method, target, token, content_type, body),
+        )
+        .await
+    }
+
+    fn request_text(
+        &self,
+        method: &str,
+        target: &str,
+        token: Option<&str>,
+        content_type: Option<&str>,
+        body: &str,
+    ) -> String {
+        let mut raw = format!(
+            "{method} {target} HTTP/1.1\r\n{}\r\nConnection: close\r\n",
+            self.u.s.host()
+        );
+        if let Some(token) = token {
+            raw.push_str(&format!("Authorization: Bearer {token}\r\n"));
+        }
+        if let Some(content_type) = content_type {
+            raw.push_str(&format!("Content-Type: {content_type}\r\n"));
+        }
+        raw.push_str(&format!("Content-Length: {}\r\n\r\n{body}", body.len()));
+        raw
+    }
+
+    async fn begin_as(&self, token: Option<&str>, body: &str) -> Reply {
+        self.send(
+            "POST",
+            "/api/v1/agent/uploads",
+            token,
+            Some("application/json"),
+            body,
+        )
+        .await
+    }
+
+    async fn begin(&self, body: &str) -> Reply {
+        self.begin_as(Some(&self.token), body).await
+    }
+
+    async fn part_as(&self, token: Option<&str>, id: &str, part: &str) -> Reply {
+        self.send(
+            "POST",
+            &format!("/api/v1/agent/uploads/{id}/parts/{part}"),
+            token,
+            None,
+            "",
+        )
+        .await
+    }
+
+    async fn part(&self, id: &str, part: &str) -> Reply {
+        self.part_as(Some(&self.token), id, part).await
+    }
+
+    async fn status_as(&self, token: Option<&str>, id: &str) -> Reply {
+        self.send(
+            "GET",
+            &format!("/api/v1/agent/uploads/{id}"),
+            token,
+            None,
+            "",
+        )
+        .await
+    }
+
+    async fn status(&self, id: &str) -> Reply {
+        self.status_as(Some(&self.token), id).await
+    }
+
+    /// A job of agent `agent` (the fixture's own for `None`) with the ownership generation
+    /// `generation` in its signed instruction.
+    async fn job_for(&self, agent: &str, generation: u64) -> String {
+        let id: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
+            .fetch_one(&self.u.w.pool)
+            .await
+            .unwrap();
+        let instruction = JobInstruction {
+            version: INSTRUCTION_VERSION,
+            job_id: JobId(id.clone()),
+            ownership_generation: generation,
+            agent_id: AgentId(agent.to_owned()),
+            operator_id: "operator".to_owned(),
+            kind: JobKind::Acquire,
+            vci: VciId("vci".to_owned()),
+            vin: None,
+            document_hashes: Vec::new(),
+            artifact_hash: None,
+            plan_hash: None,
+            issued_at: 1,
+            start_deadline: 2,
+        };
+        let sealed = self.u.w.key.seal(&instruction).await.unwrap();
+        self.insert_job(&id, agent, &sealed).await;
+        id
+    }
+
+    async fn insert_job(&self, id: &str, agent: &str, signed: &[u8]) {
+        sqlx::query(
+            "INSERT INTO jobs (tenant_id, id, kind, agent_id, operator_id, vci_id, \
+                 confirmation_level, start_deadline, signed_job, signing_key_id, idempotency_key) \
+             SELECT a.tenant_id, $1::uuid, 'acquire', a.id, o.id, 'vci', 'notifyOnly', \
+                 now() + interval '1 hour', $3, $4, gen_random_uuid()::text \
+             FROM agents a JOIN operators o ON o.tenant_id = a.tenant_id WHERE a.id = $2::uuid",
+        )
+        .bind(id)
+        .bind(agent)
+        .bind(signed)
+        .bind(self.u.w.key.key_id())
+        .execute(&self.u.w.pool)
+        .await
+        .unwrap();
+    }
+
+    async fn job(&self) -> String {
+        self.job_for(&self.u.id, 1).await
+    }
+
+    /// A row written by hand, for the cases the routes do not reach by themselves.
+    async fn row(
+        &self,
+        job: &str,
+        generation: i64,
+        kind: &str,
+        size: i64,
+        state: &str,
+        part_bytes: i64,
+    ) -> String {
+        sqlx::query_scalar(
+            "INSERT INTO job_objects (tenant_id, id, job_id, generation, kind, agent_id, \
+                 storage_key, upload_id, part_bytes, size_bytes, digest, state, finished_at) \
+             SELECT j.tenant_id, gen_random_uuid(), j.id, $2, $3, j.agent_id, \
+                 gen_random_uuid()::text, 'fake-upload-id', $6, $4, $7, $5, \
+                 CASE WHEN $5 = 'finished' THEN now() END \
+             FROM jobs j WHERE j.id = $1::uuid RETURNING id::text",
+        )
+        .bind(job)
+        .bind(generation)
+        .bind(kind)
+        .bind(size)
+        .bind(state)
+        .bind(part_bytes)
+        .bind(digest())
+        .fetch_one(&self.u.w.pool)
+        .await
+        .unwrap()
+    }
+
+    async fn sql(&self, sql: &str) -> String {
+        self.u.w.sql(sql).await
+    }
+
+    /// The token of another agent of the same tenant, with its ID.
+    async fn other_agent(&self) -> (String, String) {
+        let agent = Agent::new();
+        let id = self.u.w.register(&agent).await;
+        let r = self.u.exchange_as(&agent.key, &id).await;
+        assert_eq!(r.status, 200, "{}", r.head);
+        (id, json(&r)["token"].as_str().unwrap().to_owned())
+    }
+}
+
+fn decl(job: &str, generation: u64, kind: &str, size: u64, sha: &str) -> String {
+    format!(
+        r#"{{"jobId":"{job}","generation":{generation},"kind":"{kind}","sizeBytes":{size},"sha256":"{sha}"}}"#
+    )
+}
+
+fn result_of(job: &str, size: u64) -> String {
+    decl(job, 1, "result", size, &digest())
+}
+
+/// The count of leading parts the status reports.
+async fn held(fx: &Fx, id: &str) -> u64 {
+    let r = fx.status(id).await;
+    assert_eq!(r.status, 200, "{}", r.head);
+    json(&r)["partsHeld"].as_u64().unwrap()
+}
+
+/// Asks for the URL of part `number` and PUTs `len` bytes to it.
+async fn send(fx: &Fx, id: &str, number: u16, len: usize) {
+    let r = fx.part(id, &number.to_string()).await;
+    assert_eq!(r.status, 200, "part {number}: {}", r.head);
+    assert_eq!(r.header("cache-control"), Some("no-store"));
+    let v = json(&r);
+    assert_eq!(v["expiresInSecs"], 300);
+    let url = v["url"].as_str().unwrap().to_owned();
+    assert!(url.starts_with("http://127.0.0.1:"), "the URL's host");
+    let (status, etag) = put(&url, content(number as u8, len)).await;
+    assert_eq!(status, 200, "PUT part {number}");
+    assert!(etag.is_some());
+}
+
+fn problem(r: &Reply, status: u16, what: &str) {
+    assert_eq!(r.status, status, "{what}: {}", r.head);
+    assert_eq!(
+        r.header("content-type"),
+        Some("application/problem+json"),
+        "{what}"
+    );
+}
+
+fn upload_id(r: &Reply) -> String {
+    json(r)["uploadId"].as_str().unwrap().to_owned()
+}
+
+// ---------------------------------------------------------------------------------------------
+// Order, shape and the token
+
+/// The shape is judged before the token (ADR-493 item 16): a request with no token and a wrong
+/// body is a 400, not a 401, and a valid body with no token is a 401.
+#[tokio::test]
+async fn the_shape_is_judged_before_the_token() {
+    let fx = Fx::new(With::Nothing).await;
+    let job = v4();
+    let good = result_of(&job, 10);
+    assert_eq!(fx.begin_as(None, &good).await.status, 401);
+    let upper = job.to_uppercase();
+    let bad_shapes = [
+        "".to_owned(),
+        "[]".to_owned(),
+        "null".to_owned(),
+        "{}".to_owned(),
+        format!("{good}x"),
+        decl(&upper, 1, "result", 1, &digest()),
+        decl("not-a-uuid", 1, "result", 1, &digest()),
+        decl(&job, 1, "Result", 1, &digest()),
+        decl(&job, 1, "other", 1, &digest()),
+        decl(&job, 1, "result", 1, &digest().to_uppercase()),
+        decl(&job, 1, "result", 1, &"ab".repeat(31)),
+        decl(&job, 1, "result", 1, &"ab".repeat(33)),
+        decl(&job, 1, "result", 1, &"zz".repeat(32)),
+        // Numbers: negative, fractional, exponent form, strings, null.
+        good.replace("\"sizeBytes\":10", "\"sizeBytes\":-1"),
+        good.replace("\"sizeBytes\":10", "\"sizeBytes\":1.5"),
+        good.replace("\"sizeBytes\":10", "\"sizeBytes\":1e3"),
+        good.replace("\"sizeBytes\":10", "\"sizeBytes\":\"10\""),
+        good.replace("\"sizeBytes\":10", "\"sizeBytes\":null"),
+        good.replace("\"generation\":1", "\"generation\":-1"),
+        good.replace("\"generation\":1", "\"generation\":1.0"),
+        good.replace("\"generation\":1", "\"generation\":9223372036854775808"),
+        good.replace("\"generation\":1", "\"generation\":\"1\""),
+        // A property twice, an unknown one, one missing.
+        good.replace("}", ",\"kind\":\"result\"}"),
+        good.replace("}", ",\"extra\":1}"),
+        good.replace(",\"kind\":\"result\"", ""),
+        good.replace("\"jobId\":", "\"jobid\":"),
+    ];
+    for body in &bad_shapes {
+        let r = fx.begin_as(None, body).await;
+        problem(&r, 400, body);
+        let with_token = fx.begin(body).await;
+        assert_eq!(with_token.status, 400, "{body}");
+    }
+    // A content type that is not JSON, or none, is a 400 too; JSON with a parameter passes.
+    for content_type in [Some("text/plain"), None, Some("application/jsonx")] {
+        let r = fx
+            .send("POST", "/api/v1/agent/uploads", None, content_type, &good)
+            .await;
+        assert_eq!(r.status, 400, "{content_type:?}");
+    }
+    let r = fx
+        .send(
+            "POST",
+            "/api/v1/agent/uploads",
+            None,
+            Some("application/json; charset=utf-8"),
+            &good,
+        )
+        .await;
+    assert_eq!(r.status, 401);
+    fx.finish().await;
+}
+
+/// A length over 4 GiB is a 413 before the token and before any lookup, after the shape
+/// (ADR-493 item 3): a bad kind with a huge length is a 400.
+#[tokio::test]
+async fn a_length_over_4_gib_is_413_after_the_shape_and_before_the_token() {
+    let fx = Fx::new(With::Nothing).await;
+    let job = v4();
+    for size in [
+        "4294967297",
+        "18446744073709551615",
+        "18446744073709551616",
+        "99999999999999999999999999",
+        "1e30",
+    ] {
+        let body = result_of(&job, 0).replace("\"sizeBytes\":0", &format!("\"sizeBytes\":{size}"));
+        let r = fx.begin_as(None, &body).await;
+        problem(&r, 413, size);
+        let r = fx.begin(&body).await;
+        assert_eq!(r.status, 413, "{size}");
+        // The shape first.
+        let bad = body.replace("\"result\"", "\"nothing\"");
+        assert_eq!(fx.begin_as(None, &bad).await.status, 400, "{size}");
+    }
+    // Exactly 4 GiB is not over: it reaches the token.
+    let r = fx.begin_as(None, &result_of(&job, 4_294_967_296)).await;
+    assert_eq!(r.status, 401);
+    assert_eq!(fx.sql("SELECT count(*) FROM job_objects").await, "0");
+    fx.finish().await;
+}
+
+#[tokio::test]
+async fn a_body_of_4096_bytes_is_read_and_one_more_is_413_on_every_route() {
+    let fx = Fx::new(With::Nothing).await;
+    // 4096 bytes of a body that is not the shape: read whole, then judged.
+    let r = fx.begin(&"x".repeat(4096)).await;
+    assert_eq!(r.status, 400, "{}", r.head);
+    let r = fx.begin(&"x".repeat(4097)).await;
+    problem(&r, 413, "begin");
+    let id = v4();
+    let r = fx
+        .send(
+            "POST",
+            &format!("/api/v1/agent/uploads/{id}/parts/1"),
+            Some(&fx.token),
+            None,
+            &"x".repeat(4097),
+        )
+        .await;
+    problem(&r, 413, "part");
+    let r = fx
+        .send(
+            "GET",
+            &format!("/api/v1/agent/uploads/{id}"),
+            Some(&fx.token),
+            None,
+            &"x".repeat(4097),
+        )
+        .await;
+    problem(&r, 413, "status");
+    // The part and status routes take no body at all.
+    let r = fx
+        .send(
+            "POST",
+            &format!("/api/v1/agent/uploads/{id}/parts/1"),
+            Some(&fx.token),
+            None,
+            "x",
+        )
+        .await;
+    assert_eq!(r.status, 400, "{}", r.head);
+    fx.finish().await;
+}
+
+#[tokio::test]
+async fn a_body_that_does_not_arrive_within_five_seconds_is_408() {
+    let fx = Fx::new(With::Nothing).await;
+    for (method, target) in [
+        ("POST", "/api/v1/agent/uploads".to_owned()),
+        ("POST", format!("/api/v1/agent/uploads/{}/parts/1", v4())),
+        ("GET", format!("/api/v1/agent/uploads/{}", v4())),
+    ] {
+        let raw = format!(
+            "{method} {target} HTTP/1.1\r\n{}\r\nContent-Type: application/json\r\n\
+             Content-Length: 10\r\n\r\n",
+            fx.u.s.host()
+        );
+        let started = std::time::Instant::now();
+        let r = exchange(fx.addr(), &raw).await;
+        problem(&r, 408, &target);
+        assert!(started.elapsed() >= Duration::from_secs(5));
+    }
+    fx.finish().await;
+}
+
+/// Every refusal of the token is the same 401, byte for byte, on the three routes.
+#[tokio::test]
+async fn no_live_token_is_one_401_on_every_route() {
+    let fx = Fx::new(With::Nothing).await;
+    let job = fx.job().await;
+    let id = v4();
+    let live = token(&fx.u).await;
+    // A token that decodes to 32 bytes but was never issued.
+    let never = {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode([7u8; 32])
+    };
+    let mut seen = Vec::new();
+    for token in [None, Some("x"), Some(never.as_str()), Some("")] {
+        for r in [
+            fx.begin_as(token, &result_of(&job, 1)).await,
+            fx.part_as(token, &id, "1").await,
+            fx.status_as(token, &id).await,
+        ] {
+            problem(&r, 401, "no token");
+            assert_eq!(r.header("www-authenticate"), Some("Bearer"));
+            seen.push(bytes_of(&r));
+        }
+    }
+    assert!(seen.windows(2).all(|w| w[0] == w[1]), "{seen:?}");
+    // A token of a live session works: the route is reached (404 for an upload nobody has).
+    assert_eq!(fx.status_as(Some(&live), &id).await.status, 404);
+    fx.finish().await;
+}
+
+/// A revoked or missing agent row is the same 401, and it drops the agent's tokens at once
+/// (ADR-493 item 2); a request that is malformed drops none.
+#[tokio::test]
+async fn a_revoked_agent_is_401_and_loses_its_tokens() {
+    let fx = Fx::new(With::Fake).await;
+    let job = fx.job().await;
+    let id = fx.row(&job, 1, "result", 10, "open", 5 * 1024 * 1024).await;
+    let revoke = format!(
+        "UPDATE agents SET revoked_at = now() WHERE id = '{}'",
+        fx.u.id
+    );
+    let restore = format!(
+        "UPDATE agents SET revoked_at = NULL WHERE id = '{}'",
+        fx.u.id
+    );
+    let t1 = token(&fx.u).await;
+    let t2 = token(&fx.u).await;
+    let t3 = token(&fx.u).await;
+    sqlx::query(sqlx::AssertSqlSafe(revoke.clone()))
+        .execute(&fx.u.w.pool)
+        .await
+        .unwrap();
+    // A malformed request is answered before the row is read: it drops nothing. With the row
+    // live again, t1 still reaches the routes.
+    assert_eq!(fx.begin_as(Some(&t1), "{}").await.status, 400);
+    assert_eq!(fx.part_as(Some(&t1), &id, "0").await.status, 400);
+    assert_eq!(fx.part_as(Some(&t1), &id, "1%FF").await.status, 400);
+    sqlx::query(sqlx::AssertSqlSafe(restore.clone()))
+        .execute(&fx.u.w.pool)
+        .await
+        .unwrap();
+    assert_eq!(fx.status_as(Some(&t1), &id).await.status, 200);
+    assert_eq!(fx.part_as(Some(&t1), &id, "9").await.status, 400);
+    let unknown_token = fx.status_as(Some("x"), &id).await;
+    sqlx::query(sqlx::AssertSqlSafe(revoke.clone()))
+        .execute(&fx.u.w.pool)
+        .await
+        .unwrap();
+    // Each route sees the revoked row.
+    problem(
+        &fx.begin_as(Some(&t1), &result_of(&job, 10)).await,
+        401,
+        "begin",
+    );
+    problem(&fx.part_as(Some(&t2), &id, "1").await, 401, "part");
+    let revoked = fx.status_as(Some(&t3), &id).await;
+    problem(&revoked, 401, "status");
+    // The same bytes as a token that is unknown.
+    assert_eq!(bytes_of(&revoked), bytes_of(&unknown_token));
+    // The row is live again, and every token of the agent is gone, also the ones not used.
+    sqlx::query(sqlx::AssertSqlSafe(restore))
+        .execute(&fx.u.w.pool)
+        .await
+        .unwrap();
+    for (name, t) in [("t1", &t1), ("t2", &t2), ("t3", &t3), ("main", &fx.token)] {
+        problem(&fx.status_as(Some(t), &id).await, 401, name);
+    }
+    // A new exchange works again.
+    let fresh = token(&fx.u).await;
+    assert_eq!(fx.status_as(Some(&fresh), &id).await.status, 200);
+    // An agent with no row at all.
+    for sql in [
+        "DELETE FROM job_objects".to_owned(),
+        "DELETE FROM jobs".to_owned(),
+        "DELETE FROM agent_allowed_operators".to_owned(),
+        "DELETE FROM agent_registration_codes".to_owned(),
+        format!("DELETE FROM agents WHERE id = '{}'", fx.u.id),
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .execute(&fx.u.w.pool)
+            .await
+            .unwrap();
+    }
+    problem(&fx.status_as(Some(&fresh), &id).await, 401, "no row");
+    fx.finish().await;
+}
+
+/// The tenant comes from the agent's row: another tenant's agent cannot name this one's job or
+/// upload, and the answer for it is the unknown job's.
+#[tokio::test]
+async fn another_agents_job_or_upload_is_404_like_an_unknown_one() {
+    let fx = Fx::new(With::Fake).await;
+    let job = fx.job().await;
+    let id = fx
+        .row(&job, 1, "result", 10, "open", PART_BYTES as i64)
+        .await;
+    let (other_id, other) = fx.other_agent().await;
+    // A second tenant's agent.
+    fx.u.w.add_operator("bob").await;
+    let outsider = Agent::new();
+    let (_, r) = fx.u.w.redeem("bob", &outsider).await;
+    assert_eq!(r.status, 201, "{}", r.head);
+    let outsider_id = json(&r)["agentId"].as_str().unwrap().to_owned();
+    let r = fx.u.exchange_as(&outsider.key, &outsider_id).await;
+    let outsider_token = json(&r)["token"].as_str().unwrap().to_owned();
+    let unknown = v4();
+    for token in [&other, &outsider_token] {
+        let begin = fx.begin_as(Some(token), &result_of(&job, 10)).await;
+        problem(&begin, 404, "begin");
+        let unknown_job = fx.begin_as(Some(token), &result_of(&unknown, 10)).await;
+        assert_eq!(bytes_of(&begin), bytes_of(&unknown_job));
+        let part = fx.part_as(Some(token), &id, "1").await;
+        problem(&part, 404, "part");
+        assert_eq!(
+            bytes_of(&part),
+            bytes_of(&fx.part_as(Some(token), &unknown, "1").await)
+        );
+        let status = fx.status_as(Some(token), &id).await;
+        problem(&status, 404, "status");
+        assert_eq!(
+            bytes_of(&status),
+            bytes_of(&fx.status_as(Some(token), &unknown).await)
+        );
+    }
+    // The owner sees its own, and the other agent's own job is its own.
+    assert_eq!(fx.status(&id).await.status, 200);
+    let mine = fx.job_for(&other_id, 1).await;
+    assert_eq!(fx.begin(&result_of(&mine, 10)).await.status, 404);
+    assert_eq!(
+        fx.begin_as(Some(&other), &result_of(&mine, 10))
+            .await
+            .status,
+        201
+    );
+    assert_eq!(fx.wrap.calls()[0], 1);
+    fx.finish().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Begin
+
+#[tokio::test]
+async fn begin_makes_a_row_and_answers_the_same_row_again() {
+    let fx = Fx::new(With::Fake).await;
+    let job = fx.job().await;
+    let body = result_of(&job, 5 * MIB as u64 + 1);
+    let first = fx.begin(&body).await;
+    assert_eq!(first.status, 201, "{}", first.head);
+    assert_eq!(first.header("content-type"), Some("application/json"));
+    assert_eq!(first.header("cache-control"), Some("no-store"));
+    let v = json(&first);
+    let id = upload_id(&first);
+    assert_eq!(v["partBytes"], PART_BYTES);
+    assert_eq!(v["partCount"], 2);
+    assert_eq!(v["state"], "open");
+    assert_eq!(v.as_object().unwrap().len(), 4);
+    // The row holds what the store issued, and the answer none of it.
+    let issued = fx.wrap.issued.lock().unwrap().clone();
+    assert_eq!(issued.len(), 1);
+    assert_eq!(
+        fx.sql(&format!(
+            "SELECT storage_key || '|' || generation || '|' || kind || '|' || agent_id || '|' || \
+                part_bytes || '|' || size_bytes || '|' || digest || '|' || state || '|' || \
+                (finished_at IS NULL) FROM job_objects WHERE id = '{id}'"
+        ))
+        .await,
+        format!(
+            "{}|1|result|{}|{}|{}|{}|open|true",
+            issued[0],
+            fx.u.id,
+            PART_BYTES,
+            5 * MIB + 1,
+            digest()
+        )
+    );
+    assert!(!first.body.contains(&issued[0]) && !first.body.contains("fake-"));
+
+    // The same declaration answers the same row, and the store is not asked again.
+    let again = fx.begin(&body).await;
+    assert_eq!(again.status, 200, "{}", again.head);
+    assert_eq!(json(&again), v);
+    assert_eq!(fx.wrap.calls(), [1, 0, 0, 0]);
+    // Another length or digest is a conflict, and nothing changes.
+    let other_size = fx.begin(&result_of(&job, 5 * MIB as u64)).await;
+    problem(&other_size, 409, "length");
+    let other_digest = fx
+        .begin(&decl(
+            &job,
+            1,
+            "result",
+            5 * MIB as u64 + 1,
+            &"cd".repeat(32),
+        ))
+        .await;
+    problem(&other_digest, 409, "digest");
+    assert_eq!(fx.wrap.calls()[0], 1);
+    // The other kind is its own upload.
+    let log = fx.begin(&decl(&job, 1, "commLog", 3, &digest())).await;
+    assert_eq!(log.status, 201, "{}", log.head);
+    assert_ne!(upload_id(&log), id);
+    assert_eq!(fx.sql("SELECT count(*) FROM job_objects").await, "2");
+    fx.finish().await;
+}
+
+#[tokio::test]
+async fn a_failed_row_is_ignored_and_a_new_begin_makes_a_new_one() {
+    let fx = Fx::new(With::Fake).await;
+    let job = fx.job().await;
+    let failed = fx
+        .row(&job, 1, "result", 10, "failed", PART_BYTES as i64)
+        .await;
+    // Another declaration than the failed row's, and the same one, are both a new upload.
+    for size in [11, 10] {
+        let r = fx.begin(&result_of(&job, size)).await;
+        assert_eq!(r.status, 201, "{}", r.head);
+        let id = upload_id(&r);
+        assert_ne!(id, failed);
+        // It is the live one now.
+        assert_eq!(fx.begin(&result_of(&job, size)).await.status, 200);
+        sqlx::query("UPDATE job_objects SET state = 'failed' WHERE id = $1::uuid")
+            .bind(&id)
+            .execute(&fx.u.w.pool)
+            .await
+            .unwrap();
+    }
+    assert_eq!(fx.sql("SELECT count(*) FROM job_objects").await, "3");
+    fx.finish().await;
+}
+
+/// The job: any state, the generation of the stored instruction (ADR-493 item 15), a decodable
+/// instruction, and a row of another agent.
+#[tokio::test]
+async fn begin_judges_the_job_and_its_generation() {
+    let fx = Fx::new(With::Fake).await;
+    // Unknown.
+    problem(&fx.begin(&result_of(&v4(), 10)).await, 404, "unknown job");
+    // The generation must be the instruction's.
+    let job = fx.job_for(&fx.u.id, 3).await;
+    for generation in [0, 1, 2, 4] {
+        let r = fx
+            .begin(&decl(&job, generation, "result", 10, &digest()))
+            .await;
+        problem(&r, 404, &format!("generation {generation}"));
+    }
+    assert_eq!(fx.sql("SELECT count(*) FROM job_objects").await, "0");
+    assert_eq!(fx.wrap.calls()[0], 0);
+    let r = fx.begin(&decl(&job, 3, "result", 10, &digest())).await;
+    assert_eq!(r.status, 201, "{}", r.head);
+    // Any job state: a finished job still takes an upload.
+    sqlx::query("UPDATE jobs SET state = 'succeeded', finished_at = now() WHERE id = $1::uuid")
+        .bind(&job)
+        .execute(&fx.u.w.pool)
+        .await
+        .unwrap();
+    let r = fx.begin(&decl(&job, 3, "commLog", 10, &digest())).await;
+    assert_eq!(r.status, 201, "{}", r.head);
+    // An instruction that does not decode is the server's fault.
+    let broken = v4();
+    fx.insert_job(&broken, &fx.u.id, b"not an envelope").await;
+    problem(&fx.begin(&result_of(&broken, 10)).await, 500, "undecodable");
+    assert_eq!(fx.sql("SELECT count(*) FROM job_objects").await, "2");
+    // A live row of another agent for the same job, generation and kind is a conflict.
+    let (other_id, _) = fx.other_agent().await;
+    let shared = fx.job().await;
+    fx.row(&shared, 1, "result", 10, "open", PART_BYTES as i64)
+        .await;
+    sqlx::query("UPDATE job_objects SET agent_id = $1::uuid WHERE job_id = $2::uuid")
+        .bind(&other_id)
+        .bind(&shared)
+        .execute(&fx.u.w.pool)
+        .await
+        .unwrap();
+    problem(&fx.begin(&result_of(&shared, 10)).await, 409, "foreign row");
+    fx.finish().await;
+}
+
+#[tokio::test]
+async fn the_declared_length_decides_the_part_count() {
+    let fx = Fx::new(With::Fake).await;
+    let cases: [(u64, u64); 6] = [
+        (0, 1),
+        (1, 1),
+        (PART_BYTES, 1),
+        (PART_BYTES + 1, 2),
+        (4 * 1024 * MIB as u64, 820),
+        (4 * 1024 * MIB as u64 - 1, 820),
+    ];
+    for (size, count) in cases {
+        let job = fx.job().await;
+        let r = fx.begin(&result_of(&job, size)).await;
+        assert_eq!(r.status, 201, "{size}: {}", r.head);
+        assert_eq!(json(&r)["partCount"], count, "{size}");
+        // The row keeps the part size, whatever the setting is later.
+        assert_eq!(
+            fx.sql(&format!(
+                "SELECT part_bytes FROM job_objects WHERE id = '{}'",
+                upload_id(&r)
+            ))
+            .await,
+            PART_BYTES.to_string()
+        );
+    }
+    fx.finish().await;
+}
+
+/// Without a store begin answers an existing row and refuses a new one (503); a store that fails
+/// is a 503, one without randomness a 500, and no row is written.
+#[tokio::test]
+async fn begin_answers_what_the_store_does_and_writes_nothing_on_failure() {
+    let fx = Fx::new(With::Nothing).await;
+    let job = fx.job().await;
+    problem(&fx.begin(&result_of(&job, 10)).await, 503, "no store");
+    let id = fx
+        .row(&job, 1, "result", 10, "open", PART_BYTES as i64)
+        .await;
+    let r = fx.begin(&result_of(&job, 10)).await;
+    assert_eq!(r.status, 200, "{}", r.head);
+    assert_eq!(upload_id(&r), id);
+    fx.finish().await;
+
+    let fx = Fx::new(With::Fake).await;
+    let job = fx.job().await;
+    Wrap::set(&fx.wrap.begin_fail, Some(Fail::Io));
+    problem(&fx.begin(&result_of(&job, 10)).await, 503, "store fails");
+    Wrap::set(&fx.wrap.begin_fail, Some(Fail::Random));
+    problem(&fx.begin(&result_of(&job, 10)).await, 500, "random");
+    assert_eq!(fx.sql("SELECT count(*) FROM job_objects").await, "0");
+    Wrap::set(&fx.wrap.begin_fail, None);
+    assert_eq!(fx.begin(&result_of(&job, 10)).await.status, 201);
+    fx.finish().await;
+}
+
+/// A row that cannot be written leaves no upload behind: the key is deleted (ADR-493 item 8).
+#[tokio::test]
+async fn an_insert_that_fails_deletes_the_upload_it_began() {
+    let fx = Fx::new(With::Fake).await;
+    let job = fx.job().await;
+    fx.u.w
+        .pg
+        .execute("ALTER TABLE job_objects ADD CONSTRAINT refuse CHECK (false) NOT VALID")
+        .await;
+    let r = fx.begin(&result_of(&job, 10)).await;
+    problem(&r, 503, "insert fails");
+    assert!(!r.body.to_lowercase().contains("constraint"), "{}", r.body);
+    assert_eq!(fx.wrap.calls(), [1, 0, 0, 1]);
+    assert_eq!(
+        *fx.wrap.deleted.lock().unwrap(),
+        *fx.wrap.issued.lock().unwrap()
+    );
+    fx.finish().await;
+}
+
+/// Two begins of one declaration meet at the store, and both insert: one row stays, the loser
+/// answers the winner's row, and the upload it began is deleted from the object server (C1 to C3).
+#[tokio::test]
+async fn two_racing_begins_leave_one_row_and_the_losers_upload_is_aborted() {
+    let fx = Fx::new(With::Real).await;
+    let job = fx.job().await;
+    *fx.wrap.begin_barrier.lock().unwrap() = Some(Arc::new(Barrier::new(2)));
+    let body = result_of(&job, 10);
+    let (a, b) = tokio::join!(fx.begin(&body), fx.begin(&body));
+    let mut statuses = [a.status, b.status];
+    statuses.sort();
+    assert_eq!(statuses, [200, 201], "{} / {}", a.head, b.head);
+    assert_eq!(upload_id(&a), upload_id(&b));
+    assert_eq!(fx.sql("SELECT count(*) FROM job_objects").await, "1");
+    let key = fx.sql("SELECT storage_key FROM job_objects").await;
+    let issued = fx.wrap.issued.lock().unwrap().clone();
+    assert_eq!(issued.len(), 2);
+    let deleted = fx.wrap.deleted.lock().unwrap().clone();
+    assert_eq!(deleted.len(), 1);
+    assert_ne!(deleted[0], key);
+    assert!(issued.contains(&deleted[0]) && issued.contains(&key));
+    // The object server holds the winner's upload only.
+    let listed = fx.wrap.list_unfinished().await.unwrap();
+    assert_eq!(
+        listed
+            .uploads
+            .iter()
+            .map(|u| u.key.to_string())
+            .collect::<Vec<_>>(),
+        [key]
+    );
+    fx.finish().await;
+}
+
+/// The loser of a race for another declaration is a conflict; a failed abort is a warning and not
+/// another answer (C3, C5).
+#[tokio::test]
+async fn a_racing_begin_with_another_declaration_is_409_and_a_failed_abort_only_warns() {
+    let (log, _guard) = capture();
+    let fx = Fx::new(With::Fake).await;
+    let job = fx.job().await;
+    Wrap::set(&fx.wrap.delete_fail, Some(Fail::Io));
+    *fx.wrap.begin_barrier.lock().unwrap() = Some(Arc::new(Barrier::new(2)));
+    let (small, big) = (result_of(&job, 10), result_of(&job, 11));
+    let (a, b) = tokio::join!(fx.begin(&small), fx.begin(&big));
+    let mut statuses = [a.status, b.status];
+    statuses.sort();
+    assert_eq!(statuses, [201, 409], "{} / {}", a.head, b.head);
+    assert_eq!(fx.sql("SELECT count(*) FROM job_objects").await, "1");
+    assert_eq!(fx.wrap.calls()[3], 1);
+    let text = log.text();
+    assert!(text.contains("could not be aborted"), "{text}");
+    let key = fx.sql("SELECT storage_key FROM job_objects").await;
+    for issued in fx.wrap.issued.lock().unwrap().iter() {
+        assert!(!text.contains(issued.as_str()), "a key is in the log");
+    }
+    assert!(!text.contains(&key));
+    fx.finish().await;
+}
+
+/// No request holds a pooled connection while it waits for the store: more requests than the
+/// pool has connections are all inside `begin` at once.
+#[tokio::test]
+async fn no_pooled_connection_is_held_across_a_store_call() {
+    let fx = Fx::new(With::Fake).await;
+    // The test pool's default is ten connections.
+    const N: usize = 12;
+    *fx.wrap.begin_barrier.lock().unwrap() = Some(Arc::new(Barrier::new(N)));
+    let mut bodies = Vec::new();
+    for _ in 0..N {
+        bodies.push(result_of(&fx.job().await, 10));
+    }
+    let addr = fx.addr();
+    let tasks: Vec<_> = bodies
+        .iter()
+        .map(|body| {
+            let raw = fx.request_text(
+                "POST",
+                "/api/v1/agent/uploads",
+                Some(&fx.token),
+                Some("application/json"),
+                body,
+            );
+            tokio::spawn(async move { exchange(addr, &raw).await.status })
+        })
+        .collect();
+    for task in tasks {
+        let status = tokio::time::timeout(Duration::from_secs(30), task)
+            .await
+            .expect("every request reaches the store at once")
+            .unwrap();
+        assert_eq!(status, 201);
+    }
+    fx.finish().await;
+}
+
+#[tokio::test]
+async fn the_database_being_down_is_503() {
+    let mut fx = Fx::new(With::Fake).await;
+    let job = fx.job().await;
+    let id = fx
+        .row(&job, 1, "result", 10, "open", PART_BYTES as i64)
+        .await;
+    fx.u.w.pg.stop();
+    problem(&fx.begin(&result_of(&job, 10)).await, 503, "begin");
+    problem(&fx.part(&id, "1").await, 503, "part");
+    problem(&fx.status(&id).await, 503, "status");
+    fx.finish().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The part URL and the status
+
+#[tokio::test]
+async fn the_part_number_is_judged_before_the_token_and_the_upload_after_it() {
+    let fx = Fx::new(With::Fake).await;
+    let job = fx.job().await;
+    let id = fx
+        .row(
+            &job,
+            1,
+            "result",
+            3 * 1024 * 1024 * 1024,
+            "open",
+            PART_BYTES as i64,
+        )
+        .await;
+    // 614.4 parts: 615.
+    for part in [
+        "0", "00", "01", "+1", "-1", "1.0", "1e0", " 1", "1 ", "0x1", "10001", "99999", "abc", "٣",
+    ] {
+        let target = part.replace(' ', "%20").replace('٣', "%D9%A3");
+        for token in [None, Some(fx.token.as_str())] {
+            let r = fx.part_as(token, &id, &target).await;
+            problem(&r, 400, part);
+        }
+    }
+    // A good number with no token is a 401, whatever the upload.
+    problem(&fx.part_as(None, "garbage", "1").await, 401, "no token");
+    // After the token the upload: not a UUID, unknown and another's are a 404.
+    for upload in [
+        "garbage",
+        "%FF",
+        "0192F3A4-5B6C-7D8E-8F90-123456789ABC",
+        &v4(),
+    ] {
+        problem(&fx.part_as(Some(&fx.token), upload, "1").await, 404, upload);
+    }
+    problem(&fx.status_as(Some(&fx.token), "%FF").await, 404, "status");
+    // A part past the row's count is a 400, the last one is allowed (or refused by the store).
+    let before = fx.wrap.calls()[1];
+    assert_eq!(fx.part(&id, "615").await.status, 503);
+    // The last part reached the store (which the fake refuses).
+    assert_eq!(fx.wrap.calls()[1], before + 1);
+    assert_eq!(fx.part(&id, "616").await.status, 400);
+    // The part that is in range is not in a state to be asked for, either way: 400 comes first.
+    let done = fx
+        .row(
+            &fx.job().await,
+            1,
+            "result",
+            10,
+            "completing",
+            PART_BYTES as i64,
+        )
+        .await;
+    assert_eq!(fx.part(&done, "2").await.status, 400);
+    fx.finish().await;
+}
+
+/// A row that is not `open` gets no URL: 409 carrying its state, and the store is not asked
+/// (ADR-493 item 4, item 18).
+#[tokio::test]
+async fn a_part_url_for_a_row_that_is_not_open_is_409_with_its_state() {
+    let fx = Fx::new(With::Real).await;
+    for state in ["completing", "finished", "failed"] {
+        let job = fx.job().await;
+        let id = fx
+            .row(&job, 1, "result", 10, state, PART_BYTES as i64)
+            .await;
+        let r = fx.part(&id, "1").await;
+        problem(&r, 409, state);
+        assert_eq!(json(&r)["state"], state);
+        assert!(!r.body.contains("http"), "{}", r.body);
+        // The status of such a row has no `partsHeld` and asks the store nothing.
+        let s = fx.status(&id).await;
+        assert_eq!(s.status, 200, "{}", s.head);
+        let v = json(&s);
+        assert_eq!(v["state"], state);
+        assert_eq!(v["partBytes"], PART_BYTES);
+        assert_eq!(v["partCount"], 1);
+        assert!(v.get("partsHeld").is_none(), "{v}");
+        // HEAD answers the same without a body.
+        let head = fx
+            .send(
+                "HEAD",
+                &format!("/api/v1/agent/uploads/{id}"),
+                Some(&fx.token),
+                None,
+                "",
+            )
+            .await;
+        assert_eq!(head.status, 200);
+        assert_eq!(head.body, "");
+    }
+    assert_eq!(fx.wrap.calls(), [0, 0, 0, 0]);
+    fx.finish().await;
+}
+
+#[tokio::test]
+async fn a_part_url_and_a_status_need_the_store_and_say_so_when_it_fails() {
+    let fx = Fx::new(With::Nothing).await;
+    let job = fx.job().await;
+    let id = fx
+        .row(&job, 1, "result", 10, "open", PART_BYTES as i64)
+        .await;
+    problem(&fx.part(&id, "1").await, 503, "no store, part");
+    problem(&fx.status(&id).await, 503, "no store, status");
+    // A closed row needs none.
+    let closed = fx
+        .row(
+            &fx.job().await,
+            1,
+            "result",
+            10,
+            "failed",
+            PART_BYTES as i64,
+        )
+        .await;
+    assert_eq!(fx.status(&closed).await.status, 200);
+    fx.finish().await;
+
+    let fx = Fx::new(With::Fake).await;
+    let job = fx.job().await;
+    let id = fx
+        .row(&job, 1, "result", 10, "open", PART_BYTES as i64)
+        .await;
+    // The store refuses the URL: 503; it has no randomness: 500; the row's key does not parse: 500.
+    Wrap::set(&fx.wrap.presign_fail, Some(Fail::Io));
+    problem(&fx.part(&id, "1").await, 503, "presign fails");
+    Wrap::set(&fx.wrap.presign_fail, Some(Fail::Random));
+    problem(&fx.part(&id, "1").await, 500, "presign random");
+    Wrap::set(&fx.wrap.presign_fail, None);
+    sqlx::query("UPDATE job_objects SET storage_key = repeat('x', 36) WHERE id = $1::uuid")
+        .bind(&id)
+        .execute(&fx.u.w.pool)
+        .await
+        .unwrap();
+    problem(&fx.part(&id, "1").await, 500, "unparsable key");
+    problem(&fx.status(&id).await, 500, "unparsable key, status");
+    // A store that has lost the upload, or fails, is a 503 and the row is not written.
+    sqlx::query("UPDATE job_objects SET storage_key = gen_random_uuid()::text WHERE id = $1::uuid")
+        .bind(&id)
+        .execute(&fx.u.w.pool)
+        .await
+        .unwrap();
+    let before = fx
+        .sql(&format!(
+            "SELECT xmin::text || state FROM job_objects WHERE id = '{id}'"
+        ))
+        .await;
+    for fail in [Fail::NotFound, Fail::AlreadyFinished, Fail::Io] {
+        Wrap::set(&fx.wrap.list_fail, Some(fail));
+        problem(&fx.status(&id).await, 503, "list fails");
+    }
+    Wrap::set(&fx.wrap.list_fail, Some(Fail::Random));
+    problem(&fx.status(&id).await, 500, "list random");
+    assert_eq!(
+        fx.sql(&format!(
+            "SELECT xmin::text || state FROM job_objects WHERE id = '{id}'"
+        ))
+        .await,
+        before
+    );
+    Wrap::set(&fx.wrap.list_fail, None);
+    // An upload with no parts holds none.
+    let v = json(&fx.status(&id).await);
+    assert_eq!(v["partsHeld"], 0);
+    fx.finish().await;
+}
+
+/// The three routes against the real object server with small parts: a URL for each part, a PUT
+/// to it stored, and the status counting the leading parts of the expected size only.
+#[tokio::test]
+async fn a_put_to_a_part_url_is_stored_and_the_status_counts_the_leading_parts() {
+    let fx = Fx::sized(With::Real, Some(SMALL)).await;
+    let job = fx.job().await;
+    let size = 3 * SMALL + 10;
+    let r = fx.begin(&result_of(&job, size)).await;
+    assert_eq!(r.status, 201, "{}", r.head);
+    let id = upload_id(&r);
+    assert_eq!(json(&r)["partBytes"], SMALL);
+    assert_eq!(json(&r)["partCount"], 4);
+    assert_eq!(held(&fx, &id).await, 0);
+
+    // Part 1, then 3 (a gap at 2), then a part of another size at 2.
+    send(&fx, &id, 1, SMALL as usize).await;
+    assert_eq!(held(&fx, &id).await, 1);
+    send(&fx, &id, 3, SMALL as usize).await;
+    assert_eq!(
+        held(&fx, &id).await,
+        1,
+        "a part beyond a gap is not counted"
+    );
+    send(&fx, &id, 2, SMALL as usize - 1).await;
+    assert_eq!(
+        held(&fx, &id).await,
+        1,
+        "a part of another size is not counted"
+    );
+    // Sending it again, as asked for again, replaces it.
+    send(&fx, &id, 2, SMALL as usize).await;
+    assert_eq!(held(&fx, &id).await, 3);
+    // The last part has the remainder as its size; a whole part there is another size.
+    send(&fx, &id, 4, SMALL as usize).await;
+    assert_eq!(held(&fx, &id).await, 3);
+    send(&fx, &id, 4, 10).await;
+    assert_eq!(held(&fx, &id).await, 4);
+    // Past the count is a 400.
+    problem(&fx.part(&id, "5").await, 400, "past the count");
+    assert_eq!(fx.wrap.calls()[1], 6);
+    fx.finish().await;
+}
+
+/// The size of an object that is a multiple of the part size, and an empty one (T4, T5).
+#[tokio::test]
+async fn the_last_part_of_an_exact_multiple_is_a_whole_part_and_an_empty_object_is_one_part() {
+    let fx = Fx::sized(With::Real, Some(SMALL)).await;
+    let job = fx.job().await;
+    let r = fx.begin(&result_of(&job, 2 * SMALL)).await;
+    assert_eq!(json(&r)["partCount"], 2);
+    let id = upload_id(&r);
+    for n in 1..=2u16 {
+        let r = fx.part(&id, &n.to_string()).await;
+        let url = json(&r)["url"].as_str().unwrap().to_owned();
+        assert_eq!(put(&url, content(n as u8, SMALL as usize)).await.0, 200);
+        assert_eq!(json(&fx.status(&id).await)["partsHeld"], n);
+    }
+    let job = fx.job().await;
+    let r = fx.begin(&result_of(&job, 0)).await;
+    assert_eq!(json(&r)["partCount"], 1);
+    let id = upload_id(&r);
+    assert_eq!(json(&fx.status(&id).await)["partsHeld"], 0);
+    let url = json(&fx.part(&id, "1").await)["url"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(put(&url, Vec::new()).await.0, 200);
+    // The pinned object server lists a part of no bytes, so the empty object's only part counts.
+    assert_eq!(held(&fx, &id).await, 1);
+    fx.finish().await;
+}
+
+/// The one test with the real part size: 5 MiB, a part of it PUT and counted.
+#[tokio::test]
+async fn the_part_size_of_the_server_is_5_mib() {
+    let fx = Fx::new(With::Real).await;
+    let job = fx.job().await;
+    let r = fx.begin(&result_of(&job, 5 * MIB as u64 + 3)).await;
+    assert_eq!(json(&r)["partBytes"], 5 * MIB as u64);
+    assert_eq!(json(&r)["partCount"], 2);
+    let id = upload_id(&r);
+    for (n, len) in [(1u16, 5 * MIB), (2, 3)] {
+        let url = json(&fx.part(&id, &n.to_string()).await)["url"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(put(&url, content(n as u8, len)).await.0, 200);
+    }
+    assert_eq!(json(&fx.status(&id).await)["partsHeld"], 2);
+    fx.finish().await;
+}
+
+#[tokio::test]
+async fn the_routes_take_their_methods_only() {
+    let fx = Fx::new(With::Nothing).await;
+    let id = v4();
+    let cases = [
+        ("GET", "/api/v1/agent/uploads".to_owned(), "POST"),
+        ("PUT", "/api/v1/agent/uploads".to_owned(), "POST"),
+        ("GET", format!("/api/v1/agent/uploads/{id}/parts/1"), "POST"),
+        (
+            "HEAD",
+            format!("/api/v1/agent/uploads/{id}/parts/1"),
+            "POST",
+        ),
+        ("POST", format!("/api/v1/agent/uploads/{id}"), "GET,HEAD"),
+        ("DELETE", format!("/api/v1/agent/uploads/{id}"), "GET,HEAD"),
+    ];
+    for (method, target, allow) in cases {
+        let r = fx.send(method, &target, Some(&fx.token), None, "").await;
+        assert_eq!(r.status, 405, "{method} {target}: {}", r.head);
+        assert_eq!(r.header("allow"), Some(allow), "{method} {target}");
+    }
+    // The completion is not served yet.
+    let r = fx
+        .send(
+            "POST",
+            &format!("/api/v1/agent/uploads/{id}/complete"),
+            Some(&fx.token),
+            None,
+            "",
+        )
+        .await;
+    assert_eq!(r.status, 404, "{}", r.head);
+    fx.finish().await;
+}
+
+/// Nothing a request or an answer carries is in the log: the token, the digest, the job, the
+/// object key, the upload ID, the URL and its signature, the database's text.
+#[tokio::test]
+async fn the_log_holds_no_token_digest_key_upload_id_url_or_database_text() {
+    let (log, _guard) = capture();
+    let fx = Fx::sized(With::Real, Some(SMALL)).await;
+    let job = fx.job().await;
+    let sha = "9f".repeat(32);
+    let r = fx.begin(&decl(&job, 1, "result", SMALL + 5, &sha)).await;
+    assert_eq!(r.status, 201, "{}", r.head);
+    let id = upload_id(&r);
+    let r = fx.part(&id, "1").await;
+    let url = json(&r)["url"].as_str().unwrap().to_owned();
+    assert_eq!(put(&url, content(1, SMALL as usize)).await.0, 200);
+    assert_eq!(fx.status(&id).await.status, 200);
+    // Failures of every kind the routes log: the store, the database, a lost race's abort.
+    Wrap::set(&fx.wrap.list_fail, Some(Fail::Io));
+    assert_eq!(fx.status(&id).await.status, 503);
+    Wrap::set(&fx.wrap.list_fail, None);
+    Wrap::set(&fx.wrap.delete_fail, Some(Fail::Io));
+    *fx.wrap.begin_barrier.lock().unwrap() = Some(Arc::new(Barrier::new(2)));
+    let job2 = fx.job().await;
+    let body = decl(&job2, 1, "result", 7, &sha);
+    let (a, b) = tokio::join!(fx.begin(&body), fx.begin(&body));
+    assert_eq!(a.status.min(b.status), 200);
+    *fx.wrap.begin_barrier.lock().unwrap() = None;
+    fx.u.w
+        .pg
+        .execute("ALTER TABLE job_objects ADD CONSTRAINT refuse CHECK (false) NOT VALID")
+        .await;
+    let job3 = fx.job().await;
+    assert_eq!(
+        fx.begin(&decl(&job3, 1, "result", 7, &sha)).await.status,
+        503
+    );
+
+    let upload_ids: Vec<String> = sqlx::query_scalar("SELECT upload_id FROM job_objects")
+        .fetch_all(&fx.u.w.pool)
+        .await
+        .unwrap();
+    let keys: Vec<String> = sqlx::query_scalar("SELECT storage_key FROM job_objects")
+        .fetch_all(&fx.u.w.pool)
+        .await
+        .unwrap();
+    let mut secrets = vec![
+        fx.token.clone(),
+        sha.clone(),
+        job.clone(),
+        job2,
+        job3,
+        url.clone(),
+        id.clone(),
+    ];
+    secrets.extend(upload_ids);
+    secrets.extend(keys);
+    secrets.extend(fx.wrap.issued.lock().unwrap().iter().cloned());
+    let query = url.split_once('?').unwrap().1.to_owned();
+    secrets.push(query);
+    let text = log.text();
+    assert!(
+        text.contains("upload route"),
+        "the failures are logged: {text}"
+    );
+    for secret in &secrets {
+        assert!(!text.contains(secret.as_str()), "a secret is in the log");
+    }
+    for word in ["X-Amz", "sqlx", "constraint", "violates", "refuse"] {
+        assert!(!text.contains(word), "{word} is in the log: {text}");
+    }
+    fx.finish().await;
+}
+
+/// The migration's own rules (ADR-493 item 7): each CHECK, the partial unique index and the
+/// foreign keys, which have no cascade.
+#[tokio::test]
+async fn the_table_refuses_what_the_rules_forbid() {
+    let fx = Fx::new(With::Fake).await;
+    let job = fx.job().await;
+    let insert = |set: &'static str| {
+        let pool = fx.u.w.pool.clone();
+        let job = job.clone();
+        async move {
+            // A valid row, with one column replaced by `set` (`column = expression`).
+            let (column, expression) = set.split_once('=').unwrap_or(("id", "id"));
+            let columns = [
+                ("generation", "1"),
+                ("kind", "'result'"),
+                ("storage_key", "gen_random_uuid()::text"),
+                ("upload_id", "'u'"),
+                ("part_bytes", "5242880"),
+                ("size_bytes", "10"),
+                ("digest", "repeat('a', 64)"),
+                ("state", "'open'"),
+                ("finished_at", "NULL"),
+            ];
+            let values: Vec<String> = columns
+                .iter()
+                .map(|(c, v)| {
+                    if *c == column.trim() {
+                        expression.to_owned()
+                    } else {
+                        (*v).to_owned()
+                    }
+                })
+                .collect();
+            let sql = format!(
+                "INSERT INTO job_objects (tenant_id, id, job_id, agent_id, generation, kind, \
+                     storage_key, upload_id, part_bytes, size_bytes, digest, state, finished_at) \
+                 SELECT tenant_id, gen_random_uuid(), id, agent_id, {} FROM jobs WHERE id = '{job}'",
+                values.join(", ")
+            );
+            sqlx::query(sqlx::AssertSqlSafe(sql)).execute(&pool).await
+        }
+    };
+    for bad in [
+        "generation = -1",
+        "kind = 'log'",
+        "storage_key = 'short'",
+        "upload_id = ''",
+        "upload_id = repeat('x', 1025)",
+        "part_bytes = 0",
+        "size_bytes = -1",
+        "size_bytes = 4294967297",
+        "digest = repeat('A', 64)",
+        "digest = repeat('a', 63)",
+        "state = 'done'",
+        "state = 'finished'",
+        "finished_at = now()",
+    ] {
+        assert!(insert(bad).await.is_err(), "{bad}");
+    }
+    for good in [
+        "size_bytes = 0",
+        "size_bytes = 4294967296",
+        "kind = 'commLog'",
+        "state = 'failed'",
+    ] {
+        sqlx::query("DELETE FROM job_objects")
+            .execute(&fx.u.w.pool)
+            .await
+            .unwrap();
+        assert!(insert(good).await.is_ok(), "{good}");
+    }
+    // One live row per job, generation and kind: a second `open` or `completing` is refused, a
+    // failed one is not counted.
+    sqlx::query("DELETE FROM job_objects")
+        .execute(&fx.u.w.pool)
+        .await
+        .unwrap();
+    assert!(insert("state = 'open'").await.is_ok());
+    assert!(insert("state = 'completing'").await.is_err());
+    assert!(insert("generation = 2").await.is_ok());
+    assert!(insert("state = 'failed'").await.is_ok());
+    assert!(insert("state = 'failed'").await.is_ok());
+    // The key of an object is one row's.
+    sqlx::query("UPDATE job_objects SET storage_key = repeat('a', 36)")
+        .execute(&fx.u.w.pool)
+        .await
+        .expect_err("one key for several rows");
+    // Foreign keys, with no cascade: no row without its job, and no job, agent or tenant deleted
+    // under a row.
+    sqlx::query("UPDATE job_objects SET job_id = gen_random_uuid()")
+        .execute(&fx.u.w.pool)
+        .await
+        .expect_err("a row names a job that exists");
+    for sql in [
+        "DELETE FROM jobs",
+        "DELETE FROM agents",
+        "DELETE FROM tenants",
+    ] {
+        assert!(
+            sqlx::query(sql).execute(&fx.u.w.pool).await.is_err(),
+            "{sql}"
+        );
+    }
+    fx.finish().await;
+}

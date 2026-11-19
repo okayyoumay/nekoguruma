@@ -114,6 +114,9 @@ The type of a COP operation:
 **D-PDU API** — Diagnostic Protocol Data Unit API  
 ISO 22900-2 standardized API for vehicle communication interfaces. Exposes a module/CLL/COP object model. Implemented in this project as a gRPC service (`iso22900-service`).
 
+**Data channel** (design 5.2, 14.3, ADR-493)  
+The agent's HTTPS path for bulk data, apart from the control channel: four routes under `/api/v1/agent/uploads` (begin, one part URL per request, status, completion) with which the agent uploads an object to the object store by presigned multipart parts. It uses a session token of its own, which the server judges together with the agent's row on every request. A design, not yet implemented. See **Job object**, **Upload ledger**, **Object store**.
+
 **data phase rate** (SAE J2534-2 clause 21, `CONFIG_FD_CAN_DATA_PHASE_RATE`)  
 The CAN FD-specific bit rate used during a frame's data phase (the portion of an FD frame transmitted faster than the arbitration phase's baud rate). `j2534-0404-service` computes it as `CP_CANFDBaudrate` when nonzero, else falling back to `CP_Baudrate`, and issues it via `PassThruIoctl(SET_CONFIG, CONFIG_FD_CAN_DATA_PHASE_RATE)` — mandatorily *before* `CONFIG_J1962_PINS` on the same channel (clause 21.3.2.5.1; a native connect fails `ERR_FAILED` if this ordering is violated). See **CAN FD**, ADR-158.
 
@@ -192,6 +195,9 @@ The `SocketAddr` (e.g. `127.0.0.1:54321`, or `[::1]:54321` on an IPv6-only host 
 ---
 
 ## H–J
+
+**Job object** (design 14.3, ADR-493)  
+A stored object that belongs to a job and its ownership generation: its final result (the run's final VM state as JSON, kind `result`) or its communication log (kind `commLog`). The server holds one row per object in `job_objects` (the store's key and upload ID, the declared length and SHA-256, the part size, a state of `open`, `completing`, `finished` or `failed`); the object is delivered when the row is `finished`, after the store's read-back verified it. See **Data channel**, **Object store**.
 
 **Handle**  
 An opaque numeric identifier for an API object. In this project, handles are newtype-wrapped `u32` values.
@@ -515,6 +521,9 @@ ISO 15765-2 segmented messaging over CAN: payloads longer than one CAN frame are
 
 **UUDT** — Unacknowledged Unsegmented Data Transfer  
 Single-CAN-frame messaging with no transport-layer segmentation or flow control (e.g. periodic measurement responses). Addressed per ECU via `CP_CanRespUUDTId`. On J2534 hardware, UUDT frames are only visible on a raw `CAN` channel or via the UUDT `FLOW_CONTROL_FILTER` workaround on an `ISO15765` channel (ADR-041); the `dual-channel` CAN channel mode receives them on a companion CAN channel instead (ADR-046), and the `native-mixed` mode receives them via a genuine `PASS_FILTER` on the same ISO15765 channel instead (ADR-160).
+
+**Upload ledger** (agent, design 5.2, ADR-493)  
+The agent's durable list of the objects it has still to upload: one owner-only file per agent ID under `<state>/uploads/`, in the journal's frame format. An entry records what to upload and leaves the file only when the server answers that the object is `finished`; the ledger holds no progress, since the server's status says which parts it has. A new agent ID starts an empty ledger. See **Data channel**, **Job object**.
 
 **Unbound Frame**  
 A content frame (i.e. not an indication frame — see **RxStatus / RxFlag**'s eligibility test) that, after passing UniqueRespIdTable routing (ADR-007), matches no active-Send/Receive registrant, no **Receive Only** registrant, and no armed tester-present discard window — ISO 22900-2 §9.2.6.3.4's full attribution scan (`bind_frame`) falls through every tier. As of ADR-100 Decision §5 (S8), such a frame is discarded outright: not buffered, not delivered as unsolicited `ResultData`. Before ADR-100, every unbound frame was instead delivered to the client unsolicited (`cop_handle: None`) — a deliberate, client-visible behavior change; a client relying on the old blanket delivery (e.g. bus monitoring) should register a `NumSendCycles == 0` **Receive Only** COP with a broad/vacuous `ExpectedResponseStructure` instead, which already receives exactly this class of frame. An indication frame reaching the same fallthrough is unaffected by this flip — it keeps its pre-existing `ResultData` delivery path per ADR-098 (ADR-100 Decision §3 step 1's carve-out).

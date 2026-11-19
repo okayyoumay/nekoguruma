@@ -26,6 +26,10 @@ const VIN: &[u8] = b"NGRSIMECU00000001";
 #[path = "../../agent/tests/support/ngr_agent_binary.rs"]
 mod ngr_agent_binary;
 
+/// The agent's installation file, which `run` and `identify` read first (design 6.7, ADR-494).
+#[path = "../../agent/tests/support/installation_file.rs"]
+mod installation_file;
+
 /// `sim-vci`'s library, through the Cargo lookup `ngr_agent_binary` already includes (one copy of
 /// it per test binary; `common/artifacts.rs` would load it a second time).
 fn sim_vci_path() -> PathBuf {
@@ -160,6 +164,8 @@ impl Surroundings {
             .env_remove("VCI_SERVICE_INSECURE_NO_AUTH")
             // The simulated ECU uses its built-in configuration.
             .env_remove("NGR_SIM_ECU_CONFIG");
+        // The device is installed in user mode, the mode every command here passes.
+        installation_file::install(&mut agent, &self.root, "user", "http://127.0.0.1:1");
         agent
     }
 }

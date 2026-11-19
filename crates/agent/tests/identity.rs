@@ -192,6 +192,7 @@ fn a_release_build_has_no_file_store() {
 /// A variant's document whose procedure is `SecurityAccess`, which every build refuses (ADR-259),
 /// so `run` gets past reading the document and checking the job, as far as it goes before a
 /// worker starts.
+#[cfg(debug_assertions)]
 fn refused_document(dir: &Path) -> std::path::PathBuf {
     use diag_ir::declaration::{EcuDocumentT, EcuVariantT, ProtocolT, encode_ecu_document};
     use diag_ir::{IR_SCHEMA_VERSION, Op, Program};
@@ -231,7 +232,9 @@ fn refused_document(dir: &Path) -> std::path::PathBuf {
 /// variables set. Neither is driven to a worker here (that needs a VCI, which the end-to-end
 /// tests of the worker packages have): each goes as far as the agent's own checks refuse the job,
 /// after argument parsing and reading its inputs, which is where a store access added to the
-/// command would sit.
+/// command would sit. They read the installation file first (ADR-494), which only a debug build
+/// reads from where a test puts it.
+#[cfg(debug_assertions)]
 #[test]
 fn run_and_identify_leave_the_state_directory_alone() {
     let home = tempfile::tempdir().unwrap();
@@ -240,22 +243,23 @@ fn run_and_identify_leave_the_state_directory_alone() {
     let document = refused_document(inputs.path());
     let garbage_plan = inputs.path().join("plan.bin");
     std::fs::write(&garbage_plan, b"not a plan").unwrap();
-    let run = ngr_agent(home.path())
-        .args(["run", "--vci", "none", "--mode", "user", "--document"])
+    let mut run = ngr_agent(home.path());
+    run.args(["run", "--vci", "none", "--mode", "user", "--document"])
         .arg(&document)
         .env(KEY_STORE_VAR, "file")
-        .env(STATE_DIR_VAR, state.path())
-        .output()
-        .unwrap();
+        .env(STATE_DIR_VAR, state.path());
+    installation_file::install(&mut run, home.path(), "user", SERVER);
+    let run = run.output().unwrap();
     assert_exit(&run, 1);
     assert!(String::from_utf8_lossy(&run.stderr).contains("refused"));
-    let identify = ngr_agent(home.path())
+    let mut identify = ngr_agent(home.path());
+    identify
         .args(["identify", "--vci", "none", "--mode", "user", "--plan"])
         .arg(&garbage_plan)
         .env(KEY_STORE_VAR, "file")
-        .env(STATE_DIR_VAR, state.path())
-        .output()
-        .unwrap();
+        .env(STATE_DIR_VAR, state.path());
+    installation_file::install(&mut identify, home.path(), "user", SERVER);
+    let identify = identify.output().unwrap();
     assert_exit(&identify, 1);
     assert!(String::from_utf8_lossy(&identify.stderr).contains("plan refused"));
     assert!(is_empty_dir(state.path()));

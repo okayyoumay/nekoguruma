@@ -339,6 +339,24 @@ mod tests {
         }
     }
 
+    /// A release build's ceiling refuses a write and TesterPresent in a procedure before
+    /// anything opens (ADR-247, ADR-396). `ngr-agent run` checks the program with this ceiling
+    /// before it resolves the VCI; a release binary stops at its installation file first on a
+    /// test machine (ADR-494), so the refusal is shown here rather than through the binary.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn a_release_build_refuses_a_write_and_tester_present_up_front() {
+        let document = document_with_protocols(vec![protocol(Some("UDS"))], None);
+        for service in [0x2E, 0x3E] {
+            let request = program(vec![Op::PushBytes(0), Op::ServiceRequest { service }]);
+            let refused = check_program(&request, Some(&document.variant()), build_ceiling());
+            assert!(
+                matches!(refused, Err((1, HostError::NotAllowed(s))) if s == service),
+                "{service:#x}: {refused:?}"
+            );
+        }
+    }
+
     #[test]
     fn values_that_are_not_service_ids_are_bad_services() {
         assert!(matches!(

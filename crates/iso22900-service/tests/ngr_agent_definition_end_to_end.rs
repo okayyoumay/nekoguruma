@@ -28,6 +28,10 @@ const LIBRARY_NAME: &str = "NGR Mock D-PDU API";
 #[path = "../../agent/tests/support/ngr_agent_binary.rs"]
 mod ngr_agent_binary;
 
+/// The agent's installation file, which `run` reads first (design 6.7, ADR-494).
+#[path = "../../agent/tests/support/installation_file.rs"]
+mod installation_file;
+
 fn ngr_agent_path() -> PathBuf {
     ngr_agent_binary::ngr_agent_path()
 }
@@ -103,6 +107,13 @@ impl Setup {
             .arg(self.root.join("commlog"))
             .env("VCI_CONFIG_PATH", &self.config)
             .env("NGR_PDU_API_ROOT_FILE", &self.root_file)
+            .env(
+                installation_file::VAR,
+                installation_file::write(
+                    &self.root,
+                    &installation_file::text("user", "http://127.0.0.1:1"),
+                ),
+            )
             .env("NGR_SIM_ECU_CONFIG", ecu_config)
             .env_remove("NGR_SIM_ECU_STATE")
             .env_remove("VCI_SERVICE_INSECURE_NO_AUTH")

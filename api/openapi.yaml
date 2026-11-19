@@ -671,6 +671,145 @@ paths:
         '500': { $ref: '#/components/responses/Problem' }
         '503': { $ref: '#/components/responses/Problem' }
 
+  # ------------------------------------------------------------ Data channel (5.2, 14.3, ADR-493)
+  /v1/agent/uploads:
+    post:
+      x-ngr-status: planned
+      tags: [agents]
+      summary: Begin an upload of a job's object (5.2, 14.3, ADR-493)
+      description: |
+        The first of the four data-channel routes. The agent presents its session token (the
+        one of `/v1/agent/session`) as a bearer header. Every request of these routes judges
+        the token and then reads the agent's row: a missing or expired token, and a revoked or
+        missing row, are all **401** (the same answer), and a revoked agent's tokens are
+        dropped. A failed read is **503**. The body is a strict JSON object of at most 4 KiB
+        read within 5 seconds; a wrong shape is **400** before any lookup, and a larger body is
+        **413**.
+
+        The body declares the object: the job, the ownership generation, the kind, the length
+        (0 to 4 GiB) and the SHA-256 as 64 lowercase hex digits. There is no free-form
+        metadata. A job that does not exist or is another agent's is **404**; a length over
+        4 GiB is **413**. Begin is idempotent per job, generation and kind: a row that is not
+        `failed` and declares the same length and digest is answered **200**, one that declares
+        another length or digest is **409**. Otherwise the server starts the multipart upload,
+        inserts the row and answers **201**. Begin is allowed before the job's terminal event
+        has reached the server.
+      security:
+        - agentSession: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UploadBegin' }
+      responses:
+        '200':
+          description: The existing upload of this job, generation and kind
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Upload' }
+        '201':
+          description: A new upload
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Upload' }
+        '400': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/AgentSessionRefused' }
+        '404': { $ref: '#/components/responses/Problem' }
+        '409': { $ref: '#/components/responses/Problem' }
+        '413': { $ref: '#/components/responses/Problem' }
+        '503': { $ref: '#/components/responses/Problem' }
+
+  /v1/agent/uploads/{uploadId}/parts/{part}:
+    post:
+      x-ngr-status: planned
+      tags: [agents]
+      summary: Get the URL for one part of an upload (14.3, ADR-493)
+      description: |
+        The body is empty. `part` runs from 1 to the upload's `partCount`, else **400**. The
+        row must be `open`, else **409**; an upload of another agent or tenant is **404**. The
+        answer is one presigned PUT URL, valid 300 seconds, for that part. Asking again for a
+        part already held is allowed and gives another URL. The agent sends the part only to a
+        URL whose scheme and host are those of the origin it registered with (ADR-493 item 13).
+        Token and agent row are judged as for begin.
+      security:
+        - agentSession: []
+      parameters:
+        - { name: uploadId, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: part, in: path, required: true, schema: { type: integer, minimum: 1, maximum: 820 } }
+      responses:
+        '200':
+          description: The URL of the part
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UploadPartUrl' }
+        '400': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/AgentSessionRefused' }
+        '404': { $ref: '#/components/responses/Problem' }
+        '409': { $ref: '#/components/responses/Problem' }
+        '503': { $ref: '#/components/responses/Problem' }
+
+  /v1/agent/uploads/{uploadId}:
+    get:
+      x-ngr-status: planned
+      tags: [agents]
+      summary: The state of an upload and the parts the store holds (14.3, ADR-493)
+      description: |
+        While the row is `open`, `partsHeld` is the count of leading parts, from part 1, that
+        the store lists with the expected size (`partBytes` for each, the remainder for the
+        last), counted up to the first part that is missing or has another size. The agent
+        resumes from part `partsHeld + 1`. In any other state `partsHeld` is absent. An upload
+        of another agent or tenant is **404**. Token and agent row are judged as for begin.
+      security:
+        - agentSession: []
+      parameters:
+        - { name: uploadId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: The upload's state
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UploadStatus' }
+        '401': { $ref: '#/components/responses/AgentSessionRefused' }
+        '404': { $ref: '#/components/responses/Problem' }
+        '503': { $ref: '#/components/responses/Problem' }
+
+  /v1/agent/uploads/{uploadId}/complete:
+    post:
+      x-ngr-status: planned
+      tags: [agents]
+      summary: Complete an upload and verify the object (14.3, ADR-493, ADR-492)
+      description: |
+        The body is empty. The server moves the row from `open` to `completing` by a
+        compare-and-set, commits that, and runs the store's completion (it checks the parts,
+        completes the upload, reads the object back and compares its length and SHA-256 with
+        the row's) in a task that outlives the request; the row becomes `finished` only after
+        the verification. The request waits for the task up to 20 seconds: **200**
+        `finished` when it is done, else **202** `completing`, and the agent repeats the
+        request. A repeat on a `finished` row is **200**. A part problem (the parts are not as
+        expected) returns the row to `open` and answers **409**; a length or digest mismatch
+        makes the row `failed` with the object deleted and answers **409**, and the agent
+        begins again; any other store error leaves the row `completing` and answers **503**.
+        Token and agent row are judged as for begin.
+      security:
+        - agentSession: []
+      parameters:
+        - { name: uploadId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: The object is verified and the row is `finished`
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UploadCompletion' }
+        '202':
+          description: The completion is still running; repeat the request
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UploadCompletion' }
+        '401': { $ref: '#/components/responses/AgentSessionRefused' }
+        '404': { $ref: '#/components/responses/Problem' }
+        '409': { $ref: '#/components/responses/Problem' }
+        '503': { $ref: '#/components/responses/Problem' }
+
   # ------------------------------------------------------------ Artifacts and extensions
   /v1/artifacts:
     post:
@@ -912,6 +1051,13 @@ components:
       type: http
       scheme: bearer
       bearerFormat: JWT
+    agentSession:
+      type: http
+      scheme: bearer
+      bearerFormat: Agent session token
+      description: |
+        The token `POST /v1/agent/session` returns (6.4, ADR-466), valid 300 seconds. The data
+        channel's routes judge it on every request, together with the agent's row (ADR-493).
     operatorSession:
       type: apiKey
       in: cookie
@@ -939,6 +1085,15 @@ components:
       schema: { type: string }
 
   responses:
+    AgentSessionRefused:
+      description: |
+        The token is missing or expired, or the agent's row is revoked or missing; the same
+        answer for each. A revoked agent's tokens are dropped
+      headers:
+        WWW-Authenticate: { schema: { type: string }, description: '`Bearer`' }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
     Problem:
       description: Error (RFC 9457)
       content:
@@ -970,6 +1125,49 @@ components:
       properties:
         status: { type: string, enum: [ok] }
 
+    UploadBegin:
+      type: object
+      additionalProperties: false
+      required: [jobId, generation, kind, sizeBytes, sha256]
+      properties:
+        jobId: { type: string, format: uuid }
+        generation: { type: integer, minimum: 0, description: The job's ownership generation (ADR-229) }
+        kind:
+          type: string
+          enum: [result, commLog]
+          description: The run's final VM state as JSON, or the job's communication log (8.11)
+        sizeBytes: { type: integer, minimum: 0, maximum: 4294967296, description: The length the agent declares; over 4 GiB is refused }
+        sha256: { type: string, pattern: '^[0-9a-f]{64}$', description: SHA-256 of the object, lowercase hex }
+    Upload:
+      type: object
+      required: [uploadId, partBytes, partCount, state]
+      properties:
+        uploadId: { type: string, format: uuid, description: The row's ID; the store's key and upload ID never leave the server }
+        partBytes: { type: integer, description: The part size the server set (5 MiB), kept in the row }
+        partCount: { type: integer, minimum: 1, description: The length divided by the part size, rounded up, and at least 1 }
+        state: { $ref: '#/components/schemas/UploadState' }
+    UploadState:
+      type: string
+      enum: [open, completing, finished, failed]
+    UploadPartUrl:
+      type: object
+      required: [url, expiresInSecs]
+      properties:
+        url: { type: string, description: A presigned PUT URL; a bearer for its life }
+        expiresInSecs: { type: integer, description: 300 }
+    UploadStatus:
+      type: object
+      required: [state, partBytes, partCount]
+      properties:
+        state: { $ref: '#/components/schemas/UploadState' }
+        partBytes: { type: integer }
+        partCount: { type: integer }
+        partsHeld: { type: integer, minimum: 0, description: Present while the state is `open` }
+    UploadCompletion:
+      type: object
+      required: [state]
+      properties:
+        state: { $ref: '#/components/schemas/UploadState' }
     Problem:
       type: object
       description: RFC 9457. `code` holds a machine-readable value

@@ -35,8 +35,8 @@ proposed. It is a specification: none of it is implemented when this record is w
 1. **Four HTTPS routes under `/api/v1/agent/uploads`**, on the same listener and behind the same
    request guard as the agent's other routes (design 13.3). Every request carries the session
    token as a bearer header, obtained as the control channel's is (design 6.4, ADR-466 items 1
-   and 2). A body is at most 4 KiB, read within 5 seconds, a strict JSON object, and a wrong
-   shape is a 400 before any lookup (as ADR-466 item 1). Errors are `application/problem+json`.
+   and 2). A body is at most 4 KiB, read within 5 seconds, a strict JSON object, a larger body
+   is a 413, and a wrong shape is a 400 before any lookup (as ADR-466 item 1). Errors are `application/problem+json`.
    The routes are: `POST /uploads` (begin), `POST /uploads/{uploadId}/parts/{part}` (one part
    URL), `GET /uploads/{uploadId}` (status) and `POST /uploads/{uploadId}/complete`.
 2. **Every request judges the token and then reads the agent's row.** The token is looked up

@@ -249,8 +249,22 @@ The release build selects no store yet: the platform stores (a DPAPI blob on Win
 |---|---|---|---|
 | user | Unix | `$XDG_STATE_HOME/nekoguruma` (absolute), else `~/.local/state/nekoguruma` | the agent, 0700 |
 | user | Windows | `%LOCALAPPDATA%\nekoguruma` | the agent |
-| device | Unix | `/var/lib/nekoguruma` | the installation (for example systemd's `StateDirectory=`, 0700, the service account); the agent creates only sub-directories, and a missing root is an error |
+| device | Unix | `/var/lib/nekoguruma` | the installation: the shipped systemd unit (`StateDirectory=`, 0700, the `ngr-agent` account; "Installation (Linux)" below); the agent creates only sub-directories, and a missing root is an error |
 | device | Windows | the service account's own `%LOCALAPPDATA%\nekoguruma` | the agent |
+
+#### Installation (Linux)
+
+Two files in `packaging/` install the device-mode agent on Linux: `systemd/ngr-agent.service` (runs `/usr/bin/ngr-agent connect --mode device` as `ngr-agent`, with `StateDirectory=nekoguruma` and `StateDirectoryMode=0700`, so systemd creates the device root above) and `sysusers.d/ngr-agent.conf` (creates that system account without a login shell). The unit has no `DynamicUser=`: the state directory and the agent key must belong to one account across restarts. The unit restarts the agent after exit 3 and after a crash, and not after exit 1, 2 or 4 (see "`ngr-agent connect`" for the statuses), since a restart cannot repair those. `crates/agent/tests/packaging.rs` checks that the unit, the sysusers file and `agent::state::DEVICE_ROOT` agree. To install, with the agent binary at `/usr/bin/ngr-agent`:
+
+```sh
+install -m 0644 packaging/sysusers.d/ngr-agent.conf /usr/lib/sysusers.d/ngr-agent.conf
+install -m 0644 packaging/systemd/ngr-agent.service /etc/systemd/system/ngr-agent.service
+systemd-sysusers
+systemctl daemon-reload
+systemctl enable --now ngr-agent.service
+```
+
+The unit starts `connect`, which exits 1 until `ngr-agent register` has run as the `ngr-agent` account, so register first. The unit does not yet provide the agent key (the Linux device key store comes with its own change).
 
 Each kind of state has a sub-directory of its own: `identity` holds the key's lock file and the debug store, `registration` the registration record, its lock, the issue-time mark file `<agent-id>.issue-mark.v1.json` (below) and the received-jobs ledger `<agent-id>.received-jobs.v1` ("Received-jobs ledger" below) with its lock `received-jobs.lock`, `control` the control channel session's connection lock, `outbox` the outbox (below) and `journal` the write-job journal (`agent::journal::journal_dir`, and `JournalSetup::in_mode_dir` for a job's setup). The journal is linked into place with a hard link, so the first time a process resolves `journal` it also probes that its file system supports hard links (FAT and exFAT do not): the probe creates a file named after the process and a count, links it and removes both, so probes running at once never remove each other's files and a name already taken is skipped, and a directory that fails is refused with the reason (no path in the message). A sub-directory is created readable by its account only, and on Unix one that is writable by its group or others is refused. The operational log's directory (below) keeps its own rules.
 

@@ -1,7 +1,7 @@
 # ADR-285: The Launcher Checks the Worker's Configuration File Before Reading It
 
 **Date:** 2026-10-13
-**Status:** Accepted
+**Status:** Accepted (the agent's installation file takes the same check with no leniency in user mode, ADR-494)
 **Affects:** `vci-service-launcher` (`start_service`, `config_check.rs`, `VciServer::new`,
 `ServiceIdentity`), `ngr-library-resolver` (`check_files_with`), `iso22900-service` and
 `j2534-0404-service` (`preload.rs`, service construction), design 7.2, ADR-270 Decision item 5

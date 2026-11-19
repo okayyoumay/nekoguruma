@@ -18,6 +18,8 @@
 //! - [`identification`]: the identification job's plan, its checks and the endpoints it derives (ADR-395)
 //! - [`identity`]: the agent's key in a named-secret store, created once under a lock (design 6.4,
 //!   ADR-459, ADR-460)
+//! - [`installation`]: the installation file `agent.toml`, what the installation decides for this
+//!   device (design 6.2, 6.7, ADR-494)
 //! - [`registration`]: the agent's initial registration with the server, and its record (design 6.4,
 //!   ADR-463, ADR-470)
 //! - [`server_http`]: the HTTP/1 client for the agent's calls to the server (ADR-470)
@@ -48,6 +50,7 @@ pub mod host;
 pub mod identification;
 pub mod identity;
 pub mod inputs;
+pub mod installation;
 pub mod instruction;
 pub mod job_report;
 pub mod journal;

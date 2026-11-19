@@ -163,6 +163,20 @@ throughout.
   after that, and the reopen is tried again before the next attempt; a corrupt file is an `error`
   line and ends the session.
 
+- **The installation file** (`agent::installation`, ADR-494), read by `identity`, `register` and
+  `connect` after the log starts:
+  - A valid file is one `info` entry, "installation file read", with the mode, the profile, the
+    startup method and the root key's fingerprint (hex of a hash) as fields. The path and the
+    server's origin are in its `external` field, as `file {path} server {origin}`, and only
+    there: the origin is the operator's own text and the path may name a user's directory. The
+    root key's PEM is never logged.
+  - A file that cannot be used is one `error` entry, "the installation file cannot be used",
+    with the error's own text as the `error` field (a fixed sentence that names a key and the
+    rule it broke, a line number for a syntax error, or an I/O error kind; never a value from the
+    file, since `toml`'s own error text, which quotes the line, is not used) and, in `external`,
+    `file {path}` and, for a refusal by the writability check, the findings, which name paths.
+    The same fixed sentence is printed on standard error by the command.
+
 ## A crate not yet checked
 
 A crate that starts to reach the agent's subscriber before its calls have been checked against

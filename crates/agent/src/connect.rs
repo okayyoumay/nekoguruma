@@ -3,8 +3,11 @@
 //!
 //! The order, where the first step that fails decides:
 //!
+//! 0. The installation file ([`crate::installation`], ADR-494), read by the binary before this
+//!    flow starts: the origin it names is passed to [`run`].
 //! 1. [`crate::control::open`]: the connection lock, the registration lock and the registration
-//!    record. A missing record ends the command before the key store is touched.
+//!    record, whose origin must be the installed one (a record for another server is exit 1,
+//!    "register again"). A missing record ends the command before the key store is touched.
 //! 2. The agent's outbox ([`crate::outbox::Outbox::open`], ADR-478): the file of the record's
 //!    agent ID, created when missing. One that does not read back is corrupt, and the owner
 //!    registers again (exit 1); another process holding it, or a directory that cannot be used,
@@ -42,6 +45,7 @@ use crate::deadline::{IssueMark, MarkError, SystemClock};
 use crate::identity::{AgentKey, IdentityError, agent_key};
 use crate::outbox::{Outbox, OutboxError};
 use crate::received_jobs::{LedgerError, ReceivedJobs};
+use crate::registration::origin::ServerOrigin;
 use crate::registration::record::RecordError;
 
 /// The first wait before the key store is tried again, as the session's own delay starts.
@@ -141,6 +145,11 @@ fn control_error(error: &ControlError) -> ConnectError {
             Exit::CannotConnect,
             "register again: the agent key is not the one the registration record names",
         ),
+        ControlError::ServerMismatch => fail(
+            Exit::CannotConnect,
+            "register again: the registration record names another server than the installation \
+             file; run `ngr-agent register --replace`",
+        ),
     }
 }
 
@@ -229,10 +238,15 @@ fn identity_error(error: &IdentityError) -> ConnectError {
     fail(exit, error.to_string())
 }
 
-/// Runs the session of `mode` until `stop` resolves. `Ok` is a stop by the signal.
-pub async fn run(mode: OperatingMode, stop: impl Future<Output = ()>) -> Result<(), ConnectError> {
+/// Runs the session of `mode` to the server `installed` (the installation file's) until `stop`
+/// resolves. `Ok` is a stop by the signal.
+pub async fn run(
+    mode: OperatingMode,
+    installed: &ServerOrigin,
+    stop: impl Future<Output = ()>,
+) -> Result<(), ConnectError> {
     // Both locks and the record first: no record ends the command with the key store untouched.
-    let opened = control::open(mode).map_err(|error| control_error(&error))?;
+    let opened = control::open(mode, installed).map_err(|error| control_error(&error))?;
     // After the record (it names the agent ID) and before the key store, which a corrupt outbox
     // need not wait for. Dropping `opened` on the error releases both locks.
     let outbox =

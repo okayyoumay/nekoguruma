@@ -22,6 +22,11 @@ use crate::redeem::World;
 #[path = "../../../agent/tests/support/ngr_agent_binary.rs"]
 pub(crate) mod ngr_agent_binary;
 
+/// The agent's installation file, which names the server `register` and `connect` use
+/// (ADR-494).
+#[path = "../../../agent/tests/support/installation_file.rs"]
+pub(crate) mod installation_file;
+
 /// The registration record as the agent wrote it: the strict reader is the agent's own and is
 /// tested there, so this reads the fields the test compares.
 struct Record {
@@ -67,11 +72,23 @@ pub(crate) struct AgentEnv {
 }
 
 impl AgentEnv {
+    /// An environment whose installation file (user mode) names a server at port 1, which only
+    /// `identity` uses; [`AgentEnv::install`] names the real one.
     pub(crate) fn new() -> AgentEnv {
-        AgentEnv {
+        let env = AgentEnv {
             home: tempfile::tempdir().unwrap(),
             state: tempfile::tempdir().unwrap(),
-        }
+        };
+        env.install(1);
+        env
+    }
+
+    /// Writes the installation file for the server at `port`: user mode, the loopback origin.
+    pub(crate) fn install(&self, port: u16) {
+        installation_file::write(
+            self.home.path(),
+            &installation_file::text("user", &format!("http://127.0.0.1:{port}")),
+        );
     }
 
     pub(crate) fn command(&self, args: &[String]) -> Command {
@@ -81,6 +98,7 @@ impl AgentEnv {
             .env("HOME", self.home.path())
             .env("XDG_STATE_HOME", self.home.path().join("xdg"))
             .env("LOCALAPPDATA", self.home.path().join("local"))
+            .env(installation_file::VAR, self.home.path().join("agent.toml"))
             .env("NGR_AGENT_KEY_STORE", "file")
             .env("NGR_AGENT_STATE_DIR", self.state.path());
         command
@@ -133,18 +151,13 @@ pub(crate) async fn issue(world: &World, fingerprint: &str) -> (String, String) 
     (issued.code.as_str().to_owned(), issued.server_key_id)
 }
 
-fn register_args(world: &World, server_key: &str, extra: &[&str]) -> Vec<String> {
-    let mut args: Vec<String> = [
-        "register",
-        "--mode",
-        "user",
-        "--server",
-        &format!("http://127.0.0.1:{}", world.server.addr.port()),
-        "--server-key",
-        server_key,
-    ]
-    .map(str::to_owned)
-    .to_vec();
+/// The `register` arguments: the server is the one `env`'s installation file names, which this
+/// points at the test's server, and `--server` is left out unless `extra` gives it.
+fn register_args(env: &AgentEnv, world: &World, server_key: &str, extra: &[&str]) -> Vec<String> {
+    env.install(world.server.addr.port());
+    let mut args: Vec<String> = ["register", "--mode", "user", "--server-key", server_key]
+        .map(str::to_owned)
+        .to_vec();
     args.extend(extra.iter().map(|a| (*a).to_owned()));
     args
 }
@@ -176,8 +189,15 @@ async fn an_agent_registers_with_a_code_and_stores_the_record() {
     let fingerprint = fingerprint(&env).await;
     let (code, server_key) = issue(&world, &fingerprint).await;
 
+    // `--server` may repeat the installed origin; the other tests leave it out.
+    let url = format!("http://127.0.0.1:{}", world.server.addr.port());
     let output = run(
-        env.command(&register_args(&world, &server_key, &[])),
+        env.command(&register_args(
+            &env,
+            &world,
+            &server_key,
+            &["--server", &url],
+        )),
         format!("{code}\n"),
     )
     .await;
@@ -225,7 +245,7 @@ async fn a_wrong_or_reused_code_is_refused_and_writes_no_record() {
         .as_str()
         .to_owned();
     let output = run(
-        env.command(&register_args(&world, &server_key, &[])),
+        env.command(&register_args(&env, &world, &server_key, &[])),
         never.clone(),
     )
     .await;
@@ -236,14 +256,14 @@ async fn a_wrong_or_reused_code_is_refused_and_writes_no_record() {
 
     // The issued code works once; the second use is refused and the first record stays.
     let ok = run(
-        env.command(&register_args(&world, &server_key, &[])),
+        env.command(&register_args(&env, &world, &server_key, &[])),
         code.clone(),
     )
     .await;
     assert_exit(&ok, 0);
     let first = std::fs::read(env.record()).unwrap();
     let again = run(
-        env.command(&register_args(&world, &server_key, &["--replace"])),
+        env.command(&register_args(&env, &world, &server_key, &["--replace"])),
         code.clone(),
     )
     .await;
@@ -269,7 +289,7 @@ async fn a_wrong_server_key_is_refused_and_writes_no_record() {
         .public_key()
         .fingerprint_hex();
 
-    let output = run(env.command(&register_args(&world, &other, &[])), code).await;
+    let output = run(env.command(&register_args(&env, &world, &other, &[])), code).await;
     assert_exit(&output, 1);
     assert!(text(&output.stderr).contains("--server-key is not this server's"));
     assert!(!record_exists(&env));
@@ -288,7 +308,11 @@ async fn an_existing_record_needs_replace_and_the_new_one_has_a_new_agent_id() {
     let fingerprint = fingerprint(&env).await;
 
     let (code1, server_key) = issue(&world, &fingerprint).await;
-    let first = run(env.command(&register_args(&world, &server_key, &[])), code1).await;
+    let first = run(
+        env.command(&register_args(&env, &world, &server_key, &[])),
+        code1,
+    )
+    .await;
     assert_exit(&first, 0);
     let old_bytes = std::fs::read(env.record()).unwrap();
     let old = Record::read(&env.record()).unwrap();
@@ -296,7 +320,7 @@ async fn an_existing_record_needs_replace_and_the_new_one_has_a_new_agent_id() {
     // Without --replace: exit 5, and the unused code is not spent.
     let (code2, _) = issue(&world, &fingerprint).await;
     let refused = run(
-        env.command(&register_args(&world, &server_key, &[])),
+        env.command(&register_args(&env, &world, &server_key, &[])),
         code2.clone(),
     )
     .await;
@@ -306,7 +330,7 @@ async fn an_existing_record_needs_replace_and_the_new_one_has_a_new_agent_id() {
 
     // With --replace: the same code now registers, and the record is new.
     let replaced = run(
-        env.command(&register_args(&world, &server_key, &["--replace"])),
+        env.command(&register_args(&env, &world, &server_key, &["--replace"])),
         code2,
     )
     .await;

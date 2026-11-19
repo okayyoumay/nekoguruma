@@ -464,6 +464,37 @@ pub fn pdu_api_root_file_override() -> Option<PathBuf> {
     }
 }
 
+/// The agent's installation file (design 6.7, ADR-494): what the installation decides for this
+/// device, which the agent reads with the design 7.2 writability rules. Fixed at build time:
+/// `NGR_AGENT_INSTALLATION_FILE` at build time, either absolute or relative to the fixed system
+/// directory of [`fixed_system_root`] (default `nekoguruma/agent.toml`, so
+/// `/etc/nekoguruma/agent.toml` on Linux and `%ProgramData%\nekoguruma\agent.toml` on Windows).
+/// No `config-root-*` feature moves it. In debug builds only (ADR-073), a non-empty runtime
+/// `NGR_AGENT_INSTALLATION_FILE` takes precedence ([`agent_installation_file_override`]); release
+/// builds read no environment variable here. The file need not exist.
+pub fn agent_installation_file() -> PathBuf {
+    const INSTALLATION_FILE: &str = env!("NGR_AGENT_INSTALLATION_FILE");
+    agent_installation_file_override()
+        .unwrap_or_else(|| in_fixed_system_root(PathBuf::from(INSTALLATION_FILE)))
+}
+
+/// The debug-only runtime override of [`agent_installation_file`] on its own: the file a
+/// non-empty runtime `NGR_AGENT_INSTALLATION_FILE` names (a relative value resolved against the
+/// fixed system directory, like the build-time value), or `None` when it is unset or empty and
+/// always in release builds. Any set value counts, also one equal to the build-time value, which
+/// Cargo sets in this crate's own test processes. The agent trusts its own user as the file's
+/// owner only while this is `Some`.
+pub fn agent_installation_file_override() -> Option<PathBuf> {
+    #[cfg(debug_assertions)]
+    {
+        runtime_override(std::env::var_os("NGR_AGENT_INSTALLATION_FILE")).map(in_fixed_system_root)
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        None
+    }
+}
+
 /// A debug-only runtime override (ADR-073) from an environment variable's value: none when
 /// the variable is unset or empty, so an empty value falls back to the build-time location
 /// instead of resolving to the root itself.
@@ -1382,7 +1413,8 @@ mod tests {
     fn default_locations_are_under_nekoguruma() {
         let defaults = env!("VCI_CONFIG_PATH") == "nekoguruma/config.toml"
             && env!("NGR_J2534_DEFINITION_DIR") == "nekoguruma/j2534"
-            && env!("NGR_PDU_API_ROOT_FILE") == "pdu_api_root.xml";
+            && env!("NGR_PDU_API_ROOT_FILE") == "pdu_api_root.xml"
+            && env!("NGR_AGENT_INSTALLATION_FILE") == "nekoguruma/agent.toml";
         // Cargo puts `rustc-env` values into the test process's environment as well, so a
         // variable holding the embedded value is no override.
         let overridden = |name: &str, embedded: &str| {
@@ -1390,10 +1422,15 @@ mod tests {
         };
         let runtime_overrides = overridden("VCI_CONFIG_PATH", env!("VCI_CONFIG_PATH"))
             || overridden("NGR_J2534_DEFINITION_DIR", env!("NGR_J2534_DEFINITION_DIR"))
-            || overridden("NGR_PDU_API_ROOT_FILE", env!("NGR_PDU_API_ROOT_FILE"));
+            || overridden("NGR_PDU_API_ROOT_FILE", env!("NGR_PDU_API_ROOT_FILE"))
+            || overridden(
+                "NGR_AGENT_INSTALLATION_FILE",
+                env!("NGR_AGENT_INSTALLATION_FILE"),
+            );
         if !defaults || runtime_overrides {
             eprintln!(
-                "skipped: VCI_CONFIG_PATH, NGR_J2534_DEFINITION_DIR or NGR_PDU_API_ROOT_FILE is set"
+                "skipped: VCI_CONFIG_PATH, NGR_J2534_DEFINITION_DIR, NGR_PDU_API_ROOT_FILE or \
+                 NGR_AGENT_INSTALLATION_FILE is set"
             );
             return;
         }
@@ -1409,6 +1446,12 @@ mod tests {
         assert_eq!(
             pdu_api_root_file(),
             fixed_system_root().join("pdu_api_root.xml")
+        );
+        // The agent's installation file sits beside the configuration file's default, in the
+        // fixed system directory, whatever root a test selects.
+        assert_eq!(
+            agent_installation_file(),
+            fixed_system_root().join("nekoguruma/agent.toml")
         );
     }
 

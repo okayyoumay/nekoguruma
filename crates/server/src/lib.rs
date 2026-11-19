@@ -39,9 +39,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
-use axum::http::StatusCode;
+use axum::http::{Method, StatusCode};
 use axum::middleware;
-use axum::routing::{any, get, post};
+use axum::routing::{MethodRouter, any, get, post};
 use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
@@ -84,14 +84,61 @@ pub struct AppState {
     pub hasher: Hasher,
 }
 
+/// A route the server serves: the HTTP method and the path, as a client sends them. The control
+/// channel's route takes every method (its refusals are problem documents, 405 included) and is
+/// listed with `GET`, the method of the upgrade.
+pub type ServedRoute = (Method, &'static str);
+
+/// The routes as they are mounted, so that the list of what is served is the router's own and
+/// cannot drift from it. `api/openapi.yaml` is checked against it (`tests/api_spec.rs`).
+struct Mounts(Vec<ServedRoute>);
+
+impl Mounts {
+    /// Mounts `handler` at `path` and records the route. Every route of [`router`] goes through
+    /// here; a test in `tests/postgres/api_spec.rs` refuses any other
+    /// call of the router's own mounting method in this file.
+    fn mount<S: Clone + Send + Sync + 'static>(
+        &mut self,
+        router: Router<S>,
+        method: Method,
+        path: &'static str,
+        handler: MethodRouter<S>,
+    ) -> Router<S> {
+        self.0.push((method, path));
+        router.route(path, handler)
+    }
+}
+
 /// The server's routes behind the local profile's request guard (design 13, 13.3).
 ///
 /// The guard wraps the whole route table as a service (axum's pattern for middleware that runs
 /// before routing), so a request it rejects never reaches the router: no method-router answer
 /// (405 with `Allow`) and no fallback is seen for it.
 pub fn router(state: AppState) -> Router {
-    let health = Router::new()
-        .route("/api/v1/health", get(health::health))
+    router_with_routes(state).0
+}
+
+/// [`router`] and the list of the routes it serves, in the order they are mounted. The guard is
+/// the same; tests use the list to check what is served against `api/openapi.yaml`.
+#[doc(hidden)]
+pub fn router_with_routes(state: AppState) -> (Router, Vec<ServedRoute>) {
+    let (routes, served) = routes(state.clone());
+    // The standard profile supplies its own ingress layer here (design 13).
+    let guarded = middleware::from_fn_with_state(state.port, local_guard::guard).layer(routes);
+    (Router::new().fallback_service(guarded), served)
+}
+
+/// The route table without the guard, with the list of its routes.
+#[doc(hidden)]
+pub fn routes(state: AppState) -> (Router, Vec<ServedRoute>) {
+    let mut mounts = Mounts(Vec::new());
+    let health = mounts
+        .mount(
+            Router::new(),
+            Method::GET,
+            "/api/v1/health",
+            get(health::health),
+        )
         .with_state(state.pool.clone());
     // Login, logout and the whoami route; the session layer is the one every operator route
     // mounts with `route_layer`, so that an unknown path and a wrong method are answered first.
@@ -103,7 +150,9 @@ pub fn router(state: AppState) -> Router {
     );
     // The layer is mounted on the method router (`MethodRouter::route_layer`), not on the
     // router: only the former leaves the 405 for a wrong method outside the layer.
-    let signed_in = Router::new().route(
+    let signed_in = mounts.mount(
+        Router::new(),
+        Method::GET,
         operator_session::ME_PATH,
         get(operator_session::me).route_layer(middleware::from_fn_with_state(
             auth.clone(),
@@ -111,8 +160,10 @@ pub fn router(state: AppState) -> Router {
         )),
     );
     // The job route takes the same layer and has its own state.
-    let jobs = Router::new()
-        .route(
+    let jobs = mounts
+        .mount(
+            Router::new(),
+            Method::POST,
             jobs::PATH,
             post(jobs::create).route_layer(middleware::from_fn_with_state(
                 auth.clone(),
@@ -123,26 +174,48 @@ pub fn router(state: AppState) -> Router {
             state.pool.clone(),
             Arc::clone(&state.instruction_key),
         ));
-    let operator = Router::new()
-        .route(operator_session::LOGIN_PATH, post(operator_session::login))
-        .route(
+    let operator = mounts.mount(
+        Router::new(),
+        Method::POST,
+        operator_session::LOGIN_PATH,
+        post(operator_session::login),
+    );
+    let operator = mounts
+        .mount(
+            operator,
+            Method::POST,
             operator_session::LOGOUT_PATH,
             post(operator_session::logout),
         )
         .merge(signed_in)
         .with_state(auth);
     // The redemption route keeps its own limiter and log gates: one set per router.
-    let register = Router::new()
-        .route(register::PATH, post(register::register))
+    let register = mounts
+        .mount(
+            Router::new(),
+            Method::POST,
+            register::PATH,
+            post(register::register),
+        )
         .with_state(register::Registrar::new(
             state.pool.clone(),
             state.instruction_key,
         ));
     // The challenge store, the two limiters and the log gates of the proof exchange are per
     // router too; the token table is the state's, shared with the control channel route.
-    let exchange = Router::new()
-        .route(session::CHALLENGE_PATH, post(session::challenge))
-        .route(session::SESSION_PATH, post(session::session))
+    let exchange = mounts.mount(
+        Router::new(),
+        Method::POST,
+        session::CHALLENGE_PATH,
+        post(session::challenge),
+    );
+    let exchange = mounts
+        .mount(
+            exchange,
+            Method::POST,
+            session::SESSION_PATH,
+            post(session::session),
+        )
         .with_state(session::Exchange::new(
             state.pool.clone(),
             state.port,
@@ -150,8 +223,13 @@ pub fn router(state: AppState) -> Router {
         ));
     // The control channel judges the token the exchange issues, and hands its sockets to the hub.
     // It takes every method, so that its 405 is a problem document like its other refusals.
-    let control = Router::new()
-        .route(control::PATH, any(control::upgrade))
+    let control = mounts
+        .mount(
+            Router::new(),
+            Method::GET,
+            control::PATH,
+            any(control::upgrade),
+        )
         .with_state(control::Control::new(state.pool, state.sessions, state.hub));
     let routes = health
         .merge(operator)
@@ -160,9 +238,7 @@ pub fn router(state: AppState) -> Router {
         .merge(exchange)
         .merge(control)
         .fallback(|| async { problem::Problem::new(StatusCode::NOT_FOUND, "Not found") });
-    // The standard profile supplies its own ingress layer here (design 13).
-    let guarded = middleware::from_fn_with_state(state.port, local_guard::guard).layer(routes);
-    Router::new().fallback_service(guarded)
+    (routes, mounts.0)
 }
 
 /// Why `Server::start` failed.

@@ -14,6 +14,10 @@ info:
     ADR-469): `POST /v1/login` sets the `ngr_session` cookie, and every operator route takes
     that cookie in place of a bearer token.
 
+    An operation the server does not implement yet carries `x-ngr-status: planned`; every
+    other operation is served. A test checks this against the routes the server mounts
+    (`api/README.md`).
+
 servers:
   - url: https://example.com/api
     description: Standard deployment
@@ -185,6 +189,7 @@ paths:
 
   /v1/jobs/{jobId}:
     get:
+      x-ngr-status: planned
       tags: [jobs]
       summary: Get job status
       parameters:
@@ -197,6 +202,7 @@ paths:
 
   /v1/jobs/{jobId}/cancel:
     post:
+      x-ngr-status: planned
       tags: [jobs]
       summary: Request cancellation
       description: |
@@ -209,6 +215,7 @@ paths:
 
   /v1/jobs/{jobId}/hmi/{requestId}:
     post:
+      x-ngr-status: planned
       tags: [jobs]
       summary: Respond to an HMI request (8.6)
       parameters:
@@ -229,6 +236,7 @@ paths:
 
   /v1/jobs/{jobId}/offline-package:
     get:
+      x-ngr-status: planned
       tags: [jobs]
       summary: Get the offline job package (5.7)
       description: |
@@ -250,6 +258,7 @@ paths:
   # ------------------------------------------------------------ Agents
   /v1/agents:
     get:
+      x-ngr-status: planned
       tags: [agents]
       summary: List operable agents
       description: Returns only agents whose allowed-user list includes the caller (6.6).
@@ -263,6 +272,7 @@ paths:
 
   /v1/agents/{agentId}:
     get:
+      x-ngr-status: planned
       tags: [agents]
       parameters: [{ $ref: '#/components/parameters/AgentId' }]
       responses:
@@ -273,6 +283,7 @@ paths:
 
   /v1/agents/{agentId}/revoke:
     post:
+      x-ngr-status: planned
       tags: [agents]
       summary: Revoke an agent key (16.3)
       parameters: [{ $ref: '#/components/parameters/AgentId' }]
@@ -663,6 +674,7 @@ paths:
   # ------------------------------------------------------------ Artifacts and extensions
   /v1/artifacts:
     post:
+      x-ngr-status: planned
       tags: [artifacts]
       summary: Ingest an ECU artifact (11.2)
       description: |
@@ -686,6 +698,7 @@ paths:
 
   /v1/artifacts/{digest}/publish:
     post:
+      x-ngr-status: planned
       tags: [artifacts]
       summary: Publish a version (staged rollout)
       parameters:
@@ -705,6 +718,7 @@ paths:
 
   /v1/extensions:
     post:
+      x-ngr-status: planned
       tags: [extensions]
       summary: Ingest an extension package (9.4)
       description: |
@@ -732,6 +746,7 @@ paths:
   # ------------------------------------------------------------ Acquired data
   /v1/datasets/{datasetId}:
     get:
+      x-ngr-status: planned
       tags: [data]
       summary: Return metadata for acquired data (4.5)
       parameters:
@@ -747,6 +762,7 @@ paths:
 
   /v1/datasets/{datasetId}/series:
     get:
+      x-ngr-status: planned
       tags: [data]
       summary: Read a time series at a specified resolution
       description: |
@@ -777,6 +793,7 @@ paths:
 
   /v1/datasets/{datasetId}/annotations:
     post:
+      x-ngr-status: planned
       tags: [data]
       summary: Add an annotation
       description: Values acquired from the vehicle cannot be edited. Annotations are separate records (4.3).
@@ -797,6 +814,7 @@ paths:
 
   /v1/datasets/{datasetId}/records:
     put:
+      x-ngr-status: planned
       tags: [data]
       summary: Update a work record (3-way merge)
       description: |
@@ -824,6 +842,7 @@ paths:
 
   /v1/changes:
     get:
+      x-ngr-status: planned
       tags: [data]
       summary: Change feed (4.4)
       parameters:
@@ -843,6 +862,7 @@ paths:
   # ------------------------------------------------------------ SOVD
   /v1/sovd/components:
     get:
+      x-ngr-status: planned
       tags: [sovd]
       summary: Component hierarchy (VCI → vehicle → ECU)
       responses:
@@ -853,6 +873,7 @@ paths:
 
   /v1/sovd/components/{componentId}/data:
     get:
+      x-ngr-status: planned
       tags: [sovd]
       description: Derived from IR data objects. Use WebSocket for 10ms-interval subscriptions
       parameters: [{ $ref: '#/components/parameters/ComponentId' }]
@@ -861,6 +882,7 @@ paths:
 
   /v1/sovd/components/{componentId}/faults:
     get:
+      x-ngr-status: planned
       tags: [sovd]
       description: DTCs. Read-only; annotations only
       parameters: [{ $ref: '#/components/parameters/ComponentId' }]
@@ -869,6 +891,7 @@ paths:
 
   /v1/sovd/components/{componentId}/operations:
     get:
+      x-ngr-status: planned
       tags: [sovd]
       parameters: [{ $ref: '#/components/parameters/ComponentId' }]
       responses:
@@ -876,6 +899,7 @@ paths:
 
   /v1/sovd/components/{componentId}/updates:
     get:
+      x-ngr-status: planned
       tags: [sovd]
       description: ECU reprogramming. Execution is mapped onto the job model
       parameters: [{ $ref: '#/components/parameters/ComponentId' }]

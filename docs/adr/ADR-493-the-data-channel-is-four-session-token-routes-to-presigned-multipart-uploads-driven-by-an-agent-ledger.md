@@ -1,7 +1,7 @@
 # ADR-493: The Data Channel Is Four Session-Token Routes to Presigned Multipart Uploads, Driven by the Agent's Upload Ledger
 
 **Date:** 2026-11-19
-**Status:** Accepted (items 15 to 18 added with the begin, part URL and status routes)
+**Status:** Accepted (items 15 to 18 added with the begin, part URL and status routes; item 6's mapping corrected and items 19 to 23 added with the complete route; item 17 extended by item 23)
 **Affects:** design 5.2, 5.4, 13, 13.3, 14.3, 14.4; `crates/server` (the upload routes, a migration for `job_objects`, `db/README.md`), `crates/agent` (the uploader, the ledger, `connect`, a debug-only enqueue command), `crates/shared-proto` if the route bodies are shared, `api/openapi.yaml` (the four operations, marked planned until served), `docs/glossary.md`; uses ADR-492's `MultipartStore` and ADR-466's session token; fixes the acknowledgement ADR-455 left
 
 ## Context
@@ -81,16 +81,16 @@ proposed. It is a specification: none of it is implemented when this record is w
    request. A request that finds the row `completing` waits on the task in this process, or
    starts it again when there is none (a crash left it; the store's completion is safe to
    repeat). A request on a `finished` row answers 200. Failures of the store: a part problem
-   (`NoParts`, `MissingPart`, `PartTooSmall`, `PartsLengthMismatch`, `PartsChanged`) returns
-   the row to `open` and answers 409 (the upload and its parts are untouched, so the agent
-   reads the status and sends again); `HashMismatch`, `LengthMismatch` and `ObjectTooLarge`
-   (the object is already deleted) make the row `failed` and answer 409, and the agent begins
+   (`NoParts`, `MissingPart`, `PartTooSmall`, `PartsLengthMismatch`, `PartsChanged`,
+   `ObjectTooLarge`) returns the row to `open` and answers 409 (the upload and its parts are
+   untouched, so the agent reads the status and sends again); `HashMismatch` and
+   `LengthMismatch` (the object is already deleted) make the row `failed` and answer 409, and the agent begins
    again, which the partial unique index allows; `NotFound` (the upload and the object are both
    gone, as when the server stopped after a mismatch's delete and before the row was written)
    also makes the row `failed` and answers 409, so a row can never stay `completing` with
    nothing left to complete; any other error leaves the row `completing` and answers 503, to
-   be repeated. The mapping of the store's errors to these answers is the
-   server work's to confirm; it is not verified.
+   be repeated. The mapping of the store's errors to these answers is confirmed against
+   ADR-492 item 10 by item 19, which also puts `ObjectTooLarge` among the part problems.
 
 ### The row
 
@@ -176,7 +176,8 @@ proposed. It is a specification: none of it is implemented when this record is w
 17. **A status that finds the store without the upload answers 503 and writes nothing.** An
     `open` row whose upload `list_parts` reports as not found or already finished is a state the
     completion decides (item 6), not the status: the status answers 503, leaves the row as it
-    is, and the agent repeats it. A part URL for a row that is not `open` is never issued and
+    is, and the agent repeats it (item 23 refines this: the status reads the row once more before
+    it answers 503). A part URL for a row that is not `open` is never issued and
     asks the store nothing; the status of such a row has no `partsHeld` and asks the store
     nothing either.
 18. **Settings and details.** The part size is a constant of the code, 5 MiB, with an override
@@ -193,6 +194,46 @@ proposed. It is a specification: none of it is implemented when this record is w
     winner's row, or a 409 for another declaration. No database connection is held while the
     store is called, and nothing from a request that could identify an upload, a URL, a
     key or a digest, and no database error text, is logged.
+
+### Decisions taken with the complete route
+
+19. **The store's answer decides the row, and every outcome keeps two invariants: a row is
+    `finished` only for an object that was read back, and a row never stays `completing` with
+    nothing left to complete.** Confirmed against ADR-492 item 10: success makes the row
+    `finished` (with `finished_at`) and answers 200; `NoParts`, `MissingPart`, `PartTooSmall`,
+    `PartsLengthMismatch`, `PartsChanged` and `ObjectTooLarge` are part problems (the store
+    checks the parts, and for `ObjectTooLarge` the sizes, before it completes anything, so the
+    upload is untouched) and return the row to `open`, 409; `HashMismatch`, `LengthMismatch` and
+    `NotFound` make it `failed`, 409 (the store has deleted what was left, so the route deletes
+    nothing); a failed delete, `Refused`, `Server`, `Io` and any other error write nothing and
+    answer 503 (`Random` 500, as in the other routes), leaving the row `completing`; a database
+    failure answers 503 or 500 and writes nothing more. Both 409 answers carry the row's
+    state as a `state` member of the problem document, as the part URL's does, so the agent
+    tells "send the parts again" from "begin again"; a `failed` row asked to complete answers the
+    same 409. A `finished` row is 200 with no store call.
+20. **One completion task per upload, owned by the hub, with the compare-and-set inside it.** The
+    handler only reads. The task is registered in a registry in the server process (tenant and
+    upload to the receiver of a `watch` of the outcome, get-or-insert under one lock), is
+    adopted by the hub, and is wrapped so that the stop ends it at once. It makes the
+    compare-and-set from `open` to `completing` in a transaction of its own; when no row
+    changed it reads the state: `completing` is verified, any other state is the outcome and
+    no store call is made. It then calls the store with no transaction open and makes one write
+    conditional on `completing`. A request that arrives while the task runs joins it, so two
+    concurrent requests run one store completion. The registry is per process, as the store's
+    key lock is (ADR-492); with several server processes on one database the compare-and-set
+    keeps the row right, and the store's repeat safety keeps the object right.
+21. **The wait is 20 seconds, a constant, and a waiter that times out gets 202 with `state:
+    completing`.** The code has a test-only override of the wait. A request that goes away does
+    not stop the task. A task that ends with no outcome (it panicked, or the stop ended it)
+    closes the channel, and the waiters answer 503: the row is as the task left it.
+22. **A task the stop ended is resumed by the next request, not at start.** The row stays
+    `completing`, which the next completion request verifies (item 6). No sweep runs at start
+    or periodically, so a `completing` row that no request repeats stays so.
+23. **A status that finds the upload gone reads the row once more.** `list_parts` answering
+    `NotFound` or `AlreadyFinished` for an `open` row is the sign of a completion that moved the
+    row on between the status's read and its listing. The status re-reads the row once: a row
+    that is no longer `open` is answered with its state and no `partsHeld`; one that still is
+    `open` is the 503 of item 17, with nothing written.
 
 ## Consequences
 
@@ -214,6 +255,9 @@ proposed. It is a specification: none of it is implemented when this record is w
 - The server is not authenticated to the agent on the local profile (ADR-466 Consequences). The
   part-URL answer decides where the agent sends the job's bytes, so that gap must be closed
   before real data is enqueued.
+- A `finished` write that fails after the store verified the object leaves the row `completing`,
+  and the repeat reads the whole object back again. A `completing` row nobody repeats is never
+  finished or failed (item 22).
 - Not verified: that a part URL for the bundled object server passes the host rule on every
   platform; the URL's 300 seconds on a slow link where a part of 5 MiB takes longer to send;
   the length of one begin-to-finished cycle under the 20-second completion bound for a large

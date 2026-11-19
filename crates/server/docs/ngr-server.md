@@ -664,14 +664,14 @@ also refuses a route mounted any other way.
   in" above.
 - `POST /api/v1/jobs` (`api/openapi.yaml`; `jobs.rs`; ADR-477): creates an acquisition or a
   configuration write job behind the operator session. See "Creating a job" above.
-- `POST /api/v1/agent/uploads`, `POST /api/v1/agent/uploads/{uploadId}/parts/{part}` and
-  `GET /api/v1/agent/uploads/{uploadId}` (`api/openapi.yaml`; `uploads.rs`; ADR-493): the data
-  channel's begin, part URL and status. See "The data channel" below. The completion
-  (`POST .../complete`) is planned and not served.
+- `POST /api/v1/agent/uploads`, `POST /api/v1/agent/uploads/{uploadId}/parts/{part}`,
+  `GET /api/v1/agent/uploads/{uploadId}` and `POST /api/v1/agent/uploads/{uploadId}/complete`
+  (`api/openapi.yaml`; `uploads.rs`; ADR-493): the data channel's begin, part URL, status and
+  completion. See "The data channel" below.
 
 ## The data channel
 
-`uploads.rs` serves begin, the part URL and the status (ADR-493 items 1 to 5 and 15 to 18). The
+`uploads.rs` serves begin, the part URL, the status and the completion (ADR-493 items 1 to 8 and 15 to 23). The
 routes are built from `AppState::uploads` (`uploads::Backend`: the object store, which is `None`
 on a server without `[object_server]`, and the part size), so a store set after the router is
 built does not reach them; `Server::start` passes the store it opened, and tests use
@@ -692,7 +692,31 @@ deletes the upload it began and answers the winner's row.
 
 The status counts the leading parts the store lists with the expected size. The part size of a row
 is the 5 MiB the server had when the row was begun (`uploads::PART_BYTES`; the test override is
-`Backend::with_part_bytes`).
+`Backend::with_part_bytes`). A status that finds the store without the upload reads the row once
+more and answers the state it is in when it is no longer `open` (a completion moved it on), else
+503 with nothing written (ADR-493 items 17 and 23).
+
+**Completion.** The handler only reads: after the body, the token, the agent's row and the upload
+(404), a `finished` row is answered 200 and a `failed` row 409 with `state: failed`; a missing
+store is 503 and a row that does not parse 500. Otherwise it joins or starts the upload's
+completion task, kept in a registry inside `Uploads` (tenant and upload ID to a `watch` of the
+outcome, get-or-insert under one lock) and adopted by the hub (`Hub::adopt`, never called with the
+registry's lock held), so the task outlives the request, and the stop ends it at once (a `select!`
+against `Hub::stopping`); a guard built before the task's future removes the entry however the
+task ends. The task moves the row from `open` to `completing` by a compare-and-set in a
+transaction of its own (no row changed: a `completing` row is verified, any other state is the
+outcome), calls the store's `complete` with no transaction open and makes one write conditional
+on `state = 'completing'`. The store's answer maps to the outcome (ADR-493 item 19): success is
+`finished` with `finished_at` (200); a part problem (`NoParts`, `MissingPart`, `PartTooSmall`,
+`PartsLengthMismatch`, `PartsChanged`, `ObjectTooLarge`) returns the row to `open` (409 with
+`state: open`); `HashMismatch`, `LengthMismatch` and `NotFound` make it `failed` (409 with
+`state: failed`; the store has already deleted what was left, the route deletes nothing); any
+other error, a failed delete included, writes nothing and answers 503 (`Random` 500), and a
+database failure answers 503 or 500 with no further write. A request waits for the outcome at
+most `uploads::COMPLETE_WAIT` (20 seconds; the test override is `Backend::with_complete_wait`)
+and then answers 202 `{"state": "completing"}`; a task that ended with no outcome (a panic, the
+stop) answers 503 and the row stays as it was. Nothing resumes a task at start: the next request
+does, and a `completing` row that no request repeats stays so.
 
 Never logged: the token, the body, the digest, the job, an object key, an upload ID, a URL and the
 text of a database error (the SQLSTATE only).

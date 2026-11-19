@@ -1,5 +1,5 @@
-//! The data channel's first three routes (ADR-493 items 1 to 5, 7, 8, 15 to 18): begin, the part
-//! URL and the status, with the `job_objects` rows they write. PostgreSQL throughout; the object
+//! The data channel's four routes (ADR-493 items 1 to 8, 15 to 23): begin, the part URL, the
+//! status and the completion, with the `job_objects` rows they write. PostgreSQL throughout; the object
 //! store is the real pinned RustFS where the store's answers matter (`NGR_TEST_RUSTFS_BIN`, as
 //! `storage.rs` has it) and a wrapper of the `MultipartStore` that scripts failures, counts calls
 //! and holds a call at a barrier where they do not. Tokens and keys are made at run time; no
@@ -10,20 +10,24 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use server::Server;
+use server::config::Http;
 use server::object_server::ObjectServer;
 use server::storage::{
     MultipartStore, ObjectBody, ObjectKey, Part, PartUrl, S3Store, S3Tuning, StoreError,
     StoreFuture, UnfinishedUploads, Upload, UploadId,
 };
 use server::uploads::{Backend, PART_BYTES};
+use sha2::{Digest, Sha256};
 use shared_proto::{AgentId, INSTRUCTION_VERSION, JobId, JobInstruction, JobKind, VciId};
-use tokio::sync::Barrier;
+use tokio::io::AsyncReadExt;
+use tokio::sync::{Barrier, Notify, Semaphore};
 
 use crate::control::token;
 use crate::redeem::{Agent, bytes_of, capture, json};
-use crate::serving::{Reply, exchange};
+use crate::serving::{Reply, Running, exchange};
 use crate::session::Up;
-use crate::storage::{MIB, content, put};
+use crate::storage::{MIB, content, put, sha256};
 
 const SMALL: u64 = 512 * 1024;
 
@@ -61,6 +65,46 @@ enum Fail {
     Random,
     NotFound,
     AlreadyFinished,
+    // The store's answers to `complete`.
+    NoParts,
+    MissingPart,
+    PartTooSmall,
+    PartsLengthMismatch,
+    PartsChanged,
+    ObjectTooLarge,
+    HashMismatch,
+    LengthMismatch,
+    Refused,
+}
+
+/// A call held inside the fake until the test lets it go: `entered` says it arrived.
+struct Hold {
+    entered: Notify,
+    gate: Semaphore,
+}
+
+impl Hold {
+    fn new() -> Arc<Hold> {
+        Arc::new(Hold {
+            entered: Notify::new(),
+            gate: Semaphore::new(0),
+        })
+    }
+
+    async fn wait(&self) {
+        self.entered.notify_one();
+        self.gate.acquire().await.unwrap().forget();
+    }
+
+    async fn entered(&self) {
+        tokio::time::timeout(Duration::from_secs(20), self.entered.notified())
+            .await
+            .expect("the call reaches the store");
+    }
+
+    fn release(&self) {
+        self.gate.add_permits(1000);
+    }
 }
 
 impl Fail {
@@ -73,6 +117,15 @@ impl Fail {
             Fail::Random => StoreError::Random,
             Fail::NotFound => StoreError::NotFound,
             Fail::AlreadyFinished => StoreError::AlreadyFinished,
+            Fail::NoParts => StoreError::NoParts,
+            Fail::MissingPart => StoreError::MissingPart { part: 2 },
+            Fail::PartTooSmall => StoreError::PartTooSmall { part: 1 },
+            Fail::PartsLengthMismatch => StoreError::PartsLengthMismatch { stored: 1 },
+            Fail::PartsChanged => StoreError::PartsChanged,
+            Fail::ObjectTooLarge => StoreError::ObjectTooLarge,
+            Fail::HashMismatch => StoreError::HashMismatch,
+            Fail::LengthMismatch => StoreError::LengthMismatch { stored: 1 },
+            Fail::Refused => StoreError::Refused { op: "test" },
         }
     }
 }
@@ -86,10 +139,17 @@ struct Wrap {
     presigns: AtomicUsize,
     lists: AtomicUsize,
     deletes: AtomicUsize,
+    /// The calls of `complete`, apart from `calls()` so that its shape stays.
+    completes: AtomicUsize,
     begin_fail: Mutex<Option<Fail>>,
     list_fail: Mutex<Option<Fail>>,
     delete_fail: Mutex<Option<Fail>>,
     presign_fail: Mutex<Option<Fail>>,
+    complete_fail: Mutex<Option<Fail>>,
+    /// Holds every `complete` before it answers.
+    complete_hold: Mutex<Option<Arc<Hold>>>,
+    /// Holds every `list_parts` before it lists.
+    list_hold: Mutex<Option<Arc<Hold>>>,
     /// Awaited by every `begin` after the upload exists and before it returns.
     begin_barrier: Mutex<Option<Arc<Barrier>>>,
     issued: Mutex<Vec<String>>,
@@ -152,6 +212,10 @@ impl MultipartStore for Wrap {
     fn list_parts<'a>(&'a self, upload: &'a Upload) -> StoreFuture<'a, Vec<Part>> {
         Box::pin(async move {
             self.lists.fetch_add(1, Ordering::SeqCst);
+            let hold = self.list_hold.lock().unwrap().clone();
+            if let Some(hold) = hold {
+                hold.wait().await;
+            }
             if let Some(error) = Wrap::fail(&self.list_fail) {
                 return Err(error);
             }
@@ -168,10 +232,20 @@ impl MultipartStore for Wrap {
         sha256: [u8; 32],
         length: u64,
     ) -> StoreFuture<'a, ()> {
-        match &self.inner {
-            Some(inner) => inner.complete(upload, sha256, length),
-            None => Box::pin(async { Err(StoreError::Unavailable) }),
-        }
+        Box::pin(async move {
+            self.completes.fetch_add(1, Ordering::SeqCst);
+            let hold = self.complete_hold.lock().unwrap().clone();
+            if let Some(hold) = hold {
+                hold.wait().await;
+            }
+            if let Some(error) = Wrap::fail(&self.complete_fail) {
+                return Err(error);
+            }
+            match &self.inner {
+                Some(inner) => inner.complete(upload, sha256, length).await,
+                None => Ok(()),
+            }
+        })
     }
 
     fn get<'a>(&'a self, key: &'a ObjectKey) -> StoreFuture<'a, ObjectBody> {
@@ -235,6 +309,15 @@ impl Fx {
     }
 
     async fn sized(with: With, part_bytes: Option<u64>) -> Fx {
+        Fx::build(with, part_bytes, None).await
+    }
+
+    /// A fixture whose completion requests wait `wait` for the task before they answer 202.
+    async fn waiting(with: With, wait: Duration) -> Fx {
+        Fx::build(with, None, Some(wait)).await
+    }
+
+    async fn build(with: With, part_bytes: Option<u64>, wait: Option<Duration>) -> Fx {
         let mut real = None;
         let mut wrap = Wrap::default();
         if with == With::Real {
@@ -260,6 +343,9 @@ impl Fx {
         let mut backend = Backend::new(store);
         if let Some(bytes) = part_bytes {
             backend = backend.with_part_bytes(bytes);
+        }
+        if let Some(wait) = wait {
+            backend = backend.with_complete_wait(wait);
         }
         let u = Up::with_backend(2, None, None, backend).await;
         let token = token(&u).await;
@@ -362,6 +448,51 @@ impl Fx {
 
     async fn status(&self, id: &str) -> Reply {
         self.status_as(Some(&self.token), id).await
+    }
+
+    async fn complete_as(&self, token: Option<&str>, id: &str) -> Reply {
+        self.send(
+            "POST",
+            &format!("/api/v1/agent/uploads/{id}/complete"),
+            token,
+            None,
+            "",
+        )
+        .await
+    }
+
+    async fn complete(&self, id: &str) -> Reply {
+        self.complete_as(Some(&self.token), id).await
+    }
+
+    async fn state(&self, id: &str) -> String {
+        self.sql(&format!("SELECT state FROM job_objects WHERE id = '{id}'"))
+            .await
+    }
+
+    /// The object the row names, as the store holds it.
+    async fn stored(&self, id: &str) -> Result<Vec<u8>, StoreError> {
+        let key = self
+            .sql(&format!(
+                "SELECT storage_key FROM job_objects WHERE id = '{id}'"
+            ))
+            .await;
+        let body = self.wrap.get(&ObjectKey::parse(&key).unwrap()).await?;
+        let mut out = Vec::new();
+        let mut reader = body.reader;
+        reader.read_to_end(&mut out).await.unwrap();
+        Ok(out)
+    }
+
+    /// Waits until the row is in `state`.
+    async fn until(&self, id: &str, state: &str) {
+        for _ in 0..500 {
+            if self.state(id).await == state {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the row did not become {state}");
     }
 
     /// A job of agent `agent` (the fixture's own for `None`) with the ownership generation
@@ -485,6 +616,21 @@ async fn send(fx: &Fx, id: &str, number: u16, len: usize) {
     let (status, etag) = put(&url, content(number as u8, len)).await;
     assert_eq!(status, 200, "PUT part {number}");
     assert!(etag.is_some());
+}
+
+/// The SHA-256 of `bytes` as the begin body writes it.
+fn sha_of(bytes: &[u8]) -> String {
+    hex(&Sha256::digest(bytes))
+}
+
+/// A row begun on a new job over the route, with the declared length and digest of `bytes`.
+async fn begin_for(fx: &Fx, bytes: &[u8]) -> String {
+    let job = fx.job().await;
+    let r = fx
+        .begin(&decl(&job, 1, "result", bytes.len() as u64, &sha_of(bytes)))
+        .await;
+    assert_eq!(r.status, 201, "{}", r.head);
+    upload_id(&r)
 }
 
 fn problem(r: &Reply, status: u16, what: &str) {
@@ -647,6 +793,7 @@ async fn a_body_that_does_not_arrive_within_five_seconds_is_408() {
         ("POST", "/api/v1/agent/uploads".to_owned()),
         ("POST", format!("/api/v1/agent/uploads/{}/parts/1", v4())),
         ("GET", format!("/api/v1/agent/uploads/{}", v4())),
+        ("POST", format!("/api/v1/agent/uploads/{}/complete", v4())),
     ] {
         let raw = format!(
             "{method} {target} HTTP/1.1\r\n{}\r\nContent-Type: application/json\r\n\
@@ -1421,23 +1568,31 @@ async fn the_routes_take_their_methods_only() {
         ),
         ("POST", format!("/api/v1/agent/uploads/{id}"), "GET,HEAD"),
         ("DELETE", format!("/api/v1/agent/uploads/{id}"), "GET,HEAD"),
+        (
+            "GET",
+            format!("/api/v1/agent/uploads/{id}/complete"),
+            "POST",
+        ),
+        (
+            "PUT",
+            format!("/api/v1/agent/uploads/{id}/complete"),
+            "POST",
+        ),
+        (
+            "HEAD",
+            format!("/api/v1/agent/uploads/{id}/complete"),
+            "POST",
+        ),
     ];
     for (method, target, allow) in cases {
         let r = fx.send(method, &target, Some(&fx.token), None, "").await;
         assert_eq!(r.status, 405, "{method} {target}: {}", r.head);
         assert_eq!(r.header("allow"), Some(allow), "{method} {target}");
     }
-    // The completion is not served yet.
-    let r = fx
-        .send(
-            "POST",
-            &format!("/api/v1/agent/uploads/{id}/complete"),
-            Some(&fx.token),
-            None,
-            "",
-        )
-        .await;
-    assert_eq!(r.status, 404, "{}", r.head);
+    // The completion is served: an upload nobody has is the route's own 404, not the fallback's.
+    let r = fx.complete(&id).await;
+    problem(&r, 404, "unknown upload");
+    assert!(r.body.contains("No such upload"), "{}", r.body);
     fx.finish().await;
 }
 
@@ -1460,6 +1615,11 @@ async fn the_log_holds_no_token_digest_key_upload_id_url_or_database_text() {
     Wrap::set(&fx.wrap.list_fail, Some(Fail::Io));
     assert_eq!(fx.status(&id).await.status, 503);
     Wrap::set(&fx.wrap.list_fail, None);
+    // A completion the store fails, and a part problem it reports.
+    Wrap::set(&fx.wrap.complete_fail, Some(Fail::Io));
+    assert_eq!(fx.complete(&id).await.status, 503);
+    Wrap::set(&fx.wrap.complete_fail, None);
+    assert_eq!(fx.complete(&id).await.status, 409);
     Wrap::set(&fx.wrap.delete_fail, Some(Fail::Io));
     *fx.wrap.begin_barrier.lock().unwrap() = Some(Arc::new(Barrier::new(2)));
     let job2 = fx.job().await;
@@ -1511,6 +1671,592 @@ async fn the_log_holds_no_token_digest_key_upload_id_url_or_database_text() {
         assert!(!text.contains(word), "{word} is in the log: {text}");
     }
     fx.finish().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Complete
+
+/// The object the parts `(number, length)` hold, as `send` PUTs them.
+fn object_of(parts: &[(u16, usize)]) -> Vec<u8> {
+    parts
+        .iter()
+        .flat_map(|(n, len)| content(*n as u8, *len))
+        .collect()
+}
+
+/// Case R1 (the one-part and the empty object) and the finished row: 200 `finished`, the row
+/// `finished` with its time, and the object on the object server byte for byte what was PUT.
+#[tokio::test]
+async fn a_completed_one_part_or_empty_object_is_finished_and_byte_identical() {
+    let fx = Fx::new(With::Real).await;
+    for len in [1000usize, 0] {
+        let bytes = content(1, len);
+        let id = begin_for(&fx, &bytes).await;
+        send(&fx, &id, 1, len).await;
+        let r = fx.complete(&id).await;
+        assert_eq!(r.status, 200, "{}", r.head);
+        assert_eq!(r.header("content-type"), Some("application/json"));
+        assert_eq!(r.header("cache-control"), Some("no-store"));
+        assert_eq!(json(&r), serde_json::json!({"state": "finished"}));
+        assert_eq!(fx.state(&id).await, "finished");
+        assert_eq!(
+            fx.sql(&format!(
+                "SELECT (finished_at IS NOT NULL)::text FROM job_objects WHERE id = '{id}'"
+            ))
+            .await,
+            "true"
+        );
+        assert_eq!(fx.stored(&id).await.unwrap(), bytes);
+        // The status of a finished row has no `partsHeld`.
+        assert!(json(&fx.status(&id).await).get("partsHeld").is_none());
+    }
+    // A repeat on a `finished` row is 200 and asks the store nothing.
+    let id = fx
+        .sql("SELECT id FROM job_objects ORDER BY created_at LIMIT 1")
+        .await;
+    let before = fx.wrap.completes.load(Ordering::SeqCst);
+    assert_eq!(fx.complete(&id).await.status, 200);
+    assert_eq!(fx.wrap.completes.load(Ordering::SeqCst), before);
+    fx.finish().await;
+}
+
+/// Case R1 with the real part size: 5 MiB and a few bytes are two parts.
+#[tokio::test]
+async fn a_completed_object_of_two_parts_is_finished_and_byte_identical() {
+    let fx = Fx::new(With::Real).await;
+    let parts = [(1u16, 5 * MIB), (2, 3)];
+    let bytes = object_of(&parts);
+    let id = begin_for(&fx, &bytes).await;
+    for (n, len) in parts {
+        send(&fx, &id, n, len).await;
+    }
+    let r = fx.complete(&id).await;
+    assert_eq!(r.status, 200, "{}", r.head);
+    assert_eq!(fx.state(&id).await, "finished");
+    assert!(fx.stored(&id).await.unwrap() == bytes);
+    fx.finish().await;
+}
+
+/// Case S: a digest that is not the object's makes the row `failed` (409 with that state), the
+/// store has deleted the object, and a new begin of the declaration is allowed.
+#[tokio::test]
+async fn a_digest_mismatch_fails_the_row_and_a_new_begin_is_allowed() {
+    let fx = Fx::new(With::Real).await;
+    let job = fx.job().await;
+    let r = fx.begin(&result_of(&job, 1000)).await;
+    let id = upload_id(&r);
+    send(&fx, &id, 1, 1000).await;
+    let r = fx.complete(&id).await;
+    problem(&r, 409, "digest mismatch");
+    assert_eq!(json(&r)["state"], "failed");
+    assert_eq!(fx.state(&id).await, "failed");
+    assert!(matches!(fx.stored(&id).await, Err(StoreError::NotFound)));
+    // The route deleted nothing itself: the store did.
+    assert_eq!(fx.wrap.calls()[3], 0);
+    // The same answer again, from the row, and a new upload for the declaration.
+    let again = fx.complete(&id).await;
+    problem(&again, 409, "failed row");
+    assert_eq!(json(&again)["state"], "failed");
+    let new = fx.begin(&result_of(&job, 1000)).await;
+    assert_eq!(new.status, 201, "{}", new.head);
+    assert_ne!(upload_id(&new), id);
+    fx.finish().await;
+}
+
+/// Case S: a part problem returns the row to `open` with the parts untouched, and the agent can
+/// send them and complete again.
+#[tokio::test]
+async fn a_part_problem_returns_the_row_to_open_and_a_later_completion_finishes_it() {
+    let fx = Fx::sized(With::Real, Some(SMALL)).await;
+    let bytes = content(1, 1000);
+    let id = begin_for(&fx, &bytes).await;
+    // No part at all.
+    let r = fx.complete(&id).await;
+    problem(&r, 409, "no parts");
+    assert_eq!(json(&r)["state"], "open");
+    assert_eq!(fx.state(&id).await, "open");
+    assert_eq!(held(&fx, &id).await, 0);
+    send(&fx, &id, 1, 1000).await;
+    let r = fx.complete(&id).await;
+    assert_eq!(r.status, 200, "{}", r.head);
+    assert_eq!(fx.state(&id).await, "finished");
+    assert_eq!(fx.stored(&id).await.unwrap(), bytes);
+    fx.finish().await;
+}
+
+/// Cases S and D: every answer of the store and the row it leaves, and the repeat of a row left
+/// `open` or `completing`.
+#[tokio::test]
+async fn the_stores_answers_decide_the_row_and_the_status() {
+    let fx = Fx::new(With::Fake).await;
+    let cases = [
+        (Fail::NoParts, 409, "open"),
+        (Fail::MissingPart, 409, "open"),
+        (Fail::PartTooSmall, 409, "open"),
+        (Fail::PartsLengthMismatch, 409, "open"),
+        (Fail::PartsChanged, 409, "open"),
+        (Fail::ObjectTooLarge, 409, "open"),
+        (Fail::HashMismatch, 409, "failed"),
+        (Fail::LengthMismatch, 409, "failed"),
+        (Fail::NotFound, 409, "failed"),
+        (Fail::Io, 503, "completing"),
+        (Fail::Refused, 503, "completing"),
+        (Fail::AlreadyFinished, 503, "completing"),
+        (Fail::Random, 500, "completing"),
+    ];
+    for (fail, status, row_state) in cases {
+        let job = fx.job().await;
+        let id = fx
+            .row(&job, 1, "result", 10, "open", PART_BYTES as i64)
+            .await;
+        Wrap::set(&fx.wrap.complete_fail, Some(fail));
+        let r = fx.complete(&id).await;
+        problem(&r, status, row_state);
+        if status == 409 {
+            assert_eq!(json(&r)["state"], row_state);
+        } else {
+            assert!(json(&r).get("state").is_none());
+        }
+        assert_eq!(fx.state(&id).await, row_state);
+        // A repeat with the store well: a row that is `open` or `completing` is completed, a
+        // `failed` one is answered as it is.
+        Wrap::set(&fx.wrap.complete_fail, None);
+        let before = fx.wrap.completes.load(Ordering::SeqCst);
+        let r = fx.complete(&id).await;
+        if row_state == "failed" {
+            problem(&r, 409, "failed repeat");
+            assert_eq!(fx.wrap.completes.load(Ordering::SeqCst), before);
+        } else {
+            assert_eq!(r.status, 200, "{}", r.head);
+            assert_eq!(fx.wrap.completes.load(Ordering::SeqCst), before + 1);
+            assert_eq!(fx.state(&id).await, "finished");
+        }
+    }
+    fx.finish().await;
+}
+
+/// Case C1: two requests at once run one completion, and both are answered 200.
+#[tokio::test]
+async fn two_concurrent_completions_run_one_store_completion() {
+    let fx = Fx::new(With::Fake).await;
+    let job = fx.job().await;
+    let id = fx
+        .row(&job, 1, "result", 10, "open", PART_BYTES as i64)
+        .await;
+    let hold = Hold::new();
+    *fx.wrap.complete_hold.lock().unwrap() = Some(Arc::clone(&hold));
+    let first = fx.complete(&id);
+    let second = async {
+        hold.entered().await;
+        // The first is inside the store; this one joins it.
+        let second = fx.complete(&id);
+        let release = async {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            hold.release();
+        };
+        tokio::join!(second, release).0
+    };
+    let (a, b) = tokio::join!(first, second);
+    assert_eq!((a.status, b.status), (200, 200), "{} / {}", a.head, b.head);
+    assert_eq!(fx.wrap.completes.load(Ordering::SeqCst), 1);
+    assert_eq!(fx.state(&id).await, "finished");
+    fx.finish().await;
+}
+
+/// Case R2: a request that finds `completing` and no task (as after a crash) verifies the object
+/// and finishes the row.
+#[tokio::test]
+async fn a_completing_row_with_no_task_is_verified_and_finished() {
+    let fx = Fx::new(With::Real).await;
+    let bytes = content(1, 1000);
+    let id = begin_for(&fx, &bytes).await;
+    send(&fx, &id, 1, 1000).await;
+    sqlx::query("UPDATE job_objects SET state = 'completing' WHERE id = $1::uuid")
+        .bind(&id)
+        .execute(&fx.u.w.pool)
+        .await
+        .unwrap();
+    let r = fx.complete(&id).await;
+    assert_eq!(r.status, 200, "{}", r.head);
+    assert_eq!(fx.state(&id).await, "finished");
+    assert_eq!(fx.stored(&id).await.unwrap(), bytes);
+    // A completion that was cut after the store's completed it: the upload is gone, the object
+    // is there, and the repeat reads it back again.
+    let bytes = content(1, 10);
+    let id = begin_for(&fx, &bytes).await;
+    send(&fx, &id, 1, 10).await;
+    let upload = Upload {
+        key: ObjectKey::parse(
+            &fx.sql(&format!(
+                "SELECT storage_key FROM job_objects WHERE id = '{id}'"
+            ))
+            .await,
+        )
+        .unwrap(),
+        id: UploadId::parse(
+            &fx.sql(&format!(
+                "SELECT upload_id FROM job_objects WHERE id = '{id}'"
+            ))
+            .await,
+        )
+        .unwrap(),
+    };
+    fx.wrap.complete(&upload, sha256(&bytes), 10).await.unwrap();
+    sqlx::query("UPDATE job_objects SET state = 'completing' WHERE id = $1::uuid")
+        .bind(&id)
+        .execute(&fx.u.w.pool)
+        .await
+        .unwrap();
+    assert_eq!(fx.complete(&id).await.status, 200);
+    assert_eq!(fx.state(&id).await, "finished");
+    fx.finish().await;
+}
+
+/// Case R3: a `completing` row whose upload and object are both gone (a stop between a
+/// mismatch's delete and the row's update) is made `failed`, and a new begin is allowed.
+#[tokio::test]
+async fn a_completing_row_with_nothing_left_is_failed_and_a_new_begin_is_allowed() {
+    let fx = Fx::new(With::Real).await;
+    let job = fx.job().await;
+    let r = fx.begin(&result_of(&job, 10)).await;
+    let id = upload_id(&r);
+    // The upload is gone and so is the object: delete it as the store's own mismatch would.
+    let key = ObjectKey::parse(
+        &fx.sql(&format!(
+            "SELECT storage_key FROM job_objects WHERE id = '{id}'"
+        ))
+        .await,
+    )
+    .unwrap();
+    fx.wrap.delete(&key).await.unwrap();
+    sqlx::query("UPDATE job_objects SET state = 'completing' WHERE id = $1::uuid")
+        .bind(&id)
+        .execute(&fx.u.w.pool)
+        .await
+        .unwrap();
+    let r = fx.complete(&id).await;
+    problem(&r, 409, "nothing left");
+    assert_eq!(json(&r)["state"], "failed");
+    assert_eq!(fx.state(&id).await, "failed");
+    assert_eq!(fx.begin(&result_of(&job, 10)).await.status, 201);
+    fx.finish().await;
+}
+
+/// Case T: a store that holds past the wait is a 202 while the task goes on; the repeat after
+/// the release is 200 and the store completed once.
+#[tokio::test]
+async fn a_slow_store_is_202_the_task_goes_on_and_a_repeat_is_200() {
+    let fx = Fx::waiting(With::Fake, Duration::from_millis(300)).await;
+    let job = fx.job().await;
+    let id = fx
+        .row(&job, 1, "result", 10, "open", PART_BYTES as i64)
+        .await;
+    let hold = Hold::new();
+    *fx.wrap.complete_hold.lock().unwrap() = Some(Arc::clone(&hold));
+    let r = fx.complete(&id).await;
+    assert_eq!(r.status, 202, "{}", r.head);
+    assert_eq!(r.header("cache-control"), Some("no-store"));
+    assert_eq!(json(&r), serde_json::json!({"state": "completing"}));
+    assert_eq!(fx.state(&id).await, "completing");
+    // A repeat joins the task that still runs: another 202, and no second store call.
+    assert_eq!(fx.complete(&id).await.status, 202);
+    assert_eq!(fx.wrap.completes.load(Ordering::SeqCst), 1);
+    hold.release();
+    fx.until(&id, "finished").await;
+    assert_eq!(fx.complete(&id).await.status, 200);
+    assert_eq!(fx.wrap.completes.load(Ordering::SeqCst), 1);
+    fx.finish().await;
+}
+
+/// Case T: a request that goes away does not stop the task, which finishes the row.
+#[tokio::test]
+async fn a_client_that_leaves_does_not_stop_the_completion() {
+    let fx = Fx::new(With::Fake).await;
+    let job = fx.job().await;
+    let id = fx
+        .row(&job, 1, "result", 10, "open", PART_BYTES as i64)
+        .await;
+    let hold = Hold::new();
+    *fx.wrap.complete_hold.lock().unwrap() = Some(Arc::clone(&hold));
+    let waiting = tokio::time::timeout(Duration::from_millis(500), fx.complete(&id)).await;
+    assert!(waiting.is_err(), "the request is still waiting");
+    hold.entered().await;
+    hold.release();
+    fx.until(&id, "finished").await;
+    fx.finish().await;
+}
+
+/// Case C2: a status that finds the upload gone because a completion just finished it answers
+/// the row as it is now.
+#[tokio::test]
+async fn a_status_racing_a_completion_answers_the_finished_row() {
+    let fx = Fx::new(With::Real).await;
+    let bytes = content(1, 1000);
+    let id = begin_for(&fx, &bytes).await;
+    send(&fx, &id, 1, 1000).await;
+    let hold = Hold::new();
+    *fx.wrap.list_hold.lock().unwrap() = Some(Arc::clone(&hold));
+    let status = fx.status(&id);
+    let race = async {
+        // The status has read the `open` row and is at the store's listing.
+        hold.entered().await;
+        *fx.wrap.list_hold.lock().unwrap() = None;
+        let r = fx.complete(&id).await;
+        assert_eq!(r.status, 200, "{}", r.head);
+        hold.release();
+    };
+    let (status, ()) = tokio::join!(status, race);
+    assert_eq!(status.status, 200, "{}", status.head);
+    let v = json(&status);
+    assert_eq!(v["state"], "finished");
+    assert_eq!(v["partBytes"], PART_BYTES);
+    assert_eq!(v["partCount"], 1);
+    assert!(v.get("partsHeld").is_none(), "{v}");
+    fx.finish().await;
+}
+
+/// Case Q3: the stop ends a running task at once (the waiter is answered 503), the row stays
+/// `completing`, and a request to a server started on the same database finishes it.
+#[tokio::test]
+async fn the_stop_ends_a_running_completion_and_a_later_request_finishes_it() {
+    let mut fx = Fx::new(With::Fake).await;
+    let job = fx.job().await;
+    let id = fx
+        .row(&job, 1, "result", 10, "open", PART_BYTES as i64)
+        .await;
+    let hold = Hold::new();
+    *fx.wrap.complete_hold.lock().unwrap() = Some(Arc::clone(&hold));
+    let addr = fx.addr();
+    let raw = fx.request_text(
+        "POST",
+        &format!("/api/v1/agent/uploads/{id}/complete"),
+        Some(&fx.token),
+        None,
+        "",
+    );
+    let pending = tokio::spawn(async move { exchange(addr, &raw).await });
+    hold.entered().await;
+    assert_eq!(fx.state(&id).await, "completing");
+    fx.u.s.begin_stop().await;
+    let r = tokio::time::timeout(Duration::from_secs(10), pending)
+        .await
+        .expect("the waiter is answered when the stop begins")
+        .unwrap();
+    problem(&r, 503, "the stop");
+    fx.u.s.finish().await;
+    // The server is gone; the row and the fake are read without it.
+    assert_eq!(
+        fx.u.w
+            .sql(&format!("SELECT state FROM job_objects WHERE id = '{id}'"))
+            .await,
+        "completing"
+    );
+    assert_eq!(fx.wrap.completes.load(Ordering::SeqCst), 1);
+
+    // A server on the same database resumes it on the next request.
+    *fx.wrap.complete_hold.lock().unwrap() = None;
+    let http = Http {
+        port: 0,
+        shutdown_grace_secs: 2,
+    };
+    let backend = Backend::new(Some(Arc::clone(&fx.wrap) as Arc<dyn MultipartStore>));
+    let server = Server::bind_with_store(&http, fx.u.w.pg.pool(), fx.u.w.key.clone(), backend)
+        .await
+        .unwrap();
+    fx.u.s = Running::spawn(server);
+    let fresh = token(&fx.u).await;
+    let r = fx.complete_as(Some(&fresh), &id).await;
+    assert_eq!(r.status, 200, "{}", r.head);
+    assert_eq!(fx.state(&id).await, "finished");
+    assert_eq!(fx.wrap.completes.load(Ordering::SeqCst), 2);
+    fx.finish().await;
+}
+
+/// Case O1: the order of the judgment. The body before the token, the token before the upload,
+/// a foreign upload is the unknown one's 404, and then the store and the row.
+#[tokio::test]
+async fn complete_judges_the_body_then_the_token_then_the_upload_then_the_store() {
+    let fx = Fx::new(With::Nothing).await;
+    let job = fx.job().await;
+    let id = fx
+        .row(&job, 1, "result", 10, "open", PART_BYTES as i64)
+        .await;
+    let target = format!("/api/v1/agent/uploads/{id}/complete");
+    // The body: a byte of it is a 400, more than 4096 a 413, both with no token.
+    for token in [None, Some(fx.token.as_str())] {
+        let r = fx.send("POST", &target, token, None, "x").await;
+        problem(&r, 400, "a body");
+        assert!(r.body.contains("The body must be empty"), "{}", r.body);
+        problem(
+            &fx.send("POST", &target, token, None, &"x".repeat(4097))
+                .await,
+            413,
+            "a long body",
+        );
+    }
+    // The token, then the upload.
+    let unknown = fx.complete_as(None, &v4()).await;
+    problem(&unknown, 401, "no token");
+    assert_eq!(unknown.header("www-authenticate"), Some("Bearer"));
+    let (_, other) = fx.other_agent().await;
+    let foreign = fx.complete_as(Some(&other), &id).await;
+    problem(&foreign, 404, "foreign upload");
+    assert_eq!(
+        bytes_of(&foreign),
+        bytes_of(&fx.complete_as(Some(&other), &v4()).await)
+    );
+    problem(
+        &fx.complete_as(Some(&fx.token), "garbage").await,
+        404,
+        "not a UUID",
+    );
+    problem(
+        &fx.complete_as(Some(&fx.token), "%FF").await,
+        404,
+        "not UTF-8",
+    );
+    // A row that needs the store finds none.
+    problem(&fx.complete(&id).await, 503, "no store");
+    assert_eq!(fx.state(&id).await, "open");
+    // A `finished` or `failed` row is answered with no store.
+    let done = fx
+        .row(
+            &fx.job().await,
+            1,
+            "result",
+            10,
+            "finished",
+            PART_BYTES as i64,
+        )
+        .await;
+    assert_eq!(fx.complete(&done).await.status, 200);
+    let failed = fx
+        .row(
+            &fx.job().await,
+            1,
+            "result",
+            10,
+            "failed",
+            PART_BYTES as i64,
+        )
+        .await;
+    let r = fx.complete(&failed).await;
+    problem(&r, 409, "failed");
+    assert_eq!(json(&r)["state"], "failed");
+    fx.finish().await;
+
+    // A row that does not parse is the server's fault, and nothing is written.
+    let fx = Fx::new(With::Fake).await;
+    let job = fx.job().await;
+    let id = fx
+        .row(&job, 1, "result", 10, "open", PART_BYTES as i64)
+        .await;
+    sqlx::query("UPDATE job_objects SET storage_key = repeat('x', 36) WHERE id = $1::uuid")
+        .bind(&id)
+        .execute(&fx.u.w.pool)
+        .await
+        .unwrap();
+    problem(&fx.complete(&id).await, 500, "unparsable key");
+    assert_eq!(fx.state(&id).await, "open");
+    assert_eq!(fx.wrap.completes.load(Ordering::SeqCst), 0);
+    fx.finish().await;
+}
+
+/// Case D: a database that fails during the completion is a 503 and a later request repeats.
+#[tokio::test]
+async fn a_database_that_fails_in_the_completion_is_503_and_the_repeat_finishes() {
+    let fx = Fx::new(With::Fake).await;
+    let job = fx.job().await;
+    let id = fx
+        .row(&job, 1, "result", 10, "open", PART_BYTES as i64)
+        .await;
+    // The write of the result fails after the store completed: the row stays `completing`.
+    fx.u.w
+        .pg
+        .execute(
+            "CREATE FUNCTION refuse_finish() RETURNS trigger AS $$ BEGIN \
+             IF NEW.state = 'finished' THEN RAISE EXCEPTION 'no'; END IF; RETURN NEW; END; $$ \
+             LANGUAGE plpgsql",
+        )
+        .await;
+    fx.u.w
+        .pg
+        .execute(
+            "CREATE TRIGGER refuse_finish BEFORE UPDATE ON job_objects \
+             FOR EACH ROW EXECUTE FUNCTION refuse_finish()",
+        )
+        .await;
+    problem(&fx.complete(&id).await, 503, "the final write fails");
+    assert_eq!(fx.state(&id).await, "completing");
+    assert_eq!(fx.wrap.completes.load(Ordering::SeqCst), 1);
+    fx.u.w
+        .pg
+        .execute("DROP TRIGGER refuse_finish ON job_objects")
+        .await;
+    // The repeat verifies the object again and finishes the row.
+    assert_eq!(fx.complete(&id).await.status, 200);
+    assert_eq!(fx.state(&id).await, "finished");
+    assert_eq!(fx.wrap.completes.load(Ordering::SeqCst), 2);
+    fx.finish().await;
+}
+
+/// A failure of the completion is logged in fixed words only: no upload ID, key, digest or
+/// database text.
+#[tokio::test]
+async fn the_log_of_a_failed_completion_holds_no_upload_id_key_digest_or_database_text() {
+    let (log, _guard) = capture();
+    let mut secrets = Vec::new();
+    // The store fails.
+    let fx = Fx::new(With::Fake).await;
+    let job = fx.job().await;
+    let id = fx
+        .row(&job, 1, "result", 10, "open", PART_BYTES as i64)
+        .await;
+    Wrap::set(&fx.wrap.complete_fail, Some(Fail::Io));
+    problem(&fx.complete(&id).await, 503, "store");
+    secrets.push(id);
+    secrets.push(job);
+    secrets.push(fx.token.clone());
+    secrets.push(digest());
+    secrets.extend(
+        sqlx::query_scalar::<_, String>("SELECT storage_key FROM job_objects")
+            .fetch_all(&fx.u.w.pool)
+            .await
+            .unwrap(),
+    );
+    fx.finish().await;
+    // The database fails (a gate of its own on this server's routes).
+    let fx = Fx::new(With::Fake).await;
+    let job = fx.job().await;
+    let id = fx
+        .row(&job, 1, "result", 10, "open", PART_BYTES as i64)
+        .await;
+    fx.u.w
+        .pg
+        .execute("ALTER TABLE job_objects ADD CONSTRAINT refuse CHECK (false) NOT VALID")
+        .await;
+    problem(&fx.complete(&id).await, 503, "database");
+    secrets.push(id);
+    secrets.push(job);
+    secrets.extend(
+        sqlx::query_scalar::<_, String>("SELECT storage_key FROM job_objects")
+            .fetch_all(&fx.u.w.pool)
+            .await
+            .unwrap(),
+    );
+    fx.finish().await;
+    let text = log.text();
+    assert!(
+        text.contains("failed to complete an upload") && text.contains("a statement failed")
+            || text.contains("the database is unavailable"),
+        "both failures are logged: {text}"
+    );
+    for secret in &secrets {
+        assert!(!text.contains(secret.as_str()), "a secret is in the log");
+    }
+    for word in ["sqlx", "constraint", "violates", "refuse"] {
+        assert!(!text.contains(word), "{word} is in the log: {text}");
+    }
 }
 
 /// The migration's own rules (ADR-493 item 7): each CHECK, the partial unique index and the

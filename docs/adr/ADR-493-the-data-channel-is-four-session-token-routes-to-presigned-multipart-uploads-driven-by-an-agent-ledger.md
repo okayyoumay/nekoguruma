@@ -320,6 +320,9 @@ most 1 MiB (the journal's frame bound), and a run's final state can be larger.
 - An entry the server refuses for good, or whose source is gone, stays in the ledger, and with
   one object at a time it stands in front of the entries behind it: what clears it is decided
   with the uploader. A missing source is found by the uploader, not by the open.
+- A ledger file removed from outside the agent between two runs is not told from a first start:
+  the next open creates an empty ledger and deletes the stored results as files no entry names,
+  so their uploads are lost (item 27 guards only the reopen within a run).
 - A retention of the communication log that deletes files must first ask the ledger, since an
   entry names the file and nothing local is deleted before the server's acknowledgement
   (ADR-455 item 2).

@@ -159,7 +159,8 @@ pub enum Step {
     BeforeRename,
     /// After a rename, before it is made durable; the open calls it too, before its own sync.
     AfterRename,
-    /// After a rewrite's rename is durable, before the object it made unnamed is deleted.
+    /// After an install's rename is durable: in a removal, before the object it made unnamed is
+    /// deleted; also when the first open creates the file.
     AfterRenameSync,
     /// After the open cut a torn tail off, before the cut is synced.
     AfterCut,

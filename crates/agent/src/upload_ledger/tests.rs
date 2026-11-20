@@ -492,6 +492,10 @@ fn entries_that_break_the_rules_are_corrupt() {
         "duplicate key appended",
         &file(0, 0, &[result_entry(1, 1), result_entry(2, 1)]),
     );
+    assert_corrupt(
+        "duplicate key across the retained and appended entries",
+        &file(1, 1, &[result_entry(1, 1), result_entry(2, 1)]),
+    );
     let mut bad_job = result_entry(1, 1);
     bad_job.key.job_id = JobId("../x".to_owned());
     assert_corrupt("job ID", &file(1, 1, &[bad_job]));
@@ -699,6 +703,8 @@ fn a_result_is_stored_and_synced_before_its_frame_is_appended() {
     steps.lock().unwrap().clear();
     let seq = ledger.enqueue_result(&jk(1), b"the result").unwrap();
     assert_eq!(seq, 1);
+    // The steps' order relative to each other; that `AfterObjectSync` follows the syncs
+    // themselves rests on the code's order, since no test simulates a power loss.
     assert_eq!(
         *steps.lock().unwrap(),
         [

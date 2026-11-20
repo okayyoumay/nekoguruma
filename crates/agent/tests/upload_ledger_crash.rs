@@ -70,11 +70,13 @@ fn run(case: &str, dir: &Path) {
     let abort_at = |step| aborting_at(step, &armed);
     match case {
         "object-after-write"
+        | "object-after-sync"
         | "append-before-write"
         | "append-after-write"
         | "append-after-sync" => {
             let step = match case {
                 "object-after-write" => Step::AfterObjectWrite,
+                "object-after-sync" => Step::AfterObjectSync,
                 "append-before-write" => Step::BeforeWrite,
                 "append-after-write" => Step::AfterWrite,
                 _ => Step::AfterSync,
@@ -83,10 +85,14 @@ fn run(case: &str, dir: &Path) {
             armed.store(true, Ordering::SeqCst);
             ledger.enqueue_result(&key(1), &bytes_of(1)).unwrap();
         }
-        "finished-before-rename" | "finished-after-rename" | "finished-before-delete" => {
+        "finished-before-rename"
+        | "finished-after-rename"
+        | "finished-after-rename-sync"
+        | "finished-before-delete" => {
             let step = match case {
                 "finished-before-rename" => Step::BeforeRename,
                 "finished-after-rename" => Step::AfterRename,
+                "finished-after-rename-sync" => Step::AfterRenameSync,
                 _ => Step::BeforeObjectDelete,
             };
             let mut ledger = UploadLedger::open_with(dir, ID, abort_at(step)).unwrap();
@@ -188,7 +194,11 @@ fn the_upload_ledger_reads_back_after_a_crash_in_any_write() {
 
     // R1: the process dies after the object is written, or before the append: no entry, the
     // object is swept at the next open and the number is used again.
-    for case in ["object-after-write", "append-before-write"] {
+    for case in [
+        "object-after-write",
+        "object-after-sync",
+        "append-before-write",
+    ] {
         let dir = crash(case);
         let mut ledger = UploadLedger::open_in(&dir.0, ID).unwrap();
         assert!(ledger.next().is_none(), "{case}");
@@ -258,6 +268,12 @@ fn the_upload_ledger_reads_back_after_a_crash_in_any_write() {
 
     // R6: the process dies after the removal is durable, before the object is deleted: the
     // entry is gone and the open sweeps the object.
+    let dir = crash("finished-after-rename-sync");
+    assert_eq!(objects(&dir.0), ["1", "2"]);
+    let ledger = UploadLedger::open_in(&dir.0, ID).unwrap();
+    assert_eq!(numbers(&ledger), [2]);
+    assert_eq!(objects(&dir.0), ["2"]);
+    drop(ledger);
     let dir = crash("finished-before-delete");
     assert_eq!(objects(&dir.0), ["1", "2"]);
     let ledger = UploadLedger::open_in(&dir.0, ID).unwrap();

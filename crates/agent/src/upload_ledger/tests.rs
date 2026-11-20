@@ -3,6 +3,8 @@ use std::sync::{Arc, Mutex};
 
 use shared_proto::JobId;
 
+use std::fs::OpenOptions;
+
 use super::*;
 
 const ID: &str = "0194f0a2-7c3e-7d11-8a52-3f6f9b1c2d4e";
@@ -702,6 +704,7 @@ fn a_result_is_stored_and_synced_before_its_frame_is_appended() {
         [
             Step::BeforeObjectWrite,
             Step::AfterObjectWrite,
+            Step::AfterObjectSync,
             Step::BeforeWrite,
             Step::AfterWrite,
             Step::AfterSync
@@ -837,6 +840,68 @@ fn another_kind_or_generation_of_the_same_job_is_an_independent_entry() {
         4
     );
     assert_eq!(seqs(&ledger), [1, 3, 2, 4]);
+    // Read back, the result and the communication log of the same job are both there.
+    ledger.reopen().unwrap();
+    assert_eq!(seqs(&ledger), [1, 3, 2, 4]);
+    let kinds_of_first: Vec<(u64, Kind)> = ledger
+        .pending()
+        .filter(|entry| entry.key == jk(1))
+        .map(|entry| (entry.seq, entry.kind))
+        .collect();
+    assert_eq!(kinds_of_first, [(1, Kind::Result), (2, Kind::CommLog)]);
+}
+
+// E7a
+#[test]
+fn a_file_reaching_exactly_the_cap_and_stored_bytes_reaching_exactly_the_cap_are_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut ledger = UploadLedger::open_in(dir.path(), ID).unwrap();
+    let path = comm_path(dir.path(), 1);
+    let entry = Entry {
+        seq: 1,
+        key: jk(1),
+        kind: Kind::CommLog,
+        source: Source::File(path.to_str().unwrap().to_owned()),
+        length: 1,
+        sha256: [1; 32],
+    };
+    let frame_len = encode_frame(&entry).unwrap().len() as u64;
+    ledger.file_len = MAX_LEDGER_BYTES - frame_len + 1;
+    assert!(matches!(
+        ledger.enqueue_comm_log(&jk(1), &path, fake_digest(1, 1)),
+        Err(LedgerError::Full)
+    ));
+    ledger.file_len = MAX_LEDGER_BYTES - frame_len;
+    assert_eq!(
+        ledger
+            .enqueue_comm_log(&jk(1), &path, fake_digest(1, 1))
+            .unwrap(),
+        1
+    );
+    assert_eq!(ledger.file_len, MAX_LEDGER_BYTES);
+    assert_eq!(
+        fs::metadata(file_of(dir.path())).unwrap().len(),
+        MAX_LEDGER_BYTES
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut ledger = UploadLedger::open_in(dir.path(), ID).unwrap();
+    ledger.stored_bytes = MAX_STORED_BYTES - 1;
+    assert_eq!(ledger.enqueue_result(&jk(1), b"a").unwrap(), 1);
+    assert_eq!(ledger.stored_bytes, MAX_STORED_BYTES);
+    assert!(matches!(
+        ledger.enqueue_result(&jk(2), b"a"),
+        Err(LedgerError::Full)
+    ));
+}
+
+// O8
+#[test]
+fn a_torn_tail_of_exactly_the_longest_unfinished_frame_is_cut() {
+    let mut bytes = file(1, 1, &[result_entry(1, 1)]);
+    let whole = bytes.len();
+    bytes.extend(std::iter::repeat_n(0u8, MAX_TORN));
+    assert_eq!(parse(&bytes, ID).unwrap().len, whole);
 }
 
 // E6
@@ -1107,6 +1172,55 @@ fn a_failed_append_after_the_write_keeps_the_object_and_the_entry_is_pending_aft
     }
 }
 
+// E14a
+#[test]
+fn a_reopen_that_finds_the_file_gone_creates_nothing_sweeps_nothing_and_stays_poisoned() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut ledger = UploadLedger::open_in(dir.path(), ID).unwrap();
+    put_result(&mut ledger, 1);
+    ledger.poisoned = true;
+    fs::remove_file(file_of(dir.path())).unwrap();
+    assert!(matches!(
+        ledger.reopen(),
+        Err(LedgerError::Corrupt("the ledger file is gone"))
+    ));
+    assert!(!file_of(dir.path()).exists(), "no file was created");
+    assert_eq!(names(&objects_of(dir.path())), ["1"]);
+    assert_eq!(seqs(&ledger), [1]);
+    assert_eq!(ledger.highest(), 1);
+    assert!(ledger.is_poisoned());
+    assert!(matches!(
+        ledger.enqueue_result(&jk(2), b"x"),
+        Err(LedgerError::Poisoned)
+    ));
+}
+
+// E14b
+#[test]
+fn a_reopen_that_finds_the_file_corrupt_keeps_memory_sweeps_nothing_and_stays_poisoned() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut ledger = UploadLedger::open_in(dir.path(), ID).unwrap();
+    put_result(&mut ledger, 1);
+    put_comm(&mut ledger, dir.path(), 2);
+    fs::write(objects_of(dir.path()).join("99"), b"stray").unwrap();
+    ledger.poisoned = true;
+    let (file_len, stored) = (ledger.file_len, ledger.stored_bytes);
+    fs::write(file_of(dir.path()), b"not a ledger").unwrap();
+    assert!(matches!(ledger.reopen(), Err(LedgerError::Corrupt(_))));
+    assert!(ledger.is_poisoned());
+    assert_eq!(seqs(&ledger), [1, 2]);
+    assert_eq!(
+        (ledger.highest(), ledger.file_len, ledger.stored_bytes),
+        (2, file_len, stored)
+    );
+    assert_eq!(names(&objects_of(dir.path())), ["1", "99"]);
+    assert_eq!(fs::read(file_of(dir.path())).unwrap(), b"not a ledger");
+    assert!(matches!(
+        ledger.enqueue_result(&jk(3), b"x"),
+        Err(LedgerError::Poisoned)
+    ));
+}
+
 // E16
 #[test]
 fn an_enqueue_after_a_failed_reopen_is_poisoned_and_the_entries_stay_in_memory() {
@@ -1166,6 +1280,7 @@ fn finished_rewrites_the_file_then_memory_then_deletes_the_object() {
         [
             Step::BeforeRename,
             Step::AfterRename,
+            Step::AfterRenameSync,
             Step::BeforeObjectDelete
         ]
     );

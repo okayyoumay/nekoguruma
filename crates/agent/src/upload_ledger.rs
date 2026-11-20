@@ -29,7 +29,7 @@
 //! [`LedgerError::Corrupt`] and is never repaired, set aside or swept around.
 
 use std::collections::HashSet;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -38,8 +38,8 @@ use sha2::{Digest as _, Sha256};
 use worker_host::service::OperatingMode;
 
 use crate::journal::{
-    FRAME_HEADER, FrameRead, JobKey, JournalError, WriterLock, job_file_stem, push_frame,
-    read_frame, record_follows, sync_after_rename, sync_dir,
+    FRAME_HEADER, FrameRead, JobKey, LockFailure, WriterLock, job_file_stem, open_rw, push_frame,
+    read_frame, record_follows, sync_after_rename, sync_dir, take_writer_lock, valid_id,
 };
 use crate::registration::record::create_private;
 use crate::state::{StateDirError, prepare_subdir, private_subdir};
@@ -73,7 +73,7 @@ const MAX_ENTRY: usize = 10 + (1 + MAX_JOB_ID) + 10 + 1 + (1 + 2 + MAX_PATH_BYTE
 const MAX_TORN: usize = FRAME_HEADER + MAX_ENTRY;
 
 /// What an entry holds. Results upload before communication logs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Kind {
     Result,
     CommLog,
@@ -150,6 +150,8 @@ pub enum Step {
     BeforeObjectWrite,
     /// After the object's bytes are written, before they are synced.
     AfterObjectWrite,
+    /// After the object's bytes and its directory entry are durable, before the entry's append.
+    AfterObjectSync,
     /// Before an entry's frame is written.
     BeforeWrite,
     AfterWrite,
@@ -157,6 +159,8 @@ pub enum Step {
     BeforeRename,
     /// After a rename, before it is made durable; the open calls it too, before its own sync.
     AfterRename,
+    /// After a rewrite's rename is durable, before the object it made unnamed is deleted.
+    AfterRenameSync,
     /// After the open cut a torn tail off, before the cut is synced.
     AfterCut,
     /// Before an object is deleted, by a removal or by the sweep at open.
@@ -301,19 +305,19 @@ impl UploadLedger {
             poisoned: false,
             probe,
         };
-        ledger.open_state()?;
+        ledger.open_state(true)?;
         Ok(ledger)
     }
 
-    /// Takes the writer lock, loads the file (creating it when missing), then sweeps the
-    /// objects: the steps of an open, which [`UploadLedger::reopen`] repeats. A file that does
-    /// not read back fails here before anything is created, cut or deleted.
-    fn open_state(&mut self) -> Result<(), LedgerError> {
-        let lock = match WriterLock::at(&self.dir.join(LOCK_FILE)) {
+    /// Takes the writer lock, loads the file (creating it when missing and `create` is set, as
+    /// only the first open does), then sweeps the objects: the steps of an open, which
+    /// [`UploadLedger::reopen`] repeats. A file that does not read back, or that a reopen finds
+    /// gone, fails here before anything is created, cut or deleted.
+    fn open_state(&mut self, create: bool) -> Result<(), LedgerError> {
+        let lock = match take_writer_lock(&self.dir.join(LOCK_FILE)) {
             Ok(lock) => lock,
-            Err(JournalError::InUse) => return Err(LedgerError::InUse),
-            Err(JournalError::Io(error)) => return Err(error.into()),
-            Err(other) => return Err(io::Error::other(other.to_string()).into()),
+            Err(LockFailure::InUse) => return Err(LedgerError::InUse),
+            Err(LockFailure::Io(error)) => return Err(error.into()),
         };
         self.lock = Some(lock);
         let others = other_entries(&self.dir, &self.agent_id);
@@ -329,9 +333,14 @@ impl UploadLedger {
                 self.prepare_objects()?;
                 self.load(&bytes, parsed)?;
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Err(error) if error.kind() == io::ErrorKind::NotFound && create => {
                 self.prepare_objects()?;
                 self.install(None)?;
+            }
+            // A ledger that was open and lost its file holds results the server may not have
+            // received; making an empty file and sweeping their objects would lose them.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(LedgerError::Corrupt("the ledger file is gone"));
             }
             Err(error) => return Err(error.into()),
         }
@@ -351,7 +360,8 @@ impl UploadLedger {
     /// cut off, the counter continues from the file, the entries are read back and the objects
     /// no entry names are swept. This is the way out of [`LedgerError::Poisoned`]. On failure
     /// the ledger is poisoned, holds neither the file nor the lock, keeps the entries it had in
-    /// memory (so they still upload) and may be reopened again. Blocking.
+    /// memory (so they still upload) and may be reopened again. A file that has vanished is
+    /// [`LedgerError::Corrupt`] too: only the first open creates the file. Blocking.
     pub fn reopen(&mut self) -> Result<(), LedgerError> {
         self.poisoned = true;
         self.file = None;
@@ -365,7 +375,7 @@ impl UploadLedger {
         self.highest = 0;
         self.file_len = 0;
         self.stored_bytes = 0;
-        if let Err(error) = self.open_state() {
+        if let Err(error) = self.open_state(false) {
             self.file = None;
             self.lock = None;
             self.poisoned = true;
@@ -598,7 +608,8 @@ impl UploadLedger {
             file.write_all(bytes)?;
             (self.probe)(Step::AfterObjectWrite)?;
             file.sync_all()?;
-            sync_dir(&self.objects)
+            sync_dir(&self.objects)?;
+            (self.probe)(Step::AfterObjectSync)
         })();
         if written.is_err() {
             let _ = fs::remove_file(&path);
@@ -729,8 +740,9 @@ impl UploadLedger {
         self.stored_bytes = stored_sum(&kept);
         self.entries = kept;
         self.file_len = bytes.len() as u64;
-        let synced =
-            (self.probe)(Step::AfterRename).and_then(|()| sync_after_rename(&self.dir, &self.path));
+        let synced = (self.probe)(Step::AfterRename)
+            .and_then(|()| sync_after_rename(&self.dir, &self.path))
+            .and_then(|()| (self.probe)(Step::AfterRenameSync));
         match open_rw(&self.path) {
             Ok(file) => self.file = Some(file),
             Err(error) => {
@@ -744,15 +756,6 @@ impl UploadLedger {
         }
         Ok(())
     }
-}
-
-fn open_rw(path: &Path) -> io::Result<File> {
-    OpenOptions::new().read(true).write(true).open(path)
-}
-
-/// An agent ID names files, so it is a short run of letters, digits and hyphens.
-fn valid_id(id: &str) -> bool {
-    !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
 fn check_key(key: &JobKey) -> Result<(), LedgerError> {
@@ -874,6 +877,7 @@ fn parse(bytes: &[u8], agent_id: &str) -> Result<Parsed, LedgerError> {
         .checked_add(1)
         .ok_or(corrupt("the entry counter overflows"))?;
     let mut entries: Vec<Entry> = Vec::new();
+    let mut seen = HashSet::new();
     let mut offset = next;
     let mut previous = 0;
     for _ in 0..header.retained {
@@ -889,7 +893,7 @@ fn parse(bytes: &[u8], agent_id: &str) -> Result<Parsed, LedgerError> {
             return Err(corrupt("retained entry numbers are out of order or range"));
         }
         previous = entry.seq;
-        push_unique(&mut entries, entry)?;
+        push_unique(&mut entries, &mut seen, entry)?;
         offset = next;
     }
     let seq_of = |payload: &[u8]| decode_entry(payload).map(|entry| entry.seq);
@@ -904,7 +908,7 @@ fn parse(bytes: &[u8], agent_id: &str) -> Result<Parsed, LedgerError> {
                 expected = expected
                     .checked_add(1)
                     .ok_or(corrupt("the entry counter overflows"))?;
-                push_unique(&mut entries, entry)?;
+                push_unique(&mut entries, &mut seen, entry)?;
                 offset = next;
             }
             // One unfinished append leaves at most one frame and no entry after it; a damaged
@@ -927,11 +931,12 @@ fn parse(bytes: &[u8], agent_id: &str) -> Result<Parsed, LedgerError> {
 }
 
 /// Adds an entry unless the job already has one of its generation and kind.
-fn push_unique(entries: &mut Vec<Entry>, entry: Entry) -> Result<(), LedgerError> {
-    if entries
-        .iter()
-        .any(|held| held.key == entry.key && held.kind == entry.kind)
-    {
+fn push_unique(
+    entries: &mut Vec<Entry>,
+    seen: &mut HashSet<(String, u64, Kind)>,
+    entry: Entry,
+) -> Result<(), LedgerError> {
+    if !seen.insert((entry.key.job_id.0.clone(), entry.key.generation, entry.kind)) {
         return Err(LedgerError::Corrupt(
             "two entries have the same job and kind",
         ));

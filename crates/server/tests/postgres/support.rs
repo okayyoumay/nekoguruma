@@ -440,7 +440,10 @@ pub async fn start_object_server(
 #[test]
 fn a_lost_port_is_told_from_an_end_on_purpose() {
     let ended = |how: &str| ObjectServerError::ExitedBeforeReady(how.to_owned());
-    let silent = ClosedPort::new().port();
+    // Held for the whole test: a released port could be taken and answer, which would make
+    // the negative cases below count as lost ports.
+    let closed = ClosedPort::new();
+    let silent = closed.port();
     assert!(object_port_lost(
         &ObjectServerError::PortTaken { port: 1 },
         silent

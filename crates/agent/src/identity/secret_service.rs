@@ -53,8 +53,16 @@ struct Found {
     locked: Vec<String>,
 }
 
-/// What `GetSecret` answered. Under the `plain` algorithm the parameters must be empty.
+/// What `OpenSession` answered. Under the `plain` algorithm the output must be empty.
+struct SessionReply {
+    output_empty: bool,
+    path: String,
+}
+
+/// What `GetSecret` answered. Under the `plain` algorithm the parameters must be empty, and the
+/// reply names the session that was opened.
 struct SecretReply {
+    session: String,
     parameters: Vec<u8>,
     value: Zeroizing<Vec<u8>>,
 }
@@ -76,7 +84,7 @@ trait Transport {
     /// The collection's `Locked` property.
     fn collection_locked(&self, collection: &str) -> Result<bool, Reason>;
     /// `Service.OpenSession("plain")`: the session's path.
-    fn open_session(&self) -> Result<String, Reason>;
+    fn open_session(&self) -> Result<SessionReply, Reason>;
     /// `Item.GetSecret(session)`.
     fn get_secret(&self, item: &str, session: &str) -> Result<SecretReply, Reason>;
     /// `Collection.CreateItem(.., replace = false)`.
@@ -91,6 +99,15 @@ trait Transport {
 
 fn unavailable(reason: Reason) -> StoreError {
     StoreError::with_source(StoreErrorKind::Unavailable, reason)
+}
+
+/// Opens a `plain` session and checks the answer is one.
+fn open_plain_session(transport: &dyn Transport) -> Result<String, StoreError> {
+    let reply = transport.open_session().map_err(unavailable)?;
+    if !reply.output_empty {
+        return Err(unavailable("unexpected session output"));
+    }
+    Ok(reply.path)
 }
 
 /// The distinct item paths of both lists.
@@ -121,11 +138,14 @@ fn get_with(
         ));
     }
     if let Some(item) = found.unlocked.first() {
-        let session = transport.open_session().map_err(unavailable)?;
+        let session = open_plain_session(transport)?;
         // An item deleted between the search and this call is a failed read, not an absent key.
         let reply = transport.get_secret(item, &session).map_err(unavailable)?;
         if !reply.parameters.is_empty() {
             return Err(unavailable("unexpected session parameters"));
+        }
+        if reply.session != session {
+            return Err(unavailable("the reply names another session"));
         }
         return Ok(reply.value);
     }
@@ -166,7 +186,7 @@ fn put_new_with(
     {
         return Err(unavailable("collection locked"));
     }
-    let session = transport.open_session().map_err(unavailable)?;
+    let session = open_plain_session(transport)?;
     // A create that fails on the wire may still have happened; the caller reads back.
     match transport
         .create_item(&collection, &session, name, secret)
@@ -211,12 +231,12 @@ struct DbusTransport {
 
 impl DbusTransport {
     fn connect() -> Result<Self, Reason> {
-        let connection = zbus::block_on(async {
-            Builder::session()
-                .method_timeout(CALL_TIMEOUT)
-                .build()
-                .await
-        })
+        // `method_timeout` bounds method calls only; the socket connect, the authentication and
+        // the hello of a bus that accepts and stays silent are bounded by the timer.
+        let connection = zbus::block_on(with_timeout(
+            Builder::session().method_timeout(CALL_TIMEOUT).build(),
+        ))
+        .ok_or("no answer in time")?
         .map_err(|_| "no session bus")?;
         Ok(Self {
             connection: Some(connection),
@@ -248,6 +268,77 @@ impl DbusTransport {
         })
         .map_err(|error| reason(&error))
     }
+}
+
+/// What a timer thread and its future share.
+#[derive(Default)]
+struct TimerState {
+    fired: bool,
+    waker: Option<std::task::Waker>,
+}
+
+/// A future that is ready after `CALL_TIMEOUT`. It runs on a thread of its own, so it works
+/// under any executor (zbus's timeout is private); dropping it stops the thread.
+struct Timer {
+    state: std::sync::Arc<std::sync::Mutex<TimerState>>,
+    // Dropped with the timer: the thread sees the channel close and ends.
+    _cancel: std::sync::mpsc::Sender<()>,
+}
+
+impl Timer {
+    fn start() -> Self {
+        let state = std::sync::Arc::new(std::sync::Mutex::new(TimerState::default()));
+        let (cancel, cancelled) = std::sync::mpsc::channel::<()>();
+        let shared = state.clone();
+        std::thread::spawn(move || {
+            if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                cancelled.recv_timeout(CALL_TIMEOUT)
+            {
+                let mut state = shared.lock().unwrap_or_else(|p| p.into_inner());
+                state.fired = true;
+                if let Some(waker) = state.waker.take() {
+                    waker.wake();
+                }
+            }
+        });
+        Self {
+            state,
+            _cancel: cancel,
+        }
+    }
+}
+
+impl std::future::Future for Timer {
+    type Output = ();
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.fired {
+            std::task::Poll::Ready(())
+        } else {
+            state.waker = Some(cx.waker().clone());
+            std::task::Poll::Pending
+        }
+    }
+}
+
+/// `future`'s output, or `None` when it is not ready after `CALL_TIMEOUT`.
+async fn with_timeout<F: std::future::Future>(future: F) -> Option<F::Output> {
+    let mut future = std::pin::pin!(future);
+    let mut timer = std::pin::pin!(Timer::start());
+    std::future::poll_fn(|cx| {
+        if let std::task::Poll::Ready(output) = future.as_mut().poll(cx) {
+            return std::task::Poll::Ready(Some(output));
+        }
+        match timer.as_mut().poll(cx) {
+            std::task::Poll::Ready(()) => std::task::Poll::Ready(None),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    })
+    .await
 }
 
 impl Drop for DbusTransport {
@@ -323,25 +414,29 @@ impl Transport for DbusTransport {
         bool::try_from(value).map_err(|_| "Secret Service call failed")
     }
 
-    fn open_session(&self) -> Result<String, Reason> {
-        let (_output, session): (zbus::OwnedVariant, OwnedObjectPath) = self.call(
+    fn open_session(&self) -> Result<SessionReply, Reason> {
+        let (output, session): (zbus::OwnedVariant, OwnedObjectPath) = self.call(
             SERVICE_PATH,
             SERVICE_IFACE,
             "OpenSession",
             &("plain", Variant::from("")),
         )?;
-        Ok(session.as_str().to_owned())
+        Ok(SessionReply {
+            output_empty: String::try_from(output).is_ok_and(|text| text.is_empty()),
+            path: session.as_str().to_owned(),
+        })
     }
 
     fn get_secret(&self, item: &str, session: &str) -> Result<SecretReply, Reason> {
         let session = zbus::ObjectPath::try_from(session).map_err(|_| "bad session")?;
-        let ((_session, parameters, value, _content_type),): ((
+        let ((reply_session, parameters, value, _content_type),): ((
             OwnedObjectPath,
             Vec<u8>,
             Vec<u8>,
             String,
         ),) = self.call(item, ITEM_IFACE, "GetSecret", &(session,))?;
         Ok(SecretReply {
+            session: reply_session.as_str().to_owned(),
             parameters,
             value: Zeroizing::new(value),
         })
@@ -390,6 +485,8 @@ mod tests {
         default: Result<Option<&'static str>, Reason>,
         locked: Result<bool, Reason>,
         session: Result<&'static str, Reason>,
+        session_output_empty: bool,
+        reply_session: &'static str,
         secret: Result<(Vec<u8>, Vec<u8>), Reason>,
         create: Result<Created, Reason>,
         calls: RefCell<Vec<&'static str>>,
@@ -403,6 +500,8 @@ mod tests {
                 default: Ok(Some("/c/default")),
                 locked: Ok(false),
                 session: Ok("/s/1"),
+                session_output_empty: true,
+                reply_session: "/s/1",
                 secret: Ok((vec![], b"key".to_vec())),
                 create: Ok(Created::Done),
                 calls: RefCell::new(vec![]),
@@ -440,14 +539,18 @@ mod tests {
             self.locked
         }
 
-        fn open_session(&self) -> Result<String, Reason> {
+        fn open_session(&self) -> Result<SessionReply, Reason> {
             self.calls.borrow_mut().push("session");
-            self.session.map(str::to_owned)
+            self.session.map(|path| SessionReply {
+                output_empty: self.session_output_empty,
+                path: path.to_owned(),
+            })
         }
 
         fn get_secret(&self, _: &str, _: &str) -> Result<SecretReply, Reason> {
             self.calls.borrow_mut().push("get_secret");
             self.secret.clone().map(|(parameters, value)| SecretReply {
+                session: self.reply_session.to_owned(),
                 parameters,
                 value: Zeroizing::new(value),
             })
@@ -622,6 +725,40 @@ mod tests {
             ..Fake::with_items(&["/i/1"], &[])
         };
         assert_eq!(get_kind(&fake), Err(Unavailable));
+    }
+
+    /// Under plain the session's output must be empty and the secret's reply must name the
+    /// session that was opened.
+    #[test]
+    fn a_session_that_is_not_plain_or_not_the_one_opened_is_unavailable() {
+        let fake = Fake {
+            session_output_empty: false,
+            ..Fake::with_items(&["/i/1"], &[])
+        };
+        assert_eq!(get_kind(&fake), Err(Unavailable));
+        assert!(!fake.called("get_secret"));
+        let fake = Fake {
+            session_output_empty: false,
+            ..Fake::empty()
+        };
+        assert_eq!(put_kind(&fake), Err(Unavailable));
+        assert!(!fake.called("create"));
+        let fake = Fake {
+            reply_session: "/s/other",
+            ..Fake::with_items(&["/i/1"], &[])
+        };
+        assert_eq!(get_kind(&fake), Err(Unavailable));
+    }
+
+    /// The timer fires after its time and a ready future wins without waiting for it.
+    #[test]
+    fn the_timeout_gives_a_slow_future_up_and_a_ready_one_its_output() {
+        let started = std::time::Instant::now();
+        assert_eq!(zbus::block_on(with_timeout(async { 7 })), Some(7));
+        assert!(started.elapsed() < CALL_TIMEOUT);
+        let never = std::future::pending::<()>();
+        assert_eq!(zbus::block_on(with_timeout(never)), None);
+        assert!(started.elapsed() >= CALL_TIMEOUT);
     }
 
     /// Row 17: a create that times out or loses the connection.

@@ -291,25 +291,33 @@ fn a_locked_default_collection_is_unavailable_and_nothing_is_created() {
     if !enabled() {
         return;
     }
-    in_private_session("locked_collection_checks");
+    in_private_session("locked_collection_checks", true);
 }
 
 /// Runs the test `inner_test` of this binary in a session bus and a gnome-keyring of its own
 /// (private HOME and data directories, the outer bus and keyring variables dropped), so it can
 /// only reach a throwaway keyring, and checks that it ran and passed.
-fn in_private_session(inner_test: &str) {
+/// With `unlocked` the daemon starts with an unlocked login keyring and the default alias set;
+/// without it, with no keyring at all.
+fn in_private_session(inner_test: &str, unlocked: bool) {
     let home = tempfile::tempdir().unwrap();
+    // Its own runtime directory (mode 0700): a second gnome-keyring in the user's would replace
+    // the real daemon's control socket there and remove it at exit.
+    let runtime = tempfile::tempdir().unwrap();
+    let start = if unlocked {
+        "printf pw | gnome-keyring-daemon --unlock --components=secrets"
+    } else {
+        "gnome-keyring-daemon --start --components=secrets"
+    };
     let output = std::process::Command::new("dbus-run-session")
         .args(["--", "bash", "-c"])
-        .arg(
-            "printf pw | gnome-keyring-daemon --unlock --components=secrets >/dev/null \
-             && exec \"$@\"",
-        )
+        .arg(format!("{start} >/dev/null && exec \"$@\""))
         .arg("bash")
         .arg(std::env::current_exe().unwrap())
         .args(["--exact", inner_test, "--nocapture"])
         .env("HOME", home.path())
         .env("XDG_DATA_HOME", home.path())
+        .env("XDG_RUNTIME_DIR", runtime.path())
         .env_remove("DBUS_SESSION_BUS_ADDRESS")
         .env_remove("GNOME_KEYRING_CONTROL")
         .env(INNER, "1")
@@ -360,6 +368,88 @@ fn locked_collection_checks() {
     let connection = connect();
     assert_eq!(items(&connection, &present).len(), 1);
     assert!(items(&connection, &missing).is_empty());
+}
+
+/// Row 5: a keyring with no default collection. Runs `no_default_collection_checks` in a
+/// private session whose daemon has no login keyring.
+#[test]
+fn no_default_collection_is_unavailable_and_nothing_is_created() {
+    let _serial = serial();
+    if !enabled() {
+        return;
+    }
+    in_private_session("no_default_collection_checks", false);
+}
+
+/// The inside of the test above; does nothing elsewhere.
+#[test]
+fn no_default_collection_checks() {
+    let _serial = serial();
+    if !enabled() || std::env::var_os(INNER).is_none() {
+        return;
+    }
+    let name = unique_name("nodefault");
+    let store = SecretService::new();
+    assert_eq!(kind(store.get(&name)), StoreErrorKind::Unavailable);
+    assert_eq!(
+        kind(store.put_new(&name, b"x")),
+        StoreErrorKind::Unavailable
+    );
+    let dir = lock_dir();
+    let error =
+        load_or_create(&store, &name, &|| Ok(dir.path().to_owned()), LOCK_WAIT).unwrap_err();
+    assert!(matches!(error, IdentityError::Unavailable(_)), "{error}");
+    assert!(items(&connect(), &name).is_empty());
+}
+
+/// A listener that accepts connections and never answers, for a bus address.
+fn silent_bus(dir: &std::path::Path) -> String {
+    let path = dir.join("bus");
+    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept() {
+            held.push(stream);
+        }
+    });
+    format!("unix:path={}", path.display())
+}
+
+/// A bus that accepts the connection and never speaks: both calls are `Unavailable` after about
+/// the call timeout, not never. Needs no daemon.
+#[test]
+fn a_silent_bus_is_unavailable_within_the_timeout() {
+    let _serial = serial();
+    const VAR: &str = "DBUS_SESSION_BUS_ADDRESS";
+    let dir = tempfile::tempdir().unwrap();
+    let address = silent_bus(dir.path());
+    let saved = std::env::var_os(VAR);
+    // SAFETY: as in `no_session_bus_is_unavailable`.
+    unsafe { std::env::set_var(VAR, &address) };
+    let name = unique_name("silent");
+    let store = SecretService::new();
+    let mut times = Vec::new();
+    let mut kinds = Vec::new();
+    for put in [false, true] {
+        let started = std::time::Instant::now();
+        kinds.push(if put {
+            kind(store.put_new(&name, b"x"))
+        } else {
+            kind(store.get(&name))
+        });
+        times.push(started.elapsed());
+    }
+    // SAFETY: as above.
+    unsafe {
+        match saved {
+            Some(value) => std::env::set_var(VAR, value),
+            None => std::env::remove_var(VAR),
+        }
+    }
+    assert_eq!(kinds, [StoreErrorKind::Unavailable; 2]);
+    for elapsed in times {
+        assert!(elapsed < Duration::from_secs(8), "{elapsed:?}");
+    }
 }
 
 /// A bus address that leads nowhere: both calls are `Unavailable`, and so is `ngr-agent identity`
@@ -447,7 +537,7 @@ mod binary {
         if !enabled() {
             return;
         }
-        in_private_session("binary::restart_checks");
+        in_private_session("binary::restart_checks", true);
     }
 
     /// The inside of the test above, in the private session; does nothing elsewhere.
@@ -464,6 +554,26 @@ mod binary {
         assert_eq!(second["created"], false);
         assert_eq!(first["fingerprint"], second["fingerprint"]);
         assert_eq!(first["public_key_pem"], second["public_key_pem"]);
+    }
+
+    /// A silent bus: exit 3 after about the call timeout, nothing on stdout. Needs no daemon.
+    #[test]
+    fn with_a_silent_bus_identity_exits_3_promptly() {
+        let _serial = serial();
+        let home = tempfile::tempdir().unwrap();
+        let bus = tempfile::tempdir().unwrap();
+        let mut command = identity(home.path());
+        command.env("DBUS_SESSION_BUS_ADDRESS", silent_bus(bus.path()));
+        let started = std::time::Instant::now();
+        let output = command.output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(3),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.is_empty());
+        assert!(started.elapsed() < Duration::from_secs(8));
     }
 
     /// No bus: exit 3, nothing on stdout, and no key or lock file written. Needs no daemon.

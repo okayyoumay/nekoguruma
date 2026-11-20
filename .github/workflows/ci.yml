@@ -120,8 +120,12 @@ jobs:
       # password the tests know. `--no-tests=fail` makes a filter that matches nothing an error.
       - name: Secret Service tests
         run: |
+          sudo apt-get update
           sudo apt-get install -y --no-install-recommends gnome-keyring dbus
           export KEYRING_HOME=$(mktemp -d)
+          # Its own runtime directory: a second gnome-keyring in the runner's would replace the
+          # control socket there.
+          export XDG_RUNTIME_DIR=$(mktemp -d)
           dbus-run-session -- bash -c 'printf pw | HOME=$KEYRING_HOME XDG_DATA_HOME=$KEYRING_HOME gnome-keyring-daemon --unlock --components=secrets > /dev/null && NGR_TEST_SECRET_SERVICE=1 cargo nextest run -p agent --locked --profile ci --no-tests=fail -E "binary(secret_service)"'
       # sim-vci is a cdylib only, which cargo runs no doc tests for.
       - run: cargo test --workspace --locked --exclude sim-vci --doc

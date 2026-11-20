@@ -21,7 +21,7 @@ gnome-keyring 46.1.
 
 1. **`zbus` 6, a Linux-only dependency, with its default runtime only.** Each read or create
    runs one `zbus::block_on` over the asynchronous calls, on a new session-bus connection, with
-   a 5-second bound per call; nothing is cached, so a daemon restart or a lost bus needs no
+   a 5-second bound on setting up the connection and on each call; nothing is cached, so a daemon restart or a lost bus needs no
    recovery code. Its `tokio` and `tracing` features stay off, so it cannot log a message that
    carries the key. `zbus` updates are left out of Dependabot's automatically merged group and
    wait for the maintainer.
@@ -71,8 +71,13 @@ gnome-keyring 46.1.
   in user mode until the keyring is unlocked; an interactive command that may run the service's
   own prompt is later work.
 - Two state directories of one account can still create two items; every later start then
-  reports the key unusable (exit 4) and asks for re-registration, as ADR-460 accepts.
-- Only gnome-keyring is tested. Other providers (KeePassXC, KWallet, oo7) rely on the mapping
-  failing closed to unavailable.
+  reports the key unusable (exit 4). Registering again does not repair it, since a create finds
+  the items already there: one of them has to be deleted by hand (for example with Seahorse)
+  first.
+- Only gnome-keyring is tested, and it lists locked items in a search, which the rule for absent
+  rests on. A provider that leaves locked items out of a search (KeePassXC, KWallet and oo7 are
+  untested) would answer absent while the key sits in a locked collection other than the
+  default one, and the agent would create a second key, which every later start then reports
+  as unusable. Elsewhere the mapping fails closed to unavailable.
 - The key crosses the session bus unencrypted, inside the account's own trust boundary.
 - `zbus` 6 is young and releases often; each update is a pull request the maintainer merges.

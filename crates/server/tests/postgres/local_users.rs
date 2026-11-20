@@ -1596,7 +1596,8 @@ mod command {
         // U1, U2, U3. The URL points at nothing and standard input would hold a password: the
         // exit code 2 and the speed show that parsing stopped first.
         let dir = tempfile::tempdir().unwrap();
-        let config = write_config(dir.path(), &refused_url(&crate::support::random_password()));
+        let (_closed, url) = refused_url(&crate::support::random_password());
+        let config = write_config(dir.path(), &url);
         let config = config.to_str().unwrap();
         let cases: Vec<Vec<&str>> = vec![
             vec![],
@@ -1771,7 +1772,8 @@ mod command {
     #[test]
     fn a_terminal_on_standard_input_is_exit_2_with_a_hint() {
         let dir = tempfile::tempdir().unwrap();
-        let config = write_config(dir.path(), &refused_url(&crate::support::random_password()));
+        let (_closed, url) = refused_url(&crate::support::random_password());
+        let config = write_config(dir.path(), &url);
         for sub in ["add", "set-password"] {
             let mut line = format!(
                 "{} user {sub} --config {} --username a",
@@ -1802,7 +1804,8 @@ mod command {
     fn a_value_that_is_not_utf8_is_a_usage_error() {
         use std::os::unix::ffi::OsStrExt;
         let dir = tempfile::tempdir().unwrap();
-        let config = write_config(dir.path(), &refused_url(&crate::support::random_password()));
+        let (_closed, url) = refused_url(&crate::support::random_password());
+        let config = write_config(dir.path(), &url);
         let bad = std::ffi::OsStr::from_bytes(&[0xff, 0xfe]);
         let output = Command::new(env!("CARGO_BIN_EXE_ngr-server"))
             .args(["user", "add", "--config"])
@@ -1946,7 +1949,8 @@ mod command {
 
         // A database that is down: the URL and password are not shown.
         let secret = crate::support::random_password();
-        let config = write_config(dir.path(), &refused_url(&secret));
+        let (_closed, url) = refused_url(&secret);
+        let config = write_config(dir.path(), &url);
         for sub in ["add", "set-password", "disable"] {
             let mut args = vec![sub, "--config", config.to_str().unwrap(), "--username", "a"];
             if sub == "add" {

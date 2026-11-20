@@ -9,7 +9,7 @@ use server::db::{self, DbError};
 use server::{Server, StartError};
 use sqlx::migrate::{Migration, MigrationType, Migrator};
 
-use crate::support::{TestPostgres, free_port};
+use crate::support::TestPostgres;
 
 /// Longer than any start below should take; a hang fails the test instead of the run.
 const LIMIT: Duration = Duration::from_secs(30);
@@ -144,9 +144,10 @@ async fn two_servers_starting_together_against_an_empty_database_both_succeed() 
 
 #[tokio::test]
 async fn a_start_against_a_database_that_is_down_fails_within_the_connect_timeout() {
+    let closed = crate::support::ClosedPort::new();
     let mut database = Database::new(format!(
         "postgres://ngr:pw@127.0.0.1:{}/nekoguruma",
-        free_port()
+        closed.port()
     ));
     database.connect_timeout_secs = 1;
     let config = Config {

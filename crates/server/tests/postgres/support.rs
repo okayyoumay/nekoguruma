@@ -12,6 +12,8 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use server::config::ObjectServerConfig;
+use server::object_server::{ObjectServer, ObjectServerError, Tuning};
 use sqlx::Connection;
 use sqlx::postgres::{PgConnectOptions, PgConnection, PgSslMode};
 
@@ -265,12 +267,35 @@ impl Drop for TestPostgres {
     }
 }
 
-/// The URL of a PostgreSQL that is not there: a port that nothing listens on.
-pub fn refused_url(password: &str) -> String {
-    format!(
+/// A loopback port that nothing listens on. The socket is bound and never listens, and it holds
+/// the port for as long as the value lives, so no other test process can take it and every
+/// connection to it is refused. A port bound and then released could be taken meanwhile. Keep
+/// the value for as long as the test uses the port.
+pub struct ClosedPort(tokio::net::TcpSocket);
+
+impl ClosedPort {
+    pub fn new() -> Self {
+        let socket = tokio::net::TcpSocket::new_v4().expect("a socket");
+        socket
+            .bind((std::net::Ipv4Addr::LOCALHOST, 0).into())
+            .expect("a loopback port");
+        Self(socket)
+    }
+
+    pub fn port(&self) -> u16 {
+        self.0.local_addr().expect("a bound socket").port()
+    }
+}
+
+/// The URL of a PostgreSQL that is not there: a port that nothing listens on, held by the
+/// returned guard, which the caller keeps while the URL is in use.
+pub fn refused_url(password: &str) -> (ClosedPort, String) {
+    let closed = ClosedPort::new();
+    let url = format!(
         "postgres://ngr:{password}@127.0.0.1:{}/nekoguruma",
-        free_port()
-    )
+        closed.port()
+    );
+    (closed, url)
 }
 
 /// The `[object_server]` table of a configuration file in `dir`: the fake object server
@@ -315,8 +340,73 @@ pub fn fake_binary(dir: &Path) -> PathBuf {
     target
 }
 
-/// A port that was free a moment ago. Another process may take it before it is used (the same
-/// race as `TestPostgres::start`'s retry loop); the tests accept it.
+/// How many ports a start that binds a picked port in a child process tries.
+pub const PORT_ATTEMPTS: usize = 5;
+
+/// Runs `start` with a port that was free a moment ago, and again with a fresh port when it fails
+/// with an error that `lost` calls the loss of the port to another process, at most
+/// `PORT_ATTEMPTS` times in all. Returns the last result and the port it used. For a child
+/// process that binds the port itself: a port picked and released is only free for a moment.
+pub async fn retry_on_lost_port<T, E, Fut>(
+    mut start: impl FnMut(u16) -> Fut,
+    lost: impl Fn(&E) -> bool,
+) -> (Result<T, E>, u16)
+where
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    let mut attempt = 1;
+    loop {
+        let port = free_port();
+        let result = start(port).await;
+        match &result {
+            Err(error) if attempt < PORT_ATTEMPTS && lost(error) => attempt += 1,
+            _ => return (result, port),
+        }
+    }
+}
+
+/// The object server's own check found the port taken.
+pub fn object_port_taken(error: &ObjectServerError) -> bool {
+    matches!(error, ObjectServerError::PortTaken { .. })
+}
+
+/// The port was taken, either before the spawn (`PortTaken`) or after it, when the child ended
+/// because it could not bind (`ExitedBeforeReady`; the start reports no more than that the child
+/// ended).
+pub fn object_port_lost(error: &ObjectServerError) -> bool {
+    object_port_taken(error) || matches!(error, ObjectServerError::ExitedBeforeReady(_))
+}
+
+/// `ObjectServer::start` on `config` with a fresh port for each attempt (`retry_on_lost_port`).
+/// `retry_exit` also retries when the child ended before it was ready: use it where the start is
+/// expected to succeed, not where the child is made to end. Returns the result and the last port
+/// tried.
+pub async fn start_object_server(
+    config: &ObjectServerConfig,
+    tuning: &Tuning,
+    retry_exit: bool,
+) -> (Result<ObjectServer, ObjectServerError>, u16) {
+    retry_on_lost_port(
+        |port| {
+            let mut config = config.clone();
+            config.port = Some(port);
+            async move { ObjectServer::start(&config, 1, tuning).await }
+        },
+        |error| {
+            if retry_exit {
+                object_port_lost(error)
+            } else {
+                object_port_taken(error)
+            }
+        },
+    )
+    .await
+}
+
+/// A port that was free a moment ago. Another process may take it before it is used, so a caller
+/// that hands it to a child process or to PostgreSQL retries with a new one (`TestPostgres::start`,
+/// `retry_on_lost_port`); a server started in the test's own process binds port 0 instead. A
+/// caller that needs a port nothing listens on uses it only where no one binds it.
 pub fn free_port() -> u16 {
     std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .expect("bind a free port")

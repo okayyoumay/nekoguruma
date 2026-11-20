@@ -15,7 +15,7 @@ use sqlx::postgres::{PgConnectOptions, PgSslMode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use crate::support::{TestPostgres, free_port};
+use crate::support::{ClosedPort, TestPostgres};
 
 /// A key made in memory, for the tests that do not start from the database.
 fn test_key() -> Arc<InstructionKey> {
@@ -78,6 +78,8 @@ pub(crate) struct Running {
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     pub(crate) force: Option<tokio::sync::oneshot::Sender<()>>,
     task: tokio::task::JoinHandle<()>,
+    /// The port a pool points at when nothing listens on it, held while the server runs.
+    pub(crate) _closed: Option<crate::support::ClosedPort>,
 }
 
 impl Running {
@@ -87,19 +89,22 @@ impl Running {
     }
 
     async fn start_with_grace(grace_secs: u64) -> Running {
+        let closed = ClosedPort::new();
         let options = PgConnectOptions::new_without_pgpass()
             .host("127.0.0.1")
-            .port(free_port())
+            .port(closed.port())
             .ssl_mode(PgSslMode::Disable);
         let pool = db::pool_lazy(options, Duration::from_secs(1));
-        Running::serve(
+        let mut running = Running::serve(
             Http {
                 port: 0,
                 shutdown_grace_secs: grace_secs,
             },
             pool,
         )
-        .await
+        .await;
+        running._closed = Some(closed);
+        running
     }
 
     /// Starts as a deployment does: connect, migrate, bind.
@@ -148,6 +153,7 @@ impl Running {
             stop: Some(stop),
             force: Some(force),
             task,
+            _closed: None,
         }
     }
 
@@ -509,9 +515,10 @@ async fn a_second_stop_signal_ends_the_wait_at_once() {
 #[tokio::test]
 async fn start_fails_when_the_port_is_taken() {
     let s = Running::start().await;
+    let closed = ClosedPort::new();
     let options = PgConnectOptions::new_without_pgpass()
         .host("127.0.0.1")
-        .port(free_port())
+        .port(closed.port())
         .ssl_mode(PgSslMode::Disable);
     let http = Http {
         port: s.addr.port(),

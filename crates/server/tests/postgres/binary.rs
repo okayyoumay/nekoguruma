@@ -149,9 +149,23 @@ fn a_taken_port_exits_1() {
 /// before the child binds it; the child then exits 1, and the start is tried again with a new
 /// port. The reply must be the server's own, so a stranger on the port cannot pass for it.
 fn start_server(dir: &Path, pg: &TestPostgres) -> (Child, u16, String) {
-    for attempt in 0..5 {
+    start_server_with(dir, pg, Duration::from_secs(30), |_| {})
+}
+
+/// `start_server` with a step that edits the configuration file once it is written (it is written
+/// again for every attempt, with new ports) and a bound on how long one attempt waits for the
+/// server. The object server's port in the file is picked the same way as the server's own, so
+/// a child that cannot bind either one ends the server with exit 1 and is tried again.
+pub(crate) fn start_server_with(
+    dir: &Path,
+    pg: &TestPostgres,
+    limit: Duration,
+    edit: impl Fn(&Path),
+) -> (Child, u16, String) {
+    for attempt in 0..crate::support::PORT_ATTEMPTS {
         let port = free_port();
         let path = write_config(dir, port, &pg.url());
+        edit(&path);
         // The child's log goes to a file, so that a health answer counts only once this child has
         // logged that it listens on this port: a port that was free a moment before may since
         // belong to another test's server, whose answer would otherwise be taken for this one's.
@@ -161,7 +175,7 @@ fn start_server(dir: &Path, pg: &TestPostgres) -> (Child, u16, String) {
         command.stderr(log);
         let mut child = command.spawn().unwrap();
         let origin = format!("127.0.0.1:{port}");
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + limit;
         loop {
             let ours = std::fs::read_to_string(&log_path)
                 .is_ok_and(|text| text.contains("listening") && text.contains(&origin));
@@ -177,7 +191,10 @@ fn start_server(dir: &Path, pg: &TestPostgres) -> (Child, u16, String) {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
-    panic!("no free port could be bound in five attempts");
+    panic!(
+        "no free port could be bound in {} attempts",
+        crate::support::PORT_ATTEMPTS
+    );
 }
 
 #[test]
@@ -237,7 +254,8 @@ fn a_refused_database_exits_1_within_the_connect_timeout_and_never_listens() {
     let port = free_port();
     // A value made at run time, so the test holds no fixed secret.
     let secret = random_password();
-    let path = write_config(dir.path(), port, &refused_url(&secret));
+    let (_closed, url) = refused_url(&secret);
+    let path = write_config(dir.path(), port, &url);
     let mut command = server(&["--config", path.to_str().unwrap()]);
     command.stderr(Stdio::piped());
     let child = command.spawn().unwrap();
@@ -359,6 +377,11 @@ pub(crate) struct KillOnDrop(Child);
 impl KillOnDrop {
     pub(crate) fn new(child: Child) -> KillOnDrop {
         KillOnDrop(child)
+    }
+
+    /// Whether the server has ended.
+    pub(crate) fn exited(&mut self) -> bool {
+        self.0.try_wait().unwrap().is_some()
     }
 
     /// Ends the server the way a service manager does (SIGTERM; elsewhere a kill) and waits.

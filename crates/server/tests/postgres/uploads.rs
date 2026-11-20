@@ -337,7 +337,7 @@ impl Fx {
         let mut real = None;
         let mut wrap = Wrap::default();
         if with == With::Real {
-            let r = crate::object_server_rustfs::Real::new();
+            let mut r = crate::object_server_rustfs::Real::new();
             let server = r.start().await;
             let store = tokio::time::timeout(
                 Duration::from_secs(60),

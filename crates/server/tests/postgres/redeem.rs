@@ -22,7 +22,7 @@ use sqlx::postgres::{PgConnectOptions, PgSslMode};
 use tracing_subscriber::fmt::MakeWriter;
 
 use crate::serving::{Reply, Running, exchange};
-use crate::support::{TestPostgres, free_port};
+use crate::support::TestPostgres;
 
 pub(crate) const LIMIT: Duration = Duration::from_secs(30);
 
@@ -185,11 +185,14 @@ async fn bind(pool: PgPool, key: Arc<InstructionKey>) -> Running {
 
 /// A server whose pool points at a port nothing listens on.
 pub(crate) async fn dead(key: Arc<InstructionKey>) -> Running {
+    let closed = crate::support::ClosedPort::new();
     let options = PgConnectOptions::new_without_pgpass()
         .host("127.0.0.1")
-        .port(free_port())
+        .port(closed.port())
         .ssl_mode(PgSslMode::Disable);
-    bind(db::pool_lazy(options, Duration::from_secs(1)), key).await
+    let mut running = bind(db::pool_lazy(options, Duration::from_secs(1)), key).await;
+    running._closed = Some(closed);
+    running
 }
 
 /// A migrated database with the server key's row, and a server on it.

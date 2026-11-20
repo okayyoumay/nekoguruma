@@ -381,7 +381,8 @@ fn a_usage_error_exits_2_before_any_database_connection() {
     let dir = tempfile::tempdir().unwrap();
     // The URL points at nothing: reaching the connection would take the connect timeout and exit
     // 1, so the exit code 2 shows that parsing stopped first.
-    let config = write_config(dir.path(), &refused_url(&crate::support::random_password()));
+    let (_closed, url) = refused_url(&crate::support::random_password());
+    let config = write_config(dir.path(), &url);
     let key = fingerprint();
     for flags in [
         vec!["--owner", "alice", "--name", "n"],
@@ -571,7 +572,8 @@ async fn migrations_that_differ_from_the_binarys_are_refused_each_way() {
 fn a_database_that_is_down_exits_1_without_showing_the_url_or_password() {
     let dir = tempfile::tempdir().unwrap();
     let secret = crate::support::random_password();
-    let config = write_config(dir.path(), &refused_url(&secret));
+    let (_closed, url) = refused_url(&secret);
+    let config = write_config(dir.path(), &url);
     let started = Instant::now();
     let output = run_issue(&config, &fingerprint());
     assert_eq!(output.status.code(), Some(1));

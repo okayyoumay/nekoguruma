@@ -17,7 +17,10 @@ use server::storage::{S3Tuning, StoreError};
 use server::{RunError, Server, StartError};
 
 use crate::redeem::{Captured, capture};
-use crate::support::{TestPostgres, free_port};
+use crate::support::{
+    TestPostgres, free_port, object_port_lost, object_port_taken, retry_on_lost_port,
+    start_object_server,
+};
 
 const LIMIT: Duration = Duration::from_secs(30);
 
@@ -98,13 +101,41 @@ impl Fixture {
         names
     }
 
-    async fn start(&self, ready_ms: u64, stop_ms: u64) -> Result<ObjectServer, ObjectServerError> {
-        tokio::time::timeout(
+    /// Starts the child on a port that is free at that moment, with a new port when another
+    /// process takes it (before the spawn, or while the child binds it). The port that was used
+    /// is kept in `config`.
+    async fn start(
+        &mut self,
+        ready_ms: u64,
+        stop_ms: u64,
+    ) -> Result<ObjectServer, ObjectServerError> {
+        self.start_with(ready_ms, stop_ms, true).await
+    }
+
+    /// As `start`, for a start that is meant to fail: only a port found taken before the spawn is
+    /// tried again, so that a child that ends on purpose is not started five times.
+    async fn start_failing(
+        &mut self,
+        ready_ms: u64,
+        stop_ms: u64,
+    ) -> Result<ObjectServer, ObjectServerError> {
+        self.start_with(ready_ms, stop_ms, false).await
+    }
+
+    async fn start_with(
+        &mut self,
+        ready_ms: u64,
+        stop_ms: u64,
+        retry_exit: bool,
+    ) -> Result<ObjectServer, ObjectServerError> {
+        let (result, port) = tokio::time::timeout(
             LIMIT,
-            ObjectServer::start(&self.config, 1, &tuning(ready_ms, stop_ms)),
+            start_object_server(&self.config, &tuning(ready_ms, stop_ms), retry_exit),
         )
         .await
-        .expect("the start must not hang")
+        .expect("the start must not hang");
+        self.config.port = Some(port);
+        result
     }
 
     /// A `Config` for `Server::start` that serves on `http_port` with this fixture's child.
@@ -191,6 +222,15 @@ async fn pool_connections(pg: &TestPostgres) -> String {
         .await
 }
 
+/// `start_object_server` without the port that was used.
+async fn start_at(
+    config: &ObjectServerConfig,
+    tuning: &Tuning,
+    retry_exit: bool,
+) -> Result<ObjectServer, ObjectServerError> {
+    start_object_server(config, tuning, retry_exit).await.0
+}
+
 fn refused(result: Result<ObjectServer, ObjectServerError>) -> ObjectServerError {
     match result {
         Err(error) => error,
@@ -212,7 +252,7 @@ async fn a_binary_that_cannot_run_is_refused_before_any_file_is_made() {
     config.binary = fx.dir.path().join("missing");
     let try_start = |config: &ObjectServerConfig| {
         let config = config.clone();
-        async move { ObjectServer::start(&config, 1, &tuning(2000, 500)).await }
+        async move { start_at(&config, &tuning(2000, 500), false).await }
     };
     assert!(matches!(
         refused(try_start(&config).await),
@@ -255,7 +295,7 @@ async fn a_binary_that_cannot_run_is_refused_before_any_file_is_made() {
 #[tokio::test]
 async fn a_file_that_is_no_program_ends_the_start_at_once_and_leaves_nothing_running() {
     use std::os::unix::fs::PermissionsExt;
-    let fx = Fixture::new("");
+    let mut fx = Fixture::new("");
     let mut config = fx.config.clone();
     let bogus = fx.dir.path().join("bogus");
     std::fs::write(&bogus, b"this is not a program\n").unwrap();
@@ -263,7 +303,7 @@ async fn a_file_that_is_no_program_ends_the_start_at_once_and_leaves_nothing_run
     private(fx.dir.path());
     config.binary = bogus;
     let began = Instant::now();
-    let error = refused(ObjectServer::start(&config, 1, &tuning(20_000, 500)).await);
+    let error = refused(start_at(&config, &tuning(20_000, 500), false).await);
     assert!(
         began.elapsed() < Duration::from_secs(5),
         "{:?}",
@@ -296,7 +336,7 @@ async fn a_writable_binary_directory_is_refused_and_a_symbolic_link_is_followed(
     std::fs::copy(crate::support::fake_binary(fx.dir.path()), &copy).unwrap();
     let mut config = fx.config.clone();
     config.binary = copy;
-    let error = refused(ObjectServer::start(&config, 1, &tuning(2000, 500)).await);
+    let error = refused(start_at(&config, &tuning(2000, 500), false).await);
     assert!(
         matches!(error, ObjectServerError::BinaryWritable),
         "{error}"
@@ -307,9 +347,7 @@ async fn a_writable_binary_directory_is_refused_and_a_symbolic_link_is_followed(
     let link = fx.dir.path().join("link");
     std::os::unix::fs::symlink(crate::support::fake_binary(fx.dir.path()), &link).unwrap();
     config.binary = link;
-    let server = ObjectServer::start(&config, 1, &tuning(5000, 1000))
-        .await
-        .unwrap();
+    let server = start_at(&config, &tuning(5000, 1000), true).await.unwrap();
     assert!(fx.pid().is_some());
     server.stop(std::future::pending()).await;
 }
@@ -322,9 +360,7 @@ async fn the_data_directory_is_created_owner_only_or_refused() {
     let mut config = fx.config.clone();
     let fresh = fx.dir.path().join("fresh");
     config.data_dir = fresh.clone();
-    let server = ObjectServer::start(&config, 1, &tuning(5000, 1000))
-        .await
-        .unwrap();
+    let server = start_at(&config, &tuning(5000, 1000), true).await.unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -336,7 +372,7 @@ async fn the_data_directory_is_created_owner_only_or_refused() {
 
     config.data_dir = fx.dir.path().join("no-parent").join("data");
     assert!(matches!(
-        refused(ObjectServer::start(&config, 1, &tuning(2000, 500)).await),
+        refused(start_at(&config, &tuning(2000, 500), false).await),
         ObjectServerError::DataDirIo {
             kind: std::io::ErrorKind::NotFound,
             ..
@@ -346,7 +382,7 @@ async fn the_data_directory_is_created_owner_only_or_refused() {
     std::fs::write(&file, b"x").unwrap();
     config.data_dir = file;
     assert!(matches!(
-        refused(ObjectServer::start(&config, 1, &tuning(2000, 500)).await),
+        refused(start_at(&config, &tuning(2000, 500), false).await),
         ObjectServerError::DataDirNotADirectory
     ));
     #[cfg(unix)]
@@ -357,7 +393,7 @@ async fn the_data_directory_is_created_owner_only_or_refused() {
         std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o770)).unwrap();
         config.data_dir = open;
         assert!(matches!(
-            refused(ObjectServer::start(&config, 1, &tuning(2000, 500)).await),
+            refused(start_at(&config, &tuning(2000, 500), false).await),
             ObjectServerError::DataDirWritable
         ));
     }
@@ -367,11 +403,11 @@ async fn the_data_directory_is_created_owner_only_or_refused() {
 /// child is spawned.
 #[tokio::test]
 async fn a_taken_object_port_is_refused_by_name_before_the_spawn() {
-    let fx = Fixture::new("");
-    let holder =
-        std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, fx.config.port.unwrap()))
-            .unwrap();
-    let error = refused(fx.start(2000, 500).await);
+    let mut fx = Fixture::new("");
+    // The test holds the port itself, so that it is taken whatever other processes do.
+    let holder = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    fx.config.port = Some(holder.local_addr().unwrap().port());
+    let error = refused(ObjectServer::start(&fx.config, 1, &tuning(2000, 500)).await);
     assert!(
         matches!(error, ObjectServerError::PortTaken { port } if port == fx.config.port.unwrap()),
         "{error}"
@@ -390,12 +426,11 @@ async fn a_taken_object_port_is_refused_by_name_before_the_spawn() {
 /// anything, and of two that start together one serves (K8).
 #[tokio::test]
 async fn a_second_server_on_one_data_directory_is_refused_before_the_spawn() {
-    let fx = Fixture::new("");
+    let mut fx = Fixture::new("");
     let first = fx.start(5000, 1000).await.unwrap();
     let pid = fx.pid().unwrap();
-    let mut other = fx.config.clone();
-    other.port = Some(free_port());
-    let error = refused(ObjectServer::start(&other, 1, &tuning(2000, 500)).await);
+    let other = fx.config.clone();
+    let error = refused(start_at(&other, &tuning(2000, 500), false).await);
     assert!(matches!(error, ObjectServerError::DataDirInUse), "{error}");
     assert_eq!(fx.pid(), Some(pid), "the second start spawned a child");
     first.stop(std::future::pending()).await;
@@ -404,12 +439,11 @@ async fn a_second_server_on_one_data_directory_is_refused_before_the_spawn() {
     // (K8, the link race of the credential files themselves, is covered by the 16-thread unit
     // test in `object_server/credentials.rs`; here the data directory's lock decides first.)
     let fx = Fixture::new("");
-    let mut other = fx.config.clone();
-    other.port = Some(free_port());
+    let other = fx.config.clone();
     let bounds = tuning(5000, 1000);
     let (a, b) = tokio::join!(
-        ObjectServer::start(&fx.config, 1, &bounds),
-        ObjectServer::start(&other, 1, &bounds),
+        start_at(&fx.config, &bounds, true),
+        start_at(&other, &bounds, true),
     );
     let (served, refused) = match (a, b) {
         (Ok(server), Err(error)) | (Err(error), Ok(server)) => (server, error),
@@ -429,7 +463,7 @@ async fn a_second_server_on_one_data_directory_is_refused_before_the_spawn() {
 #[tokio::test]
 async fn the_first_start_creates_the_credentials_and_the_next_loads_them_unchanged() {
     let (log, _guard) = capture();
-    let fx = Fixture::new("");
+    let mut fx = Fixture::new("");
     let first = fx.start(5000, 1000).await.unwrap();
     let names = fx.credential_names();
     assert_eq!(names, [ACCESS_KEY_FILE, SECRET_KEY_FILE]);
@@ -472,11 +506,11 @@ async fn the_first_start_creates_the_credentials_and_the_next_loads_them_unchang
 /// A corrupt credential file ends the start before a spawn and is not overwritten (K3, S2).
 #[tokio::test]
 async fn a_corrupt_credential_file_ends_the_start_before_the_spawn() {
-    let fx = Fixture::new("");
+    let mut fx = Fixture::new("");
     let path = fx.credentials().join(SECRET_KEY_FILE);
     std::fs::write(&path, b"truncated").unwrap();
     private(&path);
-    let error = refused(fx.start(2000, 500).await);
+    let error = refused(fx.start_failing(2000, 500).await);
     assert!(
         matches!(error, ObjectServerError::Credentials(_)),
         "{error}"
@@ -491,7 +525,7 @@ async fn a_corrupt_credential_file_ends_the_start_before_the_spawn() {
 #[tokio::test]
 async fn a_server_that_is_ready_in_time_is_started_and_answers_on_loopback() {
     let (log, _guard) = capture();
-    let fx = Fixture::new("");
+    let mut fx = Fixture::new("");
     let server = fx.start(5000, 1000).await.unwrap();
     assert_eq!(server.port(), fx.config.port.unwrap());
     assert!(server.pid().is_some());
@@ -511,9 +545,9 @@ async fn a_server_that_never_becomes_ready_is_stopped_and_the_start_names_the_la
         ("mode garbage\n", "unparseable answer"),
         ("mode silent\n", "cannot connect"),
     ] {
-        let fx = Fixture::new(cfg);
+        let mut fx = Fixture::new(cfg);
         let began = Instant::now();
-        let error = refused(fx.start(ready_ms, 500).await);
+        let error = refused(fx.start_failing(ready_ms, 500).await);
         let took = began.elapsed();
         match &error {
             ObjectServerError::NotReady { last: seen, .. } => {
@@ -539,9 +573,9 @@ async fn a_server_that_never_becomes_ready_is_stopped_and_the_start_names_the_la
 #[tokio::test]
 async fn a_child_that_ignores_sigterm_is_killed_when_the_start_fails() {
     let (log, _guard) = capture();
-    let fx = Fixture::new("mode never-ready\nignore_term 1\n");
+    let mut fx = Fixture::new("mode never-ready\nignore_term 1\n");
     let began = Instant::now();
-    let error = refused(fx.start(500, 700).await);
+    let error = refused(fx.start_failing(500, 700).await);
     assert!(
         matches!(error, ObjectServerError::NotReady { .. }),
         "{error}"
@@ -562,9 +596,9 @@ async fn a_child_that_ignores_sigterm_is_killed_when_the_start_fails() {
 /// Q3: a child that ends before it is ready ends the start at once, with how it ended.
 #[tokio::test]
 async fn a_child_that_exits_early_ends_the_start_at_once() {
-    let fx = Fixture::new("mode exit\ncode 7\n");
+    let mut fx = Fixture::new("mode exit\ncode 7\n");
     let began = Instant::now();
-    let error = refused(fx.start(20_000, 1000).await);
+    let error = refused(fx.start_failing(20_000, 1000).await);
     assert!(
         began.elapsed() < Duration::from_secs(5),
         "{:?}",
@@ -582,13 +616,13 @@ async fn a_child_that_exits_early_ends_the_start_at_once() {
 /// is cut at one second, so the start ends at the bound and not much later.
 #[tokio::test]
 async fn readiness_just_under_the_bound_is_accepted_and_a_hung_probe_is_cut() {
-    let fx = Fixture::new("ready_after_ms 1500\n");
+    let mut fx = Fixture::new("ready_after_ms 1500\n");
     let server = fx.start(3000, 1000).await.unwrap();
     server.stop(std::future::pending()).await;
 
-    let fx = Fixture::new("mode hang\n");
+    let mut fx = Fixture::new("mode hang\n");
     let began = Instant::now();
-    let error = refused(fx.start(2500, 500).await);
+    let error = refused(fx.start_failing(2500, 500).await);
     let took = began.elapsed();
     assert!(
         matches!(&error, ObjectServerError::NotReady { last, .. } if last.contains("no answer within 1 s")),
@@ -609,7 +643,7 @@ async fn a_failure_after_the_spawn_kills_and_reaps_the_child() {
     let fx = Fixture::new("");
     let mut hooked = tuning(5000, 1000);
     hooked.fail_after_spawn = true;
-    let error = refused(ObjectServer::start(&fx.config, 1, &hooked).await);
+    let error = refused(start_at(&fx.config, &hooked, false).await);
     assert!(matches!(error, ObjectServerError::Setup(_)), "{error}");
     let pid = fx.pid().expect("the child was ready, so it wrote its pid");
     assert!(
@@ -621,7 +655,7 @@ async fn a_failure_after_the_spawn_kills_and_reaps_the_child() {
 /// S5: dropping the handle, or the start future, kills the child.
 #[tokio::test]
 async fn dropping_the_handle_or_the_start_future_kills_the_child() {
-    let fx = Fixture::new("");
+    let mut fx = Fixture::new("");
     let server = fx.start(5000, 1000).await.unwrap();
     let pid = server.pid().unwrap();
     assert!(!ended(pid));
@@ -631,7 +665,7 @@ async fn dropping_the_handle_or_the_start_future_kills_the_child() {
     let fx = Fixture::new("ready_after_ms 20000\n");
     let early = tokio::time::timeout(
         Duration::from_millis(600),
-        ObjectServer::start(&fx.config, 1, &tuning(30_000, 1000)),
+        start_at(&fx.config, &tuning(30_000, 1000), true),
     )
     .await;
     assert!(early.is_err(), "the start must still be waiting");
@@ -652,7 +686,7 @@ fn the_child_outlives_the_thread_that_started_it() {
             .build()
             .unwrap();
         runtime
-            .block_on(ObjectServer::start(&config, 1, &tuning(5000, 1000)))
+            .block_on(start_at(&config, &tuning(5000, 1000), true))
             .unwrap()
     });
     let server = starter.join().unwrap();
@@ -674,7 +708,7 @@ fn the_child_outlives_the_thread_that_started_it() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn the_child_gets_a_rebuilt_environment_a_group_of_its_own_and_no_extra_descriptors() {
-    let fx = Fixture::new("report 1\n");
+    let mut fx = Fixture::new("report 1\n");
     let server = fx.start(5000, 1000).await.unwrap();
     let report = fx.report();
     let port = fx.config.port.unwrap();
@@ -757,7 +791,7 @@ async fn the_child_gets_a_rebuilt_environment_a_group_of_its_own_and_no_extra_de
 #[tokio::test]
 async fn the_output_is_forwarded_bounded_and_without_the_secret() {
     let (log, _guard) = capture();
-    let fx = Fixture::new("print_secret 1\nreport 1\n");
+    let mut fx = Fixture::new("print_secret 1\nreport 1\n");
     let server = fx.start(5000, 1000).await.unwrap();
     let secret = fx.secret();
     log_has(&log, "echo again").await;
@@ -796,8 +830,8 @@ async fn the_output_is_forwarded_bounded_and_without_the_secret() {
     server.stop(std::future::pending()).await;
 
     // A failed start's error names no secret.
-    let fx = Fixture::new("print_secret 1\nmode never-ready\n");
-    let error = refused(fx.start(600, 500).await);
+    let mut fx = Fixture::new("print_secret 1\nmode never-ready\n");
+    let error = refused(fx.start_failing(600, 500).await);
     assert!(!format!("{error} {error:?}").contains(&fx.secret()));
 }
 
@@ -808,7 +842,7 @@ async fn the_output_is_forwarded_bounded_and_without_the_secret() {
 /// reported.
 #[tokio::test]
 async fn a_child_that_dies_after_the_start_is_seen_by_exited() {
-    let fx = Fixture::new("die_after_ms 500\ndie_code 4\n");
+    let mut fx = Fixture::new("die_after_ms 500\ndie_code 4\n");
     let mut server = fx.start(5000, 1000).await.unwrap();
     let how = tokio::time::timeout(Duration::from_secs(5), server.exited())
         .await
@@ -820,7 +854,7 @@ async fn a_child_that_dies_after_the_start_is_seen_by_exited() {
 #[cfg(unix)]
 #[tokio::test]
 async fn a_child_killed_by_a_signal_is_reported_with_the_signal() {
-    let fx = Fixture::new("die_after_ms 300\ndie_signal 1\n");
+    let mut fx = Fixture::new("die_after_ms 300\ndie_signal 1\n");
     let mut server = fx.start(5000, 1000).await.unwrap();
     let how = tokio::time::timeout(Duration::from_secs(5), server.exited())
         .await
@@ -833,7 +867,7 @@ async fn a_child_killed_by_a_signal_is_reported_with_the_signal() {
 #[tokio::test]
 async fn a_child_that_ignores_sigterm_is_killed_after_the_stop_bound() {
     let (log, _guard) = capture();
-    let fx = Fixture::new("ignore_term 1\n");
+    let mut fx = Fixture::new("ignore_term 1\n");
     let server = fx.start(5000, 800).await.unwrap();
     let pid = server.pid().unwrap();
     let began = Instant::now();
@@ -854,7 +888,7 @@ async fn a_child_that_ignores_sigterm_is_killed_after_the_stop_bound() {
 #[cfg(unix)]
 #[tokio::test]
 async fn a_term_ends_the_child_at_once_and_a_second_signal_kills_it() {
-    let fx = Fixture::new("");
+    let mut fx = Fixture::new("");
     let server = fx.start(5000, 8000).await.unwrap();
     let pid = server.pid().unwrap();
     let began = Instant::now();
@@ -866,7 +900,7 @@ async fn a_term_ends_the_child_at_once_and_a_second_signal_kills_it() {
     );
     assert!(ended(pid));
 
-    let fx = Fixture::new("ignore_term 1\n");
+    let mut fx = Fixture::new("ignore_term 1\n");
     let server = fx.start(5000, 20_000).await.unwrap();
     let pid = server.pid().unwrap();
     let began = Instant::now();
@@ -885,7 +919,7 @@ async fn a_term_ends_the_child_at_once_and_a_second_signal_kills_it() {
 #[tokio::test]
 async fn a_child_that_is_gone_already_is_only_reaped() {
     let (log, _guard) = capture();
-    let fx = Fixture::new("die_after_ms 300\n");
+    let mut fx = Fixture::new("die_after_ms 300\n");
     let server = fx.start(5000, 8000).await.unwrap();
     tokio::time::sleep(Duration::from_millis(1200)).await;
     let began = Instant::now();
@@ -904,7 +938,7 @@ async fn a_child_that_is_gone_already_is_only_reaped() {
 #[tokio::test]
 async fn a_failing_wait_is_logged_and_the_stop_returns() {
     let (log, _guard) = capture();
-    let fx = Fixture::new("");
+    let mut fx = Fixture::new("");
     let server = fx.start(5000, 800).await.unwrap();
     let pid = server.pid().unwrap() as libc::pid_t;
     // SAFETY: kills and reaps the test's own fake child, so that the server's wait finds no child.
@@ -924,7 +958,7 @@ async fn a_failing_wait_is_logged_and_the_stop_returns() {
 #[cfg(unix)]
 #[tokio::test]
 async fn a_forwarder_held_open_by_a_grandchild_is_aborted_after_a_second() {
-    let fx = Fixture::new("grandchild group\n");
+    let mut fx = Fixture::new("grandchild group\n");
     let server = fx.start(5000, 1000).await.unwrap();
     let began = Instant::now();
     server.stop(std::future::pending()).await;
@@ -946,7 +980,7 @@ async fn a_forwarder_held_open_by_a_grandchild_is_aborted_after_a_second() {
 #[cfg(unix)]
 #[tokio::test]
 async fn a_grandchild_in_the_childs_group_is_killed_with_it() {
-    let fx = Fixture::new("grandchild same\n");
+    let mut fx = Fixture::new("grandchild same\n");
     let server = fx.start(5000, 1000).await.unwrap();
     let began = Instant::now();
     server.stop(std::future::pending()).await;
@@ -968,7 +1002,7 @@ async fn a_grandchild_in_the_childs_group_is_killed_with_it() {
 #[cfg(unix)]
 #[tokio::test]
 async fn a_grandchild_outlives_no_stop_after_its_parent_was_reaped() {
-    let fx = Fixture::new("grandchild same\ndie_after_ms 100\n");
+    let mut fx = Fixture::new("grandchild same\ndie_after_ms 100\n");
     let mut server = fx.start(5000, 1000).await.unwrap();
     // The child ends after its first ready answer; `exited` reaps it.
     let how = tokio::time::timeout(Duration::from_secs(5), server.exited())
@@ -998,6 +1032,33 @@ fn failed(result: Result<Server, StartError>) -> StartError {
     }
 }
 
+/// `Server::start_tuned` with a fresh object-server port for each attempt when the port was
+/// taken (`retry_exit` as for `start_object_server`).
+async fn start_tuned(
+    config: &Config,
+    object: Tuning,
+    store: S3Tuning,
+    retry_exit: bool,
+) -> Result<Server, StartError> {
+    retry_on_lost_port(
+        |port| {
+            let mut config = config.clone();
+            if let Some(object_server) = config.object_server.as_mut() {
+                object_server.port = Some(port);
+            }
+            let (object, store) = (object.clone(), store.clone());
+            async move { Server::start_tuned(&config, object, store).await }
+        },
+        |error| match error {
+            StartError::ObjectServer(error) if retry_exit => object_port_lost(error),
+            StartError::ObjectServer(error) => object_port_taken(error),
+            _ => false,
+        },
+    )
+    .await
+    .0
+}
+
 async fn start_server(
     fx: &Fixture,
     pg: &TestPostgres,
@@ -1005,10 +1066,11 @@ async fn start_server(
 ) -> Result<Server, StartError> {
     tokio::time::timeout(
         LIMIT,
-        Server::start_tuned(
+        start_tuned(
             &fx.server_config(pg, http_port),
             tuning(5000, 1000),
             store_tuning(),
+            true,
         ),
     )
     .await
@@ -1040,7 +1102,7 @@ async fn a_failure_before_the_object_server_leaves_no_credentials_lock_or_child(
         .path()
         .join("no-such-directory")
         .join("instruction.key");
-    let error = failed(Server::start_tuned(&config, tuning(5000, 1000), store_tuning()).await);
+    let error = failed(start_tuned(&config, tuning(5000, 1000), store_tuning(), false).await);
     assert!(matches!(error, StartError::InstructionKey(_)), "{error}");
     assert!(fx.credential_names().is_empty());
     assert_eq!(fx.pid(), None);
@@ -1067,7 +1129,7 @@ async fn a_store_that_fails_to_open_stops_the_child_and_closes_the_pool() {
     let pg = TestPostgres::start();
     let fx = Fixture::new("s3_status 403\n");
     let config = fx.server_config(&pg, 0);
-    let error = failed(Server::start_tuned(&config, tuning(5000, 1000), store_tuning()).await);
+    let error = failed(start_tuned(&config, tuning(5000, 1000), store_tuning(), false).await);
     assert!(
         matches!(error, StartError::Storage(StoreError::Refused { .. })),
         "{error}"
@@ -1088,7 +1150,7 @@ async fn a_child_that_ends_while_the_store_opens_ends_the_start() {
     let mut tune = store_tuning();
     tune.ready_timeout = Duration::from_secs(20);
     let began = Instant::now();
-    let error = failed(Server::start_tuned(&config, tuning(5000, 1000), tune).await);
+    let error = failed(start_tuned(&config, tuning(5000, 1000), tune, false).await);
     assert!(
         matches!(
             error,
@@ -1113,7 +1175,7 @@ async fn a_store_that_never_gets_a_bucket_fails_when_the_budget_is_spent() {
     let config = fx.server_config(&pg, 0);
     let mut tune = store_tuning();
     tune.ready_timeout = Duration::from_millis(400);
-    let error = failed(Server::start_tuned(&config, tuning(5000, 1000), tune).await);
+    let error = failed(start_tuned(&config, tuning(5000, 1000), tune, false).await);
     assert!(
         matches!(
             error,
@@ -1212,7 +1274,7 @@ async fn a_stop_ends_the_child_and_a_second_signal_kills_it_at_once() {
     // The child ignores SIGTERM; the second signal comes after the grace wait.
     let fx = Fixture::new("ignore_term 1\n");
     let config = fx.server_config(&pg, 0);
-    let server = started(Server::start_tuned(&config, tuning(5000, 20_000), store_tuning()).await);
+    let server = started(start_tuned(&config, tuning(5000, 20_000), store_tuning(), true).await);
     let pid = server.object_server().unwrap().pid().unwrap();
     let began = Instant::now();
     tokio::time::timeout(
@@ -1250,7 +1312,7 @@ async fn a_stop_ends_the_child_and_a_second_signal_kills_it_at_once() {
     let fx = Fixture::new("ignore_term 1\n");
     let mut config = fx.server_config(&pg, 0);
     config.http.shutdown_grace_secs = 30;
-    let server = started(Server::start_tuned(&config, tuning(5000, 20_000), store_tuning()).await);
+    let server = started(start_tuned(&config, tuning(5000, 20_000), store_tuning(), true).await);
     let pid = server.object_server().unwrap().pid().unwrap();
     let addr = server.local_addr();
     let _idle = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -1301,6 +1363,7 @@ fn listening(port: u16) -> bool {
     .is_ok()
 }
 
+#[cfg(target_os = "linux")]
 fn read_pid(data: &Path, limit: Duration) -> u32 {
     let deadline = Instant::now() + limit;
     loop {
@@ -1380,25 +1443,66 @@ fn the_server_listens_only_after_the_object_server_is_ready() {
     let pg = TestPostgres::start();
     let dir = tempfile::tempdir().unwrap();
     let data = steer(dir.path(), "ready_after_ms 3000\n");
-    let port = free_port();
-    let path = crate::binary::write_config(dir.path(), port, &pg.url());
-    let log_path = dir.path().join("server.log");
-    let mut command = crate::binary::server(&["--config", path.to_str().unwrap()]);
-    command.stderr(std::fs::File::create(&log_path).unwrap());
-    let child = command.spawn().unwrap();
-    let mut child = crate::binary::KillOnDrop::new(child);
-    read_pid(&data, Duration::from_secs(30));
-    // Not `get_health`: a connect to a closed port takes about two seconds to be refused on
-    // Windows, long enough for the server to get ready and bind meanwhile.
-    assert!(
-        !listening(port),
-        "the server listened before the object server was ready"
-    );
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while crate::binary::get_health(port).is_none() {
-        assert!(Instant::now() < deadline, "the server never listened");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    // The ports are only known to be free a moment before the server binds them. A server that
+    // loses one of them ends with exit 1 before it listens, and is started again on new ports.
+    let mut attempt = 0;
+    let (mut child, log_path) = loop {
+        attempt += 1;
+        let _ = std::fs::remove_file(data.join("pid"));
+        let port = free_port();
+        let path = crate::binary::write_config(dir.path(), port, &pg.url());
+        let log_path = dir.path().join(format!("server-{attempt}.log"));
+        let mut command = crate::binary::server(&["--config", path.to_str().unwrap()]);
+        command.stderr(std::fs::File::create(&log_path).unwrap());
+        let mut child = crate::binary::KillOnDrop::new(command.spawn().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let pid = loop {
+            if let Some(pid) = std::fs::read_to_string(data.join("pid"))
+                .ok()
+                .and_then(|t| t.trim().parse::<u32>().ok())
+            {
+                break Some(pid);
+            }
+            if child.exited() {
+                break None;
+            }
+            assert!(Instant::now() < deadline, "the object server never started");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        if pid.is_none() && attempt < crate::support::PORT_ATTEMPTS {
+            continue; // the object server's port was lost: try new ports
+        }
+        assert!(
+            pid.is_some(),
+            "the server ended before the object server started"
+        );
+        // Not `get_health`: a connect to a closed port takes about two seconds to be refused on
+        // Windows, long enough for the server to get ready and bind meanwhile.
+        assert!(
+            !listening(port),
+            "the server listened before the object server was ready"
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let served = loop {
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            if log.contains("listening") && crate::binary::get_health(port).is_some() {
+                break true;
+            }
+            if child.exited() {
+                break false;
+            }
+            assert!(Instant::now() < deadline, "the server never listened");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        if served {
+            break (child, log_path);
+        }
+        assert!(
+            attempt < crate::support::PORT_ATTEMPTS,
+            "no free port could be bound"
+        );
+        // The server's own port was lost before it bound it: try new ports.
+    };
     child.stop_with_sigterm();
     let log = std::fs::read_to_string(&log_path).unwrap();
     let ready = log.find("object server ready").expect("the readiness line");
@@ -1441,17 +1545,9 @@ fn a_killed_server_takes_the_child_with_it() {
     let pg = TestPostgres::start();
     let dir = tempfile::tempdir().unwrap();
     let data = steer(dir.path(), "");
-    let port = free_port();
-    let path = crate::binary::write_config(dir.path(), port, &pg.url());
-    let mut child = crate::binary::server(&["--config", path.to_str().unwrap()])
-        .spawn()
-        .unwrap();
+    let (mut child, _port, _) =
+        crate::binary::start_server_with(dir.path(), &pg, Duration::from_secs(30), |_| {});
     let pid = read_pid(&data, Duration::from_secs(30));
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while crate::binary::get_health(port).is_none() {
-        assert!(Instant::now() < deadline, "the server never listened");
-        std::thread::sleep(Duration::from_millis(50));
-    }
     assert!(!ended(pid));
     child.kill().unwrap();
     let _ = child.wait();

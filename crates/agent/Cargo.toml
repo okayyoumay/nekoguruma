@@ -47,6 +47,13 @@ futures-util = { version = "0.3", default-features = false, features = ["sink"] 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# The Linux user-mode key store talks to the freedesktop Secret Service (ADR-459 Decision item 4).
+# zbus 6 has no blocking API, so each call runs `zbus::block_on` over the async one. No `tokio`
+# feature (its own executor thread serves the connection) and no `tracing` feature (zbus must not
+# log message bodies, which carry the key).
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "6.3", default-features = false, features = ["default-rt"] }
+
 [dev-dependencies]
 # The control channel's loop tests run on a paused clock (ADR-471).
 tokio = { workspace = true, features = ["test-util"] }

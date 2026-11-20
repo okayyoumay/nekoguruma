@@ -477,18 +477,41 @@ fn abs_dir() -> String {
     std::env::temp_dir().to_string_lossy().into_owned()
 }
 
-/// S8: without the debug variables no store is selected, in either build.
+/// S8: without the debug variables a debug build selects no store. A release build selects the
+/// Secret Service store for the user mode on Linux and none otherwise, with no variable read.
 #[test]
-fn no_variable_selects_no_store() {
+fn no_variable_selects_no_store_except_the_user_mode_one_in_a_release_build() {
+    let release_has_one =
+        |mode| !cfg!(debug_assertions) && cfg!(target_os = "linux") && mode == OperatingMode::User;
     for mode in [OperatingMode::Device, OperatingMode::User] {
-        let error = select_store(mode, &vars(vec![])).err().unwrap();
-        assert_eq!(kind(&error), "NoStore");
         let only_dir = vars(vec![(crate::state::STATE_DIR_VAR, abs_dir())]);
-        assert_eq!(
-            kind(&select_store(mode, &only_dir).err().unwrap()),
-            "NoStore"
-        );
+        for var in [
+            &vars(vec![]) as &dyn Fn(&str) -> Option<OsString>,
+            &only_dir,
+        ] {
+            match select_store(mode, var) {
+                Ok(_) => assert!(release_has_one(mode), "{mode}"),
+                Err(error) => {
+                    assert!(!release_has_one(mode), "{mode}");
+                    assert_eq!(kind(&error), "NoStore");
+                }
+            }
+        }
     }
+}
+
+/// E4: the debug variable `secret-service` selects the Secret Service store for the user mode on
+/// Linux and nothing else; selecting it does no I/O.
+#[cfg(debug_assertions)]
+#[test]
+fn the_secret_service_value_selects_the_user_mode_store_on_linux_only() {
+    let var = vars(vec![(KEY_STORE_VAR, "secret-service".into())]);
+    assert_eq!(
+        select_store(OperatingMode::User, &var).is_ok(),
+        cfg!(target_os = "linux")
+    );
+    let error = select_store(OperatingMode::Device, &var).err().unwrap();
+    assert_eq!(kind(&error), "NoStore");
 }
 
 /// E3: the file store needs both variables, an absolute directory and the value `file`.
@@ -523,7 +546,8 @@ fn the_file_store_needs_both_variables() {
     assert!(select_store(OperatingMode::User, &good).is_ok());
 }
 
-/// E2: a release build selects no store whatever the variables say.
+/// E2: a release build reads neither variable: the same store with and without them, whatever
+/// they say.
 #[cfg(not(debug_assertions))]
 #[test]
 fn a_release_build_ignores_both_variables() {
@@ -531,8 +555,16 @@ fn a_release_build_ignores_both_variables() {
         (KEY_STORE_VAR, "file".into()),
         (crate::state::STATE_DIR_VAR, abs_dir()),
     ]);
+    let wrong = vars(vec![(KEY_STORE_VAR, "nonsense".into())]);
     for mode in [OperatingMode::Device, OperatingMode::User] {
-        assert_eq!(kind(&select_store(mode, &both).err().unwrap()), "NoStore");
+        let none = vars(vec![]);
+        for var in [&both as &dyn Fn(&str) -> Option<OsString>, &wrong] {
+            assert_eq!(
+                select_store(mode, var).is_ok(),
+                select_store(mode, &none).is_ok(),
+                "{mode}"
+            );
+        }
     }
 }
 

@@ -29,6 +29,7 @@ updates:
         update-types: [minor, patch]
         exclude-patterns:
           - p256
+          - zbus
 
   - package-ecosystem: github-actions
     directory: /

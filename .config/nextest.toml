@@ -63,7 +63,15 @@ test-group = "windows-cert-store"
 filter = 'binary(agent_restart_end_to_end)'
 test-group = "windows-restart-scenarios"
 
+# The agent's Secret Service tests share one keyring, and one of them locks its default
+# collection, so they run one at a time. They do real work only when `NGR_TEST_SECRET_SERVICE=1`
+# (the `core-linux` job's step for them); elsewhere they return at once.
+[[profile.default.overrides]]
+filter = 'binary(secret_service)'
+test-group = "secret-service"
+
 [test-groups]
+secret-service = { max-threads = 1 }
 windows-cert-store = { max-threads = 1 }
 windows-restart-scenarios = { max-threads = 2 }
 

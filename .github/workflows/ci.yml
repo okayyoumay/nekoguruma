@@ -114,6 +114,15 @@ jobs:
       # this resolves the fuzz workspace against its lock on every pull request; nothing is built.
       - run: cargo metadata --locked --format-version 1 --manifest-path fuzz/Cargo.toml > /dev/null
       - run: cargo nextest run --workspace --locked --profile ci
+      # The agent's Linux key store against a real Secret Service (ADR-459 Decision item 4): the
+      # run above skips these tests, which need `NGR_TEST_SECRET_SERVICE=1`. gnome-keyring runs
+      # in a private D-Bus session with a throwaway data directory, its login keyring unlocked with a
+      # password the tests know. `--no-tests=fail` makes a filter that matches nothing an error.
+      - name: Secret Service tests
+        run: |
+          sudo apt-get install -y --no-install-recommends gnome-keyring dbus
+          export KEYRING_HOME=$(mktemp -d)
+          dbus-run-session -- bash -c 'printf pw | HOME=$KEYRING_HOME XDG_DATA_HOME=$KEYRING_HOME gnome-keyring-daemon --unlock --components=secrets > /dev/null && NGR_TEST_SECRET_SERVICE=1 cargo nextest run -p agent --locked --profile ci --no-tests=fail -E "binary(secret_service)"'
       # sim-vci is a cdylib only, which cargo runs no doc tests for.
       - run: cargo test --workspace --locked --exclude sim-vci --doc
 

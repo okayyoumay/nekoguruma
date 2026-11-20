@@ -37,6 +37,14 @@ fn put_result(ledger: &mut UploadLedger, n: u8) -> u64 {
         .unwrap()
 }
 
+/// A root that makes a path absolute on this platform (on Windows a path needs a drive).
+const ROOT: &str = if cfg!(windows) { r"C:\" } else { "/" };
+
+/// `rest` under [`ROOT`], as the text an entry holds.
+fn rooted(rest: &str) -> String {
+    format!("{ROOT}{rest}")
+}
+
 fn comm_path(dir: &Path, n: u8) -> PathBuf {
     dir.join(format!("comm-{n}.log"))
 }
@@ -103,7 +111,7 @@ fn comm_entry(seq: u64, n: u8) -> Entry {
         seq,
         key: jk(n),
         kind: Kind::CommLog,
-        source: Source::File("/var/log/comm.log".to_owned()),
+        source: Source::File(rooted("comm.log")),
         length: 9,
         sha256: [2; 32],
     }
@@ -489,7 +497,7 @@ fn entries_that_break_the_rules_are_corrupt() {
     relative.source = Source::File("comm.log".to_owned());
     assert_corrupt("relative path", &file(1, 1, &[relative]));
     let mut long = comm_entry(1, 1);
-    long.source = Source::File(format!("/{}", "x".repeat(MAX_PATH_BYTES)));
+    long.source = Source::File(rooted(&"x".repeat(MAX_PATH_BYTES + 1 - ROOT.len())));
     assert_corrupt("long path", &file(1, 1, &[long]));
     assert_corrupt("counter at the top", &file(u64::MAX, 0, &[]));
     assert_corrupt(
@@ -511,7 +519,7 @@ fn the_longest_entry_fits_the_torn_tail_bound() {
             generation: u64::MAX,
         },
         kind: Kind::CommLog,
-        source: Source::File(format!("/{}", "x".repeat(MAX_PATH_BYTES - 1))),
+        source: Source::File(rooted(&"x".repeat(MAX_PATH_BYTES - ROOT.len()))),
         length: u64::MAX,
         sha256: [0xFF; 32],
     };
@@ -912,7 +920,7 @@ fn a_bad_source_path_or_job_id_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let mut ledger = UploadLedger::open_in(dir.path(), ID).unwrap();
     let digest = fake_digest(1, 1);
-    let long = PathBuf::from(format!("/{}", "x".repeat(MAX_PATH_BYTES)));
+    let long = PathBuf::from(rooted(&"x".repeat(MAX_PATH_BYTES + 1 - ROOT.len())));
     for path in [PathBuf::from("comm.log"), PathBuf::from(""), long] {
         assert!(
             matches!(
@@ -931,7 +939,7 @@ fn a_bad_source_path_or_job_id_is_refused() {
             Err(LedgerError::BadSource)
         ));
     }
-    let exactly = PathBuf::from(format!("/{}", "x".repeat(MAX_PATH_BYTES - 1)));
+    let exactly = PathBuf::from(rooted(&"x".repeat(MAX_PATH_BYTES - ROOT.len())));
     assert!(ledger.enqueue_comm_log(&jk(1), &exactly, digest).is_ok());
     for id in ["", "../x", "a/b", "a.b", &"x".repeat(65)] {
         let key = JobKey {

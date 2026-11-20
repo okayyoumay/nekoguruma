@@ -138,6 +138,17 @@ impl<'a> MakeWriter<'a> for Captured {
 }
 
 impl Captured {
+    /// How many bytes were logged so far.
+    pub(crate) fn mark(&self) -> usize {
+        self.0.lock().unwrap().len()
+    }
+
+    /// Forgets what was logged after `mark`, as a retried start does with the log of the attempt
+    /// it left.
+    pub(crate) fn forget_after(&self, mark: usize) {
+        self.0.lock().unwrap().truncate(mark);
+    }
+
     pub(crate) fn text(&self) -> String {
         String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
     }

@@ -155,13 +155,15 @@ fn start_server(dir: &Path, pg: &TestPostgres) -> (Child, u16, String) {
 /// `start_server` with a step that edits the configuration file once it is written (it is written
 /// again for every attempt, with new ports) and a bound on how long one attempt waits for the
 /// server. The object server's port in the file is picked the same way as the server's own, so
-/// a child that cannot bind either one ends the server with exit 1 and is tried again.
+/// a server that ends with exit 1 and a log that shows a lost port is tried again; any other end
+/// fails the test with the status and the log's tail.
 pub(crate) fn start_server_with(
     dir: &Path,
     pg: &TestPostgres,
     limit: Duration,
     edit: impl Fn(&Path),
 ) -> (Child, u16, String) {
+    let mut last = String::new();
     for attempt in 0..crate::support::PORT_ATTEMPTS {
         let port = free_port();
         let path = write_config(dir, port, &pg.url());
@@ -184,17 +186,29 @@ pub(crate) fn start_server_with(
                 return (child, port, text);
             }
             if let Some(status) = child.try_wait().unwrap() {
-                assert_eq!(status.code(), Some(1), "the server ended unexpectedly");
-                break; // the bind lost the race: try another port
+                let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+                assert!(
+                    status.code() == Some(1) && crate::support::log_shows_lost_port(&log),
+                    "the server ended unexpectedly ({status}):\n{}",
+                    log_tail(&log)
+                );
+                last = format!("{status}:\n{}", log_tail(&log));
+                break; // a port was lost to another process: try new ports
             }
             assert!(Instant::now() < deadline, "the server never answered");
             std::thread::sleep(Duration::from_millis(50));
         }
     }
     panic!(
-        "no free port could be bound in {} attempts",
+        "a port was lost in all {} attempts; the last: {last}",
         crate::support::PORT_ATTEMPTS
     );
+}
+
+/// The last 30 lines of a server's log.
+pub(crate) fn log_tail(log: &str) -> String {
+    let lines: Vec<&str> = log.lines().collect();
+    lines[lines.len().saturating_sub(30)..].join("\n")
 }
 
 #[test]
@@ -351,7 +365,6 @@ fn a_refused_instruction_key_exits_1_and_never_listens() {
 fn a_refused_object_store_exits_1_and_never_listens() {
     let pg = TestPostgres::start();
     let dir = tempfile::tempdir().unwrap();
-    let path = write_config(dir.path(), free_port(), &pg.url());
     // The fake reads its steering file from the data directory, which the server creates only
     // later; make it here, owner-only as the server wants.
     let data = dir.path().join("object-server");
@@ -362,9 +375,25 @@ fn a_refused_object_store_exits_1_and_never_listens() {
         std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
     std::fs::write(data.join("fake-object-server.cfg"), "s3_status 403\n").unwrap();
-    let mut command = server(&["--config", path.to_str().unwrap()]);
-    command.stderr(Stdio::piped());
-    let output = wait_output(command.spawn().unwrap(), Duration::from_secs(30));
+    // A port lost to another process ends the server with exit 1 as well; the log tells them
+    // apart, and the run is repeated with new ports.
+    let mut attempt = 1;
+    let output = loop {
+        let path = write_config(dir.path(), free_port(), &pg.url());
+        let mut command = server(&["--config", path.to_str().unwrap()]);
+        command.stderr(Stdio::piped());
+        let output = wait_output(command.spawn().unwrap(), Duration::from_secs(30));
+        let log = String::from_utf8_lossy(&output.stderr).into_owned();
+        if attempt < crate::support::PORT_ATTEMPTS && crate::support::log_shows_lost_port(&log) {
+            eprintln!(
+                "a port was lost (attempt {attempt}); trying new ports:\n{}",
+                log_tail(&log)
+            );
+            attempt += 1;
+            continue;
+        }
+        break output;
+    };
     assert_eq!(output.status.code(), Some(1));
     let log = String::from_utf8_lossy(&output.stderr);
     assert!(!log.contains("listening"), "{log}");
@@ -379,9 +408,9 @@ impl KillOnDrop {
         KillOnDrop(child)
     }
 
-    /// Whether the server has ended.
-    pub(crate) fn exited(&mut self) -> bool {
-        self.0.try_wait().unwrap().is_some()
+    /// How the server ended, if it has.
+    pub(crate) fn status(&mut self) -> Option<std::process::ExitStatus> {
+        self.0.try_wait().unwrap()
     }
 
     /// Ends the server the way a service manager does (SIGTERM; elsewhere a kill) and waits.

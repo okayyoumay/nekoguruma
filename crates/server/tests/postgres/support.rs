@@ -343,15 +343,22 @@ pub fn fake_binary(dir: &Path) -> PathBuf {
 /// How many ports a start that binds a picked port in a child process tries.
 pub const PORT_ATTEMPTS: usize = 5;
 
+/// The status with which the fake object server ends when its bind finds the address in use
+/// (`src/bin/ngr-fake-object-server.rs`): a lost port, told from a child that ends on purpose.
+/// The real object server has no such status, so for it only `PortTaken` counts as a lost port.
+pub const LOST_PORT_EXIT: &str = "98";
+
 /// Runs `start` with a port that was free a moment ago, and again with a fresh port when it fails
 /// with an error that `lost` calls the loss of the port to another process, at most
 /// `PORT_ATTEMPTS` times in all. Returns the last result and the port it used. For a child
 /// process that binds the port itself: a port picked and released is only free for a moment.
+/// Each retry is printed, so that it shows in the test's output.
 pub async fn retry_on_lost_port<T, E, Fut>(
     mut start: impl FnMut(u16) -> Fut,
     lost: impl Fn(&E) -> bool,
 ) -> (Result<T, E>, u16)
 where
+    E: std::fmt::Display,
     Fut: std::future::Future<Output = Result<T, E>>,
 {
     let mut attempt = 1;
@@ -359,7 +366,10 @@ where
         let port = free_port();
         let result = start(port).await;
         match &result {
-            Err(error) if attempt < PORT_ATTEMPTS && lost(error) => attempt += 1,
+            Err(error) if attempt < PORT_ATTEMPTS && lost(error) => {
+                eprintln!("port {port} was lost (attempt {attempt}): {error}; trying a new port");
+                attempt += 1;
+            }
             _ => return (result, port),
         }
     }
@@ -370,21 +380,29 @@ pub fn object_port_taken(error: &ObjectServerError) -> bool {
     matches!(error, ObjectServerError::PortTaken { .. })
 }
 
-/// The port was taken, either before the spawn (`PortTaken`) or after it, when the child ended
-/// because it could not bind (`ExitedBeforeReady`; the start reports no more than that the child
-/// ended).
+/// The port was taken, either before the spawn (`PortTaken`) or after it, when the fake object
+/// server ended with `LOST_PORT_EXIT` because its bind found the address in use.
 pub fn object_port_lost(error: &ObjectServerError) -> bool {
-    object_port_taken(error) || matches!(error, ObjectServerError::ExitedBeforeReady(_))
+    object_port_taken(error)
+        || matches!(error, ObjectServerError::ExitedBeforeReady(how) if how.contains(LOST_PORT_EXIT))
+}
+
+/// Whether the log of an `ngr-server` process shows that a port it needed was lost: its own
+/// port in use, the object server's port in use, or the fake object server ending with
+/// `LOST_PORT_EXIT`.
+pub fn log_shows_lost_port(log: &str) -> bool {
+    log.contains("cannot listen on")
+        || log.contains("object_server.port) is in use")
+        || log
+            .lines()
+            .any(|line| line.contains("ended before it was ready") && line.contains(LOST_PORT_EXIT))
 }
 
 /// `ObjectServer::start` on `config` with a fresh port for each attempt (`retry_on_lost_port`).
-/// `retry_exit` also retries when the child ended before it was ready: use it where the start is
-/// expected to succeed, not where the child is made to end. Returns the result and the last port
-/// tried.
+/// Returns the result and the last port tried.
 pub async fn start_object_server(
     config: &ObjectServerConfig,
     tuning: &Tuning,
-    retry_exit: bool,
 ) -> (Result<ObjectServer, ObjectServerError>, u16) {
     retry_on_lost_port(
         |port| {
@@ -392,13 +410,7 @@ pub async fn start_object_server(
             config.port = Some(port);
             async move { ObjectServer::start(&config, 1, tuning).await }
         },
-        |error| {
-            if retry_exit {
-                object_port_lost(error)
-            } else {
-                object_port_taken(error)
-            }
-        },
+        object_port_lost,
     )
     .await
 }

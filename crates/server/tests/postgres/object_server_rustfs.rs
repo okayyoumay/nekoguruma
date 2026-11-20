@@ -73,7 +73,7 @@ impl Real {
     pub(crate) async fn start(&mut self) -> ObjectServer {
         let (result, port) = tokio::time::timeout(
             Duration::from_secs(60 * crate::support::PORT_ATTEMPTS as u64),
-            crate::support::start_object_server(&self.config, &Tuning::default(), true),
+            crate::support::start_object_server(&self.config, &Tuning::default()),
         )
         .await
         .expect("the start must not hang");

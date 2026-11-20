@@ -21,6 +21,8 @@
 //! - `report 1`: writes `report.txt` (its arguments, its environment, its working directory and,
 //!   on Linux, its open descriptors).
 //!
+//! A bind that fails because the address is in use ends it with status 98.
+//!
 //! It always writes its process ID to `pid` and prints a line when it is up.
 
 use std::collections::HashMap;
@@ -87,7 +89,17 @@ fn main() {
     }
 
     let address = std::env::var("RUSTFS_ADDRESS").expect("RUSTFS_ADDRESS");
-    let listener = TcpListener::bind(&address).expect("bind the address");
+    let listener = match TcpListener::bind(&address) {
+        Ok(listener) => listener,
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+            // The tests pick a port that was free a moment before, and tell this end (a lost
+            // port, worth another try) from any other by the status; it matches
+            // `LOST_PORT_EXIT` in the tests' `support.rs`.
+            eprintln!("cannot bind {address}: {error}");
+            std::process::exit(98);
+        }
+        Err(error) => panic!("bind the address: {error}"),
+    };
     println!("fake object server up on {address}");
     let mode = get("mode").unwrap_or("ok").to_owned();
     let ready_after = Duration::from_millis(number("ready_after_ms").unwrap_or(0));

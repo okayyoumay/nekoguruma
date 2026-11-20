@@ -124,7 +124,8 @@ proposed. It is a specification: none of it is implemented when this record is w
 11. **The upload ledger** is one owner-only file per agent ID under `<state>/uploads/`, in the
     journal's frame format with a magic, a version and a header frame like the outbox's. It
     holds, for each object, what to upload (job, generation, kind, where the bytes are, length,
-    SHA-256) and that it was delivered. It holds no progress: after a restart the agent begins
+    SHA-256) until it is delivered (items 24 to 28: delivery is recorded by the entry's
+    removal). It holds no progress: after a restart the agent begins
     again (idempotent) and asks for the status, and the server's answer is the truth about
     which parts exist. An entry leaves the ledger only when the server has answered that the
     object is `finished`; that answer is the acknowledgement ADR-455 item 2 asks for, and
@@ -255,7 +256,8 @@ most 1 MiB (the journal's frame bound), and a run's final state can be larger.
     wrote: the entries a rewrite wrote are increasing, and the entries appended after it
     continue from the highest number one by one, which lets the open tell an append a crash
     tore (cut off) from damage (refused, never repaired). A removal of a number already
-    removed answers success and writes nothing, so a repeat after an unclear failure is safe.
+    removed answers success and writes nothing, so a repeat after an unclear failure is safe;
+    a number above the highest given is refused and writes nothing.
 26. **An enqueue repeated for the same object is answered with the entry it made.** The same
     job, generation and kind with the same length and digest returns the pending entry's number
     and writes nothing; with another length or digest it is refused as a conflict, as begin
@@ -263,9 +265,10 @@ most 1 MiB (the journal's frame bound), and a run's final state can be larger.
     server decides what it already has.
 27. **Failures keep the bytes.** A failed append never deletes the result's file: the frame may
     have landed, and the ledger refuses writes until it is opened again, which reads the entry
-    back or finds the file unnamed. Files no entry names are deleted only by an open, after it
-    has made the file and its directory durable, and never by an open that finds the ledger
-    corrupt. A failed rewrite before the rename leaves the entry pending and the ledger usable.
+    back or finds the file unnamed. A result's file is deleted by the removal of its entry, once
+    the rewrite is durable (item 24), and otherwise only by an open, which deletes the files no
+    entry names after it has made the ledger file and its directory durable, and never when it
+    finds the ledger corrupt; a delete that fails at the removal is left to the next open. A failed rewrite before the rename leaves the entry pending and the ledger usable.
     Only the first open creates a missing file: a reopen (after a failed write) that finds the
     file gone refuses it as corrupt, so the results its entries name are not swept and their
     numbers are not given again.

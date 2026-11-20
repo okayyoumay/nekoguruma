@@ -5,7 +5,7 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -516,6 +516,45 @@ async fn a_reopen_that_fails_keeps_uploading_from_memory_and_the_removal_is_retr
     assert_eq!(rig.sim.object("job-2", "result").as_deref(), Some(DATA));
     assert_eq!(rig.sim.puts().len(), 6);
     assert!(rig.pending().await.is_empty());
+}
+
+// L7: an idle loop on a poisoned ledger keeps trying to reopen it
+#[tokio::test(start_paused = true)]
+async fn an_idle_loop_keeps_reopening_a_poisoned_ledger_and_finds_the_entry_that_landed() {
+    let append = flag(false);
+    let reopen = flag(false);
+    let reopens = Arc::new(AtomicUsize::new(0));
+    let (fail_append, fail_reopen, counted) = (append.clone(), reopen.clone(), reopens.clone());
+    let mut rig = Rig::with_probe(Box::new(move |step| {
+        if step == Step::AfterSync && fail_append.load(Ordering::SeqCst) {
+            return Err(io::Error::other("injected"));
+        }
+        if step == Step::AfterRename && fail_reopen.load(Ordering::SeqCst) {
+            counted.fetch_add(1, Ordering::SeqCst);
+            return Err(io::Error::other("injected"));
+        }
+        Ok(())
+    }));
+    rig.start();
+    append.store(true, Ordering::SeqCst);
+    reopen.store(true, Ordering::SeqCst);
+    // The append lands, its sync fails: poisoned, the entry on disk only.
+    assert!(
+        rig.ledger()
+            .enqueue_result(jk(1), DATA.to_vec())
+            .await
+            .is_err()
+    );
+    append.store(false, Ordering::SeqCst);
+    // Storage stays bad for 30 seconds with no further enqueue: the reopens go on, paced by
+    // the back-off (waits of 1, 2, 4, 8, 16 seconds), not in a spin.
+    tokio::time::sleep(secs(30)).await;
+    let tried = reopens.load(Ordering::SeqCst);
+    assert!((3..=8).contains(&tried), "{tried} reopens in 30 s");
+    assert_eq!(rig.dial.count(), 0);
+    reopen.store(false, Ordering::SeqCst);
+    rig.until(|s| s.delivered == 1).await;
+    assert_eq!(rig.sim.object("job-1", "result").as_deref(), Some(DATA));
 }
 
 // L7

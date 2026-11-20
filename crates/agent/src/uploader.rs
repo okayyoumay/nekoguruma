@@ -457,6 +457,7 @@ impl Worker {
                 // A stop that came during the reopen ends the task quietly, whatever it found.
                 break;
             }
+            let mut poisoned = false;
             match reopened {
                 Ok(true) => {
                     self.reopen_warned = false;
@@ -474,6 +475,7 @@ impl Worker {
                         tracing::warn!(%error, "the upload ledger could not be opened again; uploading from memory");
                     }
                     self.owe_wait = true;
+                    poisoned = true;
                 }
             }
             let pending = self.ledger.pending().await;
@@ -491,12 +493,26 @@ impl Worker {
                 job = eligible(&self);
             }
             let Some(job) = job else {
-                // Nothing to do: no token is held, and no request is made, until an enqueue.
+                // Nothing to do: no token is held, and no request is made, until an enqueue. A
+                // ledger that could not be opened again may hold entries memory does not (an
+                // append that landed before its sync failed), so it is tried again at the
+                // back-off's pace too, not only when an enqueue wakes the loop.
                 self.token = None;
-                tokio::select! {
-                    biased;
-                    () = self.stop.requested() => break,
-                    () = self.ledger.added() => {}
+                if poisoned {
+                    let wait = self.backoff.wait(None);
+                    tokio::select! {
+                        biased;
+                        () = self.stop.requested() => break,
+                        () = self.ledger.added() => {}
+                        () = tokio::time::sleep(wait) => self.backoff.after_wait(),
+                    }
+                    self.owe_wait = false;
+                } else {
+                    tokio::select! {
+                        biased;
+                        () = self.stop.requested() => break,
+                        () = self.ledger.added() => {}
+                    }
                 }
                 continue;
             };

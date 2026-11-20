@@ -1,7 +1,7 @@
 # ADR-493: The Data Channel Is Four Session-Token Routes to Presigned Multipart Uploads, Driven by the Agent's Upload Ledger
 
 **Date:** 2026-11-19
-**Status:** Accepted (items 15 to 18 added with the begin, part URL and status routes; item 6's mapping corrected and items 19 to 23 added with the complete route; item 17 extended by item 23)
+**Status:** Accepted (items 15 to 18 added with the begin, part URL and status routes; item 6's mapping corrected and items 19 to 23 added with the complete route; item 17 extended by item 23; item 11's record of delivery corrected and items 24 to 28 added with the upload ledger)
 **Affects:** design 5.2, 5.4, 13, 13.3, 14.3, 14.4; `crates/server` (the upload routes, a migration for `job_objects`, `db/README.md`), `crates/agent` (the uploader, the ledger, `connect`, a debug-only enqueue command), `crates/shared-proto` if the route bodies are shared, `api/openapi.yaml` (the four operations, marked planned until served), `docs/glossary.md`; uses ADR-492's `MultipartStore` and ADR-466's session token; fixes the acknowledgement ADR-455 left
 
 ## Context
@@ -235,6 +235,43 @@ proposed. It is a specification: none of it is implemented when this record is w
     that is no longer `open` is answered with its state and no `partsHeld`; one that still is
     `open` is the 503 of item 17, with nothing written.
 
+### Decisions taken with the upload ledger
+
+Item 11 left open where a `result` object's bytes wait for their upload: a ledger frame holds at
+most 1 MiB (the journal's frame bound), and a run's final state can be larger.
+
+24. **A result waits as a file of its own; a communication log stays where it is.** The agent
+    writes a result's bytes to `<state>/uploads/<agent-id>.objects/<n>`, owner-only and synced,
+    where `n` is the entry's number, before it appends the entry, and deletes that file only
+    after the entry's removal is durable. A `commLog` entry names the log file by its absolute
+    path and covers its first `length` bytes, so a later run appending to the log does not change
+    what was enqueued; the ledger never opens, changes or deletes that file. The digest is taken
+    before the enqueue, outside the ledger (item 11).
+25. **Numbers are never reused, and delivery is recorded by removal.** Each entry has a number,
+    one above the highest ever given. An entry leaves the ledger by a rewrite of the whole file
+    without it (a temporary file, synced, renamed over the ledger, the directory synced), so the
+    ledger records what is still to be delivered and not, as item 11 had it, that an object was
+    delivered. The header keeps the highest number given and how many entries the rewrite
+    wrote: the entries a rewrite wrote are increasing, and the entries appended after it
+    continue from the highest number one by one, which lets the open tell an append a crash
+    tore (cut off) from damage (refused, never repaired). A removal of a number already
+    removed answers success and writes nothing, so a repeat after an unclear failure is safe.
+26. **An enqueue repeated for the same object is answered with the entry it made.** The same
+    job, generation and kind with the same length and digest returns the pending entry's number
+    and writes nothing; with another length or digest it is refused as a conflict, as begin
+    answers 200 and 409 (item 3). A key whose entry was already removed is enqueued anew; the
+    server decides what it already has.
+27. **Failures keep the bytes.** A failed append never deletes the result's file: the frame may
+    have landed, and the ledger refuses writes until it is opened again, which reads the entry
+    back or finds the file unnamed. Files no entry names are deleted only by an open, after it
+    has made the file and its directory durable, and never by an open that finds the ledger
+    corrupt. A failed rewrite before the rename leaves the entry pending and the ledger usable.
+28. **Bounds.** The ledger file is at most 1 MiB; a result is at most 64 MiB; the results waiting
+    together hold at most 1 GiB; a communication log is at most 4 GiB, the server's bound on an
+    object. A result or log over its bound is refused as too large, and an enqueue that would
+    pass the file's or the results' total bound is refused as full; nothing is dropped to make
+    room.
+
 ## Consequences
 
 - A revoked agent that is offline cannot get a new URL or complete an upload (item 2); the
@@ -271,3 +308,12 @@ proposed. It is a specification: none of it is implemented when this record is w
   the last part (a log is appended by later runs): both are decided with the work that builds
   them. How an operator's explicit upload of a log (ADR-455 item 1) reaches the agent is likewise
   left to that work; whether begin checks the generation against the signed instruction is item 15.
+- A pending result takes its size twice on the device until it is delivered: in the job's own
+  records and in the ledger's copy (item 24). The bounds of item 28 are first values, set without
+  a measured result size.
+- An entry the server refuses for good, or whose source is gone, stays in the ledger, and with
+  one object at a time it stands in front of the entries behind it: what clears it is decided
+  with the uploader. A missing source is found by the uploader, not by the open.
+- A retention of the communication log that deletes files must first ask the ledger, since an
+  entry names the file and nothing local is deleted before the server's acknowledgement
+  (ADR-455 item 2).

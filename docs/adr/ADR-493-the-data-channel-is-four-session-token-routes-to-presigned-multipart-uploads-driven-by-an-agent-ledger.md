@@ -266,6 +266,9 @@ most 1 MiB (the journal's frame bound), and a run's final state can be larger.
     back or finds the file unnamed. Files no entry names are deleted only by an open, after it
     has made the file and its directory durable, and never by an open that finds the ledger
     corrupt. A failed rewrite before the rename leaves the entry pending and the ledger usable.
+    Only the first open creates a missing file: a reopen (after a failed write) that finds the
+    file gone refuses it as corrupt, so the results its entries name are not swept and their
+    numbers are not given again.
 28. **Bounds.** The ledger file is at most 1 MiB; a result is at most 64 MiB; the results waiting
     together hold at most 1 GiB; a communication log is at most 4 GiB, the server's bound on an
     object. A result or log over its bound is refused as too large, and an enqueue that would

@@ -1403,6 +1403,49 @@ fn a_rewrite_that_fails_before_the_rename_keeps_everything_and_may_be_retried() 
     assert_eq!(seqs(&ledger), [2, 3]);
 }
 
+#[test]
+fn abandon_removes_an_entry_like_finished_and_never_touches_a_comm_log_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut ledger = UploadLedger::open_in(dir.path(), ID).unwrap();
+    let result = put_result(&mut ledger, 1);
+    let log = put_comm(&mut ledger, dir.path(), 2);
+    let log_file = comm_path(dir.path(), 2);
+    assert_eq!(names(&objects_of(dir.path())), ["1"]);
+
+    ledger.abandon(result).unwrap();
+    assert_eq!(seqs(&ledger), [log]);
+    assert!(names(&objects_of(dir.path())).is_empty(), "the object goes");
+    ledger.abandon(log).unwrap();
+    assert!(seqs(&ledger).is_empty());
+    assert_eq!(fs::read(&log_file).unwrap(), b"log 2", "the log is intact");
+
+    // Idempotent, and a number never assigned is still out of range.
+    ledger.abandon(result).unwrap();
+    assert!(matches!(
+        ledger.abandon(99),
+        Err(LedgerError::OutOfRange {
+            seq: 99,
+            highest: 2
+        })
+    ));
+    // It reads back from the file, and the counter goes on.
+    drop(ledger);
+    let mut ledger = UploadLedger::open_in(dir.path(), ID).unwrap();
+    assert!(seqs(&ledger).is_empty());
+    assert_eq!(put_result(&mut ledger, 3), 3);
+}
+
+#[test]
+fn abandon_on_a_poisoned_ledger_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let armed = Arc::new(AtomicBool::new(true));
+    let mut ledger =
+        UploadLedger::open_with(dir.path(), ID, failing_at(Step::AfterSync, &armed)).unwrap();
+    assert!(ledger.enqueue_result(&jk(1), b"x").is_err());
+    assert!(ledger.is_poisoned());
+    assert!(matches!(ledger.abandon(1), Err(LedgerError::Poisoned)));
+}
+
 // F7
 #[test]
 fn a_failed_rename_poisons_only_when_the_old_file_cannot_be_reopened() {

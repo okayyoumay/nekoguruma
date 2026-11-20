@@ -670,6 +670,19 @@ impl UploadLedger {
     /// entry gone from memory and its object kept for the next open's sweep. A communication
     /// log's file is never touched.
     pub fn finished(&mut self, seq: u64) -> Result<(), LedgerError> {
+        self.remove(seq)
+    }
+
+    /// Takes the entry `seq` out of the ledger because the uploader proved its source broken
+    /// (ADR-495 item 7): the same rewrite, with the same failure modes, as
+    /// [`UploadLedger::finished`], and idempotent in the same way. A stored result's object is
+    /// deleted with the entry; a communication log's file is never touched, whatever state it is
+    /// in.
+    pub fn abandon(&mut self, seq: u64) -> Result<(), LedgerError> {
+        self.remove(seq)
+    }
+
+    fn remove(&mut self, seq: u64) -> Result<(), LedgerError> {
         self.check_writable()?;
         if seq > self.highest {
             return Err(LedgerError::OutOfRange {

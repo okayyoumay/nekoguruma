@@ -11,26 +11,73 @@
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use serde::Deserialize;
-use shared_crypto::proof::{ProofTranscript, sign_proof};
+use shared_crypto::proof::{Audience, ProofTranscript, sign_proof};
 use tokio::time::Instant;
 
-use super::dial::{self, ConnectError};
-use super::{Warnings, Wiring};
+use shared_crypto::{RandomError, Signer};
+
+use super::Warnings;
+use super::dial::{self, ConnectError, Dial};
 use crate::server_http::{self, PostError, PostRequest, Reply, ReplyBody, Timeouts};
 
 /// The challenge route (`api/openapi.yaml`).
-pub(super) const CHALLENGE_PATH: &str = "/api/v1/agent/challenge";
+pub(crate) const CHALLENGE_PATH: &str = "/api/v1/agent/challenge";
 /// The session route.
-pub(super) const SESSION_PATH: &str = "/api/v1/agent/session";
+pub(crate) const SESSION_PATH: &str = "/api/v1/agent/session";
 
 /// The text of a 32-byte value in padded base64.
 const VALUE_TEXT_LEN: usize = 44;
 
+/// What the exchange needs and nothing more: the dial, the key, the random source and the names
+/// the proof covers. The control channel builds it from its wiring and the uploader from its own
+/// (ADR-493 item 10), each with its own [`Log`].
+pub(crate) struct Seams<'a> {
+    pub(crate) dial: &'a dyn Dial,
+    pub(crate) signer: &'a (dyn Signer + Send + Sync),
+    pub(crate) random: fn() -> Result<[u8; 32], RandomError>,
+    pub(crate) agent_id: &'a str,
+    pub(crate) audience: &'a Audience,
+    /// The `Host` header's value.
+    pub(crate) host: &'a str,
+}
+
+/// Where the exchange reports what went wrong, in the caller's own words. The classes are fixed
+/// words and the status a number: no implementation is given anything else.
+pub(crate) trait Log: Send {
+    /// A failed attempt of this class.
+    fn failure(&mut self, class: &'static str, status: Option<u16>);
+    /// A refusal of this class: the server will not have this agent for now.
+    fn refusal(&mut self, class: &'static str, status: u16);
+    /// A token was issued.
+    fn accepted(&mut self);
+    /// The challenge was not live (a 401) and a new one is asked for (debug level).
+    fn stale_challenge(&mut self);
+}
+
+/// The control channel's texts.
+impl Log for Warnings {
+    fn failure(&mut self, class: &'static str, status: Option<u16>) {
+        Warnings::failure(self, class, status);
+    }
+
+    fn refusal(&mut self, class: &'static str, status: u16) {
+        Warnings::refusal(self, class, status);
+    }
+
+    fn accepted(&mut self) {
+        Warnings::accepted(self);
+    }
+
+    fn stale_challenge(&mut self) {
+        tracing::debug!("control channel challenge was not live; asking for a new one");
+    }
+}
+
 /// A session token: used for one upgrade, then dropped. Its text is never shown.
-pub(super) struct Token(String);
+pub(crate) struct Token(String);
 
 impl Token {
-    pub(super) fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
 }
@@ -43,7 +90,7 @@ impl std::fmt::Debug for Token {
 
 /// Why the exchange gave no token, and how the loop backs off.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Fail {
+pub(crate) enum Fail {
     /// The ordinary failed attempt: wait the delay.
     Ord,
     /// The challenge route asked for a wait of this many seconds (B3).
@@ -75,9 +122,9 @@ fn value_32(text: &str) -> Option<[u8; 32]> {
 }
 
 /// One POST: the connect within its bound, the whole call within the total (`server_http`).
-async fn call(w: &Wiring, path: &str, body: Vec<u8>) -> Result<Reply, PostError> {
+async fn call(w: &Seams<'_>, path: &str, body: Vec<u8>) -> Result<Reply, PostError> {
     let (connect_by, deadline) = server_http::deadlines(Instant::now(), Timeouts::default());
-    let stream = match dial::connect(&*w.dial, connect_by).await {
+    let stream = match dial::connect(w.dial, connect_by).await {
         Ok(stream) => stream,
         Err(ConnectError::Timeout) => return Err(PostError::ConnectTimeout),
         Err(ConnectError::Failed) => {
@@ -85,8 +132,9 @@ async fn call(w: &Wiring, path: &str, body: Vec<u8>) -> Result<Reply, PostError>
         }
     };
     let request = PostRequest {
-        port: w.port,
-        host: &w.host,
+        // The stream is already connected: the port is not used (`post_over`).
+        port: 0,
+        host: w.host,
         path,
         body,
     };
@@ -102,7 +150,7 @@ fn json_body(reply: &Reply) -> Option<&[u8]> {
 }
 
 /// Step B: the challenge.
-async fn challenge(w: &Wiring, warn: &mut Warnings) -> Result<[u8; 32], Fail> {
+async fn challenge(w: &Seams<'_>, warn: &mut dyn Log) -> Result<[u8; 32], Fail> {
     let reply = match call(w, CHALLENGE_PATH, Vec::new()).await {
         Ok(reply) => reply,
         Err(_) => {
@@ -145,7 +193,7 @@ fn session_token(reply: &Reply) -> Option<Token> {
 }
 
 /// Steps B and C: the token for one upgrade. A 401 gets one new challenge (C3).
-pub(super) async fn token(w: &Wiring, warn: &mut Warnings) -> Result<Token, Fail> {
+pub(crate) async fn token(w: &Seams<'_>, warn: &mut dyn Log) -> Result<Token, Fail> {
     let mut retried = false;
     loop {
         let challenge = challenge(w, warn).await?;
@@ -153,18 +201,16 @@ pub(super) async fn token(w: &Wiring, warn: &mut Warnings) -> Result<Token, Fail
             warn.failure("random", None);
             return Err(Fail::Ord);
         };
-        let Ok(transcript) =
-            ProofTranscript::new(&w.audience, &w.record.agent_id, challenge, nonce)
-        else {
+        let Ok(transcript) = ProofTranscript::new(w.audience, w.agent_id, challenge, nonce) else {
             warn.failure("transcript", None);
             return Err(Fail::Ord);
         };
-        let Ok(proof) = sign_proof(&*w.signer, &transcript) else {
+        let Ok(proof) = sign_proof(w.signer, &transcript) else {
             warn.failure("signing", None);
             return Err(Fail::Ord);
         };
         let body = serde_json::json!({
-            "agentId": w.record.agent_id,
+            "agentId": w.agent_id,
             "challenge": STANDARD.encode(challenge),
             "nonce": STANDARD.encode(nonce),
             "proof": STANDARD.encode(proof.to_bytes()),
@@ -193,7 +239,7 @@ pub(super) async fn token(w: &Wiring, warn: &mut Warnings) -> Result<Token, Fail
             }
             401 if !retried => {
                 retried = true;
-                tracing::debug!("control channel challenge was not live; asking for a new one");
+                warn.stale_challenge();
             }
             401 => {
                 warn.failure("session-unauthorized", Some(401));
@@ -214,3 +260,6 @@ pub(super) async fn token(w: &Wiring, warn: &mut Warnings) -> Result<Token, Fail
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

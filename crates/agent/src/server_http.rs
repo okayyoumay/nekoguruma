@@ -239,7 +239,7 @@ async fn read_body(
 }
 
 /// The header's value when the answer has exactly one and it is text.
-fn single_text(headers: &HeaderMap, name: &hyper::header::HeaderName) -> Option<String> {
+pub(crate) fn single_text(headers: &HeaderMap, name: &hyper::header::HeaderName) -> Option<String> {
     let mut values = headers.get_all(name).iter();
     let (Some(value), None) = (values.next(), values.next()) else {
         return None;

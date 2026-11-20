@@ -59,6 +59,12 @@ impl ServerOrigin {
         self.audience.as_str()
     }
 
+    /// The canonical origin without its port: the scheme and host a URL on the origin's host
+    /// begins with (ADR-493 item 13). Today `http://127.0.0.1`.
+    pub fn scheme_host(&self) -> &str {
+        BASE
+    }
+
     /// The port the agent connects to (80 when the origin has none).
     pub fn port(&self) -> u16 {
         self.port

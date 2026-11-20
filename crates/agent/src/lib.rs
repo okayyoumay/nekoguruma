@@ -24,6 +24,8 @@
 //!   ADR-463, ADR-470)
 //! - [`server_http`]: the HTTP/1 client for the agent's calls to the server (ADR-470)
 //! - [`state`]: where the agent keeps its state for each operating mode (design 6.2, ADR-460)
+//! - [`upload_ledger`]: the durable list of results and communication logs the server has not yet
+//!   received (design 5.2, ADR-493)
 //! - [`instruction`]: the gate that verifies a signed job instruction (design 5.3, 11.1, ADR-461)
 //! - [`inputs`]: the runtime inputs and service fields a restart reads (ADR-229, ADR-245)
 //! - [`journal`]: the write-job journal a restart resumes from (ADR-244)
@@ -69,6 +71,7 @@ pub mod runner;
 pub mod send_receive;
 pub mod server_http;
 pub mod state;
+pub mod upload_ledger;
 
 pub use artifact::Artifact;
 pub use client::{ExitHow, WorkerApi, WorkerExit, WorkerSource, WorkerStatus};

@@ -1408,6 +1408,34 @@ pub(crate) fn sync_after_rename(dir: &Path, final_path: &Path) -> io::Result<()>
     }
 }
 
+/// Opens an existing file for reading and writing.
+pub(crate) fn open_rw(path: &Path) -> io::Result<File> {
+    OpenOptions::new().read(true).write(true).open(path)
+}
+
+/// Whether `id` can name a file: a run of 1 to 64 letters, digits and hyphens. The outbox and
+/// the upload ledger name their files by agent ID.
+pub(crate) fn valid_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+/// Why [`take_writer_lock`] did not take the lock.
+pub(crate) enum LockFailure {
+    /// Another writer holds it.
+    InUse,
+    Io(io::Error),
+}
+
+/// Takes the writer lock on the file `lock` and sorts a failure into the two kinds a store of
+/// one file cares about (the outbox and the upload ledger both open this way).
+pub(crate) fn take_writer_lock(lock: &Path) -> Result<WriterLock, LockFailure> {
+    WriterLock::at(lock).map_err(|error| match error {
+        JournalError::InUse => LockFailure::InUse,
+        JournalError::Io(error) => LockFailure::Io(error),
+        other => LockFailure::Io(io::Error::other(other.to_string())),
+    })
+}
+
 fn unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

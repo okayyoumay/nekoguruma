@@ -34,8 +34,8 @@ use shared_proto::MAX_CONTROL_MESSAGE_LEN;
 use worker_host::service::OperatingMode;
 
 use crate::journal::{
-    FRAME_HEADER, FrameRead, JournalError, WriterLock, push_frame, read_frame, record_follows,
-    sync_after_rename,
+    FRAME_HEADER, FrameRead, LockFailure, WriterLock, open_rw, push_frame, read_frame,
+    record_follows, sync_after_rename, take_writer_lock, valid_id,
 };
 use crate::state::{StateDirError, private_subdir};
 
@@ -196,11 +196,10 @@ impl Outbox {
     /// open, which [`Outbox::reopen`] repeats. The lock and the file are taken only here, in
     /// this order.
     fn open_state(&mut self) -> Result<(), OutboxError> {
-        let lock = match WriterLock::at(&self.dir.join(LOCK_FILE)) {
+        let lock = match take_writer_lock(&self.dir.join(LOCK_FILE)) {
             Ok(lock) => lock,
-            Err(JournalError::InUse) => return Err(OutboxError::InUse),
-            Err(JournalError::Io(error)) => return Err(error.into()),
-            Err(other) => return Err(io::Error::other(other.to_string()).into()),
+            Err(LockFailure::InUse) => return Err(OutboxError::InUse),
+            Err(LockFailure::Io(error)) => return Err(error.into()),
         };
         self.lock = Some(lock);
         let others = other_outboxes(&self.dir, &self.path);
@@ -504,15 +503,6 @@ impl Outbox {
         }
         Ok(())
     }
-}
-
-fn open_rw(path: &Path) -> io::Result<File> {
-    OpenOptions::new().read(true).write(true).open(path)
-}
-
-/// An agent ID names a file, so it is a short run of letters, digits and hyphens.
-fn valid_id(id: &str) -> bool {
-    !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
 /// How many outbox files of other agent IDs `dir` holds.

@@ -784,8 +784,10 @@ paths:
         resumes from part `partsHeld + 1`. In any other state `partsHeld` is absent. An upload
         of another agent or tenant, an ID that is not a UUID and an unknown one are **404**.
         The body is empty, as for the part URL. Token and agent row are judged as for begin. An
-        `open` row whose upload the store lists as gone, or whose listing fails, is **503** and
-        the row is not changed. `HEAD` is answered like `GET`, without a body.
+        `open` row whose listing fails is **503** and the row is not changed. When the store
+        lists the upload as gone (a completion may just have moved the row on) the row is read
+        once more: a row that is no longer `open` is answered with its state, as for any
+        other state; one that still is `open` is **503** and is not changed. `HEAD` is answered like `GET`, without a body.
       security:
         - agentSession: []
       parameters:
@@ -810,23 +812,30 @@ paths:
 
   /v1/agent/uploads/{uploadId}/complete:
     post:
-      x-ngr-status: planned
       tags: [agents]
       summary: Complete an upload and verify the object (14.3, ADR-493, ADR-492)
       description: |
-        The body is empty. The server moves the row from `open` to `completing` by a
-        compare-and-set, commits that, and runs the store's completion (it checks the parts,
-        completes the upload, reads the object back and compares its length and SHA-256 with
-        the row's) in a task that outlives the request; the row becomes `finished` only after
-        the verification. The request waits for the task up to 20 seconds: **200**
-        `finished` when it is done, else **202** `completing`, and the agent repeats the
-        request. A repeat on a `finished` row is **200**. A part problem (the parts are not as
-        expected) returns the row to `open` and answers **409**; a length or digest mismatch
-        makes the row `failed` with the object deleted and answers **409**, and the agent
-        begins again; when the upload and the object are both gone (a stop between a
-        mismatch's delete and the row's update), the row also becomes `failed` with **409**;
-        any other store error leaves the row `completing` and answers **503**.
-        Token and agent row are judged as for begin.
+        The body is empty (any byte is **400**, more than 4 KiB **413**, a body that does not
+        arrive within 5 seconds **408**). Token and agent row are judged as for begin; an upload
+        of another agent or tenant, an ID that is not a UUID and an unknown one are **404**.
+        A `finished` row is answered **200** and a `failed` row **409** with state `failed`, with
+        no store call. Otherwise the server runs one completion task per upload, which moves the
+        row from `open` to `completing` by a compare-and-set, runs the store's completion (it
+        checks the parts, completes the upload, reads the object back and compares its length
+        and SHA-256 with the row's) and then writes the result; the row becomes `finished` only
+        after the verification. The task outlives the request, and every request for the
+        upload waits for it up to 20 seconds: **200** `finished` when it is done, else **202**
+        `completing`, and the agent repeats the request. A part problem (the parts are not as
+        expected, or add up to another length) returns the row to `open` and answers **409**
+        with state `open`; a length or digest mismatch makes the row `failed` with the object
+        deleted and answers **409** with state `failed`, and the agent begins again; when the
+        upload and the object are both gone (a stop between a mismatch's delete and the row's
+        update), the row also becomes `failed` with **409**. Any other store error, a failed
+        delete included, and a database failure write nothing more and answer **503**: the row
+        is `completing` once the task began (a failed compare-and-set leaves it `open`), and
+        the agent repeats the request. **500** is a stored value that does not parse, a store
+        without randomness or a database error that is a fault of the server. A stop of the server ends the task and leaves the row `completing`; the next
+        request resumes it.
       security:
         - agentSession: []
       parameters:
@@ -842,9 +851,21 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/UploadCompletion' }
+        '400': { $ref: '#/components/responses/Problem' }
         '401': { $ref: '#/components/responses/AgentSessionRefused' }
         '404': { $ref: '#/components/responses/Problem' }
-        '409': { $ref: '#/components/responses/Problem' }
+        '405':
+          description: A method other than POST
+          headers:
+            Allow: { schema: { type: string }, description: '`POST`' }
+        '408': { $ref: '#/components/responses/Problem' }
+        '409':
+          description: The upload cannot be completed as it is; `state` is `open` (send the parts again) or `failed` (begin again)
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '413': { $ref: '#/components/responses/Problem' }
+        '500': { $ref: '#/components/responses/Problem' }
         '503': { $ref: '#/components/responses/Problem' }
 
   # ------------------------------------------------------------ Artifacts and extensions
@@ -1214,7 +1235,7 @@ components:
         status: { type: integer }
         detail: { type: string }
         state:
-          description: The state of the upload the request found; present on the part URL's 409 only
+          description: The state of the upload the request found; present on the 409 of the part URL and of the completion
           allOf:
             - { $ref: '#/components/schemas/UploadState' }
         code:

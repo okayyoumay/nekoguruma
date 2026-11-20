@@ -171,8 +171,9 @@ impl Hub {
         Hub::default()
     }
 
-    /// Runs a session as a task the hub owns. Once the stop has begun the session is dropped
-    /// unrun, which drops its socket without a frame: an upgrade that completes during a stop.
+    /// Runs a session or another task as one the hub owns, which the stop ends. Once the stop has
+    /// begun the future is dropped unrun, which drops what it holds (for a session its socket,
+    /// without a frame: an upgrade that completes during a stop).
     pub(crate) fn adopt(&self, session: impl Future<Output = ()> + Send + 'static) {
         let mut state = self.0.lock();
         let Some(tasks) = state.tasks.as_mut() else {
@@ -183,7 +184,7 @@ impl Hub {
             if let Err(error) = finished
                 && error.is_panic()
             {
-                tracing::warn!("a control channel session panicked");
+                tracing::warn!("a task the hub owns panicked");
             }
         }
         tasks.spawn(session);

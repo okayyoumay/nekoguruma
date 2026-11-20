@@ -101,7 +101,12 @@ One row per upload of a job's `result` or `commLog` object, kept after it finish
 object (`storage_key`, unique, the key the store issued) and the multipart upload (`upload_id`,
 the store's, a bearer: never answered or logged), the declared length (0 to 4 GiB) and SHA-256,
 the part size the upload was begun with, and a state: `open`, `completing`, `finished` or `failed`.
-The begin route writes `open`; the others are the completion's. `finished_at` is set exactly when
+The begin route writes `open`; the others are the completion task's, each a conditional
+`UPDATE` on the state it expects: `open` to `completing` before the store's completion is called,
+then from `completing` to `finished` (with `finished_at`) after the read-back verified the object,
+back to `open` after a part problem, or to `failed` after a mismatch or when the upload and the
+object are both gone (ADR-493 items 6 and 19). A store call that fails with an error that is not a part problem or a mismatch leaves
+`completing`, which a repeated request verifies again. `finished_at` is set exactly when
 the state is `finished` (a CHECK). A partial unique index on `(tenant_id, job_id, generation,
 kind) WHERE state <> 'failed'` holds the idempotency of begin: two racing begins insert one row
 (`ON CONFLICT ... DO NOTHING` names that index), and a `failed` row leaves the slot free for a new

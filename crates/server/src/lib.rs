@@ -209,17 +209,24 @@ pub fn routes_unguarded(state: AppState) -> (Router, Vec<ServedRoute>) {
         uploads::PART_PATH,
         post(uploads::part_url),
     );
+    let uploads = mounts.mount(
+        uploads,
+        Method::GET,
+        uploads::STATUS_PATH,
+        get(uploads::status),
+    );
     let uploads = mounts
         .mount(
             uploads,
-            Method::GET,
-            uploads::STATUS_PATH,
-            get(uploads::status),
+            Method::POST,
+            uploads::COMPLETE_PATH,
+            post(uploads::complete),
         )
         .with_state(uploads::Uploads::new(
             state.pool.clone(),
             state.sessions.clone(),
             state.uploads,
+            state.hub.clone(),
         ));
     // The redemption route keeps its own limiter and log gates: one set per router.
     let register = mounts

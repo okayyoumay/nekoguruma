@@ -451,12 +451,11 @@ async fn a_stop_during_a_ledger_write_waits_for_the_write() {
         .await
         .unwrap();
     // The removal is running on its blocking task.
+    let status = rig.handle().status();
     rig.stop().await;
     armed.store(false, Ordering::SeqCst);
-    assert!(
-        rig.pending().await.is_empty(),
-        "the write that was running finished before the task ended"
-    );
+    // Read before the ledger is touched again: the task awaited the write, and counted it.
+    assert_eq!(status.borrow().delivered, 1);
 }
 
 // L7
@@ -823,11 +822,14 @@ async fn another_failure_to_read_the_source_is_a_retry_and_never_an_abandon() {
     // The directory is gone (a volume that is away): not a missing file.
     fs::remove_dir_all(&sub).unwrap();
     rig.start();
-    rig.until(|s| s.retries >= 3).await;
+    // Paced by the back-off (1, 2, 4 ... 60 seconds): about 16 retries in ten minutes, and no
+    // spin on a check that makes no request.
+    rig.settle().await;
+    let retries = rig.counters().retries;
+    assert!((8..=20).contains(&retries), "{retries} retries in 600 s");
     // The path is a directory now: opening or reading it fails, which proves nothing.
     fs::create_dir_all(&path).unwrap();
-    let before = rig.counters().retries;
-    rig.until(|s| s.retries >= before + 2).await;
+    rig.until(|s| s.retries >= retries + 2).await;
     assert_eq!(rig.counters().abandoned, 0);
     assert!(
         rig.sim.log().is_empty(),
@@ -1125,6 +1127,139 @@ async fn a_refusal_and_an_abandon_are_warned_once_per_entry_and_class_and_counte
     rig.until(|s| s.delivered == 1).await;
     let status = rig.counters();
     assert_eq!((status.passed_over, status.abandoned), (3, 1));
+}
+
+// Abandon whose write fails
+#[tokio::test(start_paused = true)]
+async fn an_abandon_whose_write_fails_is_retried_at_the_back_offs_pace() {
+    let armed = flag(false);
+    let mut rig = Rig::with_probe(failing(&[(Step::BeforeRename, &armed)]));
+    rig.comm(1, DATA).await;
+    fs::remove_file(rig.comm_path(1)).unwrap();
+    armed.store(true, Ordering::SeqCst);
+    rig.start();
+    rig.settle().await;
+    let passed = rig.counters().passed_over;
+    assert!((8..=20).contains(&passed), "{passed} passes in 600 s");
+    assert_eq!(rig.counters().abandoned, 0);
+    assert_eq!(rig.pending().await, [1], "the entry stays");
+    armed.store(false, Ordering::SeqCst);
+    rig.until(|s| s.abandoned == 1).await;
+    assert!(rig.pending().await.is_empty());
+    assert!(rig.sim.log().is_empty());
+}
+
+// A failed exchange after a stored part keeps its Retry-After
+#[tokio::test(start_paused = true)]
+async fn a_failed_exchange_after_a_stored_part_still_owes_its_retry_after() {
+    let mut rig = Rig::new();
+    rig.result(1, DATA).await;
+    // Part 1 is stored; the part URL of part 2 answers 401, and the exchange that follows is
+    // told to wait 30 seconds.
+    rig.sim.queue_after(Route::Part, 1, problem(401, None));
+    rig.sim.queue_after(
+        Route::Challenge,
+        1,
+        Reply::Bytes(answer(429, "Retry-After: 30\r\n", "{}")),
+    );
+    rig.start();
+    rig.until(|s| s.delivered == 1).await;
+    let challenges = rig.sim.of(Route::Challenge);
+    assert_eq!(challenges.len(), 3);
+    assert!(gap(&challenges[1], &challenges[2]) >= secs(30));
+}
+
+// C3 (ADR-495): two `open` completions in a row pass the entry over, whatever was stored
+#[tokio::test(start_paused = true)]
+async fn two_open_completions_in_a_row_pass_the_entry_over_even_when_parts_were_sent() {
+    let mut rig = Rig::new();
+    rig.result(1, DATA).await;
+    // The server answers every PUT 200 and stores nothing: the status holds no part each time.
+    for _ in 0..6 {
+        rig.sim.queue(Route::Put, Reply::Bytes(answer(200, "", "")));
+    }
+    rig.sim.queue(Route::Complete, problem(409, Some("open")));
+    rig.sim.queue(Route::Complete, problem(409, Some("open")));
+    rig.start();
+    rig.until(|s| s.passed_over == 1).await;
+    assert_eq!(rig.counters().retries, 1);
+    assert_eq!(
+        rig.sim.puts().len(),
+        6,
+        "bounded: two sends, not an endless resend"
+    );
+    // The pass starts again afterwards and the server finally takes it.
+    rig.until(|s| s.delivered == 1).await;
+}
+
+// Status answers finished, completing, failed
+#[tokio::test(start_paused = true)]
+async fn a_status_answering_finished_completing_or_failed_is_acted_on() {
+    let body = |state: &str| format!(r#"{{"state":"{state}","partBytes":4,"partCount":3}}"#);
+    // finished: delivered with no byte sent and no completion.
+    let mut rig = Rig::new();
+    rig.result(1, DATA).await;
+    rig.sim.queue(Route::Status, reply(200, &body("finished")));
+    rig.start();
+    rig.until(|s| s.delivered == 1).await;
+    assert!(rig.sim.puts().is_empty());
+    assert_eq!(rig.sim.count(Route::Complete), 0);
+
+    // completing: the completion directly, no part URL first.
+    let mut rig = Rig::new();
+    rig.result(1, DATA).await;
+    rig.sim
+        .queue(Route::Status, reply(200, &body("completing")));
+    rig.start();
+    rig.until(|s| s.delivered == 1).await;
+    use Route::*;
+    assert_eq!(
+        &routes_of(&rig.sim)[..5],
+        [Challenge, Session, Begin, Status, Complete]
+    );
+
+    // failed: begin again once; a second in a row sets the entry aside.
+    let mut rig = Rig::new();
+    rig.result(1, DATA).await;
+    rig.sim.queue(Route::Status, reply(200, &body("failed")));
+    rig.start();
+    rig.until(|s| s.delivered == 1).await;
+    assert_eq!(rig.sim.begins().len(), 2);
+    let mut rig = Rig::new();
+    rig.result(1, DATA).await;
+    rig.sim.queue(Route::Status, reply(200, &body("failed")));
+    rig.sim.queue(Route::Status, reply(200, &body("failed")));
+    rig.start();
+    rig.until(|s| s.set_aside == 1).await;
+    assert!(rig.sim.puts().is_empty());
+    assert_eq!(rig.pending().await, [1]);
+}
+
+// A Corrupt reopen racing a stop is a stop
+#[tokio::test(start_paused = true)]
+async fn a_corrupt_reopen_that_races_a_stop_does_not_end_the_task_as_unusable() {
+    let armed = flag(true);
+    let mut rig = Rig::with_probe(failing(&[(Step::AfterSync, &armed)]));
+    assert!(
+        rig.ledger()
+            .enqueue_result(jk(1), DATA.to_vec())
+            .await
+            .is_err()
+    );
+    fs::write(rig.dir.path().join(AGENT_ID), b"not a ledger").unwrap();
+    // Hold the ledger so that the loop's reopen waits, then stop before it can answer.
+    let shared = rig.ledger().clone();
+    let held = shared.inner.ledger.lock().await;
+    rig.start();
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+    rig.handle().stop();
+    drop(held);
+    tokio::time::timeout(secs(5), rig.handle().stopped())
+        .await
+        .expect("the task ends");
+    assert_eq!(rig.handle().ended(), None);
 }
 
 // ---------------------------------------------------------------------------------------------

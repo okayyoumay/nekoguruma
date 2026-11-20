@@ -89,6 +89,8 @@ impl Worker {
                 Ok(text)
             }
             Err(how) => {
+                // A failed exchange always owes the wait, whatever the attempt stored.
+                self.owe_wait = true;
                 match how {
                     Fail::Ord => {}
                     Fail::RetryAfter(secs) => self.retry_after = Some(secs),
@@ -148,6 +150,11 @@ impl Worker {
 
 /// One attempt on `job`.
 pub(super) async fn attempt(w: &mut Worker, job: &Pending) -> Outcome {
+    // The wait the last attempt owed comes first, whether or not this one makes a request: a
+    // source that cannot be read must not spin the loop.
+    if w.pace().await.is_err() {
+        return Outcome::Stopped;
+    }
     w.progress = false;
     match steps(w, job).await {
         Ok(outcome) => outcome,
@@ -209,7 +216,10 @@ async fn steps(w: &mut Worker, job: &Pending) -> Result<Outcome, Stray> {
     match status.state {
         State::Finished => return Ok(w.has_it()),
         State::Completing => return conclude(w, seq, id).await,
-        State::Failed => return Ok(failed(w, seq)),
+        State::Failed => {
+            w.open_completions.remove(&seq);
+            return Ok(failed(w, seq));
+        }
         State::Open => {}
     }
     for part in status.parts_held.unwrap_or(0) + 1..=status.part_count {
@@ -230,7 +240,6 @@ async fn steps(w: &mut Worker, job: &Pending) -> Result<Outcome, Stray> {
         put.map_err(Stray::Failure)?;
         w.progress = true;
         w.backoff.reset();
-        w.open_without_part.remove(&seq);
     }
     conclude(w, seq, id).await
 }
@@ -244,25 +253,34 @@ async fn conclude(w: &mut Worker, seq: u64, id: &UploadId) -> Result<Outcome, St
         {
             Completion::Finished => {
                 w.failed_once.remove(&seq);
+                w.open_completions.remove(&seq);
                 return Ok(w.has_it());
             }
             Completion::Completing => {
+                w.open_completions.remove(&seq);
                 // A wait is taken before the repeat.
                 w.owe_wait = true;
             }
             Completion::Open => {
                 w.failed_once.remove(&seq);
                 // The parts did not make the object: the next attempt's status sends them again.
-                // The same answer with no part stored in between is for good (this pass).
-                return Ok(if w.open_without_part.insert(seq) {
+                // A second `open` in a row, whatever was stored in between, is for good (this
+                // pass), so a server that stores nothing is not sent the object again and again.
+                return Ok(if w.open_completions.insert(seq) {
                     Outcome::Retry("completion-open", Some(409))
                 } else {
-                    w.open_without_part.remove(&seq);
+                    w.open_completions.remove(&seq);
                     Outcome::PassOver("completion-open", Some(409))
                 });
             }
-            Completion::Failed => return Ok(failed(w, seq)),
-            Completion::Unstated => return Ok(Outcome::PassOver("completion-state", Some(409))),
+            Completion::Failed => {
+                w.open_completions.remove(&seq);
+                return Ok(failed(w, seq));
+            }
+            Completion::Unstated => {
+                w.open_completions.remove(&seq);
+                return Ok(Outcome::PassOver("completion-state", Some(409)));
+            }
         }
     }
 }

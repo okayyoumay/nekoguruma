@@ -200,7 +200,7 @@ pub enum LedgerError {
     #[error("a write to the upload ledger failed")]
     Poisoned,
     /// A removal of a number above the highest assigned.
-    #[error("finished {seq}, but the highest entry is {highest}")]
+    #[error("removal of {seq}, but the highest entry is {highest}")]
     OutOfRange { seq: u64, highest: u64 },
 }
 
@@ -705,7 +705,7 @@ impl UploadLedger {
                     }
                 });
             if let Err(error) = deleted {
-                tracing::warn!(kind = ?error.kind(), "deleting a finished upload's object failed; the next open sweeps it");
+                tracing::warn!(kind = ?error.kind(), "deleting a removed upload's object failed; the next open sweeps it");
             }
         }
         Ok(())

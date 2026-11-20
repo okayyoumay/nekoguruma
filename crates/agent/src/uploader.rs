@@ -394,8 +394,8 @@ struct Worker {
     set_aside: HashSet<u64>,
     /// Entries whose last completion answered `failed`.
     failed_once: HashSet<u64>,
-    /// Entries whose last completion answered `open` with no part stored since.
-    open_without_part: HashSet<u64>,
+    /// Entries whose last completion answered `open`, which a second one in a row passes over.
+    open_completions: HashSet<u64>,
     /// One warning per entry and class.
     warned: HashSet<(u64, &'static str)>,
     reopen_warned: bool,
@@ -439,7 +439,7 @@ impl Worker {
             passed_over: HashSet::new(),
             set_aside: HashSet::new(),
             failed_once: HashSet::new(),
-            open_without_part: HashSet::new(),
+            open_completions: HashSet::new(),
             warned: HashSet::new(),
             reopen_warned: false,
         })
@@ -452,7 +452,12 @@ impl Worker {
             }
             // A poisoned ledger is opened again here; only a file that does not read back ends
             // the task, and another failure keeps uploading from memory.
-            match self.ledger.reopen_if_poisoned().await {
+            let reopened = self.ledger.reopen_if_poisoned().await;
+            if self.stop.is_set() {
+                // A stop that came during the reopen ends the task quietly, whatever it found.
+                break;
+            }
+            match reopened {
                 Ok(true) => {
                     self.reopen_warned = false;
                     tracing::info!("the upload ledger was opened again");
@@ -480,8 +485,8 @@ impl Worker {
             };
             let mut job = eligible(&self);
             if job.is_none() && !self.passed_over.is_empty() {
-                // Every pending entry was passed over: start again from the first; the wait was
-                // taken before the request that passed the last one over.
+                // Every pending entry was passed over: start again from the first; the owed wait
+                // is taken at the start of the attempt.
                 self.passed_over.clear();
                 job = eligible(&self);
             }
@@ -509,7 +514,7 @@ impl Worker {
         self.passed_over.retain(|seq| held.contains(seq));
         self.set_aside.retain(|seq| held.contains(seq));
         self.failed_once.retain(|seq| held.contains(seq));
-        self.open_without_part.retain(|seq| held.contains(seq));
+        self.open_completions.retain(|seq| held.contains(seq));
         self.warned.retain(|(seq, _)| held.contains(seq));
     }
 
@@ -532,7 +537,9 @@ impl Worker {
                 }
             }
             Outcome::Retry(class, status) => {
-                tracing::debug!(entry = seq, class, status = ?status, "an upload attempt will be retried");
+                if !self.stop.is_set() {
+                    tracing::debug!(entry = seq, class, status = ?status, "an upload attempt will be retried");
+                }
                 self.count(|s| s.retries += 1);
             }
             Outcome::PassOver(class, status) => {
@@ -556,8 +563,9 @@ impl Worker {
     }
 
     /// Takes the entry out of the ledger. When that fails and the entry is still pending, it is
-    /// passed over (the next pass's begin answers `finished` again, or the source check
-    /// abandons again) and the removal is retried with no byte sent; `false` then. An entry the
+    /// passed over and the next wait is owed: the next pass's begin answers `finished` again (or
+    /// the source check abandons again) and the removal is retried at the back-off's pace with
+    /// no byte sent; `false` then. An entry the
     /// failed write already removed from memory needs nothing more: the reopen at the loop's top
     /// settles the file.
     async fn remove(&mut self, job: &Pending, how: Removal) -> bool {
@@ -577,6 +585,9 @@ impl Worker {
             .any(|p| p.entry.seq == seq);
         if !still {
             return true;
+        }
+        if self.stop.is_set() {
+            return false;
         }
         self.warn_with(job, "ledger-write", None, Some(&error));
         self.passed_over.insert(seq);
@@ -602,6 +613,10 @@ impl Worker {
         status: Option<u16>,
         error: Option<&LedgerError>,
     ) -> bool {
+        if self.stop.is_set() {
+            // After a stop nothing more is logged.
+            return false;
+        }
         let (entry, kind) = (job.entry.seq, job.entry.kind);
         let first = self.warned.insert((entry, class));
         match (first, error) {

@@ -143,10 +143,19 @@ impl Captured {
         self.0.lock().unwrap().len()
     }
 
-    /// Forgets what was logged after `mark`, as a retried start does with the log of the attempt
-    /// it left.
-    pub(crate) fn forget_after(&self, mark: usize) {
-        self.0.lock().unwrap().truncate(mark);
+    /// Forgets the lines of a child's forwarded output that were logged after `mark`, as a
+    /// retried start does with what the child it left wrote. The server's own lines stay: the
+    /// attempt that failed may have written the ones the next attempt will not (the credential
+    /// files it created).
+    pub(crate) fn forget_forwarded_after(&self, mark: usize) {
+        let mut bytes = self.0.lock().unwrap();
+        let tail = String::from_utf8_lossy(&bytes[mark..]).into_owned();
+        bytes.truncate(mark);
+        for line in tail.split_inclusive('\n') {
+            if !line.contains("object server output") {
+                bytes.extend_from_slice(line.as_bytes());
+            }
+        }
     }
 
     pub(crate) fn text(&self) -> String {

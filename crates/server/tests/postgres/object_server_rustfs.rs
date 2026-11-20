@@ -68,8 +68,9 @@ impl Real {
     }
 
     /// Starts the real child on a port that is free at that moment, with a new port when another
-    /// process takes it (before the spawn, or while the child binds it). The port that was used
-    /// is kept in `config`.
+    /// process takes it (before the spawn, or while the child binds it: RustFS then ends with
+    /// status 1, which the start's error does not explain, so `object_port_lost` looks whether
+    /// something answers on the port). The port that was used is kept in `config`.
     pub(crate) async fn start(&mut self) -> ObjectServer {
         let (result, port) = tokio::time::timeout(
             Duration::from_secs(60 * crate::support::PORT_ATTEMPTS as u64),

@@ -120,10 +120,10 @@ impl Fixture {
             LIMIT,
             retry_on_lost_port(
                 |port| {
-                    // Only a retry forgets, and only what the attempt before it logged: the
-                    // lines of earlier starts of the test stay.
+                    // Only a retry forgets, and only the dead child's forwarded output: the
+                    // server's own lines and those of earlier starts stay.
                     if let (Some(log), true) = (log, tried.replace(true)) {
-                        log.forget_after(mark);
+                        log.forget_forwarded_after(mark);
                     }
                     let mut config = config.clone();
                     config.port = Some(port);
@@ -456,6 +456,63 @@ async fn a_second_server_on_one_data_directory_is_refused_before_the_spawn() {
 
 // ---------------------------------------------------------------------------------------------
 // K1, K2: the credential files at a start
+
+/// A start that loses its port once (the fake ends with the lost-port status before it binds)
+/// is tried again; the log keeps the server's own lines of the first attempt (the credential
+/// files it made) and only the live child's forwarded output.
+#[tokio::test]
+async fn a_retry_after_a_lost_port_keeps_the_servers_lines_and_the_final_childs_output() {
+    let (log, _guard) = capture();
+    let mut fx = Fixture::new("lose_port_once 1\nprint_secret 1\n");
+    fx.log = Some(log.clone());
+    let server = fx.start(5000, 1000).await.unwrap();
+    assert!(
+        fx.data().join("lost-port-once").exists(),
+        "the first attempt did not lose its port"
+    );
+    assert_eq!(server.port(), fx.config.port.unwrap());
+    log_has(&log, "echo again").await;
+    let text = log.text();
+    assert_eq!(
+        text.matches("credential files created").count(),
+        1,
+        "{text}"
+    );
+    let forwarded = text.lines().filter(|l| l.contains("echo again")).count();
+    assert_eq!(forwarded, 1, "{text}");
+    server.stop(std::future::pending()).await;
+}
+
+/// The fake ends with status 98 when its port is taken (the status the retries look for), and
+/// refuses 98 as a status of its own, so that an end on purpose never looks like a lost port.
+#[test]
+fn the_fake_ends_with_the_lost_port_status_and_reserves_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let run = |cfg: &str, address: String| {
+        let work = dir.path().join("work");
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir(&work).unwrap();
+        std::fs::write(work.join("fake-object-server.cfg"), cfg).unwrap();
+        std::process::Command::new(env!("CARGO_BIN_EXE_ngr-fake-object-server"))
+            .current_dir(&work)
+            .env("RUSTFS_ADDRESS", address)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .code()
+    };
+    let holder = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let taken = holder.local_addr().unwrap().to_string();
+    assert_eq!(run("", taken.clone()), Some(98));
+    assert_eq!(run("mode exit\ncode 98\n", taken.clone()), Some(2));
+    assert_eq!(run("die_code 98\n", taken), Some(2));
+    assert_eq!(
+        run("mode exit\ncode 7\n", "127.0.0.1:1".to_owned()),
+        Some(7)
+    );
+}
 
 #[tokio::test]
 async fn the_first_start_creates_the_credentials_and_the_next_loads_them_unchanged() {
@@ -1051,7 +1108,9 @@ async fn start_tuned(
             let (object, store) = (object.clone(), store.clone());
             async move { Server::start_tuned(&config, object, store).await }
         },
-        |error| matches!(error, StartError::ObjectServer(error) if object_port_lost(error)),
+        |error, port| {
+            matches!(error, StartError::ObjectServer(error) if object_port_lost(error, port))
+        },
     )
     .await
     .0

@@ -471,9 +471,9 @@ async fn start_whole(pg: &TestPostgres, real: &mut Real) -> server::Server {
                 config.object_server.as_mut().unwrap().port = Some(port);
                 async move { server::Server::start(&config).await }
             },
-            |error| {
+            |error, port| {
                 matches!(error, server::StartError::ObjectServer(error)
-                    if crate::support::object_port_lost(error))
+                    if crate::support::object_port_lost(error, port))
             },
         ),
     )

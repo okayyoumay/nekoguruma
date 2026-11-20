@@ -344,18 +344,18 @@ pub fn fake_binary(dir: &Path) -> PathBuf {
 pub const PORT_ATTEMPTS: usize = 5;
 
 /// The status with which the fake object server ends when its bind finds the address in use
-/// (`src/bin/ngr-fake-object-server.rs`): a lost port, told from a child that ends on purpose.
-/// The real object server has no such status, so for it only `PortTaken` counts as a lost port.
-pub const LOST_PORT_EXIT: &str = "98";
+/// (`src/bin/ngr-fake-object-server.rs`, which refuses it as a status of its own modes): a lost
+/// port, told from a child that ends on purpose.
+pub const LOST_PORT_EXIT: u8 = 98;
 
 /// Runs `start` with a port that was free a moment ago, and again with a fresh port when it fails
-/// with an error that `lost` calls the loss of the port to another process, at most
-/// `PORT_ATTEMPTS` times in all. Returns the last result and the port it used. For a child
-/// process that binds the port itself: a port picked and released is only free for a moment.
-/// Each retry is printed, so that it shows in the test's output.
+/// with an error that `lost` (given the error and the port) calls the loss of the port to another
+/// process, at most `PORT_ATTEMPTS` times in all. Returns the last result and the port it used.
+/// For a child process that binds the port itself: a port picked and released is only free for a
+/// moment. Each retry is printed, so that it shows in the test's output.
 pub async fn retry_on_lost_port<T, E, Fut>(
     mut start: impl FnMut(u16) -> Fut,
-    lost: impl Fn(&E) -> bool,
+    lost: impl Fn(&E, u16) -> bool,
 ) -> (Result<T, E>, u16)
 where
     E: std::fmt::Display,
@@ -366,7 +366,7 @@ where
         let port = free_port();
         let result = start(port).await;
         match &result {
-            Err(error) if attempt < PORT_ATTEMPTS && lost(error) => {
+            Err(error) if attempt < PORT_ATTEMPTS && lost(error, port) => {
                 eprintln!("port {port} was lost (attempt {attempt}): {error}; trying a new port");
                 attempt += 1;
             }
@@ -380,22 +380,44 @@ pub fn object_port_taken(error: &ObjectServerError) -> bool {
     matches!(error, ObjectServerError::PortTaken { .. })
 }
 
-/// The port was taken, either before the spawn (`PortTaken`) or after it, when the fake object
-/// server ended with `LOST_PORT_EXIT` because its bind found the address in use.
-pub fn object_port_lost(error: &ObjectServerError) -> bool {
+/// Whether a rendered exit status is the fake's lost-port status (`exit status: 98` on Unix,
+/// `exit code: 98` on Windows).
+fn is_lost_port_status(how: &str) -> bool {
+    how.ends_with(&format!(": {LOST_PORT_EXIT}"))
+}
+
+/// Whether something accepts a connection on the loopback port now.
+fn answers(port: u16) -> bool {
+    std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)),
+        std::time::Duration::from_millis(300),
+    )
+    .is_ok()
+}
+
+/// The port was lost to another process: taken before the spawn (`PortTaken`), or the child ended
+/// because its bind failed. The fake says so with `LOST_PORT_EXIT`. The real object server ends
+/// with status 1 and an "Address in use" line that the start's error does not carry, so for any
+/// other end of the child the port counts as lost when something answers on it now (the child
+/// itself never got ready, so it is not the one that does).
+pub fn object_port_lost(error: &ObjectServerError, port: u16) -> bool {
     object_port_taken(error)
-        || matches!(error, ObjectServerError::ExitedBeforeReady(how) if how.contains(LOST_PORT_EXIT))
+        || matches!(error, ObjectServerError::ExitedBeforeReady(how)
+            if is_lost_port_status(how) || answers(port))
 }
 
 /// Whether the log of an `ngr-server` process shows that a port it needed was lost: its own
-/// port in use, the object server's port in use, or the fake object server ending with
-/// `LOST_PORT_EXIT`.
+/// port in use, the object server's port in use, the fake object server ending with
+/// `LOST_PORT_EXIT`, or the real one's forwarded "Address in use" line.
 pub fn log_shows_lost_port(log: &str) -> bool {
     log.contains("cannot listen on")
         || log.contains("object_server.port) is in use")
-        || log
-            .lines()
-            .any(|line| line.contains("ended before it was ready") && line.contains(LOST_PORT_EXIT))
+        || log.lines().any(|line| {
+            (line.contains("ended before it was ready")
+                && (line.contains(&format!("status: {LOST_PORT_EXIT}"))
+                    || line.contains(&format!("code: {LOST_PORT_EXIT}"))))
+                || (line.contains("object server output") && line.contains("Address in use"))
+        })
 }
 
 /// `ObjectServer::start` on `config` with a fresh port for each attempt (`retry_on_lost_port`).
@@ -413,6 +435,56 @@ pub async fn start_object_server(
         object_port_lost,
     )
     .await
+}
+
+#[test]
+fn a_lost_port_is_told_from_an_end_on_purpose() {
+    let ended = |how: &str| ObjectServerError::ExitedBeforeReady(how.to_owned());
+    let silent = ClosedPort::new().port();
+    assert!(object_port_lost(
+        &ObjectServerError::PortTaken { port: 1 },
+        silent
+    ));
+    assert!(object_port_lost(
+        &ended("exited with exit status: 98"),
+        silent
+    ));
+    assert!(object_port_lost(
+        &ended("exited with exit code: 98"),
+        silent
+    ));
+    assert!(!object_port_lost(
+        &ended("exited with exit status: 7"),
+        silent
+    ));
+    assert!(!object_port_lost(
+        &ended("exited with exit status: 198"),
+        silent
+    ));
+    // Something answers on the port: the child's end was a lost port whatever its status.
+    let holder = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = holder.local_addr().unwrap().port();
+    assert!(object_port_lost(&ended("exited with exit status: 1"), port));
+
+    assert!(log_shows_lost_port(
+        "ERROR cannot listen on 127.0.0.1:1: in use"
+    ));
+    assert!(log_shows_lost_port(
+        "127.0.0.1:2 (object_server.port) is in use; if"
+    ));
+    assert!(log_shows_lost_port(
+        "2026-11-20T09:59:58Z the object server ended before it was ready: exited with exit status: 98"
+    ));
+    assert!(log_shows_lost_port(
+        "the object server ended before it was ready: exited with exit code: 98"
+    ));
+    assert!(log_shows_lost_port(
+        "INFO object server output stream=\"stderr\" line=Server runtime failed: Address in use (os error 98)"
+    ));
+    assert!(!log_shows_lost_port(
+        "2026-11-20T09:59:98Z the object server ended before it was ready: exited with exit status: 7"
+    ));
+    assert!(!log_shows_lost_port("the object server refused the bucket"));
 }
 
 /// A port that was free a moment ago. Another process may take it before it is used, so a caller

@@ -11,6 +11,11 @@
 //! [`IdentityError::LocalFault`], which no retry fixes; a key that cannot be decoded is [`IdentityError::KeyUnusable`], which asks
 //! for registration again and is never overwritten.
 //!
+//! The store is chosen by build, platform and mode ([`select_store`]): on Linux in the user mode
+//! it is the Secret Service store in [`secret_service`] (ADR-496), which a release build selects
+//! without a variable; a debug build selects it, or the plain-file test store, by
+//! `NGR_AGENT_KEY_STORE`. Device mode and other platforms have none yet.
+//!
 //! Only the commands that need the key call this (`ngr-agent identity`, later registration and
 //! connect): they call [`load_or_create`] or [`agent_key`], never the store's `put_new`.
 //! `ngr-agent run` and `identify` never touch the store.
@@ -19,6 +24,9 @@ pub mod store;
 
 #[cfg(debug_assertions)]
 pub mod file_store;
+
+#[cfg(target_os = "linux")]
+pub mod secret_service;
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -40,7 +48,8 @@ pub const LOCK_WAIT: Duration = Duration::from_secs(10);
 /// How often a waiting process tries the lock again (as `guards::LockFile` does).
 const LOCK_POLL: Duration = Duration::from_millis(20);
 
-/// The debug-only variable that selects the plain-file test store (value `file`).
+/// The debug-only variable that selects a store by value: `file` (the plain-file test store) or
+/// `secret-service` (the Linux user-mode store, which a release build selects without it).
 pub const KEY_STORE_VAR: &str = "NGR_AGENT_KEY_STORE";
 
 /// Why the agent has no key.
@@ -138,18 +147,32 @@ pub fn agent_key(mode: OperatingMode) -> Result<AgentKey, IdentityError> {
     )
 }
 
-/// The store this build uses. A release build has none until the platform stores exist; a debug
-/// build has the plain-file test store when `NGR_AGENT_KEY_STORE=file` and an absolute
-/// `NGR_AGENT_STATE_DIR` are both set (ADR-460 Decision item 6).
+/// The Linux user-mode store: the freedesktop Secret Service (ADR-459 Decision item 4). Other
+/// platforms and the device mode have none yet.
+#[cfg(target_os = "linux")]
+fn user_mode_store(mode: OperatingMode) -> Option<Box<dyn SecretStore>> {
+    (mode == OperatingMode::User).then(|| Box::new(secret_service::SecretService::new()) as _)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn user_mode_store(_mode: OperatingMode) -> Option<Box<dyn SecretStore>> {
+    None
+}
+
+const NO_STORE: &str = "this build has no key store for this platform or mode";
+
+/// The store this build uses. A debug build has the plain-file test store when
+/// `NGR_AGENT_KEY_STORE=file` and an absolute `NGR_AGENT_STATE_DIR` are both set (ADR-460
+/// Decision item 6), and the user-mode store of the platform when `NGR_AGENT_KEY_STORE` is
+/// `secret-service`; with the variable unset it has none, as a release build has none for a
+/// platform or mode without a store.
 #[cfg(debug_assertions)]
 fn select_store(
-    _mode: OperatingMode,
+    mode: OperatingMode,
     var: &dyn Fn(&str) -> Option<OsString>,
 ) -> Result<Box<dyn SecretStore>, IdentityError> {
     match var(KEY_STORE_VAR) {
-        None => Err(IdentityError::NoStore(
-            "this build has no key store for this platform or mode",
-        )),
+        None => Err(IdentityError::NoStore(NO_STORE)),
         Some(value) if value == "file" => {
             let root = var(crate::state::STATE_DIR_VAR)
                 .map(PathBuf::from)
@@ -161,21 +184,23 @@ fn select_store(
                 root.join("identity"),
             )))
         }
+        Some(value) if value == "secret-service" => user_mode_store(mode).ok_or(
+            IdentityError::NoStore("the secret-service store is for the user mode on Linux"),
+        ),
         Some(_) => Err(IdentityError::NoStore(
-            "NGR_AGENT_KEY_STORE must be \"file\"",
+            "NGR_AGENT_KEY_STORE must be \"file\" or \"secret-service\"",
         )),
     }
 }
 
-/// The store this build uses: none yet (the platform stores come later, ADR-459 Decision item 4).
+/// The store this build uses: the user-mode store of the platform, which a release build selects
+/// without reading any variable, or none (ADR-459 Decision item 4).
 #[cfg(not(debug_assertions))]
 fn select_store(
-    _mode: OperatingMode,
+    mode: OperatingMode,
     _var: &dyn Fn(&str) -> Option<OsString>,
 ) -> Result<Box<dyn SecretStore>, IdentityError> {
-    Err(IdentityError::NoStore(
-        "this build has no key store for this platform or mode",
-    ))
+    user_mode_store(mode).ok_or(IdentityError::NoStore(NO_STORE))
 }
 
 /// Reads `name`: `Ok(None)` when the store positively holds nothing.

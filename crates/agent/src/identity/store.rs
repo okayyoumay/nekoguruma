@@ -2,8 +2,9 @@
 //! ADR-460 Decision item 3).
 //!
 //! A store holds secrets by name and can only create them: it has no replace and no delete, so
-//! no code path of the agent can overwrite or lose a key (ADR-387). The platform stores
-//! (DPAPI blob, Secret Service, systemd credential) implement [`SecretStore`] later.
+//! no code path of the agent can overwrite or lose a key (ADR-387). The Linux user-mode store
+//! on the Secret Service implements [`SecretStore`] in `secret_service` (ADR-496); the other
+//! platform stores (DPAPI blob, systemd credential) implement it later.
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;

@@ -27,6 +27,11 @@ fn ngr_agent(home: &Path) -> Command {
         .env("HOME", home)
         .env("XDG_STATE_HOME", home.join("xdg"))
         .env("LOCALAPPDATA", home.join("local"))
+        // A release build selects the Secret Service in the user mode: never the developer's.
+        .env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            "unix:path=/nonexistent/ngr-test-bus",
+        )
         .env_remove(KEY_STORE_VAR)
         .env_remove(STATE_DIR_VAR);
     command

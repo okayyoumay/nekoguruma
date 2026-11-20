@@ -52,8 +52,9 @@ document the plan does not name is ignored with a warning). It sends only the pr
 and read-only requests, and takes the VCI lock, then the lock of the vehicle whose VIN it
 established.
 
-identity: loads the agent's key from its key store, creating it once when the store has none,
-and prints public_key_pem, fingerprint and created as JSON on stdout. It takes no option
+identity: loads the agent's key from its key store, creating it once when the store has none
+(on Linux in the user mode the store is the user's Secret Service, which must be running with
+its default collection unlocked; the agent never unlocks it), and prints public_key_pem, fingerprint and created as JSON on stdout. It takes no option
 but --mode. Exit status: 0 the key is there; 1 the installation file is absent, refused, not
 valid, not readable by the agent's account or for the other mode, this build or mode has no key store, the store cannot create the
 key, or the debug variables are wrong; 2 a usage error; 3 the installation file cannot be read

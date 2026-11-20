@@ -169,6 +169,12 @@ The server's tests also start the pinned RustFS, its bundled object server (ADR-
 binary's path) and set `NGR_TEST_RUSTFS_BIN` to that path; CI does so in `core-linux` and
 `core-windows`, and a missing binary fails the real-binary tests with one message naming the script.
 `scripts/test-fetch-rustfs.sh` tests the script and runs in `repo-checks.yml`.
+The agent's Linux user-mode key store has tests against a real Secret Service
+(`crates/agent/tests/secret_service.rs`, ADR-496) that run only with `NGR_TEST_SECRET_SERVICE=1`
+and then fail, rather than skip, without a session bus or a Secret Service. `core-linux` runs them
+after the main nextest run, in a step that installs gnome-keyring and starts it unlocked inside
+`dbus-run-session`; run them locally the same way (the step in `ci.yml`), never against the
+keyring of your own desktop session.
 
 CI runs the tests with [cargo-nextest](https://nexte.st/) instead. The `core-linux` job runs
 `cargo nextest run --workspace --locked --profile ci`, then
@@ -247,7 +253,7 @@ use a recently stabilized language or library feature.
 `dependabot-auto-merge.yml` turns on GitHub auto-merge (squash) for Dependabot's grouped Cargo
 minor/patch pull request only, so it merges once the required checks pass (ADR-248). Dependabot's
 other pull requests (Cargo updates Cargo treats as breaking, such as 0.22 to 0.23, updates of
-`p256`, which the group leaves out (ADR-459), and GitHub Actions) wait for the maintainer like
+`p256` and `zbus`, which the group leaves out (ADR-459, ADR-496), and GitHub Actions) wait for the maintainer like
 any other.
 
 Compiler warnings fail CI: `core-linux`, `core-windows` and `worker-check` build with

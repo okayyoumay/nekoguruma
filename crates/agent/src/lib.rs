@@ -22,6 +22,8 @@
 //!   device (design 6.2, 6.7, ADR-494)
 //! - [`registration`]: the agent's initial registration with the server, and its record (design 6.4,
 //!   ADR-463, ADR-470)
+//! - [`uploader`]: the data channel client: the four upload routes and the part URL's host rule
+//!   (design 5.2, 5.4, ADR-493)
 //! - [`server_http`]: the HTTP/1 client for the agent's calls to the server (ADR-470)
 //! - [`state`]: where the agent keeps its state for each operating mode (design 6.2, ADR-460)
 //! - [`upload_ledger`]: the durable list of results and communication logs the server has not yet
@@ -72,6 +74,7 @@ pub mod send_receive;
 pub mod server_http;
 pub mod state;
 pub mod upload_ledger;
+pub mod uploader;
 
 pub use artifact::Artifact;
 pub use client::{ExitHow, WorkerApi, WorkerExit, WorkerSource, WorkerStatus};

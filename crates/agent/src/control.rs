@@ -35,11 +35,11 @@
 //! Never logged: the token, a challenge, a nonce, a proof, a body, a message's text, a
 //! `commandId`, the text of a close reason, the record's path or content.
 
-mod backoff;
+pub(crate) mod backoff;
 mod channel;
-mod dial;
+pub(crate) mod dial;
 mod events;
-mod exchange;
+pub(crate) mod exchange;
 mod gate;
 #[cfg(test)]
 mod tests;
@@ -345,7 +345,6 @@ struct Wiring {
     audience: Audience,
     /// The `Host` header's value.
     host: String,
-    port: u16,
 }
 
 /// The warnings of one session: one per failure class since the last `hello`, debug after that,
@@ -568,7 +567,6 @@ impl Opened {
             record: self.record,
             audience,
             host: origin.host_header(),
-            port: origin.port(),
         };
         let (stop_tx, stop_rx) = watch::channel(false);
         let (status_tx, status_rx) = watch::channel(Status {
@@ -703,10 +701,18 @@ async fn attempt(w: &Wiring, stop: &Stop, status: &StatusTx, warnings: &mut Warn
         lived: false,
     };
     status.phase(Phase::Exchange);
+    let seams = exchange::Seams {
+        dial: &*w.dial,
+        signer: &*w.signer,
+        random: w.random,
+        agent_id: &w.record.agent_id,
+        audience: &w.audience,
+        host: &w.host,
+    };
     let token = tokio::select! {
         biased;
         () = stop.requested() => return Outcome::Stopped,
-        token = exchange::token(w, warnings) => token,
+        token = exchange::token(&seams, warnings) => token,
     };
     let token = match token {
         Ok(token) => token,

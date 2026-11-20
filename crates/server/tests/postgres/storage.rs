@@ -90,7 +90,7 @@ impl Running {
     }
 
     async fn start_with(bucket: &str) -> Running {
-        let real = Real::new();
+        let mut real = Real::new();
         let server = real.start().await;
         let store = open(&server, bucket).await;
         Running {
@@ -426,7 +426,7 @@ async fn an_upload_survives_a_restart_of_the_object_server() {
     let data = content(3, 77);
     put_part(&run.store, &upload, 1, data.clone()).await;
     let Running {
-        real,
+        mut real,
         mut server,
         store,
     } = run;
@@ -460,16 +460,35 @@ fn server_config(pg: &TestPostgres, real: &Real) -> Config {
     }
 }
 
+/// `Server::start` on `real`'s configuration, with a fresh object-server port when the port is
+/// lost to another process; the port that served is kept in `real`.
+async fn start_whole(pg: &TestPostgres, real: &mut Real) -> server::Server {
+    let (result, port) = tokio::time::timeout(
+        Duration::from_secs(90 * crate::support::PORT_ATTEMPTS as u64),
+        crate::support::retry_on_lost_port(
+            |port| {
+                let mut config = server_config(pg, real);
+                config.object_server.as_mut().unwrap().port = Some(port);
+                async move { server::Server::start(&config).await }
+            },
+            |error, port| {
+                matches!(error, server::StartError::ObjectServer(error)
+                    if crate::support::object_port_lost(error, port))
+            },
+        ),
+    )
+    .await
+    .expect("the start must not hang");
+    real.config.port = Some(port);
+    result.expect("the server must start")
+}
+
 /// `Server::start` opens the store on the real child; a restart finds the bucket and the object.
 #[tokio::test]
 async fn a_start_opens_the_store_and_a_restart_finds_what_it_held() {
     let pg = TestPostgres::start();
-    let real = Real::new();
-    let config = server_config(&pg, &real);
-    let server = tokio::time::timeout(Duration::from_secs(90), server::Server::start(&config))
-        .await
-        .expect("the start must not hang")
-        .expect("the server must start");
+    let mut real = Real::new();
+    let server = start_whole(&pg, &mut real).await;
     assert_ne!(server.local_addr().port(), 0);
     let store = server.object_store().expect("start opens the store");
     let upload = store.begin().await.unwrap();
@@ -479,10 +498,7 @@ async fn a_start_opens_the_store_and_a_restart_finds_what_it_held() {
     store.complete(&upload, sha256(&data), 50).await.unwrap();
     server.run(async {}, std::future::pending()).await.unwrap();
     drop(store);
-    let server = tokio::time::timeout(Duration::from_secs(90), server::Server::start(&config))
-        .await
-        .expect("the start must not hang")
-        .expect("the server must start again");
+    let server = start_whole(&pg, &mut real).await;
     let store = server.object_store().unwrap();
     let body = store.get(&upload.key).await.unwrap();
     assert_eq!(body.length, 50);

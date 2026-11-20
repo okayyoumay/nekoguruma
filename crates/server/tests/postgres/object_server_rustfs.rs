@@ -67,14 +67,19 @@ impl Real {
         self.config.port.unwrap()
     }
 
-    pub(crate) async fn start(&self) -> ObjectServer {
-        tokio::time::timeout(
-            Duration::from_secs(60),
-            ObjectServer::start(&self.config, 1, &Tuning::default()),
+    /// Starts the real child on a port that is free at that moment, with a new port when another
+    /// process takes it (before the spawn, or while the child binds it: RustFS then ends with
+    /// status 1, which the start's error does not explain, so `object_port_lost` looks whether
+    /// something answers on the port). The port that was used is kept in `config`.
+    pub(crate) async fn start(&mut self) -> ObjectServer {
+        let (result, port) = tokio::time::timeout(
+            Duration::from_secs(60 * crate::support::PORT_ATTEMPTS as u64),
+            crate::support::start_object_server(&self.config, &Tuning::default()),
         )
         .await
-        .expect("the start must not hang")
-        .unwrap_or_else(|error| panic!("the real object server must start: {error}"))
+        .expect("the start must not hang");
+        self.config.port = Some(port);
+        result.unwrap_or_else(|error| panic!("the real object server must start: {error}"))
     }
 }
 
@@ -110,7 +115,7 @@ fn loopback(port: u16) -> SocketAddr {
 #[tokio::test]
 async fn the_real_server_is_ready_and_refuses_an_anonymous_request() {
     let (log, _guard) = capture();
-    let real = Real::new();
+    let mut real = Real::new();
     let began = Instant::now();
     let server = real.start().await;
     assert!(began.elapsed() < Duration::from_secs(30));
@@ -180,7 +185,7 @@ fn non_loopback_ipv4() -> Option<Ipv4Addr> {
 /// it elsewhere.
 #[tokio::test]
 async fn the_real_server_refuses_connections_that_are_not_loopback() {
-    let real = Real::new();
+    let mut real = Real::new();
     let server = real.start().await;
     let port = real.port();
     let Some(host) = non_loopback_ipv4() else {
@@ -255,7 +260,7 @@ fn socket_inodes(pid: u32) -> Vec<String> {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn the_real_server_has_no_other_listener() {
-    let real = Real::new();
+    let mut real = Real::new();
     let server = real.start().await;
     let inodes = socket_inodes(server.pid().unwrap());
     let mut listening = Vec::new();
@@ -279,7 +284,7 @@ async fn the_real_server_has_no_other_listener() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn the_real_servers_command_line_and_environment_hold_no_secret() {
-    let real = Real::new();
+    let mut real = Real::new();
     let server = real.start().await;
     let pid = server.pid().unwrap();
     let secret = server.credentials().expose_secret().to_owned();
@@ -310,7 +315,7 @@ async fn the_real_servers_command_line_and_environment_hold_no_secret() {
 /// and RustFS 1.0.6 starts with them over the old data.
 #[tokio::test]
 async fn deleted_credential_files_are_made_again_and_used() {
-    let real = Real::new();
+    let mut real = Real::new();
     let first = real.start().await;
     let old = first.credentials().expose_secret().to_owned();
     first.stop(std::future::pending()).await;
@@ -330,23 +335,17 @@ async fn deleted_credential_files_are_made_again_and_used() {
 fn a_killed_server_takes_the_real_child_with_it() {
     let pg = crate::support::TestPostgres::start();
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
-    let path = crate::binary::write_config(dir.path(), port, &pg.url());
-    let text = std::fs::read_to_string(&path).unwrap().replace(
-        &crate::support::fake_binary(dir.path())
-            .display()
-            .to_string(),
-        &rustfs_bin().display().to_string(),
-    );
-    std::fs::write(&path, text).unwrap();
-    let mut child = crate::binary::server(&["--config", path.to_str().unwrap()])
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while crate::binary::get_health(port).is_none() {
-        assert!(Instant::now() < deadline, "the server never listened");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    // The server starts the real binary: the configuration names it in place of the fake.
+    let fake = crate::support::fake_binary(dir.path())
+        .display()
+        .to_string();
+    let (mut child, _port, _) =
+        crate::binary::start_server_with(dir.path(), &pg, Duration::from_secs(60), |path| {
+            let text = std::fs::read_to_string(path)
+                .unwrap()
+                .replace(&fake, &rustfs_bin().display().to_string());
+            std::fs::write(path, text).unwrap();
+        });
     let child_pid = rustfs_pid_of(child.id());
     child.kill().unwrap();
     let _ = child.wait();

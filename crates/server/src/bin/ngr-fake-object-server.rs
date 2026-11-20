@@ -21,6 +21,12 @@
 //! - `report 1`: writes `report.txt` (its arguments, its environment, its working directory and,
 //!   on Linux, its open descriptors).
 //!
+//! - `lose_port_once 1`: the first start in a data directory ends with status 98 as a lost port
+//!   does (below), after `print_secret`'s output and before it binds; the later starts go on.
+//!
+//! A bind that fails because the address is in use ends it with status 98. The tests tell a lost
+//! port from an end on purpose by that status, so `code` and `die_code` refuse 98.
+//!
 //! It always writes its process ID to `pid` and prints a line when it is up.
 
 use std::collections::HashMap;
@@ -78,6 +84,23 @@ fn main() {
             "z".repeat(20_000)
         );
     }
+    // 98 is the status of a lost port (below): a test's own end must not look like one.
+    for key in ["code", "die_code"] {
+        if number(key) == Some(98) {
+            eprintln!("{key} 98 is reserved for a lost port");
+            std::process::exit(2);
+        }
+    }
+    if get("lose_port_once") == Some("1")
+        && std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open("lost-port-once")
+            .is_ok()
+    {
+        eprintln!("cannot bind: the port is lost (test hook)");
+        std::process::exit(98);
+    }
     match get("mode").unwrap_or("ok") {
         "exit" => std::process::exit(number("code").unwrap_or(3) as i32),
         "silent" => loop {
@@ -87,7 +110,17 @@ fn main() {
     }
 
     let address = std::env::var("RUSTFS_ADDRESS").expect("RUSTFS_ADDRESS");
-    let listener = TcpListener::bind(&address).expect("bind the address");
+    let listener = match TcpListener::bind(&address) {
+        Ok(listener) => listener,
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+            // The tests pick a port that was free a moment before, and tell this end (a lost
+            // port, worth another try) from any other by the status; it matches
+            // `LOST_PORT_EXIT` in the tests' `support.rs`.
+            eprintln!("cannot bind {address}: {error}");
+            std::process::exit(98);
+        }
+        Err(error) => panic!("bind the address: {error}"),
+    };
     println!("fake object server up on {address}");
     let mode = get("mode").unwrap_or("ok").to_owned();
     let ready_after = Duration::from_millis(number("ready_after_ms").unwrap_or(0));

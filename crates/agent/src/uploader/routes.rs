@@ -160,8 +160,18 @@ pub struct Status {
 /// A part URL that met the host rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartUrl {
-    pub target: PartTarget,
-    pub expires_in_secs: u64,
+    target: PartTarget,
+    expires_in_secs: u64,
+}
+
+impl PartUrl {
+    pub fn target(&self) -> &PartTarget {
+        &self.target
+    }
+
+    pub fn expires_in_secs(&self) -> u64 {
+        self.expires_in_secs
+    }
 }
 
 /// Complete's answer.
@@ -363,7 +373,13 @@ impl Routes {
         let target = &url.target;
         match self
             .client
-            .put(target.port, &target.target, &target.host, length, source)
+            .put(
+                target.port(),
+                target.target(),
+                target.host(),
+                length,
+                source,
+            )
             .await
         {
             Ok(answer) if (200..300).contains(&answer.status) => Ok(()),

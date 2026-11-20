@@ -538,3 +538,124 @@ async fn a_request_over_a_real_loopback_socket() {
     assert_eq!(seen[1].1, body);
     assert!(!seen[1].0.to_ascii_lowercase().contains("authorization"));
 }
+
+/// A PUT is judged by its status alone: its body is neither waited for nor read.
+#[tokio::test(start_paused = true)]
+async fn a_puts_answer_body_is_never_read() {
+    // A 200 whose declared body never comes.
+    let dial = FakeDial::new(4096, |_, mut server| {
+        tokio::spawn(async move {
+            let _ = read_request(&mut server).await;
+            let _ = server
+                .write_all(b"HTTP/1.1 200 X\r\nContent-Length: 10\r\n\r\n12")
+                .await;
+            std::future::pending::<()>().await;
+        });
+    });
+    let started = Instant::now();
+    let got = client_put(&Client::with_dial(dial)).await.unwrap();
+    assert_eq!((got.status, got.body), (200, AnswerBody::Unread));
+    assert_eq!(started.elapsed(), Duration::ZERO);
+}
+
+/// The reader does not start before the connection is up, and stops when the put is dropped.
+#[tokio::test]
+async fn the_reader_starts_after_the_connect_and_stops_with_the_put() {
+    let (source, produced, _) = pattern(1024 * 1024 * 1024);
+    let (dial, _) = scripted(json(200, "{}"));
+    dial.set(Mode::Refuse);
+    let client = Client::with_dial(dial.clone());
+    assert_eq!(
+        client
+            .put(9000, "/p", HOST, 1024 * 1024 * 1024, source)
+            .await
+            .unwrap_err(),
+        Error::NotSent
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        produced.load(Ordering::SeqCst),
+        0,
+        "no read before a connection"
+    );
+
+    // A server that reads the head only: the reader fills its queue, then the put is dropped.
+    let dial = FakeDial::new(1024, |_, mut server| {
+        tokio::spawn(async move {
+            let mut head = [0u8; 256];
+            let _ = server.read(&mut head).await;
+            std::future::pending::<()>().await;
+        });
+    });
+    let client = Client::with_dial(dial);
+    let (source, produced, _) = pattern(1024 * 1024 * 1024);
+    let put = client.put(9000, "/p", HOST, 1024 * 1024 * 1024, source);
+    tokio::select! {
+        _ = put => panic!("the put cannot finish"),
+        () = tokio::time::sleep(Duration::from_millis(300)) => {}
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let after_drop = produced.load(Ordering::SeqCst);
+    assert!(after_drop > 0);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        produced.load(Ordering::SeqCst),
+        after_drop,
+        "the reader kept reading"
+    );
+}
+
+/// A server that takes its input slowly but steadily keeps a PUT alive: the clock counts bytes
+/// written, not only bytes read. The limit is shortened so that the test is short.
+#[tokio::test]
+async fn a_put_the_server_reads_slowly_is_kept_alive_by_the_bytes_it_takes() {
+    let limit = Duration::from_millis(400);
+    let length = 6 * 1024usize;
+    let slow = |per_read: Duration| {
+        FakeDial::new(256, move |_, mut server| {
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    server.read_exact(&mut byte).await.unwrap();
+                    head.push(byte[0]);
+                }
+                let mut got = 0;
+                let mut buf = [0u8; 128];
+                while got < length {
+                    tokio::time::sleep(per_read).await;
+                    let n = server.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        return;
+                    }
+                    got += n;
+                }
+                let _ = server.write_all(&answer(200, "", "")).await;
+                let _ = server.shutdown().await;
+            });
+        })
+    };
+    let put = |client: Client| async move {
+        client
+            .put(
+                9000,
+                "/p",
+                HOST,
+                length as u64,
+                Box::new(Cursor::new(vec![3u8; length])),
+            )
+            .await
+    };
+    // 6 KiB at 128 bytes per 100 ms is about 5 s, well past the 400 ms limit, and every read
+    // moves bytes.
+    let started = std::time::Instant::now();
+    let got = put(Client::with_dial(slow(Duration::from_millis(100))).with_no_progress(limit))
+        .await
+        .unwrap();
+    assert_eq!(got.status, 200);
+    assert!(started.elapsed() > limit * 3, "{:?}", started.elapsed());
+    // The same server reading once per limit-and-a-half gives no progress in between.
+    let got =
+        put(Client::with_dial(slow(Duration::from_millis(700))).with_no_progress(limit)).await;
+    assert_eq!(got.unwrap_err(), Error::NoProgress);
+}

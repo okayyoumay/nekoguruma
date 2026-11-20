@@ -247,10 +247,10 @@ async fn part_url_asks_by_path_and_applies_the_host_rule() {
         &format!(r#"{{"url":"{url}","expiresInSecs":300}}"#),
     ));
     let got = routes.part_url("tok", &id(), 3).await.unwrap();
-    assert_eq!(got.expires_in_secs, 300);
-    assert_eq!(got.target.port, 9000);
-    assert_eq!(got.target.host, "127.0.0.1:9000");
-    assert_eq!(got.target.target, "/bucket/key?X-Amz-Signature=abc");
+    assert_eq!(got.expires_in_secs(), 300);
+    assert_eq!(got.target().port(), 9000);
+    assert_eq!(got.target().host(), "127.0.0.1:9000");
+    assert_eq!(got.target().target(), "/bucket/key?X-Amz-Signature=abc");
     let seen = seen.lock().unwrap();
     assert_eq!(
         seen[0].request_line(),
@@ -517,12 +517,9 @@ async fn a_request_with_no_answer_is_a_retry() {
 
 #[tokio::test(start_paused = true)]
 async fn the_put_carries_no_token_and_any_failure_is_a_retry() {
+    let origin = ServerOrigin::parse("http://127.0.0.1:8080").unwrap();
     let url = PartUrl {
-        target: PartTarget {
-            port: 9000,
-            host: "127.0.0.1:9000".to_owned(),
-            target: "/b/k?sig=1".to_owned(),
-        },
+        target: part_url::check(&origin, "http://127.0.0.1:9000/b/k?sig=1").unwrap(),
         expires_in_secs: 300,
     };
     let (routes, seen) = with_reply(answer(200, "ETag: \"x\"\r\n", ""));
@@ -547,4 +544,43 @@ async fn the_put_carries_no_token_and_any_failure_is_a_retry() {
             failure(Class::Retry, "put-refused", Some(status))
         );
     }
+}
+
+/// Nothing that holds a token, a signed URL or an answer body shows it in `{:?}`.
+#[tokio::test(start_paused = true)]
+async fn debug_output_shows_no_token_url_query_or_body() {
+    let origin = ServerOrigin::parse("http://127.0.0.1:8080").unwrap();
+    let target = part_url::check(
+        &origin,
+        "http://127.0.0.1:9000/bucket/key?X-Amz-Signature=hunter2",
+    )
+    .unwrap();
+    let url = PartUrl {
+        target,
+        expires_in_secs: 300,
+    };
+    let request = crate::uploader::http::JsonRequest {
+        method: Method::POST,
+        target: "/api/v1/agent/uploads",
+        host: "127.0.0.1:8080",
+        bearer: "tok-hunter2",
+        body: Some(b"body-hunter2".to_vec()),
+    };
+    let answer = crate::uploader::http::Answer {
+        status: 200,
+        retry_after: Some("7".to_owned()),
+        body: crate::uploader::http::AnswerBody::Bytes(b"body-hunter2".to_vec()),
+    };
+    for text in [
+        format!("{url:?}"),
+        format!("{:?}", url.target()),
+        format!("{request:?}"),
+        format!("{answer:?}"),
+        format!("{:?}", crate::uploader::http::AnswerBody::Unread),
+    ] {
+        assert!(!text.contains("hunter2"), "{text}");
+        assert!(!text.contains("X-Amz"), "{text}");
+        assert!(!text.contains("bucket"), "{text}");
+    }
+    assert!(format!("{request:?}").contains("body_len"));
 }

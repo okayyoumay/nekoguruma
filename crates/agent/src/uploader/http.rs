@@ -14,7 +14,8 @@
 //!
 //! A head is at most [`MAX_HEAD`] bytes. A body is read only for the statuses that carry the
 //! routes' answers ([`reads_body`]) and is at most [`MAX_ANSWER`] bytes; the body of any other
-//! status is never read.
+//! status is never read, and a PUT's answer body is never read at all: its status says whether the
+//! part was stored.
 
 use std::io::{self, Read};
 use std::pin::Pin;
@@ -79,8 +80,7 @@ pub enum AnswerBody {
     TooLarge,
 }
 
-/// What came back.
-#[derive(Debug)]
+/// What came back. `Debug` shows the status and the body's length, never the body.
 pub struct Answer {
     pub status: u16,
     /// The single `Retry-After` value, when the answer has exactly one that is text.
@@ -88,8 +88,8 @@ pub struct Answer {
     pub body: AnswerBody,
 }
 
-/// A request to one of the four JSON routes.
-#[derive(Debug)]
+/// A request to one of the four JSON routes. `Debug` leaves out the token and shows only the
+/// body's length, as `server_http::PostRequest` does.
 pub struct JsonRequest<'a> {
     pub method: Method,
     /// The request target: the path.
@@ -102,10 +102,37 @@ pub struct JsonRequest<'a> {
     pub body: Option<Vec<u8>>,
 }
 
+impl std::fmt::Debug for Answer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let body = match &self.body {
+            AnswerBody::Unread => "unread".to_owned(),
+            AnswerBody::Bytes(bytes) => format!("{} bytes", bytes.len()),
+            AnswerBody::TooLarge => "too large".to_owned(),
+        };
+        f.debug_struct("Answer")
+            .field("status", &self.status)
+            .field("retry_after", &self.retry_after.is_some())
+            .field("body", &body)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for JsonRequest<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JsonRequest")
+            .field("method", &self.method)
+            .field("target", &self.target)
+            .field("host", &self.host)
+            .field("body_len", &self.body.as_ref().map(Vec::len))
+            .finish()
+    }
+}
+
 /// The data channel's client: a dial and nothing else. It holds no connection.
 #[derive(Clone)]
 pub struct Client {
     dial: Arc<dyn PortDial>,
+    no_progress: Duration,
 }
 
 impl Client {
@@ -113,6 +140,7 @@ impl Client {
     pub fn loopback() -> Self {
         Self {
             dial: Arc::new(LoopbackPorts),
+            no_progress: NO_PROGRESS,
         }
     }
 
@@ -122,7 +150,18 @@ impl Client {
         expect(dead_code, reason = "tests replace the dial; the loop uses `loopback`")
     )]
     pub(crate) fn with_dial(dial: Arc<dyn PortDial>) -> Self {
-        Self { dial }
+        Self {
+            dial,
+            no_progress: NO_PROGRESS,
+        }
+    }
+
+    /// The same client with another no-progress limit, so that a test of the write side need not
+    /// wait 30 real seconds.
+    #[cfg(test)]
+    pub(crate) fn with_no_progress(mut self, limit: Duration) -> Self {
+        self.no_progress = limit;
+        self
     }
 
     /// One JSON route's request, at `port`, within [`JSON_TOTAL`].
@@ -141,10 +180,16 @@ impl Client {
             // Declared even when empty: the part URL and complete routes send no body.
             builder = builder.header(CONTENT_LENGTH, body.len());
         }
-        let http_request = builder
-            .body(Full::new(Bytes::from(body)))
-            .map_err(|_| Error::Failed)?;
-        self.send(port, http_request, Some(JSON_TOTAL)).await
+        self.send(
+            port,
+            || {
+                builder
+                    .body(Full::new(Bytes::from(body)))
+                    .map_err(|_| Error::Failed)
+            },
+            Some(JSON_TOTAL),
+        )
+        .await
     }
 
     /// PUTs `length` bytes read from `source` to `target` at `port`, with no total time: the
@@ -159,24 +204,31 @@ impl Client {
         length: u64,
         source: Box<dyn Read + Send>,
     ) -> Result<Answer, Error> {
-        // The reader ends by itself when the body is dropped and the channel closes.
-        let body = ChannelBody::start(length, source);
-        let request = Request::builder()
+        let builder = Request::builder()
             .method(Method::PUT)
             .uri(target)
             .header(HOST, host)
             .header(CONNECTION, "close")
             // Always declared, so that an empty part still carries `Content-Length: 0`.
-            .header(CONTENT_LENGTH, length)
-            .body(body)
-            .map_err(|_| Error::Failed)?;
-        self.send(port, request, None).await
+            .header(CONTENT_LENGTH, length);
+        // The reader starts only once the connection is up, and ends when the body is dropped
+        // (with this future) and the channel closes.
+        self.send(
+            port,
+            move || {
+                builder
+                    .body(ChannelBody::start(length, source))
+                    .map_err(|_| Error::Failed)
+            },
+            None,
+        )
+        .await
     }
 
     async fn send<B>(
         &self,
         port: u16,
-        request: Request<B>,
+        make_request: impl FnOnce() -> Result<Request<B>, Error>,
         total: Option<Duration>,
     ) -> Result<Answer, Error>
     where
@@ -192,6 +244,7 @@ impl Client {
                 Ok(Err(_)) => return Err(Error::NotSent),
                 Ok(Ok(stream)) => stream,
             };
+        let request = make_request()?;
         let stream = Tracked {
             inner: stream,
             progress: progress.clone(),
@@ -199,7 +252,7 @@ impl Client {
         let judged = async {
             tokio::select! {
                 answer = exchange(stream, request) => answer,
-                () = progress.stalled() => Err(Error::NoProgress),
+                () = progress.stalled(self.no_progress) => Err(Error::NoProgress),
             }
         };
         match total {
@@ -225,9 +278,9 @@ impl Progress {
     }
 
     /// Completes when [`NO_PROGRESS`] has passed since the last byte.
-    async fn stalled(&self) {
+    async fn stalled(&self, limit: Duration) {
         loop {
-            let due = *self.0.lock().unwrap_or_else(|e| e.into_inner()) + NO_PROGRESS;
+            let due = *self.0.lock().unwrap_or_else(|e| e.into_inner()) + limit;
             if Instant::now() >= due {
                 return;
             }
@@ -302,13 +355,16 @@ where
     let _driver = Driver(tokio::spawn(async move {
         let _ = connection.await;
     }));
+    // The answer to a PUT is its status alone: a stored part is not undone by a body that is
+    // late or cut.
+    let is_put = request.method() == Method::PUT;
     let response = sender
         .send_request(request)
         .await
         .map_err(|_| Error::Failed)?;
     let status = response.status().as_u16();
     let retry_after = single_text(response.headers(), &RETRY_AFTER);
-    let body = if reads_body(status) {
+    let body = if !is_put && reads_body(status) {
         read_body(response).await?
     } else {
         AnswerBody::Unread

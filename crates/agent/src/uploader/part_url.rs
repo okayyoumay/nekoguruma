@@ -16,15 +16,39 @@ use crate::registration::origin::ServerOrigin;
 /// The longest URL accepted, in bytes. A presigned URL is a few hundred.
 pub const MAX_URL_LEN: usize = 4096;
 
-/// A part URL that met the rule.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A part URL that met the rule. Only [`check`] makes one. The target carries the URL's
+/// signature, so `Debug` shows the port and the lengths only.
+#[derive(Clone, PartialEq, Eq)]
 pub struct PartTarget {
+    port: u16,
+    host: String,
+    target: String,
+}
+
+impl PartTarget {
     /// The port the PUT connects to.
-    pub port: u16,
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
     /// The `Host` header's value: the URL's authority as given.
-    pub host: String,
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
     /// The request target: from the first `/` after the authority, unchanged.
-    pub target: String,
+    pub fn target(&self) -> &str {
+        &self.target
+    }
+}
+
+impl std::fmt::Debug for PartTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PartTarget")
+            .field("port", &self.port)
+            .field("target_len", &self.target.len())
+            .finish()
+    }
 }
 
 /// Why a URL was refused. The text of the URL is never repeated.

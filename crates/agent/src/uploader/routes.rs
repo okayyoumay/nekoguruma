@@ -1,5 +1,5 @@
 //! The data channel's four routes: what the agent sends and how it judges each answer (design
-//! 5.2, 13.3, ADR-493 items 1 to 9 and 15 to 23). The server's side is `crates/server/src/
+//! 5.2, 13.3, ADR-493 items 1 to 9 and 15 to 23; the classes are ADR-495 item 1). The server's side is `crates/server/src/
 //! uploads.rs`; the shapes are `api/openapi.yaml`'s.
 //!
 //! - begin: `POST /api/v1/agent/uploads`

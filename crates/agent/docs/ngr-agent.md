@@ -823,7 +823,7 @@ The `agent` library's `upload_ledger` module keeps the objects still to be uploa
 
 ## Data channel client
 
-The `agent` library's `uploader` module holds the client the uploader's loop is built from (design 5.2, 5.4, ADR-493 items 12 and 13); the loop itself, and its wiring into `connect`, are not built yet, so nothing calls it.
+The `agent` library's `uploader` module holds the client the uploader's loop is built from (design 5.2, 5.4, ADR-493 items 12 and 13, ADR-495 items 1 to 4); the loop itself, and its wiring into `connect`, are not built yet, so nothing calls it.
 
 - **`uploader::http`.** One HTTP/1 request per connection over a loopback stream the agent dials, `Connection: close`, no redirect followed (a 3xx is an answer like any other). The head is bounded as `server_http`'s is, a JSON answer at most 64 KiB, and a body is read only for 200, 201, 202 and 409. A PUT's body is streamed from a blocking reader in 64 KiB chunks with its length declared, so memory does not depend on the server's part size. No progress: a connection with no byte read or written for 30 seconds is dropped, a connect takes at most 5 seconds, and a JSON route at most 60 seconds in all; a PUT that keeps moving has no total.
 - **`uploader::part_url`.** The host rule: a part URL must begin with the registration origin's scheme and host, byte for byte, followed by `/` or by `:` and a port from 1 to 65535 written without leading zeros, and holds no userinfo, `#` or non-graphic byte, within 4096 bytes; anything else is refused and not sent to. The rest of the URL is sent unchanged as the request target, its authority as `Host`, and no token goes with it.

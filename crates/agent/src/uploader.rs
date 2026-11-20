@@ -1,4 +1,4 @@
-//! The agent's data channel client (design 5.2, 5.4, 13.3, ADR-493): the library the uploader's
+//! The agent's data channel client (design 5.2, 5.4, 13.3, ADR-493, ADR-495): the library the uploader's
 //! loop is built from.
 //!
 //! - [`http`]: the HTTP/1 client for the four routes and the part PUT: one request per

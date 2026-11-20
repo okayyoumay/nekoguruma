@@ -92,6 +92,7 @@ fn checked_plan() -> CheckedPlan {
     let loaded = load_plan(
         &plan.encode().expect("the plan encodes"),
         vec![(hash, document)],
+        None,
     )
     .expect("the plan loads");
     check_plan(&loaded).expect("the plan passes its checks")
@@ -141,8 +142,8 @@ fn plan_over(pairs: &[(u32, u32)]) -> CheckedPlan {
             documents: documents.iter().map(|(hash, _)| *hash).collect(),
         }],
     };
-    let loaded =
-        load_plan(&plan.encode().expect("the plan encodes"), documents).expect("the plan loads");
+    let loaded = load_plan(&plan.encode().expect("the plan encodes"), documents, None)
+        .expect("the plan loads");
     check_plan(&loaded).expect("the plan passes its checks")
 }
 

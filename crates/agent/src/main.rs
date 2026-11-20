@@ -827,7 +827,7 @@ async fn identify_job(args: IdentifyArgs, key: JobKey) -> Result<String, String>
         }
     }
     let loaded =
-        load_plan(&plan_bytes, supplied).map_err(|error| format!("plan refused: {error}"))?;
+        load_plan(&plan_bytes, supplied, None).map_err(|error| format!("plan refused: {error}"))?;
     let named = loaded.document_hashes();
     for (hash, path) in &paths {
         if !named.contains(hash) {

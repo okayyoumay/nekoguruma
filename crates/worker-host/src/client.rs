@@ -219,14 +219,21 @@ mod tests {
         ));
     }
 
-    /// A port that is very likely closed: bound, then released.
-    fn closed_port() -> String {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        format!("127.0.0.1:{port}")
+    /// A loopback port nothing listens on: a socket bound to it that never listens holds it for
+    /// as long as the value lives, so no other test process can take it and every connection to
+    /// it is refused. A port bound and then released could be taken meanwhile.
+    struct ClosedPort(tokio::net::TcpSocket);
+
+    impl ClosedPort {
+        fn new() -> Self {
+            let socket = tokio::net::TcpSocket::new_v4().unwrap();
+            socket.bind(([127, 0, 0, 1], 0).into()).unwrap();
+            Self(socket)
+        }
+
+        fn endpoint(&self) -> String {
+            self.0.local_addr().unwrap().to_string()
+        }
     }
 
     /// Bounds a connect attempt, so a change that makes `connect` wait for the server's HTTP/2
@@ -239,7 +246,8 @@ mod tests {
 
     #[tokio::test]
     async fn connect_reports_an_unreachable_endpoint() {
-        let endpoints = [closed_port()];
+        let closed = ClosedPort::new();
+        let endpoints = [closed.endpoint()];
         assert!(matches!(
             timeout(connect(&endpoints, KEY, &ConnectOptions::default())).await,
             Err(ConnectError::Unreachable { .. })
@@ -249,7 +257,11 @@ mod tests {
     #[tokio::test]
     async fn connect_falls_back_after_an_unreachable_endpoint() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoints = [closed_port(), listener.local_addr().unwrap().to_string()];
+        let closed = ClosedPort::new();
+        let endpoints = [
+            closed.endpoint(),
+            listener.local_addr().unwrap().to_string(),
+        ];
         timeout(connect(&endpoints, KEY, &ConnectOptions::default()))
             .await
             .expect("the second, reachable endpoint should be used");

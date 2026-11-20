@@ -138,11 +138,23 @@ fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
-/// A loopback port nothing listens on.
+/// A loopback port nothing listens on: a socket bound to it that never listens holds it for as
+/// long as the value lives, so no other test process can take it and every connection to it is
+/// refused. A port bound and then released could be taken meanwhile.
 #[cfg(debug_assertions)]
-fn closed_port() -> u16 {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    listener.local_addr().unwrap().port()
+struct ClosedPort(tokio::net::TcpSocket);
+
+#[cfg(debug_assertions)]
+impl ClosedPort {
+    fn new() -> Self {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+        Self(socket)
+    }
+
+    fn port(&self) -> u16 {
+        self.0.local_addr().unwrap().port()
+    }
 }
 
 /// Runs `command` to its end within [`LIMIT`].
@@ -308,7 +320,8 @@ fn a_record_for_another_server_is_exit_1_register_again_before_anything_else() {
 #[test]
 fn a_record_that_does_not_read_is_exit_1_register_again() {
     let env = Env::new();
-    env.register(&"ab".repeat(32), closed_port());
+    let closed = ClosedPort::new();
+    env.register(&"ab".repeat(32), closed.port());
     let path = env.state.path().join("registration").join(RECORD_FILE);
     for content in [&b"{}"[..], b"not json"] {
         std::fs::write(&path, content).unwrap();
@@ -338,7 +351,8 @@ fn a_record_that_does_not_read_is_exit_1_register_again() {
 #[test]
 fn a_corrupt_issue_time_mark_is_exit_1_register_again_and_is_not_repaired() {
     let env = Env::new();
-    env.register(&"ab".repeat(32), closed_port());
+    let closed = ClosedPort::new();
+    env.register(&"ab".repeat(32), closed.port());
     let path = env
         .state
         .path()
@@ -442,7 +456,8 @@ mod with_store {
     fn an_unusable_key_is_exit_4_and_is_not_replaced() {
         let env = Env::new();
         let fingerprint = fingerprint(&env);
-        env.register(&fingerprint, closed_port());
+        let closed = ClosedPort::new();
+        env.register(&fingerprint, closed.port());
         let (path, _) = key_files(&env).remove(0);
         std::fs::write(&path, b"not a key").unwrap();
         let output = run(env.connect());
@@ -515,7 +530,8 @@ mod with_store {
         let env = Env::new();
         let fingerprint = fingerprint(&env);
         // Nothing listens: the session retries until it is stopped.
-        env.register(&fingerprint, closed_port());
+        let closed = ClosedPort::new();
+        env.register(&fingerprint, closed.port());
         let first = start(&env);
         first.wait_for("session started");
         let second = run(env.connect());
@@ -528,7 +544,8 @@ mod with_store {
     fn register_is_exit_3_while_a_session_runs() {
         let env = Env::new();
         let fingerprint = fingerprint(&env);
-        env.register(&fingerprint, closed_port());
+        let closed = ClosedPort::new();
+        env.register(&fingerprint, closed.port());
         let record = env.state.path().join("registration").join(RECORD_FILE);
         let before = std::fs::read(&record).unwrap();
         let first = start(&env);
@@ -566,7 +583,8 @@ mod with_store {
     fn a_signal_during_the_creation_lock_wait_exits_0_promptly() {
         let env = Env::new();
         // A record whose key does not exist, so the load needs the creation lock.
-        env.register(&"ab".repeat(32), closed_port());
+        let closed = ClosedPort::new();
+        env.register(&"ab".repeat(32), closed.port());
         let dir = env.identity_dir();
         make_private_dir(&dir);
         let holder = std::fs::OpenOptions::new()
@@ -609,7 +627,8 @@ mod with_store {
         for stop in [libc::SIGINT, libc::SIGTERM] {
             let env = Env::new();
             let fingerprint = fingerprint(&env);
-            env.register(&fingerprint, closed_port());
+            let closed = ClosedPort::new();
+            env.register(&fingerprint, closed.port());
             let mut first = start(&env);
             first.wait_for("session started");
             signal(first.child.as_ref().unwrap(), stop);

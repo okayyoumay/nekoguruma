@@ -253,6 +253,27 @@ fn is_json(headers: &HeaderMap) -> bool {
         .is_some_and(|essence| essence.eq_ignore_ascii_case("application/json"))
 }
 
+/// A loopback port nothing listens on, for the unit tests: a socket bound to it that never
+/// listens holds it for as long as the value lives, so no other test process can take it and
+/// every connection to it is refused. A port bound and then released could be taken meanwhile.
+#[cfg(test)]
+pub(crate) struct ClosedPort(tokio::net::TcpSocket);
+
+#[cfg(test)]
+impl ClosedPort {
+    pub(crate) fn new() -> Self {
+        let socket = tokio::net::TcpSocket::new_v4().expect("a socket");
+        socket
+            .bind((Ipv4Addr::LOCALHOST, 0).into())
+            .expect("a loopback port");
+        Self(socket)
+    }
+
+    pub(crate) fn port(&self) -> u16 {
+        self.0.local_addr().expect("a bound socket").port()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -463,12 +484,9 @@ mod tests {
 
     #[test]
     fn a_connection_that_nothing_listens_on_is_not_sent() {
-        let port = {
-            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-            listener.local_addr().unwrap().port()
-        };
+        let closed = ClosedPort::new();
         assert!(matches!(
-            run(port, 201, Timeouts::default()),
+            run(closed.port(), 201, Timeouts::default()),
             Err(PostError::NotSent(_))
         ));
     }

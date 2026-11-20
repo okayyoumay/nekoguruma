@@ -349,11 +349,8 @@ fn an_answer_from_another_key_is_exit_6_and_nothing_is_stored() {
 #[test]
 fn a_refused_connection_is_exit_3_with_nothing_sent() {
     let dir = tempfile::tempdir().unwrap();
-    let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let closed = crate::server_http::ClosedPort::new();
+    let port = closed.port();
     let request = Request {
         mode: OperatingMode::User,
         server: ServerOrigin::parse(&format!("http://127.0.0.1:{port}")).unwrap(),

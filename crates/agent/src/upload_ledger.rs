@@ -200,7 +200,7 @@ pub enum LedgerError {
     #[error("a write to the upload ledger failed")]
     Poisoned,
     /// A removal of a number above the highest assigned.
-    #[error("finished {seq}, but the highest entry is {highest}")]
+    #[error("removal of {seq}, but the highest entry is {highest}")]
     OutOfRange { seq: u64, highest: u64 },
 }
 
@@ -670,6 +670,19 @@ impl UploadLedger {
     /// entry gone from memory and its object kept for the next open's sweep. A communication
     /// log's file is never touched.
     pub fn finished(&mut self, seq: u64) -> Result<(), LedgerError> {
+        self.remove(seq)
+    }
+
+    /// Takes the entry `seq` out of the ledger because the uploader proved its source broken
+    /// (ADR-495 item 7): the same rewrite, with the same failure modes, as
+    /// [`UploadLedger::finished`], and idempotent in the same way. A stored result's object is
+    /// deleted with the entry; a communication log's file is never touched, whatever state it is
+    /// in.
+    pub fn abandon(&mut self, seq: u64) -> Result<(), LedgerError> {
+        self.remove(seq)
+    }
+
+    fn remove(&mut self, seq: u64) -> Result<(), LedgerError> {
         self.check_writable()?;
         if seq > self.highest {
             return Err(LedgerError::OutOfRange {
@@ -692,7 +705,7 @@ impl UploadLedger {
                     }
                 });
             if let Err(error) = deleted {
-                tracing::warn!(kind = ?error.kind(), "deleting a finished upload's object failed; the next open sweeps it");
+                tracing::warn!(kind = ?error.kind(), "deleting a removed upload's object failed; the next open sweeps it");
             }
         }
         Ok(())

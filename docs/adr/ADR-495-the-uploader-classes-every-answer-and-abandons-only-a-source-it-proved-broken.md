@@ -73,6 +73,9 @@ keeps finding a digest mismatch would send the whole object again and again, up 
 10. **A 503 status on an `open` row is followed by one completion in the same attempt**, whose
     answer decides (this amends ADR-493 item 17): a lost upload becomes `failed`, and with parts
     merely missing the row stays `open`, so the call is harmless during a real outage.
+    A completion that answers 409 `open` twice in a row for the same entry within a run passes
+    the entry over, whether or not parts were stored in between, so a store that accepts parts
+    and then reports none cannot make the agent send the object again and again.
 11. **Refusals and abandons are warned once per entry and class** (its number, kind, class and
     status, never a URL, token or digest) and counted in the uploader's status. They are not
     events of the job (ADR-493 item 14).

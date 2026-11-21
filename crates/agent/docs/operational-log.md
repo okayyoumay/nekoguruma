@@ -177,6 +177,8 @@ throughout.
     `file {path}` and, for a refusal by the writability check, the findings, which name paths.
     The same fixed sentence is printed on standard error by the command.
 
+- **The uploader** (`agent::uploader`, ADR-495 item 11): a refusal, an abandon, a set-aside entry and a removal that fails are warned once per entry and class; the entry holds the entry's number, its kind (`result` or `commLog`), the class and the HTTP status where there is one, never a URL, a token, a digest, a path or a job ID. Retries are written at `debug` only. The uploader's token exchange writes the control channel's exchange entries under its own names. A ledger that cannot be reopened is written once at `warn`, and one that does not read back once at `error`; nothing is written after a stop.
+
 ## A crate not yet checked
 
 A crate that starts to reach the agent's subscriber before its calls have been checked against

@@ -62,13 +62,6 @@ impl Dial for Loopback {
 }
 
 /// A [`PortDial`] fixed to one port, which is the portless [`Dial`] the exchange takes.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the uploader loop wires its exchange with it (next item)"
-    )
-)]
 pub(crate) struct AtPort<'a> {
     pub(crate) dial: &'a dyn PortDial,
     pub(crate) port: u16,

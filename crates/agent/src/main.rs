@@ -36,6 +36,7 @@ usage: ngr-agent run --vci <name> --mode <device|user> --document <file> [option
        ngr-agent identify --vci <name> --mode <device|user> --plan <file> [--document <file>]...
                           [options]
        ngr-agent identity --mode <device|user>
+       ngr-agent provision-key --mode device [--with-key <auto|host|tpm2|host+tpm2>]
        ngr-agent register --mode <device|user> [--server <origin>] --server-key <hex>
                           [--code-file <file>] [--replace]
        ngr-agent connect --mode <device|user>
@@ -61,6 +62,19 @@ key, or the debug variables are wrong; 2 a usage error; 3 the installation file 
 (other than for lack of access), the store, its lock or the state directory is unavailable
 (nothing changed, try again); 4 the stored key cannot be used (nothing changed; register again
 after an explicit reset).
+
+provision-key: Linux device mode only, as root. Creates the device agent key once: generates it in
+memory, seals it with `systemd-creds encrypt` (--with-key says to what: auto, the default, host,
+tpm2 or host+tpm2; no PCR binding), checks that `systemd-creds decrypt` gives it back, and links
+the result into /etc/credstore.encrypted/nekoguruma-agent-key.device.v1, which the unit's
+LoadCredentialEncrypted= provides to the agent. It never replaces a key. It prints public_key_pem,
+fingerprint and created as JSON on stdout; a running unit must be restarted to see the key. It
+logs to stderr only. Exit status: 0 created; 1 it cannot (not root in a release build, --mode
+user, no installation file or not for the device mode, not Linux, a refused directory, no
+systemd-creds on PATH (it needs systemd 250 or later), the tool refused); 2 a usage error; 3 an
+I/O or tool failure, a timeout, an installation file that cannot be read (other than for lack
+of access) or a key that did not verify (the message says whether the credential is in place);
+5 the credential already exists.
 
 Every command first reads the installation file (agent.toml, beside the configuration file in
 the system directory; crates/agent/docs/ngr-agent.md): the device's mode, the server's origin
@@ -170,6 +184,8 @@ enum Command {
     Identity(OperatingMode),
     /// `ngr-agent register ...` (ADR-470).
     Register(RegisterArgs),
+    /// `ngr-agent provision-key --mode <mode> [--with-key <k>]` (ADR-498).
+    ProvisionKey(ProvisionArgs),
     /// `ngr-agent connect --mode <mode>` (ADR-471).
     Connect(OperatingMode),
 }
@@ -188,6 +204,13 @@ struct RegisterArgs {
     code_file: Option<PathBuf>,
 }
 
+/// What `ngr-agent provision-key` takes.
+#[derive(Debug, PartialEq, Eq)]
+struct ProvisionArgs {
+    mode: OperatingMode,
+    with_key: agent::identity::WithKey,
+}
+
 impl Command {
     fn mode(&self) -> OperatingMode {
         match self {
@@ -196,6 +219,7 @@ impl Command {
             Command::Identity(mode) => *mode,
             Command::Register(args) => args.mode,
             Command::Connect(mode) => *mode,
+            Command::ProvisionKey(args) => args.mode,
         }
     }
 }
@@ -208,6 +232,10 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // provision-key runs before the operational log starts: it logs to stderr only (ADR-498).
+    if let Command::ProvisionKey(args) = command {
+        return provision_key(args);
+    }
     // The operational log (design 12.2), kept for the process's lifetime: stderr and the
     // rotated file, with the settings of the configuration file checked for the device's mode
     // (`crates/agent/docs/ngr-agent.md`).
@@ -229,6 +257,7 @@ fn main() -> ExitCode {
         Command::Connect(mode) => Some(installed("connect", *mode)),
         Command::Run(args) => Some(installed("run", args.mode)),
         Command::Identify(args) => Some(installed("identify", args.mode)),
+        Command::ProvisionKey(_) => unreachable!("handled before the log starts"),
     };
     let installation = match installation.transpose() {
         Ok(installation) => installation,
@@ -269,7 +298,7 @@ fn main() -> ExitCode {
             runtime.shutdown_timeout(std::time::Duration::from_secs(2));
             return code;
         }
-        Command::Identity(_) | Command::Register(_) => {
+        Command::Identity(_) | Command::Register(_) | Command::ProvisionKey(_) => {
             unreachable!("handled before the runtime starts")
         }
     };
@@ -338,6 +367,57 @@ fn identity(mode: OperatingMode) -> ExitCode {
                 | IdentityError::Random(_) => 1,
             })
         }
+    }
+}
+
+/// `ngr-agent provision-key` off Linux: there is no device key store to provision.
+#[cfg(not(target_os = "linux"))]
+fn provision_key(args: ProvisionArgs) -> ExitCode {
+    let ProvisionArgs { mode, with_key } = args;
+    let _ = (mode, with_key);
+    eprintln!("ngr-agent: provision-key: only Linux has a device key store to provision");
+    ExitCode::from(1)
+}
+
+/// `ngr-agent provision-key` (ADR-498): the checks that come before any directory or tool, then
+/// [`agent::identity::provision`]. Prints the public key as one JSON line; the exit status is the
+/// error's ([`agent::identity::provision::ProvisionError::exit_code`]).
+#[cfg(target_os = "linux")]
+fn provision_key(args: ProvisionArgs) -> ExitCode {
+    use agent::identity::provision::{provision, require_root};
+    let fail = |text: &dyn std::fmt::Display, code: u8| {
+        eprintln!("ngr-agent: provision-key: {text}");
+        ExitCode::from(code)
+    };
+    if let Err(error) = require_root() {
+        return fail(&error, error.exit_code());
+    }
+    if args.mode != OperatingMode::Device {
+        return fail(
+            &"the user mode has no key to provision; use --mode device",
+            1,
+        );
+    }
+    // The installation must be the device mode's (design 6.7): a missing or other file stops here.
+    if let Err(code) = installed("provision-key", args.mode) {
+        return code;
+    }
+    match provision(args.with_key) {
+        Ok(public_key) => {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "public_key_pem": public_key.to_spki_pem(),
+                    "fingerprint": public_key.fingerprint_hex(),
+                    "created": true,
+                })
+            );
+            eprintln!(
+                "ngr-agent: provision-key: created; a running ngr-agent unit must be restarted to use the key"
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => fail(&error, error.exit_code()),
     }
 }
 
@@ -451,6 +531,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, Strin
         Some(command) if command == "identify" => true,
         Some(command) if command == "identity" => return parse_identity(args),
         Some(command) if command == "register" => return parse_register(args),
+        Some(command) if command == "provision-key" => return parse_provision_key(args),
         Some(command) if command == "connect" => {
             return parse_mode_only(args).map(Command::Connect);
         }
@@ -572,6 +653,43 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, Strin
 /// The options of `ngr-agent identity`: `--mode` and nothing else.
 fn parse_identity(args: impl Iterator<Item = OsString>) -> Result<Command, String> {
     parse_mode_only(args).map(Command::Identity)
+}
+
+/// The options of `ngr-agent provision-key`: `--mode`, required, and `--with-key`, each once.
+fn parse_provision_key(mut args: impl Iterator<Item = OsString>) -> Result<Command, String> {
+    let mut mode = None;
+    let mut with_key = None;
+    while let Some(flag) = args.next() {
+        let value = args.next().ok_or("an option needs a value")?;
+        let value = value
+            .to_str()
+            .ok_or_else(|| "an option value is not valid UTF-8".to_owned())?;
+        match flag.to_str() {
+            Some("--mode") if mode.is_some() => return Err("give --mode once".to_owned()),
+            Some("--mode") => {
+                mode = Some(
+                    value
+                        .parse::<OperatingMode>()
+                        .map_err(|error| format!("--mode: {error}"))?,
+                )
+            }
+            Some("--with-key") if with_key.is_some() => {
+                return Err("give --with-key once".to_owned());
+            }
+            Some("--with-key") => {
+                with_key = Some(
+                    value
+                        .parse::<agent::identity::WithKey>()
+                        .map_err(|error| format!("--with-key {error}"))?,
+                )
+            }
+            _ => return Err(format!("unknown option {flag:?}")),
+        }
+    }
+    Ok(Command::ProvisionKey(ProvisionArgs {
+        mode: mode.ok_or("--mode is required")?,
+        with_key: with_key.unwrap_or(agent::identity::WithKey::Auto),
+    }))
 }
 
 /// `--mode <device|user>` and nothing else, for `identity` and `connect`.
@@ -1032,16 +1150,60 @@ mod tests {
             Command::Identify(_)
             | Command::Identity(_)
             | Command::Register(_)
-            | Command::Connect(_) => Err("not a run".to_owned()),
+            | Command::Connect(_)
+            | Command::ProvisionKey(_) => Err("not a run".to_owned()),
         }
     }
 
     fn identify_args(args: &[&str]) -> Result<IdentifyArgs, String> {
         match parse_command(args)? {
             Command::Identify(args) => Ok(args),
-            Command::Run(_) | Command::Identity(_) | Command::Register(_) | Command::Connect(_) => {
-                Err("not an identify".to_owned())
-            }
+            Command::Run(_)
+            | Command::Identity(_)
+            | Command::Register(_)
+            | Command::Connect(_)
+            | Command::ProvisionKey(_) => Err("not an identify".to_owned()),
+        }
+    }
+
+    /// `provision-key` takes `--mode` and an optional `--with-key` from a closed list, each once.
+    #[test]
+    fn parses_a_provision_key_with_a_closed_list() {
+        use agent::identity::WithKey;
+        let ok = |mode, with_key| Ok(Command::ProvisionKey(ProvisionArgs { mode, with_key }));
+        assert_eq!(
+            parse_command(&["provision-key", "--mode", "device"]),
+            ok(OperatingMode::Device, WithKey::Auto)
+        );
+        assert_eq!(
+            parse_command(&["provision-key", "--with-key", "host+tpm2", "--mode", "user"]),
+            ok(OperatingMode::User, WithKey::HostTpm2)
+        );
+        for bad in [
+            &["provision-key"][..],
+            &["provision-key", "--mode"],
+            &["provision-key", "--mode", "machine"],
+            &["provision-key", "--mode", "device", "--mode", "device"],
+            &[
+                "provision-key",
+                "--mode",
+                "device",
+                "--with-key",
+                "tpm2-absent",
+            ],
+            &[
+                "provision-key",
+                "--mode",
+                "device",
+                "--with-key",
+                "host",
+                "--with-key",
+                "host",
+            ],
+            &["provision-key", "--mode", "device", "--vci", "x"],
+            &["provision-key", "--mode", "device", "extra"],
+        ] {
+            assert!(parse_command(bad).is_err(), "{bad:?}");
         }
     }
 

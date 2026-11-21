@@ -150,17 +150,64 @@ fn a_present_value_that_is_not_a_p256_key_is_unusable_and_not_replaced() {
     }
 }
 
-/// S9: an absent key in a store that cannot create is "not provisioned", nothing is written, and
-/// the lock is released.
+/// S9: an absent key in a store that claims it can create but whose create is refused is "not
+/// provisioned", nothing is written, and the lock is released.
 #[test]
-fn an_absent_key_in_a_read_only_store_is_not_provisioned() {
+fn an_absent_key_in_a_store_that_refuses_to_create_is_not_provisioned() {
     let temp = tempfile::tempdir().unwrap();
-    let store = MemoryStore::read_only();
+    let store = MemoryStore::refusing_create();
     let error = load(&store, temp.path()).unwrap_err();
     assert_eq!(kind(&error), "NotProvisioned");
     assert!(!error.retryable());
     assert!(store.is_empty());
     assert!(WriterLock::at(&temp.path().join(format!("{}.lock", name()))).is_ok());
+}
+
+/// L1: a store that cannot create answers "not provisioned" at the first absent read, without
+/// asking for the lock directory (a missing or refused directory is not reported instead).
+#[test]
+fn a_store_that_cannot_create_does_not_ask_for_the_lock_directory() {
+    let store = MemoryStore::read_only();
+    assert!(!store.can_create());
+    let error = load_or_create(&store, &name(), &no_lock_dir, WAIT).unwrap_err();
+    assert_eq!(kind(&error), "NotProvisioned");
+    assert!(!error.retryable());
+    let refused = || Err(StateDirError::new("refused"));
+    let error = load_or_create(&store, &name(), &refused, WAIT).unwrap_err();
+    assert_eq!(kind(&error), "NotProvisioned");
+}
+
+/// L2, L3: no lock file is made, and a creation lock another process holds is not waited for.
+#[test]
+fn a_store_that_cannot_create_takes_no_lock() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = MemoryStore::read_only();
+    let error = load(&store, temp.path()).unwrap_err();
+    assert_eq!(kind(&error), "NotProvisioned");
+    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+
+    let _held = WriterLock::at(&temp.path().join(format!("{}.lock", name()))).unwrap();
+    let started = Instant::now();
+    let error = load_or_create(
+        &store,
+        &name(),
+        &dir_of(temp.path()),
+        Duration::from_secs(5),
+    )
+    .unwrap_err();
+    assert_eq!(kind(&error), "NotProvisioned");
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+/// A key a read-only store holds is loaded as before: no lock, no state directory.
+#[test]
+fn a_present_key_in_a_store_that_cannot_create_is_loaded() {
+    let (key, der) = key_bytes();
+    let store = MemoryStore::read_only();
+    store.insert_raw(&name(), &der);
+    let loaded = load_or_create(&store, &name(), &no_lock_dir, WAIT).unwrap();
+    assert!(!loaded.created());
+    assert_eq!(loaded.public_key(), key.public_key());
 }
 
 /// S10: the re-check under the lock finds a key another process just created.
@@ -498,6 +545,105 @@ fn no_variable_selects_no_store_except_the_user_mode_one_in_a_release_build() {
             }
         }
     }
+}
+
+const DEVICE_CREDENTIAL_DIR: &str = "/run/credentials/ngr-agent.service";
+
+/// A13, A1: the device-mode credential store reads `CREDENTIALS_DIRECTORY` and nothing else: an
+/// absolute directory selects it on Linux, and an unset, empty or relative one is no store, with
+/// words that name the unit and `systemd-run`; the user mode and other platforms have none.
+#[test]
+fn the_credential_store_needs_an_absolute_credentials_directory() {
+    let good = vars(vec![(
+        CREDENTIALS_DIRECTORY_VAR,
+        DEVICE_CREDENTIAL_DIR.into(),
+    )]);
+    assert_eq!(
+        credential_store(OperatingMode::Device, &good).is_ok(),
+        cfg!(target_os = "linux")
+    );
+    assert_eq!(
+        credential_store(OperatingMode::User, &good)
+            .err()
+            .map(|e| kind(&e)),
+        Some("NoStore")
+    );
+    for bad in [None, Some(""), Some("relative/creds"), Some("./creds")] {
+        let var = vars(
+            bad.map(|value| (CREDENTIALS_DIRECTORY_VAR, value.into()))
+                .into_iter()
+                .collect(),
+        );
+        let error = credential_store(OperatingMode::Device, &var).err().unwrap();
+        assert_eq!(kind(&error), "NoStore", "{bad:?}");
+        if cfg!(target_os = "linux") {
+            assert!(error.to_string().contains("systemd-run"), "{error}");
+        }
+    }
+}
+
+/// A14: a debug build selects the credential store only for the value `systemd-credential` in the
+/// device mode, and the value does not select the other stores' modes.
+#[cfg(debug_assertions)]
+#[test]
+fn the_systemd_credential_value_selects_the_device_mode_store_on_linux_only() {
+    let both = vars(vec![
+        (KEY_STORE_VAR, "systemd-credential".into()),
+        (CREDENTIALS_DIRECTORY_VAR, DEVICE_CREDENTIAL_DIR.into()),
+    ]);
+    assert_eq!(
+        select_store(OperatingMode::Device, &both).is_ok(),
+        cfg!(target_os = "linux")
+    );
+    assert_eq!(
+        select_store(OperatingMode::User, &both)
+            .err()
+            .map(|e| kind(&e)),
+        Some("NoStore")
+    );
+    // The directory alone does not select it in a debug build, and the user value does not either.
+    let only_dir = vars(vec![(
+        CREDENTIALS_DIRECTORY_VAR,
+        DEVICE_CREDENTIAL_DIR.into(),
+    )]);
+    assert!(select_store(OperatingMode::Device, &only_dir).is_err());
+    let no_dir = vars(vec![(KEY_STORE_VAR, "systemd-credential".into())]);
+    let error = select_store(OperatingMode::Device, &no_dir).err().unwrap();
+    assert_eq!(kind(&error), "NoStore");
+    let user_value = vars(vec![
+        (KEY_STORE_VAR, "secret-service".into()),
+        (CREDENTIALS_DIRECTORY_VAR, DEVICE_CREDENTIAL_DIR.into()),
+    ]);
+    assert!(select_store(OperatingMode::Device, &user_value).is_err());
+}
+
+/// A13, A15: a release build in the device mode on Linux selects the credential store from
+/// `CREDENTIALS_DIRECTORY` alone and no `NGR_` variable changes that; in the user mode the
+/// variable is not read.
+#[cfg(not(debug_assertions))]
+#[test]
+fn a_release_build_selects_the_credential_store_in_the_device_mode_from_one_variable() {
+    let dir = vars(vec![(
+        CREDENTIALS_DIRECTORY_VAR,
+        DEVICE_CREDENTIAL_DIR.into(),
+    )]);
+    let noisy = vars(vec![
+        (CREDENTIALS_DIRECTORY_VAR, DEVICE_CREDENTIAL_DIR.into()),
+        (KEY_STORE_VAR, "file".into()),
+        (crate::state::STATE_DIR_VAR, abs_dir()),
+    ]);
+    for var in [&dir as &dyn Fn(&str) -> Option<OsString>, &noisy] {
+        assert_eq!(
+            select_store(OperatingMode::Device, var).is_ok(),
+            cfg!(target_os = "linux")
+        );
+    }
+    assert!(select_store(OperatingMode::Device, &vars(vec![])).is_err());
+    // The user mode on Linux has the Secret Service store whatever the credential variable says.
+    assert_eq!(
+        select_store(OperatingMode::User, &dir).is_ok(),
+        cfg!(target_os = "linux")
+    );
 }
 
 /// E4: the debug variable `secret-service` selects the Secret Service store for the user mode on

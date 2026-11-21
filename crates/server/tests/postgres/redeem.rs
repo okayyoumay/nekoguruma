@@ -175,13 +175,18 @@ impl Captured {
 
 /// Logs of the current thread from now on. The tests that read the log run on the current-thread
 /// runtime, so the server's tasks log on this thread too.
+///
+/// sqlx's own events are left out: it warns of a slow statement when a query, the migrations
+/// above all, takes longer than its threshold, which depends on the runner's speed, and its
+/// text carries the statement. The tests read what the server writes, so a slow runner must not
+/// change what they see.
 pub(crate) fn capture() -> (Captured, tracing::subscriber::DefaultGuard) {
     crate::support::pin_dispatchers();
     let captured = Captured::default();
     let subscriber = tracing_subscriber::fmt()
         .with_writer(captured.clone())
         .with_ansi(false)
-        .with_max_level(tracing::Level::INFO)
+        .with_env_filter(tracing_subscriber::EnvFilter::new("info,sqlx=off"))
         .finish();
     (captured, tracing::subscriber::set_default(subscriber))
 }

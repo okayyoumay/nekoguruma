@@ -430,3 +430,109 @@ fn an_identity_path_that_is_a_file_exits_with_3() {
         b"a file"
     );
 }
+
+/// `ngr-agent identity --mode device` over the Linux device-mode store, with the credential
+/// directory `creds` standing where systemd's `$CREDENTIALS_DIRECTORY` would, and the state
+/// directory `state` (ADR-498).
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn device_identity(home: &Path, state: &Path, creds: &Path) -> Command {
+    let mut command = ngr_agent(home);
+    command
+        .args(["identity", "--mode", "device"])
+        .env(KEY_STORE_VAR, "systemd-credential")
+        .env("CREDENTIALS_DIRECTORY", creds)
+        .env(STATE_DIR_VAR, state);
+    installation_file::install(&mut command, home, "device", SERVER);
+    command
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+const CREDENTIAL: &str = "nekoguruma-agent-key.device.v1";
+
+/// A8 (A4): a key the administrator planted is found by every process, never reported as created,
+/// and neither the credential directory nor the state directory is touched.
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn a_planted_device_key_is_found_and_the_state_directory_stays_empty() {
+    use shared_crypto::Signer;
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let creds = tempfile::tempdir().unwrap();
+    let key = shared_crypto::SigningKey::generate().unwrap();
+    std::fs::write(creds.path().join(CREDENTIAL), &*key.to_pkcs8_der()).unwrap();
+    for _ in 0..2 {
+        let output = device_identity(home.path(), state.path(), creds.path())
+            .output()
+            .unwrap();
+        let printed = printed(&output);
+        assert!(!printed.created);
+        assert_eq!(printed.fingerprint, key.public_key().fingerprint_hex());
+    }
+    assert!(is_empty_dir(state.path()));
+    assert_eq!(std::fs::read_dir(creds.path()).unwrap().count(), 1);
+}
+
+/// A3, L1: an empty credential directory is "not provisioned" (exit 1) and creates nothing, not
+/// a lock, a state directory or a key, even when the state directory cannot exist.
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn an_empty_credential_directory_exits_with_1_and_creates_nothing() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let creds = tempfile::tempdir().unwrap();
+    let output = device_identity(home.path(), state.path(), creds.path())
+        .output()
+        .unwrap();
+    assert_exit(&output, 1);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("provisions"));
+    assert!(is_empty_dir(state.path()));
+    assert!(is_empty_dir(creds.path()));
+    // A state directory under a regular file would fail a lock: the exit is still 1.
+    let file = state.path().join("file");
+    std::fs::write(&file, b"x").unwrap();
+    let output = device_identity(home.path(), &file.join("sub"), creds.path())
+        .output()
+        .unwrap();
+    assert_exit(&output, 1);
+    assert!(is_empty_dir(creds.path()));
+}
+
+/// A5, A6: an empty file and a file that is not a key are unusable (exit 4) and left as they are.
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn an_empty_or_garbage_credential_exits_with_4_and_is_not_replaced() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let creds = tempfile::tempdir().unwrap();
+    let file = creds.path().join(CREDENTIAL);
+    for bytes in [&b""[..], b"not a key"] {
+        std::fs::write(&file, bytes).unwrap();
+        let output = device_identity(home.path(), state.path(), creds.path())
+            .output()
+            .unwrap();
+        assert_exit(&output, 4);
+        assert_eq!(std::fs::read(&file).unwrap(), bytes);
+    }
+    assert!(is_empty_dir(state.path()));
+}
+
+/// A1, A2: no `CREDENTIALS_DIRECTORY` is no store (exit 1, the message names `systemd-run`), and
+/// a directory that is not there is unavailable (exit 3).
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn a_missing_variable_exits_with_1_and_a_missing_directory_with_3() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let creds = tempfile::tempdir().unwrap();
+    let output = device_identity(home.path(), state.path(), creds.path())
+        .env_remove("CREDENTIALS_DIRECTORY")
+        .output()
+        .unwrap();
+    assert_exit(&output, 1);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("systemd-run"));
+    let output = device_identity(home.path(), state.path(), &creds.path().join("gone"))
+        .output()
+        .unwrap();
+    assert_exit(&output, 3);
+    assert!(is_empty_dir(state.path()));
+}

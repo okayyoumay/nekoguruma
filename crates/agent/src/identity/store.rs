@@ -3,8 +3,9 @@
 //!
 //! A store holds secrets by name and can only create them: it has no replace and no delete, so
 //! no code path of the agent can overwrite or lose a key (ADR-387). The Linux user-mode store
-//! on the Secret Service implements [`SecretStore`] in `secret_service` (ADR-496); the other
-//! platform stores (DPAPI blob, systemd credential) implement it later.
+//! on the Secret Service implements [`SecretStore`] in `secret_service` (ADR-496); the Linux
+//! device-mode store on a systemd credential (`systemd_credential`, ADR-498) can read only; the
+//! Windows store (DPAPI blob) implements it later.
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -124,6 +125,14 @@ pub trait SecretStore: Send + Sync {
     /// Creates `name` holding `secret`: all or nothing, and it never replaces
     /// ([`AlreadyExists`](StoreErrorKind::AlreadyExists) when the name is present).
     fn put_new(&self, name: &SecretName, secret: &[u8]) -> Result<(), StoreError>;
+
+    /// Whether this store can ever create a secret. A store that cannot (the device-mode
+    /// credential store, which an administrator provisions) makes `load_or_create` answer
+    /// "not provisioned" at the first absent read, before any lock, state directory or key
+    /// generation (ADR-498 item 2).
+    fn can_create(&self) -> bool {
+        true
+    }
 }
 
 type GetHook = Arc<dyn Fn() + Send + Sync>;
@@ -138,6 +147,8 @@ struct MemoryInner {
     /// Whether a faulting `put_new` has stored the secret before it fails.
     put_fault_after_write: bool,
     read_only: bool,
+    /// Whether `can_create` answers false (a read-only store), or only `put_new` refuses.
+    cannot_create: bool,
     absent_hook: Option<GetHook>,
 }
 
@@ -150,9 +161,18 @@ impl MemoryStore {
         Self::default()
     }
 
-    /// A store that answers `get` but cannot create (`put_new` gives `NotCreatable`), like the
-    /// device-mode credential store the administrator provisions.
+    /// A store that answers `get` but cannot create (`put_new` gives `NotCreatable` and
+    /// `can_create` is false), like the device-mode credential store the administrator
+    /// provisions.
     pub fn read_only() -> Self {
+        let store = Self::refusing_create();
+        store.inner().cannot_create = true;
+        store
+    }
+
+    /// A store that claims it can create (`can_create` is true) but whose `put_new` gives
+    /// `NotCreatable`: the fallback path of `load_or_create` for a store that learns it late.
+    pub fn refusing_create() -> Self {
         let store = Self::new();
         store.inner().read_only = true;
         store
@@ -257,6 +277,10 @@ impl SecretStore for MemoryStore {
             Some(kind) => Err(StoreError::new(kind)),
             None => Ok(()),
         }
+    }
+
+    fn can_create(&self) -> bool {
+        !self.inner().cannot_create
     }
 }
 

@@ -141,7 +141,7 @@ async fn paging_store(run: &Running) -> S3Store {
     .unwrap()
 }
 
-async fn read_all(store: &S3Store, key: &ObjectKey) -> Result<Vec<u8>, StoreError> {
+pub(crate) async fn read_all(store: &S3Store, key: &ObjectKey) -> Result<Vec<u8>, StoreError> {
     let body = store.get(key).await?;
     let length = body.length;
     let mut reader = body.reader;

@@ -385,19 +385,19 @@ impl Fixture {
 }
 
 /// The `connect` process; it is killed when dropped, so a failed test leaves none behind.
-struct Agent {
-    child: Option<Child>,
-    log: std::path::PathBuf,
+pub(crate) struct Agent {
+    pub(crate) child: Option<Child>,
+    pub(crate) log: std::path::PathBuf,
 }
 
 impl Agent {
-    fn log_text(&self) -> String {
+    pub(crate) fn log_text(&self) -> String {
         std::fs::read_to_string(&self.log).unwrap_or_default()
     }
 
     /// Asks the agent to stop (SIGINT on Unix, a kill elsewhere) and waits for it to exit. The exit
     /// status is `None` where the stop is a kill.
-    async fn stop(&mut self) -> Option<i32> {
+    pub(crate) async fn stop(&mut self) -> Option<i32> {
         let child = self.child.as_mut().unwrap();
         #[cfg(unix)]
         {
@@ -429,13 +429,13 @@ impl Agent {
 
     /// Kills the process at once (SIGKILL on Unix) and waits for it, so that it sends and writes
     /// nothing more.
-    fn kill(&mut self) {
+    pub(crate) fn kill(&mut self) {
         let mut child = self.child.take().unwrap();
         child.kill().unwrap();
         child.wait().unwrap();
     }
 
-    fn running(&mut self) -> bool {
+    pub(crate) fn running(&mut self) -> bool {
         self.child
             .as_mut()
             .is_some_and(|child| child.try_wait().unwrap().is_none())

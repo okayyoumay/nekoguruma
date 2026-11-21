@@ -21,15 +21,26 @@
 //!    a torn last frame cut off. One that does not read back is corrupt and the owner registers
 //!    again (exit 1); another process holding it, an unusable directory or a read that fails is
 //!    exit 3.
-//! 5. The agent key, through [`crate::identity::agent_key`] (the create-once routine). A key
+//! 5. The upload ledger ([`crate::upload_ledger::UploadLedger::open`], ADR-493 item 11): the
+//!    file of the record's agent ID in `<state>/uploads/`, created when missing, an entry a
+//!    crash tore cut off. One that does not read back is corrupt and the owner registers again
+//!    (exit 1); another process holding it (a `debug enqueue` that has not ended, or a second
+//!    agent), an unusable directory or a read that fails is exit 3. It is opened with the other
+//!    state, before the key store, so that nothing starts on a file that is refused.
+//! 6. The agent key, through [`crate::identity::agent_key`] (the create-once routine). A key
 //!    store that is unavailable, or a creation lock held past its wait, is tried again with the
 //!    session's delays until the stop signal; any other error (a refused identity directory, a
 //!    lock that cannot be opened) ends the command at once. A key this run had to create, or one
 //!    that is not the record's, means registering again.
-//! 6. [`crate::control::Opened::start`], then a wait for the stop signal or for the task to end
-//!    (a task that ends alone is an error: exit 1 when its outbox or its ledger, poisoned and
-//!    opened again, was corrupt, otherwise the same exit with a generic text), then [`crate::control::Handle::stop`] (Close 1001)
-//!    and a wait for the task to end.
+//! 7. The uploader ([`crate::uploader::start`], design 5.2, ADR-493 item 10), then
+//!    [`crate::control::Opened::start`]: two tasks, each with its own token exchange, and neither
+//!    ends the other. Then a wait for the stop signal or for the session task to end (a task that
+//!    ends alone is an error: exit 1 when its outbox or its ledger, poisoned and opened again,
+//!    was corrupt, otherwise the same exit with a generic text). An uploader that ends alone
+//!    (its ledger did not read back after a reopen) is logged once at error level and the session
+//!    goes on: `connect`'s exit status is the session's. Then both tasks are stopped (the
+//!    session closes with 1001), the session is awaited, and the uploader is awaited for
+//!    [`UPLOADER_STOP_BOUND`] at most.
 //!
 //! The command prints and logs nothing the server sent and no token; its messages are fixed
 //! wording.
@@ -46,12 +57,19 @@ use crate::identity::{AgentKey, IdentityError, agent_key};
 use crate::outbox::{Outbox, OutboxError};
 use crate::received_jobs::{LedgerError, ReceivedJobs};
 use crate::registration::origin::ServerOrigin;
-use crate::registration::record::RecordError;
+use crate::registration::record::{Record, RecordError};
+use crate::upload_ledger::{LedgerError as UploadLedgerError, UploadLedger};
+use crate::uploader::{self, SharedLedger};
 
 /// The first wait before the key store is tried again, as the session's own delay starts.
 const RETRY_INITIAL: Duration = Duration::from_secs(1);
 /// The longest wait between two tries of the key store.
 const RETRY_CAP: Duration = Duration::from_secs(60);
+
+/// How long a stop waits for the uploader to end. The uploader drops the request in flight at
+/// once and awaits only a ledger write that is running, so the wait is short; the bound keeps a
+/// stuck write from holding the process.
+const UPLOADER_STOP_BOUND: Duration = Duration::from_secs(10);
 
 /// The exit status of a command that did not end by a stop signal (the usage text lists them; a
 /// stop is 0 and a usage error 2, which the caller decides).
@@ -223,6 +241,29 @@ fn ledger_error(error: &LedgerError) -> ConnectError {
     }
 }
 
+/// The exit and the text of an error that ends the open of the upload ledger. The texts are NGR's
+/// own.
+fn upload_ledger_error(error: &UploadLedgerError) -> ConnectError {
+    match error {
+        UploadLedgerError::Corrupt(_) => fail(
+            Exit::CannotConnect,
+            "the upload ledger is corrupt and is not repaired; register again with `ngr-agent register --replace`",
+        ),
+        UploadLedgerError::BadAgentId => fail(
+            Exit::CannotConnect,
+            "the registration record cannot be used; register again with `ngr-agent register --replace`",
+        ),
+        UploadLedgerError::InUse => fail(
+            Exit::Unavailable,
+            "the upload ledger is open in another process; nothing changed, try again",
+        ),
+        other => fail(
+            Exit::Unavailable,
+            format!("the upload ledger cannot be opened: {other}; nothing changed, try again"),
+        ),
+    }
+}
+
 /// The exit and the text of a key error that ends the load, as `register` reports it. The retried
 /// errors ([`IdentityError::retry_class`]) never get here.
 fn identity_error(error: &IdentityError) -> ConnectError {
@@ -256,9 +297,13 @@ pub async fn run(
         IssueMark::open(mode, &opened.record().agent_id).map_err(|error| mark_error(&error))?;
     let ledger = ReceivedJobs::open(mode, &opened.record().agent_id)
         .map_err(|error| ledger_error(&error))?;
+    let uploads = UploadLedger::open(mode, &opened.record().agent_id)
+        .map_err(|error| upload_ledger_error(&error))?;
+    let uploads = SharedLedger::new(uploads);
     run_opened(
         opened,
         move || agent_key(mode),
+        move |record, key| uploader::start(record, key, uploads),
         |opened, key| {
             opened.start(
                 key,
@@ -269,6 +314,7 @@ pub async fn run(
                 ledger,
             )
         },
+        UPLOADER_STOP_BOUND,
         stop,
     )
     .await
@@ -278,7 +324,9 @@ pub async fn run(
 async fn run_opened(
     opened: control::Opened,
     load_key: impl Fn() -> Result<AgentKey, IdentityError> + Clone + Send + 'static,
+    start_uploader: impl FnOnce(&Record, &AgentKey) -> Result<uploader::Handle, ControlError>,
     start: impl FnOnce(control::Opened, AgentKey) -> Result<control::Handle, ControlError>,
+    uploader_bound: Duration,
     stop: impl Future<Output = ()>,
 ) -> Result<(), ConnectError> {
     tokio::pin!(stop);
@@ -290,33 +338,65 @@ async fn run_opened(
     if key.created() {
         return Err(fail(Exit::CannotConnect, REGISTER_AGAIN));
     }
+    // The record's checks come before either task is spawned (the session makes them again).
+    opened
+        .check(&key.public_key())
+        .map_err(|error| control_error(&error))?;
+    // The uploader first, over the key by reference: the session's start takes the key. A start
+    // that fails drops the uploader's handle, which stops it.
+    let uploader = start_uploader(opened.record(), &key).map_err(|error| control_error(&error))?;
     let handle = start(opened, key).map_err(|error| control_error(&error))?;
     tracing::info!("control channel session started");
     // The task also ends without a stop when it panics (release builds unwind): the locks are
     // then free and no session is left, so the process must not stay up.
-    tokio::select! {
-        biased;
-        () = stop.as_mut() => {}
-        () = handle.stopped() => {
-            match handle.ended() {
-                Some(control::Ended::OutboxUnusable) => {
-                    return Err(outbox_error(&OutboxError::Corrupt("reopen")));
-                }
-                Some(control::Ended::LedgerUnusable) => {
-                    return Err(ledger_error(&LedgerError::Corrupt("reopen")));
-                }
-                None => {}
+    let mut uploader_ended = false;
+    let outcome = loop {
+        tokio::select! {
+            biased;
+            () = stop.as_mut() => break Ok(()),
+            () = handle.stopped() => {
+                break Err(match handle.ended() {
+                    Some(control::Ended::OutboxUnusable) => {
+                        outbox_error(&OutboxError::Corrupt("reopen"))
+                    }
+                    Some(control::Ended::LedgerUnusable) => {
+                        ledger_error(&LedgerError::Corrupt("reopen"))
+                    }
+                    None => fail(
+                        Exit::CannotConnect,
+                        "the control channel session ended unexpectedly",
+                    ),
+                });
             }
-            return Err(fail(
-                Exit::CannotConnect,
-                "the control channel session ended unexpectedly",
-            ));
+            // Neither channel ends the other: the session goes on without uploads.
+            () = uploader.stopped(), if !uploader_ended => {
+                uploader_ended = true;
+                tracing::error!(
+                    reason = ?uploader.ended(),
+                    "the uploader ended; nothing is uploaded until the agent restarts, and the control channel session goes on"
+                );
+            }
+        }
+    };
+    if outcome.is_ok() {
+        handle.stop();
+        handle.stopped().await;
+        tracing::info!("control channel session stopped");
+    }
+    // The uploader is awaited on the error path too: the process then ends within a short
+    // timeout, which must not cut a ledger rewrite that is running.
+    uploader.stop();
+    if !uploader_ended {
+        if tokio::time::timeout(uploader_bound, uploader.stopped())
+            .await
+            .is_err()
+        {
+            tracing::warn!("the uploader did not stop in time; the agent exits without it");
+        } else {
+            tracing::info!("uploader stopped");
         }
     }
-    handle.stop();
-    handle.stopped().await;
-    tracing::info!("control channel session stopped");
-    Ok(())
+    outcome
 }
 
 /// Loads the key, trying again after each unavailable store or busy creation lock with the

@@ -368,6 +368,131 @@ fn a_corrupt_issue_time_mark_is_exit_1_register_again_and_is_not_repaired() {
     }
 }
 
+/// ADR-493 item 11: an upload ledger file that does not read back is exit 1 with the advice to
+/// register again, before the key store is touched, and the file is not repaired.
+#[cfg(debug_assertions)]
+#[test]
+fn a_corrupt_upload_ledger_is_exit_1_register_again_and_is_not_repaired() {
+    let env = Env::new();
+    let closed = ClosedPort::new();
+    env.register(&"ab".repeat(32), closed.port());
+    let dir = env.state.path().join("uploads");
+    make_private_dir(&dir);
+    let path = dir.join(AGENT_ID);
+    std::fs::write(&path, b"not a ledger").unwrap();
+    let output = run(env.connect());
+    assert_exit(&output, 1, "the upload ledger is corrupt");
+    assert!(text(&output.stderr).contains("register again"));
+    assert!(!env.identity_dir().exists(), "the key store was touched");
+    assert_eq!(std::fs::read(&path).unwrap(), b"not a ledger", "repaired");
+}
+
+/// `debug enqueue` writes the ledger `connect` opens: a result and a communication log get the
+/// numbers 1 and 2, the same object again gets its number back, another object of the same job,
+/// generation and kind is refused (exit 1), and an agent that is not registered cannot enqueue.
+#[cfg(debug_assertions)]
+#[test]
+fn debug_enqueue_writes_the_upload_ledger_and_refuses_what_the_ledger_refuses() {
+    use agent::upload_ledger::{Kind, UploadLedger};
+    const JOB: &str = "0194f0a2-7c3e-7d11-8a52-3f6f9b1c2d4f";
+    let env = Env::new();
+    let enqueue = |kind: &str, file: &Path| {
+        let mut command = env.command();
+        command.args([
+            "debug",
+            "enqueue",
+            "--mode",
+            "user",
+            "--job",
+            JOB,
+            "--generation",
+            "1",
+            "--kind",
+            kind,
+        ]);
+        command.arg("--file").arg(file);
+        run(command)
+    };
+    let refused = |output: Output, code: i32, contains: &str| {
+        let stderr = text(&output.stderr);
+        assert_eq!(output.status.code(), Some(code), "{stderr}");
+        assert!(output.stdout.is_empty());
+        assert!(
+            stderr.contains(&format!("ngr-agent: debug enqueue: {contains}")),
+            "{stderr}"
+        );
+    };
+    let result = env.home.path().join("result.json");
+    let log = env.home.path().join("comm.log");
+    std::fs::write(&result, b"{\"state\":\"ok\"}").unwrap();
+    std::fs::write(&log, vec![7u8; 1000]).unwrap();
+    refused(
+        enqueue("result", &result),
+        1,
+        "not registered, or the registration record cannot be used",
+    );
+
+    let closed = ClosedPort::new();
+    env.register(&"ab".repeat(32), closed.port());
+    let seq = |output: &Output| -> u64 {
+        assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        json["seq"].as_u64().unwrap()
+    };
+    // A job ID no begin accepts and generation 0 would be passed over for good: refused.
+    for (job, generation, contains) in [
+        ("not-a-uuid", "1", "the job ID is not a canonical UUID"),
+        (JOB, "0", "the generation starts at 1"),
+    ] {
+        let mut command = env.command();
+        command.args([
+            "debug",
+            "enqueue",
+            "--mode",
+            "user",
+            "--job",
+            job,
+            "--generation",
+            generation,
+            "--kind",
+            "result",
+        ]);
+        command.arg("--file").arg(&result);
+        refused(run(command), 1, contains);
+    }
+    let big = env.home.path().join("big.json");
+    std::fs::File::create(&big)
+        .unwrap()
+        .set_len(64 * 1024 * 1024 + 1)
+        .unwrap();
+    refused(
+        enqueue("result", &big),
+        1,
+        "the bytes are longer than an upload may be",
+    );
+    assert_eq!(seq(&enqueue("result", &result)), 1);
+    assert_eq!(seq(&enqueue("result", &result)), 1, "the same object again");
+    assert_eq!(seq(&enqueue("commLog", &log)), 2);
+    std::fs::write(&result, b"other bytes").unwrap();
+    refused(
+        enqueue("result", &result),
+        1,
+        "the job already has an upload",
+    );
+    refused(
+        enqueue("result", &env.home.path().join("missing")),
+        1,
+        "the file cannot be read",
+    );
+
+    let ledger = UploadLedger::open_in(&env.state.path().join("uploads"), AGENT_ID).unwrap();
+    let entries: Vec<_> = ledger
+        .pending()
+        .map(|e| (e.seq, e.kind, e.length))
+        .collect();
+    assert_eq!(entries, [(1, Kind::Result, 14), (2, Kind::CommLog, 1000)]);
+}
+
 /// A debug build without the store-selecting variable has no key store, like a release build:
 /// a registered agent exits 1 without a connection.
 #[cfg(debug_assertions)]

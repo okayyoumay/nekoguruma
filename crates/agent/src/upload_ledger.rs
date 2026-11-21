@@ -959,5 +959,8 @@ fn push_unique(
     Ok(())
 }
 
+#[cfg(debug_assertions)]
+pub mod command;
+
 #[cfg(test)]
 mod tests;

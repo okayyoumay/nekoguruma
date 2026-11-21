@@ -8,6 +8,8 @@ mod agent_events;
 mod agent_fetch;
 #[cfg(debug_assertions)]
 mod agent_register;
+#[cfg(debug_assertions)]
+mod agent_upload;
 mod api_spec;
 mod binary;
 mod control;

@@ -113,5 +113,43 @@ fn the_unit_and_the_sysusers_file_match_the_agents_device_root() {
         }
     }
 
+    // The agent key (ADR-498): one encrypted credential, named and placed as the agent's
+    // constants say, and no other way to hand a credential to the unit.
+    let expected = format!(
+        "{}:{}",
+        agent::identity::DEVICE_CREDENTIAL_NAME,
+        agent::identity::DEVICE_CREDENTIAL_PATH
+    );
+    match values("LoadCredentialEncrypted").as_slice() {
+        [one] if *one == expected => {}
+        other => problems.push(format!(
+            "LoadCredentialEncrypted= is {other:?}, not exactly [{expected:?}]"
+        )),
+    }
+    for key in ["LoadCredential", "SetCredential", "SetCredentialEncrypted"] {
+        if !values(key).is_empty() {
+            problems.push(format!(
+                "{key}= is set; only LoadCredentialEncrypted= may be"
+            ));
+        }
+    }
+
     assert!(problems.is_empty(), "packaging mismatches: {problems:#?}");
+}
+
+#[test]
+fn the_credential_path_is_the_store_directory_and_the_name() {
+    assert_eq!(
+        agent::identity::DEVICE_CREDENTIAL_PATH,
+        format!(
+            "{}/{}",
+            agent::identity::DEVICE_CREDSTORE_DIR,
+            agent::identity::DEVICE_CREDENTIAL_NAME
+        )
+    );
+    assert_eq!(
+        agent::identity::DEVICE_CREDENTIAL_NAME,
+        agent::identity::store::SecretName::agent_key(worker_host::service::OperatingMode::Device)
+            .as_str()
+    );
 }

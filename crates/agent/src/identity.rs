@@ -13,8 +13,12 @@
 //!
 //! The store is chosen by build, platform and mode ([`select_store`]): on Linux in the user mode
 //! it is the Secret Service store in [`secret_service`] (ADR-496), which a release build selects
-//! without a variable; a debug build selects it, or the plain-file test store, by
-//! `NGR_AGENT_KEY_STORE`. Device mode and other platforms have none yet.
+//! without a variable; in the device mode it is the systemd credential in [`systemd_credential`]
+//! (ADR-498), which a release build selects from `CREDENTIALS_DIRECTORY` alone. A debug build
+//! selects either, or the plain-file test store, by `NGR_AGENT_KEY_STORE`. Windows has none yet.
+//! A store that cannot create ([`SecretStore::can_create`], the credential store) turns an absent
+//! key into [`IdentityError::NotProvisioned`] at once: `ngr-agent provision-key` ([`provision`])
+//! creates the device key instead.
 //!
 //! Only the commands that need the key call this (`ngr-agent identity`, later registration and
 //! connect): they call [`load_or_create`] or [`agent_key`], never the store's `put_new`.
@@ -28,8 +32,15 @@ pub mod file_store;
 #[cfg(target_os = "linux")]
 pub mod secret_service;
 
+#[cfg(target_os = "linux")]
+pub mod systemd_credential;
+
+#[cfg(target_os = "linux")]
+pub mod provision;
+
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -49,8 +60,62 @@ pub const LOCK_WAIT: Duration = Duration::from_secs(10);
 const LOCK_POLL: Duration = Duration::from_millis(20);
 
 /// The debug-only variable that selects a store by value: `file` (the plain-file test store) or
-/// `secret-service` (the Linux user-mode store, which a release build selects without it).
+/// `secret-service` (the Linux user-mode store, which a release build selects without it) or
+/// `systemd-credential` (the Linux device-mode store, which a release build selects from
+/// `CREDENTIALS_DIRECTORY`).
 pub const KEY_STORE_VAR: &str = "NGR_AGENT_KEY_STORE";
+
+/// The device key's credential name (`SecretName::agent_key` for the device mode): the unit's
+/// `LoadCredentialEncrypted=` ID, the file name in the credential directory and in the credential
+/// store, and the name `systemd-creds` binds the ciphertext to (ADR-498).
+pub const DEVICE_CREDENTIAL_NAME: &str = "nekoguruma-agent-key.device.v1";
+
+/// The directory the administrator's encrypted device key lives in (ADR-498 item 2); the
+/// packaging checks the unit against these constants on every platform.
+pub const DEVICE_CREDSTORE_DIR: &str = "/etc/credstore.encrypted";
+
+/// The encrypted device key: [`DEVICE_CREDSTORE_DIR`] and [`DEVICE_CREDENTIAL_NAME`].
+pub const DEVICE_CREDENTIAL_PATH: &str = "/etc/credstore.encrypted/nekoguruma-agent-key.device.v1";
+
+/// The variable systemd sets to the directory of a service's credentials.
+pub const CREDENTIALS_DIRECTORY_VAR: &str = "CREDENTIALS_DIRECTORY";
+
+/// What the credential is sealed to (`--with-key` of `systemd-creds`): a closed list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WithKey {
+    /// The tool picks the TPM when there is one and the host key otherwise.
+    Auto,
+    /// The host key under `/var/lib/systemd`.
+    Host,
+    Tpm2,
+    HostTpm2,
+}
+
+impl WithKey {
+    /// The value the tool's `--with-key` takes.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WithKey::Auto => "auto",
+            WithKey::Host => "host",
+            WithKey::Tpm2 => "tpm2",
+            WithKey::HostTpm2 => "host+tpm2",
+        }
+    }
+}
+
+impl FromStr for WithKey {
+    type Err = &'static str;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text {
+            "auto" => Ok(WithKey::Auto),
+            "host" => Ok(WithKey::Host),
+            "tpm2" => Ok(WithKey::Tpm2),
+            "host+tpm2" => Ok(WithKey::HostTpm2),
+            _ => Err("must be auto, host, tpm2 or host+tpm2"),
+        }
+    }
+}
 
 /// Why the agent has no key.
 #[derive(Debug, thiserror::Error)]
@@ -161,11 +226,42 @@ fn user_mode_store(_mode: OperatingMode) -> Option<Box<dyn SecretStore>> {
 
 const NO_STORE: &str = "this build has no key store for this platform or mode";
 
+/// The Linux device-mode store: the systemd credential in the directory `CREDENTIALS_DIRECTORY`
+/// names (ADR-498 item 5). The variable must be an absolute path; unset, empty or relative is no
+/// store, with the way to run the command. Other modes and platforms have none.
+#[cfg(target_os = "linux")]
+fn credential_store(
+    mode: OperatingMode,
+    var: &dyn Fn(&str) -> Option<OsString>,
+) -> Result<Box<dyn SecretStore>, IdentityError> {
+    if mode != OperatingMode::Device {
+        return Err(IdentityError::NoStore(
+            "the systemd-credential store is for the device mode",
+        ));
+    }
+    let dir = var(CREDENTIALS_DIRECTORY_VAR)
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute())
+        .ok_or(IdentityError::NoStore(
+            "CREDENTIALS_DIRECTORY is not an absolute directory: start the command from its \
+             systemd unit, or with systemd-run and LoadCredentialEncrypted= (ngr-agent.md)",
+        ))?;
+    Ok(Box::new(systemd_credential::SystemdCredential::new(dir)))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn credential_store(
+    _mode: OperatingMode,
+    _var: &dyn Fn(&str) -> Option<OsString>,
+) -> Result<Box<dyn SecretStore>, IdentityError> {
+    Err(IdentityError::NoStore(NO_STORE))
+}
+
 /// The store this build uses. A debug build has the plain-file test store when
 /// `NGR_AGENT_KEY_STORE=file` and an absolute `NGR_AGENT_STATE_DIR` are both set (ADR-460
-/// Decision item 6), and the user-mode store of the platform when `NGR_AGENT_KEY_STORE` is
-/// `secret-service`; with the variable unset it has none, as a release build has none for a
-/// platform or mode without a store.
+/// Decision item 6), and the store of the platform when `NGR_AGENT_KEY_STORE` is
+/// `secret-service` (user mode) or `systemd-credential` (device mode); with the variable unset
+/// it has none, as a release build has none for a platform or mode without a store.
 #[cfg(debug_assertions)]
 fn select_store(
     mode: OperatingMode,
@@ -187,20 +283,25 @@ fn select_store(
         Some(value) if value == "secret-service" => user_mode_store(mode).ok_or(
             IdentityError::NoStore("the secret-service store is for the user mode on Linux"),
         ),
+        Some(value) if value == "systemd-credential" => credential_store(mode, var),
         Some(_) => Err(IdentityError::NoStore(
-            "NGR_AGENT_KEY_STORE must be \"file\" or \"secret-service\"",
+            "NGR_AGENT_KEY_STORE must be \"file\", \"secret-service\" or \"systemd-credential\"",
         )),
     }
 }
 
-/// The store this build uses: the user-mode store of the platform, which a release build selects
-/// without reading any variable, or none (ADR-459 Decision item 4).
+/// The store this build uses: on Linux the Secret Service store in user mode and the systemd
+/// credential in device mode (which reads `CREDENTIALS_DIRECTORY` and no `NGR_` variable), or
+/// none (ADR-459 Decision item 4, ADR-496 item 7, ADR-498 item 5).
 #[cfg(not(debug_assertions))]
 fn select_store(
     mode: OperatingMode,
-    _var: &dyn Fn(&str) -> Option<OsString>,
+    var: &dyn Fn(&str) -> Option<OsString>,
 ) -> Result<Box<dyn SecretStore>, IdentityError> {
-    user_mode_store(mode).ok_or(IdentityError::NoStore(NO_STORE))
+    match mode {
+        OperatingMode::Device => credential_store(mode, var),
+        _ => user_mode_store(mode).ok_or(IdentityError::NoStore(NO_STORE)),
+    }
 }
 
 /// Reads `name`: `Ok(None)` when the store positively holds nothing.
@@ -244,6 +345,10 @@ pub fn load_or_create(
     };
     if let Some(key) = read(store, name)? {
         return Ok(adopt(key, false));
+    }
+    // A store that never creates has nothing to race for: no lock, no state directory, no key.
+    if !store.can_create() {
+        return Err(IdentityError::NotProvisioned);
     }
     let dir = lock_dir().map_err(|error| local_fault("the state directory", &error))?;
     let _lock = take_lock(&dir.join(format!("{name}.lock")), wait)?;

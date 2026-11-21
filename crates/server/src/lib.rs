@@ -9,11 +9,13 @@
 //! (ADR-491), and opens the object store, a bucket on that server (ADR-492), creating the bucket
 //! if it is absent. Local users sign in with a password and keep a cookie session (ADR-469).
 
+pub(crate) mod agent_caller;
 pub(crate) mod agent_events;
 pub(crate) mod audit;
 pub mod config;
 pub mod control;
 pub mod db;
+pub mod downloads;
 pub(crate) mod fs_guard;
 pub mod health;
 pub mod hub;
@@ -215,13 +217,16 @@ pub fn routes_unguarded(state: AppState) -> (Router, Vec<ServedRoute>) {
         uploads::STATUS_PATH,
         get(uploads::status),
     );
+    let uploads = mounts.mount(
+        uploads,
+        Method::POST,
+        uploads::COMPLETE_PATH,
+        post(uploads::complete),
+    );
+    // The download URL route reads the same rows and signs with the same store, so it takes the
+    // upload routes' state.
     let uploads = mounts
-        .mount(
-            uploads,
-            Method::POST,
-            uploads::COMPLETE_PATH,
-            post(uploads::complete),
-        )
+        .mount(uploads, Method::POST, downloads::PATH, post(downloads::url))
         .with_state(uploads::Uploads::new(
             state.pool.clone(),
             state.sessions.clone(),

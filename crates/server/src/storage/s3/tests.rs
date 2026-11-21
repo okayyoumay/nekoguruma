@@ -778,6 +778,32 @@ fn a_part_url_is_signed_for_five_minutes_and_binds_the_part_without_io() {
 }
 
 #[test]
+fn a_get_url_is_signed_for_a_minute_names_the_key_and_shows_nothing_without_io() {
+    // Nothing listens on this port: presigning does no I/O.
+    let store = store_with(1, fast());
+    let up = upload();
+    let url = store.presign_get(&up.key).unwrap();
+    let text = url.expose();
+    assert!(text.starts_with("http://127.0.0.1:1/nekoguruma/"), "{text}");
+    assert!(text.contains(up.key.as_str()));
+    assert!(text.contains("X-Amz-Expires=60"), "{text}");
+    assert_eq!(GET_URL_EXPIRY, Duration::from_secs(60));
+    assert!(text.contains("X-Amz-Signature="));
+    assert!(!text.contains("uploadId") && !text.contains("partNumber"));
+    // The key is covered by the signature.
+    let other = store.presign_get(&ObjectKey::generate().unwrap()).unwrap();
+    let signature = |u: &GetUrl| {
+        u.expose()
+            .split("X-Amz-Signature=")
+            .nth(1)
+            .unwrap()
+            .to_owned()
+    };
+    assert_ne!(signature(&url), signature(&other));
+    assert_eq!(format!("{url:?}"), "GetUrl(..)");
+}
+
+#[test]
 fn part_numbers_outside_1_to_10000_are_refused() {
     let store = store_with(1, fast());
     let up = upload();

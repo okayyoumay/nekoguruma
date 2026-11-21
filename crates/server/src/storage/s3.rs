@@ -47,8 +47,9 @@ use tokio::time::Instant;
 use url::Url;
 
 use super::{
-    MAX_PARTS, MAX_UPLOAD_ID_LEN, MultipartStore, ObjectBody, ObjectKey, PART_URL_EXPIRY, Part,
-    PartUrl, StoreError, StoreFuture, UnfinishedUpload, UnfinishedUploads, Upload, UploadId,
+    GET_URL_EXPIRY, GetUrl, MAX_PARTS, MAX_UPLOAD_ID_LEN, MultipartStore, ObjectBody, ObjectKey,
+    PART_URL_EXPIRY, Part, PartUrl, StoreError, StoreFuture, UnfinishedUpload, UnfinishedUploads,
+    Upload, UploadId,
 };
 use crate::config::is_valid_bucket;
 use crate::object_server::Credentials;
@@ -387,6 +388,14 @@ impl Inner {
             )
             .sign(PART_URL_EXPIRY);
         Ok(PartUrl::new(url.to_string()))
+    }
+
+    fn presign_get(&self, key: &ObjectKey) -> Result<GetUrl, StoreError> {
+        let url = self
+            .bucket
+            .get_object(Some(&self.credentials), key.as_str())
+            .sign(GET_URL_EXPIRY);
+        Ok(GetUrl::new(url.to_string()))
     }
 
     /// The parts of `upload` (paged), or that it is gone. The numbers are ascending, within
@@ -871,6 +880,10 @@ impl MultipartStore for S3Store {
 
     fn presign_part(&self, upload: &Upload, part: u16) -> Result<PartUrl, StoreError> {
         self.inner.presign_part(upload, part)
+    }
+
+    fn presign_get(&self, key: &ObjectKey) -> Result<GetUrl, StoreError> {
+        self.inner.presign_get(key)
     }
 
     fn list_parts<'a>(&'a self, upload: &'a Upload) -> StoreFuture<'a, Vec<Part>> {

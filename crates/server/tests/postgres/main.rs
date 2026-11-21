@@ -9,6 +9,7 @@ mod agent_register;
 mod api_spec;
 mod binary;
 mod control;
+mod downloads;
 mod instruction_key;
 mod job_expiry;
 mod job_queue;

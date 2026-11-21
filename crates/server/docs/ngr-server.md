@@ -286,6 +286,10 @@ hand, so `Arc<dyn MultipartStore>` works, and `Server::object_store()` returns t
   region `us-east-1`, path style. It does no I/O. `PartUrl` has a redacting `Debug` and no
   `Display`; `expose()` gives the text for the writer. The URL does not bind the length of what is
   sent (ADR-492's known limits).
+- `presign_get(key)` computes a presigned GET URL for an object, valid 60 seconds
+  (`GET_URL_EXPIRY`), signed as `presign_part` signs. It does no I/O, so it does not know whether
+  the object exists. `GetUrl` has a redacting `Debug` and no `Display`, as `PartUrl` has
+  (ADR-497).
 - `list_parts(upload)` pages through the object server's listing (1000 a page) and returns each
   part's number and size, not its entity tag. A listing that is not strictly ascending within 1 to
   10000, or a continuation that does not advance, is `PartsChanged`. An upload that is gone is
@@ -668,6 +672,8 @@ also refuses a route mounted any other way.
   `GET /api/v1/agent/uploads/{uploadId}` and `POST /api/v1/agent/uploads/{uploadId}/complete`
   (`api/openapi.yaml`; `uploads.rs`; ADR-493): the data channel's begin, part URL, status and
   completion. See "The data channel" below.
+- `POST /api/v1/agent/downloads` (`api/openapi.yaml`; `downloads.rs`; ADR-497): a presigned GET
+  URL for a job's IR document or artifact. See "The download route" below.
 
 ## The data channel
 
@@ -695,6 +701,20 @@ is the 5 MiB the server had when the row was begun (`uploads::PART_BYTES`; the t
 `Backend::with_part_bytes`). A status that finds the store without the upload reads the row once
 more and answers the state it is in when it is no longer `open` (a completion moved it on), else
 503 with nothing written (ADR-493 items 17 and 23).
+
+**The download route.** `downloads.rs` serves `POST /api/v1/agent/downloads` behind the same guard
+and from the same `uploads::Backend`; the token and the agent's row are judged by the code the
+upload routes use (`agent_caller.rs`). The order is the guard, the method (405), the body (4 KiB,
+within 5 seconds: 413, 408, 400), the shape (`jobId`, `generation`, `kind`, `sha256`; any other,
+duplicate or null member is 400), the token and the agent's row (401, 503 or 500 as for the
+uploads), then the job: unknown or another agent's or tenant's, an instruction generation other
+than the request's, a digest the stored instruction does not name (a `document` among its
+document hashes, an `artifact` as its artifact hash) and a digest with no `ir_documents` or
+`artifacts` row for the tenant are all one 404 with one body. A stored instruction that does not
+decode and a stored key that does not parse are 500; no store is 503. The job's state plays no
+part. The answer is 200 with the URL and `expiresInSecs: 60` and `Cache-Control: no-store`; the
+route writes nothing and calls the store for no I/O. Nothing logs the URL, the token, the digest or
+the body (ADR-497 items 1 to 5).
 
 **Completion.** The handler only reads: after the body, the token, the agent's row and the upload
 (404), a `finished` row is answered 200 and a `failed` row 409 with `state: failed`; a missing

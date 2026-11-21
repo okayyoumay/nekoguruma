@@ -40,7 +40,8 @@ use shared_proto::{AgentId, JobInstruction, is_canonical_uuid};
 use sqlx::PgPool;
 use tokio::sync::watch;
 
-use crate::control::{bearer_token, unauthorized};
+use crate::agent_caller::{self, Caller, Refusal};
+use crate::control::unauthorized;
 use crate::db;
 use crate::health::may_log;
 use crate::hub::Hub;
@@ -320,6 +321,27 @@ impl Uploads {
         }
     }
 
+    /// The warning of the download route, which shares this state: the same gate, so the two
+    /// route families together log at most one failure in [`LOG_EVERY`].
+    pub(crate) fn warn_download(&self, what: &str, why: &str) {
+        if may_log(&self.gate, now(), LOG_EVERY) {
+            tracing::warn!(why, "download route: {what}");
+        }
+    }
+
+    pub(crate) fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    pub(crate) fn sessions(&self) -> &Sessions {
+        &self.sessions
+    }
+
+    /// The object store of the backend, if the server has one.
+    pub(crate) fn store(&self) -> Option<&dyn MultipartStore> {
+        self.backend.store.as_deref()
+    }
+
     /// The outcome of the completion of upload `id`, which a task of this process runs: the
     /// running one's, else a new one that the hub adopts (ADR-493 item 20). The registry's lock is
     /// not held while the hub is called.
@@ -436,7 +458,7 @@ struct CompletionJob {
 // ---------------------------------------------------------------------------------------------
 // Answers
 
-fn json_answer(status: StatusCode, value: Value) -> Response {
+pub(crate) fn json_answer(status: StatusCode, value: Value) -> Response {
     let mut response = (status, value.to_string()).into_response();
     let headers = response.headers_mut();
     headers.insert(
@@ -558,19 +580,6 @@ impl Row {
             id: UploadId::parse(&self.upload_id).ok()?,
         })
     }
-}
-
-/// The agent's tenant, and whether its row is revoked; `None` when there is no row.
-async fn agent_standing(pool: &PgPool, agent: &str) -> Result<Option<(String, bool)>, sqlx::Error> {
-    let mut tx = pool.begin().await?;
-    db::statement_timeouts(&mut tx).await?;
-    let row: Option<(String, bool)> = sqlx::query_as(
-        "SELECT tenant_id::text, revoked_at IS NOT NULL FROM agents WHERE id = $1::uuid",
-    )
-    .bind(agent)
-    .fetch_optional(&mut *tx)
-    .await?;
-    Ok(row)
 }
 
 enum JobLookup {
@@ -790,7 +799,7 @@ async fn row_state(pool: &PgPool, tenant: &str, id: &str) -> Result<Option<Strin
 }
 
 /// The 32 bytes of a row's digest (64 lowercase hex digits; the column's CHECK).
-fn parse_sha256(text: &str) -> Option<[u8; 32]> {
+pub(crate) fn parse_sha256(text: &str) -> Option<[u8; 32]> {
     if !is_digest(text) {
         return None;
     }
@@ -804,26 +813,12 @@ fn parse_sha256(text: &str) -> Option<[u8; 32]> {
 // ---------------------------------------------------------------------------------------------
 // The caller
 
-struct Caller {
-    agent: AgentId,
-    tenant: String,
-}
-
-/// Judges the token, then reads the agent's row (ADR-493 item 2): the answer to a token that is
-/// unknown or expired and to a row that is revoked or missing is the same 401, and the latter
-/// drops the agent's tokens.
+/// Judges the caller for the routes of this module; see [`agent_caller::authenticate`].
 async fn authenticate(u: &Uploads, headers: &HeaderMap) -> Result<Caller, Box<Response>> {
-    let Some(agent) = bearer_token(headers).and_then(|token| u.sessions.authenticate(token)) else {
-        return Err(Box::new(unauthorized()));
-    };
-    match agent_standing(&u.pool, &agent.0).await {
-        Ok(Some((tenant, false))) => Ok(Caller { agent, tenant }),
-        Ok(_) => {
-            u.sessions.revoke_agent(&agent);
-            tracing::info!(agent_id = %agent.0, "upload request refused: the agent is revoked or unknown");
-            Err(Box::new(unauthorized()))
-        }
-        Err(error) => Err(Box::new(db_failure(u, &error))),
+    match agent_caller::authenticate(&u.pool, &u.sessions, headers).await {
+        Ok(caller) => Ok(caller),
+        Err(Refusal::Unauthorized) => Err(Box::new(unauthorized())),
+        Err(Refusal::Database(error)) => Err(Box::new(db_failure(u, &error))),
     }
 }
 
@@ -848,7 +843,7 @@ async fn empty_body(body: axum::body::Body) -> Result<(), Box<Response>> {
 /// A number of the body as the visitor sees it: serde_json turns an integer past `u64` into a
 /// float, and a length that large is over the limit, not malformed. A number beyond a double is
 /// refused by the reader itself, which makes the whole body a 400.
-enum Number {
+pub(crate) enum Number {
     Int(u64),
     /// An integral value of 2^64 or more (written as a big integer or in exponent form).
     Huge,
@@ -949,7 +944,7 @@ struct Declared {
     digest: String,
 }
 
-fn is_digest(text: &str) -> bool {
+pub(crate) fn is_digest(text: &str) -> bool {
     text.len() == 64
         && text
             .bytes()

@@ -409,9 +409,13 @@ pub(crate) enum BodyError {
     Broken,
 }
 
-/// Reads the body in full within [`BODY_TIMEOUT`], refusing more than `limit` bytes as soon as
-/// they have arrived.
-async fn read_body(body: axum::body::Body, limit: usize) -> Result<Vec<u8>, BodyError> {
+/// Reads the body in full within `budget`, refusing more than `limit` bytes as soon as they have
+/// arrived.
+async fn read_body(
+    body: axum::body::Body,
+    limit: usize,
+    budget: Duration,
+) -> Result<Vec<u8>, BodyError> {
     let read = async {
         let mut body = body;
         let mut bytes = Vec::new();
@@ -426,7 +430,7 @@ async fn read_body(body: axum::body::Body, limit: usize) -> Result<Vec<u8>, Body
         }
         Ok(bytes)
     };
-    tokio::time::timeout(BODY_TIMEOUT, read)
+    tokio::time::timeout(budget, read)
         .await
         .unwrap_or(Err(BodyError::Timeout))
 }
@@ -453,6 +457,18 @@ pub(crate) async fn bounded_body_within(
     body: axum::body::Body,
     limit: usize,
 ) -> Result<Vec<u8>, Response> {
+    bounded_body_for(body, limit, BODY_TIMEOUT, ShapeError::Json.title()).await
+}
+
+/// [`bounded_body_within`] with the route's own time bound too, for a route whose body is large
+/// enough that [`BODY_TIMEOUT`] does not suit it (the document store, ADR-500); `broken` is the
+/// title of the 400 for a body that breaks.
+pub(crate) async fn bounded_body_for(
+    body: axum::body::Body,
+    limit: usize,
+    budget: Duration,
+    broken: &'static str,
+) -> Result<Vec<u8>, Response> {
     // A declared length over the limit is answered before any byte is read, so the client gets
     // its 413. A streamed body has no declared length and is cut when it grows past the limit.
     if body.size_hint().lower() > limit as u64 {
@@ -461,17 +477,19 @@ pub(crate) async fn bounded_body_within(
             "The request body is too large",
         ));
     }
-    read_body(body, limit).await.map_err(|error| match error {
-        BodyError::Timeout => closing(
-            StatusCode::REQUEST_TIMEOUT,
-            "The request body took too long",
-        ),
-        BodyError::TooLarge => closing(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "The request body is too large",
-        ),
-        BodyError::Broken => closing(StatusCode::BAD_REQUEST, ShapeError::Json.title()),
-    })
+    read_body(body, limit, budget)
+        .await
+        .map_err(|error| match error {
+            BodyError::Timeout => closing(
+                StatusCode::REQUEST_TIMEOUT,
+                "The request body took too long",
+            ),
+            BodyError::TooLarge => closing(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "The request body is too large",
+            ),
+            BodyError::Broken => closing(StatusCode::BAD_REQUEST, broken),
+        })
 }
 
 /// `POST /api/v1/agents/register`.

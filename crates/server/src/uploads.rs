@@ -104,6 +104,8 @@ pub struct Backend {
     store: Option<Arc<dyn MultipartStore>>,
     part_bytes: u64,
     complete_wait: Duration,
+    /// The time budget of a document store's body (ADR-500).
+    document_body_timeout: Duration,
     pause: Arc<Mutex<Option<Arc<Pause>>>>,
 }
 
@@ -141,8 +143,26 @@ impl Backend {
             store,
             part_bytes: PART_BYTES,
             complete_wait: COMPLETE_WAIT,
+            document_body_timeout: crate::documents::BODY_TIMEOUT,
             pause: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// The store, shared with the document store route (ADR-500).
+    pub(crate) fn shared_store(&self) -> Option<Arc<dyn MultipartStore>> {
+        self.store.clone()
+    }
+
+    pub(crate) fn document_body_timeout(&self) -> Duration {
+        self.document_body_timeout
+    }
+
+    /// Another time budget for the body of a document store, so that a test sees the 408 without
+    /// waiting [`crate::documents::BODY_TIMEOUT`]. Tests only.
+    #[doc(hidden)]
+    pub fn with_document_body_timeout(mut self, budget: Duration) -> Backend {
+        self.document_body_timeout = budget;
+        self
     }
 
     /// Holds the next completion request that needs a task between its read of the row and the
@@ -548,6 +568,12 @@ fn db_failure_outcome(u: &Uploads, error: &sqlx::Error) -> Outcome {
 fn store_failure(u: &Uploads, error: &StoreError) -> Response {
     // The store's messages are fixed text: no key, URL or upload ID.
     u.warn("the object store failed", &error.to_string());
+    store_error_response(error)
+}
+
+/// The answer for a failed store call: 500 for a store without randomness, else 503. Shared by
+/// the data channel and the document store.
+pub(crate) fn store_error_response(error: &StoreError) -> Response {
     match error {
         StoreError::Random => problem(StatusCode::INTERNAL_SERVER_ERROR, "The request failed"),
         _ => problem(

@@ -13,6 +13,7 @@ mod agent_upload;
 mod api_spec;
 mod binary;
 mod control;
+mod documents;
 mod downloads;
 mod instruction_key;
 mod job_expiry;

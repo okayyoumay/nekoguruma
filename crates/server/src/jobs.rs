@@ -922,11 +922,10 @@ impl Inner {
             bool,
             bool,
             i64,
-        ) = sqlx::query_as(
-            "SELECT \
-               EXISTS (SELECT 1 FROM operator_roles r WHERE r.tenant_id = $1::uuid \
-                       AND r.operator_id = $2::uuid AND r.role = 'worker' \
-                       AND r.scope = '{}'::jsonb), \
+        ) = sqlx::query_as(concat!(
+            "SELECT ",
+            db::worker_unscoped!(),
+            ", \
                EXISTS (SELECT 1 FROM agents a WHERE a.id = $3::uuid AND a.tenant_id = $1::uuid), \
                EXISTS (SELECT 1 FROM agents a WHERE a.id = $3::uuid AND a.tenant_id = $1::uuid \
                        AND a.revoked_at IS NULL), \
@@ -934,8 +933,8 @@ impl Inner {
                        AND l.agent_id = $3::uuid AND l.operator_id = $2::uuid), \
                EXISTS (SELECT 1 FROM instruction_keys k WHERE k.key_id = $4 \
                        AND k.retired_at IS NULL), \
-               floor(extract(epoch FROM now()) * 1000)::bigint",
-        )
+               floor(extract(epoch FROM now()) * 1000)::bigint"
+        ))
         .bind(&operator.tenant_id)
         .bind(&operator.operator_id)
         .bind(&spec.agent_id)

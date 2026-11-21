@@ -119,8 +119,21 @@ GET URL for the row's `storage_key`. Migration 0014 makes each `digest` 64 lower
 bare (the form of the signed instruction and of `jobs.artifact_digest`; the `sha256:` prefix the
 0001 comment showed was never written, and the column comments are set again), and each
 `storage_key` 36 characters and unique within its table (a key unique across `ir_documents`, `artifacts` and `job_objects` is the writer's to keep). A row exists only for an
-object the store read back and found to match its digest. Nothing writes these tables yet (tests
-seed them); the route that stores IR documents will, and the route only reads.
+object the store read back and found to match its digest. The document store route writes
+`ir_documents` (migration 0015, ADR-500); nothing writes `artifacts` yet (tests seed it), and the
+download route only reads both.
+
+**IR documents: `ir_documents.extension_id` is nullable (migration 0015, ADR-500)**
+The document store route writes a row from the bytes of a document alone, and a document carries
+no ID of an extension package, so `extension_id` may be NULL; a placeholder would look like a real
+package's ID. A row stored by the route has it NULL and the other metadata columns filled from the
+document (schema version, variant name, part numbers, software versions, source format, source
+digest). The route inserts with `ON CONFLICT (tenant_id, digest) DO NOTHING`, so a second store of
+a tenant's digest writes nothing, and only when the key is in neither `artifacts` nor
+`job_objects`: the unique constraint of migration 0014 covers a key within one table, and this
+guard is the one-directional check across the three (the upload route's insert does not look at
+`ir_documents`). An insert writes a `documentStored` row of `audit_log` in the same transaction;
+`ir_documents` records no importer.
 
 **Do not store raw data bodies in the DB**
 `dataset_chunks` holds only object storage keys and hashes.
@@ -200,7 +213,7 @@ The server writes a row inside the transaction of the action, so a rolled-back a
 `bigserial` and breaks ties between rows of one instant. `(recorded_at, id)` is not the commit
 order: `recorded_at` is the transaction's start time, earlier than its commit by any lock waits, so a
 reader that pages by keyset must allow for rows that commit late. Columns as the server fills them:
-`tenant_id`, `operator_id`, `agent_id` and `job_id` name the job's own values; `vin` is the job's
+`tenant_id`, `operator_id`, `agent_id` and `job_id` name the job's own values (NULL where a row has no job or agent, as `documentStored`'s); `vin` is the job's
 VIN in clear, NULL when the job has none, and is the one column a VIN deletion redacts (design
 4.3); `action` is free text with no CHECK, so a new action needs no migration; `confirmation_level`
 is the job's level; `on_site_approved` and `agent_reported_at` are NULL for `jobCreated`; `offline_executed` is false; `recorded_at` is the database's
@@ -211,6 +224,10 @@ updated or deleted; the server only writes them. The actions written today:
 - `jobCreated` (`POST /api/v1/jobs`, one row per created job, none for a replay or a refusal):
   `detail` has `kind`, `irDigests` (the sorted unique hex digests), `artifactDigest` when the job
   has one and `signingKeyId`. It holds no request hash, idempotency key or VCI ID.
+- `documentStored` (`PUT /api/v1/documents/{sha256}`, ADR-500; one row per stored document, in the
+  insert's transaction, none for a second store or a refusal): `tenant_id` and `operator_id`
+  name the caller; `detail` has `digest` and `size` (bytes). `agent_id`, `job_id`, `vin`,
+  `confirmation_level`, `on_site_approved` and `agent_reported_at` are NULL.
 
 **Version work records per item**
 The unit of 3-way merge (4.4) is the item, so `work_record_items.version` exists.

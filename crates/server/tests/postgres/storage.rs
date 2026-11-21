@@ -197,6 +197,43 @@ async fn an_upload_in_two_parts_completes_and_reads_back() {
     assert!(!text.contains(&secret));
 }
 
+/// The store sends a part itself, as a document's route does (ADR-500): one small part that is
+/// the whole object, and a first part of the minimum size with a small last one.
+#[tokio::test]
+async fn the_store_sends_a_part_itself_and_completes_it() {
+    let run = Running::start().await;
+    let store = &run.store;
+
+    let small = content(7, 1234);
+    let upload = store.begin().await.unwrap();
+    store.put_part(&upload, 1, small.clone()).await.unwrap();
+    // Sending a part again replaces it.
+    store.put_part(&upload, 1, small.clone()).await.unwrap();
+    store
+        .complete(&upload, sha256(&small), small.len() as u64)
+        .await
+        .unwrap();
+    assert_eq!(read_all(store, &upload.key).await.unwrap(), small);
+
+    let first = content(8, 5 * MIB);
+    let last = content(9, 77);
+    let upload = store.begin().await.unwrap();
+    store.put_part(&upload, 1, first.clone()).await.unwrap();
+    store.put_part(&upload, 2, last.clone()).await.unwrap();
+    let whole = [first, last].concat();
+    store
+        .complete(&upload, sha256(&whole), whole.len() as u64)
+        .await
+        .unwrap();
+    assert_eq!(read_all(store, &upload.key).await.unwrap(), whole);
+
+    // An upload that is gone takes no part.
+    let gone = store.begin().await.unwrap();
+    store.delete(&gone.key).await.unwrap();
+    assert!(store.put_part(&gone, 1, vec![1]).await.is_err());
+    run.stop().await;
+}
+
 /// A writer that lost its place lists what is held, re-sends a part (the later one wins) and
 /// completes; a second completion of the finished upload verifies again and succeeds.
 #[tokio::test]

@@ -287,7 +287,7 @@ fn routes_are_mounted_only_where_they_are_recorded() {
     const ALLOWED: [(&str, &str, usize); 4] = [
         ("lib.rs", ".route(", 1),
         ("lib.rs", ".fallback_service(", 1),
-        ("lib.rs", ".merge(", 7),
+        ("lib.rs", ".merge(", 8),
         ("operator_session.rs", ".route(", 1),
     ];
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");

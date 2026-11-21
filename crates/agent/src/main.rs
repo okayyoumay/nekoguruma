@@ -616,11 +616,14 @@ fn parse_debug_enqueue(mut args: impl Iterator<Item = OsString>) -> Result<Comma
     use agent::upload_ledger::Kind;
     let (mut mode, mut job, mut generation, mut kind, mut file) = (None, None, None, None, None);
     while let Some(flag) = args.next() {
-        let value = args.next().ok_or("an option needs a value")?;
-        let text = value
-            .to_str()
-            .ok_or_else(|| "an option value is not valid UTF-8".to_owned())?;
         let name = flag.to_str().unwrap_or("");
+        if !["--mode", "--job", "--generation", "--kind", "--file"].contains(&name) {
+            return Err(format!("unknown option {flag:?}"));
+        }
+        let value = args.next().ok_or("an option needs a value")?;
+        // `--file` is a path and may be any bytes the platform allows; the others are text.
+        let text = value.to_str();
+        let text = || text.ok_or_else(|| format!("{name} is not valid UTF-8"));
         let once = |taken: bool| {
             if taken {
                 Err(format!("give {name} once"))
@@ -632,24 +635,26 @@ fn parse_debug_enqueue(mut args: impl Iterator<Item = OsString>) -> Result<Comma
             "--mode" => {
                 once(mode.is_some())?;
                 mode = Some(
-                    text.parse::<OperatingMode>()
+                    text()?
+                        .parse::<OperatingMode>()
                         .map_err(|error| format!("--mode: {error}"))?,
                 );
             }
             "--job" => {
                 once(job.is_some())?;
-                job = Some(text.to_owned());
+                job = Some(text()?.to_owned());
             }
             "--generation" => {
                 once(generation.is_some())?;
                 generation = Some(
-                    text.parse::<u64>()
+                    text()?
+                        .parse::<u64>()
                         .map_err(|_| "--generation is a number".to_owned())?,
                 );
             }
             "--kind" => {
                 once(kind.is_some())?;
-                kind = Some(match text {
+                kind = Some(match text()? {
                     "result" => Kind::Result,
                     "commLog" => Kind::CommLog,
                     _ => return Err("--kind is result or commLog".to_owned()),
@@ -1465,6 +1470,9 @@ mod tests {
         ] {
             assert!(with(bad).is_err(), "{bad:?}");
         }
+        // An unknown flag with no value is still an unknown option.
+        let error = with(&["--extra"]).unwrap_err();
+        assert!(error.contains("unknown option"), "{error}");
         for (flag, value) in [("--kind", "plan"), ("--generation", "-1")] {
             let mut all = base.to_vec();
             let at = all.iter().position(|word| *word == flag).unwrap();

@@ -122,6 +122,22 @@ fn uploads_in(dir: &std::path::Path) -> uploader::SharedLedger {
     uploader::SharedLedger::new(UploadLedger::open_in(&dir, AGENT_ID).unwrap())
 }
 
+/// The real session over `dir`'s state, which dials the record's closed port.
+fn start_session(
+    opened: control::Opened,
+    key: AgentKey,
+    dir: &std::path::Path,
+) -> Result<control::Handle, ControlError> {
+    opened.start(
+        key,
+        Arc::new(LogIntake),
+        outbox_in(dir),
+        marks_in(dir),
+        Arc::new(SystemClock),
+        ledger_in(dir),
+    )
+}
+
 fn unavailable() -> IdentityError {
     IdentityError::Unavailable("the key store is unavailable: test".to_owned())
 }
@@ -308,6 +324,7 @@ async fn a_stop_during_the_key_retry_is_ok_and_frees_the_locks() {
         || Err(unavailable()),
         |_, _| unreachable!("the uploader must not start"),
         |_, _| unreachable!("the session must not start"),
+        UPLOADER_STOP_BOUND,
         tokio::time::sleep(Duration::from_secs(5)),
     )
     .await;
@@ -337,6 +354,7 @@ async fn a_session_that_ends_on_its_own_is_exit_1() {
                 ledger_in(dirs.dir.path()),
             )
         },
+        UPLOADER_STOP_BOUND,
         std::future::pending::<()>(),
     )
     .await;
@@ -397,14 +415,135 @@ async fn an_uploader_that_ends_on_its_own_does_not_end_the_session() {
                 ledger_in(dirs.dir.path()),
             )
         },
+        UPLOADER_STOP_BOUND,
         tokio::time::sleep(Duration::from_secs(5)),
     )
     .await;
     assert!(result.is_ok(), "{result:?}");
     let text = log.text();
     assert_eq!(text.matches("the uploader ended").count(), 1, "{text}");
+    assert!(!text.contains("uploader stopped"), "{text}");
     assert!(text.contains("control channel session stopped"), "{text}");
     dirs.open().expect("the locks are free");
+}
+
+/// A record or a key the session would refuse starts neither the uploader nor the session: a
+/// record with an instruction key that does not parse does not open (exit 1), and a key that is not
+/// the record's is exit 1 before the uploader starts, with nothing sent.
+#[tokio::test(start_paused = true)]
+async fn a_record_or_key_the_session_refuses_starts_neither_task() {
+    let key = existing_key();
+    let dirs = Dirs::new(&some_key());
+    let opened = dirs.open().unwrap();
+    let slot = Arc::new(Mutex::new(Some(key)));
+    let result = run_opened(
+        opened,
+        move || Ok(slot.lock().unwrap().take().unwrap()),
+        |_, _| unreachable!("the uploader must not start"),
+        |_, _| unreachable!("the session must not start"),
+        UPLOADER_STOP_BOUND,
+        std::future::pending::<()>(),
+    )
+    .await;
+    assert_eq!(result.unwrap_err().exit_code(), 1);
+    dirs.open().expect("the locks are free");
+
+    let file = dirs
+        .dir
+        .path()
+        .join("registration")
+        .join(record::RECORD_FILE);
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    json["instruction_key_pem"] = "not a key".into();
+    std::fs::write(&file, serde_json::to_vec(&json).unwrap()).unwrap();
+    let Err(error) = dirs.open() else {
+        panic!("the record does not open");
+    };
+    assert_eq!(control_error(&error).exit_code(), 1);
+}
+
+/// A stop stops both tasks: the uploader's stop is logged once, no timeout is, and its ledger's
+/// lock is free afterwards.
+#[tokio::test(start_paused = true)]
+async fn a_stop_stops_the_uploader_and_frees_its_ledger() {
+    let log = Log::default();
+    let _guard = log.capture();
+    let key = existing_key();
+    let dirs = Dirs::new(&key);
+    let opened = dirs.open().unwrap();
+    let slot = Arc::new(Mutex::new(Some(key)));
+    let ledger = uploads_in(dirs.dir.path());
+    let result = run_opened(
+        opened,
+        move || Ok(slot.lock().unwrap().take().unwrap()),
+        move |record, key| uploader::start(record, key, ledger),
+        |opened, key| start_session(opened, key, dirs.dir.path()),
+        UPLOADER_STOP_BOUND,
+        tokio::time::sleep(Duration::from_secs(5)),
+    )
+    .await;
+    assert!(result.is_ok(), "{result:?}");
+    let text = log.text();
+    assert_eq!(text.matches("uploader stopped").count(), 1, "{text}");
+    assert!(!text.contains("did not stop in time"), "{text}");
+    UploadLedger::open_in(&dirs.dir.path().join("uploads"), AGENT_ID)
+        .expect("the uploader released the ledger");
+}
+
+/// An uploader that cannot stop in time (a ledger write stalled) is waited for 10 seconds at most:
+/// the warning is logged and the command still ends with 0.
+#[tokio::test]
+async fn an_uploader_that_does_not_stop_is_waited_for_at_most_the_bound() {
+    use crate::upload_ledger::Step;
+    let log = Log::default();
+    let _guard = log.capture();
+    let key = existing_key();
+    let dirs = Dirs::new(&key);
+    let opened = dirs.open().unwrap();
+    let slot = Arc::new(Mutex::new(Some(key)));
+    let uploads_dir = dirs.dir.path().join("uploads");
+    std::fs::create_dir_all(&uploads_dir).unwrap();
+    // The first enqueue stalls inside the ledger, holding its lock; the uploader's first pass
+    // waits for it.
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let release_rx = Mutex::new(release_rx);
+    let entered_tx = Mutex::new(entered_tx);
+    let probe: crate::upload_ledger::Probe = Box::new(move |step| {
+        if step == Step::BeforeWrite {
+            let _ = entered_tx.lock().unwrap().send(());
+            let _ = release_rx.lock().unwrap().recv();
+        }
+        Ok(())
+    });
+    let ledger = uploader::SharedLedger::new(
+        UploadLedger::open_with(&uploads_dir, AGENT_ID, probe).unwrap(),
+    );
+    let stalled = ledger.clone();
+    let job = crate::journal::JobKey {
+        job_id: shared_proto::JobId("0194f0a2-7c3e-7d11-8a52-3f6f9b1c2d4f".to_owned()),
+        generation: 1,
+    };
+    let enqueue = tokio::spawn(async move { stalled.enqueue_result(job, vec![1, 2, 3]).await });
+    tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
+        .await
+        .unwrap();
+    let result = run_opened(
+        opened,
+        move || Ok(slot.lock().unwrap().take().unwrap()),
+        move |record, key| uploader::start(record, key, ledger),
+        |opened, key| start_session(opened, key, dirs.dir.path()),
+        Duration::from_millis(200),
+        tokio::time::sleep(Duration::from_millis(100)),
+    )
+    .await;
+    assert!(result.is_ok(), "{result:?}");
+    let text = log.text();
+    assert!(text.contains("did not stop in time"), "{text}");
+    assert!(!text.contains("uploader stopped"), "{text}");
+    release_tx.send(()).unwrap();
+    enqueue.await.unwrap().unwrap();
 }
 
 #[test]

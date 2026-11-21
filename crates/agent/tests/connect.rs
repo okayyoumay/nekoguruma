@@ -439,6 +439,37 @@ fn debug_enqueue_writes_the_upload_ledger_and_refuses_what_the_ledger_refuses() 
         let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         json["seq"].as_u64().unwrap()
     };
+    // A job ID no begin accepts and generation 0 would be passed over for good: refused.
+    for (job, generation, contains) in [
+        ("not-a-uuid", "1", "the job ID is not a canonical UUID"),
+        (JOB, "0", "the generation starts at 1"),
+    ] {
+        let mut command = env.command();
+        command.args([
+            "debug",
+            "enqueue",
+            "--mode",
+            "user",
+            "--job",
+            job,
+            "--generation",
+            generation,
+            "--kind",
+            "result",
+        ]);
+        command.arg("--file").arg(&result);
+        refused(run(command), 1, contains);
+    }
+    let big = env.home.path().join("big.json");
+    std::fs::File::create(&big)
+        .unwrap()
+        .set_len(64 * 1024 * 1024 + 1)
+        .unwrap();
+    refused(
+        enqueue("result", &big),
+        1,
+        "the bytes are longer than an upload may be",
+    );
     assert_eq!(seq(&enqueue("result", &result)), 1);
     assert_eq!(seq(&enqueue("result", &result)), 1, "the same object again");
     assert_eq!(seq(&enqueue("commLog", &log)), 2);

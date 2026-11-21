@@ -42,20 +42,20 @@ pub struct CommandError {
     pub message: String,
 }
 
-fn fail(exit: u8, message: impl Into<String>) -> CommandError {
+pub(crate) fn fail(exit: u8, message: impl Into<String>) -> CommandError {
     CommandError {
         exit,
         message: message.into(),
     }
 }
 
-/// Runs one fetch. Exit 1: it cannot as asked (not registered, an envelope that does not verify,
-/// an object the instruction does not name or the server refuses, a digest that did not match
-/// twice in a row); 3: it may work later (no answer, an exchange refused, the disk, the cache
-/// locked, the key store), which includes a single digest mismatch when `--attempts` leaves no
-/// second attempt.
-pub async fn run(args: Args, installed: &ServerOrigin) -> Result<Fetched, CommandError> {
-    let mode = args.mode;
+/// The registration record of `mode`, read without the control channel's locks, which must name
+/// `installed`. Exit 1: not registered, or a record that cannot be used, or another server's; exit
+/// 3: the state directory is unusable. Shared with `ngr-agent debug enqueue`.
+pub(crate) fn installed_record(
+    mode: OperatingMode,
+    installed: &ServerOrigin,
+) -> Result<Record, CommandError> {
     let dir = state::private_subdir(mode, record::DIR_NAME)
         .map_err(|error| fail(3, format!("the state directory is unusable: {error}")))?;
     let record = Record::read(&dir.join(record::RECORD_FILE)).map_err(|_| {
@@ -70,6 +70,17 @@ pub async fn run(args: Args, installed: &ServerOrigin) -> Result<Fetched, Comman
             "the registration record names another server than the installation file",
         ));
     }
+    Ok(record)
+}
+
+/// Runs one fetch. Exit 1: it cannot as asked (not registered, an envelope that does not verify,
+/// an object the instruction does not name or the server refuses, a digest that did not match
+/// twice in a row); 3: it may work later (no answer, an exchange refused, the disk, the cache
+/// locked, the key store), which includes a single digest mismatch when `--attempts` leaves no
+/// second attempt.
+pub async fn run(args: Args, installed: &ServerOrigin) -> Result<Fetched, CommandError> {
+    let mode = args.mode;
+    let record = installed_record(mode, installed)?;
     let bytes = read_envelope(&args.instruction)?;
     let trusted = shared_crypto::PublicKey::from_spki_pem(&record.instruction_key_pem)
         .map_err(|_| fail(1, "the registration record's instruction key is not valid"))?;

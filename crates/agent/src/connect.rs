@@ -314,6 +314,7 @@ pub async fn run(
                 ledger,
             )
         },
+        UPLOADER_STOP_BOUND,
         stop,
     )
     .await
@@ -325,6 +326,7 @@ async fn run_opened(
     load_key: impl Fn() -> Result<AgentKey, IdentityError> + Clone + Send + 'static,
     start_uploader: impl FnOnce(&Record, &AgentKey) -> Result<uploader::Handle, ControlError>,
     start: impl FnOnce(control::Opened, AgentKey) -> Result<control::Handle, ControlError>,
+    uploader_bound: Duration,
     stop: impl Future<Output = ()>,
 ) -> Result<(), ConnectError> {
     tokio::pin!(stop);
@@ -336,6 +338,10 @@ async fn run_opened(
     if key.created() {
         return Err(fail(Exit::CannotConnect, REGISTER_AGAIN));
     }
+    // The record's checks come before either task is spawned (the session makes them again).
+    opened
+        .check(&key.public_key())
+        .map_err(|error| control_error(&error))?;
     // The uploader first, over the key by reference: the session's start takes the key. A start
     // that fails drops the uploader's handle, which stops it.
     let uploader = start_uploader(opened.record(), &key).map_err(|error| control_error(&error))?;
@@ -344,24 +350,23 @@ async fn run_opened(
     // The task also ends without a stop when it panics (release builds unwind): the locks are
     // then free and no session is left, so the process must not stay up.
     let mut uploader_ended = false;
-    loop {
+    let outcome = loop {
         tokio::select! {
             biased;
-            () = stop.as_mut() => break,
+            () = stop.as_mut() => break Ok(()),
             () = handle.stopped() => {
-                match handle.ended() {
+                break Err(match handle.ended() {
                     Some(control::Ended::OutboxUnusable) => {
-                        return Err(outbox_error(&OutboxError::Corrupt("reopen")));
+                        outbox_error(&OutboxError::Corrupt("reopen"))
                     }
                     Some(control::Ended::LedgerUnusable) => {
-                        return Err(ledger_error(&LedgerError::Corrupt("reopen")));
+                        ledger_error(&LedgerError::Corrupt("reopen"))
                     }
-                    None => {}
-                }
-                return Err(fail(
-                    Exit::CannotConnect,
-                    "the control channel session ended unexpectedly",
-                ));
+                    None => fail(
+                        Exit::CannotConnect,
+                        "the control channel session ended unexpectedly",
+                    ),
+                });
             }
             // Neither channel ends the other: the session goes on without uploads.
             () = uploader.stopped(), if !uploader_ended => {
@@ -372,20 +377,26 @@ async fn run_opened(
                 );
             }
         }
+    };
+    if outcome.is_ok() {
+        handle.stop();
+        handle.stopped().await;
+        tracing::info!("control channel session stopped");
     }
-    handle.stop();
+    // The uploader is awaited on the error path too: the process then ends within a short
+    // timeout, which must not cut a ledger rewrite that is running.
     uploader.stop();
-    handle.stopped().await;
-    tracing::info!("control channel session stopped");
-    if tokio::time::timeout(UPLOADER_STOP_BOUND, uploader.stopped())
-        .await
-        .is_err()
-    {
-        tracing::warn!("the uploader did not stop in time; the agent exits without it");
-    } else {
-        tracing::info!("uploader stopped");
+    if !uploader_ended {
+        if tokio::time::timeout(uploader_bound, uploader.stopped())
+            .await
+            .is_err()
+        {
+            tracing::warn!("the uploader did not stop in time; the agent exits without it");
+        } else {
+            tracing::info!("uploader stopped");
+        }
     }
-    Ok(())
+    outcome
 }
 
 /// Loads the key, trying again after each unavailable store or busy creation lock with the

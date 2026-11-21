@@ -439,7 +439,8 @@ ngr-agent connect --mode <device|user>
 ```
 
 Keeps the agent's control channel session ("Control channel session" below) with the server its
-registration record names, which must be the installation file's, until a stop signal (design 5.3, 6.4; ADR-466, ADR-471). `connect.rs`
+registration record names, which must be the installation file's, and runs the uploader ("Data
+channel client" below) over the agent's upload ledger beside it, until a stop signal (design 5.3, 6.4; ADR-466, ADR-471). `connect.rs`
 holds the flow. It takes no option but `--mode`, prints nothing on standard output, and prints and
 logs nothing the server sent and no token; its messages are fixed wording, plus the reason of a
 key store or state directory error (as `identity` and `register` print it) and the kind of a
@@ -477,11 +478,17 @@ printed, as `register` prints no argument value.
      envelope that is empty or too long, or not a regular file) ends the command with exit 1 and
      the advice to register again, before the key store is touched; a file that cannot be read,
      a ledger open in another process or a directory that cannot be used is exit 3;
-  7. the agent key through `agent::identity::agent_key` (create once). A key this run had to
+  7. the upload ledger of the record's agent ID (`UploadLedger::open`, "Upload ledger" below),
+     created when missing, a torn last frame cut off. A file that does not read back ends the
+     command with exit 1 and the advice to register again, before the key store is touched; a
+     ledger open in another process (a `debug enqueue` that has not ended, or a second agent), a
+     file that cannot be read or a directory that cannot be used is exit 3. A ledger found corrupt
+     later, by a reopen, ends only the uploader ("The uploader" below);
+  8. the agent key through `agent::identity::agent_key` (create once). A key this run had to
      create cannot be the registered one, so it is "register again" (the key stays, and a code can
      be issued for its fingerprint); a key whose fingerprint differs from the record's
      (`KeyMismatch`, from `Opened::start`) is the same;
-  8. `Opened::start`, then the wait for a stop signal.
+  9. `uploader::start`, then `Opened::start`, then the wait for a stop signal.
 - **The key's retry** covers two classes, each logged as one `warn` per try with a fixed class
   name (`key store` or `creation lock`) and the next delay: a key store that is unavailable, and
   the creation lock held by another process past its 10-second wait. The delays are the session's
@@ -490,9 +497,21 @@ printed, as `register` prints no argument value.
   command at once with its reason, as `identity` and `register` report it: a refused identity
   directory (for example one that others can write) or a creation lock that cannot be opened is
   exit 3, an unusable key is exit 4, no store is exit 1.
+- **The uploader** is the second task of `connect` (design 5.2, ADR-493 item 10, ADR-495): it
+  has its own token exchange and its own connections, exchanges only while the ledger holds work,
+  and neither channel waits on the other. It sees the entries the ledger held when `connect`
+  opened it and the ones enqueued in this process; the ledger has one writer, so another process
+  (`debug enqueue`) cannot add to a running `connect`'s ledger and there is no cross-process wake.
+  An uploader that ends on its own (`Ended::LedgerUnusable`: a poisoned ledger that, opened again,
+  did not read back, or a panic) is logged once at `error`, and the control session goes on:
+  neither channel ends the other, nothing is uploaded until the agent restarts, and `connect`'s
+  exit status stays the session's. A stop stops both: the uploader drops the request in flight
+  and awaits a ledger write that is running, and `connect` waits for it at most 10 seconds
+  (`UPLOADER_STOP_BOUND`) before it exits.
 - **A stop** is SIGINT or SIGTERM on Unix, and Ctrl-C or the console closing on Windows. The
-  command then calls `Handle::stop`, which sends Close 1001 on a live connection, waits for the
-  session's task to end (it releases both locks) and exits 0. There is no Windows service
+  command then calls `Handle::stop` on the session and on the uploader; the session sends Close
+  1001 on a live connection and its task, which releases both locks, is awaited, then the uploader
+  for its bound, and the command exits 0. There is no Windows service
   integration. The handlers are installed before the record is read, so a signal during start is a
   stop too; if they cannot be installed the command exits 1. A stop during a key load does not
   wait for the load: the runtime is shut down with a short timeout (2 seconds), so the process
@@ -509,9 +528,9 @@ printed, as `register` prints no argument value.
 | Exit status | Meaning |
 |---|---|
 | 0 | Stopped by a signal |
-| 1 | The installation file is absent, refused, not readable by the agent's account, not valid or for the other mode; not registered; register again (a record for another server than the installation file's, a key just created, a key that is not the record's, a record that reads but is not valid, an outbox file, an issue-time mark file or a received-jobs ledger that is corrupt, at start or when a poisoned outbox or ledger is opened again); no key store (a release build, a build or mode without one, wrong debug variables); the stop handlers cannot be installed; the session ended without a stop |
+| 1 | The installation file is absent, refused, not readable by the agent's account, not valid or for the other mode; not registered; register again (a record for another server than the installation file's, a key just created, a key that is not the record's, a record that reads but is not valid, an outbox file, an issue-time mark file, a received-jobs ledger or an upload ledger that is corrupt at start, or an outbox or received-jobs ledger that is corrupt when a poisoned one is opened again); no key store (a release build, a build or mode without one, wrong debug variables); the stop handlers cannot be installed; the session ended without a stop |
 | 2 | Invalid command line |
-| 3 | The installation file cannot be read for a reason other than a refusal of access, the key store is unavailable (Linux device mode: a credential that is a symlink, a FIFO or unreadable, or a missing credential directory; the unit then restarts every 10 seconds), another session or a registration is running, a lock cannot be taken, the state directory or the identity directory is unusable, the creation lock cannot be opened, the registration record cannot be read for an I/O reason, the outbox is open elsewhere or cannot be opened, the issue-time mark is open elsewhere or cannot be read, or the received-jobs ledger is open elsewhere or cannot be read |
+| 3 | The installation file cannot be read for a reason other than a refusal of access, the key store is unavailable (Linux device mode: a credential that is a symlink, a FIFO or unreadable, or a missing credential directory; the unit then restarts every 10 seconds), another session or a registration is running, a lock cannot be taken, the state directory or the identity directory is unusable, the creation lock cannot be opened, the registration record cannot be read for an I/O reason, the outbox is open elsewhere or cannot be opened, the issue-time mark is open elsewhere or cannot be read, the received-jobs ledger is open elsewhere or cannot be read, or the upload ledger is open elsewhere or cannot be opened |
 | 4 | The agent key is present and cannot be used (it is not replaced) |
 
 ## Control channel session
@@ -862,7 +881,7 @@ The `agent` library's `upload_ledger` module keeps the objects still to be uploa
 
 ## Data channel client
 
-The `agent` library's `uploader` module holds the uploader (design 5.2, 5.4, ADR-493 items 10 to 14, ADR-495): the client below and the loop that drives it from the upload ledger. `connect` does not run it yet, so nothing calls it in production.
+The `agent` library's `uploader` module holds the uploader (design 5.2, 5.4, ADR-493 items 10 to 14, ADR-495): the client below and the loop that drives it from the upload ledger. `ngr-agent connect` runs it as its second task ("The uploader" under `ngr-agent connect`). Nothing enqueues in production yet: a job's end enqueuing its result and an operator's upload enqueuing a log belong to the items that run jobs and store the log, and `debug enqueue` (below) drives it for tests.
 
 - **The loop.** `uploader::start(record, key, ledger)` starts one task and returns a `Handle` (`stop`, `stopped`, `status` with the counts delivered, passed over, abandoned, set aside and retried, and `ended`); `SharedLedger` wraps the open `UploadLedger`, runs each ledger call on a blocking task and wakes the loop on every enqueue. The task takes the ledger's entries in its order (results before communication logs, the oldest first), one object and one connection at a time, and exchanges a token of its own only while work is pending; a 401 drops it, exchanges again and repeats that request once.
 - **An attempt** starts at begin, after the source check, and ends in one of five ways (ADR-495 items 5 to 10): delivered (`finished` removes the entry), retried after the back-off (1 second doubling to 60, back to 1 when a part is stored or a removal follows a `finished` answer), passed over (a refusal: the entries behind it go first and it is tried again every pass; nothing durable changes), abandoned (`UploadLedger::abandon`, only when the source file is missing, shorter than the entry or hashes otherwise; a communication log's file is never touched), or set aside until a restart (a second `failed` completion in a row; the first one re-checks the source and begins once more). A status answering 503 for an `open` row is followed by one completion, whose answer decides. A completion answering 409 `open` twice in a row passes the entry over, so a store that keeps losing the parts cannot make the agent send the object again and again. After any attempt that stored no part and got no `finished`, the next attempt waits the back-off before it starts, also when it made no request (a source that cannot be read, an abandon that fails to write); a failed token exchange always waits, keeping a `Retry-After` or the 60-second cap.
@@ -891,7 +910,11 @@ The `agent` library's `fetch` module is the download leg of the data channel (de
 
 ### Debug commands
 
-A debug build has one command more, `ngr-agent debug fetch --mode <device|user> --instruction <file> --kind <document|artifact> --sha256 <hex> [--attempts <n>]`, for the end-to-end tests (design 13.4); a release build does not compile it, and its parser reports `unknown command`. `--instruction` is a file holding one signed instruction envelope as the server delivered it. The command reads the installation file as every command does, reads the registration record without the control channel's locks (the cache has its own lock), verifies the envelope against the record's instruction key and the agent's ID, loads the key, opens the cache and runs `fetch_retrying` (`--attempts` defaults to 4). It prints `{"path": ..., "length": ...}` of the cached file on stdout. Exit status: 0 fetched; 1 it cannot as asked (not registered, an envelope that does not verify, a digest the instruction does not name, a refusal, a digest that did not match twice, a key just created); 2 a usage error; 3 it may work later (retries ran out, an exchange refused for a revoked agent, the disk, the cache locked, the key store).
+A debug build has two commands more, `ngr-agent debug enqueue` and `ngr-agent debug fetch`; a release build compiles neither, and its parser reports `unknown command` (a test of the release build checks both).
+
+`ngr-agent debug enqueue --mode <device|user> --job <uuid> --generation <n> --kind <result|commLog> --file <file>` puts one object into the agent's upload ledger (design 13.4, ADR-493 item 10) and prints `{"seq": <n>}`. For `result` the file's bytes are the result, which the ledger copies; for `commLog` the file stays where it is and its whole current length and SHA-256 are enqueued, its path made absolute. The command reads the installation file and the registration record (for the agent ID), needs no key and no connection, and takes the ledger's lock, so it cannot run while `connect` or another `debug enqueue` has the ledger (exit 3, `InUse`): the test enqueues first and starts `connect` after, or between two runs of it. The ledger's refusals are exit 1 (a job ID that is not a UUID, another object of the same job, generation and kind, a file over the ledger's bounds, one that cannot be read, no registration); the same object again answers its entry's number. The end-to-end test is the server's `tests/postgres/agent_upload.rs`.
+
+`ngr-agent debug fetch --mode <device|user> --instruction <file> --kind <document|artifact> --sha256 <hex> [--attempts <n>]`, for the end-to-end tests (design 13.4); a release build does not compile it, and its parser reports `unknown command`. `--instruction` is a file holding one signed instruction envelope as the server delivered it. The command reads the installation file as every command does, reads the registration record without the control channel's locks (the cache has its own lock), verifies the envelope against the record's instruction key and the agent's ID, loads the key, opens the cache and runs `fetch_retrying` (`--attempts` defaults to 4). It prints `{"path": ..., "length": ...}` of the cached file on stdout. Exit status: 0 fetched; 1 it cannot as asked (not registered, an envelope that does not verify, a digest the instruction does not name, a refusal, a digest that did not match twice, a key just created); 2 a usage error; 3 it may work later (retries ran out, an exchange refused for a revoked agent, the disk, the cache locked, the key store).
 
 ## Reporting a run's end
 

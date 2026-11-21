@@ -115,6 +115,13 @@ fn ledger_in(dir: &std::path::Path) -> ReceivedJobs {
     ReceivedJobs::open_in(&dir.join("registration"), AGENT_ID).unwrap()
 }
 
+/// The upload ledger of the record's agent in `dir`, as `run` opens it.
+fn uploads_in(dir: &std::path::Path) -> uploader::SharedLedger {
+    let dir = dir.join("uploads");
+    std::fs::create_dir_all(&dir).unwrap();
+    uploader::SharedLedger::new(UploadLedger::open_in(&dir, AGENT_ID).unwrap())
+}
+
 fn unavailable() -> IdentityError {
     IdentityError::Unavailable("the key store is unavailable: test".to_owned())
 }
@@ -299,6 +306,7 @@ async fn a_stop_during_the_key_retry_is_ok_and_frees_the_locks() {
     let result = run_opened(
         opened,
         || Err(unavailable()),
+        |_, _| unreachable!("the uploader must not start"),
         |_, _| unreachable!("the session must not start"),
         tokio::time::sleep(Duration::from_secs(5)),
     )
@@ -320,6 +328,7 @@ async fn a_session_that_ends_on_its_own_is_exit_1() {
     let result = run_opened(
         opened,
         move || Ok(slot.lock().unwrap().take().unwrap()),
+        |record, key| uploader::start(record, key, uploads_in(dirs.dir.path())),
         |opened, key| {
             opened.start_panicking(
                 key,
@@ -337,6 +346,64 @@ async fn a_session_that_ends_on_its_own_is_exit_1() {
         error.to_string(),
         "the control channel session ended unexpectedly"
     );
+    dirs.open().expect("the locks are free");
+}
+
+/// An uploader that ends on its own (its ledger does not read back) is logged once at error level
+/// and the session goes on: the command ends only by the stop, with 0 (ADR-493 item 10).
+#[tokio::test(start_paused = true)]
+async fn an_uploader_that_ends_on_its_own_does_not_end_the_session() {
+    use crate::upload_ledger::Step;
+    let log = Log::default();
+    let _guard = log.capture();
+    let key = existing_key();
+    let dirs = Dirs::new(&key);
+    let opened = dirs.open().unwrap();
+    let slot = Arc::new(Mutex::new(Some(key)));
+    // An append that lands and whose sync fails poisons the ledger; the file is then replaced by
+    // one that does not read back, so the uploader's reopen ends it.
+    let uploads_dir = dirs.dir.path().join("uploads");
+    std::fs::create_dir_all(&uploads_dir).unwrap();
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let probe_armed = armed.clone();
+    let probe: crate::upload_ledger::Probe = Box::new(move |step| {
+        if step == Step::AfterSync && probe_armed.load(Ordering::SeqCst) {
+            Err(io::Error::other("scripted"))
+        } else {
+            Ok(())
+        }
+    });
+    let ledger = uploader::SharedLedger::new(
+        UploadLedger::open_with(&uploads_dir, AGENT_ID, probe).unwrap(),
+    );
+    armed.store(true, Ordering::SeqCst);
+    let key_of = crate::journal::JobKey {
+        job_id: shared_proto::JobId("0194f0a2-7c3e-7d11-8a52-3f6f9b1c2d4f".to_owned()),
+        generation: 1,
+    };
+    assert!(ledger.enqueue_result(key_of, vec![1, 2, 3]).await.is_err());
+    std::fs::write(uploads_dir.join(AGENT_ID), b"not a ledger").unwrap();
+    let result = run_opened(
+        opened,
+        move || Ok(slot.lock().unwrap().take().unwrap()),
+        move |record, key| uploader::start(record, key, ledger),
+        |opened, key| {
+            opened.start(
+                key,
+                Arc::new(LogIntake),
+                outbox_in(dirs.dir.path()),
+                marks_in(dirs.dir.path()),
+                Arc::new(SystemClock),
+                ledger_in(dirs.dir.path()),
+            )
+        },
+        tokio::time::sleep(Duration::from_secs(5)),
+    )
+    .await;
+    assert!(result.is_ok(), "{result:?}");
+    let text = log.text();
+    assert_eq!(text.matches("the uploader ended").count(), 1, "{text}");
+    assert!(text.contains("control channel session stopped"), "{text}");
     dirs.open().expect("the locks are free");
 }
 
@@ -501,6 +568,28 @@ fn every_ledger_error_has_the_documented_exit() {
     );
     assert!(
         !ledger_error(&LedgerError::Io(io::ErrorKind::PermissionDenied))
+            .to_string()
+            .contains("register again")
+    );
+}
+
+#[test]
+fn every_upload_ledger_error_has_the_documented_exit() {
+    for (error, exit) in [
+        (UploadLedgerError::Corrupt("a bad file"), 1),
+        (UploadLedgerError::BadAgentId, 1),
+        (UploadLedgerError::InUse, 3),
+        (
+            UploadLedgerError::Io(io::ErrorKind::PermissionDenied.into()),
+            3,
+        ),
+        (UploadLedgerError::Poisoned, 3),
+    ] {
+        let mapped = upload_ledger_error(&error);
+        assert_eq!(mapped.exit_code(), exit, "{mapped}");
+    }
+    assert!(
+        upload_ledger_error(&UploadLedgerError::Corrupt("x"))
             .to_string()
             .contains("register again")
     );

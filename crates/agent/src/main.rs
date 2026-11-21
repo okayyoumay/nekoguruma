@@ -102,14 +102,15 @@ used; 5 a record exists and --replace was not given; 6 the answer is not authent
 not the --server-key one, or its signature does not verify).
 
 connect: keeps the agent's control channel session to the server its registration record names
-(which must be the installation file's server), until SIGINT or SIGTERM (Ctrl-C or the console closing on Windows) stops it. It takes no option
+(which must be the installation file's server), and uploads what the agent's upload ledger holds
+over a channel of its own, until SIGINT or SIGTERM (Ctrl-C or the console closing on Windows) stops it. It takes no option
 but --mode and prints nothing on stdout. Exit status: 0 stopped by a signal; 1 the agent is not
 registered, or must register again (the key was just created, is not the registered one, or the
 record is not valid, or names another server than the installation file), the installation file
 is absent, refused, not valid, not readable by the agent's account or for the other mode, there is no key store, the stop handlers
 cannot be installed, or the session ended without a stop; 2 a usage error; 3 the installation
 file cannot be read (other than for lack of access), another session or a registration is
-running, a lock, the state or identity directory is unusable, or the record cannot be read; 4 the
+running, a lock, the state or identity directory is unusable, the upload ledger is open in another process, or the record cannot be read; 4 the
 stored key cannot be used. A key store that is unavailable, or a creation lock held too long, is retried until the
 signal.
 
@@ -191,6 +192,9 @@ enum Command {
     /// `ngr-agent debug fetch ...`: a debug build only (ADR-497).
     #[cfg(debug_assertions)]
     DebugFetch(agent::fetch::command::Args),
+    /// `ngr-agent debug enqueue ...`: a debug build only (ADR-493 item 10).
+    #[cfg(debug_assertions)]
+    DebugEnqueue(agent::upload_ledger::command::Args),
 }
 
 /// What `ngr-agent register` takes, checked before any file or socket is touched.
@@ -225,6 +229,8 @@ impl Command {
             Command::ProvisionKey(args) => args.mode,
             #[cfg(debug_assertions)]
             Command::DebugFetch(args) => args.mode,
+            #[cfg(debug_assertions)]
+            Command::DebugEnqueue(args) => args.mode,
         }
     }
 }
@@ -264,6 +270,8 @@ fn main() -> ExitCode {
         Command::Identify(args) => Some(installed("identify", args.mode)),
         #[cfg(debug_assertions)]
         Command::DebugFetch(args) => Some(installed("debug fetch", args.mode)),
+        #[cfg(debug_assertions)]
+        Command::DebugEnqueue(args) => Some(installed("debug enqueue", args.mode)),
         Command::ProvisionKey(_) => unreachable!("handled before the log starts"),
     };
     let installation = match installation.transpose() {
@@ -273,6 +281,14 @@ fn main() -> ExitCode {
     // The identity command needs no runtime and no worker.
     if let Command::Identity(mode) = command {
         return identity(mode);
+    }
+    // The ledger's calls block, so the debug enqueue needs no runtime either.
+    #[cfg(debug_assertions)]
+    if let Command::DebugEnqueue(args) = command {
+        let Some(installation) = installation else {
+            unreachable!("read before the command runs")
+        };
+        return debug_enqueue(args, installation.server());
     }
     if let Command::Register(args) = command {
         let (Some(source), Some(installation)) = (code_source, installation) else {
@@ -314,6 +330,8 @@ fn main() -> ExitCode {
             runtime.shutdown_timeout(std::time::Duration::from_secs(2));
             return code;
         }
+        #[cfg(debug_assertions)]
+        Command::DebugEnqueue(_) => unreachable!("handled before the runtime starts"),
         Command::Identity(_) | Command::Register(_) | Command::ProvisionKey(_) => {
             unreachable!("handled before the runtime starts")
         }
@@ -567,13 +585,101 @@ async fn debug_fetch(
     }
 }
 
+/// `ngr-agent debug enqueue`: one entry into the upload ledger, printing its number as one JSON
+/// line.
+#[cfg(debug_assertions)]
+fn debug_enqueue(
+    args: agent::upload_ledger::command::Args,
+    server: &agent::registration::origin::ServerOrigin,
+) -> ExitCode {
+    use std::io::Write;
+    match agent::upload_ledger::command::run(args, server) {
+        Ok(seq) => {
+            let _ = writeln!(std::io::stdout(), "{}", serde_json::json!({ "seq": seq }));
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "ngr-agent: debug enqueue: {}",
+                error.message
+            );
+            ExitCode::from(error.exit)
+        }
+    }
+}
+
+/// The options of `ngr-agent debug enqueue`: `--mode`, `--job`, `--generation`, `--kind`
+/// (`result` or `commLog`) and `--file`, each once.
+#[cfg(debug_assertions)]
+fn parse_debug_enqueue(mut args: impl Iterator<Item = OsString>) -> Result<Command, String> {
+    use agent::upload_ledger::Kind;
+    let (mut mode, mut job, mut generation, mut kind, mut file) = (None, None, None, None, None);
+    while let Some(flag) = args.next() {
+        let value = args.next().ok_or("an option needs a value")?;
+        let text = value
+            .to_str()
+            .ok_or_else(|| "an option value is not valid UTF-8".to_owned())?;
+        let name = flag.to_str().unwrap_or("");
+        let once = |taken: bool| {
+            if taken {
+                Err(format!("give {name} once"))
+            } else {
+                Ok(())
+            }
+        };
+        match name {
+            "--mode" => {
+                once(mode.is_some())?;
+                mode = Some(
+                    text.parse::<OperatingMode>()
+                        .map_err(|error| format!("--mode: {error}"))?,
+                );
+            }
+            "--job" => {
+                once(job.is_some())?;
+                job = Some(text.to_owned());
+            }
+            "--generation" => {
+                once(generation.is_some())?;
+                generation = Some(
+                    text.parse::<u64>()
+                        .map_err(|_| "--generation is a number".to_owned())?,
+                );
+            }
+            "--kind" => {
+                once(kind.is_some())?;
+                kind = Some(match text {
+                    "result" => Kind::Result,
+                    "commLog" => Kind::CommLog,
+                    _ => return Err("--kind is result or commLog".to_owned()),
+                });
+            }
+            "--file" => {
+                once(file.is_some())?;
+                file = Some(PathBuf::from(&value));
+            }
+            _ => return Err(format!("unknown option {flag:?}")),
+        }
+    }
+    Ok(Command::DebugEnqueue(agent::upload_ledger::command::Args {
+        mode: mode.ok_or("--mode is required")?,
+        job_id: job.ok_or("--job is required")?,
+        generation: generation.ok_or("--generation is required")?,
+        kind: kind.ok_or("--kind is required")?,
+        file: file.ok_or("--file is required")?,
+    }))
+}
+
 /// The options of `ngr-agent debug fetch`: `--mode`, `--instruction`, `--kind`, `--sha256`, each
 /// once, and `--attempts` (default 4).
 #[cfg(debug_assertions)]
 fn parse_debug(mut args: impl Iterator<Item = OsString>) -> Result<Command, String> {
     use agent::fetch::Kind;
-    if args.next().is_none_or(|word| word != "fetch") {
-        return Err("debug takes the command fetch".to_owned());
+    match args.next() {
+        Some(word) if word == "fetch" => {}
+        Some(word) if word == "enqueue" => return parse_debug_enqueue(args),
+        _ => return Err("debug takes the command fetch or enqueue".to_owned()),
     }
     let (mut mode, mut instruction, mut kind, mut sha256, mut attempts) =
         (None, None, None, None, None);
@@ -1266,7 +1372,7 @@ mod tests {
             | Command::Connect(_)
             | Command::ProvisionKey(_) => Err("not a run".to_owned()),
             #[cfg(debug_assertions)]
-            Command::DebugFetch(_) => Err("not a run".to_owned()),
+            Command::DebugFetch(_) | Command::DebugEnqueue(_) => Err("not a run".to_owned()),
         }
     }
 
@@ -1323,11 +1429,62 @@ mod tests {
         assert!(parse_command(&["debug", "other"]).is_err());
     }
 
+    /// The debug enqueue command takes its five options, each once.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn debug_enqueue_takes_its_options_each_once() {
+        use agent::upload_ledger::Kind;
+        let base = [
+            "debug",
+            "enqueue",
+            "--mode",
+            "user",
+            "--job",
+            "0194f0a2-7c3e-7d11-8a52-3f6f9b1c2d4f",
+            "--generation",
+            "1",
+            "--kind",
+            "commLog",
+            "--file",
+            "log.bin",
+        ];
+        let Ok(Command::DebugEnqueue(args)) = parse_command(&base) else {
+            panic!("the command parses");
+        };
+        assert_eq!(args.kind, Kind::CommLog);
+        assert_eq!((args.generation, args.file), (1, PathBuf::from("log.bin")));
+        let with = |extra: &[&'static str]| {
+            let mut all = base.to_vec();
+            all.extend_from_slice(extra);
+            parse_command(&all)
+        };
+        for bad in [
+            &["--file", "other"][..],
+            &["--generation", "2"],
+            &["--extra", "1"],
+        ] {
+            assert!(with(bad).is_err(), "{bad:?}");
+        }
+        for (flag, value) in [("--kind", "plan"), ("--generation", "-1")] {
+            let mut all = base.to_vec();
+            let at = all.iter().position(|word| *word == flag).unwrap();
+            all[at + 1] = value;
+            assert!(parse_command(&all).is_err(), "{all:?}");
+        }
+        for missing in 1..base.len() / 2 {
+            let mut all = base.to_vec();
+            all.drain(2 * missing..2 * missing + 2);
+            assert!(parse_command(&all).is_err(), "{all:?}");
+        }
+    }
+
     #[cfg(not(debug_assertions))]
     #[test]
     fn a_release_build_has_no_debug_command() {
-        let error = parse_command(&["debug", "fetch", "--mode", "user"]).unwrap_err();
-        assert!(error.contains("unknown command"), "{error}");
+        for command in ["fetch", "enqueue"] {
+            let error = parse_command(&["debug", command, "--mode", "user"]).unwrap_err();
+            assert!(error.contains("unknown command"), "{error}");
+        }
     }
 
     fn identify_args(args: &[&str]) -> Result<IdentifyArgs, String> {
@@ -1339,7 +1496,7 @@ mod tests {
             | Command::Connect(_)
             | Command::ProvisionKey(_) => Err("not an identify".to_owned()),
             #[cfg(debug_assertions)]
-            Command::DebugFetch(_) => Err("not an identify".to_owned()),
+            Command::DebugFetch(_) | Command::DebugEnqueue(_) => Err("not an identify".to_owned()),
         }
     }
 

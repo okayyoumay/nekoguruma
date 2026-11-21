@@ -118,7 +118,7 @@ The download route finds a job's IR document or artifact here, by tenant and dig
 GET URL for the row's `storage_key`. Migration 0014 makes each `digest` 64 lowercase hex digits,
 bare (the form of the signed instruction and of `jobs.artifact_digest`; the `sha256:` prefix the
 0001 comment showed was never written, and the column comments are set again), and each
-`storage_key` 36 characters and unique, so two rows never name one object. A row exists only for an
+`storage_key` 36 characters and unique within its table (a key unique across `ir_documents`, `artifacts` and `job_objects` is the writer's to keep). A row exists only for an
 object the store read back and found to match its digest. Nothing writes these tables yet (tests
 seed them); the route that stores IR documents will, and the route only reads.
 

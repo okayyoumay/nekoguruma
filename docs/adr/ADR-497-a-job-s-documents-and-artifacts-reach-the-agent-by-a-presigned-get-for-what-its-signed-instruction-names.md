@@ -40,7 +40,7 @@ agent's answers.
    UUID the store issued. A key made of the digest was rejected: a bad second upload to the same
    key would fail its read-back and the store would delete the good object with it (ADR-492
    item 5). A row exists only for an object the store has read back; the route only reads. A
-   migration makes each digest 64 lowercase hex digits and each storage key unique.
+   migration makes each digest 64 lowercase hex digits and each storage key unique within its table.
 5. **The URL lasts 60 seconds**, the store's own request expiry: it is asked for when it is
    about to be used. The route asks the store nothing, so a lost object shows as the agent's
    GET failing.

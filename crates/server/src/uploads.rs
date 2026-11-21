@@ -40,7 +40,8 @@ use shared_proto::{AgentId, JobInstruction, is_canonical_uuid};
 use sqlx::PgPool;
 use tokio::sync::watch;
 
-use crate::control::{bearer_token, unauthorized};
+use crate::agent_caller::{self, Caller, Refusal};
+use crate::control::unauthorized;
 use crate::db;
 use crate::health::may_log;
 use crate::hub::Hub;
@@ -290,6 +291,50 @@ impl Drop for Registered {
     }
 }
 
+/// Why the download route warns; each reason has its own log gate.
+#[derive(Clone, Copy)]
+pub(crate) enum DownloadWarning {
+    /// The database is unavailable (503).
+    Unavailable,
+    /// A statement failed in this code (500).
+    Internal,
+    /// The object store failed.
+    Store,
+    /// A stored job instruction does not decode.
+    Undecodable,
+    /// A named object has no row (a caller can make this happen at will).
+    NoRow,
+    /// A stored object key does not parse.
+    BadKey,
+}
+
+type Gate = Mutex<Option<Instant>>;
+
+/// The download route's log gates, one per reason so that a flood of one cannot silence another,
+/// and none of them the upload routes'.
+#[derive(Default)]
+struct DownloadGates {
+    unavailable: Gate,
+    internal: Gate,
+    store: Gate,
+    undecodable: Gate,
+    no_row: Gate,
+    bad_key: Gate,
+}
+
+impl DownloadGates {
+    fn of(&self, reason: DownloadWarning) -> &Gate {
+        match reason {
+            DownloadWarning::Unavailable => &self.unavailable,
+            DownloadWarning::Internal => &self.internal,
+            DownloadWarning::Store => &self.store,
+            DownloadWarning::Undecodable => &self.undecodable,
+            DownloadWarning::NoRow => &self.no_row,
+            DownloadWarning::BadKey => &self.bad_key,
+        }
+    }
+}
+
 /// The state of the routes.
 #[derive(Clone)]
 pub struct Uploads {
@@ -298,6 +343,7 @@ pub struct Uploads {
     backend: Backend,
     hub: Hub,
     gate: Arc<Mutex<Option<Instant>>>,
+    download_gates: Arc<DownloadGates>,
     /// The completion tasks of this process, by tenant and upload (ADR-493 item 20).
     completions: Registry,
 }
@@ -310,6 +356,7 @@ impl Uploads {
             backend,
             hub,
             gate: Arc::new(Mutex::new(None)),
+            download_gates: Arc::default(),
             completions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -318,6 +365,28 @@ impl Uploads {
         if may_log(&self.gate, now(), LOG_EVERY) {
             tracing::warn!(why, "upload route: {what}");
         }
+    }
+
+    /// The warning of the download route, which shares this state but has a gate of its own for
+    /// each reason: a caller that makes one reason warn cannot hide another's or the upload
+    /// routes'.
+    pub(crate) fn warn_download(&self, reason: DownloadWarning, what: &str, why: &str) {
+        if may_log(self.download_gates.of(reason), now(), LOG_EVERY) {
+            tracing::warn!(why, "download route: {what}");
+        }
+    }
+
+    pub(crate) fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    pub(crate) fn sessions(&self) -> &Sessions {
+        &self.sessions
+    }
+
+    /// The object store of the backend, if the server has one.
+    pub(crate) fn store(&self) -> Option<&dyn MultipartStore> {
+        self.backend.store.as_deref()
     }
 
     /// The outcome of the completion of upload `id`, which a task of this process runs: the
@@ -436,7 +505,7 @@ struct CompletionJob {
 // ---------------------------------------------------------------------------------------------
 // Answers
 
-fn json_answer(status: StatusCode, value: Value) -> Response {
+pub(crate) fn json_answer(status: StatusCode, value: Value) -> Response {
     let mut response = (status, value.to_string()).into_response();
     let headers = response.headers_mut();
     headers.insert(
@@ -560,19 +629,6 @@ impl Row {
     }
 }
 
-/// The agent's tenant, and whether its row is revoked; `None` when there is no row.
-async fn agent_standing(pool: &PgPool, agent: &str) -> Result<Option<(String, bool)>, sqlx::Error> {
-    let mut tx = pool.begin().await?;
-    db::statement_timeouts(&mut tx).await?;
-    let row: Option<(String, bool)> = sqlx::query_as(
-        "SELECT tenant_id::text, revoked_at IS NOT NULL FROM agents WHERE id = $1::uuid",
-    )
-    .bind(agent)
-    .fetch_optional(&mut *tx)
-    .await?;
-    Ok(row)
-}
-
 enum JobLookup {
     /// No job of that ID belongs to the agent.
     NoJob,
@@ -581,6 +637,43 @@ enum JobLookup {
     /// The job's generation is not the one declared.
     OtherGeneration,
     Found(Option<Row>),
+}
+
+/// What the job's stored instruction is, for the routes that judge a job by it.
+pub(crate) enum StoredInstruction {
+    /// No job of that ID belongs to the agent.
+    NoJob,
+    /// The stored instruction does not decode.
+    Undecodable,
+    Instruction(Box<JobInstruction>),
+}
+
+/// The decoded instruction of the agent's job, read in the caller's transaction. The server wrote
+/// the envelope, so its signature is not checked again.
+pub(crate) async fn stored_instruction(
+    tx: &mut sqlx::PgConnection,
+    tenant: &str,
+    job: &str,
+    agent: &str,
+) -> Result<StoredInstruction, sqlx::Error> {
+    let signed: Option<(Vec<u8>,)> = sqlx::query_as(
+        "SELECT signed_job FROM jobs WHERE tenant_id = $1::uuid AND id = $2::uuid \
+         AND agent_id = $3::uuid",
+    )
+    .bind(tenant)
+    .bind(job)
+    .bind(agent)
+    .fetch_optional(tx)
+    .await?;
+    let Some((signed,)) = signed else {
+        return Ok(StoredInstruction::NoJob);
+    };
+    let decoded = shared_crypto::instruction::Envelope::split(&signed)
+        .ok()
+        .and_then(|envelope| JobInstruction::decode(envelope.payload()).ok());
+    Ok(decoded.map_or(StoredInstruction::Undecodable, |i| {
+        StoredInstruction::Instruction(Box::new(i))
+    }))
 }
 
 /// The instruction's ownership generation of the job, then the row that holds the declaration, in
@@ -593,22 +686,12 @@ async fn lookup_job(
 ) -> Result<JobLookup, sqlx::Error> {
     let mut tx = pool.begin().await?;
     db::statement_timeouts(&mut tx).await?;
-    let signed: Option<(Vec<u8>,)> = sqlx::query_as(
-        "SELECT signed_job FROM jobs WHERE tenant_id = $1::uuid AND id = $2::uuid \
-         AND agent_id = $3::uuid",
-    )
-    .bind(tenant)
-    .bind(&declared.job_id)
-    .bind(agent)
-    .fetch_optional(&mut *tx)
-    .await?;
-    let Some((signed,)) = signed else {
-        return Ok(JobLookup::NoJob);
+    let instruction = match stored_instruction(&mut tx, tenant, &declared.job_id, agent).await? {
+        StoredInstruction::NoJob => return Ok(JobLookup::NoJob),
+        StoredInstruction::Undecodable => return Ok(JobLookup::Undecodable),
+        StoredInstruction::Instruction(instruction) => instruction,
     };
-    let Some(generation) = instruction_generation(&signed) else {
-        return Ok(JobLookup::Undecodable);
-    };
-    if generation != declared.generation {
+    if instruction.ownership_generation != declared.generation {
         return Ok(JobLookup::OtherGeneration);
     }
     let row = live_row(&mut tx, tenant, declared).await?;
@@ -632,14 +715,6 @@ async fn live_row(
     .fetch_optional(tx)
     .await?;
     Ok(raw.and_then(Row::from_raw))
-}
-
-/// The instruction's `ownership_generation` out of a stored envelope; `None` if it does not
-/// decode. The server wrote the envelope, so its signature is not checked again.
-fn instruction_generation(signed: &[u8]) -> Option<u64> {
-    let envelope = shared_crypto::instruction::Envelope::split(signed).ok()?;
-    let instruction = JobInstruction::decode(envelope.payload()).ok()?;
-    Some(instruction.ownership_generation)
 }
 
 /// Why [`insert_row`] failed. The two differ in what is known of the row: a failed statement (or
@@ -790,7 +865,7 @@ async fn row_state(pool: &PgPool, tenant: &str, id: &str) -> Result<Option<Strin
 }
 
 /// The 32 bytes of a row's digest (64 lowercase hex digits; the column's CHECK).
-fn parse_sha256(text: &str) -> Option<[u8; 32]> {
+pub(crate) fn parse_sha256(text: &str) -> Option<[u8; 32]> {
     if !is_digest(text) {
         return None;
     }
@@ -804,26 +879,12 @@ fn parse_sha256(text: &str) -> Option<[u8; 32]> {
 // ---------------------------------------------------------------------------------------------
 // The caller
 
-struct Caller {
-    agent: AgentId,
-    tenant: String,
-}
-
-/// Judges the token, then reads the agent's row (ADR-493 item 2): the answer to a token that is
-/// unknown or expired and to a row that is revoked or missing is the same 401, and the latter
-/// drops the agent's tokens.
+/// Judges the caller for the routes of this module; see [`agent_caller::authenticate`].
 async fn authenticate(u: &Uploads, headers: &HeaderMap) -> Result<Caller, Box<Response>> {
-    let Some(agent) = bearer_token(headers).and_then(|token| u.sessions.authenticate(token)) else {
-        return Err(Box::new(unauthorized()));
-    };
-    match agent_standing(&u.pool, &agent.0).await {
-        Ok(Some((tenant, false))) => Ok(Caller { agent, tenant }),
-        Ok(_) => {
-            u.sessions.revoke_agent(&agent);
-            tracing::info!(agent_id = %agent.0, "upload request refused: the agent is revoked or unknown");
-            Err(Box::new(unauthorized()))
-        }
-        Err(error) => Err(Box::new(db_failure(u, &error))),
+    match agent_caller::authenticate(&u.pool, &u.sessions, headers).await {
+        Ok(caller) => Ok(caller),
+        Err(Refusal::Unauthorized) => Err(Box::new(unauthorized())),
+        Err(Refusal::Database(error)) => Err(Box::new(db_failure(u, &error))),
     }
 }
 
@@ -848,7 +909,7 @@ async fn empty_body(body: axum::body::Body) -> Result<(), Box<Response>> {
 /// A number of the body as the visitor sees it: serde_json turns an integer past `u64` into a
 /// float, and a length that large is over the limit, not malformed. A number beyond a double is
 /// refused by the reader itself, which makes the whole body a 400.
-enum Number {
+pub(crate) enum Number {
     Int(u64),
     /// An integral value of 2^64 or more (written as a big integer or in exponent form).
     Huge,
@@ -949,7 +1010,7 @@ struct Declared {
     digest: String,
 }
 
-fn is_digest(text: &str) -> bool {
+pub(crate) fn is_digest(text: &str) -> bool {
     text.len() == 64
         && text
             .bytes()

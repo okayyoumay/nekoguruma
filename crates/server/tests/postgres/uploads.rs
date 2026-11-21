@@ -14,7 +14,7 @@ use server::Server;
 use server::config::Http;
 use server::object_server::ObjectServer;
 use server::storage::{
-    MultipartStore, ObjectBody, ObjectKey, Part, PartUrl, S3Store, S3Tuning, StoreError,
+    GetUrl, MultipartStore, ObjectBody, ObjectKey, Part, PartUrl, S3Store, S3Tuning, StoreError,
     StoreFuture, UnfinishedUploads, Upload, UploadId,
 };
 use server::uploads::{Backend, PART_BYTES, Pause};
@@ -35,12 +35,12 @@ fn digest() -> String {
     "ab".repeat(32)
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// A random version 4 UUID in canonical text.
-fn v4() -> String {
+pub(crate) fn v4() -> String {
     let mut b = [0u8; 16];
     getrandom::fill(&mut b).unwrap();
     b[6] = b[6] & 0x0f | 0x40;
@@ -60,7 +60,7 @@ fn v4() -> String {
 // The store wrapper
 
 #[derive(Clone, Copy)]
-enum Fail {
+pub(crate) enum Fail {
     Io,
     Random,
     NotFound,
@@ -133,10 +133,10 @@ impl Fail {
 /// A store that forwards to the real one when it has one, and otherwise issues uploads of its own
 /// that hold no parts (and no URL: `presign_part` of such an upload is refused).
 #[derive(Default)]
-struct Wrap {
+pub(crate) struct Wrap {
     inner: Option<Arc<S3Store>>,
     begins: AtomicUsize,
-    presigns: AtomicUsize,
+    pub(crate) presigns: AtomicUsize,
     lists: AtomicUsize,
     deletes: AtomicUsize,
     /// The calls of `complete`, apart from `calls()` so that its shape stays.
@@ -144,7 +144,7 @@ struct Wrap {
     begin_fail: Mutex<Option<Fail>>,
     list_fail: Mutex<Option<Fail>>,
     delete_fail: Mutex<Option<Fail>>,
-    presign_fail: Mutex<Option<Fail>>,
+    pub(crate) presign_fail: Mutex<Option<Fail>>,
     complete_fail: Mutex<Option<Fail>>,
     /// Makes `complete` panic, as a fault in the task would.
     complete_panics: std::sync::atomic::AtomicBool,
@@ -159,7 +159,7 @@ struct Wrap {
 }
 
 impl Wrap {
-    fn calls(&self) -> [usize; 4] {
+    pub(crate) fn calls(&self) -> [usize; 4] {
         [
             self.begins.load(Ordering::SeqCst),
             self.presigns.load(Ordering::SeqCst),
@@ -168,7 +168,7 @@ impl Wrap {
         ]
     }
 
-    fn set(slot: &Mutex<Option<Fail>>, fail: Option<Fail>) {
+    pub(crate) fn set(slot: &Mutex<Option<Fail>>, fail: Option<Fail>) {
         *slot.lock().unwrap() = fail;
     }
 
@@ -207,6 +207,17 @@ impl MultipartStore for Wrap {
         }
         match &self.inner {
             Some(inner) => inner.presign_part(upload, part),
+            None => Err(StoreError::InvalidKey),
+        }
+    }
+
+    fn presign_get(&self, key: &ObjectKey) -> Result<GetUrl, StoreError> {
+        self.presigns.fetch_add(1, Ordering::SeqCst);
+        if let Some(error) = Wrap::fail(&self.presign_fail) {
+            return Err(error);
+        }
+        match &self.inner {
+            Some(inner) => inner.presign_get(key),
             None => Err(StoreError::InvalidKey),
         }
     }
@@ -291,16 +302,16 @@ impl MultipartStore for Wrap {
 // ---------------------------------------------------------------------------------------------
 // The fixture
 
-struct Fx {
-    u: Up,
-    wrap: Arc<Wrap>,
-    real: Option<(crate::object_server_rustfs::Real, ObjectServer)>,
+pub(crate) struct Fx {
+    pub(crate) u: Up,
+    pub(crate) wrap: Arc<Wrap>,
+    pub(crate) real: Option<(crate::object_server_rustfs::Real, ObjectServer)>,
     /// The agent's session token.
-    token: String,
+    pub(crate) token: String,
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum With {
+pub(crate) enum With {
     /// No store at all.
     Nothing,
     /// The wrapper with no real store behind it.
@@ -310,7 +321,7 @@ enum With {
 }
 
 impl Fx {
-    async fn new(with: With) -> Fx {
+    pub(crate) async fn new(with: With) -> Fx {
         Fx::sized(with, None).await
     }
 
@@ -376,7 +387,7 @@ impl Fx {
         }
     }
 
-    async fn finish(self) {
+    pub(crate) async fn finish(self) {
         self.u.finish().await;
         if let Some((_real, server)) = self.real {
             server.stop(std::future::pending()).await;
@@ -387,7 +398,7 @@ impl Fx {
         self.u.s.addr
     }
 
-    async fn send(
+    pub(crate) async fn send(
         &self,
         method: &str,
         target: &str,
@@ -435,7 +446,7 @@ impl Fx {
         .await
     }
 
-    async fn begin(&self, body: &str) -> Reply {
+    pub(crate) async fn begin(&self, body: &str) -> Reply {
         self.begin_as(Some(&self.token), body).await
     }
 
@@ -450,7 +461,7 @@ impl Fx {
         .await
     }
 
-    async fn part(&self, id: &str, part: &str) -> Reply {
+    pub(crate) async fn part(&self, id: &str, part: &str) -> Reply {
         self.part_as(Some(&self.token), id, part).await
     }
 
@@ -480,7 +491,7 @@ impl Fx {
         .await
     }
 
-    async fn complete(&self, id: &str) -> Reply {
+    pub(crate) async fn complete(&self, id: &str) -> Reply {
         self.complete_as(Some(&self.token), id).await
     }
 
@@ -514,9 +525,22 @@ impl Fx {
         panic!("the row did not become {state}");
     }
 
-    /// A job of agent `agent` (the fixture's own for `None`) with the ownership generation
-    /// `generation` in its signed instruction.
+    /// A job of agent `agent` with the ownership generation `generation` in its signed
+    /// instruction.
     async fn job_for(&self, agent: &str, generation: u64) -> String {
+        self.job_naming(agent, generation, Vec::new(), None, None)
+            .await
+    }
+
+    /// A job whose signed instruction names the given documents (ascending), artifact and plan.
+    pub(crate) async fn job_naming(
+        &self,
+        agent: &str,
+        generation: u64,
+        document_hashes: Vec<[u8; 32]>,
+        artifact_hash: Option<[u8; 32]>,
+        plan_hash: Option<[u8; 32]>,
+    ) -> String {
         let id: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
             .fetch_one(&self.u.w.pool)
             .await
@@ -530,9 +554,9 @@ impl Fx {
             kind: JobKind::Acquire,
             vci: VciId("vci".to_owned()),
             vin: None,
-            document_hashes: Vec::new(),
-            artifact_hash: None,
-            plan_hash: None,
+            document_hashes,
+            artifact_hash,
+            plan_hash,
             issued_at: 1,
             start_deadline: 2,
         };
@@ -541,7 +565,7 @@ impl Fx {
         id
     }
 
-    async fn insert_job(&self, id: &str, agent: &str, signed: &[u8]) {
+    pub(crate) async fn insert_job(&self, id: &str, agent: &str, signed: &[u8]) {
         sqlx::query(
             "INSERT INTO jobs (tenant_id, id, kind, agent_id, operator_id, vci_id, \
                  confirmation_level, start_deadline, signed_job, signing_key_id, idempotency_key) \
@@ -558,7 +582,7 @@ impl Fx {
         .unwrap();
     }
 
-    async fn job(&self) -> String {
+    pub(crate) async fn job(&self) -> String {
         self.job_for(&self.u.id, 1).await
     }
 
@@ -592,12 +616,12 @@ impl Fx {
         .unwrap()
     }
 
-    async fn sql(&self, sql: &str) -> String {
+    pub(crate) async fn sql(&self, sql: &str) -> String {
         self.u.w.sql(sql).await
     }
 
     /// The token of another agent of the same tenant, with its ID.
-    async fn other_agent(&self) -> (String, String) {
+    pub(crate) async fn other_agent(&self) -> (String, String) {
         let agent = Agent::new();
         let id = self.u.w.register(&agent).await;
         let r = self.u.exchange_as(&agent.key, &id).await;
@@ -606,7 +630,7 @@ impl Fx {
     }
 }
 
-fn decl(job: &str, generation: u64, kind: &str, size: u64, sha: &str) -> String {
+pub(crate) fn decl(job: &str, generation: u64, kind: &str, size: u64, sha: &str) -> String {
     format!(
         r#"{{"jobId":"{job}","generation":{generation},"kind":"{kind}","sizeBytes":{size},"sha256":"{sha}"}}"#
     )
@@ -638,7 +662,7 @@ async fn send(fx: &Fx, id: &str, number: u16, len: usize) {
 }
 
 /// The SHA-256 of `bytes` as the begin body writes it.
-fn sha_of(bytes: &[u8]) -> String {
+pub(crate) fn sha_of(bytes: &[u8]) -> String {
     hex(&Sha256::digest(bytes))
 }
 
@@ -652,7 +676,7 @@ async fn begin_for(fx: &Fx, bytes: &[u8]) -> String {
     upload_id(&r)
 }
 
-fn problem(r: &Reply, status: u16, what: &str) {
+pub(crate) fn problem(r: &Reply, status: u16, what: &str) {
     assert_eq!(r.status, status, "{what}: {}", r.head);
     assert_eq!(
         r.header("content-type"),

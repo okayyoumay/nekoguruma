@@ -868,6 +868,55 @@ paths:
         '500': { $ref: '#/components/responses/Problem' }
         '503': { $ref: '#/components/responses/Problem' }
 
+  /v1/agent/downloads:
+    post:
+      tags: [agents]
+      summary: Get a presigned GET URL for a job's IR document or artifact (14.3, ADR-497)
+      description: |
+        The body names `jobId` (a canonical UUID), `generation` (the job's ownership generation,
+        0 to 2^63-1), `kind` (`document` or `artifact`) and `sha256` (64 lowercase hex digits);
+        an unknown, duplicate or null member is **400**, more than 4 KiB **413**, and a body
+        that does not arrive within 5 seconds **408**, all judged before the token. Token and
+        agent row are judged as for the upload routes: a revoked or missing agent is **401** and
+        drops its tokens. The job must be the caller's, the generation must equal the one in the
+        job's stored, signed instruction, and the digest must be named by that instruction: a
+        `document` among its document hashes, an `artifact` as its artifact hash. The job's
+        state plays no part. The object is found by tenant and digest among the objects the
+        store has read back. An unknown job, another agent's or tenant's, another generation, a
+        digest the instruction does not name and one no stored object answers are all the same
+        **404**. The answer is one presigned GET URL, valid for at most 60 seconds (the signing time
+        is cut to the second, so it lapses 59 to 60 seconds after its issue) and a bearer for its life,
+        with `Cache-Control: no-store`; a URL is signed for each request (two in the same
+        second may be identical) and nothing is written. The
+        server asks the object store nothing, so an object it lost shows as the GET failing.
+        The agent hashes the bytes against the instruction's hash before it uses them.
+      security:
+        - agentSession: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DownloadRequest' }
+      responses:
+        '200':
+          description: The URL of the object
+          headers:
+            Cache-Control: { schema: { type: string }, description: '`no-store`' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DownloadUrl' }
+        '400': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/AgentSessionRefused' }
+        '404': { $ref: '#/components/responses/Problem' }
+        '405':
+          description: A method other than POST
+          headers:
+            Allow: { schema: { type: string }, description: '`POST`' }
+        '408': { $ref: '#/components/responses/Problem' }
+        '413': { $ref: '#/components/responses/Problem' }
+        '500': { $ref: '#/components/responses/Problem' }
+        '503': { $ref: '#/components/responses/Problem' }
+
   # ------------------------------------------------------------ Artifacts and extensions
   /v1/artifacts:
     post:
@@ -1213,6 +1262,21 @@ components:
       properties:
         url: { type: string, description: A presigned PUT URL; a bearer for its life }
         expiresInSecs: { type: integer, description: 300 }
+    DownloadRequest:
+      type: object
+      additionalProperties: false
+      required: [jobId, generation, kind, sha256]
+      properties:
+        jobId: { type: string, format: uuid }
+        generation: { type: integer, format: int64, minimum: 0 }
+        kind: { type: string, enum: [document, artifact] }
+        sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+    DownloadUrl:
+      type: object
+      required: [url, expiresInSecs]
+      properties:
+        url: { type: string, description: A presigned GET URL; a bearer for its life }
+        expiresInSecs: { type: integer, description: '60: the URL lapses within 60 seconds of its issue (the signing time is cut to the second)' }
     UploadStatus:
       type: object
       required: [state, partBytes, partCount]

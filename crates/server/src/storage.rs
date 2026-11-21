@@ -277,6 +277,29 @@ impl std::fmt::Debug for PartUrl {
     }
 }
 
+/// A presigned URL an object is GET from. It carries its signature in the query, so `Debug` shows
+/// nothing of it and there is no `Display`; [`GetUrl::expose`] gives the text to hand to the
+/// reader, and it must not be logged.
+#[derive(Clone, PartialEq, Eq)]
+pub struct GetUrl(String);
+
+impl GetUrl {
+    pub(crate) fn new(url: String) -> GetUrl {
+        GetUrl(url)
+    }
+
+    /// The URL as signed.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for GetUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GetUrl(..)")
+    }
+}
+
 /// A part the object server holds. The entity tags it also holds do not leave the store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Part {
@@ -310,6 +333,10 @@ pub const MAX_PARTS: u16 = 10_000;
 /// How long a presigned part URL is valid.
 pub const PART_URL_EXPIRY: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// How long a presigned download URL is valid. A reader starts its GET at once, so the window is
+/// short; whether a transfer that is already running outlives it is the object server's rule.
+pub const GET_URL_EXPIRY: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// An object store whose writer sends the bytes itself, in parts, to presigned URLs. Calls on one
 /// key that complete or delete it are serialised (in this process only); the others run
 /// concurrently. A call whose future is dropped may have done part of its work: every step is
@@ -323,6 +350,10 @@ pub trait MultipartStore: Send + Sync {
     /// `upload` to, valid for [`PART_URL_EXPIRY`]. Computes a signature and does no I/O. The URL
     /// does not bind the part's length.
     fn presign_part(&self, upload: &Upload, part: u16) -> Result<PartUrl, StoreError>;
+
+    /// The URL to GET the object `key` from, valid for [`GET_URL_EXPIRY`]. Computes a signature
+    /// and does no I/O: whether the object exists is not known here.
+    fn presign_get(&self, key: &ObjectKey) -> Result<GetUrl, StoreError>;
 
     /// The parts the object server holds for `upload`, in part order. An upload that is gone
     /// while its object exists is [`StoreError::AlreadyFinished`]; gone with no object,

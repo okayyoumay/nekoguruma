@@ -1,7 +1,7 @@
 # ADR-493: The Data Channel Is Four Session-Token Routes to Presigned Multipart Uploads, Driven by the Agent's Upload Ledger
 
 **Date:** 2026-11-19
-**Status:** Accepted (items 15 to 18 added with the begin, part URL and status routes; item 6's mapping corrected and items 19 to 23 added with the complete route; item 17 extended by item 23; item 11's record of delivery corrected and items 24 to 28 added with the upload ledger; items 6 and 17 amended and item 11 extended by ADR-495)
+**Status:** Accepted (items 15 to 18 added with the begin, part URL and status routes; item 6's mapping corrected and items 19 to 23 added with the complete route; item 17 extended by item 23; item 11's record of delivery corrected and items 24 to 28 added with the upload ledger; items 6 and 17 amended and item 11 extended by ADR-495; a download route added by ADR-497)
 **Affects:** design 5.2, 5.4, 13, 13.3, 14.3, 14.4; `crates/server` (the upload routes, a migration for `job_objects`, `db/README.md`), `crates/agent` (the uploader, the ledger, `connect`, a debug-only enqueue command), `crates/shared-proto` if the route bodies are shared, `api/openapi.yaml` (the four operations, marked planned until served), `docs/glossary.md`; uses ADR-492's `MultipartStore` and ADR-466's session token; fixes the acknowledgement ADR-455 left
 
 ## Context
@@ -307,7 +307,7 @@ most 1 MiB (the journal's frame bound), and a run's final state can be larger.
   object (the read-back runs at the object server's speed).
 
 - The channel carries uploads only: documents and artifacts reach the agent by another leg,
-  and the store has no presigned GET for it. Uploads have no bandwidth limit. Abandoned uploads
+  and the store has no presigned GET for it (ADR-497 adds that leg as a fifth route). Uploads have no bandwidth limit. Abandoned uploads
   are not cleaned up, and a part URL does not bind the length of what is PUT (ADR-492).
 - The part-URL host rule is the registration origin's host, which fits the bundled object
   server and not an external one, and the agent's source bytes can change between hashing and

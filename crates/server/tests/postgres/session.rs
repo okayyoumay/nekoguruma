@@ -292,7 +292,7 @@ pub(crate) struct Up {
     agent: Agent,
     pub(crate) id: String,
     pub(crate) s: Running,
-    sessions: Sessions,
+    pub(crate) sessions: Sessions,
     /// The server's hub: the control channel tests send commands and take the inbox through it.
     pub(crate) hub: Hub,
     /// The text of every challenge and nonce this test sent, for the log check.

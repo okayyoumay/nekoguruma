@@ -113,6 +113,15 @@ kind) WHERE state <> 'failed'` holds the idempotency of begin: two racing begins
 begin. The foreign keys (tenant, agent, and the job through `(tenant_id, job_id)`) have no cascade:
 a job, an agent or a tenant that has objects cannot be deleted under them.
 
+**Content-addressed objects: `ir_documents` and `artifacts` (migration 0014, ADR-497)**
+The download route finds a job's IR document or artifact here, by tenant and digest, and signs a
+GET URL for the row's `storage_key`. Migration 0014 makes each `digest` 64 lowercase hex digits,
+bare (the form of the signed instruction and of `jobs.artifact_digest`; the `sha256:` prefix the
+0001 comment showed was never written, and the column comments are set again), and each
+`storage_key` 36 characters and unique within its table (a key unique across `ir_documents`, `artifacts` and `job_objects` is the writer's to keep). A row exists only for an
+object the store read back and found to match its digest. Nothing writes these tables yet (tests
+seed them); the route that stores IR documents will, and the route only reads.
+
 **Do not store raw data bodies in the DB**
 `dataset_chunks` holds only object storage keys and hashes.
 A `storage_key` column holds the key the object store issued (`begin()`), a lowercase version 4

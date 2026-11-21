@@ -32,7 +32,8 @@ case "$1:$mode" in
   encrypt:empty) exit 0 ;;
   encrypt:big) head -c 1000000 /dev/zero | tr '\0' a ;;
   encrypt:bg) (sleep 4 &); base64 -w0 ;;
-  encrypt:escape) (setsid sleep 4 &); base64 -w0 ;;
+  encrypt:escape) (setsid sh -c 'echo $$ > "$0"; exec sleep 3' "$dir/escaped.pid" </dev/null 2>/dev/null &); base64 -w0 ;;
+  encrypt:pid) echo $$ > "$dir/tool.pid"; exec sleep 30 ;;
   encrypt:slow) sleep 0.4; base64 -w0 ;;
   decrypt:decrypt-fail) echo "fake: decrypt failed" >&2; exit 1 ;;
   decrypt:other) cat "$dir/other.der" ;;
@@ -153,7 +154,6 @@ mod debug {
                 .arg("provision-key")
                 .args(args)
                 .env("PATH", self.path())
-                .env("FAKE_DIR", &self.fake)
                 .env("TMPDIR", &self.tmp)
                 .env("NGR_AGENT_CREDSTORE_DIR", &self.target);
             installation_file::install(&mut command, &self.home, installed, "http://127.0.0.1:1");
@@ -173,6 +173,10 @@ mod debug {
 
         pub fn env_log(&self) -> String {
             fs::read_to_string(self.fake.join("env")).unwrap_or_default()
+        }
+
+        pub fn fake_dir(&self) -> &Path {
+            &self.fake
         }
 
         pub fn target(&self) -> &Path {
@@ -627,8 +631,17 @@ mod hardening {
             provision_with(&plan(&fixture, &search, Duration::from_millis(700))).unwrap_err();
         assert!(matches!(error, ProvisionError::Io(_)), "{error}");
         assert_eq!(error.exit_code(), 3);
+        assert!(error.to_string().contains("timeout"), "{error}");
         assert!(started.elapsed() < Duration::from_secs(3));
         fixture.assert_nothing_in_place();
+        // The escaped process is the test's to end.
+        if let Some(pid) = fs::read_to_string(fixture.fake_dir().join("escaped.pid"))
+            .ok()
+            .and_then(|text| text.trim().parse::<i32>().ok())
+        {
+            // SAFETY: a plain signal to the process the fake recorded.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
     }
 
     /// The release rule for the target directory (`root_owned`): one that another account owns
@@ -714,9 +727,53 @@ mod hardening {
         let shell = ["PWD", "SHLVL", "_", "OLDPWD"];
         for name in names {
             assert!(
-                ["PATH", "LANG", "LC_ALL"].contains(&name) || shell.contains(&name),
+                ["PATH", "LANG"].contains(&name)
+                    || name.starts_with("LC_")
+                    || shell.contains(&name),
                 "{name} reached the tool"
             );
+        }
+    }
+
+    fn alive(pid: i32) -> bool {
+        // A zombie is gone for this purpose.
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| !stat.contains(") Z"))
+    }
+
+    /// The tool dies with the provisioner: the provisioner is killed while the tool runs, and the
+    /// tool's pid, which the fake recorded, is gone soon after.
+    #[test]
+    fn the_tool_dies_when_the_provisioner_is_killed() {
+        let fixture = Fixture::new();
+        fixture.mode("pid");
+        let mut child = fixture
+            .command(&[])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let file = fixture.fake_dir().join("tool.pid");
+        let started = Instant::now();
+        let pid = loop {
+            if let Some(pid) = fs::read_to_string(&file)
+                .ok()
+                .and_then(|text| text.trim().parse::<i32>().ok())
+            {
+                break pid;
+            }
+            assert!(started.elapsed() < Duration::from_secs(10), "no tool pid");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(alive(pid));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let started = Instant::now();
+        while alive(pid) {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the tool lives"
+            );
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 }

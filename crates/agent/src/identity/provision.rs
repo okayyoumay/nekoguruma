@@ -212,16 +212,19 @@ pub fn provision_with(plan: &Plan<'_>) -> Result<PublicKey, ProvisionError> {
         Err(CreateLinkedError::AlreadyExists) => Err(ProvisionError::Exists),
         Err(CreateLinkedError::Io(error)) => {
             // The link may have been made before the failure (a sync, a reopen): say which.
-            if taken(&final_path).unwrap_or(false) {
-                Err(ProvisionError::Io(format!(
+            match taken(&final_path) {
+                Ok(true) => Err(ProvisionError::Io(format!(
                     "the credential is in place but was not synced ({:?}); check it and restart the unit",
                     error.kind()
-                )))
-            } else {
-                Err(io_error(
+                ))),
+                Ok(false) => Err(io_error(
                     "cannot write the credential; nothing is in place",
                     &error,
-                ))
+                )),
+                Err(_) => Err(io_error(
+                    "cannot write the credential, and whether it is in place is unknown; check it",
+                    &error,
+                )),
             }
         }
     }
@@ -279,16 +282,23 @@ fn prepare_dir(dir: &Path, root_owned: bool) -> Result<(), ProvisionError> {
     Ok(())
 }
 
-/// The first executable regular file named [`TOOL`] in the absolute entries of `search_path`;
-/// when `trusted_only`, one that [`trusted`] accepts.
+/// The first executable regular file named [`TOOL`] in the absolute entries of `search_path`.
+/// When `trusted_only`, the file must pass [`trusted_path`] and the path returned is the
+/// resolved one that was checked: a link in a directory another account can write is never
+/// executed, since it could be pointed elsewhere after the check.
 fn find_tool(search_path: &OsStr, trusted_only: bool) -> Option<PathBuf> {
     std::env::split_paths(search_path)
         .filter(|entry| entry.is_absolute())
         .map(|entry| entry.join(TOOL))
-        .find(|candidate| {
-            fs::metadata(candidate)
+        .find_map(|candidate| {
+            let path = if trusted_only {
+                trusted_path(&candidate)?
+            } else {
+                candidate
+            };
+            fs::metadata(&path)
                 .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-                && (!trusted_only || trusted(candidate))
+                .then_some(path)
         })
 }
 
@@ -296,12 +306,18 @@ fn find_tool(search_path: &OsStr, trusted_only: bool) -> Option<PathBuf> {
 /// root and not writable by their group or others: a program run as root must not be one that
 /// another account can replace.
 pub fn trusted(path: &Path) -> bool {
-    let Ok(real) = fs::canonicalize(path) else {
-        return false;
-    };
-    real.ancestors().all(|part| {
-        fs::symlink_metadata(part).is_ok_and(|meta| meta.uid() == 0 && meta.mode() & 0o022 == 0)
-    })
+    trusted_path(path).is_some()
+}
+
+/// The resolved path of `path` when [`trusted`] holds for it. The caller executes this path, not
+/// the one it passed.
+fn trusted_path(path: &Path) -> Option<PathBuf> {
+    let real = fs::canonicalize(path).ok()?;
+    real.ancestors()
+        .all(|part| {
+            fs::symlink_metadata(part).is_ok_and(|meta| meta.uid() == 0 && meta.mode() & 0o022 == 0)
+        })
+        .then_some(real)
 }
 
 /// An exclusive advisory lock on the directory, held until the returned handle drops.
@@ -358,12 +374,19 @@ fn run_tool(
         .stderr(Stdio::inherit())
         // Its own group, so the kill reaches what it started.
         .process_group(0);
-    // SAFETY: the closure calls only prctl, which is async-signal-safe. The tool dies with the
-    // provisioner (an interrupt, a termination), which it would otherwise outlive.
+    // SAFETY: getpid cannot fail.
+    let parent = unsafe { libc::getpid() };
+    // SAFETY: the closure calls only prctl, getppid and _exit, which are async-signal-safe. The
+    // tool dies with the provisioner (an interrupt, a termination), which it would otherwise
+    // outlive; the parent is checked after the request, since one that died before it is never
+    // signalled.
     unsafe {
-        command.pre_exec(|| {
+        command.pre_exec(move || {
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
                 return Err(io::Error::last_os_error());
+            }
+            if libc::getppid() != parent {
+                libc::_exit(127);
             }
             Ok(())
         });
@@ -372,19 +395,58 @@ fn run_tool(
         .spawn()
         .map_err(|error| io_error("cannot start systemd-creds", &error))?;
     let (Some(stdin), Some(mut stdout)) = (child.stdin.take(), child.stdout.take()) else {
+        let _ = child.kill();
+        let _ = child.wait();
         return Err(ProvisionError::Io("systemd-creds has no pipes".to_owned()));
     };
     let deadline = Instant::now() + bound;
-    let group = child.id() as libc::pid_t;
-    let kill_group = |child: &mut std::process::Child| {
-        // SAFETY: a negative pid names the child's process group, made by `process_group(0)`.
-        unsafe { libc::kill(-group, libc::SIGKILL) };
-        let _ = child.kill();
-    };
+    let pid = child.id() as libc::pid_t;
+    // Whether the leader has been reaped. Its pid, and so its group, is reserved only until then:
+    // the group is signalled before the reap and never after it.
+    let mut reaped = false;
+    fn kill_group(pid: libc::pid_t, reaped: bool) {
+        if !reaped {
+            // SAFETY: a negative pid names the child's process group, made by `process_group(0)`,
+            // whose leader has not been reaped, so the number is still ours.
+            unsafe { libc::kill(-pid, libc::SIGKILL) };
+        }
+    }
+    // Ends the tool and reaps it.
+    fn terminate(child: &mut std::process::Child, pid: libc::pid_t, reaped: &mut bool) {
+        kill_group(pid, *reaped);
+        if !*reaped {
+            let _ = child.kill();
+            let _ = child.wait();
+            *reaped = true;
+        }
+    }
+    // Whether the leader has exited and is still waiting to be reaped (`WNOWAIT` leaves it a
+    // zombie, so its pid stays reserved while the group is signalled).
+    fn exited(pid: libc::pid_t) -> io::Result<bool> {
+        // SAFETY: an all-zero siginfo is a valid value for the call to fill.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is valid for writes; the id is a child of this process.
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the call succeeded, so the union holds the child fields.
+        Ok(unsafe { info.si_pid() } != 0)
+    }
 
     let outcome = std::thread::scope(|scope| {
-        // A tool that exits before it has read everything makes the write fail: its status
-        // says why, so the write's own failure is not reported.
+        // The input is the key (about 140 bytes) or the sealed credential (at most the 64 KiB
+        // answer cap), so the write rarely fills the pipe; a thread keeps a tool that does not
+        // read it from stalling the loop below. It ends when the tool exits, the write then
+        // failing, whose cause the status gives. Only a descendant that holds the read end after
+        // the tool is gone could keep it, and the sizes above fit the pipe.
         scope.spawn(move || {
             let mut stdin = stdin;
             let _ = stdin.write_all(input);
@@ -394,35 +456,38 @@ fn run_tool(
         let (mut eof, mut oversize) = (false, false);
         let mut status = None;
         loop {
-            if status.is_none() {
-                match child.try_wait() {
-                    Ok(Some(done)) => {
-                        status = Some(done);
-                        kill_group(&mut child);
+            if !reaped {
+                match exited(pid) {
+                    Ok(true) => {
+                        // The group goes while the leader is a zombie, then the reap.
+                        kill_group(pid, reaped);
+                        status = child.wait().ok();
+                        reaped = true;
                     }
-                    Ok(None) => {}
+                    Ok(false) => {}
                     Err(error) => {
-                        kill_group(&mut child);
-                        let _ = child.wait();
+                        terminate(&mut child, pid, &mut reaped);
                         return Err(io_error("cannot wait for systemd-creds", &error));
                     }
                 }
             }
-            if (eof || oversize) && status.is_some() {
+            if (eof || oversize) && reaped {
                 break;
             }
-            if oversize && status.is_none() {
-                kill_group(&mut child);
+            if oversize {
+                terminate(&mut child, pid, &mut reaped);
+                continue;
             }
             if Instant::now() >= deadline {
-                kill_group(&mut child);
-                let _ = child.wait();
+                // A descendant that left the group is not reached: closing the pipe (the
+                // return) and the exit status say what happened.
+                terminate(&mut child, pid, &mut reaped);
                 return Err(ProvisionError::Io(format!(
-                    "systemd-creds did not finish within {} s and was killed",
+                    "systemd-creds did not finish within {} s and was killed (timeout)",
                     bound.as_secs()
                 )));
             }
-            if eof || oversize {
+            if eof {
                 std::thread::sleep(Duration::from_millis(5));
                 continue;
             }
@@ -442,8 +507,7 @@ fn run_tool(
                     }
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                     Err(error) => {
-                        kill_group(&mut child);
-                        let _ = child.wait();
+                        terminate(&mut child, pid, &mut reaped);
                         return Err(io_error("cannot read the answer of systemd-creds", &error));
                     }
                 }
@@ -523,6 +587,32 @@ mod tests {
         assert!(!trusted(&tool));
         assert!(!trusted(&temp.path().join("missing")));
         assert!(trusted(Path::new("/bin/sh")));
+    }
+
+    /// A link in a directory the caller owns is resolved before it is trusted, and the resolved
+    /// path is the one returned (so the one executed); a link to an untrusted file is refused.
+    #[test]
+    fn a_trusted_tool_is_found_by_its_resolved_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let link = temp.path().join(TOOL);
+        std::os::unix::fs::symlink("/bin/sh", &link).unwrap();
+        assert_eq!(
+            find_tool(temp.path().as_os_str(), true),
+            Some(fs::canonicalize("/bin/sh").unwrap())
+        );
+        // The plain lookup keeps the path it was given.
+        assert_eq!(
+            find_tool(temp.path().as_os_str(), false),
+            Some(link.clone())
+        );
+
+        let other = tempfile::tempdir().unwrap();
+        let target = other.path().join("real");
+        fs::write(&target, b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert_eq!(find_tool(temp.path().as_os_str(), true), None);
     }
 
     #[test]

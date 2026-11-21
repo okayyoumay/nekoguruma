@@ -81,7 +81,7 @@ fn db_failure(d: &Downloads, error: &sqlx::Error) -> Response {
     match db::failure(error) {
         db::Failure::Unavailable(why) => {
             d.warn_download(
-                DownloadWarning::Database,
+                DownloadWarning::Unavailable,
                 "the database is unavailable",
                 &why,
             );
@@ -91,7 +91,7 @@ fn db_failure(d: &Downloads, error: &sqlx::Error) -> Response {
             )
         }
         db::Failure::Internal(why) => {
-            d.warn_download(DownloadWarning::Database, "a statement failed", &why);
+            d.warn_download(DownloadWarning::Internal, "a statement failed", &why);
             internal()
         }
     }

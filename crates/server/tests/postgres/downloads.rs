@@ -896,7 +896,9 @@ async fn the_digest_tables_refuse_a_malformed_digest_or_key() {
             ("35-character key", good.clone(), v4()[1..].to_owned()),
             ("37-character key", good.clone(), format!("{}0", v4())),
         ] {
-            let error = insert(digest, key).await.expect_err(what);
+            let error = insert(digest, key)
+                .await
+                .expect_err(&format!("{table}: {what}"));
             assert_eq!(sqlstate(&error), "23514", "{table}: {what}");
         }
         let key = v4();
@@ -908,37 +910,78 @@ async fn the_digest_tables_refuse_a_malformed_digest_or_key() {
     fx.finish().await;
 }
 
-/// Each reason of the download route has its own gate: a NoRow warning, which a caller can make
-/// at will, does not hide the store's or the database's warning that follows.
+/// The gates gate: a reason that warns twice in a row logs once, and every reason has a gate of
+/// its own, so a NoRow warning, which a caller can make at will, hides none of the others.
 #[tokio::test]
-async fn a_no_row_warning_does_not_hide_the_stores_or_the_databases() {
+async fn the_download_gates_suppress_a_repeat_and_keep_the_reasons_apart() {
     let (log, _guard) = capture();
     let fx = Fx::new(With::Fake).await;
     let n = named(&fx, 1).await;
     let lonely = fx.job_naming(&fx.u.id, 1, vec![[21; 32]], None, None).await;
-    problem(
-        &ask(&fx, &body(&lonely, 1, "document", &hex(&[21; 32]))).await,
-        404,
-        "no row",
-    );
-    assert!(
-        log.text()
-            .contains("download route: a named object has no row")
-    );
+    let no_row = body(&lonely, 1, "document", &hex(&[21; 32]));
+    let count = |what: &str| log.text().matches(what).count();
+    // The same reason twice: one line, and the second request is still answered.
+    problem(&ask(&fx, &no_row).await, 404, "no row");
+    problem(&ask(&fx, &no_row).await, 404, "no row again");
+    assert_eq!(count("download route: a named object has no row"), 1);
+    // A reason that follows is logged.
     *fx.wrap.presign_fail.lock().unwrap() = Some(Fail::Io);
     problem(&ask(&fx, &n.doc(1)).await, 503, "store fails");
-    assert!(
-        log.text()
-            .contains("download route: the object store failed")
+    assert_eq!(count("download route: the object store failed"), 1);
+    // So are an undecodable instruction and a key that does not parse.
+    let broken = v4();
+    fx.insert_job(&broken, &fx.u.id, b"not an envelope").await;
+    problem(
+        &ask(&fx, &body(&broken, 1, "document", &hex(&DOCUMENT))).await,
+        500,
+        "undecodable",
     );
+    assert_eq!(
+        count("download route: a stored job instruction does not decode"),
+        1
+    );
+    let bad_key_job = fx.job_naming(&fx.u.id, 1, vec![[22; 32]], None, None).await;
+    row_of(
+        &fx,
+        "ir_documents",
+        &fx.u.id,
+        &hex(&[22; 32]),
+        &"x".repeat(36),
+    )
+    .await;
+    problem(
+        &ask(&fx, &body(&bad_key_job, 1, "document", &hex(&[22; 32]))).await,
+        500,
+        "bad key",
+    );
+    assert_eq!(
+        count("download route: a stored object key does not parse"),
+        1
+    );
+    // A repeat of the first reason is still suppressed after all that.
+    problem(&ask(&fx, &no_row).await, 404, "no row, a third time");
+    assert_eq!(count("download route: a named object has no row"), 1);
+    // The database's two failures have gates apart: unavailable (a refused statement), then
+    // internal (an answer that cannot be decoded).
     fx.u.w
         .pg
         .execute("ALTER TABLE ir_documents RENAME COLUMN storage_key TO key_x")
         .await;
     problem(&ask(&fx, &n.doc(1)).await, 503, "database refuses");
-    assert!(
-        log.text()
-            .contains("download route: the database is unavailable")
-    );
+    assert_eq!(count("download route: the database is unavailable"), 1);
+    // (The artifacts query has not run yet, so no cached plan hides the change.)
+    fx.u.w
+        .pg
+        .execute("ALTER TABLE artifacts DROP CONSTRAINT artifacts_storage_key_len")
+        .await;
+    fx.u.w
+        .pg
+        .execute(
+            "ALTER TABLE artifacts ALTER COLUMN storage_key TYPE bytea \
+                 USING convert_to(storage_key, 'UTF8')",
+        )
+        .await;
+    problem(&ask(&fx, &n.art(1)).await, 500, "decode fails");
+    assert_eq!(count("download route: a statement failed"), 1);
     fx.finish().await;
 }

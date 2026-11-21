@@ -294,8 +294,10 @@ impl Drop for Registered {
 /// Why the download route warns; each reason has its own log gate.
 #[derive(Clone, Copy)]
 pub(crate) enum DownloadWarning {
-    /// The database is unavailable or a statement failed.
-    Database,
+    /// The database is unavailable (503).
+    Unavailable,
+    /// A statement failed in this code (500).
+    Internal,
     /// The object store failed.
     Store,
     /// A stored job instruction does not decode.
@@ -306,8 +308,31 @@ pub(crate) enum DownloadWarning {
     BadKey,
 }
 
-impl DownloadWarning {
-    const COUNT: usize = 5;
+type Gate = Mutex<Option<Instant>>;
+
+/// The download route's log gates, one per reason so that a flood of one cannot silence another,
+/// and none of them the upload routes'.
+#[derive(Default)]
+struct DownloadGates {
+    unavailable: Gate,
+    internal: Gate,
+    store: Gate,
+    undecodable: Gate,
+    no_row: Gate,
+    bad_key: Gate,
+}
+
+impl DownloadGates {
+    fn of(&self, reason: DownloadWarning) -> &Gate {
+        match reason {
+            DownloadWarning::Unavailable => &self.unavailable,
+            DownloadWarning::Internal => &self.internal,
+            DownloadWarning::Store => &self.store,
+            DownloadWarning::Undecodable => &self.undecodable,
+            DownloadWarning::NoRow => &self.no_row,
+            DownloadWarning::BadKey => &self.bad_key,
+        }
+    }
 }
 
 /// The state of the routes.
@@ -318,9 +343,7 @@ pub struct Uploads {
     backend: Backend,
     hub: Hub,
     gate: Arc<Mutex<Option<Instant>>>,
-    /// The download route's gates, one per reason (a flood of one cannot silence another), and
-    /// none of them the upload routes'.
-    download_gates: Arc<[Mutex<Option<Instant>>; DownloadWarning::COUNT]>,
+    download_gates: Arc<DownloadGates>,
     /// The completion tasks of this process, by tenant and upload (ADR-493 item 20).
     completions: Registry,
 }
@@ -333,7 +356,7 @@ impl Uploads {
             backend,
             hub,
             gate: Arc::new(Mutex::new(None)),
-            download_gates: Arc::new(std::array::from_fn(|_| Mutex::new(None))),
+            download_gates: Arc::default(),
             completions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -348,7 +371,7 @@ impl Uploads {
     /// each reason: a caller that makes one reason warn cannot hide another's or the upload
     /// routes'.
     pub(crate) fn warn_download(&self, reason: DownloadWarning, what: &str, why: &str) {
-        if may_log(&self.download_gates[reason as usize], now(), LOG_EVERY) {
+        if may_log(self.download_gates.of(reason), now(), LOG_EVERY) {
             tracing::warn!(why, "download route: {what}");
         }
     }

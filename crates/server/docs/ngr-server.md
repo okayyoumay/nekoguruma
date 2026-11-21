@@ -287,8 +287,9 @@ hand, so `Arc<dyn MultipartStore>` works, and `Server::object_store()` returns t
   `Display`; `expose()` gives the text for the writer. The URL does not bind the length of what is
   sent (ADR-492's known limits).
 - `presign_get(key)` computes a presigned GET URL for an object, valid at most 60 seconds
-  (`GET_URL_EXPIRY`; the signing time is cut to the second, so it lapses 59 to 60 seconds after its issue), signed as `presign_part` signs. It does no I/O, so it does not know whether
-  the object exists. `GetUrl` has a redacting `Debug` and no `Display`, as `PartUrl` has
+  (`GET_URL_EXPIRY`; the signing time is cut to the second, so it lapses 59 to 60 seconds after its
+  issue), signed as `presign_part` signs. It does no I/O, so it does not know whether the object
+  exists. `GetUrl` has a redacting `Debug` and no `Display`, as `PartUrl` has
   (ADR-497).
 - `list_parts(upload)` pages through the object server's listing (1000 a page) and returns each
   part's number and size, not its entity tag. A listing that is not strictly ascending within 1 to
@@ -322,7 +323,7 @@ The rules the implementation keeps:
 - Every request is a presigned URL built by rusty-s3 and sent over its own HTTP/1 connection to
   `127.0.0.1:<port>` (`connection: close`): no pool, no retry, no redirect, no HTTP/2. A request
   with a body always sends `content-length`, `0` included. A control request is bounded by 30
-  seconds, a presigned URL of the store's own is valid 60 seconds, an XML answer is read up to
+  seconds, a presigned URL of the store's own is valid at most 60 seconds, an XML answer is read up to
   4 MiB and an error body up to 64 KiB (the rest is not read).
 - Nothing logs or puts into an error a URL (it carries a signature), an object key, an upload ID
   or text the object server sent. An error is a fixed message, an operation name and an HTTP
@@ -714,7 +715,10 @@ document hashes, an `artifact` as its artifact hash) and a digest with no `ir_do
 decode and a stored key that does not parse are 500; no store is 503. The job's state plays no
 part. The answer is 200 with the URL and `expiresInSecs: 60` and `Cache-Control: no-store`; the
 route writes nothing and calls the store for no I/O. Nothing logs the URL, the token, the digest or
-the body (ADR-497 items 1 to 5).
+the body (ADR-497 items 1 to 5). Its log gates are its own, apart from the upload routes', and
+every reason has one: the database unavailable (503), a statement that failed (500), the store, an
+instruction that does not decode, a named object with no row and a key that does not parse, so a
+flood of one (a caller can make the no-row warning at will) cannot silence another.
 
 **Completion.** The handler only reads: after the body, the token, the agent's row and the upload
 (404), a `finished` row is answered 200 and a `failed` row 409 with `state: failed`; a missing

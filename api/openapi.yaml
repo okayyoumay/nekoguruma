@@ -885,7 +885,8 @@ paths:
         store has read back. An unknown job, another agent's or tenant's, another generation, a
         digest the instruction does not name and one no stored object answers are all the same
         **404**. The answer is one presigned GET URL, valid 60 seconds and a bearer for its life,
-        with `Cache-Control: no-store`; every request gives a new URL and writes nothing. The
+        with `Cache-Control: no-store`; a URL is signed for each request (two in the same
+        second may be identical) and nothing is written. The
         server asks the object store nothing, so an object it lost shows as the GET failing.
         The agent hashes the bytes against the instruction's hash before it uses them.
       security:

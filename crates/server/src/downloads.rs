@@ -42,7 +42,10 @@ use crate::db;
 use crate::problem::Problem;
 use crate::register::{bounded_body_within, is_json};
 use crate::storage::{GET_URL_EXPIRY, ObjectKey, StoreError};
-use crate::uploads::{MAX_BODY, Number, Uploads, is_digest, json_answer, parse_sha256};
+use crate::uploads::{
+    MAX_BODY, Number, StoredInstruction, Uploads, is_digest, json_answer, parse_sha256,
+    stored_instruction,
+};
 
 /// The route's path.
 pub const PATH: &str = "/api/v1/agent/downloads";
@@ -227,20 +230,10 @@ async fn lookup(
 ) -> Result<Lookup, sqlx::Error> {
     let mut tx = pool.begin().await?;
     db::statement_timeouts(&mut tx).await?;
-    let signed: Option<(Vec<u8>,)> = sqlx::query_as(
-        "SELECT signed_job FROM jobs WHERE tenant_id = $1::uuid AND id = $2::uuid \
-         AND agent_id = $3::uuid",
-    )
-    .bind(tenant)
-    .bind(&wanted.job_id)
-    .bind(agent)
-    .fetch_optional(&mut *tx)
-    .await?;
-    let Some((signed,)) = signed else {
-        return Ok(Lookup::NoJob);
-    };
-    let Some(instruction) = decode(&signed) else {
-        return Ok(Lookup::Undecodable);
+    let instruction = match stored_instruction(&mut tx, tenant, &wanted.job_id, agent).await? {
+        StoredInstruction::NoJob => return Ok(Lookup::NoJob),
+        StoredInstruction::Undecodable => return Ok(Lookup::Undecodable),
+        StoredInstruction::Instruction(instruction) => instruction,
     };
     if instruction.ownership_generation != wanted.generation {
         return Ok(Lookup::OtherGeneration);
@@ -258,13 +251,6 @@ async fn lookup(
     .fetch_optional(&mut *tx)
     .await?;
     Ok(key.map_or(Lookup::NoRow, |(key,)| Lookup::Key(key)))
-}
-
-/// The instruction out of a stored envelope; `None` if it does not decode. The server wrote the
-/// envelope, so its signature is not checked again.
-fn decode(signed: &[u8]) -> Option<JobInstruction> {
-    let envelope = shared_crypto::instruction::Envelope::split(signed).ok()?;
-    JobInstruction::decode(envelope.payload()).ok()
 }
 
 /// Whether the instruction names `hash` as an object of `kind`.

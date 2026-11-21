@@ -665,7 +665,7 @@ async fn a_url_issued_before_a_revocation_still_works_until_it_expires() {
     fx.finish().await;
 }
 
-/// The expiry probe: a URL signed for 2 seconds, a GET started in time and read slowly past the
+/// The expiry probe: a URL signed for 5 seconds, a GET started in time and read slowly past the
 /// expiry. The result is what the bundled object server does, which the route's 60 seconds
 /// relies on only for the start of a transfer: a request is authorised when it arrives, and a
 /// transfer that is under way is not cut when the signature runs out. A GET started after the
@@ -691,7 +691,7 @@ async fn a_transfer_started_before_the_expiry_completes_after_it() {
     let signer = S3Credentials::new(credentials.access_key(), credentials.expose_secret());
     let url = bucket
         .get_object(Some(&signer), key.as_str())
-        .sign(Duration::from_secs(2));
+        .sign(Duration::from_secs(5));
     let target = format!("{}?{}", url.path(), url.query().unwrap_or_default());
     let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
         .await
@@ -713,15 +713,22 @@ async fn a_transfer_started_before_the_expiry_completes_after_it() {
         received.extend_from_slice(&chunk[..n]);
     }
     assert!(
-        started.elapsed() < Duration::from_secs(2),
+        started.elapsed() < Duration::from_secs(5),
         "the GET starts in time"
     );
     let head_end = received.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
     let head = String::from_utf8_lossy(&received[..head_end]).into_owned();
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    // A new GET with the same URL is refused now: the signature has expired.
-    let (late_status, _) = get(url.as_str()).await;
+    // Stall until the signature has expired (the signing time is cut to the second, so how long
+    // that takes varies): a new GET with the same URL is then refused.
+    let mut late_status = 0;
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        late_status = get(url.as_str()).await.0;
+        if late_status != 200 {
+            break;
+        }
+    }
     assert_eq!(late_status, 403, "the expired URL is refused");
     // The slow reader reads the rest.
     let mut body_len = received.len() - head_end;
@@ -744,5 +751,150 @@ async fn a_transfer_started_before_the_expiry_completes_after_it() {
         bytes.len(),
         "a transfer under way is not cut by the expiry"
     );
+    fx.finish().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The warning gates, the agent's row and the token's life, and the migration's rules
+
+/// The download route's warnings have a gate of their own: a caller that makes the route warn
+/// (R11) does not hide the warning of an upload route's failure that comes next.
+#[tokio::test]
+async fn the_download_warnings_do_not_use_up_the_upload_routes_gate() {
+    let (log, _guard) = capture();
+    let fx = Fx::new(With::Fake).await;
+    let job = fx.job_naming(&fx.u.id, 1, vec![[21; 32]], None, None).await;
+    let r = ask(&fx, &body(&job, 1, "document", &hex(&[21; 32]))).await;
+    problem(&r, 404, "no row");
+    assert!(log.text().contains("a named object has no row"));
+    // An upload route's database failure right after: begin's insert is refused.
+    fx.u.w
+        .pg
+        .execute("ALTER TABLE job_objects ADD CONSTRAINT refuse CHECK (false) NOT VALID")
+        .await;
+    let upload_job = fx.job().await;
+    let r = fx
+        .begin(&crate::uploads::decl(
+            &upload_job,
+            1,
+            "result",
+            10,
+            &hex(&[1; 32]),
+        ))
+        .await;
+    problem(&r, 503, "insert refused");
+    let text = log.text();
+    assert!(
+        text.contains("upload route: the database is unavailable"),
+        "the upload route's warning is logged: {text}"
+    );
+    fx.finish().await;
+}
+
+/// R5: an agent whose row is gone is the same 401, and its tokens are dropped.
+#[tokio::test]
+async fn a_missing_agent_row_is_401_and_drops_the_tokens() {
+    let fx = Fx::new(With::Fake).await;
+    let agent = Agent::new();
+    let id = fx.u.w.register(&agent).await;
+    let mut tokens = Vec::new();
+    for _ in 0..2 {
+        let r = fx.u.exchange_as(&agent.key, &id).await;
+        tokens.push(json(&r)["token"].as_str().unwrap().to_owned());
+    }
+    let unknown = ask_as(&fx, Some("x"), &body(&v4(), 1, "document", &hex(&DOCUMENT))).await;
+    for table in [
+        "agent_allowed_operators",
+        "agent_registration_codes",
+        "agents",
+    ] {
+        let column = if table == "agents" { "id" } else { "agent_id" };
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE {column} = $1::uuid"
+        )))
+        .bind(&id)
+        .execute(&fx.u.w.pool)
+        .await
+        .unwrap();
+    }
+    let text = body(&v4(), 1, "document", &hex(&DOCUMENT));
+    let r = ask_as(&fx, Some(&tokens[0]), &text).await;
+    problem(&r, 401, "missing row");
+    assert_eq!(bytes_of(&r), bytes_of(&unknown));
+    // The other token is gone too.
+    let r = ask_as(&fx, Some(&tokens[1]), &text).await;
+    problem(&r, 401, "dropped");
+    fx.finish().await;
+}
+
+/// R4: a token past its lifetime is the same 401.
+#[tokio::test]
+async fn an_expired_token_is_401() {
+    let fx = Fx::new(With::Fake).await;
+    let n = named(&fx, 1).await;
+    // A generation the job does not have: a 404 shows the token was accepted.
+    assert_eq!(ask(&fx, &n.doc(9)).await.status, 404, "live first");
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(
+        server::session::TOKEN_LIFETIME_SECS + 1,
+    ))
+    .await;
+    tokio::time::resume();
+    let r = ask(&fx, &n.doc(9)).await;
+    problem(&r, 401, "expired");
+    assert_eq!(r.header("www-authenticate"), Some("Bearer"));
+    fx.finish().await;
+}
+
+/// Migration 0014: the digest is bare lowercase hex and the storage key is a unique 36-character
+/// text, on both tables.
+#[tokio::test]
+async fn the_digest_tables_refuse_a_malformed_digest_or_key() {
+    let fx = Fx::new(With::Fake).await;
+    let tenant: String =
+        sqlx::query_scalar("SELECT tenant_id::text FROM agents WHERE id = $1::uuid")
+            .bind(&fx.u.id)
+            .fetch_one(&fx.u.w.pool)
+            .await
+            .unwrap();
+    for table in ["ir_documents", "artifacts"] {
+        let insert = |digest: String, key: String| {
+            let pool = fx.u.w.pool.clone();
+            let tenant = tenant.clone();
+            async move {
+                let sql = if table == "ir_documents" {
+                    "INSERT INTO ir_documents (tenant_id, digest, extension_id, schema_version, \
+                         variant_name, source_format, storage_key) \
+                     VALUES ($1::uuid, $2, 'e', 1, 'v', 'odx', $3)"
+                } else {
+                    "INSERT INTO artifacts (tenant_id, digest, size_bytes, storage_key) \
+                     VALUES ($1::uuid, $2, 1, $3)"
+                };
+                sqlx::query(sql)
+                    .bind(tenant)
+                    .bind(digest)
+                    .bind(key)
+                    .execute(&pool)
+                    .await
+            }
+        };
+        let good = hex(&[5; 32]);
+        for (what, digest, key) in [
+            ("uppercase", "AB".repeat(32), v4()),
+            ("prefixed", format!("sha256:{good}"), v4()),
+            ("short digest", good[1..].to_owned(), v4()),
+            ("35-character key", good.clone(), v4()[1..].to_owned()),
+            ("37-character key", good.clone(), format!("{}0", v4())),
+        ] {
+            assert!(insert(digest, key).await.is_err(), "{table}: {what}");
+        }
+        let key = v4();
+        insert(good, key.clone()).await.expect("a good row");
+        // The same key under another digest.
+        assert!(
+            insert(hex(&[6; 32]), key).await.is_err(),
+            "{table}: duplicate key"
+        );
+    }
     fx.finish().await;
 }

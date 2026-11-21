@@ -299,6 +299,8 @@ pub struct Uploads {
     backend: Backend,
     hub: Hub,
     gate: Arc<Mutex<Option<Instant>>>,
+    /// The download route's own gate, so that it cannot use up the upload routes' warnings.
+    download_gate: Arc<Mutex<Option<Instant>>>,
     /// The completion tasks of this process, by tenant and upload (ADR-493 item 20).
     completions: Registry,
 }
@@ -311,6 +313,7 @@ impl Uploads {
             backend,
             hub,
             gate: Arc::new(Mutex::new(None)),
+            download_gate: Arc::new(Mutex::new(None)),
             completions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -321,10 +324,10 @@ impl Uploads {
         }
     }
 
-    /// The warning of the download route, which shares this state: the same gate, so the two
-    /// route families together log at most one failure in [`LOG_EVERY`].
+    /// The warning of the download route, which shares this state but has a gate of its own: a
+    /// caller that makes the download route warn cannot hide the upload routes' warnings.
     pub(crate) fn warn_download(&self, what: &str, why: &str) {
-        if may_log(&self.gate, now(), LOG_EVERY) {
+        if may_log(&self.download_gate, now(), LOG_EVERY) {
             tracing::warn!(why, "download route: {what}");
         }
     }
@@ -592,6 +595,43 @@ enum JobLookup {
     Found(Option<Row>),
 }
 
+/// What the job's stored instruction is, for the routes that judge a job by it.
+pub(crate) enum StoredInstruction {
+    /// No job of that ID belongs to the agent.
+    NoJob,
+    /// The stored instruction does not decode.
+    Undecodable,
+    Instruction(Box<JobInstruction>),
+}
+
+/// The decoded instruction of the agent's job, read in the caller's transaction. The server wrote
+/// the envelope, so its signature is not checked again.
+pub(crate) async fn stored_instruction(
+    tx: &mut sqlx::PgConnection,
+    tenant: &str,
+    job: &str,
+    agent: &str,
+) -> Result<StoredInstruction, sqlx::Error> {
+    let signed: Option<(Vec<u8>,)> = sqlx::query_as(
+        "SELECT signed_job FROM jobs WHERE tenant_id = $1::uuid AND id = $2::uuid \
+         AND agent_id = $3::uuid",
+    )
+    .bind(tenant)
+    .bind(job)
+    .bind(agent)
+    .fetch_optional(tx)
+    .await?;
+    let Some((signed,)) = signed else {
+        return Ok(StoredInstruction::NoJob);
+    };
+    let decoded = shared_crypto::instruction::Envelope::split(&signed)
+        .ok()
+        .and_then(|envelope| JobInstruction::decode(envelope.payload()).ok());
+    Ok(decoded.map_or(StoredInstruction::Undecodable, |i| {
+        StoredInstruction::Instruction(Box::new(i))
+    }))
+}
+
 /// The instruction's ownership generation of the job, then the row that holds the declaration, in
 /// one transaction.
 async fn lookup_job(
@@ -602,22 +642,12 @@ async fn lookup_job(
 ) -> Result<JobLookup, sqlx::Error> {
     let mut tx = pool.begin().await?;
     db::statement_timeouts(&mut tx).await?;
-    let signed: Option<(Vec<u8>,)> = sqlx::query_as(
-        "SELECT signed_job FROM jobs WHERE tenant_id = $1::uuid AND id = $2::uuid \
-         AND agent_id = $3::uuid",
-    )
-    .bind(tenant)
-    .bind(&declared.job_id)
-    .bind(agent)
-    .fetch_optional(&mut *tx)
-    .await?;
-    let Some((signed,)) = signed else {
-        return Ok(JobLookup::NoJob);
+    let instruction = match stored_instruction(&mut tx, tenant, &declared.job_id, agent).await? {
+        StoredInstruction::NoJob => return Ok(JobLookup::NoJob),
+        StoredInstruction::Undecodable => return Ok(JobLookup::Undecodable),
+        StoredInstruction::Instruction(instruction) => instruction,
     };
-    let Some(generation) = instruction_generation(&signed) else {
-        return Ok(JobLookup::Undecodable);
-    };
-    if generation != declared.generation {
+    if instruction.ownership_generation != declared.generation {
         return Ok(JobLookup::OtherGeneration);
     }
     let row = live_row(&mut tx, tenant, declared).await?;
@@ -641,14 +671,6 @@ async fn live_row(
     .fetch_optional(tx)
     .await?;
     Ok(raw.and_then(Row::from_raw))
-}
-
-/// The instruction's `ownership_generation` out of a stored envelope; `None` if it does not
-/// decode. The server wrote the envelope, so its signature is not checked again.
-fn instruction_generation(signed: &[u8]) -> Option<u64> {
-    let envelope = shared_crypto::instruction::Envelope::split(signed).ok()?;
-    let instruction = JobInstruction::decode(envelope.payload()).ok()?;
-    Some(instruction.ownership_generation)
 }
 
 /// Why [`insert_row`] failed. The two differ in what is known of the row: a failed statement (or

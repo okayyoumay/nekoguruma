@@ -41,7 +41,7 @@ agent's answers.
    key would fail its read-back and the store would delete the good object with it (ADR-492
    item 5). A row exists only for an object the store has read back; the route only reads. A
    migration makes each digest 64 lowercase hex digits and each storage key unique within its table.
-5. **The URL lasts 60 seconds**, the store's own request expiry: it is asked for when it is
+5. **The URL lasts at most 60 seconds** (the signing time is cut to the second, so 59 to 60), the store's own request expiry: it is asked for when it is
    about to be used. The route asks the store nothing, so a lost object shows as the agent's
    GET failing.
 

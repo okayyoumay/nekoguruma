@@ -706,18 +706,15 @@ async fn a_transfer_started_before_the_expiry_completes_after_it() {
     // Read the head and a little of the body, then stop reading until the signature has expired.
     let mut received = Vec::new();
     let mut chunk = vec![0u8; 16 * 1024];
-    let started = tokio::time::Instant::now();
     while !received.windows(4).any(|w| w == b"\r\n\r\n") {
         let n = stream.read(&mut chunk).await.unwrap();
         assert!(n > 0, "the head arrives");
         received.extend_from_slice(&chunk[..n]);
     }
-    assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "the GET starts in time"
-    );
     let head_end = received.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
     let head = String::from_utf8_lossy(&received[..head_end]).into_owned();
+    // The 200 is the proof that the transfer began while the signature was valid; how long the
+    // head took is not asserted, since the signing time is cut to the second.
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
     // Stall until the signature has expired (the signing time is cut to the second, so how long
     // that takes varies): a new GET with the same URL is then refused.
@@ -821,7 +818,9 @@ async fn a_missing_agent_row_is_401_and_drops_the_tokens() {
     let r = ask_as(&fx, Some(&tokens[0]), &text).await;
     problem(&r, 401, "missing row");
     assert_eq!(bytes_of(&r), bytes_of(&unknown));
-    // The other token is gone too.
+    // The other token is gone from the session table itself, not only refused for the row.
+    assert!(fx.u.sessions.authenticate(&tokens[0]).is_none());
+    assert!(fx.u.sessions.authenticate(&tokens[1]).is_none());
     let r = ask_as(&fx, Some(&tokens[1]), &text).await;
     problem(&r, 401, "dropped");
     fx.finish().await;
@@ -832,6 +831,7 @@ async fn a_missing_agent_row_is_401_and_drops_the_tokens() {
 async fn an_expired_token_is_401() {
     let fx = Fx::new(With::Fake).await;
     let n = named(&fx, 1).await;
+    let unknown = ask_as(&fx, Some("x"), &n.doc(9)).await;
     // A generation the job does not have: a 404 shows the token was accepted.
     assert_eq!(ask(&fx, &n.doc(9)).await.status, 404, "live first");
     tokio::time::pause();
@@ -842,8 +842,16 @@ async fn an_expired_token_is_401() {
     tokio::time::resume();
     let r = ask(&fx, &n.doc(9)).await;
     problem(&r, 401, "expired");
+    assert_eq!(bytes_of(&r), bytes_of(&unknown));
     assert_eq!(r.header("www-authenticate"), Some("Bearer"));
     fx.finish().await;
+}
+
+fn sqlstate(error: &sqlx::Error) -> String {
+    error
+        .as_database_error()
+        .and_then(|e| e.code().map(|c| c.into_owned()))
+        .unwrap_or_default()
 }
 
 /// Migration 0014: the digest is bare lowercase hex and the storage key is a unique 36-character
@@ -883,18 +891,54 @@ async fn the_digest_tables_refuse_a_malformed_digest_or_key() {
             ("uppercase", "AB".repeat(32), v4()),
             ("prefixed", format!("sha256:{good}"), v4()),
             ("short digest", good[1..].to_owned(), v4()),
+            ("65-character digest", format!("{good}a"), v4()),
+            ("non-hex digest", "g".repeat(64), v4()),
             ("35-character key", good.clone(), v4()[1..].to_owned()),
             ("37-character key", good.clone(), format!("{}0", v4())),
         ] {
-            assert!(insert(digest, key).await.is_err(), "{table}: {what}");
+            let error = insert(digest, key).await.expect_err(what);
+            assert_eq!(sqlstate(&error), "23514", "{table}: {what}");
         }
         let key = v4();
         insert(good, key.clone()).await.expect("a good row");
         // The same key under another digest.
-        assert!(
-            insert(hex(&[6; 32]), key).await.is_err(),
-            "{table}: duplicate key"
-        );
+        let error = insert(hex(&[6; 32]), key).await.unwrap_err();
+        assert_eq!(sqlstate(&error), "23505", "{table}: duplicate key");
     }
+    fx.finish().await;
+}
+
+/// Each reason of the download route has its own gate: a NoRow warning, which a caller can make
+/// at will, does not hide the store's or the database's warning that follows.
+#[tokio::test]
+async fn a_no_row_warning_does_not_hide_the_stores_or_the_databases() {
+    let (log, _guard) = capture();
+    let fx = Fx::new(With::Fake).await;
+    let n = named(&fx, 1).await;
+    let lonely = fx.job_naming(&fx.u.id, 1, vec![[21; 32]], None, None).await;
+    problem(
+        &ask(&fx, &body(&lonely, 1, "document", &hex(&[21; 32]))).await,
+        404,
+        "no row",
+    );
+    assert!(
+        log.text()
+            .contains("download route: a named object has no row")
+    );
+    *fx.wrap.presign_fail.lock().unwrap() = Some(Fail::Io);
+    problem(&ask(&fx, &n.doc(1)).await, 503, "store fails");
+    assert!(
+        log.text()
+            .contains("download route: the object store failed")
+    );
+    fx.u.w
+        .pg
+        .execute("ALTER TABLE ir_documents RENAME COLUMN storage_key TO key_x")
+        .await;
+    problem(&ask(&fx, &n.doc(1)).await, 503, "database refuses");
+    assert!(
+        log.text()
+            .contains("download route: the database is unavailable")
+    );
     fx.finish().await;
 }

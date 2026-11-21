@@ -286,8 +286,8 @@ hand, so `Arc<dyn MultipartStore>` works, and `Server::object_store()` returns t
   region `us-east-1`, path style. It does no I/O. `PartUrl` has a redacting `Debug` and no
   `Display`; `expose()` gives the text for the writer. The URL does not bind the length of what is
   sent (ADR-492's known limits).
-- `presign_get(key)` computes a presigned GET URL for an object, valid 60 seconds
-  (`GET_URL_EXPIRY`), signed as `presign_part` signs. It does no I/O, so it does not know whether
+- `presign_get(key)` computes a presigned GET URL for an object, valid at most 60 seconds
+  (`GET_URL_EXPIRY`; the signing time is cut to the second, so it lapses 59 to 60 seconds after its issue), signed as `presign_part` signs. It does no I/O, so it does not know whether
   the object exists. `GetUrl` has a redacting `Debug` and no `Display`, as `PartUrl` has
   (ADR-497).
 - `list_parts(upload)` pages through the object server's listing (1000 a page) and returns each

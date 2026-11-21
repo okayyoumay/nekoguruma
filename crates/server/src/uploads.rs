@@ -291,6 +291,25 @@ impl Drop for Registered {
     }
 }
 
+/// Why the download route warns; each reason has its own log gate.
+#[derive(Clone, Copy)]
+pub(crate) enum DownloadWarning {
+    /// The database is unavailable or a statement failed.
+    Database,
+    /// The object store failed.
+    Store,
+    /// A stored job instruction does not decode.
+    Undecodable,
+    /// A named object has no row (a caller can make this happen at will).
+    NoRow,
+    /// A stored object key does not parse.
+    BadKey,
+}
+
+impl DownloadWarning {
+    const COUNT: usize = 5;
+}
+
 /// The state of the routes.
 #[derive(Clone)]
 pub struct Uploads {
@@ -299,8 +318,9 @@ pub struct Uploads {
     backend: Backend,
     hub: Hub,
     gate: Arc<Mutex<Option<Instant>>>,
-    /// The download route's own gate, so that it cannot use up the upload routes' warnings.
-    download_gate: Arc<Mutex<Option<Instant>>>,
+    /// The download route's gates, one per reason (a flood of one cannot silence another), and
+    /// none of them the upload routes'.
+    download_gates: Arc<[Mutex<Option<Instant>>; DownloadWarning::COUNT]>,
     /// The completion tasks of this process, by tenant and upload (ADR-493 item 20).
     completions: Registry,
 }
@@ -313,7 +333,7 @@ impl Uploads {
             backend,
             hub,
             gate: Arc::new(Mutex::new(None)),
-            download_gate: Arc::new(Mutex::new(None)),
+            download_gates: Arc::new(std::array::from_fn(|_| Mutex::new(None))),
             completions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -324,10 +344,11 @@ impl Uploads {
         }
     }
 
-    /// The warning of the download route, which shares this state but has a gate of its own: a
-    /// caller that makes the download route warn cannot hide the upload routes' warnings.
-    pub(crate) fn warn_download(&self, what: &str, why: &str) {
-        if may_log(&self.download_gate, now(), LOG_EVERY) {
+    /// The warning of the download route, which shares this state but has a gate of its own for
+    /// each reason: a caller that makes one reason warn cannot hide another's or the upload
+    /// routes'.
+    pub(crate) fn warn_download(&self, reason: DownloadWarning, what: &str, why: &str) {
+        if may_log(&self.download_gates[reason as usize], now(), LOG_EVERY) {
             tracing::warn!(why, "download route: {what}");
         }
     }

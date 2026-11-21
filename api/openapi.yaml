@@ -884,7 +884,7 @@ paths:
         state plays no part. The object is found by tenant and digest among the objects the
         store has read back. An unknown job, another agent's or tenant's, another generation, a
         digest the instruction does not name and one no stored object answers are all the same
-        **404**. The answer is one presigned GET URL, valid 60 seconds and a bearer for its life,
+        **404**. The answer is one presigned GET URL, valid for at most 60 seconds (the signing time is cut to the second, so it lapses 59 to 60 seconds after its issue) and a bearer for its life,
         with `Cache-Control: no-store`; a URL is signed for each request (two in the same
         second may be identical) and nothing is written. The
         server asks the object store nothing, so an object it lost shows as the GET failing.
@@ -1275,7 +1275,7 @@ components:
       required: [url, expiresInSecs]
       properties:
         url: { type: string, description: A presigned GET URL; a bearer for its life }
-        expiresInSecs: { type: integer, description: 60 }
+        expiresInSecs: { type: integer, description: '60: the URL lapses within 60 seconds of its issue (the signing time is cut to the second)' }
     UploadStatus:
       type: object
       required: [state, partBytes, partCount]

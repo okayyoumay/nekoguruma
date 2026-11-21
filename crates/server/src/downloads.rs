@@ -43,15 +43,15 @@ use crate::problem::Problem;
 use crate::register::{bounded_body_within, is_json};
 use crate::storage::{GET_URL_EXPIRY, ObjectKey, StoreError};
 use crate::uploads::{
-    MAX_BODY, Number, StoredInstruction, Uploads, is_digest, json_answer, parse_sha256,
-    stored_instruction,
+    DownloadWarning, MAX_BODY, Number, StoredInstruction, Uploads, is_digest, json_answer,
+    parse_sha256, stored_instruction,
 };
 
 /// The route's path.
 pub const PATH: &str = "/api/v1/agent/downloads";
 
-/// The route shares the state of the upload routes: the pool, the session table, the object store
-/// and the log gate.
+/// The route shares the state of the upload routes: the pool, the session table and the object
+/// store. Its warnings have gates of their own, one per reason (`Uploads::warn_download`).
 type Downloads = Uploads;
 
 // ---------------------------------------------------------------------------------------------
@@ -80,14 +80,18 @@ fn no_store() -> Response {
 fn db_failure(d: &Downloads, error: &sqlx::Error) -> Response {
     match db::failure(error) {
         db::Failure::Unavailable(why) => {
-            d.warn_download("the database is unavailable", &why);
+            d.warn_download(
+                DownloadWarning::Database,
+                "the database is unavailable",
+                &why,
+            );
             problem(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "The database is unavailable",
             )
         }
         db::Failure::Internal(why) => {
-            d.warn_download("a statement failed", &why);
+            d.warn_download(DownloadWarning::Database, "a statement failed", &why);
             internal()
         }
     }
@@ -95,7 +99,11 @@ fn db_failure(d: &Downloads, error: &sqlx::Error) -> Response {
 
 fn store_failure(d: &Downloads, error: &StoreError) -> Response {
     // The store's messages are fixed text: no key or URL.
-    d.warn_download("the object store failed", &error.to_string());
+    d.warn_download(
+        DownloadWarning::Store,
+        "the object store failed",
+        &error.to_string(),
+    );
     match error {
         StoreError::Random => internal(),
         _ => no_store(),
@@ -289,18 +297,26 @@ pub async fn url(State(d): State<Downloads>, request: Request) -> Response {
         Err(error) => return db_failure(&d, &error),
         Ok(Lookup::NoJob | Lookup::OtherGeneration | Lookup::NotNamed) => return not_found(),
         Ok(Lookup::Undecodable) => {
-            d.warn_download("a stored job instruction does not decode", "");
+            d.warn_download(
+                DownloadWarning::Undecodable,
+                "a stored job instruction does not decode",
+                "",
+            );
             return internal();
         }
         Ok(Lookup::NoRow) => {
             // The instruction names an object the server does not hold: the row is missing.
-            d.warn_download("a named object has no row", "");
+            d.warn_download(DownloadWarning::NoRow, "a named object has no row", "");
             return not_found();
         }
         Ok(Lookup::Key(key)) => key,
     };
     let Ok(key) = ObjectKey::parse(&key) else {
-        d.warn_download("a stored object key does not parse", "");
+        d.warn_download(
+            DownloadWarning::BadKey,
+            "a stored object key does not parse",
+            "",
+        );
         return internal();
     };
     let Some(store) = d.store() else {

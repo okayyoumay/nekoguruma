@@ -32,7 +32,12 @@ case "$1:$mode" in
   encrypt:empty) exit 0 ;;
   encrypt:big) head -c 1000000 /dev/zero | tr '\0' a ;;
   encrypt:bg) (sleep 4 &); base64 -w0 ;;
-  encrypt:escape) (setsid sh -c 'echo $$ > "$0"; exec sleep 3' "$dir/escaped.pid" </dev/null 2>/dev/null &); base64 -w0 ;;
+  encrypt:escape)
+    # The escaped process writes its pid only after setsid, so waiting for the file means it
+    # has left the tool's group before the tool can exit and the group is killed.
+    (setsid sh -c 'echo $$ > "$0.tmp" && mv "$0.tmp" "$0"; exec sleep 3' "$dir/escaped.pid" </dev/null 2>/dev/null &)
+    n=0; while [ ! -s "$dir/escaped.pid" ] && [ $n -lt 500 ]; do sleep 0.01; n=$((n+1)); done
+    base64 -w0 ;;
   encrypt:pid) echo $$ > "$dir/tool.pid"; exec sleep 30 ;;
   encrypt:slow) sleep 0.4; base64 -w0 ;;
   decrypt:decrypt-fail) echo "fake: decrypt failed" >&2; exit 1 ;;

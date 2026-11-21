@@ -72,8 +72,9 @@ fingerprint and created as JSON on stdout; a running unit must be restarted to s
 logs to stderr only. Exit status: 0 created; 1 it cannot (not root in a release build, --mode
 user, no installation file or not for the device mode, not Linux, a refused directory, no
 systemd-creds on PATH (it needs systemd 250 or later), the tool refused); 2 a usage error; 3 an
-I/O or tool failure, a timeout or a key that did not verify (nothing is in place); 5 the
-credential already exists.
+I/O or tool failure, a timeout, an installation file that cannot be read (other than for lack
+of access) or a key that did not verify (the message says whether the credential is in place);
+5 the credential already exists.
 
 Every command first reads the installation file (agent.toml, beside the configuration file in
 the system directory; crates/agent/docs/ngr-agent.md): the device's mode, the server's origin

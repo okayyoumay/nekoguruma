@@ -18,19 +18,21 @@ mod installation_file;
 
 const KEY_STORE_VAR: &str = "NGR_AGENT_KEY_STORE";
 
-/// The fake tool. `$FAKE_DIR/mode` picks how it misbehaves; every call appends its arguments to
-/// `$FAKE_DIR/argv` and its environment to `$FAKE_DIR/env`.
+/// The fake tool. The `fake` directory beside its own (it runs with a cleared environment, so
+/// it finds the directory from `$0`): `mode` picks how it misbehaves, and every call appends its
+/// arguments to `argv` and its environment to `env`.
 #[cfg(debug_assertions)]
 const FAKE: &str = r#"#!/bin/sh
-dir="$FAKE_DIR"
+dir="$(dirname "$0")/../fake"
 printf '%s\n' "$*" >> "$dir/argv"
 env >> "$dir/env"
 mode=$(cat "$dir/mode" 2>/dev/null || echo ok)
 case "$1:$mode" in
   encrypt:fail) echo "fake: encrypt failed" >&2; exit 1 ;;
   encrypt:empty) exit 0 ;;
-  encrypt:hang) sleep 30; exit 0 ;;
-  encrypt:big) head -c 70000 /dev/zero | tr '\0' a; exit 0 ;;
+  encrypt:big) head -c 1000000 /dev/zero | tr '\0' a ;;
+  encrypt:bg) (sleep 4 &); base64 -w0 ;;
+  encrypt:escape) (setsid sleep 4 &); base64 -w0 ;;
   encrypt:slow) sleep 0.4; base64 -w0 ;;
   decrypt:decrypt-fail) echo "fake: decrypt failed" >&2; exit 1 ;;
   decrypt:other) cat "$dir/other.der" ;;
@@ -103,7 +105,7 @@ mod debug {
 
     /// A temporary world: the fake tool, the target directory (not yet made), `TMPDIR` and a home
     /// with the device installation file.
-    struct Fixture {
+    pub struct Fixture {
         _root: tempfile::TempDir,
         home: PathBuf,
         bin: PathBuf,
@@ -113,7 +115,7 @@ mod debug {
     }
 
     impl Fixture {
-        fn new() -> Self {
+        pub fn new() -> Self {
             let root = tempfile::tempdir().unwrap();
             let make = |name: &str| {
                 let dir = root.path().join(name);
@@ -135,11 +137,11 @@ mod debug {
             }
         }
 
-        fn mode(&self, mode: &str) {
+        pub fn mode(&self, mode: &str) {
             fs::write(self.fake.join("mode"), mode).unwrap();
         }
 
-        fn path(&self) -> String {
+        pub fn path(&self) -> String {
             format!("{}:/usr/bin:/bin", self.bin.display())
         }
 
@@ -159,27 +161,39 @@ mod debug {
         }
 
         /// `provision-key --mode device` and `args`, for a device installation.
-        fn command(&self, args: &[&str]) -> Command {
+        pub fn command(&self, args: &[&str]) -> Command {
             let mut all = vec!["--mode", "device"];
             all.extend_from_slice(args);
             self.raw(&all, "device")
         }
 
-        fn run(&self, args: &[&str]) -> Output {
+        pub fn run(&self, args: &[&str]) -> Output {
             self.command(args).output().unwrap()
         }
 
-        fn final_path(&self) -> PathBuf {
+        pub fn env_log(&self) -> String {
+            fs::read_to_string(self.fake.join("env")).unwrap_or_default()
+        }
+
+        pub fn target(&self) -> &Path {
+            &self.target
+        }
+
+        pub fn assert_nothing_in_place(&self) {
+            assert_nothing_in_place(self);
+        }
+
+        pub fn final_path(&self) -> PathBuf {
             self.target.join(NAME)
         }
 
-        fn calls(&self) -> Vec<String> {
+        pub fn calls(&self) -> Vec<String> {
             fs::read_to_string(self.fake.join("argv"))
                 .map(|text| text.lines().map(str::to_owned).collect())
                 .unwrap_or_default()
         }
 
-        fn names(&self) -> Vec<String> {
+        pub fn names(&self) -> Vec<String> {
             let mut names: Vec<String> = fs::read_dir(&self.target)
                 .map(|entries| {
                     entries
@@ -402,9 +416,11 @@ mod debug {
         let tool = hanging.join("systemd-creds");
         fs::write(&tool, "#!/bin/sh\nsleep 30\necho late\n").unwrap();
         fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+        // The tool runs with this `PATH` alone, and its script needs `sleep`.
+        let search = std::ffi::OsString::from(format!("{}:/usr/bin:/bin", hanging.display()));
         let plan = Plan {
             dir: &fixture.target,
-            search_path: hanging.as_os_str(),
+            search_path: &search,
             with_key: WithKey::Auto,
             bound: Duration::from_millis(300),
             root_owned: false,
@@ -563,5 +579,144 @@ mod debug {
 
         assert!(fixture.calls().is_empty());
         assert!(!fixture.target.exists());
+    }
+}
+
+#[cfg(debug_assertions)]
+mod hardening {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+
+    use agent::identity::WithKey;
+    use agent::identity::provision::{Plan, ProvisionError, provision_with};
+
+    use super::debug::Fixture;
+
+    fn plan<'a>(fixture: &'a Fixture, search: &'a std::ffi::OsStr, bound: Duration) -> Plan<'a> {
+        Plan {
+            dir: fixture.target(),
+            search_path: search,
+            with_key: WithKey::Auto,
+            bound,
+            root_owned: false,
+        }
+    }
+
+    /// A descendant of the tool that stays in its group and holds standard output is killed with
+    /// the group once the tool has exited, so the run ends at once and succeeds.
+    #[test]
+    fn a_descendant_in_the_tools_group_does_not_hold_the_command() {
+        let fixture = Fixture::new();
+        fixture.mode("bg");
+        let search = std::ffi::OsString::from(fixture.path());
+        let started = Instant::now();
+        provision_with(&plan(&fixture, &search, Duration::from_secs(3))).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    /// A descendant that left the group (`setsid`) and holds standard output is caught by the
+    /// bound: exit 3 within it, and nothing is linked.
+    #[test]
+    fn a_descendant_outside_the_group_is_caught_by_the_bound() {
+        let fixture = Fixture::new();
+        fixture.mode("escape");
+        let search = std::ffi::OsString::from(fixture.path());
+        let started = Instant::now();
+        let error =
+            provision_with(&plan(&fixture, &search, Duration::from_millis(700))).unwrap_err();
+        assert!(matches!(error, ProvisionError::Io(_)), "{error}");
+        assert_eq!(error.exit_code(), 3);
+        assert!(started.elapsed() < Duration::from_secs(3));
+        fixture.assert_nothing_in_place();
+    }
+
+    /// The release rule for the target directory (`root_owned`): one that another account owns
+    /// is refused (exit 1) before the tool runs. As root the directory is given to an unused uid
+    /// first; without that power the test has nothing to show and returns.
+    #[test]
+    fn a_target_directory_of_another_owner_is_refused() {
+        let fixture = Fixture::new();
+        fs::create_dir(fixture.target()).unwrap();
+        fs::set_permissions(fixture.target(), fs::Permissions::from_mode(0o700)).unwrap();
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            let path = std::ffi::CString::new(fixture.target().to_str().unwrap()).unwrap();
+            // SAFETY: a valid NUL-terminated path; the group is left as it is.
+            if unsafe { libc::chown(path.as_ptr(), 64_321, u32::MAX) } != 0 {
+                return;
+            }
+        }
+        let search = std::ffi::OsString::from(fixture.path());
+        let mut plan = plan(&fixture, &search, Duration::from_secs(5));
+        plan.root_owned = true;
+        let error = provision_with(&plan).unwrap_err();
+        assert_eq!(error.exit_code(), 1, "{error}");
+        assert!(error.to_string().contains("owned by root"), "{error}");
+        assert!(fixture.calls().is_empty());
+    }
+
+    /// P2: a regular file where the target directory belongs is refused (exit 1), untouched, and
+    /// the tool never runs.
+    #[test]
+    fn a_file_at_the_target_path_is_refused() {
+        let fixture = Fixture::new();
+        fs::write(fixture.target(), b"a file").unwrap();
+        let output = fixture.run(&[]);
+        assert_eq!(output.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("not a directory"));
+        assert!(fixture.calls().is_empty());
+        assert_eq!(fs::read(fixture.target()).unwrap(), b"a file");
+    }
+
+    /// A stale temporary file beside a final name that already exists is removed too, and the
+    /// answer is still exit 5 with the credential untouched.
+    #[test]
+    fn a_stale_temporary_file_beside_an_existing_credential_is_removed() {
+        let fixture = Fixture::new();
+        fs::create_dir(fixture.target()).unwrap();
+        fs::set_permissions(fixture.target(), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(fixture.final_path(), b"sealed").unwrap();
+        let tmp = fixture
+            .target()
+            .join(format!("{}.tmp", agent::identity::DEVICE_CREDENTIAL_NAME));
+        fs::write(&tmp, b"half").unwrap();
+        let output = fixture.run(&[]);
+        assert_eq!(output.status.code(), Some(5));
+        assert!(!tmp.exists());
+        assert_eq!(fs::read(fixture.final_path()).unwrap(), b"sealed");
+        assert!(fixture.calls().is_empty());
+    }
+
+    /// The tool runs with `PATH`, `LANG` and `LC_*` only: nothing else of the caller's
+    /// environment reaches it.
+    #[test]
+    fn the_tool_gets_a_cleared_environment() {
+        let fixture = Fixture::new();
+        let output = fixture
+            .command(&[])
+            .env("LANG", "C.UTF-8")
+            .env("LC_ALL", "C.UTF-8")
+            .env("SYSTEMD_LOG_LEVEL", "debug")
+            .env("SECRET_PROBE", "leak")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0));
+        let log = fixture.env_log();
+        let names: std::collections::BTreeSet<&str> = log
+            .lines()
+            .filter_map(|line| line.split_once('=').map(|(name, _)| name))
+            .collect();
+        for kept in ["PATH", "LANG", "LC_ALL"] {
+            assert!(names.contains(kept), "{kept} missing from {names:?}");
+        }
+        // What a shell adds itself is not the caller's.
+        let shell = ["PWD", "SHLVL", "_", "OLDPWD"];
+        for name in names {
+            assert!(
+                ["PATH", "LANG", "LC_ALL"].contains(&name) || shell.contains(&name),
+                "{name} reached the tool"
+            );
+        }
     }
 }

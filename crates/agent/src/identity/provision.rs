@@ -14,7 +14,7 @@
 //! Exit statuses ([`ProvisionError::exit_code`]): 1 it cannot be done as asked, 3 an I/O or tool
 //! failure with nothing in place, 5 the credential already exists.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -139,11 +139,18 @@ pub fn require_root() -> Result<(), ProvisionError> {
 pub fn provision_with(plan: &Plan<'_>) -> Result<PublicKey, ProvisionError> {
     prepare_dir(plan.dir, plan.root_owned)?;
     let final_path = plan.dir.join(DEVICE_CREDENTIAL_NAME);
+    let tmp = plan.dir.join(format!("{DEVICE_CREDENTIAL_NAME}.tmp"));
     if taken(&final_path)? {
+        remove_stale_temporary(plan.dir, &tmp);
         return Err(ProvisionError::Exists);
     }
-    let tool = find_tool(plan.search_path).ok_or_else(|| {
-        cannot("systemd-creds was not found on PATH; provisioning needs systemd 250 or later")
+    let tool = find_tool(plan.search_path, plan.root_owned).ok_or_else(|| {
+        cannot(if plan.root_owned {
+            "no trusted systemd-creds was found on PATH (a root-owned file in root-owned directories \
+             that others cannot write); provisioning needs systemd 250 or later"
+        } else {
+            "systemd-creds was not found on PATH; provisioning needs systemd 250 or later"
+        })
     })?;
 
     let generated = SigningKey::generate().map_err(|_| cannot("no random bytes for the key"))?;
@@ -152,6 +159,7 @@ pub fn provision_with(plan: &Plan<'_>) -> Result<PublicKey, ProvisionError> {
     drop(generated);
 
     let name_arg = format!("--name={DEVICE_CREDENTIAL_NAME}");
+    let env = tool_environment(plan.search_path);
     let sealed = run_tool(
         &tool,
         &[
@@ -162,6 +170,7 @@ pub fn provision_with(plan: &Plan<'_>) -> Result<PublicKey, ProvisionError> {
             "-".to_owned(),
             "-".to_owned(),
         ],
+        &env,
         &plaintext,
         plan.bound,
     )?;
@@ -175,6 +184,7 @@ pub fn provision_with(plan: &Plan<'_>) -> Result<PublicKey, ProvisionError> {
             "-".to_owned(),
             "-".to_owned(),
         ],
+        &env,
         &sealed,
         plan.bound,
     )
@@ -192,15 +202,36 @@ pub fn provision_with(plan: &Plan<'_>) -> Result<PublicKey, ProvisionError> {
     let _lock =
         lock_dir(plan.dir).map_err(|error| io_error("cannot lock the directory", &error))?;
     if taken(&final_path)? {
+        let _ = fs::remove_file(&tmp);
         return Err(ProvisionError::Exists);
     }
-    let tmp = plan.dir.join(format!("{DEVICE_CREDENTIAL_NAME}.tmp"));
     let mut options = OpenOptions::new();
     options.mode(0o600);
     match create_linked(plan.dir, &final_path, &tmp, &sealed, options) {
         Ok(_) => Ok(public),
         Err(CreateLinkedError::AlreadyExists) => Err(ProvisionError::Exists),
-        Err(CreateLinkedError::Io(error)) => Err(io_error("cannot write the credential", &error)),
+        Err(CreateLinkedError::Io(error)) => {
+            // The link may have been made before the failure (a sync, a reopen): say which.
+            if taken(&final_path).unwrap_or(false) {
+                Err(ProvisionError::Io(format!(
+                    "the credential is in place but was not synced ({:?}); check it and restart the unit",
+                    error.kind()
+                )))
+            } else {
+                Err(io_error(
+                    "cannot write the credential; nothing is in place",
+                    &error,
+                ))
+            }
+        }
+    }
+}
+
+/// Removes a temporary file an earlier attempt left, under the directory lock, so that it is not
+/// taken from a run that is writing it. Best effort: the answer is "exists" either way.
+fn remove_stale_temporary(dir: &Path, tmp: &Path) {
+    if let Ok(_lock) = lock_dir(dir) {
+        let _ = fs::remove_file(tmp);
     }
 }
 
@@ -248,15 +279,29 @@ fn prepare_dir(dir: &Path, root_owned: bool) -> Result<(), ProvisionError> {
     Ok(())
 }
 
-/// The first executable regular file named [`TOOL`] in the absolute entries of `search_path`.
-fn find_tool(search_path: &OsStr) -> Option<PathBuf> {
+/// The first executable regular file named [`TOOL`] in the absolute entries of `search_path`;
+/// when `trusted_only`, one that [`trusted`] accepts.
+fn find_tool(search_path: &OsStr, trusted_only: bool) -> Option<PathBuf> {
     std::env::split_paths(search_path)
         .filter(|entry| entry.is_absolute())
         .map(|entry| entry.join(TOOL))
         .find(|candidate| {
             fs::metadata(candidate)
                 .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+                && (!trusted_only || trusted(candidate))
         })
+}
+
+/// Whether the file at `path` and every directory above it (after resolving links) are owned by
+/// root and not writable by their group or others: a program run as root must not be one that
+/// another account can replace.
+pub fn trusted(path: &Path) -> bool {
+    let Ok(real) = fs::canonicalize(path) else {
+        return false;
+    };
+    real.ancestors().all(|part| {
+        fs::symlink_metadata(part).is_ok_and(|meta| meta.uid() == 0 && meta.mode() & 0o022 == 0)
+    })
 }
 
 /// An exclusive advisory lock on the directory, held until the returned handle drops.
@@ -275,93 +320,162 @@ fn lock_dir(dir: &Path) -> io::Result<File> {
     }
 }
 
-/// Runs `tool` with `args`, feeds it `input` on standard input and returns its standard output.
-/// Its standard error is the caller's. The tool is killed (with its process group) when it runs
-/// past `bound`. A non-zero status is [`ProvisionError::Cannot`]; a timeout, an I/O failure and an
-/// empty or oversize answer are [`ProvisionError::Io`].
+/// The environment the tool gets: `path` as `PATH`, and the caller's `LANG` and `LC_*`; nothing
+/// else (ADR-498 item 3).
+fn tool_environment(path: &OsStr) -> Vec<(OsString, OsString)> {
+    let mut vars = vec![(OsString::from("PATH"), path.to_owned())];
+    vars.extend(std::env::vars_os().filter(|(name, _)| {
+        name.to_str()
+            .is_some_and(|n| n == "LANG" || n.starts_with("LC_"))
+    }));
+    vars
+}
+
+/// Runs `tool` with `args` and `env` only, feeds it `input` on standard input and returns its
+/// standard output. Its standard error is the caller's. The whole run, the read of standard output
+/// included, is bounded by `bound`: past it the tool's process group is killed and the run is
+/// [`ProvisionError::Io`]. The group is killed again once the tool has exited, so a descendant
+/// that kept standard output open does not hold the command; one that left the group (`setsid`)
+/// is caught by the bound. The size cap is checked before the status: a tool cut off at the cap
+/// dies of a broken pipe, which is still "too long". A non-zero status is
+/// [`ProvisionError::Cannot`]; a timeout, an I/O failure and an empty or oversize answer are
+/// [`ProvisionError::Io`].
 fn run_tool(
     tool: &Path,
     args: &[String],
+    env: &[(OsString, OsString)],
     input: &[u8],
     bound: Duration,
 ) -> Result<Zeroizing<Vec<u8>>, ProvisionError> {
-    let mut child = Command::new(tool)
+    use std::os::fd::AsRawFd;
+    let mut command = Command::new(tool);
+    command
         .args(args)
+        .env_clear()
+        .envs(env.iter().map(|(k, v)| (k, v)))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
-        .process_group(0)
+        // Its own group, so the kill reaches what it started.
+        .process_group(0);
+    // SAFETY: the closure calls only prctl, which is async-signal-safe. The tool dies with the
+    // provisioner (an interrupt, a termination), which it would otherwise outlive.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command
         .spawn()
         .map_err(|error| io_error("cannot start systemd-creds", &error))?;
-    let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+    let (Some(stdin), Some(mut stdout)) = (child.stdin.take(), child.stdout.take()) else {
         return Err(ProvisionError::Io("systemd-creds has no pipes".to_owned()));
     };
     let deadline = Instant::now() + bound;
     let group = child.id() as libc::pid_t;
+    let kill_group = |child: &mut std::process::Child| {
+        // SAFETY: a negative pid names the child's process group, made by `process_group(0)`.
+        unsafe { libc::kill(-group, libc::SIGKILL) };
+        let _ = child.kill();
+    };
 
-    let (status, answer) = std::thread::scope(|scope| {
+    let outcome = std::thread::scope(|scope| {
         // A tool that exits before it has read everything makes the write fail: its status
         // says why, so the write's own failure is not reported.
-        let writer = scope.spawn(move || {
+        scope.spawn(move || {
             let mut stdin = stdin;
             let _ = stdin.write_all(input);
         });
-        let reader = scope.spawn(move || {
-            let mut buffer = Zeroizing::new(Vec::with_capacity(MAX_ANSWER + 1));
-            stdout
-                .take(MAX_ANSWER as u64 + 1)
-                .read_to_end(&mut buffer)
-                .map(|_| buffer)
-        });
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break Ok(status),
-                Ok(None) if Instant::now() >= deadline => {
-                    // SAFETY: a negative pid names the child's process group, made by
-                    // `process_group(0)` above.
-                    unsafe { libc::kill(-group, libc::SIGKILL) };
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break Err(ProvisionError::Io(format!(
-                        "systemd-creds did not finish within {} s and was killed",
-                        bound.as_secs()
-                    )));
+        let mut buffer = Zeroizing::new(vec![0u8; MAX_ANSWER + 1]);
+        let mut filled = 0;
+        let (mut eof, mut oversize) = (false, false);
+        let mut status = None;
+        loop {
+            if status.is_none() {
+                match child.try_wait() {
+                    Ok(Some(done)) => {
+                        status = Some(done);
+                        kill_group(&mut child);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        kill_group(&mut child);
+                        let _ = child.wait();
+                        return Err(io_error("cannot wait for systemd-creds", &error));
+                    }
                 }
-                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-                Err(error) => break Err(io_error("cannot wait for systemd-creds", &error)),
             }
-        };
-        let _ = writer.join();
-        let answer = reader.join();
-        (status, answer)
+            if (eof || oversize) && status.is_some() {
+                break;
+            }
+            if oversize && status.is_none() {
+                kill_group(&mut child);
+            }
+            if Instant::now() >= deadline {
+                kill_group(&mut child);
+                let _ = child.wait();
+                return Err(ProvisionError::Io(format!(
+                    "systemd-creds did not finish within {} s and was killed",
+                    bound.as_secs()
+                )));
+            }
+            if eof || oversize {
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+            let mut poll = libc::pollfd {
+                fd: stdout.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one valid pollfd; the bounded timeout keeps the loop checking the clock.
+            let ready = unsafe { libc::poll(&mut poll, 1, 10) };
+            if ready > 0 {
+                match stdout.read(&mut buffer[filled..]) {
+                    Ok(0) => eof = true,
+                    Ok(n) => {
+                        filled += n;
+                        oversize = filled > MAX_ANSWER;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) => {
+                        kill_group(&mut child);
+                        let _ = child.wait();
+                        return Err(io_error("cannot read the answer of systemd-creds", &error));
+                    }
+                }
+            }
+        }
+        Ok((status, oversize, filled, buffer))
     });
 
-    let status = status?;
-    if !status.success() {
-        return Err(cannot(match status.code() {
-            Some(code) => format!("systemd-creds failed with exit status {code}"),
-            None => "systemd-creds was ended by a signal".to_owned(),
-        }));
-    }
-    let answer = answer
-        .map_err(|_| ProvisionError::Io("reading systemd-creds panicked".to_owned()))?
-        .map_err(|error| io_error("cannot read the answer of systemd-creds", &error))?;
-    if answer.len() > MAX_ANSWER {
+    let (status, oversize, filled, mut answer) = outcome?;
+    if oversize {
         return Err(ProvisionError::Io(
             "the answer of systemd-creds is too long".to_owned(),
         ));
     }
-    if answer.is_empty() {
+    if status.is_some_and(|status| !status.success()) {
+        return Err(cannot(match status.and_then(|status| status.code()) {
+            Some(code) => format!("systemd-creds failed with exit status {code}"),
+            None => "systemd-creds was ended by a signal".to_owned(),
+        }));
+    }
+    if filled == 0 {
         return Err(ProvisionError::Io(
             "systemd-creds answered with nothing".to_owned(),
         ));
     }
+    answer.truncate(filled);
     Ok(answer)
 }
 
 #[cfg(test)]
 fn search(dir: &Path) -> Option<PathBuf> {
-    find_tool(dir.as_os_str())
+    find_tool(dir.as_os_str(), false)
 }
 
 #[cfg(test)]
@@ -394,7 +508,21 @@ mod tests {
         assert_eq!(search(temp.path()), None);
         fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(search(temp.path()), Some(tool));
-        assert_eq!(find_tool(OsStr::new("relative")), None);
+        assert_eq!(find_tool(OsStr::new("relative"), false), None);
+    }
+
+    /// The trust rule of a release build: a file or a directory that others may write, or that a
+    /// non-root account owns, is not trusted (the temporary directory is under world-writable
+    /// `/tmp`, whoever the tests run as); the system shell is.
+    #[test]
+    fn a_tool_is_trusted_only_under_root_owned_unwritable_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let tool = temp.path().join(TOOL);
+        fs::write(&tool, b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!trusted(&tool));
+        assert!(!trusted(&temp.path().join("missing")));
+        assert!(trusted(Path::new("/bin/sh")));
     }
 
     #[test]

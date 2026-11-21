@@ -43,7 +43,9 @@ The maintainer confirmed the fifteen choices below on 2026-11-21, from a case ta
 3. **`ngr-agent provision-key --mode device [--with-key auto|host|tpm2|host+tpm2]`**, Linux only,
    `auto` by default and a closed list (anything else is a usage error, exit 2). In order:
    - a release build refuses a caller who is not root (`geteuid`); `--mode user`, an installation
-     file that is missing or not for the device mode, and a host that is not Linux are exit 1;
+     file that is missing or not for the device mode, and a host that is not Linux are exit 1 (an
+     installation file that cannot be read for a reason other than a refusal of access is exit 3,
+     as for every command);
    - the target is `/etc/credstore.encrypted` (a debug build alone moves it with
      `NGR_AGENT_CREDSTORE_DIR`, which also lifts the root checks, so tests run as a user). A
      missing directory is created 0700, its last component only. A directory that is not owned by
@@ -51,21 +53,30 @@ The maintainer confirmed the fifteen choices below on 2026-11-21, from a case ta
    - anything at the final name, a dangling symlink and an empty file included (found with
      `lstat`), is exit 5, before a key is generated and before the tool is started;
    - `systemd-creds` is looked up on the absolute entries of `PATH`; without it the command exits 1
-     naming systemd 250 or later, before a key is generated;
+     naming systemd 250 or later, before a key is generated. A release build accepts only a file
+     that, with every directory above it (links resolved), is owned by root and not writable by
+     its group or others; a debug build with the moved target keeps the plain lookup. The tool runs
+     with a cleared environment: `PATH`, `LANG` and `LC_*` only;
    - the key is generated as `load_or_create` does (P-256, PKCS#8) and held in `Zeroizing` memory;
    - `systemd-creds encrypt --name=nekoguruma-agent-key.device.v1 --with-key=<k> --tpm2-pcrs= - -`
      gets the plaintext on standard input and answers the ciphertext on standard output. The tool
-     runs in its own process group and is killed after 60 seconds. A non-zero status is exit 1; a
+     runs in its own process group, and the run, the read of its output included, is bounded by 60
+     seconds; past it the group is killed, and it is killed again when the tool exits, so a
+     descendant holding the output does not hold the command (one that left the group is caught by
+     the bound). The size cap is checked before the status. A non-zero status is exit 1; a
      timeout, an I/O failure and an empty or longer-than-64-KiB answer are exit 3. The tool's
-     standard error passes through;
+     standard error passes through, and the tool is killed if the provisioner dies;
    - `systemd-creds decrypt --name=<name> - -` must give back the generated key (the public keys
      are compared); a failure or a mismatch is exit 3 and nothing is linked;
    - the ciphertext is linked in with `journal::create_linked(dir, name, name.tmp, ciphertext,
      0600)`, which never replaces, after an exclusive lock on the directory so that two runs at once
-     end as one exit 0 and one exit 5; a stale `name.tmp` is removed first;
+     end as one exit 0 and one exit 5; a stale `name.tmp` is removed first, and also when the
+     credential already exists (exit 5). A write that fails after the link was made is exit 3 with
+     a message that the credential is in place but was not synced (check it and restart the unit);
+     any other write failure says nothing is in place;
    - on success it prints `{"public_key_pem", "fingerprint", "created": true}` as `identity` does and
      says on standard error that a running unit must be restarted. It logs to standard error only.
-   Exit statuses: 0 created, 1 it cannot, 2 usage, 3 I/O with nothing in place, 5 exists. The
+   Exit statuses: 0 created, 1 it cannot, 2 usage, 3 an I/O failure (the message says whether the credential is in place), 5 exists. The
    logic is `identity::provision`; `main.rs` dispatches.
 4. **The unit** carries `LoadCredentialEncrypted=nekoguruma-agent-key.device.v1:/etc/credstore.encrypted/nekoguruma-agent-key.device.v1`
    and no other credential directive. The name and the path are constants in `identity`, on every
@@ -116,5 +127,9 @@ standard-error logging only; (15) this ADR.
 - Resetting the key is the administrator removing the credential file and provisioning again; the
   agent never replaces or deletes it, and it must then register again.
 - A running unit does not see a key provisioned after it started; it is restarted.
-- `provision-key` trusts the `systemd-creds` found on the root account's `PATH`.
+- `provision-key` runs the `systemd-creds` found on the root account's `PATH`; a release build
+  accepts only a root-owned file in root-owned directories that others cannot write.
+- The tool dies with the provisioner (`PR_SET_PDEATHSIG`), but a descendant it started in its
+  own process group is not killed when the provisioner is interrupted or terminated and may
+  outlive it. The tool keeps a group of its own so that a timeout can kill what it started.
 - Windows has no device-mode store yet.

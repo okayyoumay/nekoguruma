@@ -2,7 +2,7 @@
 
 **Date:** 2026-11-21
 **Status:** Accepted
-**Affects:** design 6.8, 8.2.6, 11.1, 14.3; `crates/server` (`documents`, `storage`, `storage/s3`, `audit`, `register`, `uploads`, `lib`), `db/migrations/0015_document_extension_id_nullable.sql`, `db/README.md`, `api/openapi.yaml`, `crates/server/docs/ngr-server.md`; fulfils the writer that ADR-497 leaves to a later route; extends ADR-454 and ADR-492
+**Affects:** design 6.8, 8.2.6, 11.1, 14.3; `crates/server` (`documents`, `storage`, `storage/s3`, `audit`, `register`, `uploads`, `lib`), `db/migrations/0015_document_extension_id_nullable.sql`, `db/README.md`, `api/openapi.yaml`, `crates/server/docs/ngr-server.md`; annotates ADR-477; fulfils the writer that ADR-497 leaves to a later route; extends ADR-454 and ADR-492; the check at job creation (ADR-477 item 2) is a later change
 
 ## Context
 
@@ -55,8 +55,10 @@ from a case table of the route's answers.
     NOTHING`; the loser deletes its own object, whose key no row holds, and answers 200. No
     transaction is open across a store call: the existing-row check and the insert with its audit
     row are transactions of their own.
-11. **The key is guarded against the other two tables.** The insert is conditional on the key
-    being in neither `artifacts` nor `job_objects`. The key always comes from this request's
+11. **The key is guarded against all three tables.** The insert is conditional on the key
+    being in none of `artifacts`, `job_objects` and `ir_documents`, and a unique violation on
+    `ir_documents`' own key is the same refusal. When no row is inserted, the key's own presence
+    in the three tables decides between this refusal and a lost race, not the digest's row. The key always comes from this request's
     `begin`, so a hit cannot happen unless the store reissues a key; it is a 500 and the object is
     not deleted, since it may be another row's. The guard is one-directional: the upload route's
     insert does not look at `ir_documents`, and a key table shared by all three is the full fix.
@@ -90,9 +92,9 @@ The first row that applies answers.
 | R16 | `complete` fails (a mismatch has deleted the object already) | 503, the object is deleted, best effort, no row |
 | R17 | The insert wins | audit row, commit, 201 |
 | R18 | A concurrent store won | the loser's object is deleted, 200; one row, one object |
-| R19 | The key is in `artifacts` or `job_objects` | 500, no row, no delete |
+| R19 | The key is in `artifacts`, `job_objects` or `ir_documents`, whatever else is stored for the digest | 500, no row, no delete |
 | R20 | A statement fails after the read-back (the audit insert) | rollback, the object is deleted, 503 or 500 |
-| R21 | The commit fails with the outcome unknown | 503, the object is kept |
+| R21 | The commit fails with the outcome unknown | 503 (500 for a fault that is not a database or connection error), the object is kept |
 | R22 | Another tenant holds the digest | 201, with a row and an object of its own |
 | R23 | The row exists and its object is lost | 200, no repair |
 | R24 | On the real object server, a small and a 16 MiB document | 201; the object equals the body; the download route signs it |

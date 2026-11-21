@@ -440,6 +440,24 @@ async fn the_name_is_64_lowercase_hex_digits() {
     lab.finish().await;
 }
 
+#[tokio::test]
+async fn a_name_that_does_not_decode_is_the_routes_own_400() {
+    let lab = Lab::new(With::Fake).await;
+    let fx = &lab.fx;
+    for name in ["%ff", "%c3%28", "%ff%ff"] {
+        let r = exchange_bytes(fx, good_head(fx, &lab.worker, name, 100), b"", false).await;
+        assert_eq!(r.status, 400, "{name}: {}", r.head);
+        closes(&r, "undecodable name");
+        assert_eq!(r.header("content-type"), Some("application/problem+json"));
+        assert_eq!(
+            json(&r)["title"],
+            "The name must be 64 lowercase hexadecimal digits"
+        );
+    }
+    lab.assert_untouched("undecodable name").await;
+    lab.finish().await;
+}
+
 // R4
 #[tokio::test]
 async fn the_body_is_an_octet_stream() {
@@ -597,6 +615,16 @@ async fn a_third_concurrent_store_is_turned_away() {
     }
     assert!(freed, "the slots are given back");
     lab.assert_untouched("R7").await;
+    // Both slots are free: two stores at once both succeed.
+    let (a, b) = (doc("slot a"), doc("slot b"));
+    let (ra, rb) = tokio::join!(lab.store(&a), lab.store(&b));
+    assert_eq!(
+        (ra.status, rb.status),
+        (201, 201),
+        "{} / {}",
+        ra.head,
+        rb.head
+    );
     lab.finish().await;
 }
 
@@ -667,6 +695,14 @@ async fn a_body_past_the_bound_or_the_time_is_cut() {
         text.is_empty() || text.starts_with("HTTP/1.1 400"),
         "{text}"
     );
+    // When the answer does arrive, its title fits an octet stream, not a JSON object.
+    if !text.is_empty() {
+        assert!(
+            text.contains("The request body broke before its end"),
+            "{text}"
+        );
+        assert!(!text.contains("JSON"), "{text}");
+    }
 
     lab.assert_untouched("R8").await;
     // The slots are free again.
@@ -806,6 +842,30 @@ async fn without_a_store_the_route_is_unavailable() {
     problem(&r, 503, None, &name_of(&bytes), "no store");
     assert_eq!(lab.rows().await, "0");
     assert_eq!(lab.audits().await, "0");
+    // The store is wanted only after the earlier rows: a body that is no document is 400 and a
+    // digest the tenant holds is 200, with no store at all.
+    let junk = b"no document".to_vec();
+    let r = lab.store(&junk).await;
+    problem(
+        &r,
+        400,
+        Some("INVALID_IR_DOCUMENT"),
+        &name_of(&junk),
+        "R11 before R13",
+    );
+    let name = name_of(&bytes);
+    sqlx::query(
+        "INSERT INTO ir_documents (tenant_id, digest, extension_id, schema_version, \
+             variant_name, source_format, storage_key) \
+         VALUES ($1::uuid, $2, NULL, 1, 'v', 'odx', $3)",
+    )
+    .bind(&lab.tenant)
+    .bind(&name)
+    .bind(crate::uploads::v4())
+    .execute(&lab.fx.u.w.pool)
+    .await
+    .unwrap();
+    stored(&lab.store(&bytes).await, 200, &name, "R10 before R13");
     lab.finish().await;
 }
 
@@ -1036,6 +1096,83 @@ async fn a_key_another_table_holds_is_never_inserted() {
     // With a fresh key the same bytes are stored.
     let r = lab.store(&bytes).await;
     stored(&r, 201, &name_of(&bytes), "a fresh key");
+    lab.finish().await;
+}
+
+// R19, the key of a document
+#[tokio::test]
+async fn a_key_another_document_holds_is_never_inserted_or_deleted() {
+    let lab = Lab::new(With::Fake).await;
+    let fx = &lab.fx;
+    let wrap = &fx.wrap;
+    let first = doc("first");
+    stored(&lab.store(&first).await, 201, &name_of(&first), "the first");
+    let held = wrap.issued().remove(0);
+    // `begin` reissues the key of the first document's object.
+    *wrap.begin_key.lock().unwrap() = Some(ObjectKey::parse(&held).unwrap());
+    let second = doc("second");
+    let r = lab.store(&second).await;
+    problem(&r, 500, None, &name_of(&second), "a document's key");
+    assert_eq!(lab.rows().await, "1");
+    assert_eq!(lab.audits().await, "1");
+    assert!(
+        wrap.deleted().is_empty(),
+        "the first document's object stays"
+    );
+    assert_eq!(
+        fx.sql("SELECT storage_key FROM ir_documents").await,
+        held,
+        "the first row is untouched"
+    );
+    lab.finish().await;
+}
+
+// R19 with a concurrent winner: the key's own holder decides, not the digest's row
+#[tokio::test]
+async fn a_key_another_table_holds_is_not_deleted_when_the_digest_was_stored_meanwhile() {
+    let lab = Lab::new(With::Fake).await;
+    let fx = &lab.fx;
+    let wrap = &fx.wrap;
+    let held = crate::uploads::v4();
+    sqlx::query(
+        "INSERT INTO artifacts (tenant_id, digest, size_bytes, storage_key) \
+         VALUES ($1::uuid, $2, 1, $3)",
+    )
+    .bind(&lab.tenant)
+    .bind("b".repeat(64))
+    .bind(&held)
+    .execute(&fx.u.w.pool)
+    .await
+    .unwrap();
+    *wrap.begin_key.lock().unwrap() = Some(ObjectKey::parse(&held).unwrap());
+    let barrier = wrap.hold_begins(2);
+    let bytes = doc("meanwhile");
+    let name = name_of(&bytes);
+    let winner = async {
+        // The request has begun (it is at the barrier) when another store commits the digest.
+        while wrap.issued().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        sqlx::query(
+            "INSERT INTO ir_documents (tenant_id, digest, extension_id, schema_version, \
+                 variant_name, source_format, storage_key) \
+             VALUES ($1::uuid, $2, NULL, 1, 'v', 'odx', $3)",
+        )
+        .bind(&lab.tenant)
+        .bind(&name)
+        .bind(crate::uploads::v4())
+        .execute(&fx.u.w.pool)
+        .await
+        .unwrap();
+        barrier.wait().await;
+    };
+    let (r, ()) = tokio::join!(lab.store(&bytes), winner);
+    problem(&r, 500, None, &name, "a key held elsewhere");
+    assert!(
+        wrap.deleted().is_empty(),
+        "the artifact's object must not be deleted"
+    );
+    assert_eq!(lab.rows().await, "1");
     lab.finish().await;
 }
 

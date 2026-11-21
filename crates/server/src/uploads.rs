@@ -568,6 +568,12 @@ fn db_failure_outcome(u: &Uploads, error: &sqlx::Error) -> Outcome {
 fn store_failure(u: &Uploads, error: &StoreError) -> Response {
     // The store's messages are fixed text: no key, URL or upload ID.
     u.warn("the object store failed", &error.to_string());
+    store_error_response(error)
+}
+
+/// The answer for a failed store call: 500 for a store without randomness, else 503. Shared by
+/// the data channel and the document store.
+pub(crate) fn store_error_response(error: &StoreError) -> Response {
     match error {
         StoreError::Random => problem(StatusCode::INTERNAL_SERVER_ERROR, "The request failed"),
         _ => problem(

@@ -34,6 +34,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::body::HttpBody;
+use axum::extract::rejection::PathRejection;
 use axum::extract::{Extension, Path, Request, State};
 use axum::http::header::{self, HeaderMap};
 use axum::http::{HeaderValue, StatusCode};
@@ -53,7 +54,7 @@ use crate::problem::Problem;
 use crate::register::{bounded_body_for, closing};
 use crate::session::now;
 use crate::storage::{MultipartStore, ObjectKey, StoreError};
-use crate::uploads::{is_digest, json_answer, parse_sha256};
+use crate::uploads::{is_digest, json_answer, parse_sha256, store_error_response};
 
 /// The route's path.
 pub const PATH: &str = "/api/v1/documents/{sha256}";
@@ -89,10 +90,27 @@ struct Meta {
     source_digest: String,
 }
 
+/// A character a name shown to an operator may not hold: a control character, or one that changes
+/// how text reads without showing (zero-width and direction marks, the bidi embeddings and
+/// isolates, the word joiner and invisible operators, the byte order mark, the line and
+/// paragraph separators).
+fn unfit(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{200B}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2060}'..='\u{2069}'
+                | '\u{FEFF}'
+                | '\u{2028}'
+                | '\u{2029}'
+        )
+}
+
 /// A string kept in a row: at most [`MAX_TEXT`] bytes and no control character (a NUL would be
 /// a database error, and the others have no place in a name shown to an operator).
 fn text(value: &str) -> Option<String> {
-    (value.len() <= MAX_TEXT && !value.chars().any(char::is_control)).then(|| value.to_owned())
+    (value.len() <= MAX_TEXT && !value.chars().any(unfit)).then(|| value.to_owned())
 }
 
 /// A list of `len` strings kept in a row: at most [`MAX_LIST`] of them, each as [`text`] says.
@@ -259,10 +277,7 @@ fn store_failure(inner: &Inner, operator: &str, error: &StoreError) -> Response 
         "the object store failed",
         &error.to_string(),
     );
-    match error {
-        StoreError::Random => internal(),
-        _ => no_store(),
-    }
+    store_error_response(error)
 }
 
 /// Whether the headers carry exactly one Content-Type whose media type is
@@ -291,15 +306,11 @@ fn is_octet_stream(headers: &HeaderMap) -> bool {
 async fn may_store(pool: &PgPool, tenant: &str, operator: &str) -> Result<bool, sqlx::Error> {
     let mut tx = pool.begin().await?;
     db::statement_timeouts(&mut tx).await?;
-    let (worker,): (bool,) = sqlx::query_as(
-        "SELECT EXISTS (SELECT 1 FROM operator_roles r WHERE r.tenant_id = $1::uuid \
-                        AND r.operator_id = $2::uuid AND r.role = 'worker' \
-                        AND r.scope = '{}'::jsonb)",
-    )
-    .bind(tenant)
-    .bind(operator)
-    .fetch_one(&mut *tx)
-    .await?;
+    let (worker,): (bool,) = sqlx::query_as(concat!("SELECT ", db::worker_unscoped!()))
+        .bind(tenant)
+        .bind(operator)
+        .fetch_one(&mut *tx)
+        .await?;
     Ok(worker)
 }
 
@@ -370,6 +381,7 @@ async fn record(
          SELECT $1::uuid, $2, NULL::text, $3, $4, $5, $6, $7, $8, $9 \
          WHERE NOT EXISTS (SELECT 1 FROM artifacts WHERE storage_key = $9) \
            AND NOT EXISTS (SELECT 1 FROM job_objects WHERE storage_key = $9) \
+           AND NOT EXISTS (SELECT 1 FROM ir_documents WHERE storage_key = $9) \
          ON CONFLICT (tenant_id, digest) DO NOTHING",
     )
     .bind(tenant)
@@ -382,14 +394,38 @@ async fn record(
     .bind(&meta.source_digest)
     .bind(key.as_str())
     .execute(&mut *tx)
-    .await?
-    .rows_affected();
+    .await;
+    let inserted = match inserted {
+        Ok(done) => done.rows_affected(),
+        // The guard reads the other tables' committed rows; a concurrent commit of the same key
+        // in `ir_documents` is caught by its unique constraint. The key is held either way.
+        Err(sqlx::Error::Database(e))
+            if e.constraint() == Some("ir_documents_storage_key_unique") =>
+        {
+            return Ok(Recorded::KeyHeld);
+        }
+        Err(error) => return Err(error.into()),
+    };
     if inserted == 0 {
-        // Either a concurrent store holds the digest (committed now: this statement waited for
-        // it) or the guard held the key back. The transaction's end writes nothing.
+        // Either the guard held the key back, or a concurrent store holds the digest (committed
+        // now: this statement waited for it). The key's own presence decides, not the digest's:
+        // a key held elsewhere is never this request's to delete, whatever else is stored.
+        // The transaction's end writes nothing.
+        let (held,): (bool,) = sqlx::query_as(
+            "SELECT EXISTS (SELECT 1 FROM artifacts WHERE storage_key = $1) \
+                 OR EXISTS (SELECT 1 FROM job_objects WHERE storage_key = $1) \
+                 OR EXISTS (SELECT 1 FROM ir_documents WHERE storage_key = $1)",
+        )
+        .bind(key.as_str())
+        .fetch_one(&mut *tx)
+        .await?;
+        if held {
+            return Ok(Recorded::KeyHeld);
+        }
         return Ok(if row_exists(&mut tx, tenant, digest).await? {
             Recorded::Lost
         } else {
+            // Neither: not reachable; treated as a fault and the object is kept.
             Recorded::KeyHeld
         });
     }
@@ -406,11 +442,14 @@ async fn record(
 pub async fn store(
     State(docs): State<Documents>,
     Extension(operator): Extension<SessionOperator>,
-    Path(name): Path<String>,
+    path: Result<Path<String>, PathRejection>,
     request: Request,
 ) -> Response {
     let inner = &*docs.0;
     let (parts, body) = request.into_parts();
+    // A name that does not decode (invalid UTF-8 after percent-decoding) is refused like any
+    // other that is not a digest.
+    let name = path.map(|Path(name)| name).unwrap_or_default();
     if !is_digest(&name) {
         return closed(
             StatusCode::BAD_REQUEST,
@@ -456,7 +495,14 @@ pub async fn store(
         return response;
     };
 
-    let bytes = match bounded_body_for(body, MAX_BYTES, inner.body_timeout).await {
+    let bytes = match bounded_body_for(
+        body,
+        MAX_BYTES,
+        inner.body_timeout,
+        "The request body broke before its end",
+    )
+    .await
+    {
         Ok(bytes) => bytes,
         Err(response) => return response,
     };
@@ -623,7 +669,22 @@ mod tests {
         assert!(judged(named(&format!("{longest}n"))).is_none());
         assert!(judged(EcuVariantT::default()).is_none());
         assert!(judged(named("")).is_none());
-        for bad in ["a\0b", "a\nb", "a\tb", "\u{7f}", "\u{85}"] {
+        for bad in [
+            "a\0b",
+            "a\nb",
+            "a\tb",
+            "\u{7f}",
+            "\u{85}",
+            "a\u{200B}b",
+            "a\u{200F}b",
+            "a\u{202E}b",
+            "a\u{2060}b",
+            "a\u{2066}b",
+            "a\u{2069}b",
+            "a\u{FEFF}b",
+            "a\u{2028}b",
+            "a\u{2029}b",
+        ] {
             assert!(judged(named(bad)).is_none(), "{bad:?}");
         }
         // Text that is not ASCII is allowed, counted in bytes.

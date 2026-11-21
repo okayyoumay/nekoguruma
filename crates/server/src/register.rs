@@ -457,15 +457,17 @@ pub(crate) async fn bounded_body_within(
     body: axum::body::Body,
     limit: usize,
 ) -> Result<Vec<u8>, Response> {
-    bounded_body_for(body, limit, BODY_TIMEOUT).await
+    bounded_body_for(body, limit, BODY_TIMEOUT, ShapeError::Json.title()).await
 }
 
 /// [`bounded_body_within`] with the route's own time bound too, for a route whose body is large
-/// enough that [`BODY_TIMEOUT`] does not suit it (the document store, ADR-500).
+/// enough that [`BODY_TIMEOUT`] does not suit it (the document store, ADR-500); `broken` is the
+/// title of the 400 for a body that breaks.
 pub(crate) async fn bounded_body_for(
     body: axum::body::Body,
     limit: usize,
     budget: Duration,
+    broken: &'static str,
 ) -> Result<Vec<u8>, Response> {
     // A declared length over the limit is answered before any byte is read, so the client gets
     // its 413. A streamed body has no declared length and is cut when it grows past the limit.
@@ -486,7 +488,7 @@ pub(crate) async fn bounded_body_for(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "The request body is too large",
             ),
-            BodyError::Broken => closing(StatusCode::BAD_REQUEST, ShapeError::Json.title()),
+            BodyError::Broken => closing(StatusCode::BAD_REQUEST, broken),
         })
 }
 

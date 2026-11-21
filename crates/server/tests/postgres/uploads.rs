@@ -185,8 +185,10 @@ impl Wrap {
     }
 
     /// Makes the next `begin`s wait for `parties` of them, after their upload exists.
-    pub(crate) fn hold_begins(&self, parties: usize) {
-        *self.begin_barrier.lock().unwrap() = Some(Arc::new(Barrier::new(parties)));
+    pub(crate) fn hold_begins(&self, parties: usize) -> Arc<Barrier> {
+        let barrier = Arc::new(Barrier::new(parties));
+        *self.begin_barrier.lock().unwrap() = Some(Arc::clone(&barrier));
+        barrier
     }
 
     pub(crate) fn fail_begin(&self, fail: Option<Fail>) {

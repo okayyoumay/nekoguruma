@@ -90,6 +90,18 @@ macro_rules! delete_own_lock {
 }
 pub(crate) use delete_own_lock;
 
+/// The SQL expression, as a string literal, for whether the operator (`$2`) of the tenant (`$1`)
+/// holds the role `worker` with an empty scope: the permission job creation and the document store
+/// share (design 6.8).
+macro_rules! worker_unscoped {
+    () => {
+        "EXISTS (SELECT 1 FROM operator_roles r WHERE r.tenant_id = $1::uuid \
+                 AND r.operator_id = $2::uuid AND r.role = 'worker' \
+                 AND r.scope = '{}'::jsonb)"
+    };
+}
+pub(crate) use worker_unscoped;
+
 /// Sets the lock and statement timeouts (5 seconds) for the transaction `tx`, so that a read or
 /// write that waits on a lock or runs long fails as unavailability instead of hanging a request.
 pub(crate) async fn statement_timeouts(tx: &mut sqlx::PgConnection) -> Result<(), sqlx::Error> {

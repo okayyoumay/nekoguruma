@@ -213,7 +213,7 @@ The server writes a row inside the transaction of the action, so a rolled-back a
 `bigserial` and breaks ties between rows of one instant. `(recorded_at, id)` is not the commit
 order: `recorded_at` is the transaction's start time, earlier than its commit by any lock waits, so a
 reader that pages by keyset must allow for rows that commit late. Columns as the server fills them:
-`tenant_id`, `operator_id`, `agent_id` and `job_id` name the job's own values; `vin` is the job's
+`tenant_id`, `operator_id`, `agent_id` and `job_id` name the job's own values (NULL where a row has no job or agent, as `documentStored`'s); `vin` is the job's
 VIN in clear, NULL when the job has none, and is the one column a VIN deletion redacts (design
 4.3); `action` is free text with no CHECK, so a new action needs no migration; `confirmation_level`
 is the job's level; `on_site_approved` and `agent_reported_at` are NULL for `jobCreated`; `offline_executed` is false; `recorded_at` is the database's
@@ -224,6 +224,10 @@ updated or deleted; the server only writes them. The actions written today:
 - `jobCreated` (`POST /api/v1/jobs`, one row per created job, none for a replay or a refusal):
   `detail` has `kind`, `irDigests` (the sorted unique hex digests), `artifactDigest` when the job
   has one and `signingKeyId`. It holds no request hash, idempotency key or VCI ID.
+- `documentStored` (`PUT /api/v1/documents/{sha256}`, ADR-500; one row per stored document, in the
+  insert's transaction, none for a second store or a refusal): `tenant_id` and `operator_id`
+  name the caller; `detail` has `digest` and `size` (bytes). `agent_id`, `job_id`, `vin`,
+  `confirmation_level`, `on_site_approved` and `agent_reported_at` are NULL.
 
 **Version work records per item**
 The unit of 3-way merge (4.4) is the item, so `work_record_items.version` exists.

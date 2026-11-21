@@ -272,7 +272,8 @@ command that does this is not written.
 `s3/xml.rs` (`S3Store`); the decision, the alternatives and the known limits are in ADR-492. The
 store holds the large bodies that the database refers to by key (the `storage_key` columns,
 `db/README.md`) in the bucket `object_server.bucket` of the bundled object server. The server does
-not carry the bytes: the writer PUTs each part to a presigned URL. The trait's futures are boxed by
+not carry the bytes of uploads: the writer PUTs each part to a presigned URL. The one exception
+is the document store, which receives an IR document itself and sends it with `put_part`. The trait's futures are boxed by
 hand, so `Arc<dyn MultipartStore>` works, and `Server::object_store()` returns the store
 `Server::start` opened (`None` for a `Config` with no `[object_server]`, and for a server made by
 `bind`). The data channel's routes and the document store route use it.
@@ -778,8 +779,8 @@ store set after the router is built does not reach it; its slots and log gates a
   versions. Then, with no transaction open, `begin`, `put_part` (part 1) and `complete`, which
   reads the object back. A store failure up to there is 503 (500 for `Random`) and deletes the
   object, best effort. Last, one transaction inserts the row (`extension_id` NULL) with
-  `ON CONFLICT (tenant_id, digest) DO NOTHING`, guarded by `NOT EXISTS` on the key in `artifacts`
-  and `job_objects`, and the `documentStored` audit row (`audit::document_stored`: operator,
+  `ON CONFLICT (tenant_id, digest) DO NOTHING`, guarded by `NOT EXISTS` on the key in `artifacts`,
+  `job_objects` and `ir_documents`, and the `documentStored` audit row (`audit::document_stored`: operator,
   detail with the digest and the size), then commits: 201. No row inserted means either a
   concurrent store won (the row is there: the object is deleted, 200) or the guard held the key back
   (500, the object kept, since it may be another row's). A statement that fails before the commit

@@ -20,7 +20,7 @@ pub use control::{
 mod instruction;
 pub use instruction::{
     INSTRUCTION_VERSION, InstructionError, InstructionRejectReason, JOB_ID_LEN, JobInstruction,
-    MAX_INSTRUCTION_LEN, MAX_STRING_LEN, is_canonical_uuid,
+    MAX_ARTIFACT_BYTES, MAX_DOCUMENT_BYTES, MAX_INSTRUCTION_LEN, MAX_STRING_LEN, is_canonical_uuid,
 };
 
 pub const PROTOCOL_VERSION: u32 = 1;

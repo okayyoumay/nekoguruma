@@ -16,17 +16,25 @@
 //! routes' answers ([`reads_body`]) and is at most [`MAX_ANSWER`] bytes; the body of any other
 //! status is never read, and a PUT's answer body is never read at all: its status says whether the
 //! part was stored.
+//!
+//! [`Client::get`] is the download leg's request (design 14.3, ADR-497): a presigned GET with no
+//! `Authorization` and no redirect, whose body is streamed into a writer the caller gives, on a
+//! blocking thread, so memory does not depend on the object's size. The body is read only for a
+//! 200 that declares exactly one canonical `Content-Length` within the bound the caller gives;
+//! it has no total time, only the no-progress clock.
 
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Empty, Full};
 use hyper::body::{Body, Bytes, Frame, SizeHint};
 use hyper::client::conn::http1;
-use hyper::header::{AUTHORIZATION, CONNECTION, CONTENT_LENGTH, HOST, RETRY_AFTER};
+use hyper::header::{
+    AUTHORIZATION, CONNECTION, CONTENT_LENGTH, HOST, HeaderMap, RETRY_AFTER, TRANSFER_ENCODING,
+};
 use hyper::{Method, Request};
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -64,6 +72,8 @@ pub enum Error {
     NoProgress,
     /// A JSON route did not finish within [`JSON_TOTAL`].
     Timeout,
+    /// The writer a GET streams into failed (the disk is full, the file cannot be written).
+    Write(io::ErrorKind),
     /// The request may have been sent and no complete answer came: a reset, a head over the
     /// limits, an answer that is not HTTP, a body that is cut, or a request that could not be
     /// built.
@@ -86,6 +96,27 @@ pub struct Answer {
     /// The single `Retry-After` value, when the answer has exactly one that is text.
     pub retry_after: Option<String>,
     pub body: AnswerBody,
+}
+
+/// What a GET came to.
+#[derive(Debug)]
+pub struct Got<W> {
+    pub status: u16,
+    /// The single `Retry-After` value, when the answer has exactly one that is text.
+    pub retry_after: Option<String>,
+    pub body: GetBody<W>,
+}
+
+/// The body of a GET's answer.
+#[derive(Debug)]
+pub enum GetBody<W> {
+    /// The status is not 200: no body byte was read.
+    Unread,
+    /// A 200 without exactly one canonical `Content-Length`, or one over the bound (or with a
+    /// `Transfer-Encoding`): no body byte was read.
+    BadLength,
+    /// The declared number of bytes was written to the writer, which is handed back.
+    Complete { length: u64, writer: W },
 }
 
 /// A request to one of the four JSON routes. `Debug` leaves out the token and shows only the
@@ -223,6 +254,46 @@ impl Client {
             None,
         )
         .await
+    }
+
+    /// GETs `target` at `port` and streams the body into `writer`: no `Authorization` is sent and
+    /// a redirect is an answer like any other. The body is read only for a 200 that declares
+    /// exactly one canonical `Content-Length` of at most `max_len`; any other answer is returned
+    /// with no body byte read. A body that is cut short, or whose reader sees more than the
+    /// declared length, fails the request ([`Error::Failed`]); a writer that fails is
+    /// [`Error::Write`]. There is no total time: the connection is judged by progress alone.
+    pub async fn get<W: Write + Send + 'static>(
+        &self,
+        port: u16,
+        target: &str,
+        host: &str,
+        max_len: u64,
+        writer: W,
+    ) -> Result<Got<W>, Error> {
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(target)
+            .header(HOST, host)
+            .header(CONNECTION, "close")
+            .body(Empty::<Bytes>::new())
+            .map_err(|_| Error::Failed)?;
+        let start = Instant::now();
+        let progress = Progress::new(start);
+        let stream =
+            match tokio::time::timeout_at(start + CONNECT_TIMEOUT, self.dial.dial_port(port)).await
+            {
+                Err(_) => return Err(Error::ConnectTimeout),
+                Ok(Err(_)) => return Err(Error::NotSent),
+                Ok(Ok(stream)) => stream,
+            };
+        let stream = Tracked {
+            inner: stream,
+            progress: progress.clone(),
+        };
+        tokio::select! {
+            got = exchange_get(stream, request, max_len, writer) => got,
+            () = progress.stalled(self.no_progress) => Err(Error::NoProgress),
+        }
     }
 
     async fn send<B>(
@@ -374,6 +445,99 @@ where
         retry_after,
         body,
     })
+}
+
+async fn exchange_get<W: Write + Send + 'static>(
+    stream: Tracked,
+    request: Request<Empty<Bytes>>,
+    max_len: u64,
+    writer: W,
+) -> Result<Got<W>, Error> {
+    let (mut sender, connection) = http1::Builder::new()
+        .max_buf_size(MAX_HEAD)
+        .max_headers(MAX_HEADERS)
+        .handshake::<_, Empty<Bytes>>(TokioIo::new(stream))
+        .await
+        .map_err(|_| Error::Failed)?;
+    let _driver = Driver(tokio::spawn(async move {
+        let _ = connection.await;
+    }));
+    let response = sender
+        .send_request(request)
+        .await
+        .map_err(|_| Error::Failed)?;
+    let status = response.status().as_u16();
+    let retry_after = single_text(response.headers(), &RETRY_AFTER);
+    let answer = |body| Got {
+        status,
+        retry_after: retry_after.clone(),
+        body,
+    };
+    if status != 200 {
+        return Ok(answer(GetBody::Unread));
+    }
+    let Some(length) = declared_length(response.headers(), max_len) else {
+        return Ok(answer(GetBody::BadLength));
+    };
+    let mut body = response.into_body();
+    // The writer runs on a blocking thread and ends when the channel closes, whether the body
+    // ended, failed or this future was dropped.
+    let (tx, mut rx) = mpsc::channel::<Bytes>(CHUNKS_IN_FLIGHT);
+    let sink = tokio::task::spawn_blocking(move || {
+        let mut writer = writer;
+        while let Some(chunk) = rx.blocking_recv() {
+            writer.write_all(&chunk)?;
+        }
+        writer.flush()?;
+        Ok::<W, io::Error>(writer)
+    });
+    let mut received = 0u64;
+    let mut failed = false;
+    while let Some(frame) = body.frame().await {
+        let Ok(frame) = frame else {
+            failed = true;
+            break;
+        };
+        if let Ok(data) = frame.into_data() {
+            received += data.len() as u64;
+            if received > length {
+                failed = true;
+                break;
+            }
+            if tx.send(data).await.is_err() {
+                // The writer failed; its result says why.
+                break;
+            }
+        }
+    }
+    drop(tx);
+    match sink.await {
+        Ok(Ok(writer)) if !failed && received == length => {
+            Ok(answer(GetBody::Complete { length, writer }))
+        }
+        Ok(Ok(_)) => Err(Error::Failed),
+        Ok(Err(error)) => Err(Error::Write(error.kind())),
+        Err(_) => Err(Error::Write(io::ErrorKind::Other)),
+    }
+}
+
+/// The declared body length of a 200: exactly one `Content-Length`, in canonical decimal (digits
+/// only, no sign, no leading zero), at most `max_len`, and no `Transfer-Encoding` beside it.
+fn declared_length(headers: &HeaderMap, max_len: u64) -> Option<u64> {
+    if headers.contains_key(TRANSFER_ENCODING) {
+        return None;
+    }
+    let mut values = headers.get_all(CONTENT_LENGTH).iter();
+    let text = values.next()?.to_str().ok()?;
+    if values.next().is_some() {
+        return None;
+    }
+    let canonical = !text.is_empty()
+        && text.len() <= 20
+        && text.bytes().all(|b| b.is_ascii_digit())
+        && (text == "0" || !text.starts_with('0'));
+    let length = text.parse::<u64>().ok().filter(|_| canonical)?;
+    (length <= max_len).then_some(length)
 }
 
 async fn read_body(response: hyper::Response<hyper::body::Incoming>) -> Result<AnswerBody, Error> {

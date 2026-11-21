@@ -5,6 +5,8 @@
 mod agent_connect;
 mod agent_events;
 #[cfg(debug_assertions)]
+mod agent_fetch;
+#[cfg(debug_assertions)]
 mod agent_register;
 mod api_spec;
 mod binary;

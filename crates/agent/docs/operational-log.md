@@ -177,6 +177,7 @@ throughout.
     `file {path}` and, for a refusal by the writability check, the findings, which name paths.
     The same fixed sentence is printed on standard error by the command.
 
+- **The fetcher** (`agent::fetch`, ADR-497): a fetch that gives up is written once at `warn` with the object's kind (`document` or `artifact`), the class (`retry`, `refused`, `local`, `mismatch`, `mismatch-twice`) and the HTTP status where there is one; each retry is written at `debug` with the same words and the attempt's number; a cached object that failed its check and was deleted is written once per kind at `warn`. Never a URL, a token, a digest, a path, a job ID or a body. The fetcher's token exchange writes the control channel's exchange entries under its own names (`fetch exchange attempt failed`, `fetch exchange refused`). Nothing is written by the route, the client or the cache.
 - **The uploader** (`agent::uploader`, ADR-495 item 11): a refusal, an abandon, a set-aside entry and a removal that fails are warned once per entry and class; the entry holds the entry's number, its kind (`result` or `commLog`), the class and the HTTP status where there is one, never a URL, a token, a digest, a path or a job ID. Retries are written at `debug` only. The uploader's token exchange writes the control channel's exchange entries under its own names. A ledger that cannot be reopened is written once at `warn`, and one that does not read back once at `error`; nothing is written after a stop.
 
 ## A crate not yet checked

@@ -1,4 +1,4 @@
-use std::io::Cursor;
+use std::io::{self, Cursor, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -658,4 +658,111 @@ async fn a_put_the_server_reads_slowly_is_kept_alive_by_the_bytes_it_takes() {
     let got =
         put(Client::with_dial(slow(Duration::from_millis(700))).with_no_progress(limit)).await;
     assert_eq!(got.unwrap_err(), Error::NoProgress);
+}
+
+/// A writer that fails after `ok` bytes, as a full disk does.
+struct Failing {
+    ok: usize,
+}
+
+impl Write for Failing {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.ok == 0 {
+            return Err(io::ErrorKind::StorageFull.into());
+        }
+        let n = buf.len().min(self.ok);
+        self.ok -= n;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_get_streams_the_body_and_sends_no_authorization_and_no_range() {
+    let body = vec![7u8; 150_000];
+    let mut reply = format!(
+        "HTTP/1.1 200 X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    reply.extend_from_slice(&body);
+    let (dial, seen) = {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let dial = FakeDial::new(64 * 1024, move |_, mut server| {
+            let (reply, log) = (reply.clone(), log.clone());
+            tokio::spawn(async move {
+                if let Some(request) = read_request(&mut server).await {
+                    log.lock().unwrap().push(request);
+                }
+                let _ = server.write_all(&reply).await;
+                let _ = server.shutdown().await;
+            });
+        });
+        (dial, seen)
+    };
+    let got = Client::with_dial(dial)
+        .get(9000, "/obj?sig=1", HOST, 1 << 20, Vec::new())
+        .await
+        .unwrap();
+    let GetBody::Complete { length, writer } = got.body else {
+        panic!("the body was not read");
+    };
+    assert_eq!((got.status, length), (200, 150_000));
+    assert_eq!(writer, body);
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen[0].request_line(), "GET /obj?sig=1 HTTP/1.1");
+    assert_eq!(seen[0].header("authorization"), None);
+    assert_eq!(seen[0].header("range"), None);
+    assert_eq!(seen[0].header("host").as_deref(), Some(HOST));
+    assert_eq!(seen[0].header("connection").as_deref(), Some("close"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_get_that_is_not_a_complete_200_reads_no_body() {
+    let get = |reply: Vec<u8>, max: u64| async move {
+        let (dial, _) = scripted(reply);
+        Client::with_dial(dial)
+            .get(9000, "/o", HOST, max, Vec::new())
+            .await
+            .unwrap()
+    };
+    let got = get(answer(302, "Location: http://127.0.0.1:1/\r\n", "x"), 10).await;
+    assert!(matches!((got.status, got.body), (302, GetBody::Unread)));
+    let got = get(answer(404, "Retry-After: 5\r\n", "x"), 10).await;
+    assert_eq!(got.retry_after.as_deref(), Some("5"));
+    assert!(matches!(got.body, GetBody::Unread));
+    let got = get(answer(200, "", "0123456789ab"), 10).await;
+    assert!(matches!((got.status, got.body), (200, GetBody::BadLength)));
+    let got = get(answer(200, "", "0123456789"), 10).await;
+    assert!(matches!(got.body, GetBody::Complete { length: 10, .. }));
+    // An empty body is a length of 0, which is canonical.
+    let got = get(answer(200, "", ""), 10).await;
+    assert!(matches!(got.body, GetBody::Complete { length: 0, .. }));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_get_with_a_failing_writer_is_a_write_error() {
+    let (dial, _) = scripted(answer(200, "", &"x".repeat(100_000)));
+    let error = Client::with_dial(dial)
+        .get(9000, "/o", HOST, 1 << 20, Failing { ok: 70_000 })
+        .await
+        .map(|_| ())
+        .unwrap_err();
+    assert_eq!(error, Error::Write(io::ErrorKind::StorageFull));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_get_refused_at_connect_sends_nothing() {
+    let (dial, _) = scripted(Vec::new());
+    dial.set(Mode::Refuse);
+    let error = Client::with_dial(dial)
+        .get(9000, "/o", HOST, 10, Vec::new())
+        .await
+        .map(|_| ())
+        .unwrap_err();
+    assert_eq!(error, Error::NotSent);
 }

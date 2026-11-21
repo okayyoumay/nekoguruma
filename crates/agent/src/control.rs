@@ -545,7 +545,11 @@ impl Opened {
             .map_err(|_| RecordError::Field("server_origin").into())
     }
 
-    fn start_with(self, key: &PublicKey, seams: Seams) -> Result<Handle, ControlError> {
+    /// The checks every start makes on the record and the key, before anything is spawned: the
+    /// key is the record's, and the origin, the audience and the instruction key parse. `connect`
+    /// runs it before it starts the uploader, so that a record the session would refuse starts
+    /// neither task.
+    pub fn check(&self, key: &PublicKey) -> Result<Checked, ControlError> {
         if key.fingerprint_hex() != self.record.agent_key_fingerprint {
             return Err(ControlError::KeyMismatch);
         }
@@ -554,6 +558,19 @@ impl Opened {
             .map_err(|_| RecordError::Field("server_origin"))?;
         let instruction_key = PublicKey::from_spki_pem(&self.record.instruction_key_pem)
             .map_err(|_| RecordError::Field("instruction_key_pem"))?;
+        Ok(Checked {
+            origin,
+            audience,
+            instruction_key,
+        })
+    }
+
+    fn start_with(self, key: &PublicKey, seams: Seams) -> Result<Handle, ControlError> {
+        let Checked {
+            origin,
+            audience,
+            instruction_key,
+        } = self.check(key)?;
         let wiring = Wiring {
             dial: seams.dial,
             signer: seams.signer,
@@ -594,6 +611,13 @@ impl Opened {
             ended,
         })
     }
+}
+
+/// What [`Opened::check`] parsed.
+pub struct Checked {
+    origin: ServerOrigin,
+    audience: Audience,
+    instruction_key: PublicKey,
 }
 
 /// Releases both locks and then says the task has ended, however it ends: it returns, panics, is

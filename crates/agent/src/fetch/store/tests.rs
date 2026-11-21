@@ -20,9 +20,55 @@ fn objects() -> (tempfile::TempDir, PathBuf) {
 
 /// Downloads `bytes` into the cache as a fetch does.
 fn put(store: &ObjectStore, kind: Kind, bytes: &[u8]) -> PathBuf {
-    let (tmp, mut file) = store.begin().unwrap();
-    file.write_all(bytes).unwrap();
-    store.commit(tmp, file, kind, &digest(bytes)).unwrap()
+    let (tmp, sink) = store.begin().unwrap();
+    let mut writer = HashingWriter::new(sink);
+    writer.write_all(bytes).unwrap();
+    match store.commit(tmp, writer, kind, &digest(bytes)).unwrap() {
+        Stored::Done { path, length } => {
+            assert_eq!(length, bytes.len() as u64);
+            path
+        }
+        Stored::Mismatch => panic!("the digest matches"),
+    }
+}
+
+/// The digest the commit names the file by is the one the writer computed, and a download that
+/// is not the expected one is stored nowhere.
+#[test]
+fn commit_names_the_file_by_the_writers_digest_and_refuses_another() {
+    let (_temp, root) = objects();
+    let store = ObjectStore::open_in(&root).unwrap();
+    let (tmp, sink) = store.begin().unwrap();
+    let mut writer = HashingWriter::new(sink);
+    writer.write_all(b"actual bytes").unwrap();
+    let got = store
+        .commit(tmp, writer, Kind::Document, &digest(b"expected bytes"))
+        .unwrap();
+    assert_eq!(got, Stored::Mismatch);
+    assert_eq!(fs::read_dir(root.join("tmp")).unwrap().count(), 0);
+    assert_eq!(fs::read_dir(root.join("documents")).unwrap().count(), 0);
+}
+
+/// A sweep that cannot remove an entry goes on, and the open still succeeds.
+#[test]
+fn a_sweep_that_cannot_remove_an_entry_goes_on() {
+    let (_temp, root) = objects();
+    let store = ObjectStore::open_in(&root).unwrap();
+    for name in ["a", "stuck", "z"] {
+        fs::write(root.join("tmp").join(name), b"x").unwrap();
+    }
+    store.sweep(|path| {
+        if path.file_name().is_some_and(|name| name == "stuck") {
+            Err(io::ErrorKind::PermissionDenied.into())
+        } else {
+            fs::remove_file(path)
+        }
+    });
+    let left: Vec<_> = fs::read_dir(root.join("tmp"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(left, ["stuck"]);
 }
 
 #[test]
@@ -68,13 +114,15 @@ fn a_file_that_hashes_to_its_name_is_a_hit() {
         store.load(Kind::Document, &d, 100).unwrap(),
         Load::Hit { path, length: 5 }
     );
-    assert_eq!(
-        store.read(Kind::Document, &d, 100).unwrap().as_deref(),
-        Some(&b"hello"[..])
-    );
+    let (load, bytes) = store.read(Kind::Document, &d, 100).unwrap();
+    assert!(matches!(load, Load::Hit { length: 5, .. }));
+    assert_eq!(bytes, b"hello");
     // The other kind's directory does not have it.
     assert_eq!(store.load(Kind::Artifact, &d, 100).unwrap(), Load::Miss);
-    assert_eq!(store.read(Kind::Artifact, &d, 100).unwrap(), None);
+    assert_eq!(
+        store.read(Kind::Artifact, &d, 100).unwrap(),
+        (Load::Miss, Vec::new())
+    );
 }
 
 /// A2: a file that no longer matches, or is over the bound, is deleted and is a miss.
@@ -91,7 +139,10 @@ fn a_file_that_changed_or_is_over_the_bound_is_deleted() {
 
     let path = put(&store, Kind::Document, b"hello");
     fs::write(&path, b"hellO").unwrap();
-    assert_eq!(store.read(Kind::Document, &d, 100).unwrap(), None);
+    assert_eq!(
+        store.read(Kind::Document, &d, 100).unwrap(),
+        (Load::Deleted, Vec::new())
+    );
     assert!(!path.exists());
 
     // Intact, but over the bound given.
@@ -99,7 +150,10 @@ fn a_file_that_changed_or_is_over_the_bound_is_deleted() {
     assert_eq!(store.load(Kind::Document, &d, 4).unwrap(), Load::Deleted);
     assert!(!path.exists());
     let path = put(&store, Kind::Document, b"hello");
-    assert_eq!(store.read(Kind::Document, &d, 4).unwrap(), None);
+    assert_eq!(
+        store.read(Kind::Document, &d, 4).unwrap(),
+        (Load::Deleted, Vec::new())
+    );
     assert!(!path.exists());
 }
 
@@ -219,4 +273,23 @@ fn the_hashing_writer_counts_and_hashes_what_it_writes() {
     let (inner, hash, length) = writer.finish();
     assert_eq!((inner.as_slice(), length), (&b"hello"[..], 5));
     assert_eq!(hash, digest(b"hello"));
+}
+
+/// A pipe in the name's place is refused, and the open does not wait for a writer.
+#[cfg(unix)]
+#[test]
+fn a_pipe_is_refused_without_blocking() {
+    use std::os::unix::ffi::OsStrExt;
+    let (_temp, root) = objects();
+    let store = ObjectStore::open_in(&root).unwrap();
+    let d = digest(b"hello");
+    let path = root.join("documents").join(hex(&d));
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: `c_path` is a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+    assert!(matches!(
+        store.load(Kind::Document, &d, 100),
+        Err(StoreError::NotRegular)
+    ));
+    assert!(path.exists());
 }

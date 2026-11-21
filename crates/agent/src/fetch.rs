@@ -50,7 +50,8 @@ use tokio::sync::Mutex;
 use crate::control::ControlError;
 use crate::control::backoff::Backoff;
 use crate::control::dial::{AtPort, LoopbackPorts, PortDial};
-use crate::control::exchange::{self, Fail, Token};
+use crate::control::exchange::{self, Fail};
+use crate::data_token::Holder;
 use crate::identity::AgentKey;
 use crate::instruction::VerifiedInstruction;
 use crate::registration::origin::ServerOrigin;
@@ -59,7 +60,7 @@ use crate::server_http::retry_after_secs;
 use crate::uploader::http::{Client, Error as HttpError, GetBody};
 use crate::uploader::routes::{Class, Failure, transport};
 use route::{Downloads, Want};
-use store::{HashingWriter, Load, ObjectStore, StoreError, hex};
+use store::{HashingWriter, Load, ObjectStore, StoreError, Stored, hex};
 
 #[cfg(debug_assertions)]
 pub mod command;
@@ -112,6 +113,10 @@ pub enum FetchError {
         /// A usable `Retry-After` (1 to 60 seconds), which lengthens the wait.
         retry_after_secs: Option<u32>,
     },
+    /// The exchange was refused (403 or 429 from the session route): the server will not have
+    /// this agent for now, and the back-off goes to its cap, as the uploader's does.
+    #[error("try again: the server refused the token exchange")]
+    ExchangeRefused,
     #[error("refused: {why}")]
     Refused {
         why: &'static str,
@@ -130,7 +135,7 @@ impl FetchError {
     pub fn class(&self) -> &'static str {
         match self {
             FetchError::NotNamed => "not-named",
-            FetchError::Retry { .. } => "retry",
+            FetchError::Retry { .. } | FetchError::ExchangeRefused => "retry",
             FetchError::Refused { .. } => "refused",
             FetchError::Local { .. } => "local",
             FetchError::Mismatch => "mismatch",
@@ -140,7 +145,10 @@ impl FetchError {
 
     /// Whether another attempt may come out differently.
     pub fn may_retry(&self) -> bool {
-        matches!(self, FetchError::Retry { .. } | FetchError::Mismatch)
+        matches!(
+            self,
+            FetchError::Retry { .. } | FetchError::ExchangeRefused | FetchError::Mismatch
+        )
     }
 
     fn status(&self) -> Option<u16> {
@@ -202,53 +210,15 @@ impl Limits {
     }
 }
 
-/// The exchange's log lines in the fetcher's words: one warning per class until a token is
-/// issued, debug after that, and one per refusal until a token is issued again.
-#[derive(Default)]
-struct ExchangeLog {
-    seen: HashSet<&'static str>,
-    refused: bool,
-}
-
-impl exchange::Log for ExchangeLog {
-    fn failure(&mut self, class: &'static str, status: Option<u16>) {
-        if self.seen.insert(class) {
-            tracing::warn!(class, status = ?status, "fetch exchange attempt failed");
-        } else {
-            tracing::debug!(class, status = ?status, "fetch exchange attempt failed");
-        }
-    }
-
-    fn refusal(&mut self, class: &'static str, status: u16) {
-        if self.refused {
-            tracing::debug!(class, status, "fetch exchange refused again");
-        } else {
-            self.refused = true;
-            tracing::warn!(class, status, "fetch exchange refused");
-        }
-    }
-
-    fn accepted(&mut self) {
-        self.seen.clear();
-        self.refused = false;
-    }
-
-    fn stale_challenge(&mut self) {
-        tracing::debug!("fetch challenge was not live; asking for a new one");
-    }
-}
-
 /// What is shared between attempts and changes: only ever touched with the lock held, which is
 /// also what makes one fetch run at a time.
-#[derive(Default)]
 struct State {
-    /// Held only while a call has work; dropped at its end and by a 401.
-    token: Option<Token>,
+    /// The token, held only while a call has work; dropped at its end and by a 401.
+    holder: Holder,
     /// Digest mismatches in a row, per object.
     mismatches: HashMap<(Kind, [u8; 32]), u8>,
     /// A cached file that failed its check is warned about once per kind.
     warned: HashSet<Kind>,
-    log: ExchangeLog,
 }
 
 /// What the fetcher is wired to; tests replace the client, the dial, the signer and the random
@@ -317,7 +287,11 @@ impl Fetcher {
                 document: MAX_DOCUMENT_BYTES,
                 artifact: MAX_ARTIFACT_BYTES,
             },
-            state: Mutex::new(State::default()),
+            state: Mutex::new(State {
+                holder: Holder::new("fetch"),
+                mismatches: HashMap::new(),
+                warned: HashSet::new(),
+            }),
         })
     }
 
@@ -336,11 +310,15 @@ impl Fetcher {
         kind: Kind,
         digest: &[u8; 32],
     ) -> Result<Fetched, FetchError> {
+        #[cfg(test)]
+        let _gate = tests::gate();
         let mut state = self.state.lock().await;
-        state.token = None;
-        let got = self.attempt(&mut state, instruction, kind, digest).await;
-        state.token = None;
-        got
+        state.holder.clear();
+        let got = self
+            .attempt(&mut state, instruction, kind, digest, false)
+            .await;
+        state.holder.clear();
+        got.map(|(object, _)| object)
     }
 
     /// [`Fetcher::fetch`] up to `attempts` times (at least one) while the error may retry, with
@@ -353,13 +331,15 @@ impl Fetcher {
         digest: &[u8; 32],
         attempts: u32,
     ) -> Result<Fetched, FetchError> {
+        #[cfg(test)]
+        let _gate = tests::gate();
         let mut state = self.state.lock().await;
-        state.token = None;
+        state.holder.clear();
         let got = self
-            .retrying(&mut state, instruction, kind, digest, attempts)
+            .retrying(&mut state, instruction, kind, digest, attempts, false)
             .await;
-        state.token = None;
-        got
+        state.holder.clear();
+        got.map(|(object, _)| object)
     }
 
     /// Every document the instruction names, then its artifact, each as [`Fetcher::fetch_retrying`]
@@ -380,50 +360,54 @@ impl Fetcher {
                     .iter()
                     .map(|hash| (Kind::Artifact, hash)),
             );
+        #[cfg(test)]
+        let _gate = tests::gate();
         let mut state = self.state.lock().await;
-        state.token = None;
+        state.holder.clear();
         let mut fetched = Vec::new();
         let mut outcome = Ok(());
         for (kind, digest) in wanted {
             match self
-                .retrying(&mut state, instruction, kind, digest, attempts)
+                .retrying(&mut state, instruction, kind, digest, attempts, false)
                 .await
             {
-                Ok(object) => fetched.push(object),
+                Ok((object, _)) => fetched.push(object),
                 Err(error) => {
                     outcome = Err(error);
                     break;
                 }
             }
         }
-        state.token = None;
+        state.holder.clear();
         outcome.map(|()| fetched)
     }
 
     /// The bytes of a document the instruction names, fetched when the cache lacks it: only bytes
-    /// that hashed to the instruction's hash, read within the document bound.
+    /// that hashed to the instruction's hash, read within the document bound. The read and its
+    /// hash are one load, made under the fetcher's lock, so no other task's commit or delete
+    /// interleaves with it.
     pub async fn read_document(
         &self,
         instruction: &VerifiedInstruction,
         digest: &[u8; 32],
         attempts: u32,
     ) -> Result<Vec<u8>, FetchError> {
-        // A cached file is hashed again when it is read, so a file that went bad after the fetch
-        // is a miss and fetched again, a bounded number of times.
-        for _ in 0..2 {
-            self.fetch_retrying(instruction, Kind::Document, digest, attempts)
-                .await?;
-            let store = self.store.clone();
-            let (digest, max) = (*digest, self.limits.document);
-            let read =
-                tokio::task::spawn_blocking(move || store.read(Kind::Document, &digest, max))
-                    .await
-                    .map_err(|_| FetchError::Local { why: "task" })??;
-            if let Some(bytes) = read {
-                return Ok(bytes);
-            }
-        }
-        Err(FetchError::Local { why: "changed" })
+        #[cfg(test)]
+        let _gate = tests::gate();
+        let mut state = self.state.lock().await;
+        state.holder.clear();
+        let got = self
+            .retrying(
+                &mut state,
+                instruction,
+                Kind::Document,
+                digest,
+                attempts,
+                true,
+            )
+            .await;
+        state.holder.clear();
+        got.map(|(_, bytes)| bytes)
     }
 
     async fn retrying(
@@ -433,12 +417,13 @@ impl Fetcher {
         kind: Kind,
         digest: &[u8; 32],
         attempts: u32,
-    ) -> Result<Fetched, FetchError> {
+        keep: bool,
+    ) -> Result<(Fetched, Vec<u8>), FetchError> {
         let attempts = attempts.max(1);
         let mut backoff = Backoff::new();
         let mut attempt = 1;
         loop {
-            let error = match self.attempt(state, instruction, kind, digest).await {
+            let error = match self.attempt(state, instruction, kind, digest, keep).await {
                 Ok(object) => return Ok(object),
                 Err(error) => error,
             };
@@ -463,6 +448,10 @@ impl Fetcher {
                 FetchError::Retry {
                     retry_after_secs, ..
                 } => retry_after_secs,
+                FetchError::ExchangeRefused => {
+                    backoff.cap();
+                    None
+                }
                 _ => None,
             };
             tokio::time::sleep(backoff.wait(hint)).await;
@@ -477,7 +466,8 @@ impl Fetcher {
         instruction: &VerifiedInstruction,
         kind: Kind,
         digest: &[u8; 32],
-    ) -> Result<Fetched, FetchError> {
+        keep: bool,
+    ) -> Result<(Fetched, Vec<u8>), FetchError> {
         let named = instruction.instruction();
         let is_named = match kind {
             Kind::Document => named.document_hashes.contains(digest),
@@ -490,11 +480,19 @@ impl Fetcher {
         // A cached object is used with no request and no exchange.
         let store = self.store.clone();
         let wanted = *digest;
-        let loaded = tokio::task::spawn_blocking(move || store.load(kind, &wanted, max))
-            .await
-            .map_err(|_| FetchError::Local { why: "task" })??;
+        let (loaded, bytes) = tokio::task::spawn_blocking(move || {
+            if keep {
+                store.read(kind, &wanted, max)
+            } else {
+                store
+                    .load(kind, &wanted, max)
+                    .map(|load| (load, Vec::new()))
+            }
+        })
+        .await
+        .map_err(|_| FetchError::Local { why: "task" })??;
         match loaded {
-            Load::Hit { path, length } => return Ok(Fetched { kind, path, length }),
+            Load::Hit { path, length } => return Ok((Fetched { kind, path, length }, bytes)),
             Load::Deleted => {
                 if state.warned.insert(kind) {
                     tracing::warn!(
@@ -535,8 +533,8 @@ impl Fetcher {
             Err(HttpError::Write(_)) => return Err(FetchError::Local { why: "write" }),
             Err(error) => return Err(FetchError::of(transport(error))),
         };
-        let (writer, length) = match got.body {
-            GetBody::Complete { length, writer } => (writer, length),
+        let writer = match got.body {
+            GetBody::Complete { writer, .. } => writer,
             GetBody::BadLength => {
                 return Err(FetchError::Refused {
                     why: "get-length",
@@ -549,32 +547,49 @@ impl Fetcher {
                 } else {
                     "get-status"
                 };
+                // As `routes::judge` does, a wait is taken from the server only for 429 and 503.
+                let hint = matches!(got.status, 429 | 503)
+                    .then(|| retry_after_secs(got.retry_after.as_deref()))
+                    .flatten();
                 return Err(FetchError::Retry {
                     why,
                     status: Some(got.status),
-                    retry_after_secs: retry_after_secs(got.retry_after.as_deref()),
+                    retry_after_secs: hint,
                 });
             }
         };
-        let (file, got_digest, written) = writer.finish();
-        debug_assert_eq!(written, length);
-        if got_digest != *digest {
-            // `tmp` is deleted as it drops.
-            let streak = state.mismatches.entry((kind, *digest)).or_default();
-            *streak += 1;
-            return Err(if *streak >= 2 {
-                FetchError::MismatchTwice
-            } else {
-                FetchError::Mismatch
-            });
-        }
         let store = self.store.clone();
         let wanted = *digest;
-        let path = tokio::task::spawn_blocking(move || store.commit(tmp, file, kind, &wanted))
+        let stored = tokio::task::spawn_blocking(move || store.commit(tmp, writer, kind, &wanted))
             .await
             .map_err(|_| FetchError::Local { why: "task" })??;
+        let (path, length) = match stored {
+            Stored::Done { path, length } => (path, length),
+            Stored::Mismatch => {
+                let streak = state.mismatches.entry((kind, *digest)).or_default();
+                *streak += 1;
+                return Err(if *streak >= 2 {
+                    FetchError::MismatchTwice
+                } else {
+                    FetchError::Mismatch
+                });
+            }
+        };
         state.mismatches.remove(&(kind, *digest));
-        Ok(Fetched { kind, path, length })
+        let bytes = if keep {
+            // The bytes come from a load that hashes them, not from what was streamed.
+            let store = self.store.clone();
+            match tokio::task::spawn_blocking(move || store.read(kind, &wanted, max))
+                .await
+                .map_err(|_| FetchError::Local { why: "task" })??
+            {
+                (Load::Hit { .. }, bytes) => bytes,
+                _ => return Err(FetchError::Local { why: "changed" }),
+            }
+        } else {
+            Vec::new()
+        };
+        Ok((Fetched { kind, path, length }, bytes))
     }
 
     /// The GET URL: the token (exchanged now when there is none), the route, and after a 401 one
@@ -587,24 +602,20 @@ impl Fetcher {
         let mut repeated = false;
         loop {
             let token = self.ensure_token(state).await?;
-            match self.downloads.url(&token, want).await {
+            let mut failure = match self.downloads.url(&token, want).await {
                 Ok(target) => return Ok(target),
-                Err(failure) if failure.class == Class::Reauthenticate => {
-                    state.token = None;
-                    if repeated {
-                        return Err(FetchError::retry("unauthorized", Some(401)));
-                    }
-                    repeated = true;
-                }
-                Err(failure) => return Err(FetchError::of(failure)),
+                Err(failure) => failure,
+            };
+            if failure.class == Class::Reauthenticate
+                && state.holder.unauthorized(&mut repeated, &mut failure)
+            {
+                continue;
             }
+            return Err(FetchError::of(failure));
         }
     }
 
     async fn ensure_token(&self, state: &mut State) -> Result<String, FetchError> {
-        if let Some(token) = &state.token {
-            return Ok(token.as_str().to_owned());
-        }
         let at = AtPort {
             dial: &*self.dial,
             port: self.port,
@@ -617,23 +628,15 @@ impl Fetcher {
             audience: &self.audience,
             host: &self.host,
         };
-        match exchange::token(&seams, &mut state.log).await {
-            Ok(token) => {
-                let text = token.as_str().to_owned();
-                state.token = Some(token);
-                Ok(text)
-            }
-            Err(how) => Err(FetchError::Retry {
+        state.holder.ensure(&seams).await.map_err(|how| match how {
+            Fail::Ord => FetchError::retry("exchange", None),
+            Fail::RetryAfter(secs) => FetchError::Retry {
                 why: "exchange",
                 status: None,
-                retry_after_secs: match how {
-                    Fail::Ord => None,
-                    Fail::RetryAfter(secs) => Some(secs),
-                    // The server refuses this agent for now: the cap's wait.
-                    Fail::Cap => Some(60),
-                },
-            }),
-        }
+                retry_after_secs: Some(secs),
+            },
+            Fail::Cap => FetchError::ExchangeRefused,
+        })
     }
 }
 

@@ -67,6 +67,7 @@ agent's answers.
   a transfer begun before the expiry completes after it (a test records this).
 - A port holder on the local profile can deny, stall or waste disk up to the bound, but cannot
   substitute content.
+- There is no minimum transfer rate: a slow download that keeps moving is bounded only by the caller, which cancels or bounds its attempts.
 - A cut download starts again from the first byte; identification plans' documents are not
   served; the cache is never evicted. Each is later work.
 - A cached object survives a re-registration of the agent.

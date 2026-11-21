@@ -12,7 +12,8 @@
 //!   that differs, which they then report as a miss. A name that is not a regular file, or a file
 //!   that cannot be read, is a local failure and nothing is deleted.
 //!
-//! Directories and files are owner-only. Nothing here logs.
+//! Directories and files are owner-only. The only line written is one warning when the sweep
+//! cannot remove something.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -22,7 +23,7 @@ use sha2::{Digest, Sha256};
 use worker_host::service::OperatingMode;
 
 use super::Kind;
-use crate::journal::{JournalError, WriterLock, sync_dir};
+use crate::journal::{JournalError, WriterLock, sync_after_rename};
 use crate::state::{self, StateDirError};
 
 /// The state sub-directory the cache lives in.
@@ -49,9 +50,18 @@ impl From<io::Error> for StoreError {
     }
 }
 
+/// What finishing a download came to.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Stored {
+    /// The digest matched: the file is in the cache.
+    Done { path: PathBuf, length: u64 },
+    /// The digest differs from the expected one: nothing was stored.
+    Mismatch,
+}
+
 /// What a lookup found.
 #[derive(Debug, PartialEq, Eq)]
-pub enum Load {
+pub(crate) enum Load {
     /// The file's bytes hash to the digest; its length is as given.
     Hit { path: PathBuf, length: u64 },
     /// No file.
@@ -62,17 +72,26 @@ pub enum Load {
 
 /// A download in progress: the file under `tmp/`, deleted on drop unless it was committed.
 #[derive(Debug)]
-pub struct Tmp {
+pub(crate) struct Tmp {
     path: PathBuf,
     keep: bool,
 }
 
 impl Drop for Tmp {
     fn drop(&mut self) {
-        if !self.keep {
-            // Best effort: a stop drops a download mid-way, and the sweep at the next open
-            // removes what this cannot.
-            let _ = fs::remove_file(&self.path);
+        if !self.keep && fs::remove_file(&self.path).is_err() && self.path.exists() {
+            // A stop drops a download mid-way while the writer thread may still hold the file
+            // (Windows does not delete an open file): try again for a moment on a thread of
+            // its own, and leave what remains to the sweep at the next open.
+            let path = self.path.clone();
+            std::thread::spawn(move || {
+                for _ in 0..100 {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    if fs::remove_file(&path).is_ok() || !path.exists() {
+                        return;
+                    }
+                }
+            });
         }
     }
 }
@@ -81,6 +100,35 @@ impl Drop for Tmp {
 pub struct ObjectStore {
     root: PathBuf,
     _lock: WriterLock,
+    /// Tests only: the bytes a download may write before its writes fail.
+    #[cfg(test)]
+    fail_writes_after: std::sync::Mutex<Option<u64>>,
+}
+
+/// The file a download is written to. Tests can make it fail as a full disk does.
+pub(crate) struct Sink {
+    file: File,
+    #[cfg(test)]
+    fail_after: Option<u64>,
+}
+
+impl Write for Sink {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        #[cfg(test)]
+        if let Some(left) = self.fail_after.as_mut() {
+            if *left == 0 {
+                return Err(io::ErrorKind::StorageFull.into());
+            }
+            let n = buf.len().min(usize::try_from(*left).unwrap_or(usize::MAX));
+            *left -= n as u64;
+            return self.file.write(&buf[..n]);
+        }
+        self.file.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
 }
 
 impl ObjectStore {
@@ -103,63 +151,116 @@ impl ObjectStore {
         let store = Self {
             root: root.to_owned(),
             _lock: lock,
+            #[cfg(test)]
+            fail_writes_after: std::sync::Mutex::new(None),
         };
-        store.sweep()?;
+        store.sweep(|path| fs::remove_file(path).or_else(|_| fs::remove_dir_all(path)));
         Ok(store)
     }
 
-    /// Removes what an earlier process left in `tmp/`. Under the lock, so nothing live is there.
-    fn sweep(&self) -> Result<(), StoreError> {
-        for entry in fs::read_dir(self.root.join(TMP_DIR))? {
-            let path = entry?.path();
-            // Whatever is there is removed, a directory too: only this agent writes there.
-            if fs::remove_file(&path).is_err() {
-                fs::remove_dir_all(&path)?;
+    /// Removes what an earlier process left in `tmp/`, with `remove`. Under the lock, so nothing
+    /// live is there. Best effort: an entry that cannot be removed is warned about once and the
+    /// sweep goes on, since a leftover file costs disk and must not keep the agent from fetching.
+    fn sweep(&self, remove: impl Fn(&Path) -> io::Result<()>) {
+        let mut failed = false;
+        match fs::read_dir(self.root.join(TMP_DIR)) {
+            Ok(entries) => {
+                for entry in entries {
+                    match entry {
+                        Ok(entry) => failed |= remove(&entry.path()).is_err(),
+                        Err(_) => failed = true,
+                    }
+                }
             }
+            Err(_) => failed = true,
         }
-        Ok(())
+        if failed {
+            tracing::warn!("the object cache's temporary directory could not be swept clean");
+        }
     }
 
     fn path(&self, kind: Kind, digest: &[u8; 32]) -> PathBuf {
         self.root.join(kind.dir()).join(hex(digest))
     }
 
+    /// Tests only: downloads begun from now on fail their writes after `bytes` bytes.
+    #[cfg(test)]
+    pub(crate) fn fail_writes_after(&self, bytes: u64) {
+        *self.fail_writes_after.lock().unwrap() = Some(bytes);
+    }
+
     /// A new file under `tmp/` (created with `create_new`, owner-only) and its guard.
-    pub fn begin(&self) -> Result<(Tmp, File), StoreError> {
+    pub(crate) fn begin(&self) -> Result<(Tmp, Sink), StoreError> {
         let name = shared_crypto::random_32()
             .map_err(|_| StoreError::Io(io::ErrorKind::Other))
             .map(|bytes| hex(&bytes))?;
         let path = self.root.join(TMP_DIR).join(name);
         let file = create_private(&path)?;
-        Ok((Tmp { path, keep: false }, file))
+        let sink = Sink {
+            file,
+            #[cfg(test)]
+            fail_after: *self.fail_writes_after.lock().unwrap(),
+        };
+        Ok((Tmp { path, keep: false }, sink))
     }
 
-    /// Makes the finished download `tmp` (written through `file`, whose bytes hashed to `digest`)
-    /// the cached object: sync the file, rename it to its name, sync the directory.
-    pub fn commit(
+    /// Finishes the download `tmp` written through `writer`: when the digest the writer
+    /// computed is `expected`, syncs the file, renames it to that digest and makes the rename
+    /// durable; otherwise the download is dropped (and so deleted).
+    pub(crate) fn commit(
         &self,
         mut tmp: Tmp,
-        file: File,
+        writer: HashingWriter<Sink>,
         kind: Kind,
-        digest: &[u8; 32],
-    ) -> Result<PathBuf, StoreError> {
-        file.sync_all()?;
-        drop(file);
-        let target = self.path(kind, digest);
+        expected: &[u8; 32],
+    ) -> Result<Stored, StoreError> {
+        let (sink, digest, length) = writer.finish();
+        if digest != *expected {
+            return Ok(Stored::Mismatch);
+        }
+        sink.file.sync_all()?;
+        drop(sink);
+        let target = self.path(kind, &digest);
         fs::rename(&tmp.path, &target)?;
         tmp.keep = true;
-        sync_dir(&self.root.join(kind.dir()))?;
-        Ok(target)
+        sync_after_rename(&self.root.join(kind.dir()), &target)?;
+        Ok(Stored::Done {
+            path: target,
+            length,
+        })
     }
 
     /// Looks for the object and hashes it (in chunks, keeping nothing) against `digest`, within
     /// `max` bytes.
-    pub fn load(&self, kind: Kind, digest: &[u8; 32], max: u64) -> Result<Load, StoreError> {
+    pub(crate) fn load(&self, kind: Kind, digest: &[u8; 32], max: u64) -> Result<Load, StoreError> {
+        self.check(kind, digest, max, false).map(|(load, _)| load)
+    }
+
+    /// [`ObjectStore::load`] that also returns the bytes: the only interface that does, and it
+    /// returns only bytes that matched, read once and hashed once. A file that does not match is
+    /// deleted ([`Load::Deleted`]).
+    pub(crate) fn read(
+        &self,
+        kind: Kind,
+        digest: &[u8; 32],
+        max: u64,
+    ) -> Result<(Load, Vec<u8>), StoreError> {
+        self.check(kind, digest, max, true)
+    }
+
+    fn check(
+        &self,
+        kind: Kind,
+        digest: &[u8; 32],
+        max: u64,
+        keep: bool,
+    ) -> Result<(Load, Vec<u8>), StoreError> {
         let path = self.path(kind, digest);
         let Some(mut file) = open_regular(&path)? else {
-            return Ok(Load::Miss);
+            return Ok((Load::Miss, Vec::new()));
         };
         let mut hasher = Sha256::new();
+        let mut bytes = Vec::new();
         let mut length = 0u64;
         let mut chunk = vec![0u8; 64 * 1024];
         loop {
@@ -171,37 +272,17 @@ impl ObjectStore {
             };
             length += n as u64;
             if length > max {
-                return Ok(self.delete(&path));
+                return Ok((self.delete(&path), Vec::new()));
             }
             hasher.update(&chunk[..n]);
+            if keep {
+                bytes.extend_from_slice(&chunk[..n]);
+            }
         }
         if hasher.finalize().as_slice() == digest {
-            Ok(Load::Hit { path, length })
+            Ok((Load::Hit { path, length }, bytes))
         } else {
-            Ok(self.delete(&path))
-        }
-    }
-
-    /// The bytes of a cached object read within `max` and hashed against `digest`: the only
-    /// interface that returns bytes, and it returns only bytes that matched. `Ok(None)` for a
-    /// miss; a file that does not match is deleted and is a miss too.
-    pub fn read(
-        &self,
-        kind: Kind,
-        digest: &[u8; 32],
-        max: u64,
-    ) -> Result<Option<Vec<u8>>, StoreError> {
-        let path = self.path(kind, digest);
-        let Some(file) = open_regular(&path)? else {
-            return Ok(None);
-        };
-        let mut bytes = Vec::new();
-        file.take(max.saturating_add(1)).read_to_end(&mut bytes)?;
-        if bytes.len() as u64 <= max && Sha256::digest(&bytes).as_slice() == digest {
-            Ok(Some(bytes))
-        } else {
-            self.delete(&path);
-            Ok(None)
+            Ok((self.delete(&path), Vec::new()))
         }
     }
 
@@ -219,15 +300,38 @@ impl std::fmt::Debug for ObjectStore {
 }
 
 /// The file at `path` opened for reading, `None` when there is none, and an error when the name
-/// is not a regular file (a link, a directory) or cannot be read. Nothing is deleted.
+/// is not a regular file (a link, a directory, a device) or cannot be read. Nothing is deleted.
+/// The kind is judged on the opened file itself, so it cannot change between a check and the
+/// open: on Unix the open does not follow a link and does not block on a pipe, and on Windows it
+/// opens a link itself rather than its target.
 fn open_regular(path: &Path) -> Result<Option<File>, StoreError> {
-    match fs::symlink_metadata(path) {
-        Ok(meta) if meta.is_file() => {}
-        Ok(_) => return Err(StoreError::NotRegular),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    Ok(Some(File::open(path)?))
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_FLAG_OPEN_REPARSE_POINT, and FILE_FLAG_BACKUP_SEMANTICS so a directory opens
+        // (and is then refused as not a file) instead of failing with an access error.
+        options.custom_flags(0x0020_0000 | 0x0200_0000);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        #[cfg(unix)]
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(StoreError::NotRegular);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if !file.metadata()?.is_file() {
+        return Err(StoreError::NotRegular);
+    }
+    Ok(Some(file))
 }
 
 #[cfg(unix)]

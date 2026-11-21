@@ -21,7 +21,8 @@
 //! `Authorization` and no redirect, whose body is streamed into a writer the caller gives, on a
 //! blocking thread, so memory does not depend on the object's size. The body is read only for a
 //! 200 that declares exactly one canonical `Content-Length` within the bound the caller gives;
-//! it has no total time, only the no-progress clock.
+//! it has no total time, only the no-progress clock, which a completed write of the writer
+//! restarts as a byte on the socket does.
 
 use std::io::{self, Read, Write};
 use std::pin::Pin;
@@ -291,7 +292,7 @@ impl Client {
             progress: progress.clone(),
         };
         tokio::select! {
-            got = exchange_get(stream, request, max_len, writer) => got,
+            got = exchange_get(stream, request, max_len, writer, progress.clone()) => got,
             () = progress.stalled(self.no_progress) => Err(Error::NoProgress),
         }
     }
@@ -452,6 +453,7 @@ async fn exchange_get<W: Write + Send + 'static>(
     request: Request<Empty<Bytes>>,
     max_len: u64,
     writer: W,
+    progress: Progress,
 ) -> Result<Got<W>, Error> {
     let (mut sender, connection) = http1::Builder::new()
         .max_buf_size(MAX_HEAD)
@@ -487,6 +489,9 @@ async fn exchange_get<W: Write + Send + 'static>(
         let mut writer = writer;
         while let Some(chunk) = rx.blocking_recv() {
             writer.write_all(&chunk)?;
+            // A write that completes is progress too: a slow disk that keeps taking bytes
+            // must not read as a stalled connection while the socket waits for it.
+            progress.moved();
         }
         writer.flush()?;
         Ok::<W, io::Error>(writer)

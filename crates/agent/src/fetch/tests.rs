@@ -34,6 +34,32 @@ const OBJ: u16 = 9000;
 const AGENT_ID: &str = "0194f0a2-7c3e-7d11-8a52-3f6f9b1c2d4e";
 const JOB: &str = "0194f0a2-7c3e-7d11-8a52-3f6f9b1c2d4f";
 
+/// Serializes the operations of the fetchers of all tests, which the log test also holds for its
+/// whole body. A call site that is first reached on a thread without a subscriber while the log
+/// test's scoped subscriber is being set up can stay disabled, and the "no secret in the log"
+/// checks would then pass on an empty log. A test thread that holds the gate does not take it
+/// again.
+pub(super) fn gate() -> Gate {
+    static GATE: Mutex<()> = Mutex::new(());
+    thread_local!(static HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) });
+    if HELD.get() {
+        return Gate(None);
+    }
+    let guard = GATE.lock().unwrap_or_else(|e| e.into_inner());
+    HELD.set(true);
+    Gate(Some((guard, || HELD.set(false))))
+}
+
+pub(super) struct Gate(Option<(std::sync::MutexGuard<'static, ()>, fn())>);
+
+impl Drop for Gate {
+    fn drop(&mut self) {
+        if let Some((_, release)) = &self.0 {
+            release();
+        }
+    }
+}
+
 fn digest(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
@@ -265,6 +291,19 @@ impl Rig {
 
     fn tmp_files(&self) -> usize {
         fs::read_dir(self.tmp_dir()).unwrap().count()
+    }
+
+    /// Waits (at most 10 seconds, on the real clock) until `tmp/` is empty: a dropped download's
+    /// file is removed by the guard, which on Windows retries while the writer thread still holds
+    /// it.
+    fn tmp_empty_soon(&self) -> bool {
+        for _ in 0..500 {
+            if self.tmp_files() == 0 {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
     }
 
     fn cached(&self, kind: Kind, bytes: &[u8]) -> std::path::PathBuf {
@@ -537,14 +576,7 @@ async fn a_failed_exchange_is_a_retry_with_its_wait() {
             retry_after_secs: Some(9)
         })
     );
-    assert_eq!(
-        rig.doc(0).await,
-        Err(FetchError::Retry {
-            why: "exchange",
-            status: None,
-            retry_after_secs: Some(60)
-        })
-    );
+    assert_eq!(rig.doc(0).await, Err(FetchError::ExchangeRefused));
     assert_eq!((rig.downloads(), rig.gets()), (0, 0));
     // The next one gets through.
     rig.doc(0).await.unwrap();
@@ -639,8 +671,7 @@ async fn a_401_then_a_refused_exchange_ends_in_a_retry_of_the_exchange() {
         ));
         script.session.push_back(json(403, "{}"));
     }
-    let error = rig.doc(0).await.unwrap_err();
-    assert_eq!(retry_why(error), "exchange");
+    assert_eq!(rig.doc(0).await, Err(FetchError::ExchangeRefused));
     assert_eq!(rig.gets(), 0);
 }
 
@@ -848,22 +879,23 @@ async fn a_stalled_body_is_dropped_and_a_slow_one_is_not() {
         .fetcher
         .client
         .clone()
-        .with_no_progress(Duration::from_millis(300));
+        .with_no_progress(Duration::from_secs(1));
     let mut partial = ok(&rig.docs[0]);
     partial.truncate(partial.len() - 500);
     rig.serve(Obj::Hold(partial));
     assert_eq!(retry_why(rig.doc(0).await.unwrap_err()), "no-progress");
-    assert_eq!(rig.tmp_files(), 0);
+    assert!(rig.tmp_empty_soon());
 
-    // Ten pieces, 80 ms apart: 800 ms in all, over the limit, but never silent for 300 ms.
+    // Five pieces, 400 ms apart: two seconds in all, over the one-second limit, but never silent
+    // for more than 400 ms, a margin a loaded runner does not close.
     rig.serve(Obj::Slow {
         body: rig.docs[0].clone(),
-        pieces: 10,
-        gap: Duration::from_millis(80),
+        pieces: 5,
+        gap: Duration::from_millis(400),
     });
     let started = std::time::Instant::now();
     rig.doc(0).await.unwrap();
-    assert!(started.elapsed() > Duration::from_millis(300));
+    assert!(started.elapsed() > Duration::from_secs(1));
     assert_eq!(
         fs::read(rig.cached(Kind::Document, &rig.docs[0])).unwrap(),
         rig.docs[0]
@@ -933,17 +965,29 @@ async fn a_local_failure_is_not_retried() {
 
 // ---------------------------------------------------------------- A18, A19
 
-/// A18: a stop drops the future; the temporary file is deleted and nothing is reported.
-#[cfg(unix)]
+/// A18: a stop drops the future; the temporary file is deleted and nothing is reported. The stop
+/// comes once the GET has reached the server, so the download is under way.
 #[tokio::test]
 async fn a_stop_deletes_the_temporary_file() {
     let rig = Rig::one(&bytes(1000, 3));
     let mut partial = ok(&rig.docs[0]);
     partial.truncate(partial.len() - 500);
     rig.serve(Obj::Hold(partial));
-    let stopped = tokio::time::timeout(Duration::from_millis(300), rig.doc(0)).await;
-    assert!(stopped.is_err(), "the fetch was still running");
-    assert_eq!(rig.tmp_files(), 0);
+    let stopped = async {
+        for _ in 0..500 {
+            if rig.gets() >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    tokio::select! {
+        biased;
+        () = stopped => {}
+        got = rig.doc(0) => panic!("the fetch ended by itself: {got:?}"),
+    }
+    assert!(rig.tmp_empty_soon());
     assert!(!rig.cached(Kind::Document, &rig.docs[0]).exists());
 }
 
@@ -955,6 +999,103 @@ async fn two_requests_for_one_digest_make_one_download() {
     let (a, b) = tokio::join!(rig.doc(0), rig.doc(0));
     assert_eq!(a.unwrap(), b.unwrap());
     assert_eq!(rig.gets(), 1);
+}
+
+/// A write that fails (a full disk) is a local failure, which the loop does not retry, and
+/// leaves nothing.
+#[tokio::test(start_paused = true)]
+async fn a_failing_write_is_a_local_failure() {
+    let rig = Rig::one(&bytes(100_000, 6));
+    rig.serve_body(&rig.docs[0]);
+    rig.fetcher.store.fail_writes_after(10_000);
+    assert_eq!(
+        rig.doc_retrying(0, 5).await,
+        Err(FetchError::Local { why: "write" })
+    );
+    assert_eq!(rig.gets(), 1);
+    assert!(rig.tmp_empty_soon());
+    assert!(!rig.cached(Kind::Document, &rig.docs[0]).exists());
+}
+
+/// A refused exchange takes the back-off to its cap, as the uploader's does, and it stays there:
+/// a refusal and then an ordinary failure wait 60 seconds and 60 seconds again.
+#[tokio::test(start_paused = true)]
+async fn a_refused_exchange_caps_the_back_off_and_it_stays_there() {
+    let rig = Rig::one(b"d");
+    rig.serve_body(b"d");
+    {
+        let mut script = rig.script.lock().unwrap();
+        script.challenge.push_back(json(
+            200,
+            &format!(r#"{{"challenge":"{}"}}"#, STANDARD.encode([7u8; 32])),
+        ));
+        script.session.push_back(json(403, "{}"));
+        script.challenge.push_back(json(500, "{}"));
+    }
+    let started = Instant::now();
+    rig.doc_retrying(0, 3).await.unwrap();
+    assert_eq!(started.elapsed(), Duration::from_secs(120));
+}
+
+/// A `Retry-After` of the object server is taken for a 429 and a 503 only, as for the routes.
+#[tokio::test(start_paused = true)]
+async fn the_get_s_retry_after_is_kept_for_429_and_503_only() {
+    for (status, want) in [
+        (429u16, Some(7)),
+        (503, Some(7)),
+        (500, None),
+        (404, None),
+        (302, None),
+    ] {
+        let rig = Rig::one(b"d");
+        rig.serve(Obj::Raw(answer(status, "Retry-After: 7\r\n", "")));
+        let error = rig.doc(0).await.unwrap_err();
+        assert_eq!(
+            error,
+            FetchError::Retry {
+                why: if status == 302 {
+                    "get-redirect"
+                } else {
+                    "get-status"
+                },
+                status: Some(status),
+                retry_after_secs: want
+            },
+            "{status}"
+        );
+    }
+}
+
+/// `read_document`: the bytes of a fresh download, of a cached file with no request, and a file
+/// that went bad is fetched again; the same call holds the lock, so it is not interleaved with
+/// another fetch of the digest.
+#[tokio::test(start_paused = true)]
+async fn read_document_returns_the_bytes_of_one_verified_load() {
+    let rig = Rig::one(&bytes(70_000, 9));
+    rig.serve_body(&rig.docs[0]);
+    let d = digest(&rig.docs[0]);
+    let read = || rig.fetcher.read_document(&rig.verified, &d, 1);
+    assert_eq!(read().await.unwrap(), rig.docs[0]);
+    let requests = rig.script.lock().unwrap().log.len();
+    assert_eq!(read().await.unwrap(), rig.docs[0]);
+    assert_eq!(
+        rig.script.lock().unwrap().log.len(),
+        requests,
+        "a cache hit"
+    );
+    fs::write(rig.cached(Kind::Document, &rig.docs[0]), b"bad").unwrap();
+    assert_eq!(read().await.unwrap(), rig.docs[0]);
+    assert_eq!(rig.gets(), 2);
+    let (a, b) = tokio::join!(read(), rig.doc(0));
+    assert_eq!(a.unwrap(), rig.docs[0]);
+    b.unwrap();
+    assert_eq!(rig.gets(), 2);
+    // A digest the instruction does not name is not read.
+    let other = digest(b"other");
+    assert_eq!(
+        rig.fetcher.read_document(&rig.verified, &other, 1).await,
+        Err(FetchError::NotNamed)
+    );
 }
 
 // ---------------------------------------------------------------- A21
@@ -985,6 +1126,8 @@ impl<'a> MakeWriter<'a> for Log {
 /// signature or body.
 #[tokio::test(start_paused = true)]
 async fn the_log_holds_no_url_token_digest_or_body() {
+    // No other test's fetcher runs while this subscriber is set up and used.
+    let _gate = gate();
     let log = Log::default();
     let _guard = tracing::subscriber::set_default(
         tracing_subscriber::fmt()

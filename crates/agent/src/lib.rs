@@ -49,6 +49,7 @@ pub mod client;
 pub mod comm_log;
 pub mod connect;
 pub mod control;
+mod data_token;
 pub mod deadline;
 pub mod document;
 pub mod fetch;

@@ -94,6 +94,15 @@ impl MultipartStore for Gate {
         self.inner.presign_part(upload, part)
     }
 
+    fn put_part<'a>(
+        &'a self,
+        upload: &'a Upload,
+        part: u16,
+        bytes: Vec<u8>,
+    ) -> StoreFuture<'a, ()> {
+        self.inner.put_part(upload, part, bytes)
+    }
+
     fn presign_get(&self, key: &ObjectKey) -> Result<GetUrl, StoreError> {
         self.inner.presign_get(key)
     }

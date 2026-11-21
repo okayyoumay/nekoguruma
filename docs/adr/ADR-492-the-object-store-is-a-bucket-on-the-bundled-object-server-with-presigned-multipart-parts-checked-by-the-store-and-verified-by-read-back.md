@@ -1,7 +1,7 @@
 # ADR-492: The Object Store Is a Bucket on the Bundled Object Server, With Presigned Multipart Parts, Checked by the Store and Verified by Read-Back
 
 **Date:** 2026-11-18
-**Status:** Accepted (its caller, the data channel, is ADR-493; a presigned GET added by ADR-497)
+**Status:** Accepted (its caller, the data channel, is ADR-493; a presigned GET added by ADR-497; a part the server sends itself, `put_part`, added by ADR-500)
 **Affects:** design 13, 13.3, 14.3; `crates/server` (`storage`, `storage/s3`, `config`, `lib`, `bin/ngr-fake-object-server`, `tests/postgres/`), `crates/server/docs/ngr-server.md`, `db/README.md`, `docs/glossary.md`, `README.md`; supersedes in part ADR-474; details ADR-491
 
 ## Context

@@ -275,7 +275,7 @@ store holds the large bodies that the database refers to by key (the `storage_ke
 not carry the bytes: the writer PUTs each part to a presigned URL. The trait's futures are boxed by
 hand, so `Arc<dyn MultipartStore>` works, and `Server::object_store()` returns the store
 `Server::start` opened (`None` for a `Config` with no `[object_server]`, and for a server made by
-`bind`). No route or task of the server uses the store yet.
+`bind`). The data channel's routes and the document store route use it.
 
 - `begin()` issues the key (a version 4 UUID in lowercase text) and starts a multipart upload;
   the result is `Upload { key, id }`, which the caller's row keeps whole, since the store records
@@ -286,6 +286,13 @@ hand, so `Arc<dyn MultipartStore>` works, and `Server::object_store()` returns t
   region `us-east-1`, path style. It does no I/O. `PartUrl` has a redacting `Debug` and no
   `Display`; `expose()` gives the text for the writer. The URL does not bind the length of what is
   sent (ADR-492's known limits).
+- `put_part(upload, part, bytes)` sends one part from the server, for a body the server already
+  holds (the document store, ADR-500): the same signed PUT a writer would be given, with the body
+  and its length, bounded by the control request timeout (30 seconds). A part number outside 1 to
+  10000 is `InvalidPartNumber` and a body over the store's object limit `ObjectTooLarge`, both
+  before any request; 403 and 401 are `Refused`, a 404 that names a missing upload `NotFound`, any
+  other status `Server`. Only the status is read: the entity tag comes again with the listing at
+  completion. The part is checked by `complete` like any other, and the last may be any size.
 - `presign_get(key)` computes a presigned GET URL for an object, valid at most 60 seconds
   (`GET_URL_EXPIRY`; the signing time is cut to the second, so it lapses 59 to 60 seconds after its
   issue), signed as `presign_part` signs. It does no I/O, so it does not know whether the object
@@ -669,6 +676,8 @@ also refuses a route mounted any other way.
   in" above.
 - `POST /api/v1/jobs` (`api/openapi.yaml`; `jobs.rs`; ADR-477): creates an acquisition or a
   configuration write job behind the operator session. See "Creating a job" above.
+- `PUT /api/v1/documents/{sha256}` (`api/openapi.yaml`; `documents.rs`; ADR-500): stores an IR
+  document for the caller's tenant behind the operator session. See "Storing a document" below.
 - `POST /api/v1/agent/uploads`, `POST /api/v1/agent/uploads/{uploadId}/parts/{part}`,
   `GET /api/v1/agent/uploads/{uploadId}` and `POST /api/v1/agent/uploads/{uploadId}/complete`
   (`api/openapi.yaml`; `uploads.rs`; ADR-493): the data channel's begin, part URL, status and
@@ -744,6 +753,45 @@ does, and a `completing` row that no request repeats stays so.
 
 Never logged: the token, the body, the digest, the job, an object key, an upload ID, a URL and the
 text of a database error (the SQLSTATE only).
+
+## Storing a document
+
+`documents.rs`; the decisions and the table of the route's answers (R1 to R24) are in ADR-500.
+The route is built from `AppState::uploads` for the object store, like the data channel's, so a
+store set after the router is built does not reach it; its slots and log gates are its own.
+
+- **`PUT /api/v1/documents/{sha256}`, in this order, the first step that applies answers.** The
+  guard; the method (405 with `Allow: PUT`); the session layer of "Logging in" (403 for the
+  Origin, 401, 503, 500); the path (64 lowercase hex digits, else 400); exactly one `Content-Type`
+  of `application/octet-stream`, parameters allowed (400); the declared length (over
+  `documents::MAX_BYTES`, 16 MiB, 413, and exactly 16 MiB passes); the permission (the role
+  `worker` with an empty scope, as job creation needs, else 403); the slots (two stores at a
+  time, `documents::MAX_CONCURRENT`; a third is 503 with `Retry-After: 5`); the body (413, 408
+  after `documents::BODY_TIMEOUT`, 30 seconds, and 400; the test override is
+  `Backend::with_document_body_timeout`); then the work below. Every refusal up to the body
+  closes the connection and leaves the body unread.
+- **The work.** The body is hashed (off the runtime's threads) and compared with the path
+  (`DIGEST_MISMATCH`, 400, even when a row exists). A row of the tenant for the digest is a 200,
+  with no parse, no store call and no write. Otherwise `load_ecu_document` must accept the body
+  and its metadata must be within bounds (`INVALID_IR_DOCUMENT`, 400): a variant with a name, every
+  text at most 256 bytes without a control character, at most 1024 part numbers and 1024 software
+  versions. Then, with no transaction open, `begin`, `put_part` (part 1) and `complete`, which
+  reads the object back. A store failure up to there is 503 (500 for `Random`) and deletes the
+  object, best effort. Last, one transaction inserts the row (`extension_id` NULL) with
+  `ON CONFLICT (tenant_id, digest) DO NOTHING`, guarded by `NOT EXISTS` on the key in `artifacts`
+  and `job_objects`, and the `documentStored` audit row (`audit::document_stored`: operator,
+  detail with the digest and the size), then commits: 201. No row inserted means either a
+  concurrent store won (the row is there: the object is deleted, 200) or the guard held the key back
+  (500, the object kept, since it may be another row's). A statement that fails before the commit
+  rolls back and deletes the object (503, or 500 for a fault in this code). A commit that fails
+  has an unknown outcome: 503 and the object is kept.
+- **The answer** is `{"sha256": <name>}` with `Cache-Control: no-store`, 201 for the store that
+  wrote the row and 200 otherwise, with no `Location`. A problem carries a `code` for
+  `DIGEST_MISMATCH` and `INVALID_IR_DOCUMENT` and never a value of the request.
+- **Logging.** Each reason has its own gate, once a minute: the refusal of a caller without the
+  role (the operator's ID), the database unavailable, a statement that failed, the store, a key
+  another table holds and an object that could not be deleted. `document stored` is logged at
+  info with the operator's ID. The body, the digest, a key and an upload ID are never logged.
 
 ## The agent's connection proof
 
@@ -1104,6 +1152,15 @@ a new migration file rebuilds the crate. How migrations are written and applied 
   `jobs_pending`), a dropped take, a server that goes away and the lease, a dropped socket and a
   replacement, a rejection, answers that write nothing, a retired or missing key, a revoked
   agent, a past deadline, the stop, a failing pass, and `Server::start` turning the queue on.
+  `documents.rs` covers the document store route (the case names in its comments are the rows of
+  ADR-500's table): the order of the refusals, with bodies announced and never sent where a
+  refusal must not read them, the permission cases, two held stores turning a third away, a body
+  past the bound, a stalled one and a broken one, a body under another name, a second store and a
+  stored row for bytes that are no document, what the loader refuses, a failed begin, part and
+  completion (each deleting the key), the row's columns and its audit record, two racing stores on
+  the real object server, a key another table holds, a failed audit insert rolling the row back, a
+  digest per tenant, and a small and a 16 MiB document read back byte for byte from the real object
+  server and signed by the download route. The metadata bounds are unit tests in `src/documents.rs`.
   `job_expiry.rs` covers the expiry statement and its task (ADR-487; the case names in its
   comments are the rows of the ADR's table): a job ended from its deadline and not before,
   delivered or not, with no failure and no write to the event, cursor, feed or audit tables; the

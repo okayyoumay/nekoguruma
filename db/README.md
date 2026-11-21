@@ -119,8 +119,21 @@ GET URL for the row's `storage_key`. Migration 0014 makes each `digest` 64 lower
 bare (the form of the signed instruction and of `jobs.artifact_digest`; the `sha256:` prefix the
 0001 comment showed was never written, and the column comments are set again), and each
 `storage_key` 36 characters and unique within its table (a key unique across `ir_documents`, `artifacts` and `job_objects` is the writer's to keep). A row exists only for an
-object the store read back and found to match its digest. Nothing writes these tables yet (tests
-seed them); the route that stores IR documents will, and the route only reads.
+object the store read back and found to match its digest. The document store route writes
+`ir_documents` (migration 0015, ADR-500); nothing writes `artifacts` yet (tests seed it), and the
+download route only reads both.
+
+**IR documents: `ir_documents.extension_id` is nullable (migration 0015, ADR-500)**
+The document store route writes a row from the bytes of a document alone, and a document carries
+no ID of an extension package, so `extension_id` may be NULL; a placeholder would look like a real
+package's ID. A row stored by the route has it NULL and the other metadata columns filled from the
+document (schema version, variant name, part numbers, software versions, source format, source
+digest). The route inserts with `ON CONFLICT (tenant_id, digest) DO NOTHING`, so a second store of
+a tenant's digest writes nothing, and only when the key is in neither `artifacts` nor
+`job_objects`: the unique constraint of migration 0014 covers a key within one table, and this
+guard is the one-directional check across the three (the upload route's insert does not look at
+`ir_documents`). An insert writes a `documentStored` row of `audit_log` in the same transaction;
+`ir_documents` records no importer.
 
 **Do not store raw data bodies in the DB**
 `dataset_chunks` holds only object storage keys and hashes.

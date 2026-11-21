@@ -142,6 +142,11 @@ pub(crate) struct Wrap {
     /// The calls of `complete`, apart from `calls()` so that its shape stays.
     completes: AtomicUsize,
     begin_fail: Mutex<Option<Fail>>,
+    /// The calls of `put_part`.
+    puts: AtomicUsize,
+    put_fail: Mutex<Option<Fail>>,
+    /// The key the next fake `begin` (one with no real store behind it) issues, once.
+    pub(crate) begin_key: Mutex<Option<ObjectKey>>,
     list_fail: Mutex<Option<Fail>>,
     delete_fail: Mutex<Option<Fail>>,
     pub(crate) presign_fail: Mutex<Option<Fail>>,
@@ -159,6 +164,47 @@ pub(crate) struct Wrap {
 }
 
 impl Wrap {
+    /// The calls of `put_part`.
+    pub(crate) fn puts(&self) -> usize {
+        self.puts.load(Ordering::SeqCst)
+    }
+
+    /// The calls of `complete`.
+    pub(crate) fn completes(&self) -> usize {
+        self.completes.load(Ordering::SeqCst)
+    }
+
+    /// The keys `begin` issued, in order.
+    pub(crate) fn issued(&self) -> Vec<String> {
+        self.issued.lock().unwrap().clone()
+    }
+
+    /// The keys `delete` was called with, in order.
+    pub(crate) fn deleted(&self) -> Vec<String> {
+        self.deleted.lock().unwrap().clone()
+    }
+
+    /// Makes the next `begin`s wait for `parties` of them, after their upload exists.
+    pub(crate) fn hold_begins(&self, parties: usize) {
+        *self.begin_barrier.lock().unwrap() = Some(Arc::new(Barrier::new(parties)));
+    }
+
+    pub(crate) fn fail_begin(&self, fail: Option<Fail>) {
+        Wrap::set(&self.begin_fail, fail);
+    }
+
+    pub(crate) fn fail_put(&self, fail: Option<Fail>) {
+        Wrap::set(&self.put_fail, fail);
+    }
+
+    pub(crate) fn fail_complete(&self, fail: Option<Fail>) {
+        Wrap::set(&self.complete_fail, fail);
+    }
+
+    pub(crate) fn fail_delete(&self, fail: Option<Fail>) {
+        Wrap::set(&self.delete_fail, fail);
+    }
+
     pub(crate) fn calls(&self) -> [usize; 4] {
         [
             self.begins.load(Ordering::SeqCst),
@@ -187,7 +233,12 @@ impl MultipartStore for Wrap {
             let upload = match &self.inner {
                 Some(inner) => inner.begin().await?,
                 None => Upload {
-                    key: ObjectKey::parse(&v4()).unwrap(),
+                    key: self
+                        .begin_key
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .unwrap_or_else(|| ObjectKey::parse(&v4()).unwrap()),
                     id: UploadId::parse(&format!("fake-{}", v4())).unwrap(),
                 },
             };
@@ -209,6 +260,24 @@ impl MultipartStore for Wrap {
             Some(inner) => inner.presign_part(upload, part),
             None => Err(StoreError::InvalidKey),
         }
+    }
+
+    fn put_part<'a>(
+        &'a self,
+        upload: &'a Upload,
+        part: u16,
+        bytes: Vec<u8>,
+    ) -> StoreFuture<'a, ()> {
+        Box::pin(async move {
+            self.puts.fetch_add(1, Ordering::SeqCst);
+            if let Some(error) = Wrap::fail(&self.put_fail) {
+                return Err(error);
+            }
+            match &self.inner {
+                Some(inner) => inner.put_part(upload, part, bytes).await,
+                None => Ok(()),
+            }
+        })
     }
 
     fn presign_get(&self, key: &ObjectKey) -> Result<GetUrl, StoreError> {
@@ -345,6 +414,23 @@ impl Fx {
         wait: Option<Duration>,
         pause: Option<Arc<Pause>>,
     ) -> Fx {
+        Fx::tuned(with, |mut backend| {
+            if let Some(bytes) = part_bytes {
+                backend = backend.with_part_bytes(bytes);
+            }
+            if let Some(wait) = wait {
+                backend = backend.with_complete_wait(wait);
+            }
+            if let Some(pause) = pause {
+                backend = backend.with_pause(pause);
+            }
+            backend
+        })
+        .await
+    }
+
+    /// A fixture whose backend `tune` has changed.
+    pub(crate) async fn tuned(with: With, tune: impl FnOnce(Backend) -> Backend) -> Fx {
         let mut real = None;
         let mut wrap = Wrap::default();
         if with == With::Real {
@@ -367,16 +453,7 @@ impl Fx {
         }
         let wrap = Arc::new(wrap);
         let store = (with != With::Nothing).then(|| Arc::clone(&wrap) as Arc<dyn MultipartStore>);
-        let mut backend = Backend::new(store);
-        if let Some(bytes) = part_bytes {
-            backend = backend.with_part_bytes(bytes);
-        }
-        if let Some(wait) = wait {
-            backend = backend.with_complete_wait(wait);
-        }
-        if let Some(pause) = pause {
-            backend = backend.with_pause(pause);
-        }
+        let backend = tune(Backend::new(store));
         let u = Up::with_backend(2, None, None, backend).await;
         let token = token(&u).await;
         Fx {
@@ -571,7 +648,8 @@ impl Fx {
                  confirmation_level, start_deadline, signed_job, signing_key_id, idempotency_key) \
              SELECT a.tenant_id, $1::uuid, 'acquire', a.id, o.id, 'vci', 'notifyOnly', \
                  now() + interval '1 hour', $3, $4, gen_random_uuid()::text \
-             FROM agents a JOIN operators o ON o.tenant_id = a.tenant_id WHERE a.id = $2::uuid",
+             FROM agents a JOIN LATERAL (SELECT id FROM operators WHERE tenant_id = a.tenant_id \
+                 ORDER BY created_at, id LIMIT 1) o ON true WHERE a.id = $2::uuid",
         )
         .bind(id)
         .bind(agent)
@@ -667,7 +745,7 @@ pub(crate) fn sha_of(bytes: &[u8]) -> String {
 }
 
 /// A row begun on a new job over the route, with the declared length and digest of `bytes`.
-async fn begin_for(fx: &Fx, bytes: &[u8]) -> String {
+pub(crate) async fn begin_for(fx: &Fx, bytes: &[u8]) -> String {
     let job = fx.job().await;
     let r = fx
         .begin(&decl(&job, 1, "result", bytes.len() as u64, &sha_of(bytes)))

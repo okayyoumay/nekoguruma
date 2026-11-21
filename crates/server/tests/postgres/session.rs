@@ -295,6 +295,9 @@ pub(crate) struct Up {
     pub(crate) sessions: Sessions,
     /// The server's hub: the control channel tests send commands and take the inbox through it.
     pub(crate) hub: Hub,
+    /// The server's operator sessions: a test that needs a session the login route cannot make
+    /// (the login serves the local tenant only) puts one in this table.
+    pub(crate) operator_sessions: server::OperatorSessions,
     /// The text of every challenge and nonce this test sent, for the log check.
     seen: std::sync::Mutex<Vec<String>>,
 }
@@ -351,6 +354,7 @@ impl Up {
         };
         let sessions = server.sessions();
         let hub = server.hub();
+        let operator_sessions = server.operator_sessions();
         Up {
             w,
             agent,
@@ -358,6 +362,7 @@ impl Up {
             s: Running::spawn(server),
             sessions,
             hub,
+            operator_sessions,
             seen: std::sync::Mutex::new(Vec::new()),
         }
     }

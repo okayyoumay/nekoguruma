@@ -125,7 +125,7 @@ async fn seed(fx: &Fx, bytes: &[u8]) -> ObjectKey {
 }
 
 /// A plain HTTP GET: the status and the body.
-async fn get(url: &str) -> (u16, Vec<u8>) {
+pub(crate) async fn get(url: &str) -> (u16, Vec<u8>) {
     let url: url::Url = url.parse().unwrap();
     let addr = (
         url.host_str().unwrap(),
@@ -148,7 +148,7 @@ async fn get(url: &str) -> (u16, Vec<u8>) {
     (status, body.to_vec())
 }
 
-fn url_of(r: &Reply) -> String {
+pub(crate) fn url_of(r: &Reply) -> String {
     assert_eq!(r.status, 200, "{}", r.head);
     json(r)["url"].as_str().unwrap().to_owned()
 }

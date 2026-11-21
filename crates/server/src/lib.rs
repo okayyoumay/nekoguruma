@@ -15,6 +15,7 @@ pub(crate) mod audit;
 pub mod config;
 pub mod control;
 pub mod db;
+pub mod documents;
 pub mod downloads;
 pub(crate) mod fs_guard;
 pub mod health;
@@ -44,7 +45,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::http::{Method, StatusCode};
 use axum::middleware;
-use axum::routing::{MethodRouter, any, get, post};
+use axum::routing::{MethodRouter, any, get, post, put};
 use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
@@ -182,6 +183,22 @@ pub fn routes_unguarded(state: AppState) -> (Router, Vec<ServedRoute>) {
             state.pool.clone(),
             Arc::clone(&state.instruction_key),
         ));
+    // The document store takes the operator session's layer and the object store the data
+    // channel's routes use; its state holds its own slots and log gates (ADR-500).
+    let documents = mounts
+        .mount(
+            Router::new(),
+            Method::PUT,
+            documents::PATH,
+            put(documents::store).route_layer(middleware::from_fn_with_state(
+                auth.clone(),
+                operator_session::require_session,
+            )),
+        )
+        .with_state(documents::Documents::new(
+            state.pool.clone(),
+            &state.uploads,
+        ));
     let operator = mounts.mount(
         Router::new(),
         Method::POST,
@@ -278,6 +295,7 @@ pub fn routes_unguarded(state: AppState) -> (Router, Vec<ServedRoute>) {
     let routes = health
         .merge(operator)
         .merge(jobs)
+        .merge(documents)
         .merge(uploads)
         .merge(register)
         .merge(exchange)

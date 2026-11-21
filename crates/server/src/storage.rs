@@ -11,7 +11,8 @@
 //! 1. [`MultipartStore::begin`] issues a key and starts a multipart upload; the caller keeps both
 //!    in its row ([`Upload`]).
 //! 2. [`MultipartStore::presign_part`] gives the URL for one part, valid for a few minutes.
-//!    Nothing is sent to the object server.
+//!    Nothing is sent to the object server. A body the server holds itself (an IR document,
+//!    ADR-500) goes the other way: [`MultipartStore::put_part`] sends the part from here.
 //! 3. [`MultipartStore::list_parts`] tells what the object server holds, so that a writer that
 //!    lost its place resumes.
 //! 4. [`MultipartStore::complete`] checks the parts, completes the upload, reads the object back
@@ -350,6 +351,15 @@ pub trait MultipartStore: Send + Sync {
     /// `upload` to, valid for [`PART_URL_EXPIRY`]. Computes a signature and does no I/O. The URL
     /// does not bind the part's length.
     fn presign_part(&self, upload: &Upload, part: u16) -> Result<PartUrl, StoreError>;
+
+    /// Sends the bytes of part `part` (from 1 to 10000, else [`StoreError::InvalidPartNumber`]) of
+    /// `upload` to the object server itself, for a body the server already holds (an IR document,
+    /// ADR-500); anything larger than the store's object limit is [`StoreError::ObjectTooLarge`].
+    /// The part is checked at [`MultipartStore::complete`] like any other: a part that is not the
+    /// last must be at least the minimum, and the last may be of any size, empty included. The
+    /// call is bounded in time as the store's other requests are, and the part can be sent again.
+    fn put_part<'a>(&'a self, upload: &'a Upload, part: u16, bytes: Vec<u8>)
+    -> StoreFuture<'a, ()>;
 
     /// The URL to GET the object `key` from, valid for [`GET_URL_EXPIRY`]. Computes a signature
     /// and does no I/O: whether the object exists is not known here.

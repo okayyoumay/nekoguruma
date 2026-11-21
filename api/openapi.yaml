@@ -917,6 +917,86 @@ paths:
         '500': { $ref: '#/components/responses/Problem' }
         '503': { $ref: '#/components/responses/Problem' }
 
+  # ------------------------------------------------------------ Documents
+  /v1/documents/{sha256}:
+    put:
+      tags: [jobs]
+      summary: Store an IR document by its SHA-256 (8.2.6, 14.3, ADR-500)
+      description: |
+        Stores the bytes of one IR document for the caller's tenant, so that a job can name it by
+        this digest (11.1, ADR-454) and the agent can fetch it (ADR-497). The path is the
+        document's SHA-256, 64 lowercase hex digits (**400** otherwise); the body is the raw
+        bytes, with exactly one `Content-Type: application/octet-stream` (**400** otherwise), at
+        most 16 MiB (**413**, before a byte is read when the length is declared, and as soon as
+        a streamed body passes the bound). The body is read within 30 seconds (**408**); a broken
+        body is **400**; each of them closes the connection.
+
+        Like every operator route the request needs a live session and, as a PUT, the pinned
+        Origin (**403**) before the cookie is read (**401**). The caller must hold the role
+        `worker` with no scope, as job creation needs (6.8); otherwise **403**, judged before the
+        body is read. At most two documents are stored at a time; another is **503** with
+        `Retry-After`.
+
+        A body that does not hash to the path is **400** with the `code` `DIGEST_MISMATCH`,
+        also when the tenant already holds the digest. A body that
+        `diag_ir::declaration::load_ecu_document` refuses (file identifier, structure, schema
+        version, values), or whose metadata is out of bounds (a variant without a name; a text over
+        256 bytes or with a control character; more than 1024 part numbers or software versions),
+        is **400** with the `code` `INVALID_IR_DOCUMENT`. Neither problem repeats a value of the
+        request. A tenant that already holds the digest gets **200** with no further check and
+        nothing written; otherwise the server stores the object, reads it back and compares its
+        length and SHA-256, and writes the tenant's row and an audit record, and answers **201**.
+        Each tenant has a row and an object of its own for a digest. Two stores of one digest at
+        once leave one row and one object, and both answer success (**201** and **200**). A server
+        without an object store, an object store that fails and a database that does not answer are
+        **503**; a fault of the server's own is **500**.
+      security:
+        - operatorSession: []
+      parameters:
+        - name: sha256
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[0-9a-f]{64}$' }
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary, maxLength: 16777216 }
+      responses:
+        '200':
+          description: The tenant already held the document; nothing was written
+          headers:
+            Cache-Control: { schema: { type: string }, description: '`no-store`' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DocumentStored' }
+        '201':
+          description: The document was stored
+          headers:
+            Cache-Control: { schema: { type: string }, description: '`no-store`' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DocumentStored' }
+        '400': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/Problem' }
+        '403': { $ref: '#/components/responses/Problem' }
+        '405':
+          description: A method other than PUT
+          headers:
+            Allow: { schema: { type: string }, description: '`PUT`' }
+        '408': { $ref: '#/components/responses/Problem' }
+        '413': { $ref: '#/components/responses/Problem' }
+        '500': { $ref: '#/components/responses/Problem' }
+        '503':
+          description: |
+            The object store, the database or a free slot is not there; a refusal for a full
+            slot carries `Retry-After`
+          headers:
+            Retry-After: { schema: { type: string }, description: Seconds; present when two stores are running }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
   # ------------------------------------------------------------ Artifacts and extensions
   /v1/artifacts:
     post:
@@ -1277,6 +1357,12 @@ components:
       properties:
         url: { type: string, description: A presigned GET URL; a bearer for its life }
         expiresInSecs: { type: integer, description: '60: the URL lapses within 60 seconds of its issue (the signing time is cut to the second)' }
+    DocumentStored:
+      type: object
+      additionalProperties: false
+      required: [sha256]
+      properties:
+        sha256: { type: string, pattern: '^[0-9a-f]{64}$', description: The name in the path }
     UploadStatus:
       type: object
       required: [state, partBytes, partCount]
@@ -1308,6 +1394,8 @@ components:
             - DEVICE_LOCKED
             - VEHICLE_LOCKED
             - START_DEADLINE_OUT_OF_BOUNDS
+            - DIGEST_MISMATCH
+            - INVALID_IR_DOCUMENT
             - VIN_MISMATCH
             - VARIANT_MISMATCH
             - POWER_CONDITION

@@ -390,6 +390,38 @@ impl Inner {
         Ok(PartUrl::new(url.to_string()))
     }
 
+    /// Sends one part from here: the same signed request a writer would be given, with the body.
+    /// The object server's answer carries the part's entity tag, which the listing gives again at
+    /// completion, so only the status is judged.
+    async fn put_part(&self, upload: &Upload, part: u16, bytes: Vec<u8>) -> Result<(), StoreError> {
+        const OP: &str = "store a part";
+        if !(1..=MAX_PARTS).contains(&part) {
+            return Err(StoreError::InvalidPartNumber);
+        }
+        if bytes.len() as u64 > self.tuning.max_object_bytes {
+            return Err(StoreError::ObjectTooLarge);
+        }
+        let url = self
+            .bucket
+            .upload_part(
+                Some(&self.credentials),
+                upload.key.as_str(),
+                part,
+                upload.id.expose(),
+            )
+            .sign(self.expiry());
+        let reply = self
+            .exchange_status(OP, Method::PUT, url, Some(bytes))
+            .await?;
+        match reply.status {
+            200 => Ok(()),
+            404 if xml::error_code(&reply.body) == ErrorCode::NoSuchUpload => {
+                Err(StoreError::NotFound)
+            }
+            status => Err(Inner::unexpected(OP, status)),
+        }
+    }
+
     fn presign_get(&self, key: &ObjectKey) -> Result<GetUrl, StoreError> {
         let url = self
             .bucket
@@ -880,6 +912,15 @@ impl MultipartStore for S3Store {
 
     fn presign_part(&self, upload: &Upload, part: u16) -> Result<PartUrl, StoreError> {
         self.inner.presign_part(upload, part)
+    }
+
+    fn put_part<'a>(
+        &'a self,
+        upload: &'a Upload,
+        part: u16,
+        bytes: Vec<u8>,
+    ) -> StoreFuture<'a, ()> {
+        Box::pin(self.inner.put_part(upload, part, bytes))
     }
 
     fn presign_get(&self, key: &ObjectKey) -> Result<GetUrl, StoreError> {

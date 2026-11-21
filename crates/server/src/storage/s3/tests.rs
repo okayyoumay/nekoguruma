@@ -1670,3 +1670,118 @@ async fn an_upload_of_the_key_is_aborted_whatever_its_start_time_reads_as() {
     let listed = store(&fake).list_unfinished().await.unwrap();
     assert_eq!((listed.uploads.len(), listed.skipped), (0, 1));
 }
+
+#[tokio::test]
+async fn put_part_sends_the_bytes_as_a_signed_put_of_that_part() {
+    let fake = Fake::start(|_, _| reply(200, "")).await;
+    let upload = upload();
+    let bytes = b"0123456789abcdef".to_vec();
+    store(&fake)
+        .put_part(&upload, 3, bytes.clone())
+        .await
+        .unwrap();
+    let seen = fake.seen();
+    assert_eq!(seen.len(), 1);
+    let seen = &seen[0];
+    assert_eq!(seen.op(), "upload-part");
+    assert!(seen.path().ends_with(upload.key.as_str()));
+    assert_eq!(seen.param("partNumber"), Some("3"));
+    assert_eq!(seen.param("uploadId"), Some("upload-id-1"));
+    assert!(seen.has_param("X-Amz-Signature"));
+    assert_eq!(seen.header("content-length"), Some("16"));
+    assert_eq!(seen.body, bytes);
+    assert_eq!(seen.header("connection"), Some("close"));
+}
+
+#[tokio::test]
+async fn put_part_sends_an_empty_part_with_a_length_of_zero() {
+    let fake = Fake::start(|_, _| reply(200, "")).await;
+    store(&fake)
+        .put_part(&upload(), 1, Vec::new())
+        .await
+        .unwrap();
+    let seen = &fake.seen()[0];
+    assert_eq!(seen.header("content-length"), Some("0"));
+    assert!(seen.body.is_empty());
+}
+
+#[tokio::test]
+async fn put_part_refuses_a_part_number_or_a_size_before_any_request() {
+    let fake = Fake::start(|_, _| reply(200, "")).await;
+    let store = store(&fake);
+    for part in [0, MAX_PARTS + 1] {
+        let error = store.put_part(&upload(), part, vec![1]).await.unwrap_err();
+        assert!(matches!(error, StoreError::InvalidPartNumber), "{error}");
+    }
+    assert!(store.put_part(&upload(), MAX_PARTS, vec![1]).await.is_ok());
+    // The fast tuning's object limit is 1000 bytes.
+    let error = store
+        .put_part(&upload(), 1, vec![0; 1001])
+        .await
+        .unwrap_err();
+    assert!(matches!(error, StoreError::ObjectTooLarge), "{error}");
+    assert!(store.put_part(&upload(), 1, vec![0; 1000]).await.is_ok());
+    assert_eq!(
+        fake.seen().len(),
+        2,
+        "only the two accepted parts were sent"
+    );
+}
+
+#[tokio::test]
+async fn put_part_maps_the_answer_and_leaks_nothing() {
+    let upload = upload();
+    for (status, body, expected) in [
+        (403, error_body("AccessDenied"), "refused"),
+        (401, String::new(), "refused"),
+        (404, error_body("NoSuchUpload"), "not found"),
+        (404, error_body("NoSuchBucket"), "server"),
+        (500, error_body("InternalError"), "server"),
+        (204, String::new(), "server"),
+    ] {
+        let fake = Fake::start(move |_, _| reply(status, body.clone())).await;
+        let error = store(&fake)
+            .put_part(&upload, 1, vec![1, 2, 3])
+            .await
+            .unwrap_err();
+        let kind = match &error {
+            StoreError::Refused { .. } => "refused",
+            StoreError::NotFound => "not found",
+            StoreError::Server { .. } => "server",
+            other => panic!("{status}: {other}"),
+        };
+        assert_eq!(kind, expected, "{status}");
+        let text = format!("{error} {error:?}");
+        for secret in [
+            "SERVER-SAID-THIS",
+            "RESOURCE-TEXT",
+            upload.key.as_str(),
+            upload.id.expose(),
+        ] {
+            assert!(!text.contains(secret), "{status}: {text}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn put_part_is_bounded_by_the_request_timeout() {
+    let fake = Fake::start(|_, _| Step::Hang).await;
+    let tuning = Tuning {
+        request_timeout: Duration::from_millis(200),
+        ..fast()
+    };
+    let error = store_with(fake.port, tuning)
+        .put_part(&upload(), 1, vec![1])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            StoreError::Io {
+                kind: ErrorKind::TimedOut,
+                ..
+            }
+        ),
+        "{error}"
+    );
+}

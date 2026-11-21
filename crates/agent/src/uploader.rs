@@ -44,7 +44,7 @@ use tokio::sync::{Mutex, Notify, watch};
 use crate::control::ControlError;
 use crate::control::backoff::Backoff;
 use crate::control::dial::{LoopbackPorts, PortDial};
-use crate::control::exchange::{self, Token};
+use crate::data_token::Holder;
 use crate::identity::AgentKey;
 use crate::journal::JobKey;
 use crate::registration::origin::ServerOrigin;
@@ -320,42 +320,6 @@ impl Drop for Done {
     }
 }
 
-/// The exchange's log lines in the uploader's words: one warning per class until a token is
-/// issued, debug after that, and one per refusal until a token is issued again.
-#[derive(Default)]
-struct ExchangeLog {
-    seen: HashSet<&'static str>,
-    refused: bool,
-}
-
-impl exchange::Log for ExchangeLog {
-    fn failure(&mut self, class: &'static str, status: Option<u16>) {
-        if self.seen.insert(class) {
-            tracing::warn!(class, status = ?status, "uploader exchange attempt failed");
-        } else {
-            tracing::debug!(class, status = ?status, "uploader exchange attempt failed");
-        }
-    }
-
-    fn refusal(&mut self, class: &'static str, status: u16) {
-        if self.refused {
-            tracing::debug!(class, status, "uploader exchange refused again");
-        } else {
-            self.refused = true;
-            tracing::warn!(class, status, "uploader exchange refused");
-        }
-    }
-
-    fn accepted(&mut self) {
-        self.seen.clear();
-        self.refused = false;
-    }
-
-    fn stale_challenge(&mut self) {
-        tracing::debug!("uploader challenge was not live; asking for a new one");
-    }
-}
-
 /// How an entry leaves the ledger.
 #[derive(Clone, Copy)]
 enum Removal {
@@ -376,8 +340,8 @@ struct Worker {
     ledger: SharedLedger,
     stop: Stop,
     status: watch::Sender<Status>,
-    /// Held only while an entry is pending; not tracked by age (a 401 drops it).
-    token: Option<Token>,
+    /// The token, held only while an entry is pending; not tracked by age (a 401 drops it).
+    holder: Holder,
     backoff: Backoff,
     /// The next request waits the back-off first.
     owe_wait: bool,
@@ -385,7 +349,6 @@ struct Worker {
     retry_after: Option<u32>,
     /// The attempt stored a part or got `finished`.
     progress: bool,
-    log: ExchangeLog,
     /// Entries whose source was verified this run.
     verified: HashSet<u64>,
     /// Entries passed over in the current pass.
@@ -429,12 +392,11 @@ impl Worker {
             ledger,
             stop,
             status,
-            token: None,
+            holder: Holder::new("uploader"),
             backoff: Backoff::new(),
             owe_wait: false,
             retry_after: None,
             progress: false,
-            log: ExchangeLog::default(),
             verified: HashSet::new(),
             passed_over: HashSet::new(),
             set_aside: HashSet::new(),
@@ -497,7 +459,7 @@ impl Worker {
                 // ledger that could not be opened again may hold entries memory does not (an
                 // append that landed before its sync failed), so it is tried again at the
                 // back-off's pace too, not only when an enqueue wakes the loop.
-                self.token = None;
+                self.holder.clear();
                 if poisoned {
                     let wait = self.backoff.wait(None);
                     tokio::select! {

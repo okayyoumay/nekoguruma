@@ -188,6 +188,9 @@ enum Command {
     ProvisionKey(ProvisionArgs),
     /// `ngr-agent connect --mode <mode>` (ADR-471).
     Connect(OperatingMode),
+    /// `ngr-agent debug fetch ...`: a debug build only (ADR-497).
+    #[cfg(debug_assertions)]
+    DebugFetch(agent::fetch::command::Args),
 }
 
 /// What `ngr-agent register` takes, checked before any file or socket is touched.
@@ -220,6 +223,8 @@ impl Command {
             Command::Register(args) => args.mode,
             Command::Connect(mode) => *mode,
             Command::ProvisionKey(args) => args.mode,
+            #[cfg(debug_assertions)]
+            Command::DebugFetch(args) => args.mode,
         }
     }
 }
@@ -257,6 +262,8 @@ fn main() -> ExitCode {
         Command::Connect(mode) => Some(installed("connect", *mode)),
         Command::Run(args) => Some(installed("run", args.mode)),
         Command::Identify(args) => Some(installed("identify", args.mode)),
+        #[cfg(debug_assertions)]
+        Command::DebugFetch(args) => Some(installed("debug fetch", args.mode)),
         Command::ProvisionKey(_) => unreachable!("handled before the log starts"),
     };
     let installation = match installation.transpose() {
@@ -295,6 +302,15 @@ fn main() -> ExitCode {
             let code = runtime.block_on(connect(mode, installation.server()));
             // A key load that a stop interrupted is a blocking task, which dropping the runtime
             // would wait for; give it a moment and let the process end.
+            runtime.shutdown_timeout(std::time::Duration::from_secs(2));
+            return code;
+        }
+        #[cfg(debug_assertions)]
+        Command::DebugFetch(args) => {
+            let Some(installation) = installation else {
+                unreachable!("read before the command runs")
+            };
+            let code = runtime.block_on(debug_fetch(args, installation.server()));
             runtime.shutdown_timeout(std::time::Duration::from_secs(2));
             return code;
         }
@@ -524,6 +540,101 @@ async fn connect(
     }
 }
 
+/// `ngr-agent debug fetch`: one fetch, printing the cached file's path and length as one JSON line.
+#[cfg(debug_assertions)]
+async fn debug_fetch(
+    args: agent::fetch::command::Args,
+    server: &agent::registration::origin::ServerOrigin,
+) -> ExitCode {
+    use std::io::Write;
+    match agent::fetch::command::run(args, server).await {
+        Ok(fetched) => {
+            let line = serde_json::json!({
+                "path": fetched.path.to_string_lossy(),
+                "length": fetched.length,
+            });
+            let _ = writeln!(std::io::stdout(), "{line}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "ngr-agent: debug fetch: {}",
+                error.message
+            );
+            ExitCode::from(error.exit)
+        }
+    }
+}
+
+/// The options of `ngr-agent debug fetch`: `--mode`, `--instruction`, `--kind`, `--sha256`, each
+/// once, and `--attempts` (default 4).
+#[cfg(debug_assertions)]
+fn parse_debug(mut args: impl Iterator<Item = OsString>) -> Result<Command, String> {
+    use agent::fetch::Kind;
+    if args.next().is_none_or(|word| word != "fetch") {
+        return Err("debug takes the command fetch".to_owned());
+    }
+    let (mut mode, mut instruction, mut kind, mut sha256, mut attempts) =
+        (None, None, None, None, None);
+    while let Some(flag) = args.next() {
+        let value = args.next().ok_or("an option needs a value")?;
+        let text = value
+            .to_str()
+            .ok_or_else(|| "an option value is not valid UTF-8".to_owned())?;
+        let name = flag.to_str().unwrap_or("");
+        let once = |taken: bool| {
+            if taken {
+                Err(format!("give {name} once"))
+            } else {
+                Ok(())
+            }
+        };
+        match name {
+            "--mode" => {
+                once(mode.is_some())?;
+                mode = Some(
+                    text.parse::<OperatingMode>()
+                        .map_err(|error| format!("--mode: {error}"))?,
+                );
+            }
+            "--instruction" => {
+                once(instruction.is_some())?;
+                instruction = Some(PathBuf::from(&value));
+            }
+            "--kind" => {
+                once(kind.is_some())?;
+                kind = Some(match text {
+                    "document" => Kind::Document,
+                    "artifact" => Kind::Artifact,
+                    _ => return Err("--kind is document or artifact".to_owned()),
+                });
+            }
+            "--sha256" => {
+                once(sha256.is_some())?;
+                sha256 = Some(parse_sha256(text).map_err(|error| format!("--sha256: {error}"))?);
+            }
+            "--attempts" => {
+                once(attempts.is_some())?;
+                attempts = Some(
+                    text.parse::<u32>()
+                        .ok()
+                        .filter(|n| *n >= 1)
+                        .ok_or("--attempts is a number from 1")?,
+                );
+            }
+            _ => return Err(format!("unknown option {flag:?}")),
+        }
+    }
+    Ok(Command::DebugFetch(agent::fetch::command::Args {
+        mode: mode.ok_or("--mode is required")?,
+        instruction: instruction.ok_or("--instruction is required")?,
+        kind: kind.ok_or("--kind is required")?,
+        sha256: sha256.ok_or("--sha256 is required")?,
+        attempts: attempts.unwrap_or(4),
+    }))
+}
+
 fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
     let mut args = args.into_iter();
     let identify = match args.next() {
@@ -532,6 +643,8 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, Strin
         Some(command) if command == "identity" => return parse_identity(args),
         Some(command) if command == "register" => return parse_register(args),
         Some(command) if command == "provision-key" => return parse_provision_key(args),
+        #[cfg(debug_assertions)]
+        Some(command) if command == "debug" => return parse_debug(args),
         Some(command) if command == "connect" => {
             return parse_mode_only(args).map(Command::Connect);
         }
@@ -1152,7 +1265,69 @@ mod tests {
             | Command::Register(_)
             | Command::Connect(_)
             | Command::ProvisionKey(_) => Err("not a run".to_owned()),
+            #[cfg(debug_assertions)]
+            Command::DebugFetch(_) => Err("not a run".to_owned()),
         }
+    }
+
+    /// The debug fetch command takes its five options, each once, and a release build does not
+    /// know the command at all.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn debug_fetch_takes_its_options_each_once() {
+        use agent::fetch::Kind;
+        let base = [
+            "debug",
+            "fetch",
+            "--mode",
+            "user",
+            "--instruction",
+            "i.bin",
+            "--kind",
+            "document",
+            "--sha256",
+            HASH,
+        ];
+        let Ok(Command::DebugFetch(args)) = parse_command(&base) else {
+            panic!("the command parses");
+        };
+        assert_eq!(args.kind, Kind::Document);
+        assert_eq!(
+            (args.attempts, args.instruction),
+            (4, PathBuf::from("i.bin"))
+        );
+        let with = |extra: &[&'static str]| {
+            let mut all = base.to_vec();
+            all.extend_from_slice(extra);
+            parse_command(&all)
+        };
+        assert!(matches!(
+            with(&["--attempts", "1"]),
+            Ok(Command::DebugFetch(a)) if a.attempts == 1
+        ));
+        for bad in [
+            &["--attempts", "0"][..],
+            &["--attempts", "x"],
+            &["--kind", "plan"],
+            &["--mode", "user"],
+            &["--extra", "1"],
+        ] {
+            assert!(with(bad).is_err(), "{bad:?}");
+        }
+        for missing in 2..base.len() / 2 {
+            let mut all = base.to_vec();
+            all.drain(2 * missing..2 * missing + 2);
+            assert!(parse_command(&all).is_err(), "{all:?}");
+        }
+        assert!(parse_command(&["debug"]).is_err());
+        assert!(parse_command(&["debug", "other"]).is_err());
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn a_release_build_has_no_debug_command() {
+        let error = parse_command(&["debug", "fetch", "--mode", "user"]).unwrap_err();
+        assert!(error.contains("unknown command"), "{error}");
     }
 
     fn identify_args(args: &[&str]) -> Result<IdentifyArgs, String> {
@@ -1163,6 +1338,8 @@ mod tests {
             | Command::Register(_)
             | Command::Connect(_)
             | Command::ProvisionKey(_) => Err("not an identify".to_owned()),
+            #[cfg(debug_assertions)]
+            Command::DebugFetch(_) => Err("not an identify".to_owned()),
         }
     }
 

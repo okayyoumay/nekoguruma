@@ -16,6 +16,8 @@
 //!   before the procedure starts
 //! - [`host`]: [`diag_ir::DiagHost`] on top of the worker gRPC client
 //! - [`identification`]: the identification job's plan, its checks and the endpoints it derives (ADR-395)
+//! - [`fetch`]: the download leg: a job's documents and artifacts from the object store into the
+//!   object cache (design 14.3, ADR-497)
 //! - [`identity`]: the agent's key in a named-secret store, created once under a lock (design 6.4,
 //!   ADR-459, ADR-460)
 //! - [`installation`]: the installation file `agent.toml`, what the installation decides for this
@@ -47,8 +49,10 @@ pub mod client;
 pub mod comm_log;
 pub mod connect;
 pub mod control;
+mod data_token;
 pub mod deadline;
 pub mod document;
+pub mod fetch;
 pub mod guards;
 pub mod host;
 pub mod identification;

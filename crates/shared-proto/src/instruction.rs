@@ -24,6 +24,13 @@ pub const MAX_INSTRUCTION_LEN: usize = 64 * 1024;
 /// Longest string field, in bytes.
 pub const MAX_STRING_LEN: usize = 1024;
 
+/// Longest IR document the agent fetches or the server stores, in bytes (16 MiB; ADR-497 item 8).
+/// One constant, so the download leg's bound and the later document-store route's cannot drift.
+pub const MAX_DOCUMENT_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Longest ECU distribution artifact the agent fetches, in bytes (4 GiB; ADR-497 item 8).
+pub const MAX_ARTIFACT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
 /// Length of a canonical job ID: a lowercase, hyphenated UUID.
 pub const JOB_ID_LEN: usize = 36;
 

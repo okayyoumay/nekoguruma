@@ -66,9 +66,6 @@ impl Worker {
     /// The token, exchanged now when there is none. A failure tells the back-off: the ordinary
     /// delay, a longer `Retry-After`, or the cap.
     async fn ensure_token(&mut self) -> Result<String, Stray> {
-        if let Some(token) = &self.token {
-            return Ok(token.as_str().to_owned());
-        }
         let at = AtPort {
             dial: &*self.dial,
             port: self.port,
@@ -81,13 +78,9 @@ impl Worker {
             audience: &self.audience,
             host: &self.host,
         };
-        let got = until_stop(&self.stop, exchange::token(&seams, &mut self.log)).await?;
+        let got = until_stop(&self.stop, self.holder.ensure(&seams)).await?;
         match got {
-            Ok(token) => {
-                let text = token.as_str().to_owned();
-                self.token = Some(token);
-                Ok(text)
-            }
+            Ok(text) => Ok(text),
             Err(how) => {
                 // A failed exchange always owes the wait, whatever the attempt stored.
                 self.owe_wait = true;
@@ -116,13 +109,10 @@ impl Worker {
                 Ok(value) => return Ok(value),
                 Err(failure) => failure,
             };
-            if failure.class == Class::Reauthenticate {
-                self.token = None;
-                if !repeated {
-                    repeated = true;
-                    continue;
-                }
-                failure.class = Class::Retry;
+            if failure.class == Class::Reauthenticate
+                && self.holder.unauthorized(&mut repeated, &mut failure)
+            {
+                continue;
             }
             self.retry_after = failure.retry_after_secs;
             return Err(Stray::Failure(failure));

@@ -61,7 +61,7 @@ pub struct Failure {
 }
 
 impl Failure {
-    fn new(class: Class, why: &'static str, status: Option<u16>) -> Self {
+    pub(crate) fn new(class: Class, why: &'static str, status: Option<u16>) -> Self {
         Self {
             class,
             why,
@@ -70,7 +70,7 @@ impl Failure {
         }
     }
 
-    fn unpromised(status: u16) -> Self {
+    pub(crate) fn unpromised(status: u16) -> Self {
         Self::new(Class::PassOver, "answer", Some(status))
     }
 }
@@ -415,20 +415,21 @@ impl Routes {
 }
 
 /// A request that got no answer is always a retry.
-fn transport(error: Error) -> Failure {
+pub(crate) fn transport(error: Error) -> Failure {
     let why = match error {
         Error::NotSent => "not-sent",
         Error::ConnectTimeout => "connect-timeout",
         Error::NoProgress => "no-progress",
         Error::Timeout => "timeout",
         Error::Failed => "transport",
+        Error::Write(_) => "write",
     };
     Failure::new(Class::Retry, why, None)
 }
 
 /// Sorts an answer by status: the status and body when it is one the route promises, else the
 /// failure that class of status is.
-fn judge(answer: Answer, promised: &[u16]) -> Result<(u16, Vec<u8>), Failure> {
+pub(crate) fn judge(answer: Answer, promised: &[u16]) -> Result<(u16, Vec<u8>), Failure> {
     let status = answer.status;
     if promised.contains(&status) {
         return match answer.body {
@@ -451,7 +452,7 @@ fn judge(answer: Answer, promised: &[u16]) -> Result<(u16, Vec<u8>), Failure> {
 }
 
 /// A body that is exactly the document's shape, or the answer is not promised.
-fn parse<'a, T: Deserialize<'a>>(status: u16, body: &'a [u8]) -> Result<T, Failure> {
+pub(crate) fn parse<'a, T: Deserialize<'a>>(status: u16, body: &'a [u8]) -> Result<T, Failure> {
     serde_json::from_slice(body).map_err(|_| Failure::unpromised(status))
 }
 

@@ -503,7 +503,7 @@ printed, as `register` prints no argument value.
   opened it and the ones enqueued in this process; the ledger has one writer, so another process
   (`debug enqueue`) cannot add to a running `connect`'s ledger and there is no cross-process wake.
   An uploader that ends on its own (`Ended::LedgerUnusable`: a poisoned ledger that, opened again,
-  did not read back; a panic ends it with no reason) is logged once at `error`, and the control session goes on:
+  did not read back; a panic ends it with no reason) is logged once at `error`, and the control session goes on (ADR-499):
   neither channel ends the other, nothing is uploaded until the agent restarts, and `connect`'s
   exit status stays the session's. A stop stops both: the uploader drops the request in flight
   and awaits a ledger write that is running, and `connect` waits for it at most 10 seconds

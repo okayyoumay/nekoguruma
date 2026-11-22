@@ -2,7 +2,7 @@
 
 **Date:** 2026-11-22
 **Status:** Accepted
-**Affects:** design 5.1; `crates/server` (`jobs`), `crates/server/docs/ngr-server.md`, `api/openapi.yaml`; replaces ADR-477 item 2's digests taken as named and ADR-500's consequence that job creation takes them
+**Affects:** design 5.1, 8.2.6; `crates/server` (`jobs`), `crates/server/docs/ngr-server.md`, `api/openapi.yaml`; replaces ADR-477 item 2's digests taken as named and ADR-500's consequence that job creation takes them
 
 ## Context
 

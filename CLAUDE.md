@@ -148,10 +148,12 @@ CI; Clippy lints are checked by the local `cargo clippy` run before a pull reque
 
 - **Overrides**: on the narrowest item, with a reason: `#[expect(<lint>, reason = "...")]`, or
   `#[allow]` with a reason where the lint fires only on some targets, cfgs or features, and for
-  generated code. Never lower a lint's level, or add or widen an override, to get a change
-  through: fix the code, or say in the reason why the lint is wrong there. A lint adopted in a
-  later stage starts with a crate-level `#![expect]` in each crate not yet clean, removed when the
-  crate is fixed (ADR-502).
+  generated code. The C-ABI crates (the two mocks, `sim-vci`) may hold a crate-wide override,
+  with a reason, for a lint their exported C names trigger throughout (`non_snake_case`,
+  `clippy::too_many_arguments`). Never lower a lint's level, or add or widen an override, to get
+  a change through: fix the code, or say in the reason why the lint is wrong there. A lint
+  adopted in a later stage starts with a crate-level `#![expect]` in each crate not yet clean,
+  removed when the crate is fixed (ADR-502).
 - **`unsafe`**: `unsafe_code` is denied. Only the FFI and C-ABI crates (`*-sys`, `iso22900`,
   `j2534-0404`, the two mocks, `sim-vci`) grant it crate-wide; elsewhere the override
   (`#[expect(unsafe_code, reason = "...")]`, or `#[allow]` when the `unsafe` exists only on some

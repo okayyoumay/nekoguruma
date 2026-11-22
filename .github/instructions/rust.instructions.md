@@ -43,7 +43,9 @@ Flag as P1:
 - **Warnings silenced the wrong way** (ADR-502): `#[allow(...)]` for code that is unused only
   until later work lands (use `#[expect(..., reason = "...")]`, which fails once the code is
   used); a lint override whose reason does not hold for that code; a lint level lowered, or an
-  override added or widened (to a whole module or crate), to get a change through; a crate
+  override added or widened (to a whole module or crate), to get a change through (the C-ABI
+  crates' crate-wide `non_snake_case` and `clippy::too_many_arguments` overrides for their
+  exported C functions are the exception, ADR-502 item 2); a crate
   `Cargo.toml` that drops `[lints] workspace = true` or adds its own `[lints]` table; a
   crate-wide `unsafe_code` grant outside the FFI and C-ABI crates (`*-sys`, `iso22900`,
   `j2534-0404`, the two mocks, `sim-vci`); a crate-level `#![expect]` of a staged lint left in a

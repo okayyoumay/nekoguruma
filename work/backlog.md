@@ -128,6 +128,7 @@ Where the crates stand:
 - **P3**: Vendor IOCTLs with data are rejected in 64-bit mode (layout unknown); add a VCI profile entry (design 9.3) for them. Blocked on: a vendor that needs one.
 - **P3**: The VCI profile's ABI overrides (design 7.1.2, 9.3: `long_size`, calling convention, alignment) are not applied; `agent::launch` takes `long_size` from the launch options, the registration definition's `LongSize` or the ABI default only (ADR-284). Done when: a profile's overrides take precedence over the definition and the default, with a test. Blocked on: 9.3 VCI profiles.
 - **P3**: J2534 v05.00 workers are not covered. A standalone service manager is not planned (the agent takes that role).
+- **P3**: `vci-service-launcher` built with its `eventlog` feature on a non-Windows target fails `-D warnings`: `process_name` (`crates/vci-service-launcher/src/logging.rs`) is used only by the Windows branch of the `eventlog` module, so it is dead code elsewhere. CI builds neither feature, and no production build enables it off Windows, so only a developer's `cargo check --features eventlog` on Linux reaches it. Gate the function like its caller. Done when: `RUSTFLAGS="-D warnings" cargo check -p vci-service-launcher --features journald,eventlog` passes on Linux.
 
 ## Agent (`crates/agent`)
 

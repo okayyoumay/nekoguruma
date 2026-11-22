@@ -1498,6 +1498,7 @@ fn results() -> Vec<(&'static str, Route, u16, String)> {
             200,
             status_body("finished"),
         ),
+        ("status failed", Route::Status, 200, status_body("failed")),
         ("complete 200", Route::Complete, 200, state_body("finished")),
         (
             "complete 202",
@@ -1631,6 +1632,29 @@ async fn two_forged_failed_completions_set_nothing_aside() {
     );
     rig.until(|s| s.delivered == 1).await;
     assert_eq!(rig.counters().set_aside, 0);
+    assert_eq!(rig.sim.puts(), [1, 2, 3], "the parts were sent once");
+}
+
+// R7, the status route's failed
+#[tokio::test(start_paused = true)]
+async fn two_forged_failed_statuses_set_nothing_aside_and_begin_nothing_again() {
+    let mut rig = Rig::new();
+    rig.result(1, DATA).await;
+    for _ in 0..2 {
+        rig.sim
+            .queue(Route::Status, unproved(200, &status_body("failed")));
+    }
+    rig.start();
+    rig.until(|s| s.retries == 2).await;
+    let counters = rig.counters();
+    assert_eq!((counters.set_aside, counters.passed_over), (0, 0));
+    // A believed failed status begins again at once and reads the source for it; here each
+    // attempt begins once and waits the cap.
+    assert_eq!(rig.sim.begins().len(), 2, "one begin per attempt");
+    assert!(rig.sim.puts().is_empty(), "no part was sent");
+    rig.until(|s| s.delivered == 1).await;
+    assert_eq!(rig.counters().set_aside, 0);
+    assert_eq!(rig.sim.begins().len(), 3, "one begin per attempt");
     assert_eq!(rig.sim.puts(), [1, 2, 3], "the parts were sent once");
 }
 
@@ -1774,6 +1798,23 @@ fn lies(request: &Seen, own_put_port: u16) -> Reply {
     Reply::Bytes(json(200, &body))
 }
 
+/// What an impostor answers: `lies` to everything but a part URL, which `part_answer` answers.
+/// It records what it was asked.
+fn impostor_answers(
+    asked: Arc<Mutex<Vec<Seen>>>,
+    own_put_port: u16,
+    part_answer: fn(u16) -> Reply,
+) -> impl Fn(&Seen) -> Reply + Send + Sync + 'static {
+    move |request| {
+        asked.lock().unwrap().push(request.clone());
+        if request.request_line().contains("/parts/") {
+            part_answer(own_put_port)
+        } else {
+            lies(request, own_put_port)
+        }
+    }
+}
+
 /// Serves `lies` on `listener` and records what it was asked.
 fn impostor(
     listener: tokio::net::TcpListener,
@@ -1781,15 +1822,10 @@ fn impostor(
     part_answer: fn(u16) -> Reply,
 ) -> (Arc<Mutex<Vec<Seen>>>, tokio::task::JoinHandle<()>) {
     let asked = Arc::new(Mutex::new(Vec::new()));
-    let log = asked.clone();
-    let task = tokio::spawn(serve_with(listener, move |request| {
-        log.lock().unwrap().push(request.clone());
-        if request.request_line().contains("/parts/") {
-            part_answer(own_put_port)
-        } else {
-            lies(request, own_put_port)
-        }
-    }));
+    let task = tokio::spawn(serve_with(
+        listener,
+        impostor_answers(asked.clone(), own_put_port, part_answer),
+    ));
     (asked, task)
 }
 
@@ -1831,7 +1867,7 @@ async fn an_impostor_holding_the_api_port_from_the_start_gets_one_exchange_and_n
 }
 
 /// The agent's registration and the real server over sockets, with the first part's PUT held; then
-/// the server's API port passes to an impostor, the PUT is let go, and the agent's next request
+/// the server's API port starts to be answered by an impostor, the PUT is let go, and the agent's next request
 /// is the impostor's to answer. Returns once the loop has counted its retry.
 struct Takeover {
     real: Real,
@@ -1859,7 +1895,25 @@ async fn takeover(part_answer: fn(u16) -> Reply) -> Takeover {
         &format!("http://127.0.0.1:{api_port}"),
         AGENT_ID,
     );
-    let api_task = tokio::spawn(serve_tcp(api, api_port, sim.clone()));
+    // One listener serves the API port throughout: the real server's answers until the takeover,
+    // the impostor's after it, so that no port is released and bound again.
+    let own_put = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    own_put.set_nonblocking(true).unwrap();
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let taken = Arc::new(AtomicBool::new(false));
+    let impostor = impostor_answers(
+        asked.clone(),
+        own_put.local_addr().unwrap().port(),
+        part_answer,
+    );
+    let (server, switch) = (sim.clone(), taken.clone());
+    tokio::spawn(serve_with(api, move |request| {
+        if switch.load(Ordering::SeqCst) {
+            impostor(request)
+        } else {
+            server.handle(api_port, request)
+        }
+    }));
     tokio::spawn(serve_tcp(objects, object_port, sim.clone()));
     let gate = Arc::new(tokio::sync::Notify::new());
     sim.queue(Route::Put, Reply::Held(gate.clone()));
@@ -1881,24 +1935,8 @@ async fn takeover(part_answer: fn(u16) -> Reply) -> Takeover {
         "the first part's PUT is in flight"
     );
 
-    // The server's listener closes (the task is dropped with it), and another process binds
-    // the port; a port just released may be refused for a moment on Windows.
-    api_task.abort();
-    let _ = api_task.await;
-    let mut taken = None;
-    for _ in 0..300 {
-        match tokio::net::TcpListener::bind(("127.0.0.1", api_port)).await {
-            Ok(listener) => {
-                taken = Some(listener);
-                break;
-            }
-            Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
-        }
-    }
-    let taken = taken.expect("the port is free to bind after the server's listener closed");
-    let own_put = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    own_put.set_nonblocking(true).unwrap();
-    let (asked, _task) = impostor(taken, own_put.local_addr().unwrap().port(), part_answer);
+    // Another process now answers on the server's port.
+    taken.store(true, Ordering::SeqCst);
     gate.notify_one();
     Real::until_retries(&handle, 1).await;
     Takeover {

@@ -16,7 +16,7 @@ use tokio::time::Instant;
 use crate::answer_proof::TestProver;
 use crate::control::exchange::{CHALLENGE_PATH, SESSION_PATH};
 use crate::uploader::fake::{
-    FakeDial, Proof, Seen, Served, answer, json, proved_json, read_request,
+    FakeDial, Proof, Seen, Served, accept_with, answer, json, proved_json, read_request,
 };
 use crate::uploader::routes::BEGIN_PATH;
 
@@ -545,17 +545,9 @@ pub(super) async fn serve_with(
     listener: tokio::net::TcpListener,
     handle: impl Fn(&Seen) -> Reply + Send + Sync + 'static,
 ) {
-    let handle = Arc::new(handle);
-    loop {
-        let Ok((mut stream, _)) = listener.accept().await else {
-            return;
-        };
-        let handle = handle.clone();
-        tokio::spawn(async move {
-            let Some(seen) = read_request(&mut stream).await else {
-                return;
-            };
-            play(handle(&seen), &mut stream).await;
-        });
-    }
+    accept_with(listener, move |seen, mut stream| {
+        let reply = handle(&seen);
+        async move { play(reply, &mut stream).await }
+    })
+    .await;
 }

@@ -157,11 +157,13 @@ pub(crate) enum Proof {
     OverLimit,
     /// A valid proof of a body of which only part arrives.
     Cut,
+    /// A proof made over another method than the request's.
+    OtherMethod,
 }
 
 impl Proof {
     /// Every way an answer can fail to be proved.
-    pub(crate) const UNPROVED: [Proof; 10] = [
+    pub(crate) const UNPROVED: [Proof; 11] = [
         Proof::Missing,
         Proof::OtherKey,
         Proof::OtherNonce,
@@ -172,6 +174,7 @@ impl Proof {
         Proof::NotCanonical,
         Proof::OverLimit,
         Proof::Cut,
+        Proof::OtherMethod,
     ];
 }
 
@@ -230,6 +233,7 @@ impl Served {
         let sign = |prover: &TestProver, nonce, target: &str, status, body: &[u8]| {
             prover.proof(nonce, method, target, &request.body, status, body)
         };
+        let other_method = if method == "GET" { "POST" } else { "GET" };
         let valid = sign(prover, nonce, target, self.status, body.as_bytes());
         let lines = |proofs: &[String]| {
             proofs
@@ -265,6 +269,14 @@ impl Served {
                 self.status,
                 body.as_bytes(),
             )],
+            Proof::OtherMethod => vec![prover.proof(
+                nonce,
+                other_method,
+                target,
+                &request.body,
+                self.status,
+                body.as_bytes(),
+            )],
             Proof::TwoValues => vec![valid.clone(), valid],
             Proof::NotCanonical => {
                 // The last character carries two bits of the signature and four of padding:
@@ -296,6 +308,29 @@ impl Served {
 /// the request's `Ngr-Nonce` header, or the session body's).
 pub(crate) fn proved_json(prover: &TestProver, request: &Seen, status: u16, body: &str) -> Vec<u8> {
     Served::new(status, body).bytes(prover, request)
+}
+
+/// Accepts connections on a real listener until the task is dropped and, for each, reads one
+/// request whole and hands it and the connection to `serve`, which answers it.
+pub(crate) async fn accept_with<Fut>(
+    listener: tokio::net::TcpListener,
+    serve: impl Fn(Seen, tokio::net::TcpStream) -> Fut + Send + Sync + 'static,
+) where
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let serve = Arc::new(serve);
+    loop {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            return;
+        };
+        let serve = serve.clone();
+        tokio::spawn(async move {
+            let Some(seen) = read_request(&mut stream).await else {
+                return;
+            };
+            serve(seen, stream).await;
+        });
+    }
 }
 
 /// A dial whose server answers every request with what `reply` makes of it, after reading it

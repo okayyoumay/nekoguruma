@@ -106,7 +106,10 @@ impl Worker {
             let token = self.ensure_token().await?;
             let answer = until_stop(&self.stop, call(self.routes.clone(), token)).await?;
             let mut failure = match answer {
-                Ok(value) => return Ok(value),
+                Ok(value) => {
+                    self.holder.proved();
+                    return Ok(value);
+                }
                 Err(failure) => failure,
             };
             if failure.class == Class::Reauthenticate

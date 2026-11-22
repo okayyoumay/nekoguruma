@@ -630,7 +630,10 @@ impl Fetcher {
         loop {
             let token = self.ensure_token(state).await?;
             let mut failure = match self.downloads.url(&token, want).await {
-                Ok(target) => return Ok(target),
+                Ok(target) => {
+                    state.holder.proved();
+                    return Ok(target);
+                }
                 Err(failure) => failure,
             };
             if failure.class == Class::Reauthenticate

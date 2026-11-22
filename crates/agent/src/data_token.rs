@@ -13,13 +13,17 @@ use crate::answer_proof::UNPROVEN_CAUSES;
 use crate::control::exchange::{self, Fail, Token};
 use crate::uploader::routes::{Class, Failure};
 
-/// The exchange's log lines (and the data routes' unproven answers, as `unproven`): one warning per class until a token is issued, debug after that, and
-/// one warning per refusal until a token is issued again. The prefix names the client in each
-/// line.
+/// The exchange's log lines: one warning per class until a token is issued, debug after that, and
+/// one warning per refusal until a token is issued again. A data route's unproven answers are the
+/// class `unproven`, which clears only when a data route's answer is proved (ADR-504): each of
+/// them drops the token, so a token issued says nothing of whether the server answering is the
+/// real one. The prefix names the client in each line.
 pub(crate) struct ExchangeLog {
     prefix: &'static str,
     seen: HashSet<&'static str>,
     refused: bool,
+    /// An unproven data route answer was warned about and no answer has been proved since.
+    answer_unproven: bool,
 }
 
 impl ExchangeLog {
@@ -28,6 +32,26 @@ impl ExchangeLog {
             prefix,
             seen: HashSet::new(),
             refused: false,
+            answer_unproven: false,
+        }
+    }
+
+    /// The line for an answer that is not proved: a warning when `warn`, else debug.
+    fn log_unproven(prefix: &str, warn: bool, class: &'static str, status: u16) {
+        if warn {
+            tracing::warn!(
+                class,
+                status,
+                causes = UNPROVEN_CAUSES,
+                "{prefix} answer is not proved by the server"
+            );
+        } else {
+            tracing::debug!(
+                class,
+                status,
+                causes = UNPROVEN_CAUSES,
+                "{prefix} answer is not proved by the server"
+            );
         }
     }
 }
@@ -53,22 +77,8 @@ impl exchange::Log for ExchangeLog {
     }
 
     fn unproven(&mut self, class: &'static str, status: u16) {
-        let prefix = self.prefix;
-        if self.seen.insert(class) {
-            tracing::warn!(
-                class,
-                status,
-                causes = UNPROVEN_CAUSES,
-                "{prefix} answer is not proved by the server"
-            );
-        } else {
-            tracing::debug!(
-                class,
-                status,
-                causes = UNPROVEN_CAUSES,
-                "{prefix} answer is not proved by the server"
-            );
-        }
+        let warn = self.seen.insert(class);
+        Self::log_unproven(self.prefix, warn, class, status);
     }
 
     fn accepted(&mut self) {
@@ -128,13 +138,19 @@ impl Holder {
 
     /// The rule for a data route's answer that was to be a result and is not proved by the server
     /// (ADR-504): the token is dropped, so that the next request exchanges a new one, and the
-    /// answer is logged as the class `unproven`, once per class until a token is issued. No
-    /// repeat follows; the caller waits the back-off's cap.
+    /// answer is logged as the class `unproven`, one warning until [`Holder::proved`]. No repeat
+    /// follows; the caller waits the back-off's cap.
     pub(crate) fn unproven(&mut self, status: Option<u16>) {
-        use exchange::Log;
         self.token = None;
+        let warn = !self.log.answer_unproven;
+        self.log.answer_unproven = true;
         // The status of a result is always known; 0 never matches one.
-        self.log.unproven("unproven", status.unwrap_or(0));
+        ExchangeLog::log_unproven(self.log.prefix, warn, "unproven", status.unwrap_or(0));
+    }
+
+    /// A data route's answer was proved: the class `unproven` warns again at its next answer.
+    pub(crate) fn proved(&mut self) {
+        self.log.answer_unproven = false;
     }
 }
 
@@ -203,21 +219,28 @@ mod tests {
         assert!(lines.iter().all(|line| line.contains("session-unproven")));
     }
 
-    /// A data route's unproven answer and the exchange's are two classes, each warned once until a
-    /// token is issued, in both clients' words.
+    /// A data route's unproven answers drop the token each time, so a new token is issued between
+    /// them; the class warns once until an answer is proved, and the exchange's classes clear with
+    /// each token as before.
     #[test]
-    fn the_holders_unproven_answers_warn_once_per_class_in_the_owners_words() {
+    fn the_holders_unproven_answers_warn_once_until_an_answer_is_proved() {
         let mut holder = Holder::new("uploader");
         let lines = logged(|| {
             holder.unproven(Some(200));
+            // A token is issued: the exchange's class clears, the answers' does not.
+            holder.log.accepted();
             holder.unproven(Some(409));
             holder.log.unproven("session-unproven", 200);
             holder.log.accepted();
             holder.unproven(Some(200));
+            holder.proved();
+            holder.log.accepted();
+            holder.unproven(Some(200));
         });
         let warned: Vec<bool> = lines.iter().map(|line| line.contains(" WARN ")).collect();
-        assert_eq!(warned, [true, false, true, true], "{lines:?}");
+        assert_eq!(warned, [true, false, true, false, true], "{lines:?}");
         assert!(lines.iter().all(|line| line.contains("uploader answer")));
         assert!(lines[0].contains(UNPROVEN_CAUSES), "{lines:?}");
+        assert!(lines[2].contains("session-unproven"), "{lines:?}");
     }
 }

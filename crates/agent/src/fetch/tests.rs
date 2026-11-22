@@ -30,7 +30,7 @@ use crate::control::dial::Dialled;
 use crate::control::exchange::{CHALLENGE_PATH, SESSION_PATH};
 use crate::instruction;
 use crate::uploader::fake::{
-    FakeDial, Proof, Seen, Served, answer, json, proved_json, read_request,
+    FakeDial, Proof, Seen, Served, accept_with, answer, json, proved_json, read_request,
 };
 
 const API: u16 = 8080;
@@ -122,6 +122,10 @@ struct Script {
     object_default: Option<Obj>,
     /// Every request: the port, the request line and the `Authorization` header.
     log: Vec<(u16, String, Option<String>)>,
+    /// The `Ngr-Nonce` of every request that carried one, with its port.
+    nonces: Vec<(u16, String)>,
+    /// The `Ngr-Server-Proof` value of every answer served.
+    proofs: Vec<String>,
     sessions: u32,
 }
 
@@ -135,6 +139,8 @@ impl Script {
             objects: VecDeque::new(),
             object_default: None,
             log: Vec::new(),
+            nonces: Vec::new(),
+            proofs: Vec::new(),
             sessions: 0,
         }
     }
@@ -146,7 +152,24 @@ impl Script {
             .count()
     }
 
+    /// What the server does with `seen`, recording the nonce it carried and the proofs served.
     fn react(&mut self, port: u16, seen: &Seen) -> Obj {
+        if let Some(nonce) = seen.header("ngr-nonce") {
+            self.nonces.push((port, nonce));
+        }
+        let reply = self.reply(port, seen);
+        if let Obj::Raw(bytes) = &reply {
+            let head = String::from_utf8_lossy(bytes);
+            for line in head.split("\r\n\r\n").next().unwrap_or_default().lines() {
+                if let Some(proof) = line.strip_prefix("Ngr-Server-Proof: ") {
+                    self.proofs.push(proof.to_owned());
+                }
+            }
+        }
+        reply
+    }
+
+    fn reply(&mut self, port: u16, seen: &Seen) -> Obj {
         let line = seen.request_line().to_owned();
         self.log
             .push((port, line.clone(), seen.header("authorization")));
@@ -469,6 +492,13 @@ async fn a_download_is_cached_byte_identical_with_the_bearer_on_the_route_only()
     );
     assert_eq!(script.log[3].2, None, "the URL is the bearer of the GET");
     assert_eq!(script.log.len(), 4);
+    // F7: the nonce goes to the API routes only; the object GET carries none.
+    assert!(!script.nonces.is_empty());
+    assert!(
+        script.nonces.iter().all(|(port, _)| *port == API),
+        "{:?}",
+        script.nonces
+    );
 }
 
 /// A1: a cached object that hashes to its name is used with no request and no exchange.
@@ -1252,7 +1282,7 @@ async fn the_log_holds_no_url_token_digest_or_body() {
 const REFUSALS: [u16; 6] = [400, 404, 413, 500, 403, 418];
 
 /// F2: an answer to the route that is not proved is not a URL: nothing is fetched, no temporary
-/// file is made, the mismatch streak is as it was, and the token is dropped.
+/// file is made and the mismatch streak is as it was.
 #[tokio::test(start_paused = true)]
 async fn an_unproven_download_answer_fetches_nothing() {
     for proof in Proof::UNPROVED {
@@ -1272,7 +1302,6 @@ async fn an_unproven_download_answer_fetches_nothing() {
         assert!(rig.fetcher.state.lock().await.mismatches.is_empty());
         // The next attempt exchanges a new token and is believed again.
         rig.doc(0).await.unwrap();
-        assert_eq!(rig.sessions(), 2, "{proof:?}: the token was dropped");
     }
 }
 
@@ -1289,6 +1318,7 @@ async fn an_unproven_answer_is_retried_at_the_cap() {
     let started = Instant::now();
     rig.doc_retrying(0, 3).await.unwrap();
     assert_eq!(started.elapsed(), Duration::from_secs(60));
+    // The unproven answer dropped the token: the retry exchanged a new one.
     assert_eq!(rig.sessions(), 2);
 }
 
@@ -1426,7 +1456,18 @@ async fn an_unproven_class_warns_once_per_token() {
         .collect();
     assert_eq!(warned, ["session", "answer"], "{text}");
     assert_eq!(lines.len(), 4, "the repeats of a class are debug:\n{text}");
-    for needle in ["SECRET", &token_text(1), &STANDARD.encode([7u8; 32])] {
+    let mut needles = vec![
+        "SECRET".to_owned(),
+        token_text(1),
+        STANDARD.encode([7u8; 32]),
+    ];
+    {
+        let script = rig.script.lock().unwrap();
+        assert!(!script.nonces.is_empty() && !script.proofs.is_empty());
+        needles.extend(script.nonces.iter().map(|(_, nonce)| nonce.clone()));
+        needles.extend(script.proofs.iter().cloned());
+    }
+    for needle in &needles {
         assert!(!text.contains(needle), "{needle} is in the log:\n{text}");
     }
 }
@@ -1445,24 +1486,15 @@ async fn an_unproved_404_over_a_real_socket_is_retried_and_not_refused() {
         .downloads
         .push_back(Served::new(404, r#"{"title":"x"}"#).unproved());
     let script = rig.script.clone();
-    let server = tokio::spawn(async move {
-        loop {
-            let Ok((mut stream, _)) = listener.accept().await else {
-                return;
-            };
-            let script = script.clone();
-            tokio::spawn(async move {
-                let Some(seen) = read_request(&mut stream).await else {
-                    return;
-                };
-                let reply = script.lock().unwrap().react(API, &seen);
-                if let Obj::Raw(bytes) = reply {
-                    let _ = stream.write_all(&bytes).await;
-                    let _ = stream.shutdown().await;
-                }
-            });
+    let server = tokio::spawn(accept_with(listener, move |seen, mut stream| {
+        let reply = script.lock().unwrap().react(API, &seen);
+        async move {
+            if let Obj::Raw(bytes) = reply {
+                let _ = stream.write_all(&bytes).await;
+                let _ = stream.shutdown().await;
+            }
         }
-    });
+    }));
     let error = rig.doc(0).await.unwrap_err();
     assert_eq!(error, FetchError::Unproven { status: Some(404) });
     assert!(error.may_retry());

@@ -582,7 +582,7 @@ async fn debug_output_shows_no_token_url_query_or_body() {
         host: "127.0.0.1:8080",
         bearer: "tok-hunter2",
         body: Some(b"body-hunter2".to_vec()),
-        nonce: [7; 32],
+        nonce: shared_crypto::random_32().unwrap(),
         reads: crate::uploader::http::reads_body,
     };
     let answer = crate::uploader::http::Answer {
@@ -637,7 +637,10 @@ fn calls() -> Vec<RouteCase> {
         (
             "status",
             |r| Box::pin(async move { r.status("t", &id(), 10).await.map(drop) }),
-            vec![(200, status_body("finished", MIB5, 1, None))],
+            vec![
+                (200, status_body("finished", MIB5, 1, None)),
+                (200, status_body("failed", MIB5, 1, None)),
+            ],
         ),
         (
             "complete",

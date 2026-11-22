@@ -1,7 +1,7 @@
 # ADR-495: The Uploader Classes Every Answer, Passes Over What the Server Refuses and Abandons Only a Source It Proved Broken
 
 **Date:** 2026-11-20
-**Status:** Accepted
+**Status:** Accepted (their routes' answers are proved, ADR-504)
 **Affects:** design 5.2, 5.4; `crates/agent` (`uploader::{http, part_url, routes}`, the uploader's loop, `upload_ledger`, the seams of `control::{exchange, dial, backoff}`), `crates/agent/docs/ngr-agent.md`; amends ADR-493 items 6, 11 and 17, details its items 10, 12 and 13
 
 ## Context

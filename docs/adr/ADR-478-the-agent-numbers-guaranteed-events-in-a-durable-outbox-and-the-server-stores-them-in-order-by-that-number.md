@@ -1,7 +1,7 @@
 # ADR-478: The Agent Numbers Guaranteed Events in a Durable Outbox, and the Server Stores Them in Order by That Number
 
 **Date:** 2026-11-14
-**Status:** Accepted (item 5 detailed by ADR-483; item 6 detailed by ADR-479; item 5's second `received` event for a redelivered job replaced by ADR-489: a redelivery of a recorded job is acknowledged with no event)
+**Status:** Accepted (item 5 detailed by ADR-483; item 6 detailed by ADR-479; item 5's second `received` event for a redelivered job replaced by ADR-489: a redelivery of a recorded job is acknowledged with no event; the consequence of a forged `eventAck` from an unauthenticated server answered by ADR-504: the upgrade's 101 is proved)
 **Affects:** design 5.3, 5.4; `api/asyncapi.yaml` (`agentEvent`, `eventAck`); `crates/shared-proto` (`control`); `crates/agent` (`outbox`, `state`, `control`), `crates/agent/docs/ngr-agent.md`; the server's event storage and `db/migrations`; details ADR-466 item 10 and supersedes ADR-473 item 1
 
 ## Context

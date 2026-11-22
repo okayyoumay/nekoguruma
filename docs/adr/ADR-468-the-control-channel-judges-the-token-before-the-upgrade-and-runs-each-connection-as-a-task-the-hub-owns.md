@@ -1,7 +1,7 @@
 # ADR-468: The Control Channel Judges the Token Before the Upgrade and Runs Each Connection as a Task the Hub Owns
 
 **Date:** 2026-11-12
-**Status:** Accepted (items 8, 11 and 12 detailed by ADR-472)
+**Status:** Accepted (items 8, 11 and 12 detailed by ADR-472; item 1's order gains the nonce and target 400s after the subprotocol, and the upgrade gains an unproved 503 when the proof cannot be made, ADR-504)
 **Affects:** design 5.2, 13.3, 14.1, 15.1; `api/asyncapi.yaml` (`agentControl`); `crates/server` (`lib`, `control`, `hub`), `crates/shared-proto` (`control`), `crates/server/docs/ngr-server.md`; settles what ADR-466 left to the server work and extends its items 5 and 6; details ADR-456 item 9's graceful stop for upgraded connections
 
 ## Context

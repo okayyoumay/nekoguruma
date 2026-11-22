@@ -9,6 +9,10 @@
 #![cfg(debug_assertions)]
 
 #[test]
+#[expect(
+    unsafe_code,
+    reason = "`std::env::set_var`/`remove_var` are unsafe (edition 2024) and have no safe form (ADR-502)"
+)]
 fn runtime_env_var_overrides_build_time_root_file() {
     let temp = tempfile::tempdir().expect("create temp dir");
     let file = temp.path().join("pdu_api_root.xml");

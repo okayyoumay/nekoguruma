@@ -4365,7 +4365,7 @@ mod tests {
         let first = named(document(0x90, 0x7E0, 0x7E8, |p| p.functional_id = 0x7E9));
         let second = named(document(0x91, 0x7E1, 0x7E9, |_| {}));
         assert!(matches!(
-            checked(&[first, second.clone()]),
+            checked(&[first, second]),
             Err(PlanRefused::BadFunctionalId {
                 functional_id: 0x7E9,
                 ..
@@ -4455,7 +4455,7 @@ mod tests {
     fn a_valid_plan_gives_endpoints_presence_groups_and_an_empty_presence_section() {
         let first = named(document(0x90, 0x7E0, 0x7E8, |p| p.functional_id = 0x7DF));
         let second = named(document(0x91, 0x7E1, 0x7E9, |p| p.functional_id = 0x7DF));
-        let report = checked(&[first.clone(), second.clone()]).unwrap().report();
+        let report = checked(&[first, second]).unwrap().report();
         assert_eq!(report.selection(), Chosen::Candidates);
         assert_eq!(report.candidates(), ["c1".to_owned()]);
         let keys: Vec<(u32, u32)> = report
@@ -4938,7 +4938,7 @@ mod tests {
         let vin = Vin::new("WVWZZZ1JZ3W386752".into());
         report.vin_reads[0].sources[0].outcome = VinOutcome::Decoded(vin.clone());
         report.vin_reads[0].accepted = Some(vin.clone());
-        report.vin = Some(vin.clone());
+        report.vin = Some(vin);
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["vin"], "WVWZZZ1JZ3W386752");
         assert_eq!(json["vin_reads"][0]["request"], "22f190");
@@ -6033,7 +6033,7 @@ mod tests {
             ("c2", 0, 1, 1, YEAR, "2022", b"SW2"),
             ("c2", 1, 1, 1, YEAR, "2022", b"SW2"),
         ];
-        let plan = rule_plan(&[first.clone(), second.clone()], &["c1", "c2"], &rules).unwrap();
+        let plan = rule_plan(&[first, second], &["c1", "c2"], &rules).unwrap();
         assert_eq!(plan.rule_fields.len(), 3);
         // Group 0 holds F189 (pattern, from service 1) and F187 (rule only, service 2).
         let group = &plan.ecu_reads[0].groups[0];

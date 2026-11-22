@@ -164,6 +164,12 @@ pub struct Iso22900Service {
     pub(super) config_checked: bool,
 }
 
+impl std::fmt::Debug for Iso22900Service {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Iso22900Service").finish_non_exhaustive()
+    }
+}
+
 impl Iso22900Service {
     pub(super) async fn terminate_subscription(
         &self,
@@ -527,23 +533,23 @@ impl VciServer for Iso22900Service {
     }
 
     async fn new(
-        startup_config: Self::StartupConfig,
+        args: Self::StartupConfig,
         config_file: ConfigFile,
         shutdown: Receiver<bool>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         tracing::info!(
-            library = %startup_config.library_name,
-            mode = %startup_config.mode(),
+            library = %args.library_name,
+            mode = %args.mode(),
             "starting worker"
         );
         // The root description file entry for the name gives the library
         // path (design 7.1); the 7.2 checks run here, immediately before the
         // load, so the file that is checked is the file that is loaded.
-        let resolved = ngr_library_resolver::iso22900::resolve(&startup_config.library_name)
+        let resolved = ngr_library_resolver::iso22900::resolve(&args.library_name)
             .map_err(map_resolve_error)?;
         let library_path = resolved.implementation.library_file.clone();
         // Kept alive until `DPduApi::new` has mapped the library (design 7.2).
-        let checked = check_library(&resolved, startup_config.mode())?;
+        let checked = check_library(&resolved, args.mode())?;
         // Read while the checked files are held, so the MDF read is the one checked (ADR-351).
         let error_codes = Arc::new(module_error_codes(&resolved));
         // Fail fast on a noncanonical `vendor_struct_types` config key
@@ -563,7 +569,7 @@ impl VciServer for Iso22900Service {
             vci_service_launcher::config::validate_vendor_struct_type_keys(
                 "iso22900",
                 vci_service_launcher::vci_server::current_arch(),
-                &startup_config.library_name,
+                &args.library_name,
             )
             .map_err(|msg| -> Box<dyn std::error::Error> { msg.into() })?;
         }
@@ -593,7 +599,7 @@ impl VciServer for Iso22900Service {
         });
 
         Ok(Self {
-            startup_config,
+            startup_config: args,
             api,
             event_notifications: event_notifications_tx,
             subscriptions,

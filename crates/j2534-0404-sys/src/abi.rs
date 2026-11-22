@@ -62,6 +62,12 @@ pub struct J2534Api0404 {
     inner: Inner,
 }
 
+impl std::fmt::Debug for J2534Api0404 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("J2534Api0404").finish_non_exhaustive()
+    }
+}
+
 enum Inner {
     Native(bindings::J2534Api0404),
     #[cfg(lp64)]
@@ -78,7 +84,11 @@ macro_rules! dispatch {
     };
 }
 
-#[allow(non_snake_case, clippy::missing_safety_doc)]
+#[allow(
+    non_snake_case,
+    clippy::missing_safety_doc,
+    reason = "the methods mirror the C entry point names, and every one is unsafe for the same reason as `new`"
+)]
 impl J2534Api0404 {
     /// Loads the library with the `unsigned long` width from [`LongSize::from_env`].
     pub unsafe fn new<P: AsRef<OsStr>>(path: P) -> Result<Self, libloading::Error> {
@@ -376,7 +386,7 @@ mod long64 {
     const ERR_NOT_SUPPORTED: c_long = bindings::ERR_NOT_SUPPORTED as c_long;
     const ERR_NULL_PARAMETER: c_long = bindings::ERR_NULL_PARAMETER as c_long;
 
-    #[allow(non_snake_case)]
+    #[allow(non_snake_case, reason = "the methods mirror the C entry point names")]
     impl Api {
         pub unsafe fn new<P: AsRef<OsStr>>(path: P) -> Result<Self, libloading::Error> {
             unsafe {

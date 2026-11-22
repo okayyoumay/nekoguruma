@@ -7,6 +7,10 @@
 //! Build examples:
 //!   cargo build -p sim-vci --target i686-pc-windows-msvc    (win-x86)
 //!   cargo build -p sim-vci --target x86_64-unknown-linux-gnu (linux-x86_64)
+#![allow(
+    unsafe_code,
+    reason = "a cdylib that exports the J2534 C ABI the workers load (ADR-502)"
+)]
 
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_void};
@@ -88,6 +92,7 @@ pub const MAX_MSG_DATA: usize = 4128;
 
 /// `PASSTHRU_MSG`. Packing is made explicit (7.1.1).
 #[repr(C)]
+#[derive(Debug)]
 pub struct PassThruMsg {
     pub protocol_id: PassThruUlong,
     pub rx_status: PassThruUlong,
@@ -436,7 +441,10 @@ fn lock_connected() -> Result<MutexGuard<'static, Bus>, PassThruUlong> {
 }
 
 /// `PassThruUlong` is `u32` on Windows and `u64` elsewhere, so the cast is a no-op on some targets.
-#[allow(clippy::unnecessary_cast)]
+#[allow(
+    clippy::unnecessary_cast,
+    reason = "`PassThruUlong` is `u32` on Windows and `u64` elsewhere, so the cast is a no-op on some targets"
+)]
 fn millis(ms: PassThruUlong) -> Duration {
     Duration::from_millis(ms as u64)
 }
@@ -918,6 +926,10 @@ const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// `{"command": "set_gateway_authentication", "authenticated": true}`.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
+#[expect(
+    clippy::empty_enum_variants_with_brackets,
+    reason = "serde: `Variant {}` rejects stray fields under `deny_unknown_fields`, a unit variant of an internally tagged enum ignores them (ADR-502)"
+)]
 enum Command {
     /// Arms a `sim_ecu::Fault` on the ECU (`SimEcu::inject`), or, with `service`, once a
     /// request of that service reaches it (`SimEcu::inject_for_service`), or, with `request`,

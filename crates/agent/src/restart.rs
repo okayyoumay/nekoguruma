@@ -2577,7 +2577,7 @@ mod tests {
             idempotency,
             expected_millis: 0,
         };
-        let mut no_plan = program.clone();
+        let mut no_plan = program;
         no_plan.flash.clear();
         // The primitives of the plan's code, outside every section, are not safe to repeat.
         assert_eq!(
@@ -3920,7 +3920,7 @@ def main():
             .filter(|&pc| matches!(program.code[pc as usize], Op::Log { message, .. } if message == helper))
             .map(|pc| in_section_outside_plans(&program, pc))
             .collect();
-        let mut sorted = logs.clone();
+        let mut sorted = logs;
         sorted.sort();
         assert_eq!(sorted, [false, true], "{program:#?}");
         // Each call reaches the copy on its own side: `main`'s the one outside the section, and

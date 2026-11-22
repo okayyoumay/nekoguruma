@@ -146,6 +146,10 @@ fn take_guards(setup: &GuardSetup) -> JobGuards {
 }
 
 #[test]
+#[expect(
+    unsafe_code,
+    reason = "`std::env::set_var`/`remove_var` are unsafe (edition 2024) and have no safe form (ADR-502)"
+)]
 fn a_link_on_a_lost_device_is_confirmed_closed_and_the_loss_settles_in_the_next_job() {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

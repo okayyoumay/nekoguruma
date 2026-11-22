@@ -228,8 +228,8 @@ mod number_form {
 
     impl Visitor<'_> for NumberVisitor {
         type Value = Number;
-        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            f.write_str("a non-negative number or a hex string with a 0x prefix")
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a non-negative number or a hex string with a 0x prefix")
         }
         fn visit_u64<E: de::Error>(self, v: u64) -> Result<Number, E> {
             Ok(Number(v))
@@ -253,8 +253,8 @@ mod number_form {
     }
 
     impl<'de> Deserialize<'de> for Number {
-        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-            d.deserialize_any(NumberVisitor)
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            deserializer.deserialize_any(NumberVisitor)
         }
     }
 
@@ -284,8 +284,8 @@ mod number_form {
 
     impl<'de> Visitor<'de> for BytesVisitor {
         type Value = Vec<u8>;
-        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            f.write_str("an array of bytes or a string of an even number of hex digits")
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("an array of bytes or a string of an even number of hex digits")
         }
         fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<u8>, A::Error> {
             let mut out = Vec::new();
@@ -410,6 +410,7 @@ pub trait Clock: Send {
 }
 
 /// Real time, measured from when the clock was created.
+#[derive(Debug)]
 pub struct SystemClock {
     origin: Instant,
 }
@@ -430,7 +431,7 @@ impl Clock for SystemClock {
 
 /// A clock that moves only when [`ManualClock::advance`] is called. Clones share the same time,
 /// so a test keeps one clone and hands another to [`SimEcu::with_clock`].
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug)]
 pub struct ManualClock(Arc<Mutex<Duration>>);
 
 impl ManualClock {
@@ -575,6 +576,12 @@ pub struct SimEcu {
     /// Set by [`SimEcu::hold_session`]: the non-default session does not time out until the
     /// next request reaches the ECU.
     session_held: bool,
+}
+
+impl std::fmt::Debug for SimEcu {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SimEcu").finish_non_exhaustive()
+    }
 }
 
 /// The whole state of a [`SimEcu`], from [`SimEcu::snapshot`]. Timers are kept as the time left

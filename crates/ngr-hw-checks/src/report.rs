@@ -556,6 +556,12 @@ pub struct RunGuard {
     teardown_failures: Vec<StepFailure>,
 }
 
+impl std::fmt::Debug for RunGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunGuard").finish_non_exhaustive()
+    }
+}
+
 impl RunGuard {
     /// Starts the report of `check` for `profile`; it is written to [`reports_dir`] on drop.
     pub fn start(profile: &Profile, check: &str) -> Self {

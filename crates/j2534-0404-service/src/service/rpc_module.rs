@@ -1261,6 +1261,10 @@ mod tests {
     /// `rpc_misc.rs::terminate_tp20_broadcast_periodic_for_suspension_tests::
     /// set_stop_periodic_message_error` already document for their own,
     /// separately-scoped copies of the identical two helpers.
+    #[expect(
+        unsafe_code,
+        reason = "loads the mock library and looks up its `__mock_*` test-control symbol; libloading's `Library::new` and `get` are unsafe (ADR-502)"
+    )]
     fn set_stop_periodic_message_error(code: Option<std::os::raw::c_long>) {
         let lib_path = j2534_0404_mock::mock_library_path().expect("mock cdylib should be built");
         unsafe {
@@ -1289,6 +1293,10 @@ mod tests {
     /// `__mock_set_stop_periodic_message_error` injection are in it too, so
     /// none of them sees another's injected error. (Untagged callers of
     /// `PassThruStopPeriodicMsg` elsewhere in the crate are not covered.)
+    #[expect(
+        unsafe_code,
+        reason = "loads the mock library and looks up its `__mock_*` test-control symbol; libloading's `Library::new` and `get` are unsafe (ADR-502)"
+    )]
     fn stop_periodic_call_count() -> usize {
         let lib_path = j2534_0404_mock::mock_library_path().expect("mock cdylib should be built");
         unsafe {

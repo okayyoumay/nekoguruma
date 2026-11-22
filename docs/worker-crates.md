@@ -308,7 +308,9 @@ sequenceDiagram
 
 ### Sys / Wrapper Separation Pattern
 Each protocol is split into a `-sys` crate (unsafe FFI) and a higher-level safe wrapper crate.
-- unsafe code is concentrated in `-sys`; every layer above it is safe Rust
+- unsafe code is confined to `-sys` and the safe wrapper, which makes the FFI calls and exposes a
+  safe API; the `*-service` crates above it call the wrapper (ADR-502 grants `unsafe_code` only to
+  these crates, the mocks and `sim-vci`)
 - bindings can be regenerated from header files via the `bindgen` feature
 - testability is ensured by swapping in mocks
 

@@ -78,6 +78,7 @@ fn io_error(what: &str, error: &io::Error) -> ProvisionError {
 }
 
 /// Where and how to provision; [`provision`] fills it in from the environment.
+#[derive(Debug)]
 pub struct Plan<'a> {
     /// The target directory; its last component is created when missing.
     pub dir: &'a Path,
@@ -121,6 +122,10 @@ fn moved_dir() -> Result<Option<PathBuf>, ProvisionError> {
     Ok(None)
 }
 
+#[expect(
+    unsafe_code,
+    reason = "libc::geteuid reads the effective user id; std has no equivalent (ADR-502)"
+)]
 fn check_root(moved: bool) -> Result<(), ProvisionError> {
     // SAFETY: geteuid has no preconditions and cannot fail.
     if !moved && unsafe { libc::geteuid() } != 0 {
@@ -321,6 +326,10 @@ fn trusted_path(path: &Path) -> Option<PathBuf> {
 }
 
 /// An exclusive advisory lock on the directory, held until the returned handle drops.
+#[expect(
+    unsafe_code,
+    reason = "libc FFI with no safe std equivalent: `flock` takes an advisory file lock (ADR-502)"
+)]
 fn lock_dir(dir: &Path) -> io::Result<File> {
     use std::os::fd::AsRawFd;
     let handle = File::open(dir)?;
@@ -356,6 +365,10 @@ fn tool_environment(path: &OsStr) -> Vec<(OsString, OsString)> {
 /// dies of a broken pipe, which is still "too long". A non-zero status is
 /// [`ProvisionError::Cannot`]; a timeout, an I/O failure and an empty or oversize answer are
 /// [`ProvisionError::Io`].
+#[expect(
+    unsafe_code,
+    reason = "child setup between fork and exec and polling use libc calls (_exit, getpid, getppid, prctl, poll) that std does not offer (ADR-502)"
+)]
 fn run_tool(
     tool: &Path,
     args: &[String],
@@ -404,6 +417,10 @@ fn run_tool(
     // Whether the leader has been reaped. Its pid, and so its group, is reserved only until then:
     // the group is signalled before the reap and never after it.
     let mut reaped = false;
+    #[expect(
+        unsafe_code,
+        reason = "libc FFI with no safe std equivalent: `kill` sends a signal (ADR-502)"
+    )]
     fn kill_group(pid: libc::pid_t, reaped: bool) {
         if !reaped {
             // SAFETY: a negative pid names the child's process group, made by `process_group(0)`,
@@ -422,6 +439,10 @@ fn run_tool(
     }
     // Whether the leader has exited and is still waiting to be reaped (`WNOWAIT` leaves it a
     // zombie, so its pid stays reserved while the group is signalled).
+    #[expect(
+        unsafe_code,
+        reason = "libc FFI with no safe std equivalent: `waitid` waits for a child without reaping it (ADR-502)"
+    )]
     fn exited(pid: libc::pid_t) -> io::Result<bool> {
         // SAFETY: an all-zero siginfo is a valid value for the call to fill.
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };

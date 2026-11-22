@@ -414,6 +414,10 @@ impl KillOnDrop {
     }
 
     /// Ends the server the way a service manager does (SIGTERM; elsewhere a kill) and waits.
+    #[allow(
+        unsafe_code,
+        reason = "libc FFI with no safe std equivalent: `kill` sends a signal (ADR-502)"
+    )]
     pub(crate) fn stop_with_sigterm(&mut self) {
         #[cfg(unix)]
         // SAFETY: signals the test's own child.

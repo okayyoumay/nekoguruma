@@ -133,6 +133,10 @@ fn a_suppressed_send_receive_silence_after_an_absorbed_pending_is_undetermined_h
     );
 }
 
+#[expect(
+    unsafe_code,
+    reason = "`std::env::set_var`/`remove_var` are unsafe (edition 2024) and have no safe form (ADR-502)"
+)]
 fn run_case(ecu_commands: &str, silence_at_least: Duration) {
     let _case = CASE.lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("temporary directory");

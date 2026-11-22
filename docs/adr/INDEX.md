@@ -491,6 +491,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-499](ADR-499-an-uploader-that-ends-on-its-own-leaves-the-control-session-running-and-an-upload-ledger-that-cannot-open-ends-connect-at-start.md) | An Uploader That Ends on Its Own Leaves the Control Session Running, and an Upload Ledger That Cannot Open Ends `connect` at Start | Accepted | design 5.2, `crates/agent` (`connect`, `uploader`, `upload_ledger`); details ADR-493 item 10 |
 | [ADR-500](ADR-500-the-server-stores-a-jobs-ir-documents-by-their-sha-256-through-a-put-route-for-a-worker.md) | The Server Stores a Job's IR Documents by Their SHA-256 Through a PUT Route for a Worker | Accepted (the consequence that job creation takes the digests it is given replaced by ADR-501) | design 6.8, 8.2.6, 11.1, 14.3, `crates/server` (`documents`, `storage`), `db/`, `api/openapi.yaml`; extends ADR-454 and ADR-492; the writer ADR-497 leaves |
 | [ADR-501](ADR-501-job-creation-refuses-a-job-that-names-a-document-or-artifact-its-tenant-has-not-stored.md) | Job Creation Refuses a Job That Names a Document or Artifact Its Tenant Has Not Stored | Accepted | design 5.1, 8.2.6, `crates/server` (`jobs`), `api/openapi.yaml`; replaces ADR-477 item 2's digests taken as named |
+| [ADR-502](ADR-502-lints-are-set-once-for-the-workspace-and-added-in-stages.md) | Lints Are Set Once for the Workspace and Added in Stages | Accepted | `Cargo.toml` (`[workspace.lints]`), every crate's `[lints]`, `CLAUDE.md` ("Rust code"), `.claude/agents/implementer.md`, `.claude/skills/pr-review-loop/SKILL.md`, `.github/` review guidelines, `docs/worker-crates.md` |
 | [ADR-503](ADR-503-the-review-loop-audits-the-whole-diff-for-documentation-before-the-first-review.md) | The Review Loop Audits the Whole Diff for Documentation Before the First Review | Accepted | `.claude/skills/pr-review-loop` (Step 0), `.claude/skills/backlog-loop` (step 4), `.claude/README.md` |
 | [ADR-504](ADR-504-the-server-proves-every-answer-an-agent-acts-on-with-its-instruction-key.md) | The Server Proves Every Answer an Agent Acts on With Its Instruction Key | Accepted | design 5.2, 5.3, 6.4, 11.1, 13.3, 14.4, `crates/shared-crypto`, `crates/server`, `crates/agent`, `api/`; annotates ADR-459, ADR-461, ADR-466, ADR-467, ADR-468, ADR-471, ADR-478, ADR-493, ADR-495, ADR-497 |
 
@@ -886,6 +887,7 @@ the predecessor repository these ADRs came from.
 - ADR-464
 - ADR-482
 - ADR-490
+- ADR-502
 - ADR-503
 
 ### Timestamps / Clock

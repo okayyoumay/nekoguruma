@@ -124,6 +124,10 @@ impl FieldVisitor {
 // ── Windows Event Log ─────────────────────────────────────────────────────────
 
 #[cfg(feature = "eventlog")]
+#[allow(
+    unsafe_code,
+    reason = "the Windows Event Log API (`RegisterEventSourceW`, `ReportEventW`) has no safe binding; the calls exist only on Windows (ADR-502)"
+)]
 mod eventlog {
     #[cfg(windows)]
     use super::FieldVisitor;

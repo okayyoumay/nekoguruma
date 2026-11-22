@@ -87,7 +87,10 @@
 //! restarting `j2534-0404-service` to release the stale handle before
 //! retrying.
 
-#![allow(dead_code)] // not every example in this directory uses every helper
+#![allow(
+    dead_code,
+    reason = "every example compiles this module and uses a different subset of the helpers"
+)]
 
 use std::time::Duration;
 

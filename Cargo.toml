@@ -36,6 +36,32 @@ edition = "2024"
 rust-version = "1.94"
 license = "MIT"
 
+# Lints for every crate (each crate opts in with `[lints] workspace = true`). The policy, the staged
+# adoption and how a crate that is not clean yet opts out with a crate-level `#[expect]` are in
+# ADR-502. CI builds with `-D warnings`, so a `warn` here fails CI for rustc lints; Clippy lints are
+# checked by the local `cargo clippy` run before a pull request.
+[workspace.lints.rust]
+unsafe_code = "deny"
+ambiguous_negative_literals = "warn"
+missing_debug_implementations = "warn"
+redundant_lifetimes = "warn"
+unused_lifetimes = "warn"
+
+[workspace.lints.clippy]
+allow_attributes_without_reason = "warn"
+disallowed_script_idents = "warn"
+empty_drop = "warn"
+empty_enum_variants_with_brackets = "warn"
+empty_structs_with_brackets = "warn"
+fn_to_numeric_cast_any = "warn"
+if_then_some_else_none = "warn"
+redundant_clone = "warn"
+redundant_type_annotations = "warn"
+renamed_function_params = "warn"
+unnecessary_safety_comment = "warn"
+unnecessary_safety_doc = "warn"
+unused_result_ok = "warn"
+
 [workspace.dependencies]
 # In-workspace
 shared-proto = { path = "crates/shared-proto" }

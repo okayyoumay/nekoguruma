@@ -79,6 +79,10 @@ fn ecu_config(path: &Path) {
 }
 
 #[test]
+#[expect(
+    unsafe_code,
+    reason = "`std::env::set_var`/`remove_var` are unsafe (edition 2024) and have no safe form (ADR-502)"
+)]
 fn the_timing_check_reads_the_ecu_s_p2_and_p2_star_through_the_guard() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let root = temp.path();

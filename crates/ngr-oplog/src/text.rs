@@ -149,9 +149,9 @@ mod tests {
     struct Captured(Arc<Mutex<Vec<u8>>>);
 
     impl Write for Captured {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
         }
 
         fn flush(&mut self) -> std::io::Result<()> {

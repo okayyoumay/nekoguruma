@@ -81,6 +81,12 @@ pub struct Control {
     gates: Arc<Gates>,
 }
 
+impl std::fmt::Debug for Control {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Control").finish_non_exhaustive()
+    }
+}
+
 impl Control {
     pub fn new(pool: PgPool, sessions: Sessions, hub: Hub) -> Control {
         Control {

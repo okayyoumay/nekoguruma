@@ -632,6 +632,7 @@ pub trait DiagHost {
 
 // ---------------------------------------------------------------- VM
 
+#[derive(Debug)]
 pub struct Vm {
     pub state: VmState,
     /// Whether the host has been told the current target in this run

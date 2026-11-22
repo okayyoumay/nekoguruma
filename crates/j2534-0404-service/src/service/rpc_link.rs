@@ -1230,7 +1230,10 @@ struct NewPhysicalChannelParams<'a> {
 /// payload values (ADR-160): the native header defines `CONFIG_CAN_MIXED_
 /// FORMAT` (`0x8000`, the parameter ID) but no value constants, so these are
 /// plain local `u32`s rather than a bindgen/header addition.
-#[allow(dead_code)] // no GET_CONFIG/OFF-toggle caller yet -- this stage only ever sets ON.
+#[expect(
+    dead_code,
+    reason = "no GET_CONFIG or switch-off caller yet; this stage only ever sets the value on"
+)]
 const CAN_MIXED_FORMAT_OFF: u32 = 0;
 const CAN_MIXED_FORMAT_ON: u32 = 1;
 // Used by `CanChannelMode::NativeMixedAllFrames`'s connect-time SET_CONFIG
@@ -3572,7 +3575,10 @@ impl J2534Service {
     /// every other protocol. The poll task is still spawned uniformly either
     /// way (ADR-194 Decision, rejecting a protocol-based spawn skip) -- this
     /// flag only gates the shared RX pass's native read (`events.rs`).
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "its arguments are independent inputs with no common type, so they stay plain parameters"
+    )]
     async fn spawn_new_shared_channel(
         &self,
         channel_key: ChannelKey,
@@ -3780,7 +3786,10 @@ impl J2534Service {
     /// write both complete before `connected`/`channel_key` become visible
     /// to any other call, so a pipelined `CoptUpdateparam` on this handle can
     /// never race either of them.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "its arguments are independent inputs with no common type, so they stay plain parameters"
+    )]
     async fn finalize_connected_link(
         &self,
         handle: u32,

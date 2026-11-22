@@ -20,6 +20,10 @@
 use std::fs;
 
 #[test]
+#[expect(
+    unsafe_code,
+    reason = "`std::env::set_var`/`remove_var` are unsafe (edition 2024) and have no safe form (ADR-502)"
+)]
 fn runtime_env_var_overrides_build_time_config_path() {
     let temp = tempfile::tempdir().expect("create temp dir");
     let config_file = temp.path().join("runtime-override-config.toml");

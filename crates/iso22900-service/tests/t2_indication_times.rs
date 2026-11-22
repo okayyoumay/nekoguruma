@@ -50,6 +50,10 @@ addressing = "normal"
 "#;
 
 #[test]
+#[expect(
+    unsafe_code,
+    reason = "`std::env::set_var`/`remove_var` are unsafe (edition 2024) and have no safe form (ADR-502)"
+)]
 fn the_handle_takes_its_times_from_the_indication_items() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let root = temp.path();

@@ -60,6 +60,12 @@ pub struct Teardown {
     closed: bool,
 }
 
+impl std::fmt::Debug for Teardown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Teardown").finish_non_exhaustive()
+    }
+}
+
 impl Default for Teardown {
     fn default() -> Self {
         Self::new()
@@ -220,7 +226,7 @@ fn run_step(step: Step, default: Duration) -> Result<(), String> {
 /// a failure cannot be returned to the check and lost. The handle is cheap to clone and every
 /// clone registers into the same run, so several guarded handles (a T0 loopback of two VCI
 /// modules) share one teardown, and the steps of all run in one reverse registration order.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct TeardownHandle(pub(crate) Arc<Mutex<Teardown>>);
 
 /// The run has ended its teardown, so a step registered now would never run in time.

@@ -58,6 +58,7 @@ impl AnswerError {
 }
 
 /// What the check needs from the request.
+#[derive(Debug)]
 pub struct Expected<'a> {
     pub code: &'a RegistrationCode,
     pub agent_key: &'a PublicKey,
@@ -92,8 +93,8 @@ struct FieldsVisitor;
 impl<'de> Visitor<'de> for FieldsVisitor {
     type Value = Fields;
 
-    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("an object with the registration answer's fields")
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("an object with the registration answer's fields")
     }
 
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Fields, A::Error> {
@@ -326,7 +327,7 @@ mod tests {
             )
             .into_bytes(),
         );
-        let mut flag = object.clone();
+        let mut flag = object;
         flag["allowRemote"] = "false".into();
         cases.push(flag.to_string().into_bytes());
         for body in cases {

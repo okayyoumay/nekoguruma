@@ -33,6 +33,12 @@ pub struct SharedOutbox {
     inner: Arc<Inner>,
 }
 
+impl std::fmt::Debug for SharedOutbox {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedOutbox").finish_non_exhaustive()
+    }
+}
+
 struct Inner {
     outbox: Mutex<Outbox>,
     /// An event was appended: the connected loop looks for something to send.

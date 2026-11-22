@@ -19,9 +19,21 @@ pub struct ServerState<S: JsonRpcContext> {
     json_rpc_context: Option<Result<S, BoxError>>,
 }
 
+impl<S: JsonRpcContext> std::fmt::Debug for ServerState<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerState").finish_non_exhaustive()
+    }
+}
+
 pub struct ServerContext<S: JsonRpcContext> {
     pub state: Mutex<ServerState<S>>,
     pub library_name: Option<String>,
+}
+
+impl<S: JsonRpcContext> std::fmt::Debug for ServerContext<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerContext").finish_non_exhaustive()
+    }
 }
 
 impl<S: JsonRpcContext> ServerContext<S> {

@@ -352,6 +352,7 @@ pub const DWCAN_PINS: [(u32, &str); 2] = [(6, "HI"), (14, "LOW")];
 const RC_BYTE_OFFSET: u32 = 2;
 
 /// An open link: the logical link on the worker and the event stream its primitives report on.
+#[derive(Debug)]
 pub struct Link {
     pub module_handle: ModuleHandle,
     pub cll_handle: ComLogicalLinkHandle,

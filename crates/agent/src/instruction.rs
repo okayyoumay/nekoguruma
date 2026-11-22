@@ -268,7 +268,7 @@ mod tests {
             InstructionRejectReason::BadSignature
         );
         // A payload over the bound.
-        let mut long = blob.clone();
+        let mut long = blob;
         long.resize(envelope::HEADER_LEN + envelope::MAX_PAYLOAD_LEN + 1, 0);
         assert_eq!(
             gate(&long, &trusted, AGENT).unwrap_err(),
@@ -476,9 +476,9 @@ mod tests {
     struct Captured(Arc<Mutex<Vec<u8>>>);
 
     impl std::io::Write for Captured {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
         }
 
         fn flush(&mut self) -> std::io::Result<()> {

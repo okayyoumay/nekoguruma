@@ -21,6 +21,10 @@ pub(super) fn ensure() -> Result<(), io::ErrorKind> {
     *JOB.get_or_init(|| create().map_err(|error| error.kind()))
 }
 
+#[expect(
+    unsafe_code,
+    reason = "creates a kill-on-close Win32 job object for the server process and assigns the process to it (ADR-502)"
+)]
 fn create() -> io::Result<()> {
     // SAFETY: plain Win32 calls with valid arguments. `info` is a zeroed plain-data structure of
     // the size the call is told; the job handle is checked and then deliberately leaked.

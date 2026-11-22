@@ -4895,7 +4895,7 @@ impl Kept {
         ends.push(end);
         answers.push(Answer {
             rx_id: own_id,
-            end: end_of.clone(),
+            end: end_of,
             vci_us: late.vci_us,
             clock: late.clock,
             epoch: late.epoch,
@@ -4903,7 +4903,7 @@ impl Kept {
             tx_done_us: None,
             agent_us: late.agent_us,
             pending: Vec::new(),
-            timing: timing.clone(),
+            timing,
             history: None,
         });
         // The one generic fold (ADR-425 decision 4): the pending of the same identifier leaves
@@ -7294,7 +7294,7 @@ mod tests {
         later_only.effect.owners = vec![3];
         assert!(!later_only.owed_through_owners());
         // An owner sent before it and one after it: the earlier one keeps it owed.
-        let mut both = settling.clone();
+        let mut both = settling;
         both.effect.owners = vec![1, 3];
         assert!(both.owed_through_owners());
         // No final response.
@@ -8322,7 +8322,7 @@ mod tests {
         for (second, since) in [
             (timed(answered.clone(), Some(6_000), Some(6_200)), true),
             // No time on the error's clock: the answer's order against the error is not shown.
-            (answered.clone(), false),
+            (answered, false),
         ] {
             let mut state = LinkState::default();
             let mut owed = silent.clone();
@@ -8534,7 +8534,7 @@ mod tests {
         state.keep(1, first);
         let (_, second) = log_kept(&mut state, 2, silent.clone());
         state.keep(2, second);
-        let (later, _) = log_kept(&mut state, 3, timed(silent.clone(), Some(6_000), None));
+        let (later, _) = log_kept(&mut state, 3, timed(silent, Some(6_000), None));
         let error = placed_at(Clock::Device, 0, 5_000);
         assert_eq!(state.place_error(error), ErrorPoint::After(1));
         state.error_after(Some(1), 4, LinkErrorKind::Receive, Some(error));
@@ -8567,7 +8567,7 @@ mod tests {
         let mut state = LinkState::default();
         let (_, kept) = log_kept(&mut state, 1, timed(silent.clone(), Some(1_000), None));
         state.keep(1, kept);
-        log_kept(&mut state, 2, timed(silent.clone(), Some(5_000), None));
+        log_kept(&mut state, 2, timed(silent, Some(5_000), None));
         let first = placed_at(Clock::Device, 0, 3_000);
         state.error_after(Some(1), 3, LinkErrorKind::Receive, Some(first));
         // The first exchange's answer at 2 500 is before the error: answered only.
@@ -8655,7 +8655,7 @@ mod tests {
         state.keep(1, kept);
         let (answer, _) = log_kept(&mut state, 2, timed(answered, Some(2_000), Some(2_200)));
         assert!(!answer.matched_answer());
-        log_kept(&mut state, 3, timed(silent.clone(), Some(6_000), None));
+        log_kept(&mut state, 3, timed(silent, Some(6_000), None));
         let at = placed_at(Clock::Device, 0, 5_000);
         assert_eq!(state.place_error(at), ErrorPoint::After(2));
         state.error_after(Some(2), 4, LinkErrorKind::Receive, Some(at));
@@ -8865,7 +8865,7 @@ mod tests {
         // request has its own response, the later one is its own rows' again.
         let mut state = LinkState::default();
         let (_, kept) = log_kept(&mut state, 1, silent.clone());
-        let (later, _) = log_kept(&mut state, 2, answered.clone());
+        let (later, _) = log_kept(&mut state, 2, answered);
         assert_eq!(later.classification, Classification::Undetermined);
         let (changed, past) = state.reclassify_after(&final_answer(&state, 1, &kept, answer));
         assert_eq!(past, None);
@@ -9199,7 +9199,7 @@ mod tests {
         assert_eq!(verdict.classification, Classification::Undetermined);
         assert!(verdict.reason.contains("H4"));
         // A judged window within P2 leaves no possible pending.
-        let mut judged = evidence.clone();
+        let mut judged = evidence;
         judged.timing.window = Window::WithinP2;
         judged.timing.not_judged_reason = None;
         assert_eq!(verdict_of(&judged).0, Classification::None);
@@ -9877,7 +9877,7 @@ mod tests {
         not_shown.vci_limits_past_by_us = None;
         assert_eq!(verdict_of(&not_shown).0, Classification::Undetermined);
         // A send not confirmed: the VCI may not have started its timing.
-        let mut unconfirmed = past.clone();
+        let mut unconfirmed = past;
         unconfirmed.transmit_evidence = None;
         assert_eq!(verdict_of(&unconfirmed).0, Classification::Undetermined);
         // A collecting entry with answers past its limits stays the system's, and one without
@@ -10365,7 +10365,7 @@ mod tests {
         assert_eq!(classification, Classification::Undetermined);
         assert!(reason.contains("(H3)"), "{reason}");
         // A link error and no matched answer: both readings stay open.
-        let mut both = other.clone();
+        let mut both = other;
         both.channel_link_errors = vec![LinkErrorKind::Receive];
         let (_, reason) = judged(&both, &state);
         assert!(
@@ -10374,7 +10374,7 @@ mod tests {
         );
         // On a link whose VCI absorbs pendings, with the time not judged, the possible-pending
         // row comes first (H4).
-        let mut absorbed = silent.clone();
+        let mut absorbed = silent;
         absorbed.pending_visibility = PendingVisibility::AbsorbedByVci;
         let (classification, reason) = judged(&absorbed, &state);
         assert_eq!(classification, Classification::Undetermined);
@@ -10493,7 +10493,7 @@ mod tests {
         let kept = state.kept(1).unwrap().clone();
         state.update_kept(
             1,
-            kept.evidence.clone(),
+            kept.evidence,
             Sent::Confirmed,
             super::super::timing::At::default(),
             None,
@@ -13274,7 +13274,7 @@ mod tests {
         assert_eq!(named.owed_ids(), [RX2]);
         assert!(!named.settles_owed());
         // Kept again as it now stands, the one identifier owed takes an unnamed final answer.
-        let rekept = kept_on(named.answers.clone(), &[RX, RX2]);
+        let rekept = kept_on(named.answers, &[RX, RX2]);
         assert_eq!(rekept.evidence.owed_ids(), [RX2]);
         let unnamed = rekept.answered(&POSITIVE, &late_on(None));
         assert_eq!(unnamed.answers.last().map(|a| a.rx_id), Some(RX2));
@@ -13559,7 +13559,7 @@ mod tests {
                 .1
                 .late_final_settles()
         );
-        let mut silent = table.clone();
+        let mut silent = table;
         silent.end = End::NoResponse;
         assert_eq!(silent.owed_ids(), [RX, RX2]);
         assert!(
@@ -13612,7 +13612,7 @@ mod tests {
         rejected_end.end_rejected = true;
         rejected_end.vci_ended = true;
         assert!(kept_of(rejected_end).late_pending_or_start_settles());
-        let mut waiting = table.clone();
+        let mut waiting = table;
         waiting.end = End::VciDidNotEnd;
         let waiting = kept_of(waiting);
         assert!(!waiting.late_final_settles() && waiting.late_pending_or_start_settles());
@@ -13623,7 +13623,7 @@ mod tests {
         assert!(window.settles_owed() && window.vci_ended);
         assert!(kept_of(window.clone()).late_pending_or_start_settles());
         window.vci_ended = false;
-        let mut unended = kept_of(window.clone());
+        let mut unended = kept_of(window);
         assert!(!unended.late_pending_or_start_settles());
         // The pending open when it was kept gives it no late final once its evidence settles it.
         unended.pending_at_end = true;

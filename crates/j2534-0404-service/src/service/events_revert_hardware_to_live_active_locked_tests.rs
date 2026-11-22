@@ -26,6 +26,10 @@ use super::*;
 
 const RHTLAT_CLL: u32 = 1;
 
+#[expect(
+    unsafe_code,
+    reason = "loads the mock library and looks up its `__mock_*` test-control symbol; libloading's `Library::new` and `get` are unsafe (ADR-502)"
+)]
 fn config_value(lib_path: &std::path::Path, channel_id: u32, param_id: u32) -> u32 {
     unsafe {
         let lib = Library::new(lib_path).expect("mock library should be loadable");
@@ -48,6 +52,10 @@ fn config_value(lib_path: &std::path::Path, channel_id: u32, param_id: u32) -> u
 /// `tests/grpc_mock/harness.rs`'s `MockBackdoor::set_config_param_log`,
 /// re-implemented here via a fresh `Library` handle since this unit test
 /// lives outside the `grpc_mock` harness.
+#[expect(
+    unsafe_code,
+    reason = "loads the mock library and looks up its `__mock_*` test-control symbol; libloading's `Library::new` and `get` are unsafe (ADR-502)"
+)]
 fn set_config_param_log(lib_path: &std::path::Path, channel_id: u32) -> Vec<u32> {
     unsafe {
         let lib = Library::new(lib_path).expect("mock library should be loadable");

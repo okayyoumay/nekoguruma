@@ -242,7 +242,7 @@ fn only_a_t0_socketcan_endpoint_gets_a_guard() {
             "{endpoint}"
         );
     }
-    let mut t1 = profile.clone();
+    let mut t1 = profile;
     t1.class = Class::T1;
     assert!(matches!(
         GuardedSocketCan::with_bus(&t1, 0, Box::new(bus)),

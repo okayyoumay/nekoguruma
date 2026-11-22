@@ -16,3 +16,6 @@ j2534-0404-sys = { workspace = true }
 j2534-0404 = { workspace = true }
 ngr-library-resolver = { workspace = true }
 tempfile = "3"
+
+[lints]
+workspace = true

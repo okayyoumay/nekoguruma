@@ -275,6 +275,12 @@ pub struct UploadLedger {
     probe: Probe,
 }
 
+impl std::fmt::Debug for UploadLedger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UploadLedger").finish_non_exhaustive()
+    }
+}
+
 impl UploadLedger {
     /// Opens the ledger of `agent_id` in the agent's state directory.
     pub fn open(mode: OperatingMode, agent_id: &str) -> Result<Self, LedgerError> {

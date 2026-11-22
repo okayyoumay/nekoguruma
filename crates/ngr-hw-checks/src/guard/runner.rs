@@ -62,6 +62,12 @@ pub struct GuardedClient {
     margins: agent::VciMargins,
 }
 
+impl std::fmt::Debug for GuardedClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GuardedClient").finish_non_exhaustive()
+    }
+}
+
 impl GuardedClient {
     /// Holds the device `open_device` opened and matched with `vci`, for a job. No link is
     /// created; the job creates its own, through the guard.

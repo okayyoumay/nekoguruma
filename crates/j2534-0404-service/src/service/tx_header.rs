@@ -433,7 +433,10 @@ fn j1850_header_bytes(
 /// has ever been started on the calling CLL. Only when the broadcast
 /// ComParam is unset/`0` does the established-TX-ID logic below run,
 /// unchanged.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "its arguments are independent inputs with no common type, so they stay plain parameters"
+)]
 pub(super) fn build_tx_message(
     protocol: ChannelProtocol,
     addr_source: AddrModeSource,
@@ -2321,9 +2324,9 @@ mod tests {
         // offset 4 (right after the 4-byte header), not offset 3.
         let client_mask = [0xFFu8];
         let client_pattern = [0x41u8];
-        let mut full_mask = mask.clone();
+        let mut full_mask = mask;
         full_mask.extend_from_slice(&client_mask);
-        let mut full_pattern = header.clone();
+        let mut full_pattern = header;
         full_pattern.extend_from_slice(&client_pattern);
         assert_eq!(full_mask.len(), 5);
         assert_eq!(full_pattern.len(), 5);

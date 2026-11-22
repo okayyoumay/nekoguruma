@@ -132,7 +132,7 @@ fn a_present_value_that_is_not_a_p256_key_is_unusable_and_not_replaced() {
     let (_, good) = key_bytes();
     let mut truncated = good.clone();
     truncated.truncate(good.len() - 10);
-    let mut tail_flipped = good.clone();
+    let mut tail_flipped = good;
     *tail_flipped.last_mut().unwrap() ^= 0xFF;
     let cases: [(&str, Vec<u8>); 5] = [
         ("empty", Vec::new()),
@@ -306,13 +306,7 @@ fn a_proof_from_a_later_load_verifies_against_the_first_loads_pem() {
     .unwrap();
     let pem = first.public_key().to_spki_pem();
     drop(first);
-    let later = load_or_create(
-        &DebugFileStore::new(keys.clone()),
-        &name(),
-        &no_lock_dir,
-        WAIT,
-    )
-    .unwrap();
+    let later = load_or_create(&DebugFileStore::new(keys), &name(), &no_lock_dir, WAIT).unwrap();
     assert!(!later.created());
     let transcript = transcript();
     let signature = sign_proof(&*later.signer(), &transcript).unwrap();
@@ -372,7 +366,6 @@ fn two_creators_held_at_absent_create_one_key() {
     let barrier = Arc::new(Barrier::new(2));
     let seen = Arc::new(AtomicUsize::new(0));
     {
-        let (barrier, seen) = (barrier.clone(), seen.clone());
         store.set_absent_hook(move || {
             // Only the two first reads wait: the winner's re-check under the lock must not.
             if seen.fetch_add(1, Ordering::SeqCst) < 2 {

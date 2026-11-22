@@ -35,6 +35,10 @@ struct Mock {
 }
 
 impl Mock {
+    #[expect(
+        unsafe_code,
+        reason = "loads the mock library with libloading, whose `Library::new` is unsafe (ADR-502)"
+    )]
     fn open() -> Self {
         let serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let path = iso22900_mock::mock_library_path()
@@ -52,6 +56,10 @@ impl Mock {
     /// Calls a back-door export that takes no arguments. The mock exports
     /// them as stdcall on Windows x86 and as C elsewhere, which is what
     /// `extern "system"` names on each target.
+    #[expect(
+        unsafe_code,
+        reason = "loads the mock library and looks up its `__mock_*` test-control symbol; libloading's `Library::new` and `get` are unsafe (ADR-502)"
+    )]
     fn call<R>(&self, name: &str) -> R {
         let symbol: Symbol<'_, unsafe extern "system" fn() -> R> =
             unsafe { self.library.get(name.as_bytes()) }

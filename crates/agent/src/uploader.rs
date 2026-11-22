@@ -62,6 +62,12 @@ pub struct SharedLedger {
     inner: Arc<LedgerInner>,
 }
 
+impl std::fmt::Debug for SharedLedger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedLedger").finish_non_exhaustive()
+    }
+}
+
 struct LedgerInner {
     ledger: Mutex<UploadLedger>,
     /// An enqueue was tried: the idle loop looks for work.

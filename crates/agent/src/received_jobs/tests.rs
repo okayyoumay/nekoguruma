@@ -91,9 +91,9 @@ fn lengths_after(dir: &Path, count: u32) -> Vec<u64> {
 struct Capture(Arc<Mutex<Vec<u8>>>);
 
 impl io::Write for Capture {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(bytes);
-        Ok(bytes.len())
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -343,7 +343,7 @@ fn d4_a_file_that_does_not_read_back_is_corrupt_and_is_never_touched() {
     bytes[first_end + FRAME_HEADER + 3] ^= 1;
     cases.push(("checksum before the last frame", bytes));
     // The second record's length field destroyed with whole records after it.
-    let mut bytes = valid.clone();
+    let mut bytes = valid;
     bytes[first_end..first_end + 4].copy_from_slice(&u32::MAX.to_le_bytes());
     cases.push(("damage followed by a whole record", bytes));
     cases.push((
@@ -387,7 +387,7 @@ fn d4_a_file_that_does_not_read_back_is_corrupt_and_is_never_touched() {
 fn d5_a_path_that_is_not_a_regular_file_is_corrupt() {
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir(file_of(dir.path())).unwrap();
-    let error = open(dir.path()).err().expect("a directory does not open");
+    let error = open(dir.path()).expect_err("a directory does not open");
     assert!(matches!(error, LedgerError::Corrupt(_)), "{error}");
 }
 
@@ -396,7 +396,7 @@ fn d5_a_path_that_is_not_a_regular_file_is_corrupt() {
 fn d7_a_second_store_of_the_directory_is_in_use_until_the_first_is_gone() {
     let dir = tempfile::tempdir().unwrap();
     let first = open(dir.path()).unwrap();
-    let error = open(dir.path()).err().expect("in use");
+    let error = open(dir.path()).expect_err("in use");
     assert!(matches!(error, LedgerError::InUse), "{error}");
     drop(first);
     open(dir.path()).unwrap();
@@ -406,9 +406,7 @@ fn d7_a_second_store_of_the_directory_is_in_use_until_the_first_is_gone() {
 #[test]
 fn d6_a_directory_that_cannot_be_used_is_an_io_error_not_corruption() {
     let dir = tempfile::tempdir().unwrap();
-    let error = open(&dir.path().join("missing"))
-        .err()
-        .expect("no directory");
+    let error = open(&dir.path().join("missing")).expect_err("no directory");
     assert!(matches!(error, LedgerError::Io(_)), "{error}");
 }
 
@@ -417,7 +415,7 @@ fn d6_a_directory_that_cannot_be_used_is_an_io_error_not_corruption() {
 fn d8_an_agent_id_that_is_not_a_canonical_uuid_cannot_name_the_file() {
     let dir = tempfile::tempdir().unwrap();
     for id in ["", "agent", "../x", &ID.to_uppercase(), &format!("{ID}0")] {
-        let error = ReceivedJobs::open_in(dir.path(), id).err().expect(id);
+        let error = ReceivedJobs::open_in(dir.path(), id).expect_err(id);
         assert!(matches!(error, LedgerError::BadAgentId), "{id}: {error}");
     }
 }

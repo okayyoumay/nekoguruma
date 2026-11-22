@@ -217,7 +217,7 @@ fn preload_error_lists_findings_then_the_io_error() {
         reason: Reason::NullDacl,
     };
     let both = PreloadError {
-        findings: vec![finding.clone()],
+        findings: vec![finding],
         io: Some(io::Error::other("boom")),
         signer: None,
         held: None,
@@ -477,6 +477,10 @@ try {
         not(target_arch = "x86"),
         link(name = "kernel32.dll", kind = "raw-dylib", modifiers = "+verbatim")
     )]
+    #[expect(
+        unsafe_code,
+        reason = "declares `LoadLibraryExW` and `FreeLibrary` as foreign functions (ADR-502)"
+    )]
     unsafe extern "system" {
         fn LoadLibraryExW(
             name: *const u16,
@@ -487,6 +491,10 @@ try {
     }
 
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "loads and frees a system DLL with `LoadLibraryExW` and `FreeLibrary` to check that the held file handle does not block the loader (ADR-502)"
+    )]
     fn library_loads_while_the_verdict_holds_the_file() {
         // A real load (no flags) of a copy of a system DLL: the held handle denies write
         // sharing, and the loader must still be able to map the file. The copy is of

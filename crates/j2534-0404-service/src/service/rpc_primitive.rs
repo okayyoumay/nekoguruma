@@ -901,7 +901,10 @@ impl std::fmt::Display for TxRefusal {
 /// `LogicalLinkState::tp20_connection`, in the same critical section it
 /// already captures `bound_comparams`/`connect_generation` from (ADR-086
 /// discipline), not from `params`.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "its arguments are independent inputs with no common type, so they stay plain parameters"
+)]
 pub(super) fn resolve_send_recv_tx(
     protocol: ChannelProtocol,
     hw_protocol_id: u32,
@@ -1233,7 +1236,7 @@ pub(super) fn resolve_send_recv_tx(
     // accepted and both addressing modes default to Normal (extended
     // addressing, ADR-046 addendum).
     let mut hw_tx_flags = base_tx_flags;
-    let isotp_tx = if software_isotp {
+    let isotp_tx = software_isotp.then(|| {
         hw_tx_flags &= !j2534_0404::TX_ISO15765_FRAME_PAD;
         // `cop_data` non-emptiness is validated eagerly in
         // rpc_start_com_primitive (ADR-064) -- it is ComParam-independent
@@ -1245,16 +1248,14 @@ pub(super) fn resolve_send_recv_tx(
             .map_or((None, isotp::Addressing::Normal), |a| {
                 (a.fc_can_id, a.fc_rx_addressing)
             });
-        Some(SoftIsoTpTx {
+        SoftIsoTpTx {
             framing: params.isotp_framing(base_tx_flags),
             tx_addressing,
             fc_can_id,
             fc_rx_addressing,
             n_bs_timeout_ms: params.isotp_n_bs_timeout_ms(),
-        })
-    } else {
-        None
-    };
+        }
+    });
     // TX_FLAG_CAN_29BIT_ID/ISO15765_ADDR_TYPE/SCI_MODE/SCI_TX_VOLTAGE describe
     // objective facts this service already resolved from ComParams, not
     // caller preference -- authoritative over whatever the client requested
@@ -2083,14 +2084,10 @@ pub(super) fn resolve_tester_present(
     // used to build `data` above (ADR-050); Normal when the table is empty.
     // Reuses the `tx_addressing` computed earlier (ADR-215) instead of
     // re-deriving it a second time.
-    let isotp_framing = if software_isotp {
-        Some(SoftIsoTpFraming {
-            framing: active.isotp_framing(0),
-            addressing: tx_addressing,
-        })
-    } else {
-        None
-    };
+    let isotp_framing = software_isotp.then(|| SoftIsoTpFraming {
+        framing: active.isotp_framing(0),
+        addressing: tx_addressing,
+    });
 
     // Same TxFlags corrections as CoptSendrecv (ADR-046, ADR-062): strip the
     // software-driven FRAME_PAD flag from the raw CAN channel, then let the
@@ -6837,6 +6834,10 @@ mod tp20_broadcast_periodic_api_fence_tests {
     /// Same technique as `finalize_or_orphan_broadcast_periodic_start_tests::
     /// stop_periodic_call_count` (see that function's own doc comment for the
     /// same-loaded-shared-object rationale this relies on).
+    #[expect(
+        unsafe_code,
+        reason = "loads the mock library and looks up its `__mock_*` test-control symbol; libloading's `Library::new` and `get` are unsafe (ADR-502)"
+    )]
     fn stop_periodic_call_count() -> usize {
         let lib_path = j2534_0404_mock::mock_library_path().expect("mock cdylib should be built");
         unsafe {
@@ -6854,6 +6855,10 @@ mod tp20_broadcast_periodic_api_fence_tests {
     /// test connected for itself, so -- unlike the process-global call
     /// counters -- it can never observe another test's periodic traffic and
     /// needs no `#[serial]` guard.
+    #[expect(
+        unsafe_code,
+        reason = "loads the mock library and looks up its `__mock_*` test-control symbol; libloading's `Library::new` and `get` are unsafe (ADR-502)"
+    )]
     fn live_periodic_msg_count(channel_id: ChannelId) -> usize {
         let lib_path = j2534_0404_mock::mock_library_path().expect("mock cdylib should be built");
         unsafe {
@@ -8102,6 +8107,10 @@ mod finalize_or_orphan_broadcast_periodic_start_tests {
     /// Per-thread for the same reason as that function: the process-wide
     /// count also moves whenever another test in this binary stops a
     /// periodic message in parallel, which broke the exact deltas below.
+    #[expect(
+        unsafe_code,
+        reason = "loads the mock library and looks up its `__mock_*` test-control symbol; libloading's `Library::new` and `get` are unsafe (ADR-502)"
+    )]
     fn stop_periodic_call_count() -> usize {
         let lib_path = j2534_0404_mock::mock_library_path().expect("mock cdylib should be built");
         unsafe {
@@ -8889,6 +8898,10 @@ mod rpc_cancel_com_primitive_zero_message_id_tests {
     /// Same technique as `finalize_or_orphan_broadcast_periodic_start_tests::
     /// stop_periodic_call_count` (see that function's own doc comment for
     /// the same-loaded-shared-object rationale this relies on).
+    #[expect(
+        unsafe_code,
+        reason = "loads the mock library and looks up its `__mock_*` test-control symbol; libloading's `Library::new` and `get` are unsafe (ADR-502)"
+    )]
     fn stop_periodic_call_count() -> usize {
         let lib_path = j2534_0404_mock::mock_library_path().expect("mock cdylib should be built");
         unsafe {
@@ -8906,6 +8919,10 @@ mod rpc_cancel_com_primitive_zero_message_id_tests {
     /// 14) to force the native `PassThruStopPeriodicMsg` call
     /// `rpc_cancel_com_primitive`'s `CoptCancel` branch issues to fail with
     /// an arbitrary caller-chosen code, including `ERR_INVALID_MSG_ID`.
+    #[expect(
+        unsafe_code,
+        reason = "loads the mock library and looks up its `__mock_*` test-control symbol; libloading's `Library::new` and `get` are unsafe (ADR-502)"
+    )]
     fn set_stop_periodic_message_error(code: Option<c_long>) {
         let lib_path = j2534_0404_mock::mock_library_path().expect("mock cdylib should be built");
         unsafe {

@@ -143,6 +143,10 @@ fn foreign_owner() -> io::Error {
 }
 
 #[cfg(unix)]
+#[expect(
+    unsafe_code,
+    reason = "libc FFI with no safe std equivalent: `geteuid` reads the effective user id (ADR-502)"
+)]
 fn restrict_file(file: &File) -> io::Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let meta = file.metadata()?;
@@ -170,6 +174,10 @@ fn restrict_file(file: &File) -> io::Result<()> {
 }
 
 #[cfg(windows)]
+#[expect(
+    unsafe_code,
+    reason = "makes the file and directory private by editing their ACLs through the Win32 security APIs (ADR-502)"
+)]
 mod windows {
     use std::io;
     use std::os::windows::io::{AsRawHandle, RawHandle};
@@ -390,6 +398,10 @@ mod tests {
     /// An existing file another account owns is refused: narrowing its mode would still leave
     /// that account access. Only root can give a file away, so the test runs only as root.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "libc FFI with no safe std equivalent: `geteuid` reads the effective user id (ADR-502)"
+    )]
     fn a_file_another_account_owns_is_refused() {
         // SAFETY: `geteuid` has no preconditions.
         if unsafe { libc::geteuid() } != 0 {
@@ -438,6 +450,10 @@ mod windows_tests {
     use super::*;
 
     /// `path`'s access list in SDDL.
+    #[expect(
+        unsafe_code,
+        reason = "reads a file's access list as SDDL through the Win32 security APIs and frees the descriptor with `LocalFree` (ADR-502)"
+    )]
     fn dacl(path: &Path) -> String {
         let name: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
         let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();

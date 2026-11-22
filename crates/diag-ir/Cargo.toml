@@ -22,3 +22,6 @@ download-flatc = ["flatc", "dep:sha2", "dep:zip"]
 
 [dev-dependencies]
 serde_json.workspace = true
+
+[lints]
+workspace = true

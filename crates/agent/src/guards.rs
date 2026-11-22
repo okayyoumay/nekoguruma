@@ -1332,6 +1332,10 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "libc FFI with no safe std equivalent: `mkfifo` creates a FIFO (ADR-502)"
+    )]
     fn a_fifo_lock_file_fails_the_take_promptly() {
         let dir = dir("fifo");
         let never = AtomicBool::new(false);

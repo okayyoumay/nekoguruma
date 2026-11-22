@@ -92,6 +92,10 @@ fn definition_dir(dir: &Path) {
 }
 
 #[test]
+#[expect(
+    unsafe_code,
+    reason = "`std::env::set_var`/`remove_var` are unsafe (edition 2024) and have no safe form (ADR-502)"
+)]
 fn the_read_check_identifies_the_variant_and_runs_its_read_procedure_through_the_guard() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let root = temp.path();

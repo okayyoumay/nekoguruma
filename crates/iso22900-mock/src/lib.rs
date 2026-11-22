@@ -1,6 +1,15 @@
-#![allow(clippy::too_many_arguments)]
-#![allow(unsafe_code)]
-#![allow(non_snake_case)]
+#![allow(
+    clippy::too_many_arguments,
+    reason = "the exported functions mirror the C signatures of the D-PDU API"
+)]
+#![allow(
+    unsafe_code,
+    reason = "a mock D-PDU API library that exports the C ABI of a vendor library for tests (ADR-502)"
+)]
+#![allow(
+    non_snake_case,
+    reason = "the exported symbols keep the C names of the D-PDU API"
+)]
 
 use std::collections::VecDeque;
 use std::ffi::{CStr, c_char, c_void};
@@ -1684,6 +1693,10 @@ fn default_ecu_config() -> EcuConfig {
 /// A command for `__mock_sim_ecu_control`, as JSON.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
+#[expect(
+    clippy::empty_enum_variants_with_brackets,
+    reason = "serde: `Detach {}` is read from `{\"detach\": {}}`, a unit variant only from `\"detach\"` (ADR-502)"
+)]
 pub enum SimEcuCommand {
     /// Attaches a fresh simulated ECU, replacing any attached one. Its configuration is
     /// `sim-vci`'s default with the fields `config` names (an `EcuConfig` JSON object, whole
@@ -1857,7 +1870,8 @@ exported_fn!(PDUDestruct() -> T_PDU_ERROR {
 });
 
 exported_fn!(PDUIoCtl(_h_mod: UNUM32, _h_cll: UNUM32, io_ctl_command_id: T_PDU_IT, p_input_data: *mut PDU_DATA_ITEM, p_output_data: *mut *mut PDU_DATA_ITEM) -> T_PDU_ERROR {
-    if io_ctl_command_id.0 as UNUM32 == MOCK_IOCTL_NULL_OUTPUT {
+    let command_id = io_ctl_command_id.0 as UNUM32;
+    if command_id == MOCK_IOCTL_NULL_OUTPUT {
         return no_error();
     }
     if !p_output_data.is_null() {
@@ -2987,7 +3001,7 @@ mod library_path_tests {
         let base = std::time::SystemTime::now();
         set_mtime(&uplifted, base - std::time::Duration::from_secs(100));
         set_mtime(&fresh, base);
-        assert_eq!(search_directory(&root), Some(fresh.clone()));
+        assert_eq!(search_directory(&root), Some(fresh));
 
         // The preference is by mtime, not by location in the tree.
         set_mtime(&uplifted, base + std::time::Duration::from_secs(100));
@@ -3557,8 +3571,7 @@ mod response_pending_tests {
     #[test]
     fn with_the_handling_off_each_pending_message_is_a_result_item() {
         let answer = Some(vec![0x62, 0xF1, 0x90]);
-        let (events, last) =
-            receive_events(Rc78::default(), REQ, pending(&[0, 20]), answer.clone(), 40);
+        let (events, last) = receive_events(Rc78::default(), REQ, pending(&[0, 20]), answer, 40);
         assert_eq!(last, 40);
         assert_eq!(
             shape(&events),
@@ -3681,8 +3694,7 @@ mod response_pending_tests {
         assert_eq!(last, 130);
         assert_eq!(shape(&events), shape(&[timeout_at(130)]));
         // With the handling off it is a result item.
-        let (events, _) =
-            receive_events(Rc78::default(), REQ, Vec::new(), last_message.clone(), 30);
+        let (events, _) = receive_events(Rc78::default(), REQ, Vec::new(), last_message, 30);
         assert_eq!(shape(&events), [(30, "result [7F, 22, 78]".to_owned())]);
         // A pending message for another service is not absorbed.
         let (events, _) = receive_events(

@@ -126,10 +126,6 @@ use vci_service_launcher::vci_server::VciServer;
 /// ADR-149). New timing-window tests should budget this **once per
 /// round trip inside the window being tested**, not as a flat total; see
 /// the module doc above for the full guideline.
-// Not yet referenced by any Rust code, only by doc comments across this
-// file's siblings (ADR-149) -- allow(dead_code) so `-D warnings` clippy runs
-// don't fail on a documented reference constant.
-#[allow(dead_code)]
 pub(crate) const GRPC_ROUND_TRIP_OVERHEAD_CEILING_MS: u64 = 85;
 
 pub(crate) const MOCK_MODULE_HANDLE: u32 = 1;
@@ -156,6 +152,10 @@ pub(crate) struct MockBackdoor {
     lib: Library,
 }
 
+#[expect(
+    unsafe_code,
+    reason = "loads the mock library and looks up its `__mock_*` test-control symbols; libloading's `Library::new` and `get` are unsafe (ADR-502)"
+)]
 impl MockBackdoor {
     pub(crate) fn open(path: &Path) -> Self {
         let lib = unsafe { Library::new(path) }.expect("mock library should be loadable");
@@ -977,7 +977,7 @@ impl MockBackdoor {
                 &mut query_msg_id as *mut u32 as *mut c_void,
                 &mut status as *mut u32 as *mut c_void,
             );
-            if rc == NC { Some(status) } else { None }
+            (rc == NC).then_some(status)
         }
     }
 
@@ -1884,6 +1884,10 @@ impl TestServer {
     /// close that gap, `config_path` is now also made per-process-unique (via
     /// `std::process::id()`), so two concurrent processes never write to the
     /// same file even without any cross-process synchronization (ADR-195).
+    #[expect(
+        unsafe_code,
+        reason = "`std::env::set_var`/`remove_var` are unsafe (edition 2024) and have no safe form (ADR-502)"
+    )]
     pub(crate) async fn try_start_with_extra_config(
         extra_toml: &str,
     ) -> Result<Self, vci_service_launcher::BoxError> {
@@ -2845,26 +2849,53 @@ pub(crate) const CP_ANALOG_INPUT_RANGE_HIGH: u32 = 0x80D9;
 /// `_CHx`-forwarding coverage is representative of all ten, mirroring this
 /// file's own convention of predefining a full sibling-id set even when not
 /// every one is individually exercised, e.g. the `PARAM_TP20_*` group above)
-/// -- `#[allow(dead_code)]` so a `-D warnings` clippy run doesn't fail on the
+/// -- `#[expect(dead_code)]` so a `-D warnings` clippy run doesn't fail on the
 /// other nine.
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "only `CP_UEB_T1_MAX` is exercised; the rest complete the id set (ADR-216)"
+)]
 pub(crate) const CP_UEB_T0_MIN: u32 = 0x80DA;
 pub(crate) const CP_UEB_T1_MAX: u32 = 0x80DB;
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "only `CP_UEB_T1_MAX` is exercised; the rest complete the id set (ADR-216)"
+)]
 pub(crate) const CP_UEB_T2_MAX: u32 = 0x80DC;
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "only `CP_UEB_T1_MAX` is exercised; the rest complete the id set (ADR-216)"
+)]
 pub(crate) const CP_UEB_T3_MAX: u32 = 0x80DD;
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "only `CP_UEB_T1_MAX` is exercised; the rest complete the id set (ADR-216)"
+)]
 pub(crate) const CP_UEB_T4_MIN: u32 = 0x80DE;
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "only `CP_UEB_T1_MAX` is exercised; the rest complete the id set (ADR-216)"
+)]
 pub(crate) const CP_UEB_T5_MAX: u32 = 0x80DF;
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "only `CP_UEB_T1_MAX` is exercised; the rest complete the id set (ADR-216)"
+)]
 pub(crate) const CP_UEB_T6_MAX: u32 = 0x80E0;
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "only `CP_UEB_T1_MAX` is exercised; the rest complete the id set (ADR-216)"
+)]
 pub(crate) const CP_UEB_T7_MIN: u32 = 0x80E1;
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "only `CP_UEB_T1_MAX` is exercised; the rest complete the id set (ADR-216)"
+)]
 pub(crate) const CP_UEB_T7_MAX: u32 = 0x80E2;
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "only `CP_UEB_T1_MAX` is exercised; the rest complete the id set (ADR-216)"
+)]
 pub(crate) const CP_UEB_T9_MIN: u32 = 0x80E3;
 
 /// Fallible counterpart to [`set_com_param_unum32`] -- returns the raw

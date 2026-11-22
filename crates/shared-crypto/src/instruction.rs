@@ -254,7 +254,7 @@ mod tests {
             Envelope::split(&[2, 0, 0]),
             Err(EnvelopeError::UnknownFormat(2))
         );
-        let mut other_format = blob.clone();
+        let mut other_format = blob;
         other_format[0] = 2;
         assert_eq!(
             Envelope::split(&other_format),
@@ -263,7 +263,7 @@ mod tests {
         // The bound is on the payload: the largest is accepted, one more is not.
         let at_limit = seal(&key, &payload(MAX_PAYLOAD_LEN)).unwrap();
         assert!(Envelope::split(&at_limit).is_ok());
-        let mut over = at_limit.clone();
+        let mut over = at_limit;
         over.push(0);
         assert_eq!(
             Envelope::split(&over),

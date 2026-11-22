@@ -10,6 +10,12 @@ pub struct ApiItem<'a, Item> {
     _marker: PhantomData<&'a ()>,
 }
 
+impl<Item> std::fmt::Debug for ApiItem<'_, Item> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiItem").finish_non_exhaustive()
+    }
+}
+
 impl<'a, Item> ApiItem<'a, Item> {
     /// Wraps an item pointer that a D-PDU function returned through an output parameter.
     ///
@@ -771,6 +777,10 @@ mod tests {
             pData: (&raw as *const PDU_IO_BYTEARRAY_DATA).cast_mut().cast(),
         });
 
+        #[expect(
+            clippy::redundant_clone,
+            reason = "`to_owned` here is `BorrowedDataItem`'s own conversion into an owned copy of the bytes, which the test checks against the later change of `source` (ADR-502)"
+        )]
         let owned = item.to_owned();
         source[0] = 99;
 

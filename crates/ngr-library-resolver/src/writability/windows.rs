@@ -117,6 +117,10 @@ pub(super) use probe::WindowsProbe;
 pub(super) use probe::current_user_sid;
 
 #[cfg(windows)]
+#[expect(
+    unsafe_code,
+    reason = "the probe reads a file's owner and ACL through the Win32 security APIs (ADR-502)"
+)]
 mod probe {
     use std::{
         io,

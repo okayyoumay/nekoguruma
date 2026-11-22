@@ -246,6 +246,12 @@ pub struct Fetcher {
     state: Mutex<State>,
 }
 
+impl std::fmt::Debug for Fetcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Fetcher").finish_non_exhaustive()
+    }
+}
+
 impl Fetcher {
     /// The fetcher of the registered agent `record` (whose key is `key`) over the open `store`.
     /// It sends nothing until an object is asked for.

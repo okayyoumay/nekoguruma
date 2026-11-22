@@ -10,6 +10,10 @@
 #![cfg(debug_assertions)]
 
 #[test]
+#[expect(
+    unsafe_code,
+    reason = "`std::env::set_var`/`remove_var` are unsafe (edition 2024) and have no safe form (ADR-502)"
+)]
 fn runtime_env_var_overrides_build_time_definition_dir() {
     let temp = tempfile::tempdir().expect("create temp dir");
     let dir = temp.path().join("j2534");

@@ -159,6 +159,10 @@ fn temp_paths() -> TempPaths {
 }
 
 #[test]
+#[expect(
+    unsafe_code,
+    reason = "`std::env::set_var`/`remove_var` are unsafe (edition 2024) and have no safe form (ADR-502)"
+)]
 fn marked_guards_are_kept_until_the_worker_is_gone_and_a_retried_close_confirms() {
     let paths = temp_paths();
     std::fs::write(&paths.config, "").expect("test config file should be writable");

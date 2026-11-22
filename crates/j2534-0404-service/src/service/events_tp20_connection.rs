@@ -1139,11 +1139,8 @@ pub(in crate::service) fn quarantine_tp20_passive_slot_on_disarm(
 ) {
     if let Some(entry) = sc.tp20_connections.get_mut(&rx_id_passive) {
         entry.abandoned = true;
-        entry.idle_release_at = if !was_established && config_cleared {
-            Some(tokio::time::Instant::now() + TP20_PASSIVE_IDLE_RELEASE_GRACE)
-        } else {
-            None
-        };
+        entry.idle_release_at = (!was_established && config_cleared)
+            .then(|| tokio::time::Instant::now() + TP20_PASSIVE_IDLE_RELEASE_GRACE);
     }
     sc.tp20_passive = None;
 }

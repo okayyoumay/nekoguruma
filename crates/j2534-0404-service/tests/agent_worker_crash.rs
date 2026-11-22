@@ -85,6 +85,10 @@ impl Drop for TempPaths {
 
 /// Ends the worker process `pid` at once, as a crash would: nothing in it is closed or flushed.
 #[cfg(unix)]
+#[expect(
+    unsafe_code,
+    reason = "libc FFI with no safe std equivalent: `kill` sends a signal (ADR-502)"
+)]
 fn kill_worker(pid: u32) {
     let pid = i32::try_from(pid).expect("a process ID fits in pid_t");
     // SAFETY: kill(2) takes a process ID and a signal number and touches no memory.
@@ -100,6 +104,10 @@ fn kill_worker(pid: u32) {
 /// Ends the worker process `pid` at once, as a crash would: `TerminateProcess`, so nothing in
 /// it is closed or flushed.
 #[cfg(windows)]
+#[expect(
+    unsafe_code,
+    reason = "ends the worker with the Win32 `OpenProcess` and `TerminateProcess` calls, which std has no form of (ADR-502)"
+)]
 fn kill_worker(pid: u32) {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
@@ -306,6 +314,10 @@ fn exchanges(dir: &Path) -> usize {
 }
 
 #[test]
+#[expect(
+    unsafe_code,
+    reason = "`std::env::set_var`/`remove_var` are unsafe (edition 2024) and have no safe form (ADR-502)"
+)]
 fn a_run_starts_a_worker_that_crashed_again() {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

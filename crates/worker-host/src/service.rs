@@ -160,6 +160,15 @@ pub struct WorkerProcess {
     request_timeout: Duration,
 }
 
+impl std::fmt::Debug for WorkerProcess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkerProcess")
+            .field("endpoints", &self.endpoints)
+            .field("request_timeout", &self.request_timeout)
+            .finish_non_exhaustive()
+    }
+}
+
 impl WorkerProcess {
     /// Launches `binary` for `library_name` in the device's operating `mode`, provisions a fresh
     /// auth key and waits until the gRPC server reports its endpoints.

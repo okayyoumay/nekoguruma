@@ -34,6 +34,10 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
+#[allow(
+    unsafe_code,
+    reason = "libc FFI with no safe std equivalent, Unix only: `signal` installs a signal handler (ADR-502)"
+)]
 fn main() {
     let cfg = read_config();
     let get = |key: &str| cfg.get(key).map(String::as_str);
@@ -43,6 +47,10 @@ fn main() {
 
     #[cfg(unix)]
     {
+        #[allow(
+            unsafe_code,
+            reason = "libc FFI with no safe std equivalent, Unix only: `_exit` ends the process without unwinding, `signal` installs a signal handler (ADR-502)"
+        )]
         extern "C" fn on_term(_: libc::c_int) {
             // SAFETY: `_exit` is async-signal-safe.
             unsafe { libc::_exit(0) }
@@ -50,7 +58,7 @@ fn main() {
         let handler = if get("ignore_term") == Some("1") {
             libc::SIG_IGN
         } else {
-            on_term as extern "C" fn(libc::c_int) as libc::sighandler_t
+            on_term as extern "C" fn(libc::c_int) as *const () as libc::sighandler_t
         };
         // SAFETY: installs a handler that only calls `_exit`, or ignores the signal.
         unsafe { libc::signal(libc::SIGTERM, handler) };
@@ -156,6 +164,10 @@ fn read_config() -> HashMap<String, String> {
         .collect()
 }
 
+#[allow(
+    unsafe_code,
+    reason = "libc FFI with no safe std equivalent, Unix only: `raise` raises a signal (ADR-502)"
+)]
 fn answer(
     mut stream: TcpStream,
     mode: &str,
@@ -217,6 +229,10 @@ fn answer(
     }
 }
 
+#[allow(
+    unsafe_code,
+    reason = "libc FFI with no safe std equivalent, Unix only: `getpgrp` reads the process group id, `getppid` reads the parent process id (ADR-502)"
+)]
 fn report() {
     let mut text = String::new();
     for arg in std::env::args().skip(1) {

@@ -582,7 +582,10 @@ mod tests {
     }
 
     // The cast matters on *-windows-msvc, where the enum is c_int.
-    #[allow(clippy::unnecessary_cast)]
+    #[allow(
+        clippy::unnecessary_cast,
+        reason = "the enum is `c_int` on msvc and `u32` elsewhere, so the cast is a no-op on some targets"
+    )]
     #[test]
     fn unique_response_mixed_vendor_types_preserved_with_resolver() {
         let mut vendor_payload_a = vec![0xC1_u8, 0xC2, 0xC3, 0xC4];

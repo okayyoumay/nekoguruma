@@ -25,6 +25,10 @@ struct WritableMock {
 }
 
 impl WritableMock {
+    #[expect(
+        unsafe_code,
+        reason = "`std::env::set_var`/`remove_var` are unsafe (edition 2024) and have no safe form (ADR-502)"
+    )]
     fn new() -> Self {
         let dir = tempfile::tempdir().expect("create temp dir");
         let mock = iso22900_mock::mock_library_path()
@@ -84,8 +88,7 @@ async fn device_mode_refuses_a_library_that_fails_a_check() {
     let mock = WritableMock::new();
     let error = start("device")
         .await
-        .err()
-        .expect("device mode should refuse the library");
+        .expect_err("device mode should refuse the library");
     let status = error
         .downcast_ref::<Status>()
         .expect("the refusal is a gRPC status");

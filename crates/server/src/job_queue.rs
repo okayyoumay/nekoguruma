@@ -1150,7 +1150,7 @@ mod tests {
             &a,
             delivery.connection,
             AgentMessage::CommandRejected {
-                command_id: delivery.command_id.clone(),
+                command_id: delivery.command_id,
                 reason: InstructionRejectReason::BadSignature,
             },
         );

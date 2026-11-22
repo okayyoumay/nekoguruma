@@ -13,6 +13,7 @@ use crate::journal::{CreateLinkedError, create_linked};
 
 /// Secrets as files `<name>.pk8` in one directory. A file appears complete or not at all, made by the
 /// same routine as the journal (`create_linked`).
+#[derive(Debug)]
 pub struct DebugFileStore {
     dir: PathBuf,
 }

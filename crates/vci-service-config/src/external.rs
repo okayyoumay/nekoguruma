@@ -31,8 +31,8 @@ impl<T: fmt::Display> fmt::Display for External<T> {
 struct Escaping<'a, 'b>(&'a mut fmt::Formatter<'b>);
 
 impl Write for Escaping<'_, '_> {
-    fn write_str(&mut self, text: &str) -> fmt::Result {
-        for c in text.chars() {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        for c in s.chars() {
             match c {
                 '\\' => self.0.write_str(r"\\")?,
                 '\n' => self.0.write_str(r"\n")?,

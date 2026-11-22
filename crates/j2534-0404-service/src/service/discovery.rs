@@ -143,7 +143,10 @@ pub(super) enum DeviceAccess {
     /// instead. Left in place (and unit-tested via `enforce_discovery_capability`)
     /// for a future enforcement point that does not already hold a device
     /// guard.
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "no enforcement point uses this variant yet and the unit tests do, so it is dead only in a non-test build"
+    )]
     OpenIfNeeded,
 }
 
@@ -166,7 +169,10 @@ impl J2534Service {
     /// it's always called while its own caller's `device_guard` is already
     /// held, so it uses `discovery_device_info_with_open_device` directly
     /// instead of this function.
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "no production caller yet and the unit tests use it, so it is dead only in a non-test build"
+    )]
     pub(super) async fn discovery_device_info(
         &self,
         module_handle: u32,
@@ -364,7 +370,10 @@ impl J2534Service {
     /// caller) was switched to `DeviceAccess::AlreadyOpen` /
     /// [`Self::discovery_protocol_info_with_open_device`] instead, by the
     /// same lock-order fix.
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "no production caller yet and the unit tests use it, so it is dead only in a non-test build"
+    )]
     pub(super) async fn discovery_protocol_info(
         &self,
         module_handle: u32,
@@ -851,6 +860,10 @@ mod tests {
     /// `check_chx_capacity` or an RPC handler) ran in parallel, which broke
     /// the exact before/after deltas below under `cargo test`. Delta-measured
     /// all the same, since earlier tests may have run on a reused thread.
+    #[expect(
+        unsafe_code,
+        reason = "loads the mock library and looks up its `__mock_*` test-control symbol; libloading's `Library::new` and `get` are unsafe (ADR-502)"
+    )]
     fn get_device_info_call_count() -> usize {
         let lib_path = j2534_0404_mock::mock_library_path().expect("mock cdylib should be built");
         unsafe {

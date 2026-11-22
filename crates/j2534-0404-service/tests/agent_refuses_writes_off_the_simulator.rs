@@ -55,6 +55,10 @@ fn program() -> Program {
 }
 
 #[test]
+#[expect(
+    unsafe_code,
+    reason = "`std::env::set_var`/`remove_var` are unsafe (edition 2024) and have no safe form (ADR-502)"
+)]
 fn agent_refuses_a_write_on_a_vci_that_is_not_the_simulator() {
     let mock_library =
         mock_library_path().expect("mock library should be discoverable after build");

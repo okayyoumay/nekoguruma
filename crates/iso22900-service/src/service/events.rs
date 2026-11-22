@@ -168,16 +168,9 @@ pub(super) fn to_proto_event_item(
                 rx_flag,
                 unique_resp_identifier: result.unique_resp_identifier(),
                 acceptance_id: result.acceptance_id(),
-                tx_msg_done_timestamp: if has_tx_msg_done_timestamp {
-                    Some(result.tx_msg_done_timestamp())
-                } else {
-                    None
-                },
-                start_msg_timestamp: if has_start_msg_timestamp {
-                    Some(result.start_msg_timestamp())
-                } else {
-                    None
-                },
+                tx_msg_done_timestamp: has_tx_msg_done_timestamp
+                    .then(|| result.tx_msg_done_timestamp()),
+                start_msg_timestamp: has_start_msg_timestamp.then(|| result.start_msg_timestamp()),
                 extra_info,
                 data_bytes: result.data_bytes().map_err(map_err)?.to_vec(),
             }))

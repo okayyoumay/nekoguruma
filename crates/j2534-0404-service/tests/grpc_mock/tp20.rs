@@ -4721,7 +4721,10 @@ const CP_TP20_BROADCAST_INTERVAL: u32 = 0x80D1;
 /// hardcode a fixed shape, which the broadcast tests below need to vary
 /// (temp-scoped ComParam staging, and the cyclic `-1` periodic re-trigger
 /// case).
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "its arguments are independent inputs with no common type, so they stay plain parameters"
+)]
 async fn start_send_recv(
     client: &mut vci_service_interface::vci_service_client::VciServiceClient<
         tonic::transport::Channel,

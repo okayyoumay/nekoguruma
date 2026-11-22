@@ -11,3 +11,6 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 j2534-0404-registry = { workspace = true }
+
+[lints]
+workspace = true

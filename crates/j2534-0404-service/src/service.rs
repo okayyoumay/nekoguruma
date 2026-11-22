@@ -1690,7 +1690,7 @@ pub(super) enum RegistrantTier {
 /// field here except `request_sid` (redundant with -- and, at every current
 /// construction site, always equal to -- `rc_cfg`'s own `request_sid`, which
 /// is what `detect_pending_rc` actually consults; see that field's own doc
-/// comment) -- it keeps `#[allow(dead_code)]` until a later step gives it an
+/// comment) -- it keeps `#[expect(dead_code)]` until a later step gives it an
 /// independent reader. `cyclic_deadline`/`cyclic_timeout_ms` are read/written
 /// as of S6 (ADR-100 Decision §4, scope widened by ADR-182):
 /// `bind_registrant`'s match-acceptance step restarts `cyclic_deadline` from
@@ -1730,7 +1730,10 @@ pub(super) struct CopRegistrant {
     /// (not removed) since it is `CopRegistrant`'s own natural home for this
     /// value if a later step (e.g. a tier-2 registrant with `rc_cfg: None`)
     /// ever needs it without a full `RcHandlingConfig`.
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "never read yet; kept as the natural home of the value if a registrant without an `RcHandlingConfig` needs it"
+    )]
     pub(super) request_sid: Option<u8>,
     pub(super) matches_needed: Option<u32>,
     pub(super) matches_got: u32,
@@ -5476,6 +5479,12 @@ pub struct J2534Service {
         Arc<Mutex<HashMap<DiscoveryProtocolKey, DiscoveryCacheEntry>>>,
 }
 
+impl std::fmt::Debug for J2534Service {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("J2534Service").finish_non_exhaustive()
+    }
+}
+
 impl VciServer for J2534Service {
     type StartupConfig = StartupConfig;
 
@@ -5497,7 +5506,7 @@ impl VciServer for J2534Service {
     }
 
     async fn new(
-        startup_config: Self::StartupConfig,
+        args: Self::StartupConfig,
         config_file: vci_service_launcher::ConfigFile,
         shutdown: Receiver<bool>,
     ) -> Result<Self, BoxError> {
@@ -5510,8 +5519,8 @@ impl VciServer for J2534Service {
         // first-use moment.
         events::init_module_clock();
         tracing::info!(
-            library = %startup_config.library_name,
-            mode = %startup_config.mode(),
+            library = %args.library_name,
+            mode = %args.mode(),
             "starting worker"
         );
         // The library name resolves through its registration definition on
@@ -5521,14 +5530,14 @@ impl VciServer for J2534Service {
         // definition, and the mode decides what a failed check means
         // (ADR-281 Decision item 2). The launcher checked the configuration
         // file before this (ADR-285).
-        let resolved = ngr_library_resolver::j2534_0404::resolve(&startup_config.library_name)
+        let resolved = ngr_library_resolver::j2534_0404::resolve(&args.library_name)
             .map_err(map_resolve_error)?;
-        let checked = crate::preload::check_library(&resolved, startup_config.mode())?;
+        let checked = crate::preload::check_library(&resolved, args.mode())?;
         // The per-library settings come from the configuration file only when
         // the launcher's check let it through: one created after the check
         // has passed none, so it configures nothing (ADR-285).
         let arch = vci_service_launcher::vci_server::current_arch();
-        let library_name = &startup_config.library_name;
+        let library_name = &args.library_name;
         let (can_channel_mode, modules, vendor_ioctls) = if config_file.settings_apply() {
             (
                 // Fail fast on an invalid `can_channel_mode` config value so a
@@ -5580,7 +5589,7 @@ impl VciServer for J2534Service {
 
         Ok(Self {
             api,
-            startup_config: Arc::new(startup_config),
+            startup_config: Arc::new(args),
             can_channel_mode,
             resolved_can_channel_mode: Arc::new(Mutex::new(None)),
             modules,

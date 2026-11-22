@@ -84,7 +84,9 @@ how a writing session works, and a diff cannot show whether they were followed.
 
 ## Do not flag
 
-- What `cargo fmt` and `cargo clippy` report.
+- What `cargo fmt` and `cargo clippy` report. Do flag the lint-override problems that
+  `.github/instructions/rust.instructions.md` lists (a missing or false reason, a lowered level,
+  a widened override), which Clippy does not judge.
 - PR numbers, review rounds and agent names in older ADRs, notes and code comments, including
   the worker crates' (provenance from earlier history). Do flag new text that adds such
   references.

@@ -133,6 +133,10 @@ async fn run(client: &WorkerClient, config: &LinkConfig) -> Result<VmState, JobE
 }
 
 #[test]
+#[expect(
+    unsafe_code,
+    reason = "`std::env::set_var`/`remove_var` are unsafe (edition 2024) and have no safe form (ADR-502)"
+)]
 fn the_worker_absorbs_response_pending_for_the_agent() {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

@@ -111,6 +111,12 @@ pub struct ReceivedJobs {
     inner: Arc<Inner>,
 }
 
+impl std::fmt::Debug for ReceivedJobs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReceivedJobs").finish_non_exhaustive()
+    }
+}
+
 struct Inner {
     /// The highest generation recorded per job ID; changed only after a record is synced, or by a
     /// reopen that read the file again.

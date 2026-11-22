@@ -28,6 +28,7 @@ use crate::report::{Masker, Outcome};
 pub const FRAME_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// The two ends of the loopback, in the order of the profile's endpoints.
+#[derive(Debug)]
 pub enum Ends<'a> {
     /// Two channels of one module: one handle with a link per endpoint.
     OneModule(&'a mut GuardedHandle),

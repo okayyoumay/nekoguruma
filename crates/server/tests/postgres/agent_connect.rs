@@ -397,6 +397,10 @@ impl Agent {
 
     /// Asks the agent to stop (SIGINT on Unix, a kill elsewhere) and waits for it to exit. The exit
     /// status is `None` where the stop is a kill.
+    #[allow(
+        unsafe_code,
+        reason = "libc FFI with no safe std equivalent: `kill` sends a signal (ADR-502)"
+    )]
     pub(crate) async fn stop(&mut self) -> Option<i32> {
         let child = self.child.as_mut().unwrap();
         #[cfg(unix)]
@@ -420,11 +424,7 @@ impl Agent {
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
         self.child = None;
-        if cfg!(unix) {
-            Some(status.code().expect("exited, not killed"))
-        } else {
-            None
-        }
+        cfg!(unix).then(|| status.code().expect("exited, not killed"))
     }
 
     /// Kills the process at once (SIGKILL on Unix) and waits for it, so that it sends and writes

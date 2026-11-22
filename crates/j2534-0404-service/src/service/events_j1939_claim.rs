@@ -2347,8 +2347,7 @@ mod tests {
     fn claim_indication_routes_to_live_cll() {
         let mut claims = HashMap::new();
         claims.insert(0x80u8, test_entry(42, 7));
-        let resolved =
-            resolve_j1939_claim_indication(0x80, &claims, |h| if h == 42 { Some(7) } else { None });
+        let resolved = resolve_j1939_claim_indication(0x80, &claims, |h| (h == 42).then_some(7));
         assert_eq!(resolved, Some(42));
     }
 
@@ -2359,8 +2358,7 @@ mod tests {
         // generation (8) -- a disconnect/reconnect landed since the claim
         // attempt was registered.
         claims.insert(0x80u8, test_entry(42, 7));
-        let resolved =
-            resolve_j1939_claim_indication(0x80, &claims, |h| if h == 42 { Some(8) } else { None });
+        let resolved = resolve_j1939_claim_indication(0x80, &claims, |h| (h == 42).then_some(8));
         assert_eq!(resolved, None);
     }
 

@@ -349,6 +349,10 @@ impl ObjectServer {
 
 /// Kills the process group of the child with ID `pid` (its group ID, since it leads its own
 /// group). The child is reaped already; a group with no member is not an error.
+#[allow(
+    unsafe_code,
+    reason = "libc FFI with no safe std equivalent: `kill` sends a signal (ADR-502)"
+)]
 fn kill_group(pid: Option<u32>) {
     #[cfg(unix)]
     if let Some(pid) = pid {
@@ -418,6 +422,10 @@ async fn stop_child(child: &mut Child, stop_timeout: Duration, force: impl Futur
 
 /// Asks the child to end: SIGTERM on Unix, termination on Windows (which has no signal a console-less
 /// child receives).
+#[allow(
+    unsafe_code,
+    reason = "libc FFI with no safe std equivalent: `kill` sends a signal (ADR-502)"
+)]
 fn terminate(child: &mut Child) {
     #[cfg(unix)]
     {
@@ -541,6 +549,10 @@ fn prepare_data_dir(dir: &Path) -> Result<(ProcessLock, PathBuf), ObjectServerEr
 /// holds what the object server reads (the address, the volume, the two credential file paths, the
 /// console switched off) and the minimum a process needs, and nothing of the
 /// server's own. The secret is not in it: only the paths of the credential files are.
+#[allow(
+    unsafe_code,
+    reason = "sets the child's parent-death signal with libc::prctl in a pre_exec hook (ADR-502)"
+)]
 fn command(
     binary: &Path,
     data_dir: &Path,
@@ -609,9 +621,11 @@ fn command(
                 #[cfg(target_os = "linux")]
                 let marked = {
                     const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
+                    // A variadic argument is not converted, so the type is spelled out.
+                    const FIRST_DESCRIPTOR: libc::c_uint = 3;
                     libc::syscall(
                         libc::SYS_close_range,
-                        3 as libc::c_uint,
+                        FIRST_DESCRIPTOR,
                         libc::c_uint::MAX,
                         CLOSE_RANGE_CLOEXEC,
                     ) == 0
@@ -643,6 +657,10 @@ fn command(
 /// How many descriptors a process may have open: the soft `RLIMIT_NOFILE`, at most 65 536 (the
 /// loop that uses it runs in the child and must stay short), and 4096 if it cannot be read.
 #[cfg(unix)]
+#[expect(
+    unsafe_code,
+    reason = "libc FFI with no safe std equivalent: `getrlimit` reads a resource limit (ADR-502)"
+)]
 fn descriptor_limit() -> libc::c_int {
     let mut limit = libc::rlimit {
         rlim_cur: 0,

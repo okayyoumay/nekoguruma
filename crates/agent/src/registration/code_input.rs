@@ -191,7 +191,7 @@ mod tests {
     fn a_file_that_cannot_be_read_names_only_the_io_kind() {
         let dir = tempfile::tempdir().unwrap();
         let secret_name = dir.path().join("secret-file-name");
-        for path in [secret_name.clone(), dir.path().to_owned()] {
+        for path in [secret_name, dir.path().to_owned()] {
             let error = read(&CodeSource::File(path)).unwrap_err();
             assert_eq!(error.exit_code(), 1);
             let text = error.to_string();

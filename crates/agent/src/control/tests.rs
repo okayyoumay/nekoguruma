@@ -73,9 +73,9 @@ const JOB_ID: &str = "0194f0a2-7c3e-7d11-8a52-3f6f9b1c2d4f";
 struct Log(Arc<Mutex<Vec<u8>>>);
 
 impl io::Write for Log {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(bytes);
-        Ok(bytes.len())
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {

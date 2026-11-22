@@ -186,6 +186,10 @@ async fn links_on_one_channel_share_their_filters() {
         .expect("the scenarios should finish in time");
 }
 
+#[expect(
+    unsafe_code,
+    reason = "`std::env::set_var`/`remove_var` are unsafe (edition 2024) and have no safe form (ADR-502)"
+)]
 async fn scenarios() {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

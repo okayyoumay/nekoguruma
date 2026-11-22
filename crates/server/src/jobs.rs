@@ -224,8 +224,8 @@ impl<'de> Deserialize<'de> for Raw {
         impl<'de> Visitor<'de> for RawVisitor {
             type Value = Raw;
 
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("a job request object")
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a job request object")
             }
 
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Raw, A::Error> {
@@ -604,6 +604,12 @@ impl Gates {
 /// The route's state: the pool, the key and the log gates of this router.
 #[derive(Clone)]
 pub struct Jobs(Arc<Inner>);
+
+impl std::fmt::Debug for Jobs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Jobs").finish_non_exhaustive()
+    }
+}
 
 struct Inner {
     pool: PgPool,

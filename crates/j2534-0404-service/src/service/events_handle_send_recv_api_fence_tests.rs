@@ -95,6 +95,10 @@ const HSRF_WORKING_BROADCAST_INTERVAL: u32 = 250;
 /// not this CLL's own `active`) is unambiguously observable.
 const HSRF_PRE_BRACKET_HARDWARE_BROADCAST_INTERVAL: u32 = 33;
 
+#[expect(
+    unsafe_code,
+    reason = "loads the mock library and looks up its `__mock_*` test-control symbol; libloading's `Library::new` and `get` are unsafe (ADR-502)"
+)]
 fn config_value(lib_path: &std::path::Path, channel_id: u32, param_id: u32) -> u32 {
     unsafe {
         let lib = j2534_0404_sys::libloading::Library::new(lib_path)
@@ -117,6 +121,10 @@ fn config_value(lib_path: &std::path::Path, channel_id: u32, param_id: u32) -> u
 
 /// Same shape as `events_revert_hardware_to_live_active_locked_tests.rs`'s
 /// own `set_config_param_log`.
+#[expect(
+    unsafe_code,
+    reason = "loads the mock library and looks up its `__mock_*` test-control symbol; libloading's `Library::new` and `get` are unsafe (ADR-502)"
+)]
 fn set_config_param_log(lib_path: &std::path::Path, channel_id: u32) -> Vec<u32> {
     unsafe {
         let lib = j2534_0404_sys::libloading::Library::new(lib_path)
@@ -150,6 +158,10 @@ fn set_config_param_log(lib_path: &std::path::Path, channel_id: u32) -> Vec<u32>
 /// re-implemented here via a fresh `Library` handle since this unit test
 /// lives outside the `grpc_mock` harness (same technique this file's sibling
 /// test modules already use for their own backdoor accessors).
+#[expect(
+    unsafe_code,
+    reason = "loads the mock library and looks up its `__mock_*` test-control symbol; libloading's `Library::new` and `get` are unsafe (ADR-502)"
+)]
 fn written_count(lib_path: &std::path::Path, channel_id: u32) -> usize {
     unsafe {
         let lib = j2534_0404_sys::libloading::Library::new(lib_path)

@@ -129,8 +129,8 @@ impl<'de> Deserialize<'de> for Raw {
         impl<'de> Visitor<'de> for RawVisitor {
             type Value = Raw;
 
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("a download request")
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a download request")
             }
 
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Raw, A::Error> {

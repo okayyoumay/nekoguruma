@@ -51,6 +51,10 @@ fn vci(module: &str, firmware: &str, library: &str) -> Vci {
 }
 
 /// Opens `vci` against the mock; `Ok` holds the device already closed, with how its worker ended.
+#[expect(
+    unsafe_code,
+    reason = "`std::env::set_var`/`remove_var` are unsafe (edition 2024) and have no safe form (ADR-502)"
+)]
 async fn open(vci: &Vci) -> Result<Stopped, OpenError> {
     let temp = tempfile::tempdir().expect("temporary directory");
     let root = temp.path();

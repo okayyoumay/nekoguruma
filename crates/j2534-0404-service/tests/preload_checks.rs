@@ -31,6 +31,10 @@ struct TestLibrary {
 }
 
 impl TestLibrary {
+    #[expect(
+        unsafe_code,
+        reason = "`std::env::set_var`/`remove_var` are unsafe (edition 2024) and have no safe form (ADR-502)"
+    )]
     fn new(config_toml: &str) -> Self {
         let dir = tempfile::tempdir().expect("create temp dir");
         let mock = j2534_0404_mock::mock_library_path()
@@ -97,8 +101,7 @@ async fn device_mode_refuses_a_library_that_fails_a_check() {
     make_writable_by_regular_users(&test_library.library);
     let error = start("device")
         .await
-        .err()
-        .expect("device mode should refuse the library");
+        .expect_err("device mode should refuse the library");
     let status = error
         .downcast_ref::<Status>()
         .expect("the refusal is a gRPC status");

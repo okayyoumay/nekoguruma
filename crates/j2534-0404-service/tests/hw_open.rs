@@ -63,6 +63,10 @@ struct Environment {
     abi: worker_host::abi::Abi,
 }
 
+#[expect(
+    unsafe_code,
+    reason = "`std::env::set_var`/`remove_var` are unsafe (edition 2024) and have no safe form (ADR-502)"
+)]
 fn environment(modules: &[(&str, &str)]) -> Environment {
     let temp = tempfile::tempdir().expect("temporary directory");
     let root = temp.path();

@@ -14,3 +14,6 @@ bindgen = { version = "0.73.2", optional = true }
 [features]
 bindgen = ["dep:bindgen"]
 
+
+[lints]
+workspace = true

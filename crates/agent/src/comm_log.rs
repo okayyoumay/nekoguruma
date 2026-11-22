@@ -2036,6 +2036,12 @@ pub(crate) struct AgentNow {
 #[derive(Clone)]
 pub struct CommLog(Arc<Mutex<Inner>>);
 
+impl std::fmt::Debug for CommLog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommLog").finish_non_exhaustive()
+    }
+}
+
 impl CommLog {
     /// Opens the log of `setup`'s job and generation for appending, creating it when missing
     /// (ADR-347). Takes the log's writer lock first: a log another run holds is
@@ -5634,7 +5640,7 @@ impl Inner {
                 seq: owner,
                 link: kept.evidence.link,
                 origin: kept.origin,
-                request: kept.request.clone(),
+                request: kept.request,
                 classification,
                 reason,
             })
@@ -7974,7 +7980,7 @@ pub(crate) mod tests {
             );
         }
         let sink = Recording::default();
-        let log = CommLog::over(Box::new(sink.clone()), CLEAN);
+        let log = CommLog::over(Box::new(sink), CLEAN);
         log.begin(&facts(), RunKind::Resume);
         log.end("ok");
         assert_eq!(log.status(), CommLogStatus::Complete);
@@ -8135,7 +8141,7 @@ pub(crate) mod tests {
         );
         // A first run starts a log cleanly.
         let sink = Recording::default();
-        let log = CommLog::over(Box::new(sink.clone()), b"");
+        let log = CommLog::over(Box::new(sink), b"");
         log.begin(&facts(), RunKind::First);
         log.end("ok");
         assert_eq!(log.status(), CommLogStatus::Complete);
@@ -18733,7 +18739,7 @@ pub(crate) mod tests {
         let kept = kept_of(&log, seq);
         let (from, in_window) = late_window(&kept, 0x7E8);
         assert_eq!((from, in_window.len()), (None, 1));
-        let mut unplaced = kept.clone();
+        let mut unplaced = kept;
         unplaced.pending_order = vec![usize::MAX];
         let (from, in_window) = late_window(&unplaced, 0x7E8);
         assert_eq!((from, in_window.len()), (None, 0));
@@ -19101,7 +19107,7 @@ pub(crate) mod tests {
         let lone = answer_on(0x7E8, exchange::End::Negative(vec![0x7F, 0x3E, 0x78]), 10);
         // The pending names no identifier, so it counts for the answer after it as well.
         let (windows, entry) = windows_of(
-            vec![lone.clone(), positive_on(0x7E9, 30)],
+            vec![lone, positive_on(0x7E9, 30)],
             vec![pending_on(10)],
             Vec::new(),
             &[0],

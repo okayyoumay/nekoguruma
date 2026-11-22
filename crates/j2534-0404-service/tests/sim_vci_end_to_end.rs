@@ -178,6 +178,10 @@ async fn service_reads_the_vin_from_sim_vci() {
         .expect("the end-to-end flow should finish in time");
 }
 
+#[expect(
+    unsafe_code,
+    reason = "`std::env::set_var`/`remove_var` are unsafe (edition 2024) and have no safe form (ADR-502)"
+)]
 async fn read_the_vin() {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

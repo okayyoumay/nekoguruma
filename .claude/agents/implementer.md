@@ -27,6 +27,14 @@ Working rules:
   wrapper -> `*-service` for the worker crates), naming, error types, and
   the design-document section citations (e.g. `// 7.3`) used nearby. Look at
   a neighbouring file in the same crate before inventing a pattern.
+- Follow `CLAUDE.md`'s "Rust code" rules (ADR-502). The ones agents break
+  most: no `.clone()` just to satisfy the borrow checker (restructure the
+  borrow first); no lint override without a reason, lowered lint level or
+  wider override to make a warning go away (`#[expect]` by default,
+  `#[allow]` only where the lint fires on some targets, cfgs or builds and
+  not others); no `unsafe` outside the item that needs it; tests that check
+  behaviour, not a copy of the implementation's constants or branches; doc
+  comments that describe the code, not how it was designed.
 - Share a step, never copy it (ADR-397). When the change needs a step that
   existing code already performs (a query, a check, a mapping of errors to
   answers, a token or retry holder, a test helper), extract that code into

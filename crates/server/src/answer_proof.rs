@@ -179,10 +179,6 @@ impl Prover {
     /// `response` with its proof, when the request asked for one: the body is collected (at most
     /// [`MAX_ANSWER_LEN`] bytes), signed and put back unchanged. With `None` the response is
     /// returned as it is. A failure answers as [`Unprovable`].
-    #[expect(
-        dead_code,
-        reason = "the data routes (next step) prove their answers through it"
-    )]
     pub(crate) async fn prove(
         &self,
         asked: Option<&Asked>,
@@ -359,5 +355,47 @@ mod tests {
         }
         let response = Unprovable.into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// A request whose transcript cannot be built after the shape step's checks is a defect; the
+    /// route answers an unproved 503 and never the promised status.
+    #[tokio::test]
+    async fn a_transcript_that_cannot_be_built_is_an_unproved_503() {
+        let key = SigningKey::generate().unwrap();
+        let prover = Prover::new(Arc::new(InstructionKey::from_signer(Arc::new(key))), 8080);
+        let agent = AgentId("3f1c2a52-6a0e-4c0d-9d3e-0a1b2c3d4e5f".to_owned());
+        // Built by hand, as `Asked::from_header` never would: a target without its leading slash.
+        let asked = Asked {
+            nonce: fresh(),
+            method: "GET".to_owned(),
+            target: "no-slash".to_owned(),
+        };
+        let answered = (StatusCode::OK, "promised").into_response();
+        let response = prover.prove(Some(&asked), &agent, [0; 32], answered).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.headers().get(PROOF_HEADER).is_none());
+        let body = axum::body::to_bytes(response.into_body(), MAX_ANSWER_LEN)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("The answer could not be proved"), "{text}");
+        assert!(!text.contains("promised"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_request_without_an_ask_is_answered_as_it_is() {
+        let key = SigningKey::generate().unwrap();
+        let prover = Prover::new(Arc::new(InstructionKey::from_signer(Arc::new(key))), 8080);
+        let agent = AgentId("3f1c2a52-6a0e-4c0d-9d3e-0a1b2c3d4e5f".to_owned());
+        let response = prover
+            .prove(
+                None,
+                &agent,
+                [0; 32],
+                (StatusCode::CREATED, "kept").into_response(),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert!(response.headers().get(PROOF_HEADER).is_none());
     }
 }

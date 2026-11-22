@@ -363,13 +363,18 @@ impl Up {
     /// Like [`Up::new`], with a signer that fails once the returned flag is set (ADR-504): the
     /// agent is registered while it still signs.
     pub(crate) async fn flaky() -> (Up, Arc<AtomicBool>) {
+        Up::flaky_with(Default::default()).await
+    }
+
+    /// Like [`Up::flaky`], with the data channel's object store and part size.
+    pub(crate) async fn flaky_with(backend: server::uploads::Backend) -> (Up, Arc<AtomicBool>) {
         let fail = Arc::new(AtomicBool::new(false));
         let key = Arc::new(server::InstructionKey::from_signer(Arc::new(Flaky {
             key: SigningKey::generate().unwrap(),
             fail: fail.clone(),
         })));
         let w = World::with_key(key).await;
-        let up = Up::with_world(w, 2, None, None, Default::default()).await;
+        let up = Up::with_world(w, 2, None, None, backend).await;
         (up, fail)
     }
 

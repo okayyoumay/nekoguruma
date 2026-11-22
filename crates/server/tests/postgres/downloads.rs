@@ -17,11 +17,12 @@ use server::storage::{GET_URL_EXPIRY, MultipartStore, ObjectKey};
 use server::uploads::PART_BYTES;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::control::token;
+use crate::control::{nonce_line, token};
 use crate::redeem::{Agent, bytes_of, capture, json};
 use crate::serving::Reply;
 use crate::storage::{content, put, sha256};
-use crate::uploads::{Fail, Fx, With, hex, problem, v4};
+use crate::support::assert_unproved;
+use crate::uploads::{Call, Fail, Fx, With, bad_nonce_lines, hex, problem, v4};
 
 const PATH: &str = "/api/v1/agent/downloads";
 
@@ -36,6 +37,17 @@ async fn ask_as(fx: &Fx, token: Option<&str>, body: &str) -> Reply {
 
 async fn ask(fx: &Fx, body: &str) -> Reply {
     ask_as(fx, Some(&fx.token), body).await
+}
+
+/// The request of a download with `body`, as the agent writes it.
+fn download(body: &str) -> Call {
+    Call {
+        name: "download",
+        method: "POST",
+        target: PATH.to_owned(),
+        content_type: Some("application/json"),
+        body: body.to_owned(),
+    }
 }
 
 /// The objects the fixture's job names, with a row in both tables for every digest that matters,
@@ -332,6 +344,10 @@ async fn an_unreadable_agent_row_is_503_or_500() {
     let n = named(&fx, 1).await;
     fx.u.w.pg.stop();
     problem(&ask(&fx, &n.doc(1)).await, 503, "database down");
+    // A request that asks for a proof is refused the same way, unproved (ADR-504).
+    let (_, r) = fx.nonced(&download(&n.doc(1)), &[]).await;
+    problem(&r, 503, "database down, nonce");
+    assert_unproved(&r, "database down");
     fx.finish().await;
     let fx = Fx::new(With::Fake).await;
     let n = named(&fx, 1).await;
@@ -340,6 +356,9 @@ async fn an_unreadable_agent_row_is_503_or_500() {
         .execute("ALTER TABLE agents RENAME COLUMN revoked_at TO revoked_x")
         .await;
     problem(&ask(&fx, &n.doc(1)).await, 503, "statement fails");
+    let (_, r) = fx.nonced(&download(&n.doc(1)), &[]).await;
+    problem(&r, 503, "statement fails, nonce");
+    assert_unproved(&r, "statement fails");
     fx.finish().await;
 }
 
@@ -523,6 +542,10 @@ async fn a_failing_job_or_object_read_is_503_or_500() {
     let n = named(&fx, 1).await;
     fx.u.w.pg.stop();
     problem(&ask(&fx, &n.doc(1)).await, 503, "database down");
+    // A request that asks for a proof is refused the same way, unproved (ADR-504).
+    let (_, r) = fx.nonced(&download(&n.doc(1)), &[]).await;
+    problem(&r, 503, "database down, nonce");
+    assert_unproved(&r, "database down");
     fx.finish().await;
 }
 
@@ -983,5 +1006,217 @@ async fn the_download_gates_suppress_a_repeat_and_keep_the_reasons_apart() {
         .await;
     problem(&ask(&fx, &n.art(1)).await, 500, "decode fails");
     assert_eq!(count("download route: a statement failed"), 1);
+    fx.finish().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The answer proof (ADR-504)
+
+#[tokio::test]
+async fn a_download_answer_without_a_nonce_carries_no_proof() {
+    let fx = Fx::new(With::Fake).await;
+    let n = named(&fx, 1).await;
+    for (what, text, status) in [
+        ("no such job", body(&v4(), 1, "document", &n.document), 404),
+        ("the store has no URL", n.doc(1), 503),
+    ] {
+        let r = ask(&fx, &text).await;
+        assert_eq!(r.status, status, "{what}: {}", r.head);
+        assert_unproved(&r, what);
+    }
+    fx.finish().await;
+}
+
+/// Nothing refused before the token and the agent's row is proved: the body, the shape, the guard,
+/// the method and the token.
+#[tokio::test]
+async fn no_download_answer_before_the_token_carries_a_proof() {
+    let fx = Fx::new(With::Fake).await;
+    let n = named(&fx, 1).await;
+    let line = [nonce_line(&shared_crypto::random_32().unwrap())];
+    let good = n.doc(1);
+    let big = format!("{good}{}", " ".repeat(4096));
+    for (what, text, status) in [("shape", "{}".to_owned(), 400), ("size", big, 413)] {
+        for token in [None, Some(fx.token.as_str())] {
+            let r = fx
+                .send_with("POST", PATH, token, Some("application/json"), &line, &text)
+                .await;
+            assert_eq!(r.status, status, "{what}: {}", r.head);
+            assert_unproved(&r, what);
+        }
+    }
+    let call = download(&good);
+    for token in [None, Some("x")] {
+        let r = fx.call(&call, token, &line).await;
+        problem(&r, 401, "token");
+        assert_unproved(&r, "token");
+    }
+    let r = fx
+        .send_with("GET", PATH, Some(&fx.token), None, &line, "")
+        .await;
+    assert_eq!(r.status, 405, "{}", r.head);
+    assert_unproved(&r, "method");
+    let host = format!(
+        "POST {PATH} HTTP/1.1\r\nHost: example.invalid\r\n{}\r\nConnection: close\r\n\
+         Content-Length: 0\r\n\r\n",
+        line[0]
+    );
+    let r = crate::serving::exchange(fx.u.s.addr, &host).await;
+    assert_eq!(r.status, 421, "{}", r.head);
+    assert_unproved(&r, "guard");
+    // The body that does not arrive.
+    let slow = format!(
+        "POST {PATH} HTTP/1.1\r\n{}\r\n{}\r\nContent-Type: application/json\r\n\
+         Content-Length: 10\r\n\r\n",
+        fx.u.s.host(),
+        line[0]
+    );
+    let r = crate::serving::exchange(fx.u.s.addr, &slow).await;
+    problem(&r, 408, "no body");
+    assert_unproved(&r, "no body");
+    // The agent's row: revoked.
+    set_agent_revoked(&fx, true).await;
+    let r = fx.call(&call, Some(&fx.token), &line).await;
+    problem(&r, 401, "revoked");
+    assert_unproved(&r, "revoked");
+    fx.finish().await;
+}
+
+#[tokio::test]
+async fn a_download_nonce_or_target_the_proof_cannot_take_is_400_before_the_token() {
+    let fx = Fx::new(With::Fake).await;
+    let n = named(&fx, 1).await;
+    let call = download(&n.doc(1));
+    for (name, lines) in bad_nonce_lines() {
+        for token in [None, Some(fx.token.as_str())] {
+            let r = fx.call(&call, token, &lines).await;
+            problem(&r, 400, name);
+            assert!(r.body.contains("Invalid Ngr-Nonce header"), "{}", r.body);
+            assert_unproved(&r, name);
+        }
+    }
+    // The route's own shape error and length come first.
+    let (_, lines) = bad_nonce_lines().swap_remove(0);
+    let r = fx
+        .send_with("POST", PATH, None, Some("application/json"), &lines, "{}")
+        .await;
+    problem(&r, 400, "shape");
+    assert!(r.body.contains("not the expected JSON"), "{}", r.body);
+    // A target the transcript cannot take: too long, or a byte over 0x7F in the query. The
+    // parser may refuse the second before the route does; both are a 400.
+    let line = [nonce_line(&shared_crypto::random_32().unwrap())];
+    for suffix in [format!("?q={}", "a".repeat(2100)), "?q=\u{e9}".to_owned()] {
+        let bad = Call {
+            target: format!("{PATH}{suffix}"),
+            ..download(&n.doc(1))
+        };
+        for token in [None, Some(fx.token.as_str())] {
+            let r = fx.call(&bad, token, &line).await;
+            assert_eq!(r.status, 400, "{}", r.head);
+            assert_unproved(&r, "target");
+        }
+        // Without a nonce the same request is judged as before: the token, then the answer.
+        assert_eq!(fx.call(&bad, None, &[]).await.status, 401);
+        assert_eq!(fx.call(&bad, Some(&fx.token), &[]).await.status, 503);
+    }
+    fx.finish().await;
+}
+
+#[tokio::test]
+async fn a_download_answer_is_proved_and_binds_the_target_as_sent() {
+    let fx = Fx::new(With::Real).await;
+    let n = named(&fx, 1).await;
+    let key = seed(&fx, b"downloaded bytes").await;
+    sqlx::query("UPDATE ir_documents SET storage_key = $1 WHERE digest = $2")
+        .bind(key.as_str())
+        .bind(&n.document)
+        .execute(&fx.u.w.pool)
+        .await
+        .unwrap();
+    let call = download(&n.doc(1));
+    // Without a nonce the same answer carries no proof.
+    let plain = fx.call(&call, Some(&fx.token), &[]).await;
+    assert_eq!(plain.status, 200, "{}", plain.head);
+    assert_unproved(&plain, "no nonce");
+    let r = fx.proved(&call, 200).await;
+    assert_eq!(r.header("cache-control"), Some("no-store"));
+    assert!(json(&r)["url"].is_string());
+    // The target is the bytes the agent sent, query included.
+    let queried = Call {
+        target: format!("{PATH}?a=1"),
+        ..download(&n.doc(1))
+    };
+    let (nonce, r) = fx.nonced(&queried, &[]).await;
+    fx.assert_proved_for(nonce, "POST", &queried.target, &queried.body, 200, &r);
+    let wrong = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        fx.assert_proved_for(nonce, "POST", PATH, &queried.body, 200, &r);
+    }));
+    assert!(wrong.is_err(), "the proof ignores the query");
+    fx.finish().await;
+}
+
+/// Every answer after the token and the row are judged is proved, whatever its status.
+#[tokio::test]
+async fn every_download_answer_after_the_token_and_row_is_proved() {
+    let fx = Fx::new(With::Fake).await;
+    let n = named(&fx, 1).await;
+    fx.proved(&download(&body(&v4(), 1, "document", &n.document)), 404)
+        .await;
+    fx.proved(&download(&n.doc(2)), 404).await;
+    fx.proved(&download(&body(&n.job, 1, "document", &hex(&[9; 32]))), 404)
+        .await;
+    // Named by the instruction, with no row.
+    let unrowed = fx.job_naming(&fx.u.id, 1, vec![[7; 32]], None, None).await;
+    fx.proved(
+        &download(&body(&unrowed, 1, "document", &hex(&[7; 32]))),
+        404,
+    )
+    .await;
+    // An instruction that does not decode.
+    let garbage = v4();
+    fx.insert_job(&garbage, &fx.u.id, b"not an envelope").await;
+    fx.proved(&download(&body(&garbage, 1, "document", &n.document)), 500)
+        .await;
+    // The store fails.
+    fx.proved(&download(&n.doc(1)), 503).await;
+    *fx.wrap.presign_fail.lock().unwrap() = Some(Fail::Random);
+    fx.proved(&download(&n.art(1)), 500).await;
+    fx.finish().await;
+
+    // A stored key that does not parse, and no object store.
+    let fx = Fx::new(With::Nothing).await;
+    let n = named(&fx, 1).await;
+    fx.proved(&download(&n.doc(1)), 503).await;
+    sqlx::query("UPDATE ir_documents SET storage_key = repeat('x', 36) WHERE digest = $1")
+        .bind(&n.document)
+        .execute(&fx.u.w.pool)
+        .await
+        .unwrap();
+    fx.proved(&download(&n.doc(1)), 500).await;
+    fx.finish().await;
+}
+
+#[tokio::test]
+async fn a_download_signing_failure_is_an_unproved_503() {
+    let (log, _guard) = capture();
+    let (fx, fail) = Fx::flaky(With::Fake).await;
+    let n = named(&fx, 1).await;
+    let call = download(&n.doc(1));
+    fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    let (_, r) = fx.nonced(&call, &[]).await;
+    problem(&r, 503, "signing fails");
+    assert!(
+        r.body.contains("The answer could not be proved"),
+        "{}",
+        r.body
+    );
+    assert_unproved(&r, "signing fails");
+    // Without a nonce nothing is signed, so the failing signer changes nothing.
+    assert_eq!(fx.call(&call, Some(&fx.token), &[]).await.status, 503);
+    fail.store(false, std::sync::atomic::Ordering::SeqCst);
+    fx.proved(&call, 503).await;
+    let text = log.text();
+    assert!(text.contains("could not be proved"), "{text}");
+    assert!(!text.contains(PATH), "the log names the target: {text}");
     fx.finish().await;
 }

@@ -594,3 +594,80 @@ pub(crate) fn pin_dispatchers() {
     static PIN: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
     PIN.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
 }
+
+// ---------------------------------------------------------------------------------------------
+// The server's answer proof (ADR-504)
+
+/// What the agent knows of a request it made, from which it builds the transcript of the answer
+/// it expects and checks `Ngr-Server-Proof` the way the agent does (design 14.4).
+pub struct Answered<'a> {
+    /// The server's instruction key, as the agent holds it from registration.
+    pub public: &'a shared_crypto::PublicKey,
+    /// The audience the agent pinned.
+    pub audience: &'a shared_crypto::proof::Audience,
+    pub agent_id: &'a str,
+    pub nonce: [u8; 32],
+    pub method: &'a str,
+    /// The request target as the agent sent it.
+    pub target: &'a str,
+    /// The request body as sent; empty for a GET and an upgrade.
+    pub request_body: &'a [u8],
+}
+
+impl Answered<'_> {
+    /// Asserts that the answer carries exactly one `Ngr-Server-Proof` that verifies for `status`
+    /// and `answer_body`, and that the answer has no content coding (the digests are over the
+    /// bytes as sent).
+    pub fn verify_parts(&self, status: u16, headers: &[(&str, &str)], answer_body: &[u8]) {
+        use base64::Engine;
+        use shared_crypto::answer::{AnswerTranscript, body_digest, verify};
+        let has = |name: &str| {
+            headers
+                .iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| *v)
+                .collect::<Vec<_>>()
+        };
+        assert!(has("content-encoding").is_empty(), "a content coding");
+        let proofs = has(shared_proto::PROOF_HEADER);
+        assert_eq!(proofs.len(), 1, "one Ngr-Server-Proof header");
+        let signature = base64::engine::general_purpose::STANDARD
+            .decode(proofs[0])
+            .expect("the proof is base64");
+        let signature = shared_crypto::Signature::from_bytes(&signature).expect("64 bytes");
+        let transcript = AnswerTranscript::new(
+            self.audience,
+            self.agent_id,
+            self.nonce,
+            self.method,
+            self.target,
+            body_digest(self.request_body),
+            status,
+            body_digest(answer_body),
+        )
+        .unwrap();
+        verify(self.public, &transcript, &signature).expect("the proof verifies");
+    }
+
+    /// [`Answered::verify_parts`] for a reply read off a socket.
+    pub fn verify(&self, status: u16, reply: &crate::serving::Reply) {
+        assert_eq!(reply.status, status, "{}", reply.head);
+        let headers: Vec<(&str, &str)> = reply
+            .head
+            .lines()
+            .skip(1)
+            .filter_map(|l| l.split_once(':'))
+            .map(|(k, v)| (k, v.trim()))
+            .collect();
+        self.verify_parts(status, &headers, reply.body.as_bytes());
+    }
+}
+
+/// Asserts that a reply carries no answer proof.
+pub fn assert_unproved(reply: &crate::serving::Reply, what: &str) {
+    assert!(
+        reply.header(shared_proto::PROOF_HEADER).is_none(),
+        "{what}: an unproved answer carries a proof: {}",
+        reply.head
+    );
+}

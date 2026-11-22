@@ -3,7 +3,9 @@
 //!
 //! The route is judged in this order, and the first step that applies answers: the request guard
 //! (before routing), the method (405), the bearer token (401 with `WWW-Authenticate: Bearer`),
-//! the WebSocket request (400), the subprotocol (400), then the upgrade (101). Every refusal is
+//! the WebSocket request (400), the subprotocol (400), then, when the request carries an
+//! `Ngr-Nonce`, the nonce (400) and the target (400) and the proof (503 if it cannot be made),
+//! then the upgrade (101, with the proof; ADR-504). Every refusal is
 //! the server's problem document. The token is judged here and nowhere else: it is not consumed
 //! by the upgrade, not bound to the connection and not looked at again.
 //!
@@ -20,19 +22,21 @@ use std::time::Duration;
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{FromRequestParts, Request, State};
-use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use shared_crypto::answer::body_digest;
 use shared_proto::{
     AgentId, AgentMessage, CLOSE_CODE_BINARY, CLOSE_CODE_GOING_AWAY, CLOSE_CODE_IDLE,
     CLOSE_CODE_PROTOCOL, CLOSE_CODE_REVOKED, CLOSE_CODE_TOO_BIG, CONTROL_SUBPROTOCOL, ControlError,
-    DEFAULT_HEARTBEAT_SECS, HEARTBEAT_MISSED_LIMIT, MAX_CONTROL_MESSAGE_LEN, ServerMessage,
-    close_reason,
+    DEFAULT_HEARTBEAT_SECS, HEARTBEAT_MISSED_LIMIT, MAX_CONTROL_MESSAGE_LEN, PROOF_HEADER,
+    ServerMessage, close_reason,
 };
 use sqlx::PgPool;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{oneshot, watch};
 use tokio::time::Instant;
 
+use crate::answer_proof::{Asked, Prover};
 use crate::health::may_log;
 use crate::hub::{ConnectionId, Hub, Inbound, Registration, Stopping};
 use crate::problem::Problem;
@@ -79,11 +83,13 @@ pub struct Control {
     hub: Hub,
     gate: Arc<Gate>,
     gates: Arc<Gates>,
+    prover: Arc<Prover>,
 }
 
 impl Control {
-    pub fn new(pool: PgPool, sessions: Sessions, hub: Hub) -> Control {
+    pub(crate) fn new(pool: PgPool, sessions: Sessions, hub: Hub, prover: Arc<Prover>) -> Control {
         Control {
+            prover,
             pool,
             sessions,
             hub,
@@ -152,16 +158,50 @@ pub async fn upgrade(State(control): State<Control>, request: Request) -> Respon
         )
         .into_response();
     }
+    // A request that carries a nonce is answered with a proof on the 101 (ADR-504 item 4): the
+    // nonce and the target are judged after the subprotocol, and the proof is signed before the
+    // upgrade, so a proof that cannot be made is a 503 and no connection exists. The request
+    // body is not read and counts as absent; the 101 has none.
+    let asked = match Asked::from_header(&parts) {
+        Ok(asked) => asked,
+        Err(error) => return error.into_response(),
+    };
+    let proof = match &asked {
+        Some(asked) => {
+            match control
+                .prover
+                .header(
+                    asked,
+                    &agent,
+                    body_digest(&[]),
+                    StatusCode::SWITCHING_PROTOCOLS.as_u16(),
+                    &[],
+                )
+                .await
+            {
+                Ok(proof) => Some(proof),
+                Err(unprovable) => return unprovable.into_response(),
+            }
+        }
+        None => None,
+    };
     let hub = control.hub.clone();
     // Both limits equal the message limit: the stack refuses an oversized frame on its header,
     // before it reads the payload.
-    ws.max_message_size(MAX_CONTROL_MESSAGE_LEN)
+    let mut response = ws
+        .max_message_size(MAX_CONTROL_MESSAGE_LEN)
         .max_frame_size(MAX_CONTROL_MESSAGE_LEN)
         .on_failed_upgrade(|error| tracing::debug!(%error, "control channel upgrade failed"))
         .on_upgrade(move |socket| async move {
             // axum runs this callback on a task it detaches; the session runs on the hub's.
             hub.adopt(session(control, agent, socket));
-        })
+        });
+    if let Some(proof) = proof {
+        response
+            .headers_mut()
+            .insert(HeaderName::from_static(PROOF_HEADER), proof);
+    }
+    response
 }
 
 // ---------------------------------------------------------------------------------------------

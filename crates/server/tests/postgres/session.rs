@@ -3,6 +3,8 @@
 //! rest run against a throwaway PostgreSQL. Keys, challenges and nonces are made at run time, and
 //! no assertion message prints a secret: values are named by index.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use base64::Engine;
@@ -13,10 +15,11 @@ use server::local_guard::pinned_origin;
 use server::{Hub, Server, Sessions};
 use shared_crypto::proof::{Audience, ProofTranscript, sign_proof};
 use shared_crypto::{SigningKey, random_32};
-use shared_proto::AgentId;
+use shared_proto::{AgentId, NONCE_HEADER};
 
-use crate::redeem::{Agent, World, bytes_of, capture, dead, high_s, instruction_key, json};
+use crate::redeem::{Agent, Flaky, World, bytes_of, capture, dead, high_s, instruction_key, json};
 use crate::serving::{Reply, Running, exchange};
+use crate::support::{Answered, assert_unproved};
 
 const CHALLENGE: &str = "/api/v1/agent/challenge";
 const SESSION: &str = "/api/v1/agent/session";
@@ -25,7 +28,21 @@ const SESSION: &str = "/api/v1/agent/session";
 // Requests
 
 fn post(host: &str, path: &str, content_type: Option<&str>, body: &str) -> String {
+    post_with(host, path, content_type, &[], body)
+}
+
+/// [`post`] with more header lines.
+fn post_with(
+    host: &str,
+    path: &str,
+    content_type: Option<&str>,
+    headers: &[String],
+    body: &str,
+) -> String {
     let mut raw = format!("POST {path} HTTP/1.1\r\n{host}\r\nConnection: close\r\n");
+    for header in headers {
+        raw.push_str(&format!("{header}\r\n"));
+    }
     if let Some(content_type) = content_type {
         raw.push_str(&format!("Content-Type: {content_type}\r\n"));
     }
@@ -236,6 +253,21 @@ async fn each_session_shape_rule_is_a_400_and_consumes_no_challenge() {
     );
     assert_problem(&exchange(s.addr, &big).await, 413, "4097 bytes");
 
+    // S4: a body that is not the expected shape and a target that cannot be proved: the shape's
+    // own 400 answers, not the target's.
+    let bad_target = format!("{SESSION}?{}", "a".repeat(2100));
+    let r = exchange(
+        s.addr,
+        &post(&s.host(), &bad_target, Some("application/json"), "nope"),
+    )
+    .await;
+    assert_problem(&r, 400, "shape error and bad target");
+    assert!(
+        r.body.contains("The body is not the expected JSON object"),
+        "{}",
+        r.body
+    );
+
     // The challenge in those bodies is still live (503: it reached the dead database), and is
     // consumed by that presentation (a second one is 401).
     assert_problem(
@@ -333,7 +365,29 @@ impl Up {
         expiry: Option<server::job_expiry::Settings>,
         backend: server::uploads::Backend,
     ) -> Up {
-        let w = World::new().await;
+        Up::with_world(World::new().await, grace_secs, queue, expiry, backend).await
+    }
+
+    /// Like [`Up::new`], with a signer that fails once the returned flag is set (ADR-504): the
+    /// agent is registered while it still signs.
+    pub(crate) async fn flaky() -> (Up, Arc<AtomicBool>) {
+        let fail = Arc::new(AtomicBool::new(false));
+        let key = Arc::new(server::InstructionKey::from_signer(Arc::new(Flaky {
+            key: SigningKey::generate().unwrap(),
+            fail: fail.clone(),
+        })));
+        let w = World::with_key(key).await;
+        let up = Up::with_world(w, 2, None, None, Default::default()).await;
+        (up, fail)
+    }
+
+    async fn with_world(
+        w: World,
+        grace_secs: u64,
+        queue: Option<Settings>,
+        expiry: Option<server::job_expiry::Settings>,
+        backend: server::uploads::Backend,
+    ) -> Up {
         w.add_operator("alice").await;
         let agent = Agent::new();
         let id = w.register(&agent).await;
@@ -730,4 +784,213 @@ async fn one_valid_request_sent_twice_at_once_gets_one_token() {
         assert_eq!(statuses, [200, 401], "round {round}");
     }
     u.finish().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The answer proof (ADR-504)
+
+/// A session request body for a fresh challenge, and the nonce in it.
+async fn fresh_body(u: &Up) -> (String, [u8; 32]) {
+    let c = u.challenge_and_nonce().await;
+    let p = proof(&u.agent.key, &u.audience(), &u.id, c.0, c.1);
+    (session_body(&u.id, &c.0, &c.1, &p), c.1)
+}
+
+/// Checks that `r` is the proved 200 of the session request `body` made with `nonce`.
+fn assert_proved_session(u: &Up, nonce: [u8; 32], target: &str, body: &str, r: &Reply) {
+    let public = u.w.key.public_key();
+    let audience = u.audience();
+    Answered {
+        public: &public,
+        audience: &audience,
+        agent_id: &u.id,
+        nonce,
+        method: "POST",
+        target,
+        request_body: body.as_bytes(),
+    }
+    .verify(200, r);
+}
+
+#[tokio::test]
+async fn a_session_200_is_proved_with_the_bodys_nonce() {
+    let u = Up::new().await;
+    let (body, nonce) = fresh_body(&u).await;
+    let r = send_session(&u.s, &body).await;
+    assert_proved_session(&u, nonce, SESSION, &body, &r);
+    assert_eq!(r.header("cache-control"), Some("no-store"));
+    assert_eq!(r.header("content-type"), Some("application/json"));
+    // The token in the proved body is the one the table holds.
+    let token = json(&r)["token"].as_str().unwrap().to_owned();
+    assert_eq!(u.sessions.authenticate(&token), Some(AgentId(u.id.clone())));
+
+    // The proof is bound to the request: another nonce, target or status does not verify it.
+    let public = u.w.key.public_key();
+    let audience = u.audience();
+    let other = Answered {
+        public: &public,
+        audience: &audience,
+        agent_id: &u.id,
+        nonce: random_32().unwrap(),
+        method: "POST",
+        target: SESSION,
+        request_body: body.as_bytes(),
+    };
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| other.verify(200, &r))).is_err()
+    );
+    u.finish().await;
+}
+
+#[tokio::test]
+async fn the_session_route_reads_no_nonce_header() {
+    let u = Up::new().await;
+    let other = STANDARD.encode(random_32().unwrap());
+    let header = |value: &str| format!("{NONCE_HEADER}: {value}");
+    let cases: Vec<(&str, Vec<String>)> = vec![
+        ("another valid nonce", vec![header(&other)]),
+        ("a malformed nonce", vec![header("not base64")]),
+        ("two values", vec![header(&other), header(&other)]),
+    ];
+    for (name, headers) in cases {
+        let (body, nonce) = fresh_body(&u).await;
+        let raw = post_with(
+            &u.s.host(),
+            SESSION,
+            Some("application/json"),
+            &headers,
+            &body,
+        );
+        let r = exchange(u.s.addr, &raw).await;
+        assert_eq!(r.status, 200, "{name}: {}", r.head);
+        assert_proved_session(&u, nonce, SESSION, &body, &r);
+    }
+    u.finish().await;
+}
+
+#[tokio::test]
+async fn a_session_target_that_cannot_be_proved_is_400_and_takes_no_challenge() {
+    let u = Up::new().await;
+    let (body, nonce) = fresh_body(&u).await;
+    let long = format!("{SESSION}?{}", "a".repeat(2100));
+    // A raw byte outside ASCII in the query: the parser may refuse it before the route does,
+    // which is a 400 too.
+    let raw_byte = format!("{SESSION}?\u{e9}");
+    for (name, target) in [("over-long", long), ("non-ASCII", raw_byte)] {
+        let raw = post(&u.s.host(), &target, Some("application/json"), &body);
+        let r = exchange(u.s.addr, &raw).await;
+        assert_problem(&r, 400, name);
+        assert_unproved(&r, name);
+    }
+    // The same challenge, presented at a target that can be proved, still succeeds.
+    let r = send_session(&u.s, &body).await;
+    assert_proved_session(&u, nonce, SESSION, &body, &r);
+    u.finish().await;
+}
+
+#[tokio::test]
+async fn no_session_refusal_carries_a_proof() {
+    let u = Up::new().await;
+    let host = u.s.host();
+    let mut replies: Vec<(&str, Reply)> = Vec::new();
+
+    // 400: a shape error.
+    replies.push(("400", send_session(&u.s, "nope").await));
+    // 401: a challenge the store does not hold.
+    replies.push((
+        "401",
+        send_session(&u.s, &shaped_body(&random_32().unwrap())).await,
+    ));
+    // 403: a proof by another key.
+    replies.push(("403", u.refused().await));
+    // 405 and 413.
+    let get = format!(
+        "GET {SESSION} HTTP/1.1\r\n{host}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+    );
+    replies.push(("405", exchange(u.s.addr, &get).await));
+    let big = post(&host, SESSION, Some("application/json"), &"x".repeat(4097));
+    replies.push(("413", exchange(u.s.addr, &big).await));
+    // The request guard.
+    let foreign = format!("{host}\r\nOrigin: http://evil.example");
+    let raw = post(&foreign, SESSION, Some("application/json"), "nope");
+    replies.push(("guard 403", exchange(u.s.addr, &raw).await));
+    // 408: a body that stalls.
+    let stalled = format!(
+        "POST {SESSION} HTTP/1.1\r\n{host}\r\nContent-Type: application/json\r\nContent-Length: 10\r\n\r\n"
+    );
+    replies.push(("408", exchange(u.s.addr, &stalled).await));
+    // 500: a stored key that does not decode.
+    let broken = Agent::new();
+    let broken_id = u.w.register(&broken).await;
+    sqlx::query("UPDATE agents SET public_key = '\\x01' WHERE id = $1::uuid")
+        .bind(&broken_id)
+        .execute(&u.w.pool)
+        .await
+        .unwrap();
+    replies.push(("500", u.exchange_as(&broken.key, &broken_id).await));
+    // 503: a table that stays locked past the lock timeout.
+    let mut tx = u.w.pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE agents IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    replies.push(("503", u.valid().await));
+    drop(tx);
+    // 429: past ten refusals within a minute (9 so far counted: 403 above is the first).
+    for _ in 0..9 {
+        u.refused().await;
+    }
+    replies.push(("429", u.refused().await));
+
+    let wanted = [400, 401, 403, 405, 413, 403, 408, 500, 503, 429];
+    for ((name, r), status) in replies.iter().zip(wanted) {
+        assert_eq!(r.status, status, "{name}: {}", r.head);
+        assert_unproved(r, name);
+    }
+    u.finish().await;
+}
+
+#[tokio::test]
+async fn a_signing_failure_at_the_session_route_leaves_no_token() {
+    let (logs, _guard) = capture();
+    let (u, fail) = Up::flaky().await;
+    let (body, nonce) = fresh_body(&u).await;
+    fail.store(true, Ordering::SeqCst);
+    let r = send_session(&u.s, &body).await;
+    assert_problem(&r, 503, "the signer fails");
+    assert_unproved(&r, "the signer fails");
+    assert!(!r.body.contains("token"), "{}", r.body);
+    assert_eq!(format!("{:?}", u.sessions), "Sessions { count: 0 }");
+    // The challenge is consumed.
+    assert_problem(&send_session(&u.s, &body).await, 401, "the same challenge");
+    // The failure is logged once, with neither the target nor a nonce.
+    let text = logs.text();
+    assert_eq!(
+        text.lines()
+            .filter(|l| l.contains("an answer could not be proved"))
+            .count(),
+        1,
+        "{text}"
+    );
+    assert!(!text.contains(&STANDARD.encode(nonce)));
+
+    // The next exchange succeeds once the signer does.
+    fail.store(false, Ordering::SeqCst);
+    let (body, nonce) = fresh_body(&u).await;
+    let r = send_session(&u.s, &body).await;
+    assert_proved_session(&u, nonce, SESSION, &body, &r);
+    assert_eq!(format!("{:?}", u.sessions), "Sessions { count: 1 }");
+    u.finish().await;
+}
+
+#[tokio::test]
+async fn the_challenge_answer_is_never_proved() {
+    let s = dead(instruction_key()).await;
+    let nonce = STANDARD.encode(random_32().unwrap());
+    let headers = [format!("{NONCE_HEADER}: {nonce}")];
+    let raw = post_with(&s.host(), CHALLENGE, None, &headers, "");
+    let r = exchange(s.addr, &raw).await;
+    assert_eq!(r.status, 200, "{}", r.head);
+    assert_unproved(&r, "the challenge");
+    s.finish().await;
 }

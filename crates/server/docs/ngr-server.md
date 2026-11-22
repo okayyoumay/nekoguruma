@@ -582,8 +582,8 @@ ngr-server user disable --config <file> --username alice
   and `Z`, an offset of at most 15:59, one to nine fractional digits, a real date from the year 1,
   a second of at most 59), kept as UTC whole seconds with the fraction floored; anything else
   (not a string, null, a duplicate property included) is 400 with no database access. A 400
-  means the request can never be valid; a 422 that the key is another request's or that the
-  deadline is out of bounds (next item).
+  means the request can never be valid; a 422 that the key is another request's, that the
+  deadline is out of bounds or that a named object is not stored (next item).
 - **The transaction** (read committed, 5 second lock and statement timeouts). (a) The row of
   `(tenant, key)`: when it exists, the same operator with an equal request hash is answered with
   the stored job (202), any other request with 422 and no data of the job, whatever the
@@ -594,8 +594,13 @@ ngr-server user disable --config <file> --username alice
   `agent_revoked`, `not_allowed`) goes to the log through its own gate. Then the deadline's
   bounds, when the request names one, against the issue time (the floor of this read's second):
   60 to 86400 seconds after it, both inclusive, else 422 with the Problem `code`
-  `START_DEADLINE_OUT_OF_BOUNDS` (nothing written, the key unbound, no audit row, no lock). A key
-  that is not the active one is 503 and one logged error, judged after the bounds. (c) The kind's confirmation level is read from
+  `START_DEADLINE_OUT_OF_BOUNDS` (nothing written, the key unbound, no audit row, no lock). Then
+  one read of what the job names (ADR-501): every named IR digest must have an `ir_documents` row
+  of the session's tenant, else 422 with the `code` `DOCUMENT_NOT_STORED`, and the artifact digest,
+  when present, an `artifacts` row of the tenant, else 422 with `ARTIFACT_NOT_STORED`; the
+  documents are judged first, the problem names no digest, nothing is written and the key stays
+  unbound. The read takes no row lock, since nothing deletes those rows. A key that is not the
+  active one is 503 and one logged error, judged after these. (c) The kind's confirmation level is read from
   `confirmation_defaults` (ADR-488); a kind without a row is 500 and nothing is signed or
   written. The ID (UUIDv7 from the database's milliseconds and ten random bytes) and the instruction (version 1, generation 1, the session's operator, the
   sorted unique hashes, no plan, issued at the database's second, start deadline the request's

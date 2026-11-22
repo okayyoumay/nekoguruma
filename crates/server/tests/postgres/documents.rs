@@ -7,6 +7,7 @@
 //! only and these tests need the agent's tenant and a second one. Digests, keys and tokens are
 //! made at run time; no assertion message prints one.
 
+use std::net::SocketAddr;
 use std::time::{Duration, Instant, SystemTime};
 
 use base64::Engine;
@@ -32,7 +33,7 @@ use crate::uploads::{Fail, Fx, With, begin_for, hex};
 // Documents
 
 /// A valid document whose bytes differ with `tag`.
-fn doc(tag: &str) -> Vec<u8> {
+pub(crate) fn doc(tag: &str) -> Vec<u8> {
     let mut variant = EcuVariantT::default();
     variant.short_name = Some(format!("Variant {tag}"));
     variant.part_numbers = Some(vec![format!("PN-{tag}"), "PN-2".to_owned()]);
@@ -51,7 +52,7 @@ fn encoded(variant: EcuVariantT, procedure: Vec<u8>) -> Vec<u8> {
 }
 
 /// A valid document of exactly `total` bytes: its procedure part is padded until it fits.
-fn document_of(total: usize) -> Vec<u8> {
+pub(crate) fn document_of(total: usize) -> Vec<u8> {
     let mut variant = EcuVariantT::default();
     variant.short_name = Some("Large".to_owned());
     let base = encoded(variant.clone(), Vec::new()).len();
@@ -66,17 +67,17 @@ fn document_of(total: usize) -> Vec<u8> {
     }
 }
 
-fn name_of(bytes: &[u8]) -> String {
+pub(crate) fn name_of(bytes: &[u8]) -> String {
     hex(&Sha256::digest(bytes))
 }
 
 // ---------------------------------------------------------------------------------------------
 // The lab
 
-struct Operator {
+pub(crate) struct Operator {
     id: String,
     tenant: String,
-    cookie: String,
+    pub(crate) cookie: String,
 }
 
 struct Lab {
@@ -148,7 +149,17 @@ impl Lab {
 
 /// An operator of `tenant` with the roles `(role, scope)` and a session in the server's table.
 async fn operator(fx: &Fx, tenant: &str, name: &str, roles: &[(&str, &str)]) -> Operator {
-    let pool = &fx.u.w.pool;
+    operator_at(&fx.u.w.pool, &fx.u.operator_sessions, tenant, name, roles).await
+}
+
+/// [`operator`] for a server that is not the upload fixture's: `sessions` is that server's table.
+pub(crate) async fn operator_at(
+    pool: &sqlx::PgPool,
+    sessions: &server::OperatorSessions,
+    tenant: &str,
+    name: &str,
+    roles: &[(&str, &str)],
+) -> Operator {
     let id: String = sqlx::query_scalar(
         "INSERT INTO operators (id, tenant_id, subject, display_name) \
          VALUES (gen_random_uuid(), $1::uuid, $2, $2) RETURNING id::text",
@@ -182,7 +193,7 @@ async fn operator(fx: &Fx, tenant: &str, name: &str, roles: &[(&str, &str)]) -> 
     .await
     .unwrap();
     let token = random_32().unwrap();
-    fx.u.operator_sessions.establish(
+    sessions.establish(
         &[],
         Sha256::digest(token).into(),
         Holder {
@@ -214,9 +225,29 @@ fn head(
     content_types: &[&str],
     length: &str,
 ) -> String {
+    head_at(
+        fx.u.s.addr,
+        method,
+        name,
+        cookie,
+        origin,
+        content_types,
+        length,
+    )
+}
+
+fn head_at(
+    addr: SocketAddr,
+    method: &str,
+    name: &str,
+    cookie: Option<&str>,
+    origin: Option<&str>,
+    content_types: &[&str],
+    length: &str,
+) -> String {
     let mut raw = format!(
-        "{method} /api/v1/documents/{name} HTTP/1.1\r\n{}\r\nConnection: close\r\n",
-        fx.u.s.host()
+        "{method} /api/v1/documents/{name} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n",
+        addr.port()
     );
     if let Some(origin) = origin {
         raw.push_str(&format!("Origin: {origin}\r\n"));
@@ -255,7 +286,11 @@ fn good_head(fx: &Fx, who: &Operator, name: &str, len: usize) -> String {
 /// has read everything) and reads the answer until the server closes. With `half_close` the
 /// write side is shut after the body.
 async fn exchange_bytes(fx: &Fx, head: String, body: &[u8], half_close: bool) -> Reply {
-    let mut stream = TcpStream::connect(fx.u.s.addr).await.unwrap();
+    exchange_bytes_at(fx.u.s.addr, head, body, half_close).await
+}
+
+async fn exchange_bytes_at(addr: SocketAddr, head: String, body: &[u8], half_close: bool) -> Reply {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
     let (mut read, mut write) = stream.split();
     let writing = async {
         let _ = write.write_all(head.as_bytes()).await;
@@ -290,6 +325,22 @@ async fn exchange_bytes(fx: &Fx, head: String, body: &[u8], half_close: bool) ->
 
 async fn put_as(fx: &Fx, who: &Operator, name: &str, bytes: &[u8]) -> Reply {
     exchange_bytes(fx, good_head(fx, who, name, bytes.len()), bytes, false).await
+}
+
+/// Stores `bytes` under their own name through the route of the server at `addr`, as the
+/// operator whose session `cookie` is: for the tests of other routes that need a stored
+/// document (the job creation's check, ADR-501).
+pub(crate) async fn put_document(addr: SocketAddr, cookie: &str, bytes: &[u8]) -> Reply {
+    let head = head_at(
+        addr,
+        "PUT",
+        &name_of(bytes),
+        Some(cookie),
+        Some(&pinned_origin(addr.port())),
+        OCTETS,
+        &format!("Content-Length: {}", bytes.len()),
+    );
+    exchange_bytes_at(addr, head, bytes, false).await
 }
 
 /// A request that has sent its head and `declared` bytes of body it never finishes: it holds a

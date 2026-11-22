@@ -1,7 +1,7 @@
 # ADR-500: The Server Stores a Job's IR Documents by Their SHA-256 Through a PUT Route for a Worker
 
 **Date:** 2026-11-21
-**Status:** Accepted
+**Status:** Accepted (the consequence that job creation takes the digests it is given replaced by ADR-501)
 **Affects:** design 6.8, 8.2.6, 11.1, 14.3; `crates/server` (`documents`, `storage`, `storage/s3`, `audit`, `register`, `uploads`, `lib`), `db/migrations/0015_document_extension_id_nullable.sql`, `db/README.md`, `api/openapi.yaml`, `crates/server/docs/ngr-server.md`; annotates ADR-477; fulfils the writer that ADR-497 leaves to a later route; extends ADR-454 and ADR-492; the check at job creation (ADR-477 item 2) is a later change
 
 ## Context

@@ -4,9 +4,11 @@
 use std::io;
 use std::sync::{Arc, Mutex};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, DuplexStream};
 
-use crate::answer_proof::TestProver;
+use shared_crypto::Signer as _;
+
+use crate::answer_proof::{TestProver, Verifier, nonce_of};
 use crate::control::dial::{Dialled, PortDial, Stream};
 
 /// What the dial does with a call.
@@ -94,7 +96,7 @@ impl Seen {
 }
 
 /// Reads the head of a request, and its body when the head has a length.
-pub(crate) async fn read_request(server: &mut DuplexStream) -> Option<Seen> {
+pub(crate) async fn read_request<S: AsyncRead + Unpin>(server: &mut S) -> Option<Seen> {
     let mut raw = Vec::new();
     let mut byte = [0u8; 1];
     while !raw.ends_with(b"\r\n\r\n") {
@@ -130,41 +132,221 @@ pub(crate) fn json(status: u16, body: &str) -> Vec<u8> {
     answer(status, "Content-Type: application/json\r\n", body)
 }
 
+/// What a fake server does with the proof of an answer it serves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Proof {
+    /// A valid proof of the answer to the request as it was made.
+    Valid,
+    /// No `Ngr-Server-Proof` header.
+    Missing,
+    /// A proof under another key.
+    OtherKey,
+    /// A proof for another nonce.
+    OtherNonce,
+    /// A proof of a body one byte longer than the one sent.
+    BodyAltered,
+    /// A proof of another status.
+    StatusAltered,
+    /// A proof of another request's target.
+    OtherRequest,
+    /// Two proof headers, both valid.
+    TwoValues,
+    /// A proof whose text is not the canonical base64 of its bytes.
+    NotCanonical,
+    /// A valid proof of a body over the 64 KiB the client reads.
+    OverLimit,
+    /// A valid proof of a body of which only part arrives.
+    Cut,
+}
+
+impl Proof {
+    /// Every way an answer can fail to be proved.
+    pub(crate) const UNPROVED: [Proof; 10] = [
+        Proof::Missing,
+        Proof::OtherKey,
+        Proof::OtherNonce,
+        Proof::BodyAltered,
+        Proof::StatusAltered,
+        Proof::OtherRequest,
+        Proof::TwoValues,
+        Proof::NotCanonical,
+        Proof::OverLimit,
+        Proof::Cut,
+    ];
+}
+
+/// An answer a fake server serves: its proof is made when it is served, from the request that
+/// asked.
+#[derive(Debug, Clone)]
+pub(crate) struct Served {
+    pub(crate) status: u16,
+    pub(crate) headers: String,
+    pub(crate) body: String,
+    pub(crate) proof: Proof,
+}
+
+impl Served {
+    /// A JSON answer with a valid proof.
+    pub(crate) fn new(status: u16, body: &str) -> Self {
+        Self {
+            status,
+            headers: "Content-Type: application/json\r\n".to_owned(),
+            body: body.to_owned(),
+            proof: Proof::Valid,
+        }
+    }
+
+    /// The same answer with the extra header lines `headers` (each ending in CRLF).
+    pub(crate) fn with_headers(mut self, headers: &str) -> Self {
+        self.headers.push_str(headers);
+        self
+    }
+
+    /// The same answer with `proof` instead of a valid one.
+    pub(crate) fn with(mut self, proof: Proof) -> Self {
+        self.proof = proof;
+        self
+    }
+
+    /// The same answer with no proof.
+    pub(crate) fn unproved(self) -> Self {
+        self.with(Proof::Missing)
+    }
+
+    /// The bytes of the answer to `request`, proved as `self.proof` says.
+    pub(crate) fn bytes(&self, prover: &TestProver, request: &Seen) -> Vec<u8> {
+        if self.proof == Proof::Missing {
+            // A request with no nonce (the challenge) gets no proof either.
+            return answer(self.status, &self.headers, &self.body);
+        }
+        let mut words = request.request_line().split(' ');
+        let (method, target) = (words.next().unwrap(), words.next().unwrap());
+        let mut body = self.body.clone();
+        if self.proof == Proof::OverLimit {
+            // Still JSON, so that only the size is wrong.
+            body.push_str(&" ".repeat(70_000));
+        }
+        let nonce = nonce_of(request.header("ngr-nonce").as_deref(), &request.body);
+        let sign = |prover: &TestProver, nonce, target: &str, status, body: &[u8]| {
+            prover.proof(nonce, method, target, &request.body, status, body)
+        };
+        let valid = sign(prover, nonce, target, self.status, body.as_bytes());
+        let lines = |proofs: &[String]| {
+            proofs
+                .iter()
+                .map(|p| format!("Ngr-Server-Proof: {p}\r\n"))
+                .collect::<String>()
+        };
+        let proofs: Vec<String> = match self.proof {
+            Proof::Valid | Proof::OverLimit | Proof::Cut => vec![valid],
+            Proof::Missing => unreachable!("answered above"),
+            Proof::OtherKey => {
+                let other =
+                    prover.with_key(Arc::new(shared_crypto::SigningKey::generate().unwrap()));
+                vec![sign(&other, nonce, target, self.status, body.as_bytes())]
+            }
+            Proof::OtherNonce => {
+                let mut other = nonce;
+                other[0] ^= 1;
+                vec![sign(prover, other, target, self.status, body.as_bytes())]
+            }
+            Proof::BodyAltered => {
+                let longer = format!("{body} ");
+                vec![sign(prover, nonce, target, self.status, longer.as_bytes())]
+            }
+            Proof::StatusAltered => {
+                let other = if self.status == 200 { 201 } else { 200 };
+                vec![sign(prover, nonce, target, other, body.as_bytes())]
+            }
+            Proof::OtherRequest => vec![sign(
+                prover,
+                nonce,
+                "/api/v1/agent/other",
+                self.status,
+                body.as_bytes(),
+            )],
+            Proof::TwoValues => vec![valid.clone(), valid],
+            Proof::NotCanonical => {
+                // The last character carries two bits of the signature and four of padding:
+                // the same bits with nonzero padding are not the text the bytes encode to.
+                let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+                let mut text = valid.into_bytes();
+                let at = text.len() - 3;
+                let value = alphabet.iter().position(|c| *c == text[at]).unwrap();
+                text[at] = alphabet[(value & 0x30) | 1];
+                vec![String::from_utf8(text).unwrap()]
+            }
+        };
+        let head = format!(
+            "HTTP/1.1 {} X\r\n{}{}",
+            self.status,
+            self.headers,
+            lines(&proofs)
+        );
+        let declared = if self.proof == Proof::Cut {
+            body.len() + 10
+        } else {
+            body.len()
+        };
+        format!("{head}Content-Length: {declared}\r\nConnection: close\r\n\r\n{body}").into_bytes()
+    }
+}
+
 /// A JSON answer that carries the server's proof of it, for the request `request` (the nonce is
 /// the request's `Ngr-Nonce` header, or the session body's).
 pub(crate) fn proved_json(prover: &TestProver, request: &Seen, status: u16, body: &str) -> Vec<u8> {
-    let mut words = request.request_line().split(' ');
-    let (method, target) = (words.next().unwrap(), words.next().unwrap());
-    let proof = prover.proof_of_request(
-        method,
-        target,
-        request.header("ngr-nonce").as_deref(),
-        &request.body,
-        status,
-        body.as_bytes(),
-    );
-    answer(
-        status,
-        &format!("Content-Type: application/json\r\nNgr-Server-Proof: {proof}\r\n"),
-        body,
-    )
+    Served::new(status, body).bytes(prover, request)
 }
 
-/// A dial whose server answers every request with `reply` after reading it whole, and records
-/// what it read.
-pub(crate) fn scripted(reply: Vec<u8>) -> (Arc<FakeDial>, Arc<Mutex<Vec<Seen>>>) {
+/// A dial whose server answers every request with what `reply` makes of it, after reading it
+/// whole, and records what it read.
+pub(crate) fn scripted_with(
+    reply: impl Fn(&Seen) -> Vec<u8> + Send + Sync + 'static,
+) -> (Arc<FakeDial>, Arc<Mutex<Vec<Seen>>>) {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let log = seen.clone();
+    let reply = Arc::new(reply);
     let dial = FakeDial::new(64 * 1024, move |_, mut server| {
         let reply = reply.clone();
         let log = log.clone();
         tokio::spawn(async move {
-            if let Some(request) = read_request(&mut server).await {
-                log.lock().unwrap().push(request);
-            }
-            let _ = server.write_all(&reply).await;
+            let bytes = match read_request(&mut server).await {
+                Some(request) => {
+                    let bytes = reply(&request);
+                    log.lock().unwrap().push(request);
+                    bytes
+                }
+                None => Vec::new(),
+            };
+            let _ = server.write_all(&bytes).await;
             let _ = server.shutdown().await;
         });
     });
     (dial, seen)
+}
+
+/// A dial whose server answers every request with `reply` as it is.
+pub(crate) fn scripted(reply: Vec<u8>) -> (Arc<FakeDial>, Arc<Mutex<Vec<Seen>>>) {
+    scripted_with(move |_| reply.clone())
+}
+
+/// A dial whose server answers every request with `reply`, proved as it says by `prover`.
+pub(crate) fn scripted_served(
+    prover: TestProver,
+    reply: Served,
+) -> (Arc<FakeDial>, Arc<Mutex<Vec<Seen>>>) {
+    scripted_with(move |request| reply.bytes(&prover, request))
+}
+
+/// A server key's prover for the agent `agent_id` of the server at `origin`, and the verifier
+/// an agent that registered with that key holds.
+pub(crate) fn proving(origin: &str, agent_id: &str) -> (TestProver, Arc<Verifier>) {
+    let key = Arc::new(shared_crypto::SigningKey::generate().unwrap());
+    let prover = TestProver::new(key.clone(), origin, agent_id);
+    let verifier = Verifier {
+        key: key.public_key(),
+        audience: prover.audience.clone(),
+        agent_id: agent_id.to_owned(),
+    };
+    (prover, Arc::new(verifier))
 }

@@ -110,6 +110,20 @@ pub(crate) struct TestProver {
     pub(crate) agent_id: String,
 }
 
+/// The nonce of a request as a fake server read it: the `Ngr-Nonce` header's value, or, on the
+/// session route, which sends none, the body's.
+#[cfg(test)]
+pub(crate) fn nonce_of(nonce_header: Option<&str>, request_body: &[u8]) -> [u8; 32] {
+    let text = match nonce_header {
+        Some(text) => text.to_owned(),
+        None => serde_json::from_slice::<serde_json::Value>(request_body)
+            .ok()
+            .and_then(|body| body["nonce"].as_str().map(str::to_owned))
+            .expect("a request with a nonce"),
+    };
+    canonical_base64::<32>(&text).expect("a canonical nonce")
+}
+
 #[cfg(test)]
 impl TestProver {
     /// A prover that signs with `key` for the agent `agent_id` of the server at `origin`.
@@ -136,15 +150,17 @@ impl TestProver {
         status: u16,
         answer_body: &[u8],
     ) -> String {
-        let text = match nonce_header {
-            Some(text) => text.to_owned(),
-            None => serde_json::from_slice::<serde_json::Value>(request_body)
-                .ok()
-                .and_then(|body| body["nonce"].as_str().map(str::to_owned))
-                .expect("a request with a nonce"),
-        };
-        let nonce = canonical_base64::<32>(&text).expect("a canonical nonce");
+        let nonce = nonce_of(nonce_header, request_body);
         self.proof(nonce, method, target, request_body, status, answer_body)
+    }
+
+    /// The same prover under another key (an impostor's).
+    pub(crate) fn with_key(&self, key: std::sync::Arc<shared_crypto::SigningKey>) -> Self {
+        Self {
+            key,
+            audience: self.audience.clone(),
+            agent_id: self.agent_id.clone(),
+        }
     }
 
     /// The `Ngr-Server-Proof` value for the answer (`status`, `answer_body`) to the request

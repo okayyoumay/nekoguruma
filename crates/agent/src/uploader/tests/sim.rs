@@ -10,12 +10,14 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use sha2::{Digest as _, Sha256};
 use shared_crypto::{PublicKey, Signer as _, SigningKey};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::Instant;
 
 use crate::answer_proof::TestProver;
 use crate::control::exchange::{CHALLENGE_PATH, SESSION_PATH};
-use crate::uploader::fake::{FakeDial, Seen, answer, json, proved_json, read_request};
+use crate::uploader::fake::{
+    FakeDial, Proof, Seen, Served, answer, json, proved_json, read_request,
+};
 use crate::uploader::routes::BEGIN_PATH;
 
 /// The port of the API routes and the port of the object PUTs, over the in-memory dial.
@@ -35,17 +37,34 @@ pub(super) enum Route {
 
 /// What the server does with a request.
 pub(super) enum Reply {
+    /// These bytes as they are.
     Bytes(Vec<u8>),
+    /// An answer proved (or not) when it is served, from the request it answers.
+    Json(Served),
     /// Reads the request and never answers.
     Hang,
     /// Reads the request and closes without an answer.
     Cut,
+    /// Reads the request, waits for the notification, then answers 200 with no body (a PUT held
+    /// until the test lets it end).
+    Held(Arc<tokio::sync::Notify>),
     /// No override: the server's own answer (a placeholder in a queue).
     Default,
 }
 
+/// A JSON answer, proved as the server proves one.
 pub(super) fn status(code: u16, body: &str) -> Reply {
-    Reply::Bytes(json(code, body))
+    Reply::Json(Served::new(code, body))
+}
+
+/// A JSON answer with no proof.
+pub(super) fn unproved(code: u16, body: &str) -> Reply {
+    Reply::Json(Served::new(code, body).unproved())
+}
+
+/// A JSON answer whose proof is wrong in the way `proof` says.
+pub(super) fn tampered(code: u16, body: &str, proof: Proof) -> Reply {
+    Reply::Json(Served::new(code, body).with(proof))
 }
 
 pub(super) fn problem(code: u16, state: Option<&str>) -> Reply {
@@ -62,6 +81,8 @@ pub(super) struct Logged {
     pub(super) port: u16,
     pub(super) at: Instant,
     pub(super) bearer: Option<String>,
+    /// The request's `Ngr-Nonce`.
+    pub(super) nonce: Option<String>,
     /// Begin: `job/kind`; part and PUT: the part number; otherwise empty.
     pub(super) detail: String,
     pub(super) body_len: usize,
@@ -296,6 +317,7 @@ impl Sim {
             bearer: seen
                 .header("authorization")
                 .map(|v| v.trim_start_matches("Bearer ").to_owned()),
+            nonce: seen.header("ngr-nonce"),
             detail,
             body_len: seen.body.len(),
         };
@@ -308,19 +330,25 @@ impl Sim {
         if let Some(tap) = tap {
             tap(&logged);
         }
-        if let Some(reply) = canned.filter(|r| !matches!(r, Reply::Default)) {
-            return reply;
+        let reply = match canned.filter(|r| !matches!(r, Reply::Default)) {
+            Some(reply) => reply,
+            None => self.default(route, path, seen, &logged),
+        };
+        match reply {
+            Reply::Json(served) => {
+                Reply::Bytes(served.bytes(&self.state.lock().unwrap().prover, seen))
+            }
+            other => other,
         }
-        self.default(route, path, seen, &logged)
     }
 
     fn default(&self, route: Route, path: &str, seen: &Seen, logged: &Logged) -> Reply {
         let mut state = self.state.lock().unwrap();
         match route {
-            Route::Challenge => status(
+            Route::Challenge => Reply::Bytes(json(
                 200,
                 &format!(r#"{{"challenge":"{}"}}"#, STANDARD.encode([7u8; 32])),
-            ),
+            )),
             Route::Session => {
                 state.tokens += 1;
                 let token = token_text(state.tokens);
@@ -353,7 +381,7 @@ impl Sim {
                     .and_then(token_number)
                     .is_some_and(|n| n >= state.min_valid && n <= state.tokens);
                 if !good {
-                    return status(401, "{}");
+                    return unproved(401, "{}");
                 }
                 api(&mut state, route, path, seen)
             }
@@ -480,53 +508,54 @@ pub(super) fn dial(sim: &Arc<Sim>) -> Arc<FakeDial> {
             let Some(seen) = read_request(&mut stream).await else {
                 return;
             };
-            match sim.handle(port, &seen) {
-                Reply::Bytes(bytes) => {
-                    let _ = stream.write_all(&bytes).await;
-                    let _ = stream.shutdown().await;
-                }
-                Reply::Hang => {
-                    let mut byte = [0u8; 1];
-                    while matches!(stream.read(&mut byte).await, Ok(n) if n > 0) {}
-                }
-                Reply::Cut | Reply::Default => {}
-            }
+            play(sim.handle(port, &seen), &mut stream).await;
         });
     })
 }
 
+/// Plays a server's answer on the connection the request came on.
+async fn play<S: AsyncRead + AsyncWrite + Unpin>(reply: Reply, stream: &mut S) {
+    match reply {
+        Reply::Bytes(bytes) => {
+            let _ = stream.write_all(&bytes).await;
+            let _ = stream.shutdown().await;
+        }
+        Reply::Held(gate) => {
+            gate.notified().await;
+            let _ = stream.write_all(&answer(200, "", "")).await;
+            let _ = stream.shutdown().await;
+        }
+        Reply::Hang => {
+            let mut byte = [0u8; 1];
+            while matches!(stream.read(&mut byte).await, Ok(n) if n > 0) {}
+        }
+        // `Json` is resolved to bytes before it gets here; `Cut` closes at once.
+        Reply::Json(_) | Reply::Cut | Reply::Default => {}
+    }
+}
+
 /// Serves `sim` on a real listener: one request per connection, read whole, answered, closed.
 pub(super) async fn serve_tcp(listener: tokio::net::TcpListener, port: u16, sim: Arc<Sim>) {
+    serve_with(listener, move |seen| sim.handle(port, seen)).await;
+}
+
+/// Accepts connections on a real listener until the task is dropped and answers each request, read
+/// whole, as `handle` says.
+pub(super) async fn serve_with(
+    listener: tokio::net::TcpListener,
+    handle: impl Fn(&Seen) -> Reply + Send + Sync + 'static,
+) {
+    let handle = Arc::new(handle);
     loop {
         let Ok((mut stream, _)) = listener.accept().await else {
             return;
         };
-        let sim = sim.clone();
+        let handle = handle.clone();
         tokio::spawn(async move {
-            let mut raw = Vec::new();
-            let mut byte = [0u8; 1];
-            while !raw.ends_with(b"\r\n\r\n") {
-                match stream.read(&mut byte).await {
-                    Ok(1) => raw.push(byte[0]),
-                    _ => return,
-                }
-            }
-            let mut seen = Seen {
-                head: String::from_utf8_lossy(&raw).into_owned(),
-                body: Vec::new(),
-            };
-            let length = seen
-                .header("content-length")
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(0);
-            seen.body = vec![0u8; length];
-            if stream.read_exact(&mut seen.body).await.is_err() {
+            let Some(seen) = read_request(&mut stream).await else {
                 return;
-            }
-            if let Reply::Bytes(bytes) = sim.handle(port, &seen) {
-                let _ = stream.write_all(&bytes).await;
-                let _ = stream.shutdown().await;
-            }
+            };
+            play(handle(&seen), &mut stream).await;
         });
     }
 }

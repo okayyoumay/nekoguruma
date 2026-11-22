@@ -17,6 +17,8 @@ fn request<'a>(method: Method, target: &'a str, body: Option<&str>) -> JsonReque
         host: HOST,
         bearer: "tok-123",
         body: body.map(|b| b.as_bytes().to_vec()),
+        nonce: shared_crypto::random_32().unwrap(),
+        reads: reads_body,
     }
 }
 
@@ -446,7 +448,7 @@ async fn the_json_total_does_not_end_a_request_that_finishes_inside_it() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_cut_answer_and_garbage_are_failures() {
+async fn a_cut_body_is_reported_as_cut_and_garbage_is_a_failure() {
     let dial = FakeDial::new(4096, |_, mut server| {
         tokio::spawn(async move {
             let _ = read_request(&mut server).await;
@@ -456,10 +458,10 @@ async fn a_cut_answer_and_garbage_are_failures() {
             let _ = server.shutdown().await;
         });
     });
-    assert_eq!(
-        post(&Client::with_dial(dial)).await.unwrap_err(),
-        Error::Failed
-    );
+    // The head arrived and the body did not: the answer says so, for the caller to treat as
+    // not proved.
+    let cut = post(&Client::with_dial(dial)).await.unwrap();
+    assert_eq!((cut.status, cut.body), (200, AnswerBody::Cut));
     let (dial, _) = scripted(b"not http at all\r\n\r\n".to_vec());
     assert_eq!(
         post(&Client::with_dial(dial)).await.unwrap_err(),
@@ -515,6 +517,8 @@ async fn a_request_over_a_real_loopback_socket() {
                 host: &host,
                 bearer: "t",
                 body: Some(b"{}".to_vec()),
+                nonce: shared_crypto::random_32().unwrap(),
+                reads: reads_body,
             },
         )
         .await

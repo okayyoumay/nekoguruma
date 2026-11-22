@@ -7,7 +7,11 @@
 //! - status: `GET /api/v1/agent/uploads/{uploadId}`
 //! - complete: `POST /api/v1/agent/uploads/{uploadId}/complete`
 //!
-//! The session token goes to these four as a bearer and nowhere else. Answers are strict: an
+//! The session token goes to these four as a bearer and nowhere else, with a fresh `Ngr-Nonce`.
+//! An answer whose status is one the route promises (`shared_proto`'s tables) is verified, with the
+//! server's proof of it ([`Verifier`]), before any of its body is read; one that is not proved is
+//! [`Class::Unproven`], however its body looks. Any other status is classed by the status alone
+//! and not checked (ADR-504). Answers are strict: an
 //! unknown member, a wrong type, an `uploadId` that is not a canonical UUID (it goes into a
 //! path), a `partCount` that is not the agent's own `max(1, ceil(length / partBytes))` or is over
 //! 10000, and a `partsHeld` above the count are all answers the route does not promise.
@@ -16,6 +20,8 @@
 //! what to do with the entry:
 //!
 //! - [`Class::Reauthenticate`]: a 401. The token is no longer good: exchange a new one.
+//! - [`Class::Unproven`]: an answer that was to be a result and is not proved by the server: the
+//!   token is dropped, the wait is the back-off's cap, and nothing of the answer is acted on.
 //! - [`Class::Retry`]: no answer, a cut, no progress, a time out, a 3xx, 408, 429, 502, 503, 504,
 //!   any failure of the part's PUT, a part URL answered 409 (the next begin reads the row), and a part URL that breaks the host rule. The server (or the
 //!   network) may be better soon.
@@ -24,12 +30,18 @@
 //!   gives, a body that is not the shape, over 64 KiB or not JSON). The entry is left for this
 //!   pass.
 
+use std::sync::Arc;
+
 use hyper::Method;
 use serde::Deserialize;
-use shared_proto::is_canonical_uuid;
+use shared_crypto::RandomError;
+use shared_proto::{
+    BEGIN_RESULTS, COMPLETE_RESULTS, PART_URL_RESULTS, STATUS_RESULTS, is_canonical_uuid,
+};
 
-use super::http::{Answer, AnswerBody, Client, Error, JsonRequest};
+use super::http::{Answer, AnswerBody, Client, Error, JsonRequest, reads_body};
 use super::part_url::{self, PartTarget};
+use crate::answer_proof::{Sent, Verifier};
 use crate::registration::origin::ServerOrigin;
 use crate::server_http::retry_after_secs;
 
@@ -43,6 +55,9 @@ pub const MAX_PARTS: u64 = 10_000;
 pub enum Class {
     /// A 401: exchange a new token.
     Reauthenticate,
+    /// An answer that was to be a result carries no valid proof: drop the token and wait the
+    /// cap, with no repeat.
+    Unproven,
     /// Try again after the back-off.
     Retry,
     /// Leave the entry for this pass.
@@ -226,16 +241,145 @@ fn counts_match(length: u64, part_bytes: u64, part_count: u64) -> bool {
     part_bytes > 0 && part_count <= MAX_PARTS && part_count == length.div_ceil(part_bytes).max(1)
 }
 
+/// What the data channel's JSON routes share: the client, the server's origin, the verifier of
+/// its proofs and the source of nonces. The upload routes ([`Routes`]) and the download route
+/// (`fetch::route::Downloads`) make their requests and judge their answers through it.
+#[derive(Clone, Debug)]
+pub(crate) struct Requester {
+    pub(crate) client: Client,
+    pub(crate) origin: ServerOrigin,
+    verifier: Arc<Verifier>,
+    random: fn() -> Result<[u8; 32], RandomError>,
+}
+
+/// An answer with what the request was.
+pub(crate) struct Called {
+    answer: Answer,
+    nonce: [u8; 32],
+    method: Method,
+    target: String,
+    body: Vec<u8>,
+}
+
+impl Requester {
+    pub(crate) fn new(
+        client: Client,
+        origin: ServerOrigin,
+        verifier: Arc<Verifier>,
+        random: fn() -> Result<[u8; 32], RandomError>,
+    ) -> Self {
+        Self {
+            client,
+            origin,
+            verifier,
+            random,
+        }
+    }
+
+    /// One request with the bearer and a fresh nonce. The body of an answer is read for the
+    /// statuses `reads` names.
+    pub(crate) async fn call(
+        &self,
+        token: &str,
+        method: Method,
+        path: &str,
+        body: Option<Vec<u8>>,
+        reads: fn(u16) -> bool,
+    ) -> Result<Called, Failure> {
+        let nonce = (self.random)().map_err(|_| Failure::new(Class::Retry, "random", None))?;
+        let host = self.origin.host_header();
+        let request = JsonRequest {
+            method,
+            target: path,
+            host: &host,
+            bearer: token,
+            body,
+            nonce,
+            reads,
+        };
+        let answer = self
+            .client
+            .json(self.origin.port(), &request)
+            .await
+            .map_err(transport)?;
+        Ok(Called {
+            answer,
+            nonce,
+            method: request.method,
+            target: path.to_owned(),
+            body: request.body.unwrap_or_default(),
+        })
+    }
+
+    /// Sorts an answer by status: the status and body when it is one the route promises and the
+    /// server proved it, else the failure that status is. The statuses `checked` names (a
+    /// superset of `promised`) are verified first: one that is not proved is
+    /// [`Class::Unproven`], whatever it says, and a body that is over the limit or cut is not
+    /// proved. The rest are classed by status alone.
+    pub(crate) fn judge(
+        &self,
+        called: Called,
+        promised: &[u16],
+        checked: impl Fn(u16) -> bool,
+    ) -> Result<(u16, Vec<u8>), Failure> {
+        let Called {
+            answer,
+            nonce,
+            method,
+            target,
+            body,
+        } = called;
+        let status = answer.status;
+        if checked(status) {
+            let sent = Sent {
+                nonce,
+                method: method.as_str(),
+                target: &target,
+                body: &body,
+            };
+            let proved = match &answer.body {
+                AnswerBody::Bytes(bytes) => {
+                    self.verifier
+                        .proved(&sent, status, bytes, answer.proof.as_deref())
+                }
+                AnswerBody::TooLarge | AnswerBody::Cut | AnswerBody::Unread => false,
+            };
+            if !proved {
+                return Err(Failure::new(Class::Unproven, "unproven", Some(status)));
+            }
+        }
+        if promised.contains(&status) {
+            return match answer.body {
+                AnswerBody::Bytes(bytes) => Ok((status, bytes)),
+                AnswerBody::TooLarge | AnswerBody::Cut | AnswerBody::Unread => {
+                    Err(Failure::unpromised(status))
+                }
+            };
+        }
+        if answer.body == AnswerBody::Cut {
+            // An answer that is no result and whose body failed is no answer.
+            return Err(Failure::new(Class::Retry, "transport", None));
+        }
+        Err(by_status(&answer))
+    }
+}
+
 /// The four routes of one server.
 #[derive(Clone, Debug)]
 pub struct Routes {
-    client: Client,
-    origin: ServerOrigin,
+    requester: Requester,
 }
 
 impl Routes {
-    pub fn new(client: Client, origin: ServerOrigin) -> Self {
-        Self { client, origin }
+    pub(crate) fn new(
+        client: Client,
+        origin: ServerOrigin,
+        verifier: Arc<Verifier>,
+        random: fn() -> Result<[u8; 32], RandomError>,
+    ) -> Self {
+        Self {
+            requester: Requester::new(client, origin, verifier, random),
+        }
     }
 
     /// Begin: declares the object. `201` is a new `open` row; `200` is the row of the same
@@ -250,10 +394,10 @@ impl Routes {
         })
         .to_string()
         .into_bytes();
-        let answer = self
+        let called = self
             .call(token, Method::POST, BEGIN_PATH, Some(body))
             .await?;
-        let (status, body) = judge(answer, &[200, 201])?;
+        let (status, body) = self.judge(called, BEGIN_RESULTS)?;
         let parsed: UploadAnswer = parse(status, &body)?;
         let state = State::parse(&parsed.state).filter(|s| {
             // A new row is `open`; the same declaration's row is never `failed`.
@@ -287,19 +431,20 @@ impl Routes {
         part: u32,
     ) -> Result<PartUrl, Failure> {
         let path = format!("{BEGIN_PATH}/{}/parts/{part}", id.as_str());
-        let answer = self
+        let called = self
             .call(token, Method::POST, &path, Some(Vec::new()))
             .await?;
         // A 409 (the row is not open) is a retry: the next attempt's begin reads the row's state.
-        if answer.status == 409 {
+        // It is not a result and is not checked.
+        if called.answer.status == 409 {
             return Err(Failure::new(Class::Retry, "not-open", Some(409)));
         }
-        let (status, body) = judge(answer, &[200])?;
+        let (status, body) = self.judge(called, PART_URL_RESULTS)?;
         let parsed: PartAnswer = parse(status, &body)?;
         if parsed.expires_in_secs == 0 {
             return Err(Failure::unpromised(status));
         }
-        let target = part_url::check(&self.origin, &parsed.url)
+        let target = part_url::check(&self.requester.origin, &parsed.url)
             .map_err(|_| Failure::new(Class::Retry, "part-url-host", Some(status)))?;
         Ok(PartUrl {
             target,
@@ -310,8 +455,8 @@ impl Routes {
     /// Status of an upload of `length` bytes.
     pub async fn status(&self, token: &str, id: &UploadId, length: u64) -> Result<Status, Failure> {
         let path = format!("{BEGIN_PATH}/{}", id.as_str());
-        let answer = self.call(token, Method::GET, &path, None).await?;
-        let (status, body) = judge(answer, &[200])?;
+        let called = self.call(token, Method::GET, &path, None).await?;
+        let (status, body) = self.judge(called, STATUS_RESULTS)?;
         let parsed: StatusAnswer = parse(status, &body)?;
         let state = State::parse(&parsed.state);
         let held_ok = match (state, parsed.parts_held) {
@@ -338,10 +483,10 @@ impl Routes {
     /// Complete: asks the server to verify the object.
     pub async fn complete(&self, token: &str, id: &UploadId) -> Result<Completion, Failure> {
         let path = format!("{BEGIN_PATH}/{}/complete", id.as_str());
-        let answer = self
+        let called = self
             .call(token, Method::POST, &path, Some(Vec::new()))
             .await?;
-        let (status, body) = judge(answer, &[200, 202, 409])?;
+        let (status, body) = self.judge(called, COMPLETE_RESULTS)?;
         if status == 409 {
             // The problem document's `state` member; any other shape is no state.
             let state = serde_json::from_slice::<serde_json::Value>(&body)
@@ -372,6 +517,7 @@ impl Routes {
     ) -> Result<(), Failure> {
         let target = &url.target;
         match self
+            .requester
             .client
             .put(
                 target.port(),
@@ -398,19 +544,16 @@ impl Routes {
         method: Method,
         path: &str,
         body: Option<Vec<u8>>,
-    ) -> Result<Answer, Failure> {
-        let host = self.origin.host_header();
-        let request = JsonRequest {
-            method,
-            target: path,
-            host: &host,
-            bearer: token,
-            body,
-        };
-        self.client
-            .json(self.origin.port(), &request)
+    ) -> Result<Called, Failure> {
+        self.requester
+            .call(token, method, path, body, reads_body)
             .await
-            .map_err(transport)
+    }
+
+    /// [`Requester::judge`] for a route whose results are `promised`: those statuses are verified.
+    fn judge(&self, called: Called, promised: &[u16]) -> Result<(u16, Vec<u8>), Failure> {
+        self.requester
+            .judge(called, promised, |status| promised.contains(&status))
     }
 }
 
@@ -427,16 +570,9 @@ pub(crate) fn transport(error: Error) -> Failure {
     Failure::new(Class::Retry, why, None)
 }
 
-/// Sorts an answer by status: the status and body when it is one the route promises, else the
-/// failure that class of status is.
-pub(crate) fn judge(answer: Answer, promised: &[u16]) -> Result<(u16, Vec<u8>), Failure> {
+/// The failure a status is when it is not a result of the route.
+fn by_status(answer: &Answer) -> Failure {
     let status = answer.status;
-    if promised.contains(&status) {
-        return match answer.body {
-            AnswerBody::Bytes(bytes) => Ok((status, bytes)),
-            AnswerBody::TooLarge | AnswerBody::Unread => Err(Failure::unpromised(status)),
-        };
-    }
     let mut failure = match status {
         401 => Failure::new(Class::Reauthenticate, "unauthorized", Some(401)),
         300..=399 => Failure::new(Class::Retry, "redirect", Some(status)),
@@ -448,7 +584,7 @@ pub(crate) fn judge(answer: Answer, promised: &[u16]) -> Result<(u16, Vec<u8>), 
     if matches!(status, 429 | 503) {
         failure.retry_after_secs = retry_after_secs(answer.retry_after.as_deref());
     }
-    Err(failure)
+    failure
 }
 
 /// A body that is exactly the document's shape, or the answer is not promised.

@@ -9,19 +9,31 @@
 //! The URL goes through the part URL's host rule before any byte is sent to it, and a URL that
 //! breaks the rule is a retry.
 //!
+//! The request carries a fresh `Ngr-Nonce`. The answer is verified with the server's proof before
+//! any of it is read, for the 200 and for every status that would end the fetch (400, 404, 413,
+//! 500, any other 4xx and a status the route never gives): a refusal ends the fetch only when the
+//! server proved it, and one that is not proved is [`Class::Unproven`] (ADR-504 item 3). Their
+//! bodies are read for that (up to 64 KiB; a body that is over the limit or cut is not proved). A
+//! 401, a 3xx, 408, 429, 502, 503 and 504 are not checked.
+//!
 //! The classes are the upload routes' ([`Class`]): a 401 is [`Class::Reauthenticate`]; no answer,
 //! a cut, no progress, a time out, a 3xx, 408, 429, 502, 503 and 504 are [`Class::Retry`] (a
 //! `Retry-After` of 1 to 60 seconds is kept); 400, 404, 413, 500, any other 4xx and an answer
 //! that is not promised are [`Class::PassOver`], which here ends the fetch.
 
+use std::sync::Arc;
+
 use hyper::Method;
 use serde::Deserialize;
+use shared_crypto::RandomError;
+use shared_proto::DOWNLOAD_RESULTS;
 
 use super::Kind;
+use crate::answer_proof::Verifier;
 use crate::registration::origin::ServerOrigin;
-use crate::uploader::http::{Client, JsonRequest};
+use crate::uploader::http::Client;
 use crate::uploader::part_url::{self, PartTarget};
-use crate::uploader::routes::{Class, Failure, judge, parse, transport};
+use crate::uploader::routes::{Class, Failure, Requester, parse};
 
 /// The route's path.
 pub const PATH: &str = "/api/v1/agent/downloads";
@@ -43,16 +55,28 @@ struct Answer {
     expires_in_secs: u64,
 }
 
+/// Whether the answer with this status is verified before it is used: all but the statuses the
+/// agent retries or answers by asking for a new token. Its body is read for the same statuses.
+fn verified(status: u16) -> bool {
+    !matches!(status, 300..=399 | 401 | 408 | 429 | 502..=504)
+}
+
 /// The download route of one server.
 #[derive(Clone, Debug)]
 pub struct Downloads {
-    client: Client,
-    origin: ServerOrigin,
+    requester: Requester,
 }
 
 impl Downloads {
-    pub fn new(client: Client, origin: ServerOrigin) -> Self {
-        Self { client, origin }
+    pub(crate) fn new(
+        client: Client,
+        origin: ServerOrigin,
+        verifier: Arc<Verifier>,
+        random: fn() -> Result<[u8; 32], RandomError>,
+    ) -> Self {
+        Self {
+            requester: Requester::new(client, origin, verifier, random),
+        }
     }
 
     /// The GET URL for `want`, already judged by the host rule.
@@ -65,25 +89,16 @@ impl Downloads {
         })
         .to_string()
         .into_bytes();
-        let host = self.origin.host_header();
-        let request = JsonRequest {
-            method: Method::POST,
-            target: PATH,
-            host: &host,
-            bearer: token,
-            body: Some(body),
-        };
-        let answer = self
-            .client
-            .json(self.origin.port(), &request)
-            .await
-            .map_err(transport)?;
-        let (status, body) = judge(answer, &[200])?;
+        let called = self
+            .requester
+            .call(token, Method::POST, PATH, Some(body), verified)
+            .await?;
+        let (status, body) = self.requester.judge(called, DOWNLOAD_RESULTS, verified)?;
         let parsed: Answer = parse(status, &body)?;
         if parsed.expires_in_secs == 0 {
             return Err(Failure::unpromised(status));
         }
-        part_url::check(&self.origin, &parsed.url)
+        part_url::check(&self.requester.origin, &parsed.url)
             .map_err(|_| Failure::new(Class::Retry, "download-url-host", Some(status)))
     }
 }

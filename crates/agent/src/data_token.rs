@@ -3,7 +3,8 @@
 //! work, and each repeats a request once after a 401.
 //!
 //! [`Holder`] keeps the token and the exchange's log lines (in the owner's words: the prefix names
-//! the client), and [`Holder::unauthorized`] is the 401 rule. The callers keep what differs: how
+//! the client), [`Holder::unauthorized`] is the 401 rule and [`Holder::unproven`] the rule for a
+//! data route's answer the server did not prove. The callers keep what differs: how
 //! a failed exchange moves their back-off, and what a stop does.
 
 use std::collections::HashSet;
@@ -12,7 +13,7 @@ use crate::answer_proof::UNPROVEN_CAUSES;
 use crate::control::exchange::{self, Fail, Token};
 use crate::uploader::routes::{Class, Failure};
 
-/// The exchange's log lines: one warning per class until a token is issued, debug after that, and
+/// The exchange's log lines (and the data routes' unproven answers, as `unproven`): one warning per class until a token is issued, debug after that, and
 /// one warning per refusal until a token is issued again. The prefix names the client in each
 /// line.
 pub(crate) struct ExchangeLog {
@@ -58,14 +59,14 @@ impl exchange::Log for ExchangeLog {
                 class,
                 status,
                 causes = UNPROVEN_CAUSES,
-                "{prefix} exchange answer is not proved by the server"
+                "{prefix} answer is not proved by the server"
             );
         } else {
             tracing::debug!(
                 class,
                 status,
                 causes = UNPROVEN_CAUSES,
-                "{prefix} exchange answer is not proved by the server"
+                "{prefix} answer is not proved by the server"
             );
         }
     }
@@ -123,6 +124,17 @@ impl Holder {
         }
         *repeated = true;
         true
+    }
+
+    /// The rule for a data route's answer that was to be a result and is not proved by the server
+    /// (ADR-504): the token is dropped, so that the next request exchanges a new one, and the
+    /// answer is logged as the class `unproven`, once per class until a token is issued. No
+    /// repeat follows; the caller waits the back-off's cap.
+    pub(crate) fn unproven(&mut self, status: Option<u16>) {
+        use exchange::Log;
+        self.token = None;
+        // The status of a result is always known; 0 never matches one.
+        self.log.unproven("unproven", status.unwrap_or(0));
     }
 }
 
@@ -189,5 +201,23 @@ mod tests {
             .collect();
         assert_eq!(levels, ["WARN", "DEBUG", "WARN"], "{lines:?}");
         assert!(lines.iter().all(|line| line.contains("session-unproven")));
+    }
+
+    /// A data route's unproven answer and the exchange's are two classes, each warned once until a
+    /// token is issued, in both clients' words.
+    #[test]
+    fn the_holders_unproven_answers_warn_once_per_class_in_the_owners_words() {
+        let mut holder = Holder::new("uploader");
+        let lines = logged(|| {
+            holder.unproven(Some(200));
+            holder.unproven(Some(409));
+            holder.log.unproven("session-unproven", 200);
+            holder.log.accepted();
+            holder.unproven(Some(200));
+        });
+        let warned: Vec<bool> = lines.iter().map(|line| line.contains(" WARN ")).collect();
+        assert_eq!(warned, [true, false, true, true], "{lines:?}");
+        assert!(lines.iter().all(|line| line.contains("uploader answer")));
+        assert!(lines[0].contains(UNPROVEN_CAUSES), "{lines:?}");
     }
 }

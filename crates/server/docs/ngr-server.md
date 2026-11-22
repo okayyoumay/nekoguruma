@@ -490,7 +490,9 @@ nonce, the request's method, target and body, and the answer's status and body
   is served as before. The five data routes (begin, part URL, status, completion, download) prove
   every answer they send after the token and the agent's row are judged, whatever its status, when
   the request carries `Ngr-Nonce` (`Prover::prove` signs the finished response; the request digest
-  is that of the body read, and of zero bytes on the routes with none). No refusal before that
+  is that of the body read, and of zero bytes on the routes with none; for a HEAD request, which
+  the status route takes as a GET, the answer's digest is over zero bytes, the body actually
+  sent). No refusal before that
   point (the guard, the method, the body, the shape, the token, the agent's row), no challenge
   answer and no registration answer carries a proof.
 - The new 400s: on the session route the target joins the shape step (the challenge is not

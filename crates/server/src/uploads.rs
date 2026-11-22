@@ -11,8 +11,9 @@
 //! it is revoked or missing, 503, 500), the job or the upload (404), the request against the row
 //! (400 for a part outside the count, 409), the object store (503, 500) and the answer.
 //!
-//! A request that carries `Ngr-Nonce` is judged for it last in the shape step (400 for a nonce or
-//! a target the proof cannot take, before the token), and every answer sent after the token and
+//! A request that carries `Ngr-Nonce` is judged for it after the shape and, for begin, the
+//! declared length (413), and before the token (400 for a nonce or a target the proof cannot
+//! take), and every answer sent after the token and
 //! the agent's row are judged carries the proof of the answer (ADR-504); a proof that cannot be
 //! made is an unproved 503. A request without a nonce is served as before.
 //!

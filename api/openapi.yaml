@@ -823,7 +823,16 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/UploadPartUrl' }
-        '400': { $ref: '#/components/responses/Problem' }
+        '400':
+          description: |
+            A problem document. A part beyond the upload's part count is judged after the token
+            and the agent's row, and that 400 is proved; the shape 400s (the body, the part
+            number, the nonce, the target) come before the token and carry no proof.
+          headers:
+            Ngr-Server-Proof: { $ref: '#/components/headers/NgrServerProof' }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '401': { $ref: '#/components/responses/AgentSessionRefused' }
         '404':
           description: A problem document; proved when sent after the token and the agent's row are judged
@@ -1454,9 +1463,11 @@ components:
       required: false
       description: |
         The request header of the data routes and the control upgrade (ADR-504): the agent's
-        32-byte nonce, standard padded base64 (44 characters). A request that carries it is
-        answered with `Ngr-Server-Proof`; one that does not is served as before. A repeated or
-        malformed value is a **400**. The session route reads no such header.
+        32-byte nonce, standard padded base64 (44 characters). On a data route every answer sent
+        after the token and the agent's row are judged carries `Ngr-Server-Proof`, and the control
+        upgrade's 101 does; answers before that point, and an unproved 503 when the proof cannot
+        be made, carry none. A request without it is served as before. A repeated or malformed
+        value is a **400**. The session route reads no such header.
       schema: { type: string, minLength: 44, maxLength: 44 }
 
   headers:

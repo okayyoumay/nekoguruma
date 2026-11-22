@@ -178,7 +178,8 @@ impl Prover {
 
     /// `response` with its proof, when the request asked for one: the body is collected (at most
     /// [`MAX_ANSWER_LEN`] bytes), signed and put back unchanged. With `None` the response is
-    /// returned as it is. A failure answers as [`Unprovable`].
+    /// returned as it is. The answer's body digest is over the bytes sent: none for a HEAD
+    /// request, whose body the server layer drops. A failure answers as [`Unprovable`].
     pub(crate) async fn prove(
         &self,
         asked: Option<&Asked>,
@@ -193,8 +194,9 @@ impl Prover {
         let Ok(bytes) = axum::body::to_bytes(body, MAX_ANSWER_LEN).await else {
             return self.failed("the answer could not be read").into_response();
         };
+        let sent: &[u8] = if asked.method == "HEAD" { &[] } else { &bytes };
         match self
-            .header(asked, agent, request_digest, parts.status.as_u16(), &bytes)
+            .header(asked, agent, request_digest, parts.status.as_u16(), sent)
             .await
         {
             Ok(value) => {

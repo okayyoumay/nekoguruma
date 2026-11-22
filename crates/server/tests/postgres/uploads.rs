@@ -3306,6 +3306,7 @@ async fn a_signing_failure_is_an_unproved_503() {
     fx.proved(&begin, 200).await;
     assert_eq!(fx.sql(&count).await, "1");
     // The completion ran although its answer could not be proved; the repeat is a proved 200.
+    fx.until(&open, "finished").await;
     fx.proved(&call_of("complete", "", &open), 200).await;
     let text = logs.text();
     assert!(text.contains("could not be proved"), "{text}");
@@ -3314,6 +3315,25 @@ async fn a_signing_failure_is_an_unproved_503() {
         "the log names the target: {text}"
     );
     assert!(!text.contains(&open), "the log names the upload: {text}");
+    fx.finish().await;
+}
+
+/// Hyper sends no body for a HEAD, so the proof is over zero answer bytes, which is what the agent
+/// reads and hashes.
+#[tokio::test]
+async fn a_head_status_is_proved_over_zero_answer_bytes() {
+    let fx = Fx::new(With::Fake).await;
+    let open = fx
+        .row(&fx.job().await, 1, "result", 10, "open", PART_BYTES as i64)
+        .await;
+    let call = Call {
+        method: "HEAD",
+        ..call_of("status", "", &open)
+    };
+    let (nonce, r) = fx.nonced(&call, &[]).await;
+    assert!(r.body.is_empty(), "a HEAD answer has a body: {}", r.body);
+    // The agent's transcript is built from the empty body it received.
+    fx.assert_proved_for(nonce, "HEAD", &call.target, "", 200, &r);
     fx.finish().await;
 }
 

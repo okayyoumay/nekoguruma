@@ -27,6 +27,15 @@ Working rules:
   wrapper -> `*-service` for the worker crates), naming, error types, and
   the design-document section citations (e.g. `// 7.3`) used nearby. Look at
   a neighbouring file in the same crate before inventing a pattern.
+- Share a step, never copy it (ADR-397). When the change needs a step that
+  existing code already performs (a query, a check, a mapping of errors to
+  answers, a token or retry holder, a test helper), extract that code into
+  one function both callers use, whether or not the brief names the
+  existing code, and even when it names it only as a reference. If the
+  extraction would change a file outside the brief, do not copy the step:
+  stop, and report the step, the file it lives in and the extraction it
+  needs. A copy stays only when the existing code cannot be called from the
+  new path; say why in the report.
 - Write or update tests with the change, even if the brief did not say
   "test".
 - Tests also run on Windows in CI with `-D warnings`. Keep in mind the

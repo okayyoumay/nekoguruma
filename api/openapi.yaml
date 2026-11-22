@@ -696,8 +696,7 @@ paths:
       tags: [agents]
       summary: Begin an upload of a job's object (5.2, 14.3, ADR-493)
       description: |
-        The first of the four data-channel routes (this one, the part URL and the status are
-        served; the completion is planned). The agent presents its session token (the one of
+        The first of the four data-channel routes (all four are served). The agent presents its session token (the one of
         `/v1/agent/session`) as a bearer header. Every request of these routes judges the
         token and then reads the agent's row: a missing or expired token, and a revoked or
         missing row, are all **401** (the same answer), and a revoked agent's tokens are

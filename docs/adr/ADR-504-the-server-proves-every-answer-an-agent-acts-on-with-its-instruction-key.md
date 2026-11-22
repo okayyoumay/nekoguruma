@@ -38,6 +38,7 @@ The agent already holds the one key that the server's own signatures verify unde
 
 ## Consequences
 
+- On a data route, the nonce's and the target's 400s come after the route's own shape refusals and after begin's 413 for its declared length, so a request a route refuses for its shape is refused as before. A proof that fails after the route has done its work leaves the work done (begin's row stays) and answers an unproved 503; the agent's repeat is then answered from that work, with a proof.
 - The listener probe's first `core-windows` run (the server's listener bound with default options) refused a same-account bind of the listener's address with address reuse, so the server's listener takes no exclusive address use: item 5's first outcome. The probe keeps running there and decides again if the bind or the runner image changes.
 - A process that holds the port in the server's place (the server is down or not yet started) can no longer be sent a job's bytes, direct a download, or have a forged answer, acknowledgement or command accepted. It can refuse service and read what the agent sends before the first unproven answer: the agent's proof, a token that died with the server that issued it, and one request body. Design 14.4 uses the same "in the server's place" wording.
 - A proved "revoked" answer is not built: on the local profile a revoked agent's answer is a 401 like an expired token's and carries no proof, so the agent cannot yet tell revocation from an impostor. Erasure on revocation depends on it and is a backlog item.

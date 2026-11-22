@@ -37,12 +37,15 @@
 
 use std::time::Duration;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use futures_util::{SinkExt, StreamExt};
+use hyper::header::HeaderName;
 use shared_proto::{
     AgentEventMessage, AgentMessage, CLOSE_CODE_BINARY, CLOSE_CODE_GOING_AWAY, CLOSE_CODE_IDLE,
     CLOSE_CODE_PROTOCOL, CLOSE_CODE_REPLACED, CLOSE_CODE_REVOKED, CLOSE_CODE_TOO_BIG,
     CONTROL_SUBPROTOCOL, FailureCode, HEARTBEAT_MISSED_LIMIT, JobId, JobState,
-    MAX_CONTROL_MESSAGE_LEN, ServerMessage, close_reason,
+    MAX_CONTROL_MESSAGE_LEN, NONCE_HEADER, PROOF_HEADER, ServerMessage, close_reason,
 };
 use tokio::time::Instant;
 use tokio_tungstenite::WebSocketStream;
@@ -56,6 +59,7 @@ use super::events::{Acked, Sender};
 use super::exchange::Token;
 use super::gate::{Admitted, Gate, IntakeError};
 use super::{Fail, Outcome, Phase, SessionState, Stop, Wiring};
+use crate::answer_proof::Sent;
 use crate::deadline::{MarkError, Verdict};
 use crate::instruction::VerifiedInstruction;
 use crate::outbox::{Kind, OutboxError};
@@ -90,15 +94,22 @@ pub(super) type Socket = WebSocketStream<Stream>;
 pub(super) struct UpgradeFail {
     pub(super) class: &'static str,
     pub(super) status: Option<u16>,
+    /// The 101 carried no valid proof (ADR-504): the loop backs off to the cap.
+    pub(super) unproven: bool,
 }
 
 fn fail(class: &'static str, status: Option<u16>) -> UpgradeFail {
-    UpgradeFail { class, status }
+    UpgradeFail {
+        class,
+        status,
+        unproven: false,
+    }
 }
 
-/// Opens the WebSocket (D). The request has `Host` from the record, the bearer token and the
-/// subprotocol, and no `Origin` and no extensions; the bounds are 5 seconds to connect and 30 in
-/// all.
+/// Opens the WebSocket (D). The request has `Host` from the record, the bearer token, a fresh
+/// `Ngr-Nonce` and the subprotocol, and no `Origin` and no extensions; the bounds are 5 seconds
+/// to connect and 30 in all. The 101 is taken only with the server's answer proof (ADR-504): an
+/// unproven one is dropped with its socket before a frame is written or read.
 pub(super) async fn upgrade(w: &Wiring, token: &Token) -> Result<Socket, UpgradeFail> {
     let (connect_by, deadline) =
         server_http::deadlines(Instant::now(), server_http::Timeouts::default());
@@ -111,8 +122,10 @@ pub(super) async fn upgrade(w: &Wiring, token: &Token) -> Result<Socket, Upgrade
     let uri: http::Uri = format!("ws://{}{CONTROL_PATH}", w.host)
         .parse()
         .map_err(|_| fail("upgrade-request", None))?;
+    let nonce = (w.random)().map_err(|_| fail("upgrade-random", None))?;
     let request = ClientRequestBuilder::new(uri)
         .with_header("Authorization", format!("Bearer {}", token.as_str()))
+        .with_header(NONCE_HEADER, STANDARD.encode(nonce))
         .with_sub_protocol(CONTROL_SUBPROTOCOL);
     let config = WebSocketConfig::default()
         .max_message_size(Some(MAX_CONTROL_MESSAGE_LEN))
@@ -120,7 +133,30 @@ pub(super) async fn upgrade(w: &Wiring, token: &Token) -> Result<Socket, Upgrade
     let handshake = tokio_tungstenite::client_async_with_config(request, stream, Some(config));
     match tokio::time::timeout_at(deadline, handshake).await {
         Err(_) => Err(fail("upgrade-transport", None)),
-        Ok(Ok((socket, _response))) => Ok(socket),
+        Ok(Ok((socket, response))) => {
+            let proof = server_http::single_text(
+                response.headers(),
+                &HeaderName::from_static(PROOF_HEADER),
+            );
+            let sent = Sent {
+                nonce,
+                method: "GET",
+                target: CONTROL_PATH,
+                body: &[],
+            };
+            if w.verifier
+                .proved(&sent, response.status().as_u16(), &[], proof.as_deref())
+            {
+                Ok(socket)
+            } else {
+                // Dropping the socket closes the connection without a frame.
+                Err(UpgradeFail {
+                    class: "upgrade-unproven",
+                    status: Some(response.status().as_u16()),
+                    unproven: true,
+                })
+            }
+        }
         Ok(Err(error)) => Err(upgrade_error(&error)),
     }
 }

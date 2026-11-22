@@ -573,6 +573,26 @@ connect`, above) loads the agent key and passes it in.
   TCP stream to `127.0.0.1:<port>` with the limits of `register` (5 seconds to connect, 30 in all);
   messages and frames are limited to 131072 bytes. A first 401 on the session route takes a new
   challenge at once; a second ends the attempt.
+- **The server's answer proof** (design 6.4, 14.4; ADR-504). The agent takes two answers as results
+  only with `Ngr-Server-Proof`, one value that verifies under the registration record's
+  instruction key for this agent, the record's origin and the request it made: the session
+  route's 200 and the upgrade's 101. The upgrade request carries `Ngr-Nonce`, a fresh 32-byte
+  nonce from the agent's random source in padded base64, with the bearer token and the
+  subprotocol unchanged; the session route sends no such header, since the nonce of its body is
+  the proof's. The 200's proof is checked against the exact body bytes sent and received before
+  the body is parsed; the 101's against the empty body and the 101's status. A challenge answer
+  and every other status are classed by their status as before, with or without a proof, and
+  none is checked. An answer without a valid proof (the header missing, twice, not the canonical
+  text of 64 bytes, another key, nonce, request or status) is treated as no answer at all: the
+  class `session-unproven` or `upgrade-unproven`, and the attempt waits the 60-second cap. So is a
+  session 200 whose body is over 4096 bytes or is cut before its end, even if the server proved
+  it. A nonce the agent could not draw for the upgrade is not unproven: it is the class
+  `upgrade-random`, an ordinary failure at the short back-off, and nothing is sent. An unproven 200 is never parsed, so no token is taken and
+  nothing follows it. An unproven 101 is dropped with its socket before the agent writes or
+  reads a frame, so a `hello`, an `eventAck` or a command the peer writes behind it changes
+  nothing: the outbox, the received-jobs ledger, the intake and the counters stay as they were,
+  and the phase never reaches `hello`. No build option or setting waives the check. A server
+  whose instruction key was replaced fails it on every attempt until the agent registers again.
 - **Connected**, the agent sends `{"type":"heartbeat"}` at `hello` plus each multiple of the
   interval the `hello` gave, and ends the connection with Close 4003 when no frame has arrived
   for three intervals. Every frame received counts, pings and pongs included; a heartbeat it
@@ -636,7 +656,7 @@ connect`, above) loads the agent key and passes it in.
   before an attempt, is found corrupt (`Handle::ended()` is `OutboxUnusable` or `LedgerUnusable`; `connect` exits 1), and a stop. Every
   answer of the server, a 403, a 429 and Close 4002 included, is retried, and nothing is erased.
   The delay before the next attempt starts at 1 second and doubles after every wait, up to 60
-  seconds; 403, a 429 on the session route, and Close 4001 or 4002 set it to 60 seconds at once.
+  seconds; 403, a 429 on the session route, an unproven answer and Close 4001 or 4002 set it to 60 seconds at once.
   A 429 on the challenge route with a `Retry-After` of 1 to 60 seconds waits the longer of the two.
   A connection that received frames for at least 60 seconds after its `hello` sets the delay back
   to 1 second when it ends, unless it ended with 4001 or 4002. The first attempt starts at once,
@@ -645,7 +665,8 @@ connect`, above) loads the agent key and passes it in.
   (at most 10 seconds to write it and 5 to read the answer); a stop during a heartbeat write
   drops the connection.
 - **Logging**: one `info` line when the connection is up and one when it ends, with the close
-  code the server sent; one `warn` per failure class until the next `hello`, and one per refusal
+  code the server sent; one `warn` per failure class (an unproven answer is `session-unproven`
+  or `upgrade-unproven`, with fixed words that name both causes) until the next `hello`, and one per refusal
   until a session token is issued again, with `debug` for the repeats ("Entries with a rule of
   their own" in `operational-log.md`). The WebSocket library turns a Close code it does not
   accept (2000, for example) into 1002 before the agent reads it, so such a close is logged as
@@ -909,7 +930,7 @@ The `agent` library's `fetch` module is the download leg of the data channel (de
 - **One attempt.** The cache first (a hit sends nothing and exchanges no token); then the token, exchanged only now, by the fetcher's own exchange through `control::exchange` (the token holder and its log, `crate::data_token`, are shared with the uploader) (a 401 from the route drops it, exchanges once more and repeats once; a second 401 is a retry) and dropped when the call ends; then the route's strict answer (`{url, expiresInSecs}`, at most 64 KiB, no unknown member) and the part URL's host rule; then `uploader::http::Client::get`; then the digest check and the rename.
 - **The GET.** No `Authorization` and no redirect. The body is read only for a 200 with exactly one canonical `Content-Length` (digits only, no leading zero, no `Transfer-Encoding`) of at most the kind's bound: a document at most 16 MiB (`shared_proto::MAX_DOCUMENT_BYTES`, which the later document-store route shares), an artifact at most 4 GiB. It is written on a blocking thread through a bounded channel into a temporary file while it is hashed, so memory does not depend on its size. The clock is the 30-second no-progress one; there is no total. A body cut short fails the attempt, and bytes past the declared length are never read. A completed write counts as progress as a byte on the socket does, so a slow disk that keeps taking bytes is not a stalled connection; a write that blocks for 30 seconds is. There is no minimum rate: a slow download that keeps moving is bounded only by the caller (ADR-497).
 - **The cache** (`fetch::store`, the **Object cache** of the glossary). `<state>/objects/documents/<hex>`, `<state>/objects/artifacts/<hex>` and `<state>/objects/tmp/<random>`, all owner-only (the directories 0700 on Unix, the temporary files 0600). `ObjectStore::open` takes the directory lock `objects.lock` (a second process is refused, `InUse`) and then sweeps `tmp/`, so a live download is never swept; an entry the sweep cannot remove is warned about once and the sweep goes on. A dropped download's file is deleted, retried briefly on a thread of its own where the writer still holds it. A matching download is synced, renamed to its digest and the directory is synced; a file is never written in place. Every load opens the name without following a link (and without blocking on a pipe) and judges the kind on the opened file, then hashes it against the expected digest (a document's bytes are read within the bound; an artifact is hashed in chunks and its path returned, which its reader hashes again) and deletes one that differs or is over the bound, warning once per kind and fetching again. A name that is not a regular file (a directory, a link) or a file that cannot be read is a local failure and nothing is deleted. Nothing evicts the cache.
-- **Classes.** Each attempt ends in `Fetched` or one `FetchError`: `Retry` (a failed exchange, which includes `ExchangeRefused` (403 or 429 from the session route), taking the back-off to its cap as the uploader's does; no answer, a cut, no progress, a 3xx, 408, 429, 502, 503 or 504 from the route, a URL that breaks the host rule, a refused connect, a GET status that is not 200 with a new URL asked for next time, and a `Retry-After` kept only for 429 and 503), `Refused` (400, 404, 413, 500, another 4xx or an answer the route does not promise; a 200 with no usable length), `Local` (the disk, a bad cached name), `Mismatch` (the full body's digest differs from the instruction's hash; the temporary file is deleted and one more attempt is allowed) and `MismatchTwice` (the second in a row for the object: it fails until the agent restarts), and `NotNamed`. The library classes; the caller bounds the retries.
+- **Classes.** Each attempt ends in `Fetched` or one `FetchError`: `Retry` (a failed exchange, which includes `ExchangeRefused` (403 or 429 from the session route, and also a session answer the server did not prove; it is retried at the cap and never reported as a refusal by its class), taking the back-off to its cap as the uploader's does; no answer, a cut, no progress, a 3xx, 408, 429, 502, 503 or 504 from the route, a URL that breaks the host rule, a refused connect, a GET status that is not 200 with a new URL asked for next time, and a `Retry-After` kept only for 429 and 503), `Refused` (400, 404, 413, 500, another 4xx or an answer the route does not promise; a 200 with no usable length), `Local` (the disk, a bad cached name), `Mismatch` (the full body's digest differs from the instruction's hash; the temporary file is deleted and one more attempt is allowed) and `MismatchTwice` (the second in a row for the object: it fails until the agent restarts), and `NotNamed`. The library classes; the caller bounds the retries.
 - **Logging.** The loop writes the kind, the class, a fixed word and the HTTP status, never a URL, a token, a digest or a body (`operational-log.md`).
 
 ### Debug commands

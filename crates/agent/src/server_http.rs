@@ -18,9 +18,10 @@ use std::time::Duration;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use hyper::client::conn::http1;
-use hyper::header::{CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, RETRY_AFTER};
+use hyper::header::{CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, HeaderName, RETRY_AFTER};
 use hyper::{HeaderMap, Method};
 use hyper_util::rt::TokioIo;
+use shared_proto::PROOF_HEADER;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
@@ -84,6 +85,9 @@ pub struct Reply {
     pub retry_after: Option<String>,
     /// Exactly one Content-Type, whose media type is `application/json` (parameters allowed).
     pub json_content_type: bool,
+    /// The single `Ngr-Server-Proof` value (ADR-504), when the answer has exactly one that is
+    /// text; two values are read as none.
+    pub proof: Option<String>,
     /// The body, read only when the status is the one the caller asked for.
     pub body: Option<ReplyBody>,
 }
@@ -94,6 +98,9 @@ pub enum ReplyBody {
     Bytes(Vec<u8>),
     /// More than [`MAX_BODY`] bytes: declared or arrived. The bytes are not kept.
     TooLarge,
+    /// The connection ended or failed before the body's end. The status and headers did arrive;
+    /// a body that is only late is [`PostError::Unknown`].
+    Cut,
 }
 
 /// Why no answer came back.
@@ -104,7 +111,7 @@ pub enum PostError {
     /// The connect did not finish in time: nothing was sent.
     ConnectTimeout,
     /// The request may have been sent and no complete answer came: a time out, a reset, a head
-    /// over the limits, an answer that is not HTTP, or a body that is cut or late.
+    /// over the limits, an answer that is not HTTP, or a body that is late.
     Unknown,
 }
 
@@ -117,11 +124,11 @@ impl Drop for Driver {
     }
 }
 
-/// Sends `request` and returns the answer. The body is read only when the status is
-/// `body_status`.
+/// Sends `request` and returns the answer. The body is read only when the status is one of
+/// `body_statuses`.
 pub async fn post(
     request: &PostRequest<'_>,
-    body_status: u16,
+    body_statuses: &[u16],
     timeouts: Timeouts,
 ) -> Result<Reply, PostError> {
     // One deadline from before the connect: the connect within its limit, everything within the
@@ -134,7 +141,7 @@ pub async fn post(
         Ok(Err(error)) => return Err(PostError::NotSent(error.kind())),
         Ok(Ok(stream)) => stream,
     };
-    post_over(stream, request, body_status, deadline).await
+    post_over(stream, request, body_statuses, deadline).await
 }
 
 /// Sends `request` over `stream`, which the caller opened, and returns the answer, with
@@ -143,13 +150,13 @@ pub async fn post(
 pub async fn post_over<S>(
     stream: S,
     request: &PostRequest<'_>,
-    body_status: u16,
+    body_statuses: &[u16],
     deadline: Instant,
 ) -> Result<Reply, PostError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    tokio::time::timeout_at(deadline, exchange(stream, request, body_status))
+    tokio::time::timeout_at(deadline, exchange(stream, request, body_statuses))
         .await
         .unwrap_or(Err(PostError::Unknown))
 }
@@ -173,7 +180,7 @@ pub(crate) fn deadlines(start: Instant, timeouts: Timeouts) -> (Instant, Instant
 async fn exchange<S>(
     stream: S,
     request: &PostRequest<'_>,
-    body_status: u16,
+    body_statuses: &[u16],
 ) -> Result<Reply, PostError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -203,7 +210,8 @@ where
     let headers = response.headers();
     let retry_after = single_text(headers, &RETRY_AFTER);
     let json_content_type = is_json(headers);
-    let body = if status == body_status {
+    let proof = single_text(headers, &HeaderName::from_static(PROOF_HEADER));
+    let body = if body_statuses.contains(&status) {
         Some(read_body(response).await?)
     } else {
         None
@@ -212,6 +220,7 @@ where
         status,
         retry_after,
         json_content_type,
+        proof,
         body,
     })
 }
@@ -227,7 +236,9 @@ async fn read_body(
     let mut body = response.into_body();
     let mut bytes = Vec::new();
     while let Some(frame) = body.frame().await {
-        let frame = frame.map_err(|_| PostError::Unknown)?;
+        let Ok(frame) = frame else {
+            return Ok(ReplyBody::Cut);
+        };
         if let Ok(data) = frame.into_data() {
             if bytes.len() + data.len() > MAX_BODY {
                 return Ok(ReplyBody::TooLarge);
@@ -239,7 +250,7 @@ async fn read_body(
 }
 
 /// The header's value when the answer has exactly one and it is text.
-pub(crate) fn single_text(headers: &HeaderMap, name: &hyper::header::HeaderName) -> Option<String> {
+pub(crate) fn single_text(headers: &HeaderMap, name: &HeaderName) -> Option<String> {
     let mut values = headers.get_all(name).iter();
     let (Some(value), None) = (values.next(), values.next()) else {
         return None;
@@ -326,7 +337,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap()
-            .block_on(post(&request(port), body_status, timeouts))
+            .block_on(post(&request(port), &[body_status], timeouts))
     }
 
     #[test]
@@ -342,6 +353,33 @@ mod tests {
         assert_eq!(reply.status, 201);
         assert!(reply.json_content_type);
         assert_eq!(reply.body, Some(ReplyBody::Bytes(b"{}".to_vec())));
+    }
+
+    #[test]
+    fn the_proof_header_is_one_text_value_and_two_values_are_none() {
+        let one = stub(|mut s| {
+            s.write_all(
+                b"HTTP/1.1 201 Created\r\nNgr-Server-Proof: abc\r\nContent-Length: 0\r\n\r\n",
+            )
+            .unwrap();
+        });
+        let two = stub(|mut s| {
+            s.write_all(
+                b"HTTP/1.1 201 Created\r\nNgr-Server-Proof: abc\r\nNgr-Server-Proof: abc\r\n\
+                  Content-Length: 0\r\n\r\n",
+            )
+            .unwrap();
+        });
+        let none = stub(|mut s| {
+            s.write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+        });
+        assert_eq!(
+            run(one, 201, Timeouts::default()).unwrap().proof.as_deref(),
+            Some("abc")
+        );
+        assert_eq!(run(two, 201, Timeouts::default()).unwrap().proof, None);
+        assert_eq!(run(none, 201, Timeouts::default()).unwrap().proof, None);
     }
 
     /// The body of another status is not read: the answer's head alone decides.
@@ -427,6 +465,22 @@ mod tests {
         }
     }
 
+    /// A body cut by the end of the connection is reported with the status and headers that
+    /// came before it.
+    #[test]
+    fn a_body_cut_by_the_connection_is_cut_with_its_status() {
+        let port = stub(|mut s| {
+            s.write_all(
+                b"HTTP/1.1 201 Created\r\nNgr-Server-Proof: abc\r\nContent-Length: 10\r\n\r\nabc",
+            )
+            .unwrap();
+        });
+        let reply = run(port, 201, Timeouts::default()).unwrap();
+        assert_eq!(reply.status, 201);
+        assert_eq!(reply.proof.as_deref(), Some("abc"));
+        assert_eq!(reply.body, Some(ReplyBody::Cut));
+    }
+
     #[test]
     fn a_retry_after_is_usable_from_1_to_60_in_digits() {
         for (text, secs) in [("1", 1), ("17", 17), ("60", 60), ("007", 7)] {
@@ -502,15 +556,7 @@ mod tests {
     }
 
     #[test]
-    fn a_cut_body_a_reset_a_big_head_and_a_non_http_answer_are_unknown() {
-        let cut = stub(|mut s| {
-            s.write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 10\r\n\r\nabc")
-                .unwrap();
-        });
-        assert_eq!(
-            run(cut, 201, Timeouts::default()).unwrap_err(),
-            PostError::Unknown
-        );
+    fn a_reset_a_big_head_and_a_non_http_answer_are_unknown() {
         let reset = stub(drop);
         assert_eq!(
             run(reset, 201, Timeouts::default()).unwrap_err(),

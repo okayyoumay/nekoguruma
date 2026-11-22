@@ -91,6 +91,18 @@ impl SharedOutbox {
         reopened.unwrap_or_else(|_| Err(task_failed()))
     }
 
+    /// The numbers of the events still pending, for a test that checks nothing was acknowledged.
+    #[cfg(test)]
+    pub(super) async fn pending_for_test(&self) -> Vec<u64> {
+        self.inner
+            .outbox
+            .lock()
+            .await
+            .pending()
+            .map(|(seq, _)| seq)
+            .collect()
+    }
+
     #[cfg(test)]
     pub(super) async fn is_poisoned_for_test(&self) -> bool {
         self.inner.outbox.lock().await.is_poisoned()

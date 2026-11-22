@@ -40,10 +40,11 @@ use tokio_tungstenite::tungstenite::{self, Message};
 use tracing_subscriber::fmt::MakeWriter;
 
 use super::backoff::{self, Backoff};
-use super::channel::{self, HEARTBEAT};
+use super::channel::{self, CONTROL_PATH, HEARTBEAT};
 use super::dial::{Dial, Dialled, Stream};
 use super::exchange::{CHALLENGE_PATH, SESSION_PATH};
 use super::*;
+use crate::answer_proof::TestProver;
 use crate::deadline::{Clock, IssueMark};
 use crate::identity::load_or_create;
 use crate::identity::store::{MemoryStore, SecretName};
@@ -213,6 +214,7 @@ impl Dial for FakeDial {
 // The state directory, the record and the key
 
 struct Fixture {
+    origin: String,
     dir: tempfile::TempDir,
     key: Arc<SigningKey>,
     /// The key whose public half the record names as the instruction key.
@@ -248,6 +250,7 @@ impl Fixture {
         let key = Arc::new(SigningKey::generate().unwrap());
         let instruction = Arc::new(SigningKey::generate().unwrap());
         let fixture = Fixture {
+            origin: origin.to_owned(),
             dir,
             key,
             instruction,
@@ -262,6 +265,12 @@ impl Fixture {
 
     fn new() -> Fixture {
         Fixture::with_origin(ORIGIN)
+    }
+
+    /// The server's side of the answer proof: signs with the key the record names as the
+    /// instruction key.
+    fn prover(&self) -> TestProver {
+        TestProver::new(self.instruction.clone(), &self.origin, AGENT_ID)
     }
 
     fn control_dir(&self) -> PathBuf {
@@ -493,19 +502,44 @@ struct Env {
 
 type Ws = WebSocketStream<DuplexStream>;
 
-/// What the upgrade request carried.
+/// What the upgrade request carried, and the proofs the fake server put on its 101.
 #[derive(Default, Clone)]
 struct Seen {
     path: String,
     headers: Vec<(String, String)>,
+    proofs: Vec<String>,
 }
 
 impl Seen {
+    /// The upgrade's nonce and the 101's proofs: values the log must not hold.
+    fn secrets(&self) -> Vec<String> {
+        self.header("ngr-nonce")
+            .into_iter()
+            .map(str::to_owned)
+            .chain(self.proofs.iter().cloned())
+            .collect()
+    }
+
     fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
             .find(|(key, _)| key == name)
             .map(|(_, value)| value.as_str())
+    }
+}
+
+/// A session request as the fake server read it: its JSON and the exact bytes, which the server's
+/// proof of the answer covers.
+struct Session {
+    json: serde_json::Value,
+    raw: Vec<u8>,
+}
+
+impl std::ops::Index<&str> for Session {
+    type Output = serde_json::Value;
+
+    fn index(&self, index: &str) -> &serde_json::Value {
+        &self.json[index]
     }
 }
 
@@ -719,7 +753,7 @@ impl Env {
 
     /// The session request for `challenge`, checked: the agent ID, the challenge and a proof that
     /// verifies. Returns the stream to answer on and the body.
-    async fn session(&mut self, challenge: [u8; 32]) -> (Instant, DuplexStream, serde_json::Value) {
+    async fn session(&mut self, challenge: [u8; 32]) -> (Instant, DuplexStream, Session) {
         let (at, stream, req) = self.request().await;
         assert!(
             req.is_post(SESSION_PATH),
@@ -750,11 +784,22 @@ impl Env {
             4,
             "the body has four properties"
         );
-        (at, stream, body)
+        assert!(
+            req.header("ngr-nonce").is_none(),
+            "the session route reads no nonce header"
+        );
+        (
+            at,
+            stream,
+            Session {
+                json: body,
+                raw: req.body,
+            },
+        )
     }
 
     /// Challenge and session request, up to the point where the session route answers.
-    async fn until_session(&mut self) -> (Instant, DuplexStream, serde_json::Value) {
+    async fn until_session(&mut self) -> (Instant, DuplexStream, Session) {
         let (_, challenge) = self.challenge().await;
         self.session(challenge).await
     }
@@ -764,20 +809,46 @@ impl Env {
         let (at, challenge) = self.challenge().await;
         let (_, mut stream, body) = self.session(challenge).await;
         let token = token_text();
-        json_reply(&mut stream, 200, &token_body(&token)).await;
+        let server_proof = self
+            .proved_reply(&mut stream, &body, 200, &token_body(&token))
+            .await;
         let secrets = ["challenge", "nonce", "proof"]
             .iter()
             .map(|name| body[name].as_str().unwrap().to_owned())
-            .chain([token.clone()])
+            .chain([token.clone(), server_proof])
             .collect();
         Exchanged { at, token, secrets }
     }
 
-    /// The upgrade: the fake server accepts the WebSocket handshake and picks the subprotocol.
+    /// The answer to the session request `session`, with the server's proof of it, which is
+    /// returned.
+    async fn proved_reply(
+        &self,
+        stream: &mut DuplexStream,
+        session: &Session,
+        status: u16,
+        body: &str,
+    ) -> String {
+        proved_reply(&self.fx.prover(), stream, session, status, body).await
+    }
+
+    /// The upgrade: the fake server accepts the WebSocket handshake, picks the subprotocol and
+    /// proves its 101.
     async fn upgrade(&mut self) -> (Instant, Ws, Seen) {
+        let prover = self.fx.prover();
+        self.upgrade_with(|request| vec![upgrade_proof(&prover, request)])
+            .await
+    }
+
+    /// [`Env::upgrade`] with the `Ngr-Server-Proof` values of the 101 that `proofs` gives for the
+    /// request: none, one that is wrong, or two.
+    async fn upgrade_with(
+        &mut self,
+        proofs: impl FnOnce(&Request) -> Vec<String> + Unpin,
+    ) -> (Instant, Ws, Seen) {
         let (at, stream) = self.conn().await;
         let seen = Arc::new(Mutex::new(Seen::default()));
-        let ws = accept_ws(stream, seen.clone()).await;
+        let ws = accept_ws_with(stream, seen.clone(), proofs).await;
         let seen = seen.lock().unwrap().clone();
         (at, ws, seen)
     }
@@ -916,10 +987,70 @@ fn token_body(token: &str) -> String {
     format!(r#"{{"token":"{token}","expiresInSecs":3600}}"#)
 }
 
+/// A JSON answer to the session request `session` that carries the server's proof of it, which
+/// is returned.
+async fn proved_reply<S: AsyncWrite + Unpin>(
+    prover: &TestProver,
+    stream: &mut S,
+    session: &Session,
+    status: u16,
+    body: &str,
+) -> String {
+    let proof = prover.proof_of_request(
+        "POST",
+        SESSION_PATH,
+        None,
+        &session.raw,
+        status,
+        body.as_bytes(),
+    );
+    reply(
+        stream,
+        status,
+        &[
+            ("Content-Type", "application/json"),
+            ("Ngr-Server-Proof", &proof),
+        ],
+        body.as_bytes(),
+    )
+    .await;
+    proof
+}
+
+/// The proof of the 101 for the upgrade request `request`, which carries the agent's nonce.
+fn upgrade_proof(prover: &TestProver, request: &Request) -> String {
+    let nonce = request
+        .headers()
+        .get("ngr-nonce")
+        .expect("the upgrade carries a nonce")
+        .to_str()
+        .unwrap();
+    prover.proof_of_request(
+        "GET",
+        request.uri().path_and_query().unwrap().as_str(),
+        Some(nonce),
+        &[],
+        101,
+        &[],
+    )
+}
+
 // ---------------------------------------------------------------------------------------------
 // The fake server: WebSocket
 
-async fn accept_ws<S>(stream: S, seen: Arc<Mutex<Seen>>) -> WebSocketStream<S>
+async fn accept_ws<S>(stream: S, seen: Arc<Mutex<Seen>>, prover: &TestProver) -> WebSocketStream<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    accept_ws_with(stream, seen, |request| vec![upgrade_proof(prover, request)]).await
+}
+
+/// Accepts the handshake with the `Ngr-Server-Proof` values `proofs` gives for the request.
+async fn accept_ws_with<S>(
+    stream: S,
+    seen: Arc<Mutex<Seen>>,
+    proofs: impl FnOnce(&Request) -> Vec<String> + Unpin,
+) -> WebSocketStream<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -929,6 +1060,7 @@ where
     )]
     let callback =
         move |request: &Request, mut response: Response| -> Result<Response, ErrorResponse> {
+            let proofs = proofs(request);
             *seen.lock().unwrap() = Seen {
                 path: request.uri().path().to_owned(),
                 headers: request
@@ -941,11 +1073,17 @@ where
                         )
                     })
                     .collect(),
+                proofs: proofs.clone(),
             };
             response.headers_mut().insert(
                 "Sec-WebSocket-Protocol",
                 HeaderValue::from_static(CONTROL_SUBPROTOCOL),
             );
+            for proof in proofs {
+                response
+                    .headers_mut()
+                    .append("Ngr-Server-Proof", HeaderValue::from_str(&proof).unwrap());
+            }
             Ok(response)
         };
     tokio::time::timeout(
@@ -1176,7 +1314,7 @@ enum Got {
     Eof,
 }
 
-async fn got(ws: &mut Ws) -> (Instant, Got) {
+async fn got<S: AsyncRead + AsyncWrite + Unpin>(ws: &mut WebSocketStream<S>) -> (Instant, Got) {
     let next = tokio::time::timeout(DEADLINE, ws.next())
         .await
         .expect("the agent sent nothing in time");
@@ -1948,9 +2086,10 @@ async fn c1_a_valid_token_leads_to_the_upgrade_and_clears_the_refusal_flag() {
     env.wait_phase(Phase::Waiting).await;
     assert_eq!(env.log.warns("control channel refused"), 1);
     // A valid answer: the upgrade follows at once, and nothing is scheduled by `expiresInSecs`.
-    let (second, mut stream, _) = env.until_session().await;
+    let (second, mut stream, session) = env.until_session().await;
     assert_after(first, second, 60, "after the refusal's cap");
-    json_reply(&mut stream, 200, &token_body(&token_text())).await;
+    env.proved_reply(&mut stream, &session, 200, &token_body(&token_text()))
+        .await;
     let (third, mut stream, req) = env.request().await;
     assert_after(second, third, 0, "the upgrade follows at once");
     assert_eq!(req.method, "GET");
@@ -2009,12 +2148,20 @@ async fn c2_an_invalid_session_answer_is_an_ordinary_failure_and_the_token_is_no
     ];
     let mut times = Vec::new();
     for (_, content_type, body) in &cases {
-        let (at, mut stream, _) = env.until_session().await;
+        let (at, mut stream, session) = env.until_session().await;
         times.push(at);
+        let proof = env.fx.prover().proof_of_request(
+            "POST",
+            SESSION_PATH,
+            None,
+            &session.raw,
+            200,
+            body.as_bytes(),
+        );
         reply(
             &mut stream,
             200,
-            &[("Content-Type", content_type)],
+            &[("Content-Type", content_type), ("Ngr-Server-Proof", &proof)],
             body.as_bytes(),
         )
         .await;
@@ -2043,7 +2190,8 @@ async fn c3_the_first_401_gets_a_new_challenge_nonce_and_proof_at_once() {
     assert!(first["challenge"] != second["challenge"], "a new challenge");
     assert!(first["proof"] != second["proof"], "a new proof");
     assert_eq!(env.status().next_delay, secs(1), "the delay is untouched");
-    json_reply(&mut stream, 200, &token_body(&token_text())).await;
+    env.proved_reply(&mut stream, &second, 200, &token_body(&token_text()))
+        .await;
     let (_, _, req) = env.request().await;
     assert_eq!(req.method, "GET");
 }
@@ -2373,9 +2521,10 @@ impl Env {
     /// An exchange whose token is given after `flag` was set.
     async fn exchange_then(&mut self, flag: &AtomicBool) -> Instant {
         let (at, challenge) = self.challenge().await;
-        let (_, mut stream, _) = self.session(challenge).await;
+        let (_, mut stream, session) = self.session(challenge).await;
         flag.store(true, Ordering::SeqCst);
-        json_reply(&mut stream, 200, &token_body(&token_text())).await;
+        self.proved_reply(&mut stream, &session, 200, &token_body(&token_text()))
+            .await;
         at
     }
 }
@@ -3655,7 +3804,7 @@ fn j_the_session_reads_no_wall_clock() {
 async fn l_one_info_line_at_hello_and_one_at_the_end_and_no_secret_is_logged() {
     let mut env = Env::new();
     let exchanged = env.exchange().await;
-    let (_, mut ws, _) = env.upgrade().await;
+    let (_, mut ws, seen) = env.upgrade().await;
     send(&mut ws, &hello(10)).await;
     env.wait_phase(Phase::Connected).await;
     send(&mut ws, &job_command("command-id-that-must-not-be-logged")).await;
@@ -3676,7 +3825,8 @@ async fn l_one_info_line_at_hello_and_one_at_the_end_and_no_secret_is_logged() {
             .count(),
         1
     );
-    for secret in exchanged.secrets.iter().map(String::as_str).chain([
+    let secrets = [exchanged.secrets, seen.secrets()].concat();
+    for secret in secrets.iter().map(String::as_str).chain([
         "command-id-that-must-not-be-logged",
         "reason-text-that-must-not-be-logged",
         "c2lnbmVk",
@@ -3835,8 +3985,9 @@ async fn append_in_phase_then_hello(phase: &str) {
         "exchange" => {
             let (_, challenge) = env.challenge().await;
             env.append("received").await;
-            let (_, mut stream, _) = env.session(challenge).await;
-            json_reply(&mut stream, 200, &token_body(&token_text())).await;
+            let (_, mut stream, session) = env.session(challenge).await;
+            env.proved_reply(&mut stream, &session, 200, &token_body(&token_text()))
+                .await;
             env.upgrade().await.1
         }
         "upgrade" => {
@@ -4967,7 +5118,11 @@ fn real_fixture(port: u16) -> (Fixture, crate::identity::AgentKey, Arc<SigningKe
     let agent = agent_key_for(&signing);
     let origin = format!("http://127.0.0.1:{port}");
     let fx = Fixture::with_origin(&origin);
-    fx.write(&record_for(&agent.public_key(), &origin));
+    fx.write(&record_with(
+        &agent.public_key(),
+        &origin,
+        &fx.instruction.public_key(),
+    ));
     (fx, agent, signing)
 }
 
@@ -4982,11 +5137,15 @@ async fn real_challenge(stream: &mut tokio::net::TcpStream) {
     .await;
 }
 
-async fn real_session(stream: &mut tokio::net::TcpStream) -> String {
+async fn real_session(stream: &mut tokio::net::TcpStream, prover: &TestProver) -> String {
     let req = read_req(stream).await;
     assert!(req.is_post(SESSION_PATH));
     let token = token_text();
-    json_reply(stream, 200, &token_body(&token)).await;
+    let session = Session {
+        json: req.json(),
+        raw: req.body,
+    };
+    proved_reply(prover, stream, &session, 200, &token_body(&token)).await;
     token
 }
 
@@ -5013,10 +5172,10 @@ async fn r1_over_real_loopback_an_exchange_an_upgrade_a_heartbeat_and_a_stop() {
         let (mut stream, _) = listener.accept().await.unwrap();
         real_challenge(&mut stream).await;
         let (mut stream, _) = listener.accept().await.unwrap();
-        let token = real_session(&mut stream).await;
+        let token = real_session(&mut stream, &fx.prover()).await;
         let (stream, _) = listener.accept().await.unwrap();
         let seen = Arc::new(Mutex::new(Seen::default()));
-        let mut ws = accept_ws(stream, seen.clone()).await;
+        let mut ws = accept_ws(stream, seen.clone(), &fx.prover()).await;
         let bearer = format!("Bearer {token}");
         assert!(seen.lock().unwrap().header("authorization") == Some(bearer.as_str()));
         // A 5 s interval gives a 15 s idle deadline in real time: a stalled CI thread does not
@@ -5079,9 +5238,9 @@ async fn r1_over_real_loopback_a_refused_connection_and_then_the_server_appears(
         let (mut stream, _) = listener.accept().await.unwrap();
         real_challenge(&mut stream).await;
         let (mut stream, _) = listener.accept().await.unwrap();
-        let _ = real_session(&mut stream).await;
+        let _ = real_session(&mut stream, &fx.prover()).await;
         let (stream, _) = listener.accept().await.unwrap();
-        let mut ws = accept_ws(stream, Arc::new(Mutex::new(Seen::default()))).await;
+        let mut ws = accept_ws(stream, Arc::new(Mutex::new(Seen::default())), &fx.prover()).await;
         ws.send(Message::Text(hello(20).into())).await.unwrap();
         status
             .wait_for(|s| s.phase == Phase::Connected)
@@ -6539,4 +6698,351 @@ async fn ledger_e6_a_stop_during_the_ledger_write_ends_as_a_stop_and_the_write_f
     send(&mut ws, &verified(&env, "a")).await;
     acked(&mut ws, "a").await;
     assert_eq!(env.intake.calls(), 0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The server's answer proof (ADR-504): the upgrade, the logging and an impostor on the port
+
+/// The ways a 101 can fail to be proved: the `Ngr-Server-Proof` values the fake server sends for
+/// the request, given the prover the agent's record names.
+type Unproved = (&'static str, fn(&TestProver, &Request) -> Vec<String>);
+
+fn unproved_101s() -> Vec<Unproved> {
+    fn other_key(_: &TestProver, request: &Request) -> Vec<String> {
+        let other = TestProver::new(Arc::new(SigningKey::generate().unwrap()), ORIGIN, AGENT_ID);
+        vec![upgrade_proof(&other, request)]
+    }
+    fn other_nonce(prover: &TestProver, _: &Request) -> Vec<String> {
+        let nonce = STANDARD.encode(shared_crypto::random_32().unwrap());
+        vec![prover.proof_of_request("GET", CONTROL_PATH, Some(&nonce), &[], 101, &[])]
+    }
+    fn other_status(prover: &TestProver, request: &Request) -> Vec<String> {
+        let nonce = request.headers()["ngr-nonce"].to_str().unwrap();
+        vec![prover.proof_of_request("GET", CONTROL_PATH, Some(nonce), &[], 200, &[])]
+    }
+    fn other_request(prover: &TestProver, request: &Request) -> Vec<String> {
+        let nonce = request.headers()["ngr-nonce"].to_str().unwrap();
+        vec![prover.proof_of_request("POST", SESSION_PATH, Some(nonce), &[], 101, &[])]
+    }
+    fn twice(prover: &TestProver, request: &Request) -> Vec<String> {
+        let proof = upgrade_proof(prover, request);
+        vec![proof.clone(), proof]
+    }
+    fn unpadded(prover: &TestProver, request: &Request) -> Vec<String> {
+        vec![
+            upgrade_proof(prover, request)
+                .trim_end_matches('=')
+                .to_owned(),
+        ]
+    }
+    vec![
+        ("missing", |_, _| Vec::new()),
+        ("another key", other_key),
+        ("another nonce", other_nonce),
+        ("another status", other_status),
+        ("another request", other_request),
+        ("two valid values", twice),
+        ("not canonical base64", unpadded),
+    ]
+}
+
+/// The phases the loop reports, from now on.
+fn watch_phases(env: &Env) -> Arc<Mutex<Vec<Phase>>> {
+    let seen = Arc::new(Mutex::new(vec![env.status().phase]));
+    let mut status = env.handle.status();
+    let log = seen.clone();
+    tokio::spawn(async move {
+        while status.changed().await.is_ok() {
+            let phase = status.borrow_and_update().phase;
+            log.lock().unwrap().push(phase);
+        }
+    });
+    seen
+}
+
+/// A 101 without a valid proof is dropped before a frame is written or read (U2), and the loop
+/// waits the cap (60 seconds) without having lived.
+#[tokio::test(start_paused = true)]
+async fn an_unproven_101_is_dropped_before_any_frame() {
+    for (name, proofs) in unproved_101s() {
+        let mut env = Env::new();
+        let phases = watch_phases(&env);
+        let exchanged = env.exchange().await;
+        let prover = env.fx.prover();
+        let (_, mut ws, seen) = env.upgrade_with(|request| proofs(&prover, request)).await;
+        env.wait_phase(Phase::Waiting).await;
+        assert_eq!(got(&mut ws).await.1, Got::Eof, "{name}: no frame");
+        assert!(
+            !phases.lock().unwrap().contains(&Phase::Hello),
+            "{name}: the loop never waited for a hello"
+        );
+        assert_eq!(env.log.warns("upgrade-unproven"), 1, "{name}");
+        assert_eq!(env.status().next_delay, secs(60), "{name}: the cap");
+        // The next attempt starts 60 seconds after the failed one, though the connection was
+        // accepted first: it did not live.
+        let (next, _, req) = env.request().await;
+        assert!(req.is_post(CHALLENGE_PATH), "{name}");
+        assert!(next >= exchanged.at + secs(60), "{name}: the cap");
+        for secret in [exchanged.token.as_str(), seen.header("ngr-nonce").unwrap()] {
+            assert!(!env.log.contains(secret), "{name}: a secret is logged");
+        }
+    }
+}
+
+/// What a peer that is not the server may write after its 101 is never read (U3).
+#[tokio::test(start_paused = true)]
+async fn frames_after_an_unproven_101_are_never_read() {
+    let mut env = Env::new();
+    env.append("received").await;
+    env.append("finished").await;
+    let pending = env.outbox().pending_for_test().await;
+    let phases = watch_phases(&env);
+    env.exchange().await;
+    let (_, mut ws, _) = env.upgrade_with(|_| Vec::new()).await;
+    let verified = verified(&env, "a");
+    for text in [
+        hello(10),
+        format!(r#"{{"type":"cancelCommand","jobId":"{JOB_ID}"}}"#),
+        format!(r#"{{"type":"hmiResponse","jobId":"{JOB_ID}","requestId":"r1"}}"#),
+        format!(r#"{{"type":"seedKeyResponse","jobId":"{JOB_ID}","requestId":"r1","key":"AAAA"}}"#),
+        ack(2),
+        verified,
+    ] {
+        // The agent may already have closed: a write that fails is the point.
+        let _ = ws.send(Message::Text(text.into())).await;
+    }
+    env.wait_phase(Phase::Waiting).await;
+    assert_eq!(
+        env.outbox().pending_for_test().await,
+        pending,
+        "no eventAck"
+    );
+    assert_eq!(env.counts(), (0, 0), "no command was answered");
+    assert_eq!(env.intake.calls(), 0, "no intake");
+    assert_eq!(
+        env.ledger.as_ref().unwrap().jobs(),
+        0,
+        "the received-jobs ledger is untouched"
+    );
+    let phases = phases.lock().unwrap();
+    assert!(!phases.contains(&Phase::Hello) && !phases.contains(&Phase::Connected));
+}
+
+/// Each upgrade carries one nonce, fresh each time, as the canonical text of 32 bytes; the
+/// bearer token and the subprotocol are as before (U5).
+#[tokio::test(start_paused = true)]
+async fn each_upgrade_carries_a_fresh_nonce() {
+    let mut env = Env::new();
+    let mut nonces = Vec::new();
+    for _ in 0..2 {
+        let exchanged = env.exchange().await;
+        let (_, mut ws, seen) = env.upgrade().await;
+        let bearer = format!("Bearer {}", exchanged.token);
+        assert_eq!(seen.header("authorization"), Some(bearer.as_str()));
+        assert_eq!(
+            seen.header("sec-websocket-protocol"),
+            Some(CONTROL_SUBPROTOCOL)
+        );
+        let text = seen.header("ngr-nonce").expect("a nonce");
+        let bytes = STANDARD.decode(text).unwrap();
+        assert_eq!(bytes.len(), 32);
+        assert_eq!(STANDARD.encode(&bytes), text, "canonical");
+        assert_eq!(
+            seen.headers
+                .iter()
+                .filter(|(k, _)| k == "ngr-nonce")
+                .count(),
+            1,
+            "one header"
+        );
+        nonces.push(text.to_owned());
+        // End the connection so that the next attempt starts. The next dial is the next
+        // attempt's, so the loop needs no wait for `Waiting`: that phase can be over before the
+        // test looks, when the back-off ran out during the close handshake, and the test would
+        // then keep the next attempt's request unanswered until the agent gave up on it.
+        send(&mut ws, &hello(10)).await;
+        env.wait_phase(Phase::Connected).await;
+        ws.send(close_frame(Some(1000))).await.unwrap();
+        let _ = got(&mut ws).await;
+    }
+    assert_ne!(nonces[0], nonces[1], "a fresh nonce for each upgrade");
+}
+
+/// An unproven answer of a class warns once since the last hello and is debug after that (L1);
+/// the warning names both causes in fixed words (L4) and the log holds no nonce, proof, token
+/// or body (L3).
+#[tokio::test(start_paused = true)]
+async fn an_unproven_class_warns_once_per_hello() {
+    let mut env = Env::new();
+    // The session 200 without a proof, twice.
+    let mut secrets = Vec::new();
+    for _ in 0..2 {
+        let (_, mut stream, session) = env.until_session().await;
+        let token = token_text();
+        json_reply(&mut stream, 200, &token_body(&token)).await;
+        secrets.extend([
+            token,
+            session["nonce"].as_str().unwrap().to_owned(),
+            session["proof"].as_str().unwrap().to_owned(),
+        ]);
+        env.wait_phase(Phase::Waiting).await;
+    }
+    assert_eq!(env.log.warns("session-unproven"), 1);
+    assert_eq!(
+        env.log.warns("another process may hold the server's port"),
+        1
+    );
+    assert_eq!(env.log.warns("register again"), 1);
+    // The 101 without a proof, twice: its class warns once too.
+    for _ in 0..2 {
+        env.exchange().await;
+        let (_, _, seen) = env.upgrade_with(|_| Vec::new()).await;
+        secrets.push(seen.header("ngr-nonce").unwrap().to_owned());
+        env.wait_phase(Phase::Waiting).await;
+    }
+    assert_eq!(env.log.warns("upgrade-unproven"), 1);
+    assert_eq!(env.log.warns("session-unproven"), 1);
+    // A hello clears the classes: the next one warns again.
+    let (_, mut ws) = env.connected(10).await;
+    ws.send(close_frame(Some(1000))).await.unwrap();
+    let _ = got(&mut ws).await;
+    env.wait_phase(Phase::Waiting).await;
+    let (_, mut stream, session) = env.until_session().await;
+    json_reply(&mut stream, 200, &token_body(&token_text())).await;
+    env.wait_phase(Phase::Waiting).await;
+    assert_eq!(env.log.warns("session-unproven"), 2);
+    assert_eq!(env.log.warns("upgrade-unproven"), 1);
+    secrets.push(session["nonce"].as_str().unwrap().to_owned());
+    for secret in secrets {
+        assert!(!env.log.contains(&secret), "a secret is in the log");
+    }
+}
+
+/// After the cap the agent tries again, and a server that proves its answers is accepted: an
+/// unproven answer costs time only (the paused-clock twin of the impostor test).
+#[tokio::test(start_paused = true)]
+async fn an_impostor_that_goes_away_is_replaced_by_the_server_after_the_cap() {
+    let mut env = Env::new();
+    // The impostor answers the session request with a token and no proof.
+    let (failed_at, mut stream, _) = env.until_session().await;
+    json_reply(&mut stream, 200, &token_body(&token_text())).await;
+    env.wait_phase(Phase::Waiting).await;
+    // No request of any kind comes before the cap.
+    let (next, challenge) = env.challenge().await;
+    assert!(next >= failed_at + secs(60), "the agent waited the cap");
+    let (_, mut stream, session) = env.session(challenge).await;
+    env.proved_reply(&mut stream, &session, 200, &token_body(&token_text()))
+        .await;
+    let (_, mut ws, _) = env.upgrade().await;
+    send(&mut ws, &hello(10)).await;
+    env.wait_phase(Phase::Connected).await;
+}
+
+/// An impostor on a real loopback port (I1): it answers the challenge and a session 200 without
+/// a proof, and the agent never sends the upgrade; and, once a signing fake proves the session, a
+/// 101 without a proof followed by every frame it would like to be taken for is closed on without
+/// a frame, the outbox keeps its events and the loop never connects. The recovery after the cap
+/// is the paused-clock test above, not real time.
+#[tokio::test]
+async fn i1_an_impostor_on_a_real_port_gets_no_upgrade_and_no_frame_is_read() {
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (fx, agent, _) = real_fixture(port);
+    let outbox = open_outbox(&fx, None);
+    append_event(&outbox, "received").await;
+    append_event(&outbox, "finished").await;
+    let handle = fx
+        .open()
+        .unwrap()
+        .start(
+            agent,
+            Arc::new(LogIntake),
+            outbox.clone(),
+            open_marks(&fx, None),
+            Arc::new(crate::deadline::SystemClock),
+            open_ledger(&fx, None),
+        )
+        .unwrap();
+    tokio::time::timeout(secs(30), async {
+        let mut status = handle.status();
+        // The impostor: a challenge and then a token for a session request, with no proof.
+        let (mut stream, _) = listener.accept().await.unwrap();
+        real_challenge(&mut stream).await;
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let req = read_req(&mut stream).await;
+        assert!(req.is_post(SESSION_PATH));
+        json_reply(&mut stream, 200, &token_body(&token_text())).await;
+        status
+            .wait_for(|s| s.phase == Phase::Waiting)
+            .await
+            .unwrap();
+        // The upgrade was not sent: nothing waits to be accepted.
+        assert!(
+            futures_util::FutureExt::now_or_never(listener.accept()).is_none(),
+            "no upgrade was sent to a server that did not prove its session"
+        );
+    })
+    .await
+    .expect("the impostor's run took too long");
+    handle.stop();
+    handle.stopped().await;
+
+    // A server whose session is proved but whose 101 is not.
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (fx2, agent2, _) = real_fixture(port);
+    let outbox2 = open_outbox(&fx2, None);
+    append_event(&outbox2, "received").await;
+    let handle = fx2
+        .open()
+        .unwrap()
+        .start(
+            agent2,
+            Arc::new(LogIntake),
+            outbox2.clone(),
+            open_marks(&fx2, None),
+            Arc::new(crate::deadline::SystemClock),
+            open_ledger(&fx2, None),
+        )
+        .unwrap();
+    let pending = outbox2.pending_for_test().await;
+    tokio::time::timeout(secs(30), async {
+        let mut status = handle.status();
+        let (mut stream, _) = listener.accept().await.unwrap();
+        real_challenge(&mut stream).await;
+        let (mut stream, _) = listener.accept().await.unwrap();
+        real_session(&mut stream, &fx2.prover()).await;
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = accept_ws_with(stream, Arc::new(Mutex::new(Seen::default())), |_| {
+            Vec::new()
+        })
+        .await;
+        for text in [
+            hello(10),
+            format!(r#"{{"type":"cancelCommand","jobId":"{JOB_ID}"}}"#),
+            ack(1),
+            job_command("impostor-command"),
+        ] {
+            let _ = ws.send(Message::Text(text.into())).await;
+        }
+        assert_eq!(got(&mut ws).await.1, Got::Eof, "the agent wrote no frame");
+        status
+            .wait_for(|s| s.phase == Phase::Waiting)
+            .await
+            .unwrap();
+        assert_ne!(status.borrow().phase, Phase::Connected);
+    })
+    .await
+    .expect("the impostor's run took too long");
+    assert_eq!(
+        outbox2.pending_for_test().await,
+        pending,
+        "no event was acknowledged"
+    );
+    handle.stop();
+    handle.stopped().await;
 }

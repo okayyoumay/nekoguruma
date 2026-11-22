@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
+use crate::answer_proof::TestProver;
 use crate::control::dial::{Dialled, PortDial, Stream};
 
 /// What the dial does with a call.
@@ -127,6 +128,26 @@ pub(crate) fn answer(status: u16, extra_headers: &str, body: &str) -> Vec<u8> {
 /// A JSON answer.
 pub(crate) fn json(status: u16, body: &str) -> Vec<u8> {
     answer(status, "Content-Type: application/json\r\n", body)
+}
+
+/// A JSON answer that carries the server's proof of it, for the request `request` (the nonce is
+/// the request's `Ngr-Nonce` header, or the session body's).
+pub(crate) fn proved_json(prover: &TestProver, request: &Seen, status: u16, body: &str) -> Vec<u8> {
+    let mut words = request.request_line().split(' ');
+    let (method, target) = (words.next().unwrap(), words.next().unwrap());
+    let proof = prover.proof_of_request(
+        method,
+        target,
+        request.header("ngr-nonce").as_deref(),
+        &request.body,
+        status,
+        body.as_bytes(),
+    );
+    answer(
+        status,
+        &format!("Content-Type: application/json\r\nNgr-Server-Proof: {proof}\r\n"),
+        body,
+    )
 }
 
 /// A dial whose server answers every request with `reply` after reading it whole, and records

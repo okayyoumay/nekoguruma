@@ -8,6 +8,7 @@
 
 use std::collections::HashSet;
 
+use crate::answer_proof::UNPROVEN_CAUSES;
 use crate::control::exchange::{self, Fail, Token};
 use crate::uploader::routes::{Class, Failure};
 
@@ -47,6 +48,25 @@ impl exchange::Log for ExchangeLog {
         } else {
             self.refused = true;
             tracing::warn!(class, status, "{prefix} exchange refused");
+        }
+    }
+
+    fn unproven(&mut self, class: &'static str, status: u16) {
+        let prefix = self.prefix;
+        if self.seen.insert(class) {
+            tracing::warn!(
+                class,
+                status,
+                causes = UNPROVEN_CAUSES,
+                "{prefix} exchange answer is not proved by the server"
+            );
+        } else {
+            tracing::debug!(
+                class,
+                status,
+                causes = UNPROVEN_CAUSES,
+                "{prefix} exchange answer is not proved by the server"
+            );
         }
     }
 
@@ -103,5 +123,71 @@ impl Holder {
         }
         *repeated = true;
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+    use exchange::Log;
+
+    /// A log writer that every event is appended to.
+    #[derive(Clone, Default)]
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The lines `act` logs at debug level and above, one string each.
+    fn logged(act: impl FnOnce()) -> Vec<String> {
+        let out = Sink::default();
+        let writer = out.clone();
+        let guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(move || writer.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::DEBUG)
+                .finish(),
+        );
+        // Another test's thread may have cached a call site as disabled before this subscriber
+        // existed.
+        tracing::callsite::rebuild_interest_cache();
+        act();
+        drop(guard);
+        let text = String::from_utf8_lossy(&out.0.lock().unwrap()).into_owned();
+        text.lines().map(str::to_owned).collect()
+    }
+
+    /// An unproven answer is one warning per class until a token is issued, debug after that.
+    #[test]
+    fn an_unproven_answer_warns_once_and_again_only_after_a_token() {
+        let mut log = ExchangeLog::new("fetch");
+        let lines = logged(|| {
+            log.unproven("session-unproven", 200);
+            log.unproven("session-unproven", 200);
+            log.accepted();
+            log.unproven("session-unproven", 200);
+        });
+        let levels: Vec<&str> = lines
+            .iter()
+            .map(|line| {
+                ["WARN", "DEBUG"]
+                    .into_iter()
+                    .find(|level| line.contains(&format!(" {level} ")))
+                    .expect("a warn or debug line")
+            })
+            .collect();
+        assert_eq!(levels, ["WARN", "DEBUG", "WARN"], "{lines:?}");
+        assert!(lines.iter().all(|line| line.contains("session-unproven")));
     }
 }

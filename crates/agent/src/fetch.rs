@@ -42,11 +42,11 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use shared_crypto::proof::Audience;
 use shared_crypto::{RandomError, Signer};
 use shared_proto::{MAX_ARTIFACT_BYTES, MAX_DOCUMENT_BYTES};
 use tokio::sync::Mutex;
 
+use crate::answer_proof::Verifier;
 use crate::control::ControlError;
 use crate::control::backoff::Backoff;
 use crate::control::dial::{AtPort, LoopbackPorts, PortDial};
@@ -113,9 +113,10 @@ pub enum FetchError {
         /// A usable `Retry-After` (1 to 60 seconds), which lengthens the wait.
         retry_after_secs: Option<u32>,
     },
-    /// The exchange was refused (403 or 429 from the session route): the server will not have
-    /// this agent for now, and the back-off goes to its cap, as the uploader's does.
-    #[error("try again: the server refused the token exchange")]
+    /// The exchange gave no token and the back-off goes to its cap, as the uploader's does: the
+    /// session route refused (403 or 429), or its 200 was not proved by the server. It is retried
+    /// and never reported as a refusal by its class.
+    #[error("try again: the token exchange was refused or not proved")]
     ExchangeRefused,
     #[error("refused: {why}")]
     Refused {
@@ -238,8 +239,7 @@ pub struct Fetcher {
     dial: Arc<dyn PortDial>,
     signer: Arc<dyn Signer + Send + Sync>,
     random: fn() -> Result<[u8; 32], RandomError>,
-    agent_id: String,
-    audience: Audience,
+    verifier: Verifier,
     host: String,
     port: u16,
     limits: Limits,
@@ -276,8 +276,7 @@ impl Fetcher {
         }
         let origin = ServerOrigin::parse(&record.server_origin)
             .map_err(|_| RecordError::Field("server_origin"))?;
-        let audience = Audience::parse_canonical(&record.server_origin)
-            .map_err(|_| RecordError::Field("server_origin"))?;
+        let verifier = Verifier::from_record(record)?;
         Ok(Self {
             store: Arc::new(store),
             downloads: Downloads::new(seams.client.clone(), origin.clone()),
@@ -285,8 +284,7 @@ impl Fetcher {
             dial: seams.dial,
             signer: seams.signer,
             random: seams.random,
-            agent_id: record.agent_id.clone(),
-            audience,
+            verifier,
             host: origin.host_header(),
             port: origin.port(),
             limits: Limits {
@@ -630,8 +628,7 @@ impl Fetcher {
             dial: &at,
             signer: &*self.signer,
             random: self.random,
-            agent_id: &self.agent_id,
-            audience: &self.audience,
+            verifier: &self.verifier,
             host: &self.host,
         };
         state.holder.ensure(&seams).await.map_err(|how| match how {

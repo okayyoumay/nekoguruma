@@ -37,10 +37,10 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
-use shared_crypto::proof::Audience;
 use shared_crypto::{RandomError, Signer};
 use tokio::sync::{Mutex, Notify, watch};
 
+use crate::answer_proof::Verifier;
 use crate::control::ControlError;
 use crate::control::backoff::Backoff;
 use crate::control::dial::{LoopbackPorts, PortDial};
@@ -339,8 +339,7 @@ struct Worker {
     dial: Arc<dyn PortDial>,
     signer: Arc<dyn Signer + Send + Sync>,
     random: fn() -> Result<[u8; 32], RandomError>,
-    agent_id: String,
-    audience: Audience,
+    verifier: Verifier,
     host: String,
     port: u16,
     ledger: SharedLedger,
@@ -384,15 +383,13 @@ impl Worker {
         }
         let origin = ServerOrigin::parse(&record.server_origin)
             .map_err(|_| RecordError::Field("server_origin"))?;
-        let audience = Audience::parse_canonical(&record.server_origin)
-            .map_err(|_| RecordError::Field("server_origin"))?;
+        let verifier = Verifier::from_record(record)?;
         Ok(Worker {
             routes: Routes::new(seams.client, origin.clone()),
             dial: seams.dial,
             signer: seams.signer,
             random: seams.random,
-            agent_id: record.agent_id.clone(),
-            audience,
+            verifier,
             host: origin.host_header(),
             port: origin.port(),
             ledger,

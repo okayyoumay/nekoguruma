@@ -303,6 +303,7 @@ fn the_retry_after_is_shown_only_when_it_is_a_small_integer() {
     let agent = key.public_key();
     let code = code();
     let reply = |retry: Option<&str>| Reply {
+        proof: None,
         status: 429,
         retry_after: retry.map(str::to_owned),
         json_content_type: false,

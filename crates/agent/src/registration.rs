@@ -270,7 +270,7 @@ pub fn register_in(
             )
         })?;
     let reply = runtime
-        .block_on(server_http::post(&post, 201, timeouts))
+        .block_on(server_http::post(&post, &[201], timeouts))
         .map_err(transport_error)?;
 
     let verified = judge(&reply, code, &agent_public, request.server_key)?;
@@ -353,6 +353,7 @@ fn judge(
         201 => {
             let body = match &reply.body {
                 Some(ReplyBody::Bytes(bytes)) => bytes,
+                Some(ReplyBody::Cut) => return Err(fail(Exit::Unavailable, UNKNOWN)),
                 Some(ReplyBody::TooLarge) | None => {
                     return Err(fail(Exit::CannotRegister, "not a registration answer"));
                 }

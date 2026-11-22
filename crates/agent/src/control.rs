@@ -49,12 +49,12 @@ use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use shared_crypto::proof::Audience;
 use shared_crypto::{PublicKey, RandomError, Signer};
 use tokio::sync::watch;
 use tokio::time::Instant;
 use worker_host::service::OperatingMode;
 
+use crate::answer_proof::{UNPROVEN_CAUSES, Verifier};
 use crate::deadline::{Clock, IssueMark, MarkError};
 use crate::identity::AgentKey;
 use crate::journal::{JournalError, WriterLock};
@@ -342,7 +342,8 @@ struct Wiring {
     clock: Arc<dyn Clock>,
     /// The jobs this agent has taken (ADR-489).
     ledger: ReceivedJobs,
-    audience: Audience,
+    /// The key, the audience and the agent ID the server's answers are checked with (ADR-504).
+    verifier: Verifier,
     /// The `Host` header's value.
     host: String,
 }
@@ -436,6 +437,26 @@ impl Warnings {
     /// `hello` came: the classes warn again.
     fn hello(&mut self) {
         self.seen.clear();
+    }
+
+    /// An answer that had to carry the server's proof did not (ADR-504): one warning per class
+    /// since `hello`, debug after that. The words name both causes and nothing of the answer.
+    fn unproven(&mut self, class: &'static str, status: u16) {
+        if self.seen.insert(class) {
+            tracing::warn!(
+                class,
+                status,
+                causes = UNPROVEN_CAUSES,
+                "control channel answer is not proved by the server"
+            );
+        } else {
+            tracing::debug!(
+                class,
+                status,
+                causes = UNPROVEN_CAUSES,
+                "control channel answer is not proved by the server"
+            );
+        }
     }
 
     /// A token was issued: the refusal is over.
@@ -554,23 +575,12 @@ impl Opened {
             return Err(ControlError::KeyMismatch);
         }
         let origin = self.origin()?;
-        let audience = Audience::parse_canonical(&self.record.server_origin)
-            .map_err(|_| RecordError::Field("server_origin"))?;
-        let instruction_key = PublicKey::from_spki_pem(&self.record.instruction_key_pem)
-            .map_err(|_| RecordError::Field("instruction_key_pem"))?;
-        Ok(Checked {
-            origin,
-            audience,
-            instruction_key,
-        })
+        let verifier = Verifier::from_record(&self.record)?;
+        Ok(Checked { origin, verifier })
     }
 
     fn start_with(self, key: &PublicKey, seams: Seams) -> Result<Handle, ControlError> {
-        let Checked {
-            origin,
-            audience,
-            instruction_key,
-        } = self.check(key)?;
+        let Checked { origin, verifier } = self.check(key)?;
         let wiring = Wiring {
             dial: seams.dial,
             signer: seams.signer,
@@ -580,9 +590,9 @@ impl Opened {
             marks: seams.marks,
             clock: seams.clock,
             ledger: seams.ledger,
-            instruction_key,
+            instruction_key: verifier.key,
             record: self.record,
-            audience,
+            verifier,
             host: origin.host_header(),
         };
         let (stop_tx, stop_rx) = watch::channel(false);
@@ -617,8 +627,7 @@ impl Opened {
 #[derive(Debug)]
 pub struct Checked {
     origin: ServerOrigin,
-    audience: Audience,
-    instruction_key: PublicKey,
+    verifier: Verifier,
 }
 
 /// Releases both locks and then says the task has ended, however it ends: it returns, panics, is
@@ -730,8 +739,7 @@ async fn attempt(w: &Wiring, stop: &Stop, status: &StatusTx, warnings: &mut Warn
         dial: &*w.dial,
         signer: &*w.signer,
         random: w.random,
-        agent_id: &w.record.agent_id,
-        audience: &w.audience,
+        verifier: &w.verifier,
         host: &w.host,
     };
     let token = tokio::select! {
@@ -753,6 +761,10 @@ async fn attempt(w: &Wiring, stop: &Stop, status: &StatusTx, warnings: &mut Warn
     drop(token);
     let socket = match upgraded {
         Ok(socket) => socket,
+        Err(error) if error.unproven => {
+            warnings.unproven(error.class, error.status.unwrap_or_default());
+            return failed(Fail::Cap);
+        }
         Err(error) => {
             warnings.failure(error.class, error.status);
             return failed(Fail::Ord);

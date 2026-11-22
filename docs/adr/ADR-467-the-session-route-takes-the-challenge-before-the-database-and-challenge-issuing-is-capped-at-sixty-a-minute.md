@@ -1,7 +1,7 @@
 # ADR-467: The Session Route Takes the Challenge Before the Database, and Challenge Issuing Is Capped at Sixty a Minute
 
 **Date:** 2026-11-12
-**Status:** Accepted
+**Status:** Accepted (item 1's order gains the target's 400 at the shape step and an unproved 503 when the proof cannot be made, ADR-504)
 **Affects:** design 6.4, 14.4; `crates/server` (`session`, `register::Limiter`, `db::failure`), `crates/server/docs/ngr-server.md`, `api/openapi.yaml` (`/v1/agent/challenge`, `/v1/agent/session`); sets the numbers that ADR-466 item 3 left to the server work and restates one consequence of ADR-466
 
 ## Context

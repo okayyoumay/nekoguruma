@@ -1,7 +1,7 @@
 # ADR-497: A Job's Documents and Artifacts Reach the Agent by a Presigned GET for What Its Signed Instruction Names
 
 **Date:** 2026-11-21
-**Status:** Accepted (the writer of `ir_documents` is ADR-500)
+**Status:** Accepted (the writer of `ir_documents` is ADR-500; their routes' answers are proved, ADR-504)
 **Affects:** design 4.1, 5.2, 8.2.6, 13.3, 14.3; `crates/server` (`downloads`, `storage`, the token and agent-row judgment shared with `uploads`), `db/migrations/` and `db/README.md`, `api/openapi.yaml`, `crates/agent` (`fetch`, the agent half, a later change); extends ADR-492 and ADR-493, relies on ADR-454 and ADR-461
 
 ## Context

@@ -227,12 +227,23 @@ fn parse_port(text: &str) -> Result<u16, AudienceError> {
 /// A transcript could not be built.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum TranscriptError {
-    /// The agent ID is empty, or longer than [`MAX_FIELD_LEN`].
-    #[error("{field} must be 1 to {MAX_FIELD_LEN} bytes")]
+    /// A field is empty, longer than its bound, or holds a character its rule does not allow:
+    /// the agent ID (1 to [`MAX_FIELD_LEN`] bytes), or the answer proof's method and target
+    /// (`crate::answer`).
+    #[error("{field} is empty, too long or holds a character that is not allowed")]
     BadField {
-        /// `agent_id`.
+        /// `agent_id`, `method` or `target`.
         field: &'static str,
     },
+}
+
+/// The rule for an agent ID in any transcript of this crate that carries one: 1 to
+/// [`MAX_FIELD_LEN`] bytes.
+pub(crate) fn check_agent_id(agent_id: &str) -> Result<(), TranscriptError> {
+    if agent_id.is_empty() || agent_id.len() > MAX_FIELD_LEN {
+        return Err(TranscriptError::BadField { field: "agent_id" });
+    }
+    Ok(())
 }
 
 /// What a connection proof covers.
@@ -255,9 +266,7 @@ impl ProofTranscript {
         challenge: [u8; VALUE_LEN],
         nonce: [u8; VALUE_LEN],
     ) -> Result<Self, TranscriptError> {
-        if agent_id.is_empty() || agent_id.len() > MAX_FIELD_LEN {
-            return Err(TranscriptError::BadField { field: "agent_id" });
-        }
+        check_agent_id(agent_id)?;
         Ok(Self {
             audience: audience.as_str().to_owned(),
             agent_id: agent_id.to_owned(),
@@ -285,7 +294,7 @@ impl ProofTranscript {
     }
 }
 
-fn put_prefixed(out: &mut Vec<u8>, bytes: &[u8]) {
+pub(crate) fn put_prefixed(out: &mut Vec<u8>, bytes: &[u8]) {
     let len = u32::try_from(bytes.len()).expect("fields are length-checked");
     out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(bytes);

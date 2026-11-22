@@ -374,7 +374,7 @@ pub fn verify_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{SignErrorKind, SigningKey, instruction, proof};
+    use crate::{SignErrorKind, SigningKey, answer, instruction, proof};
 
     fn code() -> RegistrationCode {
         RegistrationCode::generate().unwrap()
@@ -759,12 +759,13 @@ mod tests {
     // --------------------------------------------------------- cross-tag
 
     #[test]
-    fn the_four_tags_are_distinct_and_signatures_do_not_cross() {
-        let tags: [&[u8]; 4] = [
+    fn the_five_tags_are_distinct_and_signatures_do_not_cross() {
+        let tags: [&[u8]; 5] = [
             DOMAIN_TAG,
             RESPONSE_DOMAIN_TAG,
             proof::DOMAIN_TAG,
             instruction::DOMAIN_TAG,
+            answer::DOMAIN_TAG,
         ];
         for (i, a) in tags.iter().enumerate() {
             for b in &tags[i + 1..] {
@@ -782,8 +783,13 @@ mod tests {
         assert!(verify_response(&pk, &resp, &req_sig).is_err());
         assert!(verify_tagged(&pk, RESPONSE_DOMAIN_TAG, &req.encode(), &req_sig).is_err());
         assert!(verify_tagged(&pk, DOMAIN_TAG, &resp.encode(), &resp_sig).is_err());
-        // Nor under the proof's or the instruction's tag, and theirs are not accepted here.
-        for tag in [proof::DOMAIN_TAG, instruction::DOMAIN_TAG] {
+        // Nor under the proof's, the instruction's or the answer proof's tag, and theirs are not
+        // accepted here.
+        for tag in [
+            proof::DOMAIN_TAG,
+            instruction::DOMAIN_TAG,
+            answer::DOMAIN_TAG,
+        ] {
             assert!(verify_tagged(&pk, tag, &req.encode(), &req_sig).is_err());
             assert!(verify_tagged(&pk, tag, &resp.encode(), &resp_sig).is_err());
             let other_req = sign_tagged(&key, tag, &req.encode()).unwrap();

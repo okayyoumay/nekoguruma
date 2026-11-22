@@ -261,7 +261,7 @@ fn tagged_message(tag: &[u8], body: &[u8]) -> Vec<u8> {
 /// Signs `body` for the purpose named by `tag`. Every signed purpose goes through this pair
 /// with a tag of its own, so a signature made for one purpose does not verify for another. The
 /// callers are the connection proof, the job instruction (design 11.1), the registration
-/// request and the registration response (ADR-463).
+/// request and the registration response (ADR-463), and the server's answer proof (ADR-504).
 pub fn sign_tagged<S: Signer + ?Sized>(
     signer: &S,
     tag: &[u8],

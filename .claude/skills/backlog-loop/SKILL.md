@@ -182,7 +182,9 @@ backlog-only PR.
 ## 4. Implement
 
 Work the item as any other task, following CLAUDE.md and `.claude/README.md` (task size, agents,
-documentation sync, ADRs). For an item whose blocker a decision of the maintainer just resolved,
+documentation sync, ADRs). Before the PR's first review request, `doc-sync-checker` audits the
+whole diff with the PR description and the commit messages, and its findings are fixed first
+(`pr-review-loop`, Step 0). For an item whose blocker a decision of the maintainer just resolved,
 write CLAUDE.md's design summary ("Guidelines") and get it confirmed before implementing. When
 the item meets the case-table gate in `.claude/README.md` (ADR-381), get `design-advisor`'s case
 table before implementing it. Close the item with the `backlog` skill in the same PR. A Dependabot

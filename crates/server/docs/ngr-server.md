@@ -473,8 +473,38 @@ value. The 307 carries `Cache-Control: no-store` and an absolute `Location`.
   a client that sends nothing, or one byte at a time, is dropped.
 - The guard wraps the whole route table, so a request it rejects never gets a method router's
   405 with `Allow` or the fallback's 404.
-- Loopback has no server authentication: another OS user that binds the port first answers as
-  the server. The guard does not address this.
+
+## The answer proof
+
+`answer_proof.rs` (ADR-504, design 14.4). The proof exchange authenticates the agent, not the
+server, and on the local profile another OS user could answer in the server's place while the
+server is down. The server therefore signs the answers an agent acts on with its instruction key
+and sends the signature in `Ngr-Server-Proof`; the transcript binds the answer to the agent's
+nonce, the request's method, target and body, and the answer's status and body
+(`shared_crypto::answer`).
+
+- One `Prover` is built per router, with the key, the audience (the pinned origin of the
+  listener's port) and the log gate of a failed proof. The session route's 200 is always proved,
+  to the nonce of its body; it reads no `Ngr-Nonce` header. The control upgrade's 101 is proved
+  when the request carries `Ngr-Nonce` (the proof is a header of the 101); a request without it
+  is served as before. No refusal, no challenge answer and no registration answer carries a proof.
+- The new 400s: on the session route the target joins the shape step (the challenge is not
+  taken); on the upgrade they come after the method (405), the token (401), the WebSocket
+  request (400) and the subprotocol (400), in this order: the nonce, then the target. Neither
+  consumes the token or registers the connection. The target rule is `answer::check_target`; the
+  title is the guard's "Unsupported request target".
+- A proof that cannot be made (the signer fails) is an unproved 503, logged once a minute without
+  the target. At the session route the minted token is discarded; at the upgrade the proof is
+  signed before the upgrade, so no connection exists.
+- The proof rests on nobody else being able to receive connections to the server's address. The
+  listener (`loopback_listener`) is bound to `127.0.0.1` itself, never the wildcard address, and
+  sets neither `SO_REUSEPORT` nor, on Windows, `SO_REUSEADDR` (mio sets `SO_REUSEADDR` on Unix, which
+  Linux does not let share a listening address). The unit test `the_listener_shares_its_address_with_nobody`
+  pins it: the local address is `127.0.0.1`, a second bind with address reuse (and, on Unix, with
+  port reuse) fails, a wildcard bind fails on Linux, and where one succeeds 16 connections to `127.0.0.1` still reach
+  the server's listener.
+- The browser side is unchanged: the guard still decides on Host and Origin, and a browser sends
+  no nonce.
 
 ## Local users
 

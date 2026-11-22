@@ -579,7 +579,10 @@ paths:
         The checks run in this order: the request guard (13.3), the method (**405**, with
         `Allow`), the body (read within 5 seconds, **408**; at most 4 KiB, **413**), the shape
         (**400**, which uses up no challenge), the challenge (**401**), the agent's row
-        (**503**, **500**), then the key and the proof (**403**, or **429**).
+        (**503**, **500**), then the key and the proof (**403**, or **429**). The target joins
+        the shape step: every 200 of this route carries the server's answer proof, so a request
+        target that the proof cannot take (more than 2048 bytes, or not visible ASCII from the
+        leading `/`) is **400** at that step and uses up no challenge.
 
         **400** is decided on the shape of the request alone, before and without any lookup: a
         `Content-Type` other than `application/json` (parameters allowed), an `agentId` that is
@@ -598,8 +601,15 @@ paths:
         server's log only, and the log is rate-bounded. Refusals are limited for the whole
         route as registration's are (ten 403 responses within the last minute, then **429**
         until the oldest is a minute old); only 403 counts, and a valid proof is never limited.
-        A distinct answer for a revoked key waits for the work that authenticates the server to
-        the agent, since the answer would be unauthenticated on the local profile.
+        A distinct answer for a revoked key is not given: a refusal of this route comes before
+        the agent is authenticated and carries no proof (ADR-504).
+
+        The 200 carries `Ngr-Server-Proof` (ADR-504): the server's signature, under its
+        instruction key, over the request's method, target and body digest, the agent ID, the
+        status and the answer's digest, bound to the nonce of the request body. The proof's
+        nonce is the body's nonce; an `Ngr-Nonce` header is not read here. No refusal of this
+        route carries a proof. If the proof cannot be made the answer is **503** and the token
+        is not given out.
 
         On success the server returns a token: 32 random bytes, of which it keeps only the
         SHA-256, valid for 300 seconds and reported as a relative time, since the device clock
@@ -646,6 +656,8 @@ paths:
       responses:
         '200':
           description: A session token
+          headers:
+            Ngr-Server-Proof: { $ref: '#/components/headers/NgrServerProof' }
           content:
             application/json:
               schema: { $ref: '#/components/schemas/AgentSession' }
@@ -1277,6 +1289,24 @@ components:
       in: path
       required: true
       schema: { type: string }
+    NgrNonce:
+      name: Ngr-Nonce
+      in: header
+      required: false
+      description: |
+        The request header of the data routes and the control upgrade (ADR-504): the agent's
+        32-byte nonce, standard padded base64 (44 characters). A request that carries it is
+        answered with `Ngr-Server-Proof`; one that does not is served as before. A repeated or
+        malformed value is a **400**. The session route reads no such header.
+      schema: { type: string, minLength: 44, maxLength: 44 }
+
+  headers:
+    NgrServerProof:
+      description: |
+        The server's answer proof (ADR-504, 14.4): the base64 of the 64-byte signature under
+        the instruction key over a transcript that binds the answer to the request it answers
+        and to the agent's nonce. The agent verifies the bytes it received before it parses them.
+      schema: { type: string, minLength: 88, maxLength: 88 }
 
   responses:
     AgentSessionRefused:

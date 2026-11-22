@@ -11,6 +11,7 @@
 
 pub(crate) mod agent_caller;
 pub(crate) mod agent_events;
+pub(crate) mod answer_proof;
 pub(crate) mod audit;
 pub mod config;
 pub mod control;
@@ -141,6 +142,12 @@ pub fn router_with_routes(state: AppState) -> (Router, Vec<ServedRoute>) {
 #[doc(hidden)]
 pub fn routes_unguarded(state: AppState) -> (Router, Vec<ServedRoute>) {
     let mut mounts = Mounts(Vec::new());
+    // The answer proof's key, audience and log gate are built once and shared by the routes that
+    // prove (ADR-504).
+    let prover = Arc::new(answer_proof::Prover::new(
+        Arc::clone(&state.instruction_key),
+        state.port,
+    ));
     let health = mounts
         .mount(
             Router::new(),
@@ -279,7 +286,7 @@ pub fn routes_unguarded(state: AppState) -> (Router, Vec<ServedRoute>) {
         )
         .with_state(session::Exchange::new(
             state.pool.clone(),
-            state.port,
+            Arc::clone(&prover),
             state.sessions.clone(),
         ));
     // The control channel judges the token the exchange issues, and hands its sockets to the hub.
@@ -291,7 +298,12 @@ pub fn routes_unguarded(state: AppState) -> (Router, Vec<ServedRoute>) {
             control::PATH,
             any(control::upgrade),
         )
-        .with_state(control::Control::new(state.pool, state.sessions, state.hub));
+        .with_state(control::Control::new(
+            state.pool,
+            state.sessions,
+            state.hub,
+            prover,
+        ));
     let routes = health
         .merge(operator)
         .merge(jobs)
@@ -302,6 +314,16 @@ pub fn routes_unguarded(state: AppState) -> (Router, Vec<ServedRoute>) {
         .merge(control)
         .fallback(|| async { problem::Problem::new(StatusCode::NOT_FOUND, "Not found") });
     (routes, mounts.0)
+}
+
+/// The server's listener: bound to `127.0.0.1` itself, never the wildcard address, with no
+/// address-sharing option set by this code (no `SO_REUSEPORT`, and `SO_REUSEADDR` only where the
+/// runtime's own bind sets it, which on Unix does not let a second socket bind a listening
+/// address). The answer proof rests on no other process being able to receive connections to this
+/// address while the server listens (ADR-504 item 5); the probe
+/// `the_listener_shares_its_address_with_nobody` checks it.
+async fn loopback_listener(port: u16) -> std::io::Result<TcpListener> {
+    TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await
 }
 
 /// Why `Server::start` failed.
@@ -505,7 +527,7 @@ impl Server {
         uploads: uploads::Backend,
     ) -> Result<Server, StartError> {
         let port = http.port;
-        let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await {
+        let listener = match loopback_listener(port).await {
             Ok(listener) => listener,
             Err(source) => {
                 db::close(&pool).await;
@@ -767,5 +789,69 @@ async fn serve_connection(connection: Upgradeable, mut stop: watch::Receiver<boo
     };
     if let Err(error) = result {
         tracing::debug!(%error, "connection ended with an error");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpSocket;
+
+    /// ADR-504 item 5: while the server's listener is up, no other socket can take its address.
+    /// A second bind of `127.0.0.1:<port>` with address reuse (and on Unix with port reuse)
+    /// fails; a wildcard bind fails on Linux, and where one succeeds every connection to
+    /// `127.0.0.1` still reaches the server's listener.
+    #[tokio::test]
+    async fn the_listener_shares_its_address_with_nobody() {
+        let listener = loopback_listener(0).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        assert_eq!(addr.ip(), std::net::IpAddr::V4(Ipv4Addr::LOCALHOST));
+
+        // Another bind of the same address, with address reuse.
+        let second = TcpSocket::new_v4().unwrap();
+        second.set_reuseaddr(true).unwrap();
+        assert!(second.bind(addr).is_err(), "a reuse bind took the address");
+        #[cfg(unix)]
+        {
+            let second = TcpSocket::new_v4().unwrap();
+            second.set_reuseport(true).unwrap();
+            assert!(second.bind(addr).is_err(), "a port reuse bind took it");
+        }
+
+        // A wildcard socket on the same port. Linux refuses the bind while the loopback listener
+        // is up, with or without address reuse. Elsewhere (Windows) it may bind, and then every
+        // connection to `127.0.0.1` must still reach the server's listener.
+        for reuse in [false, true] {
+            let wildcard = TcpSocket::new_v4().unwrap();
+            wildcard.set_reuseaddr(reuse).unwrap();
+            let bound = wildcard.bind((Ipv4Addr::UNSPECIFIED, addr.port()).into());
+            if cfg!(target_os = "linux") {
+                assert!(
+                    bound.is_err(),
+                    "a wildcard bind took the port (reuse {reuse})"
+                );
+                eprintln!("wildcard bind refused (reuse {reuse}): the Linux variant");
+                continue;
+            }
+            if bound.is_err() {
+                eprintln!("wildcard bind refused (reuse {reuse}): nothing to connect to");
+                continue;
+            }
+            eprintln!("wildcard bind taken (reuse {reuse}): checking the connections");
+            let wildcard = wildcard.listen(16).unwrap();
+            let mut clients = Vec::new();
+            for _ in 0..16 {
+                clients.push(TcpStream::connect(addr).await.unwrap());
+            }
+            for i in 0..16 {
+                let accepted = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!("connection {i} did not reach the server (reuse {reuse})")
+                    });
+                accepted.unwrap();
+            }
+            drop(wildcard);
+        }
     }
 }

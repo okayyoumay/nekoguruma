@@ -12,7 +12,7 @@ Cargo workspace corresponding to the design document `docs/system-architecture.m
 
 | Crate | Role | Design document |
 |---|---|---|
-| `shared-proto` | Commands, events, capabilities, job types, the signed job instruction's body | 5.1 / 5.3 / 9.5 / 11.1 |
+| `shared-proto` | Commands, events, capabilities, job types, the signed job instruction's body, the answer proof's header names and proved-status tables | 5.1 / 5.3 / 6.4 / 9.5 / 11.1 / 14.4 |
 | `shared-crypto` | Agent key (ECDSA P-256) and connection proof; the server's answer proof; signature verification for all 3 trust layers | 6.4 / 11.1 |
 | `diag-ir` | IR schema, bytecode, VM | 8.2 |
 | `diag-frontend` | ODX/OTX parser, CSV + Starlark->IR conversion (server only) | 8.3 / 8.4 |

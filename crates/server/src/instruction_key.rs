@@ -169,6 +169,15 @@ impl InstructionKey {
         )?)
     }
 
+    /// Signs an answer proof (ADR-504): the transcript binds the answer to the request it
+    /// answers, under the answer proof's own domain tag. `async` for the same reason as `seal`.
+    pub async fn prove_answer(
+        &self,
+        transcript: &shared_crypto::answer::AnswerTranscript,
+    ) -> Result<Signature, shared_crypto::SignError> {
+        shared_crypto::answer::sign(self.signer.as_ref(), transcript)
+    }
+
     /// Makes the key ready at start: reads or creates the file and checks it against the
     /// database (the table in the module's documentation). The pool must be migrated.
     pub async fn open(
@@ -473,6 +482,33 @@ mod tests {
         );
         let other = SigningKey::generate().unwrap().public_key();
         assert!(verify_response(&other, &transcript(Preset::Personal, false), &signature).is_err());
+    }
+
+    #[tokio::test]
+    async fn an_answer_proof_verifies_under_the_public_key_and_under_no_other_tag() {
+        use shared_crypto::answer::{AnswerTranscript, verify};
+        let key = InstructionKey::from_signer(Arc::new(SigningKey::generate().unwrap()));
+        let audience =
+            shared_crypto::proof::Audience::canonicalise("http://127.0.0.1:8080").unwrap();
+        let nonce = shared_crypto::random_32().unwrap();
+        let transcript = |status| {
+            AnswerTranscript::new(
+                &audience,
+                "agent-id",
+                nonce,
+                "POST",
+                "/api/v1/agent/session",
+                [2; 32],
+                status,
+                [3; 32],
+            )
+            .unwrap()
+        };
+        let signature = key.prove_answer(&transcript(200)).await.unwrap();
+        verify(&key.public_key(), &transcript(200), &signature).unwrap();
+        assert!(verify(&key.public_key(), &transcript(201), &signature).is_err());
+        let other = SigningKey::generate().unwrap().public_key();
+        assert!(verify(&other, &transcript(200), &signature).is_err());
     }
 
     #[tokio::test]

@@ -25,7 +25,6 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use axum::Json;
 use axum::extract::{Request, State};
 use axum::http::header::{self, HeaderMap};
 use axum::http::{HeaderValue, StatusCode};
@@ -33,14 +32,15 @@ use axum::response::{IntoResponse, Response};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use sha2::{Digest, Sha256};
+use shared_crypto::answer::body_digest;
 use shared_crypto::proof::{Audience, ProofTranscript, VALUE_LEN, verify_proof};
 use shared_crypto::{PublicKey, RandomError, Signature, random_32};
 use shared_proto::AgentId;
 use sqlx::PgPool;
 
+use crate::answer_proof::{Asked, Prover};
 use crate::db;
 use crate::health::may_log;
-use crate::local_guard::pinned_origin;
 use crate::problem::Problem;
 use crate::register::{Admission, Limiter, bounded_body, is_json, strict_strings};
 
@@ -205,6 +205,15 @@ impl Sessions {
         before - table.len()
     }
 
+    /// Drops the token `bearer_token` stands for, if it is held: a token whose answer could not
+    /// be proved is never given out (ADR-504 item 4).
+    pub(crate) fn discard(&self, bearer_token: &str) {
+        if let Some(token) = decode_token(bearer_token) {
+            let mut table = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            table.remove(&table_key(&token));
+        }
+    }
+
     pub(crate) fn authenticate_at(&self, bearer_token: &str, now: Instant) -> Option<AgentId> {
         let key = table_key(&decode_token(bearer_token)?);
         let mut table = self.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -232,7 +241,7 @@ impl Sessions {
     }
 
     #[cfg(test)]
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 }
@@ -284,7 +293,7 @@ fn is_agent_id(text: &str) -> bool {
 }
 
 /// Strict standard padded base64 of exactly `N` bytes, in at most `max_text` characters.
-fn decode_fixed<const N: usize>(text: &str, max_text: usize) -> Option<[u8; N]> {
+pub(crate) fn decode_fixed<const N: usize>(text: &str, max_text: usize) -> Option<[u8; N]> {
     if text.len() > max_text {
         return None;
     }
@@ -417,7 +426,7 @@ impl std::fmt::Debug for Exchange {
 struct Inner {
     pool: PgPool,
     sessions: Sessions,
-    audience: Audience,
+    prover: Arc<Prover>,
     challenges: Challenges,
     issuing: Limiter,
     refusals: Limiter,
@@ -425,16 +434,13 @@ struct Inner {
 }
 
 impl Exchange {
-    /// `port` is the listener's bound port: the audience is the pinned origin for it, never a
-    /// value from a request. A port the pinned origin cannot be canonical for (0) is a caller's
-    /// fault.
-    pub fn new(pool: PgPool, port: u16, sessions: Sessions) -> Exchange {
-        let audience = Audience::parse_canonical(&pinned_origin(port))
-            .expect("the pinned origin of a bound port is a canonical audience");
+    /// The audience of the proof is the prover's: the pinned origin of the listener's bound port,
+    /// never a value from a request.
+    pub(crate) fn new(pool: PgPool, prover: Arc<Prover>, sessions: Sessions) -> Exchange {
         Exchange(Arc::new(Inner {
             pool,
             sessions,
-            audience,
+            prover,
             challenges: Challenges::default(),
             issuing: Limiter::new(ISSUE_LIMIT, ISSUE_WINDOW),
             refusals: Limiter::default(),
@@ -445,10 +451,22 @@ impl Exchange {
 
 /// A 200 document: uncacheable, since the token is a credential.
 fn ok(body: serde_json::Value) -> Response {
-    let mut response = Json(body).into_response();
-    response
-        .headers_mut()
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    ok_bytes(serialize(&body))
+}
+
+/// The bytes of a 200 document, which the proof is signed over as they are sent.
+fn serialize(body: &serde_json::Value) -> Vec<u8> {
+    serde_json::to_vec(body).expect("a JSON value serializes")
+}
+
+fn ok_bytes(bytes: Vec<u8>) -> Response {
+    let mut response = (StatusCode::OK, bytes).into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
 }
 
@@ -503,6 +521,13 @@ pub async fn session(State(exchange): State<Exchange>, request: Request) -> Resp
         Ok(shaped) => shaped,
         Err(error) => return Problem::new(StatusCode::BAD_REQUEST, error.title()).into_response(),
     };
+    // Every 200 of this route is proved to the body's nonce, so a request whose answer cannot be
+    // proved is judged with the shape and consumes nothing (ADR-504 item 4). An `Ngr-Nonce`
+    // header is not read.
+    let asked = match Asked::with_nonce(&parts, shaped.nonce) {
+        Ok(asked) => asked,
+        Err(error) => return error.into_response(),
+    };
 
     // One instant for the challenge take and the answers before the row read.
     let now = now();
@@ -522,7 +547,7 @@ pub async fn session(State(exchange): State<Exchange>, request: Request) -> Resp
             };
         }
     };
-    match judge(row, &shaped, &inner.audience) {
+    match judge(row, &shaped, inner.prover.audience()) {
         Ok(()) => {}
         // The clock is read again after the row read, so instants enter the refusal limiter in
         // order, as in registration.
@@ -538,10 +563,53 @@ pub async fn session(State(exchange): State<Exchange>, request: Request) -> Resp
     let now = self::now();
     match inner.sessions.mint(&agent, now) {
         Ok(token) => {
-            tracing::info!(agent_id = %shaped.agent_id, "session issued");
-            ok(serde_json::json!({ "token": token, "expiresInSecs": TOKEN_LIFETIME_SECS }))
+            let body = serialize(
+                &serde_json::json!({ "token": token, "expiresInSecs": TOKEN_LIFETIME_SECS }),
+            );
+            // The proof is signed over the bytes sent. If it cannot be made, or the handler is
+            // dropped while it is made, the token is discarded and nothing was given out.
+            let mut unsent = Unsent {
+                sessions: &inner.sessions,
+                token: &token,
+                given: false,
+            };
+            let proof = inner
+                .prover
+                .header(
+                    &asked,
+                    &agent,
+                    body_digest(&bytes),
+                    StatusCode::OK.as_u16(),
+                    &body,
+                )
+                .await;
+            match proof {
+                Ok(proof) => {
+                    unsent.given = true;
+                    tracing::info!(agent_id = %shaped.agent_id, "session issued");
+                    let mut response = ok_bytes(body);
+                    Prover::attach(response.headers_mut(), proof);
+                    response
+                }
+                Err(unprovable) => unprovable.into_response(),
+            }
         }
         Err(_) => inner.internal(Some(&shaped.agent_id), "the random source failed", now),
+    }
+}
+
+/// A minted token that is discarded when this drops before it is marked given out.
+struct Unsent<'a> {
+    sessions: &'a Sessions,
+    token: &'a str,
+    given: bool,
+}
+
+impl Drop for Unsent<'_> {
+    fn drop(&mut self) {
+        if !self.given {
+            self.sessions.discard(self.token);
+        }
     }
 }
 
@@ -605,6 +673,7 @@ impl Inner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::local_guard::pinned_origin;
     use axum::http::HeaderValue;
     use shared_crypto::proof::sign_proof;
     use shared_crypto::{Signer, SigningKey};
@@ -756,6 +825,23 @@ mod tests {
         assert_eq!(table.len(), 1);
         assert_eq!(table.authenticate_at(&second, t0 + secs(300)), None);
         assert_eq!(table.authenticate_at(&third, t0 + secs(300)), Some(a));
+    }
+
+    #[test]
+    fn a_discarded_token_is_gone_and_the_others_stay() {
+        let table = Sessions::new();
+        let t0 = Instant::now();
+        let a = agent(1);
+        let (first, second) = (table.mint(&a, t0).unwrap(), table.mint(&a, t0).unwrap());
+        assert_eq!(table.len(), 2);
+        table.discard(&first);
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.authenticate_at(&first, t0), None);
+        assert_eq!(table.authenticate_at(&second, t0), Some(a));
+        // A malformed or unknown token discards nothing.
+        table.discard("garbage");
+        table.discard(&STANDARD.encode(fresh()));
+        assert_eq!(table.len(), 1);
     }
 
     #[test]

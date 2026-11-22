@@ -1,13 +1,18 @@
 //! Protocol types shared by the server, agent, and worker.
 //!
 //! Design document sections: 5.1 job kinds / 5.3 handling disconnects / 9.5 capabilities /
-//! 11.1 job instructions / 5.2 control channel messages (ADR-466)
+//! 11.1 job instructions / 5.2 control channel messages (ADR-466) / 6.4 answer proof header names (ADR-504)
 //!
 //! These types are also used for worker IPC, so only fixed-width types are used.
 //! `usize` / `isize` / `c_long` must not appear in public types (7.4).
 
 use serde::{Deserialize, Serialize};
 
+mod answer_proof;
+pub use answer_proof::{
+    BEGIN_RESULTS, COMPLETE_RESULTS, DOWNLOAD_RESULTS, NONCE_HEADER, PART_URL_RESULTS,
+    PROOF_HEADER, SESSION_RESULTS, STATUS_RESULTS, UPGRADE_RESULTS,
+};
 mod control;
 pub use control::{
     AgentEventKind, AgentEventMessage, AgentMessage, CLOSE_CODE_BINARY, CLOSE_CODE_GOING_AWAY,

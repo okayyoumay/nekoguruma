@@ -27,7 +27,8 @@ use tokio_tungstenite::{WebSocketStream, client_async};
 
 use crate::redeem::{Agent, capture, dead, instruction_key, json};
 use crate::serving::{Reply, exchange};
-use crate::session::Up;
+use crate::session::{Up, audience_of};
+use crate::support::{Answered, assert_unproved};
 
 const PATH: &str = "/api/v1/agent/control";
 const SUBPROTOCOL: &str = "ngr-control.v1";
@@ -427,6 +428,11 @@ async fn the_subprotocol_is_taken_from_a_list_and_from_two_headers_and_hello_com
         );
         assert!(
             response.headers().get("sec-websocket-extensions").is_none(),
+            "{name}"
+        );
+        // U1: a request with no nonce is answered with no proof.
+        assert!(
+            response.headers().get(shared_proto::PROOF_HEADER).is_none(),
             "{name}"
         );
         hello(&mut client).await;
@@ -1658,5 +1664,199 @@ async fn a_frame_queued_before_the_stop_is_never_written() {
     for client in &mut clients {
         assert_eq!(first_frame_close_code(client).await, 1001);
     }
+    u.finish().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The answer proof of the 101 (ADR-504)
+
+fn nonce_line(nonce: &[u8; 32]) -> String {
+    format!("{}: {}", shared_proto::NONCE_HEADER, STANDARD.encode(nonce))
+}
+
+/// An upgrade request with the agent's token and `nonce`.
+fn nonced_request(u: &Up, token: &str, nonce: &[u8; 32]) -> Request<()> {
+    let mut request = request(u.s.addr, Some(&format!("Bearer {token}")), &[SUBPROTOCOL]);
+    request.headers_mut().insert(
+        shared_proto::NONCE_HEADER,
+        HeaderValue::from_str(&STANDARD.encode(nonce)).unwrap(),
+    );
+    request
+}
+
+/// Checks `response`, the 101 to an upgrade made with `nonce`, against the agent's expectation.
+fn assert_proved_101(u: &Up, nonce: [u8; 32], response: &Response<Option<Vec<u8>>>) {
+    let public = u.w.key.public_key();
+    let audience = audience_of(u.s.addr.port());
+    let headers: Vec<(&str, &str)> = response
+        .headers()
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.to_str().unwrap()))
+        .collect();
+    Answered {
+        public: &public,
+        audience: &audience,
+        agent_id: &u.id,
+        nonce,
+        method: "GET",
+        target: PATH,
+        request_body: &[],
+    }
+    .verify_parts(101, &headers, &[]);
+}
+
+#[tokio::test]
+async fn an_upgrade_with_a_nonce_gets_a_proved_101() {
+    let u = Up::new().await;
+    let t = token(&u).await;
+    let nonce = random_32().unwrap();
+    let request = nonced_request(&u, &t, &nonce);
+    let (mut client, response) = handshake(u.s.addr, request).await.unwrap();
+    assert_eq!(response.status(), 101);
+    assert_proved_101(&u, nonce, &response);
+    // The proof is a header of the 101; the connection is the usual one.
+    hello(&mut client).await;
+    heartbeat(&mut client).await;
+    u.finish().await;
+}
+
+#[tokio::test]
+async fn a_nonce_does_not_change_what_is_refused_before_the_nonce_is_judged() {
+    let u = Up::new().await;
+    let t = token(&u).await;
+    let host = u.s.host();
+    let good = nonce_line(&random_32().unwrap());
+    let bad = format!("{}: not base64", shared_proto::NONCE_HEADER);
+    for nonce in [good.as_str(), bad.as_str()] {
+        // U3: not a GET.
+        let mut headers = [upgrade_headers(), vec![bearer(&t), nonce.to_owned()]].concat();
+        headers.push("Content-Length: 0".to_owned());
+        let post = raw(&host, "HTTP/1.1", &headers).replacen("GET", "POST", 1);
+        let r = exchange(u.s.addr, &post).await;
+        assert_problem(&r, 405, "a POST");
+        assert_unproved(&r, "a POST");
+
+        // U4: no token, and an unknown one.
+        for (name, auth) in [("none", None), ("unknown", Some(bearer(&random_token())))] {
+            let mut headers = [upgrade_headers(), vec![nonce.to_owned()]].concat();
+            headers.extend(auth);
+            let r = exchange(u.s.addr, &raw(&host, "HTTP/1.1", &headers)).await;
+            assert_problem(&r, 401, name);
+            assert_unproved(&r, name);
+        }
+
+        // U5: not a WebSocket request; U6: no subprotocol. The existing 400 answers.
+        let plain = vec!["Connection: close".to_owned(), bearer(&t), nonce.to_owned()];
+        let r = exchange(u.s.addr, &raw(&host, "HTTP/1.1", &plain)).await;
+        assert_problem(&r, 400, "U5");
+        assert!(
+            r.body.contains("A WebSocket upgrade is required"),
+            "{}",
+            r.body
+        );
+        assert_unproved(&r, "U5");
+        let no_protocol = [
+            without(upgrade_headers(), "Sec-WebSocket-Protocol"),
+            vec![bearer(&t), nonce.to_owned()],
+        ]
+        .concat();
+        let r = exchange(u.s.addr, &raw(&host, "HTTP/1.1", &no_protocol)).await;
+        assert_problem(&r, 400, "U6");
+        assert!(
+            r.body
+                .contains("The subprotocol ngr-control.v1 is required"),
+            "{}",
+            r.body
+        );
+        assert_unproved(&r, "U6");
+    }
+    // None of them used the token up.
+    drop(open(u.s.addr, &t).await);
+    u.finish().await;
+}
+
+#[tokio::test]
+async fn a_malformed_nonce_on_the_upgrade_is_400_after_the_subprotocol() {
+    let u = Up::new().await;
+    let t = token(&u).await;
+    let host = u.s.host();
+    let good = nonce_line(&random_32().unwrap());
+    let short = format!(
+        "{}: {}",
+        shared_proto::NONCE_HEADER,
+        STANDARD.encode([1u8; 31])
+    );
+    let cases: Vec<(&str, Vec<String>)> = vec![
+        (
+            "not base64",
+            vec![format!("{}: !!", shared_proto::NONCE_HEADER)],
+        ),
+        ("31 bytes", vec![short]),
+        ("two values", vec![good.clone(), good.clone()]),
+    ];
+    for (name, nonce) in cases {
+        let headers = [upgrade_headers(), vec![bearer(&t)], nonce].concat();
+        let r = exchange(u.s.addr, &raw(&host, "HTTP/1.1", &headers)).await;
+        assert_problem(&r, 400, name);
+        assert!(
+            r.body.contains("Invalid Ngr-Nonce header"),
+            "{name}: {}",
+            r.body
+        );
+        assert_unproved(&r, name);
+    }
+    // U8: a target the proof cannot take is a 400 with a nonce, and a 101 without one.
+    let long = format!("{PATH}?{}", "a".repeat(2100));
+    let with = [upgrade_headers(), vec![bearer(&t), good]].concat();
+    let r = exchange(
+        u.s.addr,
+        &raw(&host, "HTTP/1.1", &with).replacen(PATH, &long, 1),
+    )
+    .await;
+    assert_problem(&r, 400, "a long target with a nonce");
+    assert_unproved(&r, "a long target with a nonce");
+    assert!(u.hub.connected().is_empty(), "a refused request upgraded");
+    let without_nonce = [upgrade_headers(), vec![bearer(&t)]].concat();
+    let mut stream = TcpStream::connect(u.s.addr).await.unwrap();
+    let text = raw(&host, "HTTP/1.1", &without_nonce).replacen(PATH, &long, 1);
+    stream.write_all(text.as_bytes()).await.unwrap();
+    assert!(read_head(&mut stream).await.starts_with("HTTP/1.1 101"));
+    drop(stream);
+    // The token is intact.
+    drop(open(u.s.addr, &t).await);
+    u.finish().await;
+}
+
+#[tokio::test]
+async fn a_signing_failure_on_the_upgrade_is_503_before_any_upgrade() {
+    let (u, fail) = Up::flaky().await;
+    let t = token(&u).await;
+    fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    let headers = [
+        upgrade_headers(),
+        vec![bearer(&t), nonce_line(&random_32().unwrap())],
+    ]
+    .concat();
+    let r = exchange(u.s.addr, &raw(&u.s.host(), "HTTP/1.1", &headers)).await;
+    assert_problem(&r, 503, "the signer fails");
+    assert_unproved(&r, "the signer fails");
+    assert!(u.hub.connected().is_empty());
+    assert_eq!(last_seen(&u, &u.id).await, "", "nothing was stamped");
+
+    // Without a nonce nothing is signed, and the upgrade goes through; the token is intact.
+    drop(open(u.s.addr, &t).await);
+    u.finish().await;
+}
+
+#[tokio::test]
+async fn a_revoked_agent_gets_a_proved_101_then_4002() {
+    let u = Up::new().await;
+    let t = token(&u).await;
+    revoke_row(&u, &u.id).await;
+    let nonce = random_32().unwrap();
+    let request = nonced_request(&u, &t, &nonce);
+    let (mut client, response) = handshake(u.s.addr, request).await.unwrap();
+    assert_proved_101(&u, nonce, &response);
+    assert_eq!(first_frame_close_code(&mut client).await, 4002);
     u.finish().await;
 }

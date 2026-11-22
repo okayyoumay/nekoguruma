@@ -44,7 +44,7 @@ pub enum Decision {
     Redirect(String),
 }
 
-const BAD_TARGET: &str = "Unsupported request target";
+pub(crate) const BAD_TARGET: &str = "Unsupported request target";
 const BAD_HOST: &str = "Invalid Host header";
 const WRONG_AUTHORITY: &str = "Not served at this authority";
 const BAD_ORIGIN: &str = "Origin not allowed";

@@ -34,13 +34,12 @@ fn hex(bytes: &[u8]) -> String {
 // Requests
 
 fn post(host: &str, content_type: Option<&str>, body: &str) -> String {
-    let mut raw =
-        format!("POST /api/v1/agents/register HTTP/1.1\r\n{host}\r\nConnection: close\r\n");
-    if let Some(content_type) = content_type {
-        raw.push_str(&format!("Content-Type: {content_type}\r\n"));
-    }
-    raw.push_str(&format!("Content-Length: {}\r\n\r\n{body}", body.len()));
-    raw
+    post_with(host, content_type, &[], body)
+}
+
+/// [`post`] with more header lines.
+fn post_with(host: &str, content_type: Option<&str>, headers: &[&str], body: &str) -> String {
+    crate::support::post_with(host, "/api/v1/agents/register", content_type, headers, body)
 }
 
 async fn send(s: &Running, body: &str) -> Reply {
@@ -281,10 +280,25 @@ impl World {
     }
 
     pub(crate) async fn redeem(&self, owner: &str, agent: &Agent) -> (RegistrationCode, Reply) {
+        self.redeem_with(owner, agent, &[]).await
+    }
+
+    /// [`World::redeem`] with more header lines on the request.
+    pub(crate) async fn redeem_with(
+        &self,
+        owner: &str,
+        agent: &Agent,
+        headers: &[&str],
+    ) -> (RegistrationCode, Reply) {
         let code = self.issue(owner, agent).await;
         let body = agent.body(plain(&code), &code, Mode::User, &self.key.public_key());
-        let reply = send(&self.server, &body).await;
-        (code, reply)
+        let raw = post_with(
+            &self.server.host(),
+            Some("application/json"),
+            headers,
+            &body,
+        );
+        (code, exchange(self.server.addr, &raw).await)
     }
 
     pub(crate) async fn sql(&self, sql: &str) -> String {
@@ -1438,5 +1452,22 @@ async fn the_transaction_is_read_committed_whatever_the_database_default() {
         );
     }
     server.finish().await;
+    w.finish().await;
+}
+
+#[tokio::test]
+async fn the_registration_answer_is_never_proved() {
+    let w = World::new().await;
+    w.add_operator("alice").await;
+    let nonce = format!(
+        "{}: {}",
+        shared_proto::NONCE_HEADER,
+        STANDARD.encode(shared_crypto::random_32().unwrap())
+    );
+    let (_, r) = w
+        .redeem_with("alice", &Agent::new(), &[nonce.as_str()])
+        .await;
+    assert_eq!(r.status, 201, "{}", r.head);
+    crate::support::assert_unproved(&r, "the registration answer");
     w.finish().await;
 }

@@ -11,6 +11,12 @@
 //! it is revoked or missing, 503, 500), the job or the upload (404), the request against the row
 //! (400 for a part outside the count, 409), the object store (503, 500) and the answer.
 //!
+//! A request that carries `Ngr-Nonce` is judged for it after the shape and, for begin, the
+//! declared length (413), and before the token (400 for a nonce or a target the proof cannot
+//! take), and every answer sent after the token and
+//! the agent's row are judged carries the proof of the answer (ADR-504); a proof that cannot be
+//! made is an unproved 503. A request without a nonce is served as before.
+//!
 //! Every database call is a short transaction of its own, and none is open while the object store
 //! is called. The writers of `job_objects` are this module's INSERT (state `open`) and the
 //! completion task's updates (`open` to `completing`, then one conditional write of the state the
@@ -36,11 +42,13 @@ use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::de::{self, Deserialize, Deserializer, MapAccess, Visitor};
 use serde_json::{Value, json};
+use shared_crypto::answer::body_digest;
 use shared_proto::{AgentId, JobInstruction, is_canonical_uuid};
 use sqlx::PgPool;
 use tokio::sync::watch;
 
 use crate::agent_caller::{self, Caller, Refusal};
+use crate::answer_proof::{Asked, Prover};
 use crate::control::unauthorized;
 use crate::db;
 use crate::health::may_log;
@@ -363,6 +371,7 @@ pub struct Uploads {
     sessions: Sessions,
     backend: Backend,
     hub: Hub,
+    prover: Arc<Prover>,
     gate: Arc<Mutex<Option<Instant>>>,
     download_gates: Arc<DownloadGates>,
     /// The completion tasks of this process, by tenant and upload (ADR-493 item 20).
@@ -376,12 +385,19 @@ impl std::fmt::Debug for Uploads {
 }
 
 impl Uploads {
-    pub fn new(pool: PgPool, sessions: Sessions, backend: Backend, hub: Hub) -> Uploads {
+    pub(crate) fn new(
+        pool: PgPool,
+        sessions: Sessions,
+        backend: Backend,
+        hub: Hub,
+        prover: Arc<Prover>,
+    ) -> Uploads {
         Uploads {
             pool,
             sessions,
             backend,
             hub,
+            prover,
             gate: Arc::new(Mutex::new(None)),
             download_gates: Arc::default(),
             completions: Arc::new(Mutex::new(HashMap::new())),
@@ -409,6 +425,11 @@ impl Uploads {
 
     pub(crate) fn sessions(&self) -> &Sessions {
         &self.sessions
+    }
+
+    /// The signer of the answer proofs (ADR-504).
+    pub(crate) fn prover(&self) -> &Prover {
+        &self.prover
     }
 
     /// The object store of the backend, if the server has one.
@@ -1127,12 +1148,24 @@ pub async fn begin(State(u): State<Uploads>, request: Request) -> Response {
             "The object is over the size limit",
         );
     }
+    let asked = match Asked::from_header(&parts) {
+        Ok(asked) => asked,
+        Err(error) => return error.into_response(),
+    };
     let caller = match authenticate(&u, &parts.headers).await {
         Ok(caller) => caller,
         Err(response) => return *response,
     };
-    match lookup_job(&u.pool, &caller.tenant, &caller.agent.0, &declared).await {
-        Err(error) => return db_failure(&u, &error),
+    let answer = begin_answer(&u, &caller, &declared).await;
+    u.prover
+        .prove(asked.as_ref(), &caller.agent, body_digest(&bytes), answer)
+        .await
+}
+
+/// What begin answers for an authenticated caller and a declaration that passed its shape.
+async fn begin_answer(u: &Uploads, caller: &Caller, declared: &Declared) -> Response {
+    match lookup_job(&u.pool, &caller.tenant, &caller.agent.0, declared).await {
+        Err(error) => return db_failure(u, &error),
         Ok(JobLookup::NoJob | JobLookup::OtherGeneration) => {
             return problem(StatusCode::NOT_FOUND, "No such job");
         }
@@ -1140,7 +1173,7 @@ pub async fn begin(State(u): State<Uploads>, request: Request) -> Response {
             u.warn("a stored job instruction does not decode", "");
             return problem(StatusCode::INTERNAL_SERVER_ERROR, "The request failed");
         }
-        Ok(JobLookup::Found(Some(row))) => return existing(&row, &caller.agent, &declared),
+        Ok(JobLookup::Found(Some(row))) => return existing(&row, &caller.agent, declared),
         Ok(JobLookup::Found(None)) => {}
     }
     let Some(store) = u.backend.store.as_deref() else {
@@ -1148,14 +1181,14 @@ pub async fn begin(State(u): State<Uploads>, request: Request) -> Response {
     };
     let upload = match store.begin().await {
         Ok(upload) => upload,
-        Err(error) => return store_failure(&u, &error),
+        Err(error) => return store_failure(u, &error),
     };
     let part_bytes = u.backend.part_bytes;
     match insert_row(
         &u.pool,
         &caller.tenant,
         &caller.agent.0,
-        &declared,
+        declared,
         &upload,
         part_bytes,
     )
@@ -1173,19 +1206,19 @@ pub async fn begin(State(u): State<Uploads>, request: Request) -> Response {
         Ok(None) => {
             // Another request inserted the declaration first: this upload is not used.
             abort(store, &upload).await;
-            match reread(&u.pool, &caller.tenant, &declared).await {
-                Ok(Some(row)) => existing(&row, &caller.agent, &declared),
+            match reread(&u.pool, &caller.tenant, declared).await {
+                Ok(Some(row)) => existing(&row, &caller.agent, declared),
                 Ok(None) => problem(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "The upload changed while it was begun; repeat the request",
                 ),
-                Err(error) => db_failure(&u, &error),
+                Err(error) => db_failure(u, &error),
             }
         }
         Err(InsertFailure::Statement(error)) => {
             // The statement did not insert: nothing names the upload.
             abort(store, &upload).await;
-            db_failure(&u, &error)
+            db_failure(u, &error)
         }
         Err(InsertFailure::Commit(error)) => {
             // The commit's answer was lost, so the row may exist, or may still come to exist: the
@@ -1209,14 +1242,14 @@ pub async fn begin(State(u): State<Uploads>, request: Request) -> Response {
                         "an upload may be left without a row after a failed commit",
                         "the commit failed and no row named the upload yet",
                     );
-                    db_failure(&u, &error)
+                    db_failure(u, &error)
                 }
                 Err(_) => {
                     u.warn(
                         "an upload may be left without a row after a failed commit",
                         "the commit and the read after it failed",
                     );
-                    db_failure(&u, &error)
+                    db_failure(u, &error)
                 }
             }
         }
@@ -1278,11 +1311,23 @@ pub async fn part_url(State(u): State<Uploads>, request: Request) -> Response {
     let Some(part) = parse_part(part) else {
         return bad_request("The part must be a number from 1 to 10000");
     };
+    let asked = match Asked::from_header(&parts) {
+        Ok(asked) => asked,
+        Err(error) => return error.into_response(),
+    };
     let caller = match authenticate(&u, &parts.headers).await {
         Ok(caller) => caller,
         Err(response) => return *response,
     };
-    let row = match find(&u, &caller, id).await {
+    let answer = part_url_answer(&u, &caller, id, part).await;
+    u.prover
+        .prove(asked.as_ref(), &caller.agent, body_digest(&[]), answer)
+        .await
+}
+
+/// What the part URL route answers for an authenticated caller and a part that passed its shape.
+async fn part_url_answer(u: &Uploads, caller: &Caller, id: &str, part: u16) -> Response {
+    let row = match find(u, caller, id).await {
         Ok(row) => row,
         Err(response) => return *response,
     };
@@ -1297,14 +1342,14 @@ pub async fn part_url(State(u): State<Uploads>, request: Request) -> Response {
         return no_store();
     };
     let Some(upload) = row.upload() else {
-        return unparsable(&u);
+        return unparsable(u);
     };
     match store.presign_part(&upload, part) {
         Ok(url) => json_answer(
             StatusCode::OK,
             json!({"url": url.expose(), "expiresInSecs": PART_URL_EXPIRY.as_secs()}),
         ),
-        Err(error) => store_failure(&u, &error),
+        Err(error) => store_failure(u, &error),
     }
 }
 
@@ -1337,14 +1382,30 @@ pub async fn status(
     if let Err(response) = empty_body(body).await {
         return *response;
     }
+    let asked = match Asked::from_header(&parts) {
+        Ok(asked) => asked,
+        Err(error) => return error.into_response(),
+    };
     let caller = match authenticate(&u, &parts.headers).await {
         Ok(caller) => caller,
         Err(response) => return *response,
     };
+    let answer = status_answer(&u, &caller, path).await;
+    u.prover
+        .prove(asked.as_ref(), &caller.agent, body_digest(&[]), answer)
+        .await
+}
+
+/// What the status route answers for an authenticated caller.
+async fn status_answer(
+    u: &Uploads,
+    caller: &Caller,
+    path: Result<Path<String>, PathRejection>,
+) -> Response {
     let Ok(Path(id)) = path else {
         return not_found();
     };
-    let row = match find(&u, &caller, &id).await {
+    let row = match find(u, caller, &id).await {
         Ok(row) => row,
         Err(response) => return *response,
     };
@@ -1358,7 +1419,7 @@ pub async fn status(
             return no_store();
         };
         let Some(upload) = row.upload() else {
-            return unparsable(&u);
+            return unparsable(u);
         };
         match store.list_parts(&upload).await {
             Ok(listed) => answer["partsHeld"] = parts_held(&listed, &row).into(),
@@ -1379,12 +1440,12 @@ pub async fn status(
                         );
                     }
                     Ok(_) => {
-                        return store_failure(&u, &error);
+                        return store_failure(u, &error);
                     }
-                    Err(error) => return db_failure(&u, &error),
+                    Err(error) => return db_failure(u, &error),
                 }
             }
-            Err(error) => return store_failure(&u, &error),
+            Err(error) => return store_failure(u, &error),
         }
     }
     json_answer(StatusCode::OK, answer)
@@ -1406,14 +1467,30 @@ pub async fn complete(
     if let Err(response) = empty_body(body).await {
         return *response;
     }
+    let asked = match Asked::from_header(&parts) {
+        Ok(asked) => asked,
+        Err(error) => return error.into_response(),
+    };
     let caller = match authenticate(&u, &parts.headers).await {
         Ok(caller) => caller,
         Err(response) => return *response,
     };
+    let answer = complete_answer(&u, &caller, path).await;
+    u.prover
+        .prove(asked.as_ref(), &caller.agent, body_digest(&[]), answer)
+        .await
+}
+
+/// What the completion route answers for an authenticated caller.
+async fn complete_answer(
+    u: &Uploads,
+    caller: &Caller,
+    path: Result<Path<String>, PathRejection>,
+) -> Response {
     let Ok(Path(id)) = path else {
         return not_found();
     };
-    let row = match find(&u, &caller, &id).await {
+    let row = match find(u, caller, &id).await {
         Ok(row) => row,
         Err(response) => return *response,
     };
@@ -1426,7 +1503,7 @@ pub async fn complete(
         return no_store();
     };
     let (Some(upload), Some(sha256)) = (row.upload(), parse_sha256(&row.digest)) else {
-        return unparsable(&u);
+        return unparsable(u);
     };
     let job = CompletionJob {
         upload,

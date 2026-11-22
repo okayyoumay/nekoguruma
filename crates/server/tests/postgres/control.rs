@@ -1670,7 +1670,7 @@ async fn a_frame_queued_before_the_stop_is_never_written() {
 // ---------------------------------------------------------------------------------------------
 // The answer proof of the 101 (ADR-504)
 
-fn nonce_line(nonce: &[u8; 32]) -> String {
+pub(crate) fn nonce_line(nonce: &[u8; 32]) -> String {
     format!("{}: {}", shared_proto::NONCE_HEADER, STANDARD.encode(nonce))
 }
 

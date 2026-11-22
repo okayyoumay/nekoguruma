@@ -487,15 +487,25 @@ nonce, the request's method, target and body, and the answer's status and body
   listener's port) and the log gate of a failed proof. The session route's 200 is always proved,
   to the nonce of its body; it reads no `Ngr-Nonce` header. The control upgrade's 101 is proved
   when the request carries `Ngr-Nonce` (the proof is a header of the 101); a request without it
-  is served as before. No refusal, no challenge answer and no registration answer carries a proof.
+  is served as before. The five data routes (begin, part URL, status, completion, download) prove
+  every answer they send after the token and the agent's row are judged, whatever its status, when
+  the request carries `Ngr-Nonce` (`Prover::prove` signs the finished response; the request digest
+  is that of the body read, and of zero bytes on the routes with none; for a HEAD request, which
+  the status route takes as a GET, the answer's digest is over zero bytes, the body actually
+  sent). No refusal before that
+  point (the guard, the method, the body, the shape, the token, the agent's row), no challenge
+  answer and no registration answer carries a proof.
 - The new 400s: on the session route the target joins the shape step (the challenge is not
   taken); on the upgrade they come after the method (405), the token (401), the WebSocket
   request (400) and the subprotocol (400), in this order: the nonce, then the target. Neither
-  consumes the token or registers the connection. The target rule is `answer::check_target`; the
-  title is the guard's "Unsupported request target".
+  consumes the token or registers the connection. On a data route they come last in the shape
+  step, after the route's own shape error and begin's length (413) and before the token: the
+  nonce, then the target. The target rule is `answer::check_target`; the title is the guard's
+  "Unsupported request target".
 - A proof that cannot be made (the signer fails) is an unproved 503, logged once a minute without
   the target. At the session route the minted token is discarded; at the upgrade the proof is
-  signed before the upgrade, so no connection exists.
+  signed before the upgrade, so no connection exists; on a data route the work is done (a begun
+  row exists, a completion ran) and the repeated request is answered, proved.
 - The proof rests on nobody else being able to receive connections to the server's address. The
   listener (`loopback_listener`) is bound to `127.0.0.1` itself, never the wildcard address, and
   sets neither `SO_REUSEPORT` nor, on Windows, `SO_REUSEADDR` (mio sets `SO_REUSEADDR` on Unix, which

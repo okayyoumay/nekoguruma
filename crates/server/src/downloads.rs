@@ -4,7 +4,8 @@
 //!
 //! A request is judged in this order, and the first step that applies answers: the request guard
 //! (before routing), the method (405), the body (at most [`MAX_BODY`] bytes, 413; within 5 seconds,
-//! 408; broken, 400), the shape (400), the bearer token (401 with `WWW-Authenticate: Bearer`), the
+//! 408; broken, 400), the shape (400; then, when the request carries `Ngr-Nonce`, the nonce and the
+//! request target, 400), the bearer token (401 with `WWW-Authenticate: Bearer`), the
 //! agent's row (401 and the agent's tokens dropped when it is revoked or missing, 503, 500), the
 //! job (404), its generation (404), what the job names (404), the digest's row (404), the stored
 //! key (500) and the object store (503, 500). All the 404 answers are one body, so a caller learns
@@ -33,10 +34,12 @@ use axum::http::header::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use serde::de::{self, Deserialize, Deserializer, MapAccess, Visitor};
 use serde_json::json;
+use shared_crypto::answer::body_digest;
 use shared_proto::{JobInstruction, is_canonical_uuid};
 use sqlx::PgPool;
 
-use crate::agent_caller::{self, Refusal};
+use crate::agent_caller::{self, Caller, Refusal};
+use crate::answer_proof::Asked;
 use crate::control::unauthorized;
 use crate::db;
 use crate::problem::Problem;
@@ -288,13 +291,25 @@ pub async fn url(State(d): State<Downloads>, request: Request) -> Response {
             "The body is not the expected JSON object",
         );
     };
+    let asked = match Asked::from_header(&parts) {
+        Ok(asked) => asked,
+        Err(error) => return error.into_response(),
+    };
     let caller = match agent_caller::authenticate(d.pool(), d.sessions(), &parts.headers).await {
         Ok(caller) => caller,
         Err(Refusal::Unauthorized) => return unauthorized(),
         Err(Refusal::Database(error)) => return db_failure(&d, &error),
     };
-    let key = match lookup(d.pool(), &caller.tenant, &caller.agent.0, &wanted, hash).await {
-        Err(error) => return db_failure(&d, &error),
+    let answer = url_answer(&d, &caller, &wanted, hash).await;
+    d.prover()
+        .prove(asked.as_ref(), &caller.agent, body_digest(&bytes), answer)
+        .await
+}
+
+/// What the route answers for an authenticated caller and a request that passed its shape.
+async fn url_answer(d: &Downloads, caller: &Caller, wanted: &Wanted, hash: [u8; 32]) -> Response {
+    let key = match lookup(d.pool(), &caller.tenant, &caller.agent.0, wanted, hash).await {
+        Err(error) => return db_failure(d, &error),
         Ok(Lookup::NoJob | Lookup::OtherGeneration | Lookup::NotNamed) => return not_found(),
         Ok(Lookup::Undecodable) => {
             d.warn_download(
@@ -327,7 +342,7 @@ pub async fn url(State(d): State<Downloads>, request: Request) -> Response {
             StatusCode::OK,
             json!({"url": url.expose(), "expiresInSecs": GET_URL_EXPIRY.as_secs()}),
         ),
-        Err(error) => store_failure(&d, &error),
+        Err(error) => store_failure(d, &error),
     }
 }
 

@@ -256,6 +256,7 @@ pub fn routes_unguarded(state: AppState) -> (Router, Vec<ServedRoute>) {
             state.sessions.clone(),
             state.uploads,
             state.hub.clone(),
+            Arc::clone(&prover),
         ));
     // The redemption route keeps its own limiter and log gates: one set per router.
     let register = mounts

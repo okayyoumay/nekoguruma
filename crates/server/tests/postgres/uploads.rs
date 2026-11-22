@@ -17,17 +17,18 @@ use server::storage::{
     GetUrl, MultipartStore, ObjectBody, ObjectKey, Part, PartUrl, S3Store, S3Tuning, StoreError,
     StoreFuture, UnfinishedUploads, Upload, UploadId,
 };
-use server::uploads::{Backend, PART_BYTES, Pause};
+use server::uploads::{BEGIN_PATH, Backend, MAX_SIZE, PART_BYTES, Pause};
 use sha2::{Digest, Sha256};
 use shared_proto::{AgentId, INSTRUCTION_VERSION, JobId, JobInstruction, JobKind, VciId};
 use tokio::io::AsyncReadExt;
 use tokio::sync::{Barrier, Notify, Semaphore};
 
-use crate::control::token;
+use crate::control::{nonce_line, token};
 use crate::redeem::{Agent, bytes_of, capture, json};
 use crate::serving::{Reply, Running, exchange};
-use crate::session::Up;
+use crate::session::{Up, audience_of};
 use crate::storage::{MIB, content, put, sha256};
+use crate::support::{Answered, assert_unproved};
 
 const SMALL: u64 = 512 * 1024;
 
@@ -433,6 +434,20 @@ impl Fx {
 
     /// A fixture whose backend `tune` has changed.
     pub(crate) async fn tuned(with: With, tune: impl FnOnce(Backend) -> Backend) -> Fx {
+        Fx::assemble(with, tune, false).await.0
+    }
+
+    /// A fixture whose instruction key stops signing while the returned flag is set.
+    pub(crate) async fn flaky(with: With) -> (Fx, Arc<std::sync::atomic::AtomicBool>) {
+        let (fx, fail) = Fx::assemble(with, |backend| backend, true).await;
+        (fx, fail.expect("a flaky fixture has its flag"))
+    }
+
+    async fn assemble(
+        with: With,
+        tune: impl FnOnce(Backend) -> Backend,
+        flaky: bool,
+    ) -> (Fx, Option<Arc<std::sync::atomic::AtomicBool>>) {
         let mut real = None;
         let mut wrap = Wrap::default();
         if with == With::Real {
@@ -456,14 +471,22 @@ impl Fx {
         let wrap = Arc::new(wrap);
         let store = (with != With::Nothing).then(|| Arc::clone(&wrap) as Arc<dyn MultipartStore>);
         let backend = tune(Backend::new(store));
-        let u = Up::with_backend(2, None, None, backend).await;
+        let (u, fail) = if flaky {
+            let (u, fail) = Up::flaky_with(backend).await;
+            (u, Some(fail))
+        } else {
+            (Up::with_backend(2, None, None, backend).await, None)
+        };
         let token = token(&u).await;
-        Fx {
-            u,
-            wrap,
-            real,
-            token,
-        }
+        (
+            Fx {
+                u,
+                wrap,
+                real,
+                token,
+            },
+            fail,
+        )
     }
 
     pub(crate) async fn finish(self) {
@@ -500,10 +523,26 @@ impl Fx {
         content_type: Option<&str>,
         body: &str,
     ) -> String {
+        self.request_text_with(method, target, token, content_type, &[], body)
+    }
+
+    /// Like `request_text`, with the header lines `extra` after the `Host` line.
+    fn request_text_with(
+        &self,
+        method: &str,
+        target: &str,
+        token: Option<&str>,
+        content_type: Option<&str>,
+        extra: &[String],
+        body: &str,
+    ) -> String {
         let mut raw = format!(
             "{method} {target} HTTP/1.1\r\n{}\r\nConnection: close\r\n",
             self.u.s.host()
         );
+        for line in extra {
+            raw.push_str(&format!("{line}\r\n"));
+        }
         if let Some(token) = token {
             raw.push_str(&format!("Authorization: Bearer {token}\r\n"));
         }
@@ -512,6 +551,23 @@ impl Fx {
         }
         raw.push_str(&format!("Content-Length: {}\r\n\r\n{body}", body.len()));
         raw
+    }
+
+    /// Like [`Fx::send`], with the header lines `extra`.
+    pub(crate) async fn send_with(
+        &self,
+        method: &str,
+        target: &str,
+        token: Option<&str>,
+        content_type: Option<&str>,
+        extra: &[String],
+        body: &str,
+    ) -> Reply {
+        exchange(
+            self.addr(),
+            &self.request_text_with(method, target, token, content_type, extra, body),
+        )
+        .await
     }
 
     async fn begin_as(&self, token: Option<&str>, body: &str) -> Reply {
@@ -1428,6 +1484,12 @@ async fn the_database_being_down_is_503() {
     problem(&fx.part(&id, "1").await, 503, "part");
     problem(&fx.status(&id).await, 503, "status");
     problem(&fx.complete(&id).await, 503, "complete");
+    // A request that asks for a proof is refused the same way, unproved (ADR-504).
+    for call in calls(&result_of(&job, 10), &id) {
+        let (_, r) = fx.nonced(&call, &[]).await;
+        problem(&r, 503, call.name);
+        assert_unproved(&r, call.name);
+    }
     fx.finish().await;
 }
 
@@ -2615,6 +2677,697 @@ async fn the_table_refuses_what_the_rules_forbid() {
             sqlx::query(sql).execute(&fx.u.w.pool).await.is_err(),
             "{sql}"
         );
+    }
+    fx.finish().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The answer proof (ADR-504)
+
+/// One request of a data route, as the agent writes it.
+pub(crate) struct Call {
+    pub(crate) name: &'static str,
+    pub(crate) method: &'static str,
+    pub(crate) target: String,
+    pub(crate) content_type: Option<&'static str>,
+    pub(crate) body: String,
+}
+
+/// A valid request to each of the four upload routes: begin with `declaration`, the part URL of
+/// part 1, the status and the completion of upload `id`.
+pub(crate) fn calls(declaration: &str, id: &str) -> Vec<Call> {
+    vec![
+        Call {
+            name: "begin",
+            method: "POST",
+            target: BEGIN_PATH.to_owned(),
+            content_type: Some("application/json"),
+            body: declaration.to_owned(),
+        },
+        Call {
+            name: "part",
+            method: "POST",
+            target: format!("{BEGIN_PATH}/{id}/parts/1"),
+            content_type: None,
+            body: String::new(),
+        },
+        Call {
+            name: "status",
+            method: "GET",
+            target: format!("{BEGIN_PATH}/{id}"),
+            content_type: None,
+            body: String::new(),
+        },
+        Call {
+            name: "complete",
+            method: "POST",
+            target: format!("{BEGIN_PATH}/{id}/complete"),
+            content_type: None,
+            body: String::new(),
+        },
+    ]
+}
+
+fn fresh() -> [u8; 32] {
+    shared_crypto::random_32().unwrap()
+}
+
+impl Fx {
+    /// `call` with the agent's token and the header lines `extra`.
+    pub(crate) async fn call(&self, call: &Call, token: Option<&str>, extra: &[String]) -> Reply {
+        self.send_with(
+            call.method,
+            &call.target,
+            token,
+            call.content_type,
+            extra,
+            &call.body,
+        )
+        .await
+    }
+
+    /// `call` with the agent's token and a fresh nonce, which is returned.
+    pub(crate) async fn nonced(&self, call: &Call, extra: &[String]) -> ([u8; 32], Reply) {
+        let nonce = fresh();
+        let lines = [vec![nonce_line(&nonce)], extra.to_vec()].concat();
+        (nonce, self.call(call, Some(&self.token), &lines).await)
+    }
+
+    /// Asserts that `reply` is the answer of `status` to the request of `method`, `target` and
+    /// `request_body` made with `nonce`, proved as the agent checks it.
+    pub(crate) fn assert_proved_for(
+        &self,
+        nonce: [u8; 32],
+        method: &str,
+        target: &str,
+        request_body: &str,
+        status: u16,
+        reply: &Reply,
+    ) {
+        let public = self.u.w.key.public_key();
+        let audience = audience_of(self.addr().port());
+        Answered {
+            public: &public,
+            audience: &audience,
+            agent_id: &self.u.id,
+            nonce,
+            method,
+            target,
+            request_body: request_body.as_bytes(),
+        }
+        .verify(status, reply);
+    }
+
+    /// Sends `call` with a fresh nonce and asserts the answer is `status`, proved.
+    pub(crate) async fn proved(&self, call: &Call, status: u16) -> Reply {
+        let (nonce, r) = self.nonced(call, &[]).await;
+        self.assert_proved_for(nonce, call.method, &call.target, &call.body, status, &r);
+        r
+    }
+}
+
+#[tokio::test]
+async fn an_answer_without_a_nonce_carries_no_proof() {
+    let fx = Fx::new(With::Fake).await;
+    let job = fx.job().await;
+    let id = fx
+        .row(&fx.job().await, 1, "result", 10, "open", PART_BYTES as i64)
+        .await;
+    let mut all = calls(&result_of(&job, 10), &id);
+    // Answers of several statuses: the created row, the same row again, a 404 and the errors.
+    all.extend(calls(&result_of(&job, 10), &v4()));
+    all.extend(calls(&result_of(&v4(), 10), &id));
+    let mut statuses = Vec::new();
+    for call in &all {
+        let r = fx.call(call, Some(&fx.token), &[]).await;
+        assert_unproved(&r, call.name);
+        statuses.push(r.status);
+    }
+    for want in [200, 201, 404, 503] {
+        assert!(statuses.contains(&want), "{want} not in {statuses:?}");
+    }
+    fx.finish().await;
+}
+
+#[tokio::test]
+async fn no_answer_before_the_token_carries_a_proof() {
+    let fx = Fx::new(With::Fake).await;
+    let job = fx.job().await;
+    let id = fx
+        .row(&fx.job().await, 1, "result", 10, "open", PART_BYTES as i64)
+        .await;
+    let good = result_of(&job, 10);
+    let line = [nonce_line(&fresh())];
+    let json_type = Some("application/json");
+    // The body step and the shape, whatever the token.
+    let begin = |body: &str| ("POST", BEGIN_PATH.to_owned(), json_type, body.to_owned());
+    let over_length = decl(&job, 1, "result", MAX_SIZE + 1, &digest());
+    let mut cases = vec![
+        ("shape", 400, begin("{}")),
+        ("length", 413, begin(&over_length)),
+        (
+            "body size",
+            413,
+            begin(&format!("{good}{}", " ".repeat(4096))),
+        ),
+    ];
+    for call in calls(&good, &id).into_iter().skip(1) {
+        cases.push((
+            call.name,
+            400,
+            (call.method, call.target, None, "x".to_owned()),
+        ));
+    }
+    cases.push((
+        "part number",
+        400,
+        (
+            "POST",
+            format!("{BEGIN_PATH}/{id}/parts/0"),
+            None,
+            String::new(),
+        ),
+    ));
+    for (name, status, (method, target, content_type, body)) in &cases {
+        for token in [None, Some(fx.token.as_str())] {
+            let r = fx
+                .send_with(method, target, token, *content_type, &line, body)
+                .await;
+            assert_eq!(r.status, *status, "{name}: {}", r.head);
+            assert_unproved(&r, name);
+        }
+    }
+    // The token, then the agent's row.
+    for call in calls(&good, &id) {
+        let r = fx.call(&call, None, &line).await;
+        problem(&r, 401, call.name);
+        assert_unproved(&r, call.name);
+        let r = fx.call(&call, Some("x"), &line).await;
+        problem(&r, 401, call.name);
+        assert_unproved(&r, call.name);
+    }
+    sqlx::query("UPDATE agents SET revoked_at = now() WHERE id = $1::uuid")
+        .bind(&fx.u.id)
+        .execute(&fx.u.w.pool)
+        .await
+        .unwrap();
+    for call in calls(&good, &id) {
+        let r = fx.call(&call, Some(&fx.token), &line).await;
+        problem(&r, 401, call.name);
+        assert_unproved(&r, call.name);
+    }
+    fx.finish().await;
+}
+
+#[tokio::test]
+async fn a_body_that_does_not_arrive_is_an_unproved_408() {
+    let fx = Fx::new(With::Nothing).await;
+    let line = nonce_line(&fresh());
+    let requests: Vec<String> = calls(&result_of(&v4(), 1), &v4())
+        .iter()
+        .map(|call| {
+            format!(
+                "{} {} HTTP/1.1\r\n{}\r\n{line}\r\nContent-Type: application/json\r\n\
+                 Content-Length: 10\r\n\r\n",
+                call.method,
+                call.target,
+                fx.u.s.host()
+            )
+        })
+        .collect();
+    let replies =
+        futures_util::future::join_all(requests.iter().map(|raw| exchange(fx.addr(), raw))).await;
+    for r in &replies {
+        problem(r, 408, "no body");
+        assert_unproved(r, "no body");
+    }
+    fx.finish().await;
+}
+
+/// What a guard refusal and a wrong method answer with a nonce: no proof, since no route ran.
+#[tokio::test]
+async fn the_guard_and_the_method_answer_unproved() {
+    let fx = Fx::new(With::Fake).await;
+    let port = fx.addr().port();
+    let line = nonce_line(&fresh());
+    for call in calls(&result_of(&v4(), 1), &v4()) {
+        let host = |host: &str| {
+            format!(
+                "{} {} HTTP/1.1\r\nHost: {host}\r\n{line}\r\nConnection: close\r\n\
+                 Content-Length: 0\r\n\r\n",
+                call.method, call.target
+            )
+        };
+        let r = exchange(fx.addr(), &host("example.invalid")).await;
+        assert_eq!(r.status, 421, "{}", call.name);
+        assert_unproved(&r, call.name);
+        let r = exchange(fx.addr(), &host(&format!("localhost:{port}"))).await;
+        assert_eq!(r.status, 307, "{}", call.name);
+        assert_unproved(&r, call.name);
+        let origin = ["Origin: http://example.invalid".to_owned(), line.clone()];
+        let r = fx.call(&call, Some(&fx.token), &origin).await;
+        assert_eq!(r.status, 403, "{}", call.name);
+        assert_unproved(&r, call.name);
+        // An absolute-form target is the guard's 400.
+        let absolute = format!(
+            "{} http://127.0.0.1:{port}{} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{line}\r\n\
+             Connection: close\r\nContent-Length: 0\r\n\r\n",
+            call.method, call.target
+        );
+        let r = exchange(fx.addr(), &absolute).await;
+        assert_eq!(r.status, 400, "{}", call.name);
+        assert_unproved(&r, call.name);
+        // Another method than the route's.
+        let other = if call.method == "GET" { "PUT" } else { "GET" };
+        let r = fx
+            .send_with(
+                other,
+                &call.target,
+                Some(&fx.token),
+                None,
+                std::slice::from_ref(&line),
+                "",
+            )
+            .await;
+        assert_eq!(r.status, 405, "{}", call.name);
+        assert_unproved(&r, call.name);
+    }
+    fx.finish().await;
+}
+
+/// Nonces that are not the canonical base64 of 32 bytes, and two of them.
+pub(crate) fn bad_nonce_lines() -> Vec<(&'static str, Vec<String>)> {
+    use base64::Engine;
+    let name = shared_proto::NONCE_HEADER;
+    let engine = base64::engine::general_purpose::STANDARD;
+    let nonce = fresh();
+    let good = engine.encode(nonce);
+    // The last data character of 32 bytes carries two padding bits, clear in the canonical text.
+    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let last = alphabet
+        .iter()
+        .position(|c| *c == good.as_bytes()[42])
+        .unwrap();
+    let loose = format!("{}{}=", &good[..42], alphabet[last | 1] as char);
+    vec![
+        ("not base64", vec![format!("{name}: !!not base64!!")]),
+        (
+            "31 bytes",
+            vec![format!("{name}: {}", engine.encode(&nonce[..31]))],
+        ),
+        (
+            "33 bytes",
+            vec![format!(
+                "{name}: {}",
+                engine.encode([&nonce[..], &[0]].concat())
+            )],
+        ),
+        ("non-canonical", vec![format!("{name}: {loose}")]),
+        (
+            "unpadded",
+            vec![format!("{name}: {}", good.trim_end_matches('='))],
+        ),
+        ("empty", vec![format!("{name}:")]),
+        ("non-ASCII", vec![format!("{name}: \u{e9}")]),
+        (
+            "two values",
+            vec![format!("{name}: {good}"), format!("{name}: {good}")],
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn a_malformed_nonce_is_400_before_the_token() {
+    let fx = Fx::new(With::Fake).await;
+    let job = fx.job().await;
+    let id = fx
+        .row(&fx.job().await, 1, "result", 10, "open", PART_BYTES as i64)
+        .await;
+    let all = calls(&result_of(&job, 10), &id);
+    let rows_before = fx.sql("SELECT count(*) FROM job_objects").await;
+    for (name, lines) in bad_nonce_lines() {
+        for call in &all {
+            for token in [None, Some(fx.token.as_str())] {
+                let r = fx.call(call, token, &lines).await;
+                problem(&r, 400, &format!("{} {name}", call.name));
+                assert!(r.body.contains("Invalid Ngr-Nonce header"), "{}", r.body);
+                assert_unproved(&r, name);
+            }
+        }
+    }
+    // Nothing was consumed: no row, and the token still works.
+    assert_eq!(
+        fx.sql("SELECT count(*) FROM job_objects").await,
+        rows_before
+    );
+    assert_eq!(fx.status(&id).await.status, 200);
+    fx.finish().await;
+}
+
+#[tokio::test]
+async fn the_routes_own_refusals_come_before_the_nonce() {
+    let fx = Fx::new(With::Fake).await;
+    let job = fx.job().await;
+    let id = v4();
+    let (_, lines) = bad_nonce_lines().swap_remove(0);
+    let json_type = Some("application/json");
+    let shape = fx
+        .send_with("POST", BEGIN_PATH, None, json_type, &lines, "{}")
+        .await;
+    problem(&shape, 400, "begin shape");
+    assert!(
+        shape.body.contains("not the expected JSON"),
+        "{}",
+        shape.body
+    );
+    let over = decl(&job, 1, "result", MAX_SIZE + 1, &digest());
+    let r = fx
+        .send_with("POST", BEGIN_PATH, None, json_type, &lines, &over)
+        .await;
+    problem(&r, 413, "begin length");
+    let target = format!("{BEGIN_PATH}/{id}/parts/0");
+    let r = fx.send_with("POST", &target, None, None, &lines, "").await;
+    problem(&r, 400, "part number");
+    assert!(r.body.contains("The part must be a number"), "{}", r.body);
+    for (method, target) in [
+        ("GET", format!("{BEGIN_PATH}/{id}")),
+        ("POST", format!("{BEGIN_PATH}/{id}/complete")),
+        ("POST", format!("{BEGIN_PATH}/{id}/parts/1")),
+    ] {
+        let r = fx.send_with(method, &target, None, None, &lines, "x").await;
+        problem(&r, 400, &target);
+        assert!(r.body.contains("The body must be empty"), "{}", r.body);
+    }
+    fx.finish().await;
+}
+
+/// A target that the transcript cannot take is a 400 before the token when a nonce is sent, and
+/// the same request without a nonce is answered as before. A raw byte over 0x7F in a request
+/// target is refused by this server's own parser or by the route's shape step; either is a 400.
+#[tokio::test]
+async fn a_target_the_transcript_cannot_take_is_400() {
+    let fx = Fx::new(With::Fake).await;
+    let job = fx.job().await;
+    let id = fx
+        .row(&fx.job().await, 1, "result", 10, "open", PART_BYTES as i64)
+        .await;
+    let line = [nonce_line(&fresh())];
+    let long_query = format!("?q={}", "a".repeat(2100));
+    let all = calls(&result_of(&job, 10), &id);
+    for call in &all {
+        let long = Call {
+            target: format!("{}{long_query}", call.target),
+            body: call.body.clone(),
+            ..*call
+        };
+        let high_query = Call {
+            target: format!("{}?q=\u{e9}", call.target),
+            body: call.body.clone(),
+            ..*call
+        };
+        for bad in [&long, &high_query] {
+            for token in [None, Some(fx.token.as_str())] {
+                let r = fx.call(bad, token, &line).await;
+                assert_eq!(r.status, 400, "{}: {}", call.name, r.head);
+                assert_unproved(&r, call.name);
+            }
+            // D11: no nonce, no token: the route judges the token as before.
+            let r = fx.call(bad, None, &[]).await;
+            assert_eq!(r.status, 401, "{} without a nonce: {}", call.name, r.head);
+        }
+    }
+    // A byte over 0x7F in the upload ID of the three routes that have one.
+    for call in all.iter().skip(1) {
+        let high = Call {
+            target: call.target.replace(&id, "\u{e9}"),
+            body: String::new(),
+            ..*call
+        };
+        let r = fx.call(&high, Some(&fx.token), &line).await;
+        assert_eq!(r.status, 400, "{}: {}", call.name, r.head);
+        assert_unproved(&r, call.name);
+        // Without a nonce it names no upload: the route's own 404.
+        let r = fx.call(&high, Some(&fx.token), &[]).await;
+        assert_eq!(r.status, 404, "{} without a nonce: {}", call.name, r.head);
+    }
+    fx.finish().await;
+}
+
+/// The request of route `name` among [`calls`].
+fn call_of(name: &str, declaration: &str, id: &str) -> Call {
+    calls(declaration, id)
+        .into_iter()
+        .find(|call| call.name == name)
+        .expect("a route of that name")
+}
+
+#[tokio::test]
+async fn a_begin_answer_is_proved() {
+    let fx = Fx::new(With::Fake).await;
+    let job = fx.job().await;
+    let begin = call_of("begin", &result_of(&job, 10), "");
+    let created = fx.proved(&begin, 201).await;
+    assert_eq!(created.header("cache-control"), Some("no-store"));
+    assert_eq!(upload_id(&created).len(), 36);
+    // The same declaration again is the same row, proved to the new nonce.
+    let again = fx.proved(&begin, 200).await;
+    assert_eq!(upload_id(&again), upload_id(&created));
+    fx.finish().await;
+}
+
+#[tokio::test]
+async fn a_part_url_answer_is_proved() {
+    let fx = Fx::new(With::Real).await;
+    let id = begin_for(&fx, b"some bytes").await;
+    let r = fx.proved(&call_of("part", "", &id), 200).await;
+    assert!(
+        json(&r)["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("http://127.0.0.1:")
+    );
+    fx.finish().await;
+}
+
+#[tokio::test]
+async fn a_status_answer_is_proved() {
+    let fx = Fx::new(With::Fake).await;
+    for state in ["open", "completing", "finished", "failed"] {
+        let id = fx
+            .row(&fx.job().await, 1, "result", 10, state, PART_BYTES as i64)
+            .await;
+        let r = fx.proved(&call_of("status", "", &id), 200).await;
+        assert_eq!(json(&r)["state"], state);
+    }
+    fx.finish().await;
+}
+
+#[tokio::test]
+async fn a_completion_answer_is_proved() {
+    let fx = Fx::waiting(With::Fake, Duration::from_millis(300)).await;
+    let open = || async {
+        fx.row(&fx.job().await, 1, "result", 10, "open", PART_BYTES as i64)
+            .await
+    };
+    // 200: the object matches.
+    let id = open().await;
+    let r = fx.proved(&call_of("complete", "", &id), 200).await;
+    assert_eq!(json(&r)["state"], "finished");
+    // 409 with the row open again, and 409 with the row failed.
+    for (fail, state) in [(Fail::MissingPart, "open"), (Fail::HashMismatch, "failed")] {
+        let id = open().await;
+        Wrap::set(&fx.wrap.complete_fail, Some(fail));
+        let r = fx.proved(&call_of("complete", "", &id), 409).await;
+        assert_eq!(json(&r)["state"], state);
+    }
+    Wrap::set(&fx.wrap.complete_fail, None);
+    // 202: the task is still at the store when the wait ends.
+    let id = open().await;
+    let hold = Hold::new();
+    *fx.wrap.complete_hold.lock().unwrap() = Some(Arc::clone(&hold));
+    let r = fx.proved(&call_of("complete", "", &id), 202).await;
+    assert_eq!(json(&r)["state"], "completing");
+    hold.release();
+    fx.until(&id, "finished").await;
+    fx.finish().await;
+}
+
+/// Every answer after the token and the row are judged is proved, whatever its status.
+#[tokio::test]
+async fn every_answer_after_the_token_and_row_is_proved() {
+    let fx = Fx::new(With::Fake).await;
+    let job = fx.job().await;
+    let declaration = result_of(&job, 10);
+    let open = fx
+        .row(&fx.job().await, 1, "result", 10, "open", PART_BYTES as i64)
+        .await;
+    let finished = fx
+        .row(
+            &fx.job().await,
+            1,
+            "result",
+            10,
+            "finished",
+            PART_BYTES as i64,
+        )
+        .await;
+    let unparsable = fx
+        .row(&fx.job().await, 1, "result", 10, "open", PART_BYTES as i64)
+        .await;
+    sqlx::query("UPDATE job_objects SET storage_key = repeat('x', 36) WHERE id = $1::uuid")
+        .bind(&unparsable)
+        .execute(&fx.u.w.pool)
+        .await
+        .unwrap();
+    let garbage = v4();
+    fx.insert_job(&garbage, &fx.u.id, b"not an envelope").await;
+
+    // Begin: no such job, a repeat with another declaration, an instruction that does not decode,
+    // and the store failing.
+    let begin = |declaration: &str| call_of("begin", declaration, "");
+    fx.proved(&begin(&result_of(&v4(), 10)), 404).await;
+    fx.proved(&begin(&declaration), 201).await;
+    fx.proved(&begin(&result_of(&job, 11)), 409).await;
+    fx.proved(&begin(&result_of(&garbage, 10)), 500).await;
+    let other = fx.job().await;
+    fx.wrap.fail_begin(Some(Fail::Io));
+    fx.proved(&begin(&result_of(&other, 10)), 503).await;
+    fx.wrap.fail_begin(None);
+
+    // The part URL.
+    let part = |id: &str| call_of("part", "", id);
+    fx.proved(&part(&v4()), 404).await;
+    fx.proved(&part(&finished), 409).await;
+    fx.proved(&part(&unparsable), 500).await;
+    fx.proved(&part(&open), 503).await;
+    let beyond = Call {
+        target: format!("{BEGIN_PATH}/{open}/parts/2"),
+        ..part(&open)
+    };
+    fx.proved(&beyond, 400).await;
+
+    // The status.
+    let status = |id: &str| call_of("status", "", id);
+    fx.proved(&status(&v4()), 404).await;
+    Wrap::set(&fx.wrap.list_fail, Some(Fail::Io));
+    fx.proved(&status(&open), 503).await;
+    Wrap::set(&fx.wrap.list_fail, None);
+
+    // The completion.
+    let complete = |id: &str| call_of("complete", "", id);
+    fx.proved(&complete(&v4()), 404).await;
+    Wrap::set(&fx.wrap.complete_fail, Some(Fail::Io));
+    fx.proved(&complete(&open), 503).await;
+    Wrap::set(&fx.wrap.complete_fail, None);
+    fx.finish().await;
+
+    // No object store.
+    let fx = Fx::new(With::Nothing).await;
+    let open = fx
+        .row(&fx.job().await, 1, "result", 10, "open", PART_BYTES as i64)
+        .await;
+    fx.proved(&call_of("part", "", &open), 503).await;
+    fx.proved(&call_of("status", "", &open), 503).await;
+    fx.proved(&call_of("complete", "", &open), 503).await;
+    fx.proved(&call_of("begin", &result_of(&fx.job().await, 10), ""), 503)
+        .await;
+    fx.finish().await;
+}
+
+#[tokio::test]
+async fn a_signing_failure_is_an_unproved_503() {
+    let (logs, _guard) = capture();
+    let (fx, fail) = Fx::flaky(With::Fake).await;
+    let job = fx.job().await;
+    let open = fx
+        .row(&fx.job().await, 1, "result", 10, "open", PART_BYTES as i64)
+        .await;
+    let begin_call = |job: &str| call_of("begin", &result_of(job, 10), "");
+    let begin = begin_call(&job);
+    fail.store(true, Ordering::SeqCst);
+    let count = format!("SELECT count(*) FROM job_objects WHERE job_id = '{job}'");
+    for name in ["begin", "part", "status", "complete"] {
+        let call = match name {
+            "begin" => begin_call(&job),
+            other => call_of(other, "", &open),
+        };
+        let (_, r) = fx.nonced(&call, &[]).await;
+        problem(&r, 503, call.name);
+        assert!(
+            r.body.contains("The answer could not be proved"),
+            "{}",
+            r.body
+        );
+        assert_unproved(&r, call.name);
+    }
+    // The row begin made is there: the answer was lost, not the work.
+    assert_eq!(fx.sql(&count).await, "1");
+    fail.store(false, Ordering::SeqCst);
+    fx.proved(&begin, 200).await;
+    assert_eq!(fx.sql(&count).await, "1");
+    // The completion ran although its answer could not be proved; the repeat is a proved 200.
+    fx.until(&open, "finished").await;
+    fx.proved(&call_of("complete", "", &open), 200).await;
+    let text = logs.text();
+    assert!(text.contains("could not be proved"), "{text}");
+    assert!(
+        !text.contains("/api/v1"),
+        "the log names the target: {text}"
+    );
+    assert!(!text.contains(&open), "the log names the upload: {text}");
+    fx.finish().await;
+}
+
+/// Hyper sends no body for a HEAD, so the proof is over zero answer bytes, which is what the agent
+/// reads and hashes.
+#[tokio::test]
+async fn a_head_status_is_proved_over_zero_answer_bytes() {
+    let fx = Fx::new(With::Fake).await;
+    let open = fx
+        .row(&fx.job().await, 1, "result", 10, "open", PART_BYTES as i64)
+        .await;
+    let call = Call {
+        method: "HEAD",
+        ..call_of("status", "", &open)
+    };
+    let (nonce, r) = fx.nonced(&call, &[]).await;
+    assert!(r.body.is_empty(), "a HEAD answer has a body: {}", r.body);
+    // The agent's transcript is built from the empty body it received.
+    fx.assert_proved_for(nonce, "HEAD", &call.target, "", 200, &r);
+    fx.finish().await;
+}
+
+#[tokio::test]
+async fn the_signed_target_is_the_bytes_the_agent_sends() {
+    let fx = Fx::new(With::Fake).await;
+    let job = fx.job().await;
+    let declaration = result_of(&job, 10);
+    let open = fx
+        .row(&fx.job().await, 1, "result", 10, "open", PART_BYTES as i64)
+        .await;
+    // The first round finds the row open (the fake store has no URL to give: 503) and finishes it,
+    // so the second finds it finished (409).
+    for (suffix, begin_status, part_status) in [("", 201, 503), ("?a=1", 200, 409)] {
+        for (name, status) in [
+            ("begin", begin_status),
+            ("part", part_status),
+            ("status", 200),
+            ("complete", 200),
+        ] {
+            let mut call = call_of(name, &declaration, &open);
+            call.target.push_str(suffix);
+            let (nonce, r) = fx.nonced(&call, &[]).await;
+            fx.assert_proved_for(nonce, call.method, &call.target, &call.body, status, &r);
+            // The proof is for these bytes only: the target without its query, or with another
+            // one, does not verify it.
+            if !suffix.is_empty() {
+                let bare = call.target.trim_end_matches(suffix);
+                let wrong = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    fx.assert_proved_for(nonce, call.method, bare, &call.body, status, &r);
+                }));
+                assert!(wrong.is_err(), "{name}: the proof ignores the query");
+            }
+        }
     }
     fx.finish().await;
 }

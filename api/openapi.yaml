@@ -696,8 +696,7 @@ paths:
       tags: [agents]
       summary: Begin an upload of a job's object (5.2, 14.3, ADR-493)
       description: |
-        The first of the four data-channel routes (this one, the part URL and the status are
-        served; the completion is planned). The agent presents its session token (the one of
+        The first of the four data-channel routes (all four are served). The agent presents its session token (the one of
         `/v1/agent/session`) as a bearer header. Every request of these routes judges the
         token and then reads the agent's row: a missing or expired token, and a revoked or
         missing row, are all **401** (the same answer), and a revoked agent's tokens are
@@ -719,8 +718,18 @@ paths:
         another length or digest is **409**. Otherwise the server starts the multipart upload,
         inserts the row and answers **201**. Begin is allowed before the job's terminal event
         has reached the server.
+
+        The shape step ends with the proof's request: when the request carries `Ngr-Nonce`
+        (ADR-504), the nonce and the request target are judged after the route's own shape
+        checks, a malformed or repeated nonce and a target the proof cannot take being **400**,
+        before the token. Every answer sent after the token and the agent's row are judged,
+        whatever its status, then carries `Ngr-Server-Proof` for that nonce; a refusal before
+        that point carries none, and a proof that cannot be made is **503** without one. A
+        request without the header is served as before.
       security:
         - agentSession: []
+      parameters:
+        - { $ref: '#/components/parameters/NgrNonce' }
       requestBody:
         required: true
         content:
@@ -729,26 +738,54 @@ paths:
       responses:
         '200':
           description: The existing upload of this job, generation and kind
+          headers:
+            Ngr-Server-Proof: { $ref: '#/components/headers/NgrServerProof' }
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Upload' }
         '201':
           description: A new upload
+          headers:
+            Ngr-Server-Proof: { $ref: '#/components/headers/NgrServerProof' }
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Upload' }
         '400': { $ref: '#/components/responses/Problem' }
         '401': { $ref: '#/components/responses/AgentSessionRefused' }
-        '404': { $ref: '#/components/responses/Problem' }
+        '404':
+          description: A problem document; proved when sent after the token and the agent's row are judged
+          headers:
+            Ngr-Server-Proof: { $ref: '#/components/headers/NgrServerProof' }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '405':
           description: A method other than POST
           headers:
             Allow: { schema: { type: string }, description: '`POST`' }
         '408': { $ref: '#/components/responses/Problem' }
-        '409': { $ref: '#/components/responses/Problem' }
+        '409':
+          description: A problem document; proved when sent after the token and the agent's row are judged
+          headers:
+            Ngr-Server-Proof: { $ref: '#/components/headers/NgrServerProof' }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '413': { $ref: '#/components/responses/Problem' }
-        '500': { $ref: '#/components/responses/Problem' }
-        '503': { $ref: '#/components/responses/Problem' }
+        '500':
+          description: A problem document; proved when sent after the token and the agent's row are judged
+          headers:
+            Ngr-Server-Proof: { $ref: '#/components/headers/NgrServerProof' }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '503':
+          description: A problem document; proved when sent after the token and the agent's row are judged
+          headers:
+            Ngr-Server-Proof: { $ref: '#/components/headers/NgrServerProof' }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
 
   /v1/agent/uploads/{uploadId}/parts/{part}:
     post:
@@ -764,20 +801,46 @@ paths:
         part already held is allowed and gives another URL. The agent sends the part only to a
         URL whose scheme and host are those of the origin it registered with (ADR-493 item 13).
         Token and agent row are judged as for begin.
+
+        The shape step ends with the proof's request: when the request carries `Ngr-Nonce`
+        (ADR-504), the nonce and the request target are judged after the route's own shape
+        checks, a malformed or repeated nonce and a target the proof cannot take being **400**,
+        before the token. Every answer sent after the token and the agent's row are judged,
+        whatever its status, then carries `Ngr-Server-Proof` for that nonce; a refusal before
+        that point carries none, and a proof that cannot be made is **503** without one. A
+        request without the header is served as before.
       security:
         - agentSession: []
       parameters:
+        - { $ref: '#/components/parameters/NgrNonce' }
         - { name: uploadId, in: path, required: true, schema: { type: string, format: uuid } }
         - { name: part, in: path, required: true, schema: { type: integer, minimum: 1, maximum: 10000 } }
       responses:
         '200':
           description: The URL of the part
+          headers:
+            Ngr-Server-Proof: { $ref: '#/components/headers/NgrServerProof' }
           content:
             application/json:
               schema: { $ref: '#/components/schemas/UploadPartUrl' }
-        '400': { $ref: '#/components/responses/Problem' }
+        '400':
+          description: |
+            A problem document. A part beyond the upload's part count is judged after the token
+            and the agent's row, and that 400 is proved; the shape 400s (the body, the part
+            number, the nonce, the target) come before the token and carry no proof.
+          headers:
+            Ngr-Server-Proof: { $ref: '#/components/headers/NgrServerProof' }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '401': { $ref: '#/components/responses/AgentSessionRefused' }
-        '404': { $ref: '#/components/responses/Problem' }
+        '404':
+          description: A problem document; proved when sent after the token and the agent's row are judged
+          headers:
+            Ngr-Server-Proof: { $ref: '#/components/headers/NgrServerProof' }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '405':
           description: A method other than POST
           headers:
@@ -785,12 +848,26 @@ paths:
         '408': { $ref: '#/components/responses/Problem' }
         '409':
           description: The upload is not `open`; the body is a problem document with the row's `state`
+          headers:
+            Ngr-Server-Proof: { $ref: '#/components/headers/NgrServerProof' }
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
         '413': { $ref: '#/components/responses/Problem' }
-        '500': { $ref: '#/components/responses/Problem' }
-        '503': { $ref: '#/components/responses/Problem' }
+        '500':
+          description: A problem document; proved when sent after the token and the agent's row are judged
+          headers:
+            Ngr-Server-Proof: { $ref: '#/components/headers/NgrServerProof' }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '503':
+          description: A problem document; proved when sent after the token and the agent's row are judged
+          headers:
+            Ngr-Server-Proof: { $ref: '#/components/headers/NgrServerProof' }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
 
   /v1/agent/uploads/{uploadId}:
     get:
@@ -807,27 +884,56 @@ paths:
         lists the upload as gone (a completion may just have moved the row on) the row is read
         once more: a row that is no longer `open` is answered with its state, as for any
         other state; one that still is `open` is **503** and is not changed. `HEAD` is answered like `GET`, without a body.
+
+        The shape step ends with the proof's request: when the request carries `Ngr-Nonce`
+        (ADR-504), the nonce and the request target are judged after the route's own shape
+        checks, a malformed or repeated nonce and a target the proof cannot take being **400**,
+        before the token. Every answer sent after the token and the agent's row are judged,
+        whatever its status, then carries `Ngr-Server-Proof` for that nonce; a refusal before
+        that point carries none, and a proof that cannot be made is **503** without one. A
+        request without the header is served as before.
       security:
         - agentSession: []
       parameters:
+        - { $ref: '#/components/parameters/NgrNonce' }
         - { name: uploadId, in: path, required: true, schema: { type: string, format: uuid } }
       responses:
         '200':
           description: The upload's state
+          headers:
+            Ngr-Server-Proof: { $ref: '#/components/headers/NgrServerProof' }
           content:
             application/json:
               schema: { $ref: '#/components/schemas/UploadStatus' }
         '400': { $ref: '#/components/responses/Problem' }
         '401': { $ref: '#/components/responses/AgentSessionRefused' }
-        '404': { $ref: '#/components/responses/Problem' }
+        '404':
+          description: A problem document; proved when sent after the token and the agent's row are judged
+          headers:
+            Ngr-Server-Proof: { $ref: '#/components/headers/NgrServerProof' }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '405':
           description: A method other than GET and HEAD
           headers:
             Allow: { schema: { type: string }, description: '`GET,HEAD`' }
         '408': { $ref: '#/components/responses/Problem' }
         '413': { $ref: '#/components/responses/Problem' }
-        '500': { $ref: '#/components/responses/Problem' }
-        '503': { $ref: '#/components/responses/Problem' }
+        '500':
+          description: A problem document; proved when sent after the token and the agent's row are judged
+          headers:
+            Ngr-Server-Proof: { $ref: '#/components/headers/NgrServerProof' }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '503':
+          description: A problem document; proved when sent after the token and the agent's row are judged
+          headers:
+            Ngr-Server-Proof: { $ref: '#/components/headers/NgrServerProof' }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
 
   /v1/agent/uploads/{uploadId}/complete:
     post:
@@ -855,24 +961,43 @@ paths:
         the agent repeats the request. **500** is a stored value that does not parse, a store
         without randomness or a database error that is a fault of the server. A stop of the server ends the task and leaves the row `completing`; the next
         request resumes it.
+
+        The shape step ends with the proof's request: when the request carries `Ngr-Nonce`
+        (ADR-504), the nonce and the request target are judged after the route's own shape
+        checks, a malformed or repeated nonce and a target the proof cannot take being **400**,
+        before the token. Every answer sent after the token and the agent's row are judged,
+        whatever its status, then carries `Ngr-Server-Proof` for that nonce; a refusal before
+        that point carries none, and a proof that cannot be made is **503** without one. A
+        request without the header is served as before.
       security:
         - agentSession: []
       parameters:
+        - { $ref: '#/components/parameters/NgrNonce' }
         - { name: uploadId, in: path, required: true, schema: { type: string, format: uuid } }
       responses:
         '200':
           description: The object is verified and the row is `finished`
+          headers:
+            Ngr-Server-Proof: { $ref: '#/components/headers/NgrServerProof' }
           content:
             application/json:
               schema: { $ref: '#/components/schemas/UploadCompletion' }
         '202':
           description: The completion is still running; repeat the request
+          headers:
+            Ngr-Server-Proof: { $ref: '#/components/headers/NgrServerProof' }
           content:
             application/json:
               schema: { $ref: '#/components/schemas/UploadCompletion' }
         '400': { $ref: '#/components/responses/Problem' }
         '401': { $ref: '#/components/responses/AgentSessionRefused' }
-        '404': { $ref: '#/components/responses/Problem' }
+        '404':
+          description: A problem document; proved when sent after the token and the agent's row are judged
+          headers:
+            Ngr-Server-Proof: { $ref: '#/components/headers/NgrServerProof' }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '405':
           description: A method other than POST
           headers:
@@ -880,12 +1005,26 @@ paths:
         '408': { $ref: '#/components/responses/Problem' }
         '409':
           description: The upload cannot be completed as it is; `state` is `open` (send the parts again) or `failed` (begin again)
+          headers:
+            Ngr-Server-Proof: { $ref: '#/components/headers/NgrServerProof' }
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
         '413': { $ref: '#/components/responses/Problem' }
-        '500': { $ref: '#/components/responses/Problem' }
-        '503': { $ref: '#/components/responses/Problem' }
+        '500':
+          description: A problem document; proved when sent after the token and the agent's row are judged
+          headers:
+            Ngr-Server-Proof: { $ref: '#/components/headers/NgrServerProof' }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '503':
+          description: A problem document; proved when sent after the token and the agent's row are judged
+          headers:
+            Ngr-Server-Proof: { $ref: '#/components/headers/NgrServerProof' }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
 
   /v1/agent/downloads:
     post:
@@ -909,8 +1048,18 @@ paths:
         second may be identical) and nothing is written. The
         server asks the object store nothing, so an object it lost shows as the GET failing.
         The agent hashes the bytes against the instruction's hash before it uses them.
+
+        The shape step ends with the proof's request: when the request carries `Ngr-Nonce`
+        (ADR-504), the nonce and the request target are judged after the route's own shape
+        checks, a malformed or repeated nonce and a target the proof cannot take being **400**,
+        before the token. Every answer sent after the token and the agent's row are judged,
+        whatever its status, then carries `Ngr-Server-Proof` for that nonce; a refusal before
+        that point carries none, and a proof that cannot be made is **503** without one. A
+        request without the header is served as before.
       security:
         - agentSession: []
+      parameters:
+        - { $ref: '#/components/parameters/NgrNonce' }
       requestBody:
         required: true
         content:
@@ -920,21 +1069,40 @@ paths:
         '200':
           description: The URL of the object
           headers:
+            Ngr-Server-Proof: { $ref: '#/components/headers/NgrServerProof' }
             Cache-Control: { schema: { type: string }, description: '`no-store`' }
           content:
             application/json:
               schema: { $ref: '#/components/schemas/DownloadUrl' }
         '400': { $ref: '#/components/responses/Problem' }
         '401': { $ref: '#/components/responses/AgentSessionRefused' }
-        '404': { $ref: '#/components/responses/Problem' }
+        '404':
+          description: A problem document; proved when sent after the token and the agent's row are judged
+          headers:
+            Ngr-Server-Proof: { $ref: '#/components/headers/NgrServerProof' }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '405':
           description: A method other than POST
           headers:
             Allow: { schema: { type: string }, description: '`POST`' }
         '408': { $ref: '#/components/responses/Problem' }
         '413': { $ref: '#/components/responses/Problem' }
-        '500': { $ref: '#/components/responses/Problem' }
-        '503': { $ref: '#/components/responses/Problem' }
+        '500':
+          description: A problem document; proved when sent after the token and the agent's row are judged
+          headers:
+            Ngr-Server-Proof: { $ref: '#/components/headers/NgrServerProof' }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '503':
+          description: A problem document; proved when sent after the token and the agent's row are judged
+          headers:
+            Ngr-Server-Proof: { $ref: '#/components/headers/NgrServerProof' }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
 
   # ------------------------------------------------------------ Documents
   /v1/documents/{sha256}:
@@ -1295,9 +1463,11 @@ components:
       required: false
       description: |
         The request header of the data routes and the control upgrade (ADR-504): the agent's
-        32-byte nonce, standard padded base64 (44 characters). A request that carries it is
-        answered with `Ngr-Server-Proof`; one that does not is served as before. A repeated or
-        malformed value is a **400**. The session route reads no such header.
+        32-byte nonce, standard padded base64 (44 characters). On a data route every answer sent
+        after the token and the agent's row are judged carries `Ngr-Server-Proof`, and the control
+        upgrade's 101 does; answers before that point, and an unproved 503 when the proof cannot
+        be made, carry none. A request without it is served as before. A repeated or malformed
+        value is a **400**. The session route reads no such header.
       schema: { type: string, minLength: 44, maxLength: 44 }
 
   headers:

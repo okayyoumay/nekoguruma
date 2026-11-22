@@ -67,7 +67,8 @@ Every agent spawn starts cold and re-reads context, so match the pipeline to the
 1. **Small** (one file, or a question answered by one or two targeted reads): do it inline. No
    agents.
 2. **Medium** (a few files in one crate, clear scope): the main session plans and reviews;
-   `implementer` edits, `cargo-runner` verifies, `doc-sync-checker` audits before commit.
+   `implementer` edits, `cargo-runner` verifies, `doc-sync-checker` audits before commit (and,
+   in `pr-review-loop`, the whole diff before the first review request, ADR-503).
 3. **Large** (several crates, a new subsystem, or unclear scope): as Medium, plus `scope-shaper`
    first when the request is genuinely fuzzy, `code-scout` for the fan-out search, and
    `edge-case-hunter` before commit.
@@ -91,7 +92,11 @@ delegated (the final commit and push) or a single targeted read to check an agen
   missing from the new path is fixed by having the new path call the existing path's code,
   extracted into a function both call, not by copying the step or reproducing part of it; a copy
   stays only when the existing code cannot be called from the new path, and the PR says why
-  (ADR-397). The fix brief asks for that extraction, without a smaller fallback.
+  (ADR-397). The fix brief asks for that extraction, without a smaller fallback. `implementer`
+  carries the same rule in its working rules ("Share a step, never copy it"), since it does not
+  read this file: it extracts a step existing code performs even when the brief names that code
+  only as a reference, and stops and reports when the extraction would reach a file outside the
+  brief.
 - **`design-advisor`** when a wrong decision is expensive to reverse: interpreting ISO 22900 /
   J2534 / UDS requirements, concurrency or state-machine design across crates, trust-boundary
   and signature design, a choice that needs an ADR, or a bug that survived a `code-scout` +

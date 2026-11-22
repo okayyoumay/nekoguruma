@@ -117,6 +117,13 @@ paths:
         its deadline has been reached is ended by the server (within one 30-second period) as `expired` and its vehicle lock is
         deleted; the replay of its creation then shows the state `expired` and no `failure`.
 
+        **Named objects** (8.2.6, ADR-501). Each `irDigests` entry must be an IR document the
+        caller's tenant has stored (`PUT /v1/documents/{sha256}`), and `artifactDigest`, when
+        given, an artifact the tenant holds; otherwise the request is **422** with the `code`
+        `DOCUMENT_NOT_STORED` or `ARTIFACT_NOT_STORED` (the documents are judged first), judged
+        after the start deadline's bounds and before the instruction key (**503**), with nothing
+        created and the key still free. A replay is answered before this check.
+
         Like every operator route the request needs a live session and, as a POST, the pinned
         Origin (**403**) before the cookie is read (**401**). The body is read within 5 seconds
         (**408**); a body over the limit is **413**; each of them closes the connection.
@@ -180,7 +187,7 @@ paths:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
         '422':
-          description: The idempotency key belongs to another request or operator (the answer holds no data of the job), or `startDeadline` is not 60 to 86400 seconds after the issue time (`code` `START_DEADLINE_OUT_OF_BOUNDS`)
+          description: The idempotency key belongs to another request or operator (the answer holds no data of the job), or `startDeadline` is not 60 to 86400 seconds after the issue time (`code` `START_DEADLINE_OUT_OF_BOUNDS`), or a named IR document or the named artifact is not stored for the tenant (`code` `DOCUMENT_NOT_STORED` or `ARTIFACT_NOT_STORED`); nothing was created and the idempotency key is not used
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
@@ -1394,6 +1401,8 @@ components:
             - DEVICE_LOCKED
             - VEHICLE_LOCKED
             - START_DEADLINE_OUT_OF_BOUNDS
+            - DOCUMENT_NOT_STORED
+            - ARTIFACT_NOT_STORED
             - DIGEST_MISMATCH
             - INVALID_IR_DOCUMENT
             - VIN_MISMATCH

@@ -1,8 +1,8 @@
 # ADR-500: The Server Stores a Job's IR Documents by Their SHA-256 Through a PUT Route for a Worker
 
 **Date:** 2026-11-21
-**Status:** Accepted
-**Affects:** design 6.8, 8.2.6, 11.1, 14.3; `crates/server` (`documents`, `storage`, `storage/s3`, `audit`, `register`, `uploads`, `lib`), `db/migrations/0015_document_extension_id_nullable.sql`, `db/README.md`, `api/openapi.yaml`, `crates/server/docs/ngr-server.md`; annotates ADR-477; fulfils the writer that ADR-497 leaves to a later route; extends ADR-454 and ADR-492; the check at job creation (ADR-477 item 2) is a later change
+**Status:** Accepted (the consequence that job creation takes the digests it is given replaced by ADR-501)
+**Affects:** design 6.8, 8.2.6, 11.1, 14.3; `crates/server` (`documents`, `storage`, `storage/s3`, `audit`, `register`, `uploads`, `lib`), `db/migrations/0015_document_extension_id_nullable.sql`, `db/README.md`, `api/openapi.yaml`, `crates/server/docs/ngr-server.md`; annotates ADR-477; fulfils the writer that ADR-497 leaves to a later route; extends ADR-454 and ADR-492; the check at job creation (ADR-477 item 2) is ADR-501
 
 ## Context
 
@@ -109,7 +109,7 @@ The first row that applies answers.
   because other OS users on the PC could put a program before a vehicle; this route is behind
   the operator session, the pinned Origin and a role, and a stored document runs only when the
   signed instruction names it, but it does not replace that rejection for the M6 ceiling.
-- **Job creation still takes the digests it is given** (ADR-477 item 2); a job may name a
+- **Job creation still takes the digests it is given** (ADR-477 item 2; replaced by ADR-501, which checks at creation that each is stored); a job may name a
   document no one stored, and its agent's fetch then gets the download route's 404. Checking at
   creation that each named document is stored, and the artifact too, is a later change. It is
   point-in-time and safe only while nothing deletes `ir_documents` rows.

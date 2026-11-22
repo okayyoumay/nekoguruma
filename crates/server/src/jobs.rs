@@ -7,11 +7,13 @@
 //! the idempotency key and the shape of the JSON (400, with no database access), then one
 //! transaction: the key's row (a replay or a conflict answers here, before any permission is
 //! judged), the caller's permission (403), the bounds of a `startDeadline` against the issue time
-//! (422, ADR-487), the active instruction key (503), the kind's confirmation level from
+//! (422, ADR-487), whether the named IR documents and then the named artifact are stored for the
+//! tenant (422, ADR-501), the active instruction key (503), the kind's confirmation level from
 //! `confirmation_defaults` (500 without a row, ADR-488), the signing of the instruction and the
 //! insert, which loses to a concurrent insert of the same key and then answers like the first
-//! read. A 400 means the request can never be valid, a 422 that the key belongs to another request
-//! or that the deadline lies outside the bounds. A job's ID is made here, never taken from the client.
+//! read. A 400 means the request can never be valid, a 422 that the key belongs to another
+//! request, that the deadline lies outside the bounds or that a named object is not stored. A
+//! job's ID is made here, never taken from the client.
 //!
 //! What the 403 refused goes to the log only, through a gate per reason. Never logged: the
 //! body, the idempotency key, the VCI ID and the VIN.
@@ -641,6 +643,11 @@ enum Outcome {
     /// The request's `startDeadline` is not between 1 minute and 24 hours after the issue time
     /// (ADR-487); nothing was written.
     DeadlineOutOfBounds,
+    /// A named IR document has no `ir_documents` row for the tenant (ADR-501); nothing was
+    /// written.
+    DocumentNotStored,
+    /// The named artifact has no `artifacts` row for the tenant (ADR-501); nothing was written.
+    ArtifactNotStored,
 }
 
 /// What a failed creation is.
@@ -719,6 +726,18 @@ pub async fn create(
             "START_DEADLINE_OUT_OF_BOUNDS",
         )
         .into_response(),
+        Ok(Outcome::DocumentNotStored) => Problem::with_code(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "A named IR document is not stored",
+            "DOCUMENT_NOT_STORED",
+        )
+        .into_response(),
+        Ok(Outcome::ArtifactNotStored) => Problem::with_code(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "The named artifact is not stored",
+            "ARTIFACT_NOT_STORED",
+        )
+        .into_response(),
         Ok(Outcome::KeyNotActive) => {
             if inner.gates.allow(SLOT_KEY_INACTIVE, now) {
                 tracing::error!("the instruction key is not the active key; no job is created");
@@ -788,6 +807,31 @@ impl Inner {
         if !deadline_in_bounds(spec.start_deadline, issued_at) {
             return Ok(Outcome::DeadlineOutOfBounds);
         }
+        // What the job names must be stored for the tenant (ADR-501): after the deadline and
+        // before the key, so a refused caller learns nothing of the tenant's documents, and a
+        // replay, answered above, is never judged again. The documents are judged before the
+        // artifact. The read takes no row lock: nothing deletes a row of either table.
+        let digests: Vec<String> = spec.hashes.iter().map(|h| hex(h)).collect();
+        let artifact = spec.artifact.map(|h| hex(&h));
+        let (documents, artifact_stored): (i64, bool) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM ir_documents \
+                       WHERE tenant_id = $1::uuid AND digest = ANY($2)), \
+                    $3::text IS NULL OR EXISTS (SELECT 1 FROM artifacts \
+                       WHERE tenant_id = $1::uuid AND digest = $3)",
+        )
+        .bind(&operator.tenant_id)
+        .bind(&digests)
+        .bind(&artifact)
+        .fetch_one(&mut *tx)
+        .await?;
+        // The digests are unique (`shape` sorts and dedups them) and the table's key is the
+        // tenant and the digest, so the count is the number of named documents stored.
+        if usize::try_from(documents).ok() != Some(digests.len()) {
+            return Ok(Outcome::DocumentNotStored);
+        }
+        if !artifact_stored {
+            return Ok(Outcome::ArtifactNotStored);
+        }
         if !key_active {
             return Ok(Outcome::KeyNotActive);
         }
@@ -819,7 +863,6 @@ impl Inner {
             .await
             .map_err(|e| JobError::Internal(e.to_string()))?;
 
-        let digests: Vec<String> = spec.hashes.iter().map(|h| hex(h)).collect();
         let inserted: Option<StoredRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "INSERT INTO jobs (tenant_id, id, kind, agent_id, operator_id, vci_id, vin, \
                  ir_digests, artifact_digest, confirmation_level, start_deadline, signed_job, \
@@ -836,7 +879,7 @@ impl Inner {
         .bind(&spec.vci_id)
         .bind(&spec.vin)
         .bind(&digests)
-        .bind(spec.artifact.map(|h| hex(&h)))
+        .bind(&artifact)
         .bind(&level)
         .bind(instruction.start_deadline as i64)
         .bind(&sealed)

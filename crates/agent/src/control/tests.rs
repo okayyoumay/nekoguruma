@@ -6856,12 +6856,14 @@ async fn each_upgrade_carries_a_fresh_nonce() {
             "one header"
         );
         nonces.push(text.to_owned());
-        // End the connection so that the next attempt starts.
+        // End the connection so that the next attempt starts. The next dial is the next
+        // attempt's, so the loop needs no wait for `Waiting`: that phase can be over before the
+        // test looks, when the back-off ran out during the close handshake, and the test would
+        // then keep the next attempt's request unanswered until the agent gave up on it.
         send(&mut ws, &hello(10)).await;
         env.wait_phase(Phase::Connected).await;
         ws.send(close_frame(Some(1000))).await.unwrap();
         let _ = got(&mut ws).await;
-        env.wait_phase(Phase::Waiting).await;
     }
     assert_ne!(nonces[0], nonces[1], "a fresh nonce for each upgrade");
 }

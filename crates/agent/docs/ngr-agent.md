@@ -573,6 +573,24 @@ connect`, above) loads the agent key and passes it in.
   TCP stream to `127.0.0.1:<port>` with the limits of `register` (5 seconds to connect, 30 in all);
   messages and frames are limited to 131072 bytes. A first 401 on the session route takes a new
   challenge at once; a second ends the attempt.
+- **The server's answer proof** (design 6.4, 14.4; ADR-504). The agent takes two answers as results
+  only with `Ngr-Server-Proof`, one value that verifies under the registration record's
+  instruction key for this agent, the record's origin and the request it made: the session
+  route's 200 and the upgrade's 101. The upgrade request carries `Ngr-Nonce`, a fresh 32-byte
+  nonce from the agent's random source in padded base64, with the bearer token and the
+  subprotocol unchanged; the session route sends no such header, since the nonce of its body is
+  the proof's. The 200's proof is checked against the exact body bytes sent and received before
+  the body is parsed; the 101's against the empty body and the 101's status. A challenge answer
+  and every other status are classed by their status as before, with or without a proof, and
+  none is checked. An answer without a valid proof (the header missing, twice, not the canonical
+  text of 64 bytes, another key, nonce, request or status, or an answer body over 4096 bytes) is
+  treated as no answer at all: the class `session-unproven` or `upgrade-unproven`, and the
+  attempt waits the 60-second cap. An unproven 200 is never parsed, so no token is taken and
+  nothing follows it. An unproven 101 is dropped with its socket before the agent writes or
+  reads a frame, so a `hello`, an `eventAck` or a command the peer writes behind it changes
+  nothing: the outbox, the received-jobs ledger, the intake and the counters stay as they were,
+  and the phase never reaches `hello`. No build option or setting waives the check. A server
+  whose instruction key was replaced fails it on every attempt until the agent registers again.
 - **Connected**, the agent sends `{"type":"heartbeat"}` at `hello` plus each multiple of the
   interval the `hello` gave, and ends the connection with Close 4003 when no frame has arrived
   for three intervals. Every frame received counts, pings and pongs included; a heartbeat it
@@ -636,7 +654,7 @@ connect`, above) loads the agent key and passes it in.
   before an attempt, is found corrupt (`Handle::ended()` is `OutboxUnusable` or `LedgerUnusable`; `connect` exits 1), and a stop. Every
   answer of the server, a 403, a 429 and Close 4002 included, is retried, and nothing is erased.
   The delay before the next attempt starts at 1 second and doubles after every wait, up to 60
-  seconds; 403, a 429 on the session route, and Close 4001 or 4002 set it to 60 seconds at once.
+  seconds; 403, a 429 on the session route, an unproven answer and Close 4001 or 4002 set it to 60 seconds at once.
   A 429 on the challenge route with a `Retry-After` of 1 to 60 seconds waits the longer of the two.
   A connection that received frames for at least 60 seconds after its `hello` sets the delay back
   to 1 second when it ends, unless it ended with 4001 or 4002. The first attempt starts at once,
@@ -645,7 +663,8 @@ connect`, above) loads the agent key and passes it in.
   (at most 10 seconds to write it and 5 to read the answer); a stop during a heartbeat write
   drops the connection.
 - **Logging**: one `info` line when the connection is up and one when it ends, with the close
-  code the server sent; one `warn` per failure class until the next `hello`, and one per refusal
+  code the server sent; one `warn` per failure class (an unproven answer is `session-unproven`
+  or `upgrade-unproven`, with fixed words that name both causes) until the next `hello`, and one per refusal
   until a session token is issued again, with `debug` for the repeats ("Entries with a rule of
   their own" in `operational-log.md`). The WebSocket library turns a Close code it does not
   accept (2000, for example) into 1002 before the agent reads it, so such a close is logged as

@@ -74,8 +74,7 @@ impl Worker {
             dial: &at,
             signer: &*self.signer,
             random: self.random,
-            agent_id: &self.agent_id,
-            audience: &self.audience,
+            verifier: &self.verifier,
             host: &self.host,
         };
         let got = until_stop(&self.stop, self.holder.ensure(&seams)).await?;

@@ -53,7 +53,8 @@ impl Rig {
     fn with_probe(probe: Probe) -> Rig {
         let dir = tempfile::tempdir().unwrap();
         let ledger = UploadLedger::open_with(dir.path(), AGENT_ID, probe).unwrap();
-        let sim = Sim::new(4, sim::OBJECT_PORT);
+        let origin = format!("http://127.0.0.1:{}", sim::API_PORT);
+        let sim = Sim::new(4, sim::OBJECT_PORT, &origin, AGENT_ID);
         let dial = sim::dial(&sim);
         let key = Arc::new(SigningKey::generate().unwrap());
         let record = Record {
@@ -61,8 +62,8 @@ impl Rig {
             owner_id: "0194f0a2-7c3e-7d11-8a52-000000000001".to_owned(),
             preset: "personal".to_owned(),
             allow_remote: false,
-            server_origin: format!("http://127.0.0.1:{}", sim::API_PORT),
-            instruction_key_pem: SigningKey::generate().unwrap().public_key().to_spki_pem(),
+            server_origin: origin,
+            instruction_key_pem: sim.instruction_key().to_spki_pem(),
             instruction_key_id: String::new(),
             agent_key_fingerprint: key.public_key().fingerprint_hex(),
         };
@@ -1340,7 +1341,12 @@ async fn a_transfer_over_loopback_sockets_is_cut_in_the_middle_and_resumed_after
         api.local_addr().unwrap().port(),
         objects.local_addr().unwrap().port(),
     );
-    let sim = Sim::new(1000, object_port);
+    let sim = Sim::new(
+        1000,
+        object_port,
+        &format!("http://127.0.0.1:{api_port}"),
+        AGENT_ID,
+    );
     tokio::spawn(serve_tcp(api, api_port, sim.clone()));
     tokio::spawn(serve_tcp(objects, object_port, sim.clone()));
     // The third PUT is cut: the server closes with no answer.
@@ -1357,7 +1363,7 @@ async fn a_transfer_over_loopback_sockets_is_cut_in_the_middle_and_resumed_after
         preset: "personal".to_owned(),
         allow_remote: false,
         server_origin: format!("http://127.0.0.1:{api_port}"),
-        instruction_key_pem: SigningKey::generate().unwrap().public_key().to_spki_pem(),
+        instruction_key_pem: sim.instruction_key().to_spki_pem(),
         instruction_key_id: String::new(),
         agent_key_fingerprint: key.public_key().fingerprint_hex(),
     };

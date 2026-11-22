@@ -44,6 +44,7 @@
 //! The contract between the VM and the worker (what `ServiceRequest` sends, what comes back,
 //! deadlines, the sync/async bridge) is ADR-235.
 
+mod answer_proof;
 pub mod artifact;
 pub mod client;
 pub mod comm_log;

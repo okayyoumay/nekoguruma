@@ -145,7 +145,12 @@ throughout.
   challenge, the nonce or the proof, an HTTP body, a message's text, a `commandId`, or the reason
   text of a Close the server sent. A failure class warns once until the next `hello` and is logged
   at `debug` after that; a refusal (403, a 429 on the session route, Close 4002) warns once until
-  the server issues a session token again.
+  the server issues a session token again. An answer that must carry the server's proof and does
+  not (ADR-504) is a failure class of its own, `session-unproven` (the exchange's 200) or
+  `upgrade-unproven` (the 101), with the status. Its `warn` carries a fixed text that names both
+  possible causes, another process holding the server's port and a changed instruction key (the
+  agent registers again), and never the answer, its headers, the nonce or the proof. The
+  uploader's and the fetcher's exchanges write the same class under their own prefix.
   `tungstenite` and `tokio-tungstenite` log through the `log` crate, at `trace` and `debug`, the
   upgrade request with its `Authorization` header, each message's text and a close's reason. The
   agent installs its subscriber with `set_global_default`, which installs no `log` bridge, so none

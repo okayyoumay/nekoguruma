@@ -18,9 +18,10 @@ use std::time::Duration;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use hyper::client::conn::http1;
-use hyper::header::{CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, RETRY_AFTER};
+use hyper::header::{CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, HeaderName, RETRY_AFTER};
 use hyper::{HeaderMap, Method};
 use hyper_util::rt::TokioIo;
+use shared_proto::PROOF_HEADER;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
@@ -84,6 +85,9 @@ pub struct Reply {
     pub retry_after: Option<String>,
     /// Exactly one Content-Type, whose media type is `application/json` (parameters allowed).
     pub json_content_type: bool,
+    /// The single `Ngr-Server-Proof` value (ADR-504), when the answer has exactly one that is
+    /// text; two values are read as none.
+    pub proof: Option<String>,
     /// The body, read only when the status is the one the caller asked for.
     pub body: Option<ReplyBody>,
 }
@@ -203,6 +207,7 @@ where
     let headers = response.headers();
     let retry_after = single_text(headers, &RETRY_AFTER);
     let json_content_type = is_json(headers);
+    let proof = single_text(headers, &HeaderName::from_static(PROOF_HEADER));
     let body = if status == body_status {
         Some(read_body(response).await?)
     } else {
@@ -212,6 +217,7 @@ where
         status,
         retry_after,
         json_content_type,
+        proof,
         body,
     })
 }
@@ -239,7 +245,7 @@ async fn read_body(
 }
 
 /// The header's value when the answer has exactly one and it is text.
-pub(crate) fn single_text(headers: &HeaderMap, name: &hyper::header::HeaderName) -> Option<String> {
+pub(crate) fn single_text(headers: &HeaderMap, name: &HeaderName) -> Option<String> {
     let mut values = headers.get_all(name).iter();
     let (Some(value), None) = (values.next(), values.next()) else {
         return None;
@@ -342,6 +348,33 @@ mod tests {
         assert_eq!(reply.status, 201);
         assert!(reply.json_content_type);
         assert_eq!(reply.body, Some(ReplyBody::Bytes(b"{}".to_vec())));
+    }
+
+    #[test]
+    fn the_proof_header_is_one_text_value_and_two_values_are_none() {
+        let one = stub(|mut s| {
+            s.write_all(
+                b"HTTP/1.1 201 Created\r\nNgr-Server-Proof: abc\r\nContent-Length: 0\r\n\r\n",
+            )
+            .unwrap();
+        });
+        let two = stub(|mut s| {
+            s.write_all(
+                b"HTTP/1.1 201 Created\r\nNgr-Server-Proof: abc\r\nNgr-Server-Proof: abc\r\n\
+                  Content-Length: 0\r\n\r\n",
+            )
+            .unwrap();
+        });
+        let none = stub(|mut s| {
+            s.write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+        });
+        assert_eq!(
+            run(one, 201, Timeouts::default()).unwrap().proof.as_deref(),
+            Some("abc")
+        );
+        assert_eq!(run(two, 201, Timeouts::default()).unwrap().proof, None);
+        assert_eq!(run(none, 201, Timeouts::default()).unwrap().proof, None);
     }
 
     /// The body of another status is not read: the answer's head alone decides.

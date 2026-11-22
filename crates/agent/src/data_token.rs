@@ -8,6 +8,7 @@
 
 use std::collections::HashSet;
 
+use crate::answer_proof::UNPROVEN_CAUSES;
 use crate::control::exchange::{self, Fail, Token};
 use crate::uploader::routes::{Class, Failure};
 
@@ -47,6 +48,25 @@ impl exchange::Log for ExchangeLog {
         } else {
             self.refused = true;
             tracing::warn!(class, status, "{prefix} exchange refused");
+        }
+    }
+
+    fn unproven(&mut self, class: &'static str, status: u16) {
+        let prefix = self.prefix;
+        if self.seen.insert(class) {
+            tracing::warn!(
+                class,
+                status,
+                causes = UNPROVEN_CAUSES,
+                "{prefix} exchange answer is not proved by the server"
+            );
+        } else {
+            tracing::debug!(
+                class,
+                status,
+                causes = UNPROVEN_CAUSES,
+                "{prefix} exchange answer is not proved by the server"
+            );
         }
     }
 

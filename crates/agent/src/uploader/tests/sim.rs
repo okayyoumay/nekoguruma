@@ -9,11 +9,13 @@ use std::sync::{Arc, Mutex};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use sha2::{Digest as _, Sha256};
+use shared_crypto::{PublicKey, Signer as _, SigningKey};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::Instant;
 
+use crate::answer_proof::TestProver;
 use crate::control::exchange::{CHALLENGE_PATH, SESSION_PATH};
-use crate::uploader::fake::{FakeDial, Seen, answer, json, read_request};
+use crate::uploader::fake::{FakeDial, Seen, answer, json, proved_json, read_request};
 use crate::uploader::routes::BEGIN_PATH;
 
 /// The port of the API routes and the port of the object PUTs, over the in-memory dial.
@@ -79,6 +81,7 @@ struct Row {
 }
 
 struct State {
+    prover: TestProver,
     rows: Vec<Row>,
     next_row: u64,
     tokens: u32,
@@ -111,9 +114,13 @@ fn token_number(text: &str) -> Option<u32> {
 }
 
 impl Sim {
-    pub(super) fn new(part_bytes: u64, object_port: u16) -> Arc<Sim> {
+    /// A server at `origin` that signs its session answers with a key of its own, for the agent
+    /// `agent_id`; the registration record must name [`Sim::instruction_key`].
+    pub(super) fn new(part_bytes: u64, object_port: u16, origin: &str, agent_id: &str) -> Arc<Sim> {
+        let key = Arc::new(SigningKey::generate().unwrap());
         Arc::new(Sim {
             state: Mutex::new(State {
+                prover: TestProver::new(key, origin, agent_id),
                 rows: Vec::new(),
                 next_row: 1,
                 tokens: 0,
@@ -125,6 +132,11 @@ impl Sim {
             }),
             tap: Mutex::new(None),
         })
+    }
+
+    /// The public half of the key the server signs with: the record's instruction key.
+    pub(super) fn instruction_key(&self) -> PublicKey {
+        self.state.lock().unwrap().prover.key.public_key()
     }
 
     /// The next request of `route` is answered with `reply` instead of the default.
@@ -312,10 +324,12 @@ impl Sim {
             Route::Session => {
                 state.tokens += 1;
                 let token = token_text(state.tokens);
-                status(
+                Reply::Bytes(proved_json(
+                    &state.prover,
+                    seen,
                     200,
                     &format!(r#"{{"token":"{token}","expiresInSecs":300}}"#),
-                )
+                ))
             }
             Route::Put => {
                 let id = path.split('/').nth(2).unwrap_or_default().to_owned();

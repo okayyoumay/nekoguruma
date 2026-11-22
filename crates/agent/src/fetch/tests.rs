@@ -24,10 +24,11 @@ use tokio::time::Instant;
 use tracing_subscriber::fmt::MakeWriter;
 
 use super::*;
+use crate::answer_proof::TestProver;
 use crate::control::dial::Dialled;
 use crate::control::exchange::{CHALLENGE_PATH, SESSION_PATH};
 use crate::instruction;
-use crate::uploader::fake::{FakeDial, Seen, answer, json, read_request};
+use crate::uploader::fake::{FakeDial, Seen, answer, json, proved_json, read_request};
 
 const API: u16 = 8080;
 const OBJ: u16 = 9000;
@@ -105,10 +106,12 @@ enum Obj {
     },
 }
 
-#[derive(Default)]
 struct Script {
+    /// The server's key: the record names its public half as the instruction key.
+    prover: TestProver,
     challenge: VecDeque<Vec<u8>>,
-    session: VecDeque<Vec<u8>>,
+    /// The answers to the session requests in order; `None` is the server's own, a proved token.
+    session: VecDeque<Option<Vec<u8>>>,
     downloads: VecDeque<Vec<u8>>,
     objects: VecDeque<Obj>,
     object_default: Option<Obj>,
@@ -118,6 +121,19 @@ struct Script {
 }
 
 impl Script {
+    fn new(prover: TestProver) -> Self {
+        Self {
+            prover,
+            challenge: VecDeque::new(),
+            session: VecDeque::new(),
+            downloads: VecDeque::new(),
+            objects: VecDeque::new(),
+            object_default: None,
+            log: Vec::new(),
+            sessions: 0,
+        }
+    }
+
     fn count(&self, port: u16, line: &str) -> usize {
         self.log
             .iter()
@@ -146,9 +162,11 @@ impl Script {
             }));
         }
         if line.contains(SESSION_PATH) {
-            return raw(self.session.pop_front().unwrap_or_else(|| {
+            return raw(self.session.pop_front().flatten().unwrap_or_else(|| {
                 self.sessions += 1;
-                json(
+                proved_json(
+                    &self.prover,
+                    seen,
                     200,
                     &format!(
                         r#"{{"token":"{}","expiresInSecs":300}}"#,
@@ -235,7 +253,13 @@ impl Rig {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("objects");
         fs::create_dir(&root).unwrap();
-        let script = Arc::new(Mutex::new(Script::default()));
+        let instruction = Arc::new(SigningKey::generate().unwrap());
+        let origin = format!("http://127.0.0.1:{API}");
+        let script = Arc::new(Mutex::new(Script::new(TestProver::new(
+            instruction.clone(),
+            &origin,
+            AGENT_ID,
+        ))));
         let dials = Arc::new(Dials {
             inner: FakeDial::new(64 * 1024, serve(script.clone())),
             object_down: AtomicBool::new(false),
@@ -246,8 +270,8 @@ impl Rig {
             owner_id: "owner".to_owned(),
             preset: "personal".to_owned(),
             allow_remote: false,
-            server_origin: format!("http://127.0.0.1:{API}"),
-            instruction_key_pem: String::new(),
+            server_origin: origin,
+            instruction_key_pem: instruction.public_key().to_spki_pem(),
             instruction_key_id: String::new(),
             agent_key_fingerprint: agent_key.public_key().fingerprint_hex(),
         };
@@ -558,7 +582,7 @@ async fn a_failed_exchange_is_a_retry_with_its_wait() {
         script
             .challenge
             .push_back(answer(429, "Retry-After: 9\r\n", "{}"));
-        script.session.push_back(json(403, "{}"));
+        script.session.push_back(Some(json(403, "{}")));
     }
     assert_eq!(
         rig.doc(0).await,
@@ -665,11 +689,8 @@ async fn a_401_then_a_refused_exchange_ends_in_a_retry_of_the_exchange() {
     {
         let mut script = rig.script.lock().unwrap();
         script.downloads.push_back(json(401, "{}"));
-        script.session.push_back(json(
-            200,
-            &format!(r#"{{"token":"{}","expiresInSecs":300}}"#, token_text(1)),
-        ));
-        script.session.push_back(json(403, "{}"));
+        script.session.push_back(None);
+        script.session.push_back(Some(json(403, "{}")));
     }
     assert_eq!(rig.doc(0).await, Err(FetchError::ExchangeRefused));
     assert_eq!(rig.gets(), 0);
@@ -1029,7 +1050,7 @@ async fn a_refused_exchange_caps_the_back_off_and_it_stays_there() {
             200,
             &format!(r#"{{"challenge":"{}"}}"#, STANDARD.encode([7u8; 32])),
         ));
-        script.session.push_back(json(403, "{}"));
+        script.session.push_back(Some(json(403, "{}")));
         script.challenge.push_back(json(500, "{}"));
     }
     let started = Instant::now();

@@ -9,13 +9,18 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use shared_crypto::SigningKey;
 use shared_proto::JobId;
 
 use super::*;
+use crate::control::exchange::{CHALLENGE_PATH, SESSION_PATH};
 use crate::upload_ledger::{Probe, Step, digest_file};
-use crate::uploader::fake::{FakeDial, Mode, answer};
-use sim::{Logged, Reply, Route, Sim, problem, serve_tcp, status as reply};
+use crate::uploader::fake::{FakeDial, Mode, Proof, Seen, answer, json};
+use sim::{
+    Logged, Reply, Route, Sim, problem, serve_tcp, serve_with, status as reply, tampered, unproved,
+};
 
 mod sim;
 
@@ -1329,6 +1334,65 @@ async fn a_key_other_than_the_records_is_refused_and_a_dropped_handle_stops_the_
 // ---------------------------------------------------------------------------------------------
 // Real loopback
 
+/// The ledger and the registration of an agent whose server is on a real loopback port.
+struct Real {
+    dir: tempfile::TempDir,
+    ledger: SharedLedger,
+    key: Arc<SigningKey>,
+    record: Record,
+}
+
+impl Real {
+    /// An agent that registered with `instruction_key` at the server on `api_port`.
+    fn new(instruction_key: &shared_crypto::PublicKey, api_port: u16) -> Real {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = SharedLedger::new(UploadLedger::open_in(dir.path(), AGENT_ID).unwrap());
+        let key = Arc::new(SigningKey::generate().unwrap());
+        let record = Record {
+            agent_id: AGENT_ID.to_owned(),
+            owner_id: "0194f0a2-7c3e-7d11-8a52-000000000001".to_owned(),
+            preset: "personal".to_owned(),
+            allow_remote: false,
+            server_origin: format!("http://127.0.0.1:{api_port}"),
+            instruction_key_pem: instruction_key.to_spki_pem(),
+            instruction_key_id: String::new(),
+            agent_key_fingerprint: key.public_key().fingerprint_hex(),
+        };
+        Real {
+            dir,
+            ledger,
+            key,
+            record,
+        }
+    }
+
+    /// Starts the loop over real sockets.
+    fn start(&self) -> Handle {
+        let seams = Seams {
+            client: Client::loopback(),
+            dial: Arc::new(LoopbackPorts),
+            signer: self.key.clone(),
+            random: shared_crypto::random_32,
+        };
+        start_with(
+            &self.record,
+            &self.key.public_key(),
+            self.ledger.clone(),
+            seams,
+        )
+        .unwrap()
+    }
+
+    /// Waits until the loop has counted `n` retries (a state it stays in while it waits).
+    async fn until_retries(handle: &Handle, n: u64) {
+        let mut status = handle.status();
+        tokio::time::timeout(secs(30), status.wait_for(|s| s.retries >= n))
+            .await
+            .expect("the loop counts the retry")
+            .unwrap();
+    }
+}
+
 #[tokio::test]
 async fn a_transfer_over_loopback_sockets_is_cut_in_the_middle_and_resumed_after_the_status() {
     let api = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -1352,28 +1416,14 @@ async fn a_transfer_over_loopback_sockets_is_cut_in_the_middle_and_resumed_after
     // The third PUT is cut: the server closes with no answer.
     sim.queue_after(Route::Put, 2, Reply::Cut);
 
-    let dir = tempfile::tempdir().unwrap();
-    let ledger = SharedLedger::new(UploadLedger::open_in(dir.path(), AGENT_ID).unwrap());
+    let real = Real::new(&sim.instruction_key(), api_port);
     let data: Vec<u8> = (0..3500u32).map(|n| (n % 251) as u8).collect();
-    ledger.enqueue_result(jk(1), data.clone()).await.unwrap();
-    let key = Arc::new(SigningKey::generate().unwrap());
-    let record = Record {
-        agent_id: AGENT_ID.to_owned(),
-        owner_id: "0194f0a2-7c3e-7d11-8a52-000000000001".to_owned(),
-        preset: "personal".to_owned(),
-        allow_remote: false,
-        server_origin: format!("http://127.0.0.1:{api_port}"),
-        instruction_key_pem: sim.instruction_key().to_spki_pem(),
-        instruction_key_id: String::new(),
-        agent_key_fingerprint: key.public_key().fingerprint_hex(),
-    };
-    let seams = Seams {
-        client: Client::loopback(),
-        dial: Arc::new(LoopbackPorts),
-        signer: key.clone(),
-        random: shared_crypto::random_32,
-    };
-    let handle = start_with(&record, &key.public_key(), ledger.clone(), seams).unwrap();
+    real.ledger
+        .enqueue_result(jk(1), data.clone())
+        .await
+        .unwrap();
+    let handle = real.start();
+    let ledger = real.ledger.clone();
     let mut status = handle.status();
     tokio::time::timeout(secs(30), status.wait_for(|s| s.delivered == 1))
         .await
@@ -1386,4 +1436,568 @@ async fn a_transfer_over_loopback_sockets_is_cut_in_the_middle_and_resumed_after
     );
     assert_eq!(sim.object("job-1", "result"), Some(data));
     assert!(ledger.pending().await.is_empty());
+}
+
+// ---------------------------------------------------------------------------------------------
+// The server's proof of the answers (ADR-504 item 3): R2 to R11
+
+const UPLOAD_ID: &str = "3f2a9c1e-5b7d-4e08-9a41-0c6d2b8f7a13";
+
+fn begin_body(state: &str) -> String {
+    format!(r#"{{"uploadId":"{UPLOAD_ID}","partBytes":4,"partCount":3,"state":"{state}"}}"#)
+}
+
+/// A part URL that names the server's object port, as a forger's answer might.
+fn part_body(port: u16) -> String {
+    format!(r#"{{"url":"http://127.0.0.1:{port}/obj/{UPLOAD_ID}/1?sig=s","expiresInSecs":60}}"#)
+}
+
+fn status_body(state: &str) -> String {
+    format!(r#"{{"state":"{state}","partBytes":4,"partCount":3}}"#)
+}
+
+fn state_body(state: &str) -> String {
+    format!(r#"{{"state":"{state}"}}"#)
+}
+
+fn problem_body(state: &str) -> String {
+    format!(r#"{{"title":"x","state":"{state}"}}"#)
+}
+
+/// The requests of an attempt that got as far as `route`'s first one.
+fn up_to(route: Route) -> Vec<Route> {
+    use Route::*;
+    let all = [
+        Challenge, Session, Begin, Status, Part, Put, Part, Put, Part, Put, Complete,
+    ];
+    let end = match route {
+        Begin => 3,
+        Status => 4,
+        Part => 5,
+        _ => all.len(),
+    };
+    all[..end].to_vec()
+}
+
+/// Every answer a route gives as a result, with the first request of that route that the loop
+/// makes (the part URL's is part 1, whose PUT is the next request if it is believed).
+fn results() -> Vec<(&'static str, Route, u16, String)> {
+    vec![
+        (
+            "begin 200 finished",
+            Route::Begin,
+            200,
+            begin_body("finished"),
+        ),
+        ("begin 200 open", Route::Begin, 200, begin_body("open")),
+        ("begin 201 open", Route::Begin, 201, begin_body("open")),
+        ("part url", Route::Part, 200, part_body(sim::OBJECT_PORT)),
+        (
+            "status finished",
+            Route::Status,
+            200,
+            status_body("finished"),
+        ),
+        ("status failed", Route::Status, 200, status_body("failed")),
+        ("complete 200", Route::Complete, 200, state_body("finished")),
+        (
+            "complete 202",
+            Route::Complete,
+            202,
+            state_body("completing"),
+        ),
+        (
+            "complete 409 open",
+            Route::Complete,
+            409,
+            problem_body("open"),
+        ),
+        (
+            "complete 409 failed",
+            Route::Complete,
+            409,
+            problem_body("failed"),
+        ),
+    ]
+}
+
+// R2 to R6
+#[tokio::test(start_paused = true)]
+async fn an_unproven_result_is_a_retry_at_the_cap_that_drops_the_token() {
+    for (label, route, code, body) in results() {
+        for proof in Proof::UNPROVED {
+            let what = format!("{label} {proof:?}");
+            let mut rig = Rig::new();
+            let seq = rig.result(1, DATA).await;
+            rig.sim.queue(route, tampered(code, &body, proof));
+            rig.start();
+            rig.until(|s| s.retries == 1).await;
+            // Nothing the forger said was acted on: not a request, not a removal.
+            assert_eq!(routes_of(&rig.sim), up_to(route), "{what}");
+            assert!(
+                !rig.dial.dialled.lock().unwrap().contains(&sim::OBJECT_PORT)
+                    || route == Route::Complete,
+                "{what}: no connection to an object port"
+            );
+            assert_eq!(rig.pending().await, [seq], "{what}");
+            assert!(rig.object_file(seq).exists(), "{what}");
+            let counters = rig.counters();
+            assert_eq!(
+                (counters.delivered, counters.passed_over, counters.set_aside),
+                (0, 0, 0),
+                "{what}"
+            );
+            // The next attempt exchanges a new token after the cap, and the real server's
+            // answers then finish the entry.
+            rig.until(|s| s.delivered == 1).await;
+            let challenges = rig.sim.of(Route::Challenge);
+            assert_eq!(challenges.len(), 2, "{what}");
+            assert_eq!(gap(&challenges[0], &challenges[1]), secs(60), "{what}");
+            assert_eq!(
+                rig.sim.count(Route::Session),
+                2,
+                "{what}: the token was dropped"
+            );
+        }
+    }
+}
+
+// R4
+#[tokio::test(start_paused = true)]
+async fn an_unproven_part_url_opens_no_connection_to_any_object_port() {
+    for proof in Proof::UNPROVED {
+        let mut rig = Rig::new();
+        rig.result(1, DATA).await;
+        rig.sim.queue(
+            Route::Part,
+            tampered(200, &part_body(sim::OBJECT_PORT), proof),
+        );
+        rig.start();
+        rig.until(|s| s.retries == 1).await;
+        assert!(rig.sim.of(Route::Put).is_empty(), "{proof:?}");
+        let dialled = rig.dial.dialled.lock().unwrap().clone();
+        assert!(
+            dialled.iter().all(|port| *port == sim::API_PORT),
+            "{proof:?}: {dialled:?}"
+        );
+    }
+}
+
+// R5: an unproven status sends no part and a proved one after it is believed again.
+// R2: a forger that keeps saying finished delivers nothing, whatever it repeats
+#[tokio::test(start_paused = true)]
+async fn a_forged_finished_removes_nothing() {
+    for route in [Route::Begin, Route::Status, Route::Complete] {
+        let (code, body) = match route {
+            Route::Begin => (200, begin_body("finished")),
+            Route::Status => (200, status_body("finished")),
+            _ => (200, state_body("finished")),
+        };
+        let mut rig = Rig::new();
+        let seq = rig.result(1, DATA).await;
+        for _ in 0..5 {
+            rig.sim.queue(route, unproved(code, &body));
+        }
+        rig.start();
+        rig.until(|s| s.retries == 5).await;
+        assert_eq!(rig.counters().delivered, 0, "{route:?}");
+        rig.stop().await;
+        assert_eq!(rig.pending().await, [seq], "{route:?}");
+        assert!(rig.object_file(seq).exists(), "{route:?}");
+        let challenges = rig.sim.of(Route::Challenge);
+        assert_eq!(challenges.len(), 5, "{route:?}: one exchange per attempt");
+        for pair in challenges.windows(2) {
+            assert_eq!(gap(&pair[0], &pair[1]), secs(60), "{route:?}: the cap");
+        }
+    }
+}
+
+// R7
+#[tokio::test(start_paused = true)]
+async fn two_forged_failed_completions_set_nothing_aside() {
+    let mut rig = Rig::new();
+    rig.result(1, DATA).await;
+    for _ in 0..2 {
+        rig.sim
+            .queue(Route::Complete, unproved(409, &problem_body("failed")));
+    }
+    rig.start();
+    rig.until(|s| s.retries == 2).await;
+    let counters = rig.counters();
+    assert_eq!((counters.set_aside, counters.passed_over), (0, 0));
+    assert_eq!(
+        rig.sim.begins().len(),
+        2,
+        "one begin per attempt, none to start over"
+    );
+    rig.until(|s| s.delivered == 1).await;
+    assert_eq!(rig.counters().set_aside, 0);
+    assert_eq!(rig.sim.puts(), [1, 2, 3], "the parts were sent once");
+}
+
+// R7, the status route's failed
+#[tokio::test(start_paused = true)]
+async fn two_forged_failed_statuses_set_nothing_aside_and_begin_nothing_again() {
+    let mut rig = Rig::new();
+    rig.result(1, DATA).await;
+    for _ in 0..2 {
+        rig.sim
+            .queue(Route::Status, unproved(200, &status_body("failed")));
+    }
+    rig.start();
+    rig.until(|s| s.retries == 2).await;
+    let counters = rig.counters();
+    assert_eq!((counters.set_aside, counters.passed_over), (0, 0));
+    // A believed failed status begins again at once and reads the source for it; here each
+    // attempt begins once and waits the cap.
+    assert_eq!(rig.sim.begins().len(), 2, "one begin per attempt");
+    assert!(rig.sim.puts().is_empty(), "no part was sent");
+    rig.until(|s| s.delivered == 1).await;
+    assert_eq!(rig.counters().set_aside, 0);
+    assert_eq!(rig.sim.begins().len(), 3, "one begin per attempt");
+    assert_eq!(rig.sim.puts(), [1, 2, 3], "the parts were sent once");
+}
+
+// R8
+#[tokio::test(start_paused = true)]
+async fn forged_open_completions_pass_nothing_over_and_forged_202s_repeat_nothing() {
+    let mut rig = Rig::new();
+    rig.result(1, DATA).await;
+    for _ in 0..2 {
+        rig.sim
+            .queue(Route::Complete, unproved(409, &problem_body("open")));
+    }
+    rig.start();
+    rig.until(|s| s.retries == 2).await;
+    assert_eq!(rig.counters().passed_over, 0);
+    rig.until(|s| s.delivered == 1).await;
+    assert_eq!(rig.counters().passed_over, 0);
+
+    let mut rig = Rig::new();
+    rig.result(1, DATA).await;
+    rig.sim
+        .queue(Route::Complete, unproved(202, &state_body("completing")));
+    rig.start();
+    rig.until(|s| s.retries == 1).await;
+    assert_eq!(rig.sim.count(Route::Complete), 1, "no repeat");
+}
+
+// R9
+#[tokio::test(start_paused = true)]
+async fn an_impostors_401_buys_one_exchange_and_no_result() {
+    for proof in [
+        Proof::Valid,
+        Proof::Missing,
+        Proof::NotCanonical,
+        Proof::TwoValues,
+    ] {
+        let mut rig = Rig::new();
+        rig.result(1, DATA).await;
+        for _ in 0..3 {
+            rig.sim.queue(
+                Route::Begin,
+                Reply::Json(crate::uploader::fake::Served::new(401, "{}").with(proof)),
+            );
+        }
+        rig.start();
+        rig.until(|s| s.retries == 1).await;
+        use Route::*;
+        assert_eq!(
+            routes_of(&rig.sim),
+            [Challenge, Session, Begin, Challenge, Session, Begin],
+            "{proof:?}: one exchange at once, one repeat, then a retry"
+        );
+        let begins = rig.sim.of(Begin);
+        assert_eq!(gap(&begins[0], &begins[1]), secs(0), "{proof:?}");
+        assert!(begins[0].nonce.is_some() && begins[1].nonce.is_some());
+        assert_ne!(
+            begins[0].nonce, begins[1].nonce,
+            "a new nonce for the repeat"
+        );
+        assert_eq!(rig.counters().delivered, 0);
+    }
+}
+
+// R10
+#[tokio::test(start_paused = true)]
+async fn a_begin_409_is_classed_by_its_status_whatever_proof_it_carries() {
+    for proof in [Proof::Valid, Proof::Missing, Proof::NotCanonical] {
+        let mut rig = Rig::new();
+        rig.result(1, DATA).await;
+        rig.sim.queue(
+            Route::Begin,
+            Reply::Json(crate::uploader::fake::Served::new(409, "{}").with(proof)),
+        );
+        rig.start();
+        rig.until(|s| s.delivered == 1).await;
+        assert_eq!(rig.counters().passed_over, 1, "{proof:?}");
+        assert_eq!(rig.counters().retries, 0, "{proof:?}");
+    }
+}
+
+// R11
+#[tokio::test(start_paused = true)]
+async fn an_unproved_503_status_then_a_forged_completion_gives_one_completion_and_unproven() {
+    let mut rig = Rig::new();
+    let seq = rig.result(1, DATA).await;
+    rig.sim.queue(Route::Status, problem(503, None));
+    rig.sim
+        .queue(Route::Complete, unproved(409, &problem_body("failed")));
+    rig.start();
+    rig.until(|s| s.retries == 1).await;
+    use Route::*;
+    assert_eq!(
+        routes_of(&rig.sim),
+        [Challenge, Session, Begin, Status, Complete]
+    );
+    assert_eq!(rig.pending().await, [seq]);
+    assert_eq!(rig.counters().set_aside, 0);
+}
+
+// The wait is owed even when parts were stored before the forged answer.
+#[tokio::test(start_paused = true)]
+async fn an_unproven_answer_after_stored_parts_still_waits_the_cap_and_then_recovers() {
+    let mut rig = Rig::new();
+    rig.result(1, DATA).await;
+    rig.sim.queue_after(
+        Route::Part,
+        1,
+        tampered(200, &part_body(sim::OBJECT_PORT), Proof::OtherKey),
+    );
+    rig.start();
+    rig.until(|s| s.retries == 1).await;
+    assert_eq!(rig.sim.puts(), [1], "part 1 was stored before");
+    rig.until(|s| s.delivered == 1).await;
+    let challenges = rig.sim.of(Route::Challenge);
+    assert_eq!(gap(&challenges[0], &challenges[1]), secs(60));
+    assert_eq!(rig.sim.object("job-1", "result").as_deref(), Some(DATA));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Impostors on real sockets: I2, I2r
+
+/// What a process that holds the server's port and is not the server says: a challenge and a
+/// token with no proof, and for anything else that the upload is done.
+fn lies(request: &Seen, own_put_port: u16) -> Reply {
+    let line = request.request_line();
+    let body = if line.contains(CHALLENGE_PATH) {
+        format!(
+            r#"{{"challenge":"{}"}}"#,
+            STANDARD.encode(shared_crypto::random_32().unwrap())
+        )
+    } else if line.contains(SESSION_PATH) {
+        format!(
+            r#"{{"token":"{}","expiresInSecs":300}}"#,
+            STANDARD.encode(shared_crypto::random_32().unwrap())
+        )
+    } else if line.contains("/parts/") {
+        part_body(own_put_port)
+    } else {
+        begin_body("finished")
+    };
+    Reply::Bytes(json(200, &body))
+}
+
+/// What an impostor answers: `lies` to everything but a part URL, which `part_answer` answers.
+/// It records what it was asked.
+fn impostor_answers(
+    asked: Arc<Mutex<Vec<Seen>>>,
+    own_put_port: u16,
+    part_answer: fn(u16) -> Reply,
+) -> impl Fn(&Seen) -> Reply + Send + Sync + 'static {
+    move |request| {
+        asked.lock().unwrap().push(request.clone());
+        if request.request_line().contains("/parts/") {
+            part_answer(own_put_port)
+        } else {
+            lies(request, own_put_port)
+        }
+    }
+}
+
+/// Serves `lies` on `listener` and records what it was asked.
+fn impostor(
+    listener: tokio::net::TcpListener,
+    own_put_port: u16,
+    part_answer: fn(u16) -> Reply,
+) -> (Arc<Mutex<Vec<Seen>>>, tokio::task::JoinHandle<()>) {
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let task = tokio::spawn(serve_with(
+        listener,
+        impostor_answers(asked.clone(), own_put_port, part_answer),
+    ));
+    (asked, task)
+}
+
+fn request_lines(asked: &Mutex<Vec<Seen>>) -> Vec<String> {
+    asked
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|r| r.request_line().to_owned())
+        .collect()
+}
+
+// I2
+#[tokio::test]
+async fn an_impostor_holding_the_api_port_from_the_start_gets_one_exchange_and_no_begin() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (asked, _task) = impostor(listener, 1, |port| {
+        Reply::Bytes(json(200, &part_body(port)))
+    });
+    // The agent registered with the real server's key, which the impostor does not hold.
+    let real = Real::new(&SigningKey::generate().unwrap().public_key(), port);
+    real.ledger
+        .enqueue_result(jk(1), DATA.to_vec())
+        .await
+        .unwrap();
+    let handle = real.start();
+    // The exchange fails and the loop waits the cap before it dials again: the retry's count is
+    // a state it stays in.
+    Real::until_retries(&handle, 1).await;
+    let lines = request_lines(&asked);
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(lines[0].contains(CHALLENGE_PATH) && lines[1].contains(SESSION_PATH));
+    assert_eq!(handle.status().borrow().delivered, 0);
+    handle.stop();
+    handle.stopped().await;
+}
+
+/// The agent's registration and the real server over sockets, with the first part's PUT held; then
+/// the server's API port starts to be answered by an impostor, the PUT is let go, and the agent's next request
+/// is the impostor's to answer. Returns once the loop has counted its retry.
+struct Takeover {
+    real: Real,
+    handle: Handle,
+    sim: Arc<Sim>,
+    asked: Arc<Mutex<Vec<Seen>>>,
+    /// The impostor's own PUT port, which nothing accepts on.
+    own_put: std::net::TcpListener,
+}
+
+async fn takeover(part_answer: fn(u16) -> Reply) -> Takeover {
+    let api = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let objects = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let (api_port, object_port) = (
+        api.local_addr().unwrap().port(),
+        objects.local_addr().unwrap().port(),
+    );
+    let sim = Sim::new(
+        1000,
+        object_port,
+        &format!("http://127.0.0.1:{api_port}"),
+        AGENT_ID,
+    );
+    // One listener serves the API port throughout: the real server's answers until the takeover,
+    // the impostor's after it, so that no port is released and bound again.
+    let own_put = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    own_put.set_nonblocking(true).unwrap();
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let taken = Arc::new(AtomicBool::new(false));
+    let impostor = impostor_answers(
+        asked.clone(),
+        own_put.local_addr().unwrap().port(),
+        part_answer,
+    );
+    let (server, switch) = (sim.clone(), taken.clone());
+    tokio::spawn(serve_with(api, move |request| {
+        if switch.load(Ordering::SeqCst) {
+            impostor(request)
+        } else {
+            server.handle(api_port, request)
+        }
+    }));
+    tokio::spawn(serve_tcp(objects, object_port, sim.clone()));
+    let gate = Arc::new(tokio::sync::Notify::new());
+    sim.queue(Route::Put, Reply::Held(gate.clone()));
+
+    let real = Real::new(&sim.instruction_key(), api_port);
+    let data: Vec<u8> = (0..3500u32).map(|n| (n % 251) as u8).collect();
+    real.ledger.enqueue_result(jk(1), data).await.unwrap();
+    let handle = real.start();
+    // The first PUT reached the server: it is the next request that the impostor will get.
+    for _ in 0..3000 {
+        if sim.count(Route::Put) >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        sim.count(Route::Put),
+        1,
+        "the first part's PUT is in flight"
+    );
+
+    // Another process now answers on the server's port.
+    taken.store(true, Ordering::SeqCst);
+    gate.notify_one();
+    Real::until_retries(&handle, 1).await;
+    Takeover {
+        real,
+        handle,
+        sim,
+        asked,
+        own_put,
+    }
+}
+
+impl Takeover {
+    async fn end(self) {
+        self.handle.stop();
+        self.handle.stopped().await;
+    }
+}
+
+// I2r
+#[tokio::test]
+async fn an_impostor_that_takes_the_port_over_cannot_send_the_agents_bytes_anywhere() {
+    let t = takeover(|port| Reply::Bytes(json(200, &part_body(port)))).await;
+    let lines = request_lines(&t.asked);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("/parts/2"), "{lines:?}");
+    let old_bearer = t.sim.of(Route::Part).last().unwrap().bearer.clone();
+    assert_eq!(
+        t.asked.lock().unwrap()[0]
+            .header("authorization")
+            .map(|v| v.trim_start_matches("Bearer ").to_owned()),
+        old_bearer,
+        "the impostor met the token of the real server"
+    );
+    assert!(
+        matches!(
+            t.own_put.accept().map(drop),
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
+        ),
+        "no connection to the impostor's PUT port"
+    );
+    assert_eq!(t.real.ledger.pending().await.len(), 1);
+    let file = t
+        .real
+        .dir
+        .path()
+        .join(format!("{AGENT_ID}.objects"))
+        .join("1");
+    assert!(file.exists());
+    assert_eq!(t.handle.status().borrow().delivered, 0);
+    t.end().await;
+}
+
+// I2r, the second answer
+#[tokio::test]
+async fn an_impostors_401_after_the_takeover_buys_one_exchange_and_no_further_data_request() {
+    let t = takeover(|_| Reply::Bytes(answer(401, "", "{}"))).await;
+    let lines = request_lines(&t.asked);
+    assert_eq!(lines.len(), 3, "{lines:?}");
+    assert!(lines[0].contains("/parts/2"), "{lines:?}");
+    assert!(lines[1].contains(CHALLENGE_PATH) && lines[2].contains(SESSION_PATH));
+    assert_eq!(t.real.ledger.pending().await.len(), 1);
+    assert_eq!(t.handle.status().borrow().delivered, 0);
+    t.end().await;
 }

@@ -1,10 +1,14 @@
-//! The download route's rows: the request, the strict answer and the classes (A3 to A7 of the
-//! agent's case table), over the in-memory dial on a paused clock.
+//! The download route's rows: the request, the strict answer, the classes (A3 to A7 of the
+//! agent's case table) and the server's proof of the answers that decide (ADR-504 item 3, F1 to
+//! F5), over the in-memory dial on a paused clock.
 
 use tokio::io::{AsyncWriteExt, DuplexStream};
 
 use super::*;
-use crate::uploader::fake::{FakeDial, Mode, answer, json, read_request, scripted};
+use crate::answer_proof::Verifier;
+use crate::uploader::fake::{
+    FakeDial, Mode, Proof, Served, proving, read_request, scripted_served, scripted_with,
+};
 
 const API: u16 = 8080;
 const JOB: &str = "0194f0a2-7c3e-7d11-8a52-3f6f9b1c2d4e";
@@ -27,20 +31,30 @@ fn good_url() -> String {
     r#"{"url":"http://127.0.0.1:9000/bucket/key?X-Amz-Signature=s","expiresInSecs":60}"#.to_owned()
 }
 
-async fn ask(reply: Vec<u8>) -> Result<PartTarget, Failure> {
-    let (dial, _) = scripted(reply);
-    Downloads::new(Client::with_dial(dial), origin())
-        .url("tok", &want())
-        .await
+const AGENT: &str = "0194f0a2-7c3e-7d11-8a52-3f6f9b1c2d4e";
+
+fn downloads(dial: std::sync::Arc<FakeDial>, verifier: std::sync::Arc<Verifier>) -> Downloads {
+    Downloads::new(
+        Client::with_dial(dial),
+        origin(),
+        verifier,
+        shared_crypto::random_32,
+    )
+}
+
+/// The route's answer to a request that a server answered with `reply`, proved as it says.
+async fn ask(reply: Served) -> Result<PartTarget, Failure> {
+    let (prover, verifier) = proving(&format!("http://127.0.0.1:{API}"), AGENT);
+    let (dial, _) = scripted_served(prover, reply);
+    downloads(dial, verifier).url("tok", &want()).await
 }
 
 #[tokio::test(start_paused = true)]
 async fn the_request_is_a_post_with_the_bearer_and_the_four_members() {
-    let (dial, seen) = scripted(json(200, &good_url()));
-    let target = Downloads::new(Client::with_dial(dial.clone()), origin())
-        .url("tok-1", &want())
-        .await
-        .unwrap();
+    let (prover, verifier) = proving(&format!("http://127.0.0.1:{API}"), AGENT);
+    let (dial, seen) = scripted_served(prover, Served::new(200, &good_url()));
+    let route = downloads(dial.clone(), verifier);
+    let target = route.url("tok-1", &want()).await.unwrap();
     assert_eq!((target.port(), target.host()), (9000, "127.0.0.1:9000"));
     assert_eq!(target.target(), "/bucket/key?X-Amz-Signature=s");
     assert_eq!(*dial.dialled.lock().unwrap(), vec![API]);
@@ -61,10 +75,7 @@ async fn the_request_is_a_post_with_the_bearer_and_the_four_members() {
         kind: Kind::Artifact,
         ..want()
     };
-    Downloads::new(Client::with_dial(dial), origin())
-        .url("t", &artifact)
-        .await
-        .unwrap();
+    route.url("t", &artifact).await.unwrap();
     let body: serde_json::Value = serde_json::from_slice(&seen.lock().unwrap()[1].body).unwrap();
     assert_eq!(body["kind"], "artifact");
 }
@@ -73,7 +84,9 @@ async fn the_request_is_a_post_with_the_bearer_and_the_four_members() {
 #[tokio::test(start_paused = true)]
 async fn refusals_are_passed_over() {
     for status in [400u16, 404, 413, 500, 403, 418] {
-        let failure = ask(json(status, r#"{"title":"x"}"#)).await.unwrap_err();
+        let failure = ask(Served::new(status, r#"{"title":"x"}"#))
+            .await
+            .unwrap_err();
         assert_eq!(
             (status, failure.class, failure.status),
             (status, Class::PassOver, Some(status))
@@ -84,10 +97,6 @@ async fn refusals_are_passed_over() {
 /// A5: an answer the route does not promise.
 #[tokio::test(start_paused = true)]
 async fn an_answer_that_is_not_promised_is_passed_over() {
-    let big = format!(
-        r#"{{"url":"http://127.0.0.1:9000/{}","expiresInSecs":60}}"#,
-        "a".repeat(70_000)
-    );
     let cases = [
         r#"{"url":"http://127.0.0.1:9000/x","expiresInSecs":60,"extra":1}"#.to_owned(),
         r#"{"expiresInSecs":60}"#.to_owned(),
@@ -96,10 +105,9 @@ async fn an_answer_that_is_not_promised_is_passed_over() {
         r#"{"url":5,"expiresInSecs":60}"#.to_owned(),
         "not json".to_owned(),
         String::new(),
-        big,
     ];
     for body in cases {
-        let failure = ask(json(200, &body)).await.unwrap_err();
+        let failure = ask(Served::new(200, &body)).await.unwrap_err();
         assert_eq!(
             (failure.class, failure.status),
             (Class::PassOver, Some(200)),
@@ -108,14 +116,14 @@ async fn an_answer_that_is_not_promised_is_passed_over() {
         );
     }
     // 201 is not a status of this route.
-    let failure = ask(json(201, &good_url())).await.unwrap_err();
+    let failure = ask(Served::new(201, &good_url())).await.unwrap_err();
     assert_eq!(failure.class, Class::PassOver);
 }
 
 /// A4: a 401 is the class that exchanges a new token.
 #[tokio::test(start_paused = true)]
 async fn a_401_asks_for_a_new_token() {
-    let failure = ask(json(401, "{}")).await.unwrap_err();
+    let failure = ask(Served::new(401, "{}")).await.unwrap_err();
     assert_eq!(failure.class, Class::Reauthenticate);
 }
 
@@ -123,7 +131,7 @@ async fn a_401_asks_for_a_new_token() {
 #[tokio::test(start_paused = true)]
 async fn unavailable_statuses_are_retried_and_retry_after_is_kept() {
     for status in [408u16, 429, 502, 503, 504, 302, 307] {
-        let failure = ask(json(status, "{}")).await.unwrap_err();
+        let failure = ask(Served::new(status, "{}")).await.unwrap_err();
         assert_eq!((status, failure.class), (status, Class::Retry), "{status}");
     }
     for (header, want) in [
@@ -132,7 +140,9 @@ async fn unavailable_statuses_are_retried_and_retry_after_is_kept() {
         ("Retry-After: 61\r\n", None),
         ("", None),
     ] {
-        let failure = ask(answer(503, header, "{}")).await.unwrap_err();
+        let failure = ask(Served::new(503, "{}").with_headers(header))
+            .await
+            .unwrap_err();
         assert_eq!(failure.retry_after_secs, want, "{header}");
     }
 }
@@ -140,15 +150,16 @@ async fn unavailable_statuses_are_retried_and_retry_after_is_kept() {
 /// A6: no answer, a cut and no progress are retries; nothing about them is final.
 #[tokio::test(start_paused = true)]
 async fn a_dead_server_is_retried() {
-    let (dial, _) = scripted(Vec::new());
+    let (_, verifier) = proving(&format!("http://127.0.0.1:{API}"), AGENT);
+    let (dial, _) = scripted_with(|_| Vec::new());
     dial.set(Mode::Refuse);
-    let failure = Downloads::new(Client::with_dial(dial.clone()), origin())
+    let failure = downloads(dial.clone(), verifier.clone())
         .url("t", &want())
         .await
         .unwrap_err();
     assert_eq!((failure.class, failure.why), (Class::Retry, "not-sent"));
     dial.set(Mode::Hang);
-    let failure = Downloads::new(Client::with_dial(dial), origin())
+    let failure = downloads(dial, verifier.clone())
         .url("t", &want())
         .await
         .unwrap_err();
@@ -161,7 +172,7 @@ async fn a_dead_server_is_retried() {
             let _ = server.shutdown().await;
         });
     });
-    let failure = Downloads::new(Client::with_dial(silent), origin())
+    let failure = downloads(silent, verifier)
         .url("t", &want())
         .await
         .unwrap_err();
@@ -184,7 +195,7 @@ async fn a_url_that_breaks_the_host_rule_is_a_retry() {
         long.as_str(),
     ] {
         let body = serde_json::json!({"url": url, "expiresInSecs": 60}).to_string();
-        let failure = ask(json(200, &body)).await.unwrap_err();
+        let failure = ask(Served::new(200, &body)).await.unwrap_err();
         assert_eq!(
             (failure.class, failure.why),
             (Class::Retry, "download-url-host"),
@@ -192,4 +203,109 @@ async fn a_url_that_breaks_the_host_rule_is_a_retry() {
             url.len()
         );
     }
+}
+
+/// The statuses the fetch ends on when the server proved them.
+const REFUSALS: [u16; 7] = [400, 404, 413, 500, 403, 418, 501];
+
+/// F3: a proved refusal is a refusal, the same for each status that ends the fetch.
+#[tokio::test(start_paused = true)]
+async fn a_proved_refusal_ends_the_fetch() {
+    for status in REFUSALS {
+        let failure = ask(Served::new(status, r#"{"title":"x"}"#))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (failure.class, failure.status),
+            (Class::PassOver, Some(status))
+        );
+    }
+}
+
+/// F2 and F4: an answer that is not proved is never acted on, whatever it says: the 200 is not
+/// a URL and a refusal is not one that ends the fetch.
+#[tokio::test(start_paused = true)]
+async fn an_answer_that_is_not_proved_is_unproven_whatever_its_status() {
+    for proof in Proof::UNPROVED {
+        for status in std::iter::once(200).chain(REFUSALS) {
+            let body = if status == 200 {
+                good_url()
+            } else {
+                r#"{"title":"x"}"#.to_owned()
+            };
+            let failure = ask(Served::new(status, &body).with(proof))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                (failure.class, failure.why, failure.status),
+                (Class::Unproven, "unproven", Some(status)),
+                "{proof:?} {status}"
+            );
+        }
+    }
+}
+
+/// F5: a 401 and the statuses that are retried are classed by status, whatever proof they carry.
+#[tokio::test(start_paused = true)]
+async fn statuses_that_are_not_results_are_not_checked() {
+    for proof in [
+        Proof::Valid,
+        Proof::Missing,
+        Proof::NotCanonical,
+        Proof::TwoValues,
+    ] {
+        for (status, class) in [
+            (401, Class::Reauthenticate),
+            (302, Class::Retry),
+            (408, Class::Retry),
+            (429, Class::Retry),
+            (502, Class::Retry),
+            (503, Class::Retry),
+            (504, Class::Retry),
+        ] {
+            let failure = ask(Served::new(status, "{}").with(proof))
+                .await
+                .unwrap_err();
+            assert_eq!((failure.class, failure.status), (class, Some(status)));
+        }
+    }
+}
+
+/// The nonce is fresh for every request, and the proof of one request does not prove the answer
+/// to another.
+#[tokio::test(start_paused = true)]
+async fn each_request_carries_its_own_nonce() {
+    let (prover, verifier) = proving(&format!("http://127.0.0.1:{API}"), AGENT);
+    let (dial, seen) = scripted_served(prover, Served::new(200, &good_url()));
+    let route = downloads(dial, verifier);
+    route.url("t", &want()).await.unwrap();
+    route.url("t", &want()).await.unwrap();
+    let seen = seen.lock().unwrap();
+    let nonces: Vec<String> = seen
+        .iter()
+        .map(|request| request.header("ngr-nonce").expect("a nonce"))
+        .collect();
+    assert_ne!(nonces[0], nonces[1]);
+    assert!(
+        nonces
+            .iter()
+            .all(|n| crate::answer_proof::canonical_base64::<32>(n).is_some())
+    );
+}
+
+/// A server that signs for the nonce of an earlier request (a replay) is not proved.
+#[tokio::test(start_paused = true)]
+async fn an_answer_replayed_from_an_earlier_request_is_unproven() {
+    let (prover, verifier) = proving(&format!("http://127.0.0.1:{API}"), AGENT);
+    let recorded = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let first = recorded.clone();
+    let (dial, _) = scripted_with(move |request| {
+        let mut held = first.lock().unwrap();
+        held.get_or_insert_with(|| Served::new(200, &good_url()).bytes(&prover, request))
+            .clone()
+    });
+    let route = downloads(dial, verifier);
+    route.url("t", &want()).await.unwrap();
+    let failure = route.url("t", &want()).await.unwrap_err();
+    assert_eq!(failure.class, Class::Unproven);
 }

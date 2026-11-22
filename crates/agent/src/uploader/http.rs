@@ -12,10 +12,12 @@
 //!   every request ([`Error::NoProgress`]);
 //! - [`JSON_TOTAL`] in all for the JSON routes, and no total for a part's PUT.
 //!
-//! A head is at most [`MAX_HEAD`] bytes. A body is read only for the statuses that carry the
-//! routes' answers ([`reads_body`]) and is at most [`MAX_ANSWER`] bytes; the body of any other
-//! status is never read, and a PUT's answer body is never read at all: its status says whether the
-//! part was stored.
+//! A head is at most [`MAX_HEAD`] bytes. A body is read only for the statuses the request's
+//! [`JsonRequest::reads`] names ([`reads_body`] for the upload routes: the statuses that carry
+//! their answers) and is at most [`MAX_ANSWER`] bytes; the body of any other status is never read,
+//! and a PUT's answer body is never read at all: its status says whether the part was stored.
+//! Every JSON request carries a fresh `Ngr-Nonce` and its answer's `Ngr-Server-Proof` is kept
+//! beside the body, for the caller to verify (ADR-504); the PUT and the GET carry neither.
 //!
 //! [`Client::get`] is the download leg's request (design 14.3, ADR-497): a presigned GET with no
 //! `Authorization` and no redirect, whose body is streamed into a writer the caller gives, on a
@@ -30,11 +32,14 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use http_body_util::{BodyExt, Empty, Full};
 use hyper::body::{Body, Bytes, Frame, SizeHint};
 use hyper::client::conn::http1;
 use hyper::header::{
-    AUTHORIZATION, CONNECTION, CONTENT_LENGTH, HOST, HeaderMap, RETRY_AFTER, TRANSFER_ENCODING,
+    AUTHORIZATION, CONNECTION, CONTENT_LENGTH, HOST, HeaderMap, HeaderName, RETRY_AFTER,
+    TRANSFER_ENCODING,
 };
 use hyper::{Method, Request};
 use hyper_util::rt::TokioIo;
@@ -44,6 +49,8 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::control::dial::{LoopbackPorts, PortDial, Stream};
+use shared_proto::{NONCE_HEADER, PROOF_HEADER};
+
 use crate::server_http::{CONNECT_TIMEOUT, MAX_HEAD, MAX_HEADERS, single_text};
 
 /// How long a connection may go with no byte read or written, in either direction.
@@ -89,6 +96,8 @@ pub enum AnswerBody {
     Bytes(Vec<u8>),
     /// More than [`MAX_ANSWER`] bytes, declared or arrived. The bytes are not kept.
     TooLarge,
+    /// The body ended before its declared end, or failed while it was read.
+    Cut,
 }
 
 /// What came back. `Debug` shows the status and the body's length, never the body.
@@ -96,6 +105,8 @@ pub struct Answer {
     pub status: u16,
     /// The single `Retry-After` value, when the answer has exactly one that is text.
     pub retry_after: Option<String>,
+    /// The single `Ngr-Server-Proof` value, when the answer has exactly one that is text.
+    pub proof: Option<String>,
     pub body: AnswerBody,
 }
 
@@ -132,6 +143,10 @@ pub struct JsonRequest<'a> {
     pub bearer: &'a str,
     /// The JSON body of a POST with one.
     pub body: Option<Vec<u8>>,
+    /// The request's nonce, sent in the `Ngr-Nonce` header (ADR-504).
+    pub nonce: [u8; 32],
+    /// Whether the body of an answer with this status is read.
+    pub reads: fn(u16) -> bool,
 }
 
 impl std::fmt::Debug for Answer {
@@ -140,6 +155,7 @@ impl std::fmt::Debug for Answer {
             AnswerBody::Unread => "unread".to_owned(),
             AnswerBody::Bytes(bytes) => format!("{} bytes", bytes.len()),
             AnswerBody::TooLarge => "too large".to_owned(),
+            AnswerBody::Cut => "cut".to_owned(),
         };
         f.debug_struct("Answer")
             .field("status", &self.status)
@@ -210,7 +226,11 @@ impl Client {
             .uri(request.target)
             .header(HOST, request.host)
             .header(CONNECTION, "close")
-            .header(AUTHORIZATION, format!("Bearer {}", request.bearer));
+            .header(AUTHORIZATION, format!("Bearer {}", request.bearer))
+            .header(
+                HeaderName::from_static(NONCE_HEADER),
+                STANDARD.encode(request.nonce),
+            );
         if request.body.is_some() {
             builder = builder.header(hyper::header::CONTENT_TYPE, "application/json");
         }
@@ -226,6 +246,7 @@ impl Client {
                     .map_err(|_| Error::Failed)
             },
             Some(JSON_TOTAL),
+            request.reads,
         )
         .await
     }
@@ -259,6 +280,7 @@ impl Client {
                     .map_err(|_| Error::Failed)
             },
             None,
+            |_| false,
         )
         .await
     }
@@ -308,6 +330,7 @@ impl Client {
         port: u16,
         make_request: impl FnOnce() -> Result<Request<B>, Error>,
         total: Option<Duration>,
+        reads: fn(u16) -> bool,
     ) -> Result<Answer, Error>
     where
         B: Body<Data = Bytes> + Send + Unpin + 'static,
@@ -329,7 +352,7 @@ impl Client {
         };
         let judged = async {
             tokio::select! {
-                answer = exchange(stream, request) => answer,
+                answer = exchange(stream, request, reads) => answer,
                 () = progress.stalled(self.no_progress) => Err(Error::NoProgress),
             }
         };
@@ -419,7 +442,11 @@ impl Drop for Driver {
     }
 }
 
-async fn exchange<B>(stream: Tracked, request: Request<B>) -> Result<Answer, Error>
+async fn exchange<B>(
+    stream: Tracked,
+    request: Request<B>,
+    reads: fn(u16) -> bool,
+) -> Result<Answer, Error>
 where
     B: Body<Data = Bytes> + Send + Unpin + 'static,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
@@ -442,7 +469,8 @@ where
         .map_err(|_| Error::Failed)?;
     let status = response.status().as_u16();
     let retry_after = single_text(response.headers(), &RETRY_AFTER);
-    let body = if !is_put && reads_body(status) {
+    let proof = single_text(response.headers(), &HeaderName::from_static(PROOF_HEADER));
+    let body = if !is_put && reads(status) {
         read_body(response).await?
     } else {
         AnswerBody::Unread
@@ -450,6 +478,7 @@ where
     Ok(Answer {
         status,
         retry_after,
+        proof,
         body,
     })
 }
@@ -560,7 +589,9 @@ async fn read_body(response: hyper::Response<hyper::body::Incoming>) -> Result<A
     let mut body = response.into_body();
     let mut bytes = Vec::new();
     while let Some(frame) = body.frame().await {
-        let frame = frame.map_err(|_| Error::Failed)?;
+        let Ok(frame) = frame else {
+            return Ok(AnswerBody::Cut);
+        };
         if let Ok(data) = frame.into_data() {
             if bytes.len() + data.len() > MAX_ANSWER {
                 return Ok(AnswerBody::TooLarge);

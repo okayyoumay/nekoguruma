@@ -339,7 +339,7 @@ struct Worker {
     dial: Arc<dyn PortDial>,
     signer: Arc<dyn Signer + Send + Sync>,
     random: fn() -> Result<[u8; 32], RandomError>,
-    verifier: Verifier,
+    verifier: Arc<Verifier>,
     host: String,
     port: u16,
     ledger: SharedLedger,
@@ -383,9 +383,9 @@ impl Worker {
         }
         let origin = ServerOrigin::parse(&record.server_origin)
             .map_err(|_| RecordError::Field("server_origin"))?;
-        let verifier = Verifier::from_record(record)?;
+        let verifier = Arc::new(Verifier::from_record(record)?);
         Ok(Worker {
-            routes: Routes::new(seams.client, origin.clone()),
+            routes: Routes::new(seams.client, origin.clone(), verifier.clone(), seams.random),
             dial: seams.dial,
             signer: seams.signer,
             random: seams.random,

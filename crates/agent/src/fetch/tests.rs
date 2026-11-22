@@ -20,6 +20,7 @@ use sha2::{Digest, Sha256};
 use shared_crypto::{PublicKey, SigningKey, instruction as envelope};
 use shared_proto::{AgentId, INSTRUCTION_VERSION, JobId, JobInstruction, JobKind, VciId, Vin};
 use tokio::io::{AsyncWriteExt, DuplexStream};
+use tokio::net::TcpListener;
 use tokio::time::Instant;
 use tracing_subscriber::fmt::MakeWriter;
 
@@ -28,7 +29,9 @@ use crate::answer_proof::TestProver;
 use crate::control::dial::Dialled;
 use crate::control::exchange::{CHALLENGE_PATH, SESSION_PATH};
 use crate::instruction;
-use crate::uploader::fake::{FakeDial, Seen, answer, json, proved_json, read_request};
+use crate::uploader::fake::{
+    FakeDial, Proof, Seen, Served, accept_with, answer, json, proved_json, read_request,
+};
 
 const API: u16 = 8080;
 const OBJ: u16 = 9000;
@@ -112,11 +115,17 @@ struct Script {
     challenge: VecDeque<Vec<u8>>,
     /// The answers to the session requests in order; `None` is the server's own, a proved token.
     session: VecDeque<Option<Vec<u8>>>,
-    downloads: VecDeque<Vec<u8>>,
+    /// The download route's answers in order, proved when they are served; the server's own
+    /// is a proved URL.
+    downloads: VecDeque<Served>,
     objects: VecDeque<Obj>,
     object_default: Option<Obj>,
     /// Every request: the port, the request line and the `Authorization` header.
     log: Vec<(u16, String, Option<String>)>,
+    /// The `Ngr-Nonce` of every request that carried one, with its port.
+    nonces: Vec<(u16, String)>,
+    /// The `Ngr-Server-Proof` value of every answer served.
+    proofs: Vec<String>,
     sessions: u32,
 }
 
@@ -130,6 +139,8 @@ impl Script {
             objects: VecDeque::new(),
             object_default: None,
             log: Vec::new(),
+            nonces: Vec::new(),
+            proofs: Vec::new(),
             sessions: 0,
         }
     }
@@ -141,7 +152,24 @@ impl Script {
             .count()
     }
 
+    /// What the server does with `seen`, recording the nonce it carried and the proofs served.
     fn react(&mut self, port: u16, seen: &Seen) -> Obj {
+        if let Some(nonce) = seen.header("ngr-nonce") {
+            self.nonces.push((port, nonce));
+        }
+        let reply = self.reply(port, seen);
+        if let Obj::Raw(bytes) = &reply {
+            let head = String::from_utf8_lossy(bytes);
+            for line in head.split("\r\n\r\n").next().unwrap_or_default().lines() {
+                if let Some(proof) = line.strip_prefix("Ngr-Server-Proof: ") {
+                    self.proofs.push(proof.to_owned());
+                }
+            }
+        }
+        reply
+    }
+
+    fn reply(&mut self, port: u16, seen: &Seen) -> Obj {
         let line = seen.request_line().to_owned();
         self.log
             .push((port, line.clone(), seen.header("authorization")));
@@ -175,10 +203,11 @@ impl Script {
                 )
             }));
         }
-        raw(self
+        let reply = self
             .downloads
             .pop_front()
-            .unwrap_or_else(|| json(200, &download_url())))
+            .unwrap_or_else(|| Served::new(200, &download_url()));
+        raw(reply.bytes(&self.prover, seen))
     }
 }
 
@@ -248,13 +277,28 @@ impl Rig {
 
     /// A rig whose bounds are `bound` bytes when given.
     fn build(docs: Vec<Vec<u8>>, artifact: Option<Vec<u8>>, bound: Option<u64>) -> Rig {
+        Rig::assemble(docs, artifact, bound, None)
+    }
+
+    /// A rig whose fetcher dials the loopback port `port` for real, where the test serves the
+    /// API (the object port is never reached).
+    fn over_sockets(doc: &[u8], port: u16) -> Rig {
+        Rig::assemble(vec![doc.to_vec()], None, None, Some(port))
+    }
+
+    fn assemble(
+        docs: Vec<Vec<u8>>,
+        artifact: Option<Vec<u8>>,
+        bound: Option<u64>,
+        real_port: Option<u16>,
+    ) -> Rig {
         let mut docs = docs;
         docs.sort_by_key(|d| digest(d));
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("objects");
         fs::create_dir(&root).unwrap();
         let instruction = Arc::new(SigningKey::generate().unwrap());
-        let origin = format!("http://127.0.0.1:{API}");
+        let origin = format!("http://127.0.0.1:{}", real_port.unwrap_or(API));
         let script = Arc::new(Mutex::new(Script::new(TestProver::new(
             instruction.clone(),
             &origin,
@@ -275,11 +319,20 @@ impl Rig {
             instruction_key_id: String::new(),
             agent_key_fingerprint: agent_key.public_key().fingerprint_hex(),
         };
-        let seams = Seams {
-            client: Client::with_dial(dials.clone()),
-            dial: dials.clone(),
-            signer: agent_key.clone(),
-            random: shared_crypto::random_32,
+        let seams = if real_port.is_some() {
+            Seams {
+                client: Client::loopback(),
+                dial: Arc::new(LoopbackPorts),
+                signer: agent_key.clone(),
+                random: shared_crypto::random_32,
+            }
+        } else {
+            Seams {
+                client: Client::with_dial(dials.clone()),
+                dial: dials.clone(),
+                signer: agent_key.clone(),
+                random: shared_crypto::random_32,
+            }
         };
         let mut fetcher = Fetcher::with_seams(
             &record,
@@ -439,6 +492,13 @@ async fn a_download_is_cached_byte_identical_with_the_bearer_on_the_route_only()
     );
     assert_eq!(script.log[3].2, None, "the URL is the bearer of the GET");
     assert_eq!(script.log.len(), 4);
+    // F7: the nonce goes to the API routes only; the object GET carries none.
+    assert!(!script.nonces.is_empty());
+    assert!(
+        script.nonces.iter().all(|(port, _)| *port == API),
+        "{:?}",
+        script.nonces
+    );
 }
 
 /// A1: a cached object that hashes to its name is used with no request and no exchange.
@@ -600,7 +660,7 @@ async fn a_failed_exchange_is_a_retry_with_its_wait() {
             retry_after_secs: Some(9)
         })
     );
-    assert_eq!(rig.doc(0).await, Err(FetchError::ExchangeRefused));
+    assert_eq!(rig.doc(0).await, Err(FetchError::ExchangeCapped));
     assert_eq!((rig.downloads(), rig.gets()), (0, 0));
     // The next one gets through.
     rig.doc(0).await.unwrap();
@@ -645,7 +705,7 @@ async fn a_401_gets_one_new_exchange_and_one_repeat() {
         .lock()
         .unwrap()
         .downloads
-        .push_back(json(401, "{}"));
+        .push_back(Served::new(401, "{}").unproved());
     rig.doc(0).await.unwrap();
     assert_eq!((rig.sessions(), rig.downloads()), (2, 2));
     {
@@ -668,8 +728,12 @@ async fn a_401_gets_one_new_exchange_and_one_repeat() {
     let rig = Rig::one(b"d");
     {
         let mut script = rig.script.lock().unwrap();
-        script.downloads.push_back(json(401, "{}"));
-        script.downloads.push_back(json(401, "{}"));
+        script
+            .downloads
+            .push_back(Served::new(401, "{}").unproved());
+        script
+            .downloads
+            .push_back(Served::new(401, "{}").unproved());
     }
     assert_eq!(
         rig.doc(0).await,
@@ -688,26 +752,28 @@ async fn a_401_then_a_refused_exchange_ends_in_a_retry_of_the_exchange() {
     let rig = Rig::one(b"d");
     {
         let mut script = rig.script.lock().unwrap();
-        script.downloads.push_back(json(401, "{}"));
+        script
+            .downloads
+            .push_back(Served::new(401, "{}").unproved());
         script.session.push_back(None);
         script.session.push_back(Some(json(403, "{}")));
     }
-    assert_eq!(rig.doc(0).await, Err(FetchError::ExchangeRefused));
+    assert_eq!(rig.doc(0).await, Err(FetchError::ExchangeCapped));
     assert_eq!(rig.gets(), 0);
 }
 
 // ---------------------------------------------------------------- A5, A6, A7
 
-/// A5: a refusal ends the fetch, and the loop does not repeat it.
+/// A5, F3: a refusal the server proved ends the fetch, and the loop does not repeat it.
 #[tokio::test(start_paused = true)]
-async fn a_refusal_ends_the_fetch_and_is_not_retried() {
+async fn a_proved_refusal_ends_the_fetch() {
     for status in [400u16, 404, 413, 500, 403] {
         let rig = Rig::one(b"d");
         rig.script
             .lock()
             .unwrap()
             .downloads
-            .push_back(json(status, "{}"));
+            .push_back(Served::new(status, "{}"));
         assert_eq!(
             rig.doc_retrying(0, 5).await,
             Err(FetchError::Refused {
@@ -719,7 +785,7 @@ async fn a_refusal_ends_the_fetch_and_is_not_retried() {
         assert_eq!((rig.downloads(), rig.gets()), (1, 0));
     }
     let rig = Rig::one(b"d");
-    rig.script.lock().unwrap().downloads.push_back(json(
+    rig.script.lock().unwrap().downloads.push_back(Served::new(
         200,
         r#"{"url":"http://127.0.0.1:9000/x","expiresInSecs":60,"more":1}"#,
     ));
@@ -736,10 +802,10 @@ async fn an_unavailable_route_is_retried_after_the_back_off() {
     rig.serve_body(b"d");
     {
         let mut script = rig.script.lock().unwrap();
-        script.downloads.push_back(json(503, "{}"));
+        script.downloads.push_back(Served::new(503, "{}"));
         script
             .downloads
-            .push_back(answer(429, "Retry-After: 10\r\n", "{}"));
+            .push_back(Served::new(429, "{}").with_headers("Retry-After: 10\r\n"));
     }
     let started = Instant::now();
     rig.doc_retrying(0, 3).await.unwrap();
@@ -753,7 +819,7 @@ async fn an_unavailable_route_is_retried_after_the_back_off() {
 async fn a_url_off_the_host_rule_is_a_retry_and_is_never_dialled() {
     let rig = Rig::one(b"d");
     rig.serve_body(b"d");
-    rig.script.lock().unwrap().downloads.push_back(json(
+    rig.script.lock().unwrap().downloads.push_back(Served::new(
         200,
         r#"{"url":"http://127.0.0.2:9000/x","expiresInSecs":60}"#,
     ));
@@ -1143,14 +1209,12 @@ impl<'a> MakeWriter<'a> for Log {
     }
 }
 
-/// A21: whatever happens, the log has kinds, classes and statuses and no URL, token, digest,
-/// signature or body.
-#[tokio::test(start_paused = true)]
-async fn the_log_holds_no_url_token_digest_or_body() {
-    // No other test's fetcher runs while this subscriber is set up and used.
-    let _gate = gate();
+/// Sets up a subscriber that writes every event to the returned log, with the gate held: no
+/// other test's fetcher runs while this subscriber is set up and used.
+fn capture() -> (Gate, Log, tracing::subscriber::DefaultGuard) {
+    let gate = gate();
     let log = Log::default();
-    let _guard = tracing::subscriber::set_default(
+    let guard = tracing::subscriber::set_default(
         tracing_subscriber::fmt()
             .with_writer(log.clone())
             .with_ansi(false)
@@ -1160,6 +1224,14 @@ async fn the_log_holds_no_url_token_digest_or_body() {
     // Another test's thread may have cached a call site as disabled before this subscriber
     // existed.
     tracing::callsite::rebuild_interest_cache();
+    (gate, log, guard)
+}
+
+/// A21: whatever happens, the log has kinds, classes and statuses and no URL, token, digest,
+/// signature or body.
+#[tokio::test(start_paused = true)]
+async fn the_log_holds_no_url_token_digest_or_body() {
+    let (_gate, log, _guard) = capture();
     let secret = b"SECRET-DOCUMENT-BODY";
     let rig = Rig::one(secret);
     {
@@ -1167,10 +1239,10 @@ async fn the_log_holds_no_url_token_digest_or_body() {
         script.challenge.push_back(json(500, "{}"));
         script
             .downloads
-            .push_back(json(503, r#"{"title":"SECRET-PROBLEM-BODY"}"#));
+            .push_back(Served::new(503, r#"{"title":"SECRET-PROBLEM-BODY"}"#));
         script
             .downloads
-            .push_back(json(404, r#"{"title":"SECRET-PROBLEM-BODY"}"#));
+            .push_back(Served::new(404, r#"{"title":"SECRET-PROBLEM-BODY"}"#));
     }
     let _ = rig.doc_retrying(0, 5).await;
     // A mismatch, a cached file gone bad and a refusal of the URL.
@@ -1180,7 +1252,7 @@ async fn the_log_holds_no_url_token_digest_or_body() {
     fine.serve_body(secret);
     let path = fine.doc(0).await.unwrap().path;
     fs::write(&path, b"changed").unwrap();
-    fine.script.lock().unwrap().downloads.push_back(json(
+    fine.script.lock().unwrap().downloads.push_back(Served::new(
         200,
         r#"{"url":"http://127.0.0.2:9000/SECRET-URL-PATH","expiresInSecs":60}"#,
     ));
@@ -1202,4 +1274,230 @@ async fn the_log_holds_no_url_token_digest_or_body() {
     ] {
         assert!(!text.contains(needle), "{needle} is in the log:\n{text}");
     }
+}
+
+// ---------------------------------------------------------------- the server's proof (ADR-504)
+
+/// The statuses that end the fetch when the server proved them.
+const REFUSALS: [u16; 6] = [400, 404, 413, 500, 403, 418];
+
+/// F2: an answer to the route that is not proved is not a URL: nothing is fetched, no temporary
+/// file is made and the mismatch streak is as it was.
+#[tokio::test(start_paused = true)]
+async fn an_unproven_download_answer_fetches_nothing() {
+    for proof in Proof::UNPROVED {
+        let rig = Rig::one(b"d");
+        rig.serve_body(b"d");
+        rig.script
+            .lock()
+            .unwrap()
+            .downloads
+            .push_back(Served::new(200, &download_url()).with(proof));
+        assert_eq!(
+            rig.doc(0).await,
+            Err(FetchError::Unproven { status: Some(200) }),
+            "{proof:?}"
+        );
+        assert_eq!((rig.gets(), rig.dialled(OBJ), rig.tmp_files()), (0, 0, 0));
+        assert!(rig.fetcher.state.lock().await.mismatches.is_empty());
+        // The next attempt exchanges a new token and is believed again.
+        rig.doc(0).await.unwrap();
+    }
+}
+
+/// F2: the bounded loop waits the cap after an unproven answer, not the delay.
+#[tokio::test(start_paused = true)]
+async fn an_unproven_answer_is_retried_at_the_cap() {
+    let rig = Rig::one(b"d");
+    rig.serve_body(b"d");
+    rig.script
+        .lock()
+        .unwrap()
+        .downloads
+        .push_back(Served::new(200, &download_url()).unproved());
+    let started = Instant::now();
+    rig.doc_retrying(0, 3).await.unwrap();
+    assert_eq!(started.elapsed(), Duration::from_secs(60));
+    // The unproven answer dropped the token: the retry exchanged a new one.
+    assert_eq!(rig.sessions(), 2);
+}
+
+/// F4: a refusal the server did not prove is not a refusal: it is retried, whatever status it
+/// carries, and it never ends the fetch.
+#[tokio::test(start_paused = true)]
+async fn an_impostors_404_does_not_end_the_fetch_as_refused() {
+    for status in REFUSALS {
+        for proof in Proof::UNPROVED {
+            let rig = Rig::one(b"d");
+            rig.script
+                .lock()
+                .unwrap()
+                .downloads
+                .push_back(Served::new(status, r#"{"title":"x"}"#).with(proof));
+            let error = rig.doc(0).await.unwrap_err();
+            assert_eq!(
+                error,
+                FetchError::Unproven {
+                    status: Some(status)
+                },
+                "{status} {proof:?}"
+            );
+            assert!(error.may_retry());
+            assert_eq!(error.class(), "unproven");
+        }
+    }
+    // And the loop goes on to the real answer.
+    let rig = Rig::one(b"d");
+    rig.serve_body(b"d");
+    rig.script
+        .lock()
+        .unwrap()
+        .downloads
+        .push_back(Served::new(404, "{}").unproved());
+    rig.doc_retrying(0, 3).await.unwrap();
+}
+
+/// F5: a 401 and the statuses the loop retries are classed by status, whatever proof they carry.
+#[tokio::test(start_paused = true)]
+async fn statuses_that_are_not_results_need_no_proof() {
+    for proof in [Proof::Missing, Proof::NotCanonical, Proof::TwoValues] {
+        let rig = Rig::one(b"d");
+        rig.script
+            .lock()
+            .unwrap()
+            .downloads
+            .push_back(Served::new(503, "{}").with(proof));
+        assert_eq!(retry_why(rig.doc(0).await.unwrap_err()), "unavailable");
+    }
+}
+
+/// F6: when every attempt ends in an answer that is not proved, no answer or an exchange that
+/// gave no token, the last error is one that may be retried and is never a refusal (so the debug
+/// command exits 3).
+#[tokio::test(start_paused = true)]
+async fn attempts_that_run_out_are_never_a_refusal() {
+    // Unproven answers to the route.
+    let rig = Rig::one(b"d");
+    {
+        let mut script = rig.script.lock().unwrap();
+        for _ in 0..3 {
+            script
+                .downloads
+                .push_back(Served::new(404, "{}").with(Proof::OtherKey));
+        }
+    }
+    let error = rig.doc_retrying(0, 3).await.unwrap_err();
+    assert_eq!((error.class(), error.may_retry()), ("unproven", true));
+    // An exchange whose answer is not proved, and one that is refused.
+    for session in [
+        json(200, r#"{"token":"x","expiresInSecs":60}"#),
+        json(403, "{}"),
+    ] {
+        let rig = Rig::one(b"d");
+        {
+            let mut script = rig.script.lock().unwrap();
+            for _ in 0..3 {
+                script.session.push_back(Some(session.clone()));
+            }
+        }
+        let error = rig.doc_retrying(0, 3).await.unwrap_err();
+        assert_eq!((error.class(), error.may_retry()), ("retry", true));
+        assert_eq!(error, FetchError::ExchangeCapped);
+        assert_eq!(rig.downloads(), 0);
+    }
+    // No answer at all.
+    let rig = Rig::one(b"d");
+    rig.dials.inner.set(crate::uploader::fake::Mode::Refuse);
+    let error = rig.doc_retrying(0, 3).await.unwrap_err();
+    assert_eq!((error.class(), error.may_retry()), ("retry", true));
+}
+
+/// L2: an answer that is not proved is one warning for its class since the last token was
+/// issued and debug after: a process holding the port gets one warning for its sessions, and an
+/// answer after a token was issued is another class.
+#[tokio::test(start_paused = true)]
+async fn an_unproven_class_warns_once_per_token() {
+    let (_gate, log, _guard) = capture();
+    let rig = Rig::one(b"d");
+    rig.serve_body(b"d");
+    {
+        let mut script = rig.script.lock().unwrap();
+        for _ in 0..3 {
+            script
+                .session
+                .push_back(Some(json(200, r#"{"token":"x","expiresInSecs":60}"#)));
+        }
+        script
+            .downloads
+            .push_back(Served::new(200, &download_url()).unproved());
+    }
+    for _ in 0..3 {
+        assert_eq!(rig.doc(0).await, Err(FetchError::ExchangeCapped));
+    }
+    assert_eq!(
+        rig.doc(0).await,
+        Err(FetchError::Unproven { status: Some(200) })
+    );
+    let text = String::from_utf8_lossy(&log.0.lock().unwrap()).into_owned();
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("not proved by the server"))
+        .collect();
+    let warned: Vec<&str> = lines
+        .iter()
+        .filter(|l| l.contains(" WARN "))
+        .map(|l| {
+            if l.contains("session-unproven") {
+                "session"
+            } else {
+                "answer"
+            }
+        })
+        .collect();
+    assert_eq!(warned, ["session", "answer"], "{text}");
+    assert_eq!(lines.len(), 4, "the repeats of a class are debug:\n{text}");
+    let mut needles = vec![
+        "SECRET".to_owned(),
+        token_text(1),
+        STANDARD.encode([7u8; 32]),
+    ];
+    {
+        let script = rig.script.lock().unwrap();
+        assert!(!script.nonces.is_empty() && !script.proofs.is_empty());
+        needles.extend(script.nonces.iter().map(|(_, nonce)| nonce.clone()));
+        needles.extend(script.proofs.iter().cloned());
+    }
+    for needle in &needles {
+        assert!(!text.contains(needle), "{needle} is in the log:\n{text}");
+    }
+}
+
+/// I3: over a real socket, a server that proves its session and then answers the download route
+/// with a 404 it does not prove (what a process that took the port over could say) does not end
+/// the fetch as a refusal.
+#[tokio::test]
+async fn an_unproved_404_over_a_real_socket_is_retried_and_not_refused() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let rig = Rig::over_sockets(b"d", port);
+    rig.script
+        .lock()
+        .unwrap()
+        .downloads
+        .push_back(Served::new(404, r#"{"title":"x"}"#).unproved());
+    let script = rig.script.clone();
+    let server = tokio::spawn(accept_with(listener, move |seen, mut stream| {
+        let reply = script.lock().unwrap().react(API, &seen);
+        async move {
+            if let Obj::Raw(bytes) = reply {
+                let _ = stream.write_all(&bytes).await;
+                let _ = stream.shutdown().await;
+            }
+        }
+    }));
+    let error = rig.doc(0).await.unwrap_err();
+    assert_eq!(error, FetchError::Unproven { status: Some(404) });
+    assert!(error.may_retry());
+    assert_eq!((rig.downloads(), rig.gets(), rig.tmp_files()), (1, 0, 0));
+    server.abort();
 }

@@ -75,7 +75,7 @@ pub(crate) fn installed_record(
 
 /// Runs one fetch. Exit 1: it cannot as asked (not registered, an envelope that does not verify,
 /// an object the instruction does not name or the server refuses, a digest that did not match
-/// twice in a row); 3: it may work later (no answer, an exchange refused, the disk, the cache
+/// twice in a row); 3: it may work later (no answer, an exchange refused, an answer the server did not prove, the disk, the cache
 /// locked, the key store), which includes a single digest mismatch when `--attempts` leaves no
 /// second attempt.
 pub async fn run(args: Args, installed: &ServerOrigin) -> Result<Fetched, CommandError> {

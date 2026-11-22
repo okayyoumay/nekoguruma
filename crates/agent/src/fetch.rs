@@ -14,9 +14,13 @@
 //! - [`FetchError::Retry`]: no answer, a cut, no progress, a refused or lapsed URL, a status of
 //!   the GET that is not 200, a URL that breaks the host rule, a failed exchange: try again after
 //!   the back-off
-//! - [`FetchError::Refused`]: the server will not give this object (400, 404, 413, 500, another
-//!   4xx, an answer that is not promised) or the object server's answer has no usable length: the
-//!   fetch ends and the job cannot start
+//! - [`FetchError::Unproven`]: the route's answer (the 200, or a status that would end the fetch)
+//!   carries no valid proof of the server (ADR-504): nothing of it is acted on, the token is
+//!   dropped and the retry waits the back-off's cap; never a refusal, which only a proved answer
+//!   is
+//! - [`FetchError::Refused`]: the server proved that it will not give this object (400, 404, 413,
+//!   500, another 4xx, an answer that is not promised) or the object server's answer has no usable
+//!   length: the fetch ends and the job cannot start
 //! - [`FetchError::Local`]: the disk (or a cached name that is not a regular file): not retried by
 //!   the library, and nothing is deleted or evicted
 //! - [`FetchError::Mismatch`]: the full download's digest differs from the instruction's hash; the
@@ -114,10 +118,14 @@ pub enum FetchError {
         retry_after_secs: Option<u32>,
     },
     /// The exchange gave no token and the back-off goes to its cap, as the uploader's does: the
-    /// session route refused (403 or 429), or its 200 was not proved by the server. It is retried
-    /// and never reported as a refusal by its class.
-    #[error("try again: the token exchange was refused or not proved")]
-    ExchangeRefused,
+    /// session route said no (403 or 429), or its 200 was not proved by the server. It is retried
+    /// and is never a refusal.
+    #[error("try again: the token exchange gave no token")]
+    ExchangeCapped,
+    /// The route's answer was to be a result (or a refusal that ends the fetch) and is not proved
+    /// by the server. It is retried at the cap and is never a refusal.
+    #[error("try again: the answer is not proved by the server")]
+    Unproven { status: Option<u16> },
     #[error("refused: {why}")]
     Refused {
         why: &'static str,
@@ -136,7 +144,8 @@ impl FetchError {
     pub fn class(&self) -> &'static str {
         match self {
             FetchError::NotNamed => "not-named",
-            FetchError::Retry { .. } | FetchError::ExchangeRefused => "retry",
+            FetchError::Retry { .. } | FetchError::ExchangeCapped => "retry",
+            FetchError::Unproven { .. } => "unproven",
             FetchError::Refused { .. } => "refused",
             FetchError::Local { .. } => "local",
             FetchError::Mismatch => "mismatch",
@@ -148,13 +157,18 @@ impl FetchError {
     pub fn may_retry(&self) -> bool {
         matches!(
             self,
-            FetchError::Retry { .. } | FetchError::ExchangeRefused | FetchError::Mismatch
+            FetchError::Retry { .. }
+                | FetchError::ExchangeCapped
+                | FetchError::Unproven { .. }
+                | FetchError::Mismatch
         )
     }
 
     fn status(&self) -> Option<u16> {
         match self {
-            FetchError::Retry { status, .. } | FetchError::Refused { status, .. } => *status,
+            FetchError::Retry { status, .. }
+            | FetchError::Refused { status, .. }
+            | FetchError::Unproven { status } => *status,
             _ => None,
         }
     }
@@ -171,6 +185,9 @@ impl FetchError {
         match failure.class {
             Class::PassOver => FetchError::Refused {
                 why: failure.why,
+                status: failure.status,
+            },
+            Class::Unproven => FetchError::Unproven {
                 status: failure.status,
             },
             Class::Retry | Class::Reauthenticate => FetchError::Retry {
@@ -239,7 +256,7 @@ pub struct Fetcher {
     dial: Arc<dyn PortDial>,
     signer: Arc<dyn Signer + Send + Sync>,
     random: fn() -> Result<[u8; 32], RandomError>,
-    verifier: Verifier,
+    verifier: Arc<Verifier>,
     host: String,
     port: u16,
     limits: Limits,
@@ -276,10 +293,15 @@ impl Fetcher {
         }
         let origin = ServerOrigin::parse(&record.server_origin)
             .map_err(|_| RecordError::Field("server_origin"))?;
-        let verifier = Verifier::from_record(record)?;
+        let verifier = Arc::new(Verifier::from_record(record)?);
         Ok(Self {
             store: Arc::new(store),
-            downloads: Downloads::new(seams.client.clone(), origin.clone()),
+            downloads: Downloads::new(
+                seams.client.clone(),
+                origin.clone(),
+                verifier.clone(),
+                seams.random,
+            ),
             client: seams.client,
             dial: seams.dial,
             signer: seams.signer,
@@ -452,7 +474,7 @@ impl Fetcher {
                 FetchError::Retry {
                     retry_after_secs, ..
                 } => retry_after_secs,
-                FetchError::ExchangeRefused => {
+                FetchError::ExchangeCapped | FetchError::Unproven { .. } => {
                     backoff.cap();
                     None
                 }
@@ -597,7 +619,8 @@ impl Fetcher {
     }
 
     /// The GET URL: the token (exchanged now when there is none), the route, and after a 401 one
-    /// new exchange and one repeat; a second 401 is a retry.
+    /// new exchange and one repeat; a second 401 is a retry. An answer the server did not prove
+    /// drops the token and is [`FetchError::Unproven`].
     async fn target(
         &self,
         state: &mut State,
@@ -607,13 +630,19 @@ impl Fetcher {
         loop {
             let token = self.ensure_token(state).await?;
             let mut failure = match self.downloads.url(&token, want).await {
-                Ok(target) => return Ok(target),
+                Ok(target) => {
+                    state.holder.proved();
+                    return Ok(target);
+                }
                 Err(failure) => failure,
             };
             if failure.class == Class::Reauthenticate
                 && state.holder.unauthorized(&mut repeated, &mut failure)
             {
                 continue;
+            }
+            if failure.class == Class::Unproven {
+                state.holder.unproven(failure.status);
             }
             return Err(FetchError::of(failure));
         }
@@ -638,7 +667,7 @@ impl Fetcher {
                 status: None,
                 retry_after_secs: Some(secs),
             },
-            Fail::Cap => FetchError::ExchangeRefused,
+            Fail::Cap => FetchError::ExchangeCapped,
         })
     }
 }

@@ -94,7 +94,8 @@ impl Worker {
     }
 
     /// One of the four routes, with the token: a 401 drops the token, exchanges at once and
-    /// repeats the request once; a second 401 is a retry.
+    /// repeats the request once; a second 401 is a retry. An answer the server did not prove drops
+    /// the token and takes the back-off to its cap, with no repeat.
     async fn authed<T, F>(&mut self, call: impl Fn(Routes, String) -> F) -> Result<T, Stray>
     where
         F: Future<Output = Result<T, Failure>>,
@@ -105,13 +106,23 @@ impl Worker {
             let token = self.ensure_token().await?;
             let answer = until_stop(&self.stop, call(self.routes.clone(), token)).await?;
             let mut failure = match answer {
-                Ok(value) => return Ok(value),
+                Ok(value) => {
+                    self.holder.proved();
+                    return Ok(value);
+                }
                 Err(failure) => failure,
             };
             if failure.class == Class::Reauthenticate
                 && self.holder.unauthorized(&mut repeated, &mut failure)
             {
                 continue;
+            }
+            if failure.class == Class::Unproven {
+                // Nothing of the answer was acted on. The wait is owed even when the attempt
+                // stored parts before: the server that answered is not the agent's.
+                self.holder.unproven(failure.status);
+                self.backoff.cap();
+                self.owe_wait = true;
             }
             self.retry_after = failure.retry_after_secs;
             return Err(Stray::Failure(failure));
@@ -131,7 +142,9 @@ impl Worker {
             Stray::Exchange => Outcome::Retry("exchange", None),
             Stray::Failure(failure) => match failure.class {
                 Class::PassOver => Outcome::PassOver(failure.why, failure.status),
-                Class::Retry | Class::Reauthenticate => Outcome::Retry(failure.why, failure.status),
+                Class::Retry | Class::Reauthenticate | Class::Unproven => {
+                    Outcome::Retry(failure.why, failure.status)
+                }
             },
         }
     }

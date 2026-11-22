@@ -175,9 +175,21 @@ fn fake_store() -> server::uploads::Backend {
     server::uploads::Backend::new(Some(store))
 }
 
-/// Gives `tenant` the rows that make the IR documents `DIGEST_A` and `DIGEST_B` and the artifact
-/// `DIGEST_B` stored, each with a storage key of its own.
-pub(crate) async fn hold_named(pool: &sqlx::PgPool, tenant: &str) {
+/// Gives the agent's tenant the rows that make the IR documents `DIGEST_A` and `DIGEST_B` and the
+/// artifact `DIGEST_B` stored.
+pub(crate) async fn hold_named(pool: &sqlx::PgPool, agent_id: &str) {
+    let tenant: String =
+        sqlx::query_scalar("SELECT tenant_id::text FROM agents WHERE id = $1::uuid")
+            .bind(agent_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    hold(pool, &tenant, &[DIGEST_A, DIGEST_B], &[DIGEST_B]).await;
+}
+
+/// Gives `tenant` a row for each of `documents` in `ir_documents` and each of `artifacts` in
+/// `artifacts`, each with a storage key of its own, so that a job may name them (ADR-501).
+async fn hold(pool: &sqlx::PgPool, tenant: &str, documents: &[&str], artifacts: &[&str]) {
     sqlx::query(
         "INSERT INTO ir_documents (tenant_id, digest, extension_id, schema_version, \
              variant_name, source_format, storage_key) \
@@ -185,16 +197,16 @@ pub(crate) async fn hold_named(pool: &sqlx::PgPool, tenant: &str) {
          FROM unnest($2::text[]) AS d",
     )
     .bind(tenant)
-    .bind([DIGEST_A, DIGEST_B])
+    .bind(documents)
     .execute(pool)
     .await
     .unwrap();
     sqlx::query(
         "INSERT INTO artifacts (tenant_id, digest, size_bytes, storage_key) \
-         VALUES ($1::uuid, $2, 1, gen_random_uuid()::text)",
+         SELECT $1::uuid, d, 1, gen_random_uuid()::text FROM unnest($2::text[]) AS d",
     )
     .bind(tenant)
-    .bind(DIGEST_B)
+    .bind(artifacts)
     .execute(pool)
     .await
     .unwrap();
@@ -218,12 +230,7 @@ impl Lab {
         add_user(&w.pool, "alice", &["worker"], &hash).await;
         let agent = Agent::new();
         let agent_id = w.register(&agent).await;
-        let tenant = w
-            .sql(&format!(
-                "SELECT tenant_id::text FROM agents WHERE id = '{agent_id}'"
-            ))
-            .await;
-        hold_named(&w.pool, &tenant).await;
+        hold_named(&w.pool, &agent_id).await;
         let server = Server::bind_with_store(&http(), w.pg.pool(), w.key.clone(), fake_store())
             .await
             .unwrap();
@@ -278,7 +285,7 @@ impl Lab {
         let (_, r) = self.w.redeem("bob", &agent).await;
         assert_eq!(r.status, 201, "{}", r.head);
         let agent_id = json(&r)["agentId"].as_str().unwrap().to_owned();
-        hold_named(&self.w.pool, &tenant).await;
+        hold_named(&self.w.pool, &agent_id).await;
         let token = random_32().unwrap();
         self.operator_sessions.establish(
             &[],
@@ -2461,14 +2468,7 @@ async fn a_job_naming_a_document_or_an_artifact_its_tenant_does_not_hold_is_a_42
     let cookie = lab.login("alice").await;
     let (_, _, tenant_2) = lab.second_tenant().await;
     // DIGEST_C is a document and an artifact of the second tenant only: the check is per tenant.
-    lab.exec(&format!(
-        "INSERT INTO ir_documents (tenant_id, digest, extension_id, schema_version, \
-             variant_name, source_format, storage_key) \
-         VALUES ('{tenant_2}', '{DIGEST_C}', 'ext', 1, 'variant', 'odx', gen_random_uuid()::text); \
-         INSERT INTO artifacts (tenant_id, digest, size_bytes, storage_key) \
-         VALUES ('{tenant_2}', '{DIGEST_C}', 1, gen_random_uuid()::text)"
-    ))
-    .await;
+    hold(&lab.w.pool, &tenant_2, &[DIGEST_C], &[DIGEST_C]).await;
     for (what, extra, code) in [
         (
             "one of two documents",

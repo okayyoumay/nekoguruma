@@ -25,7 +25,7 @@ use tokio::net::TcpStream;
 
 use crate::downloads::{get, url_of};
 use crate::redeem::{capture, json};
-use crate::serving::Reply;
+use crate::serving::{Reply, host_header};
 use crate::storage::content;
 use crate::uploads::{Fail, Fx, With, begin_for, hex};
 
@@ -246,8 +246,8 @@ fn head_at(
     length: &str,
 ) -> String {
     let mut raw = format!(
-        "{method} /api/v1/documents/{name} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n",
-        addr.port()
+        "{method} /api/v1/documents/{name} HTTP/1.1\r\n{}\r\nConnection: close\r\n",
+        host_header(addr)
     );
     if let Some(origin) = origin {
         raw.push_str(&format!("Origin: {origin}\r\n"));

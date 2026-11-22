@@ -653,14 +653,7 @@ async fn a_job_created_through_the_route_is_accepted_and_acknowledged_by_the_age
     let addr = f.server.as_ref().unwrap().addr;
     let cookie = login(addr, "alice").await;
     // The job names documents its tenant holds (ADR-501).
-    let tenant = f
-        .world
-        .sql(&format!(
-            "SELECT tenant_id::text FROM agents WHERE id = '{}'",
-            f.agent_id
-        ))
-        .await;
-    hold_named(&f.world.pool, &tenant).await;
+    hold_named(&f.world.pool, &f.agent_id).await;
     let body = serde_json::json!({
         "kind": "acquire",
         "agentId": f.agent_id,

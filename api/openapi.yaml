@@ -113,7 +113,9 @@ paths:
         judged after the permission (**403**) and before the instruction key (**503**), with nothing
         created and the key still free. The deadline is part of the request: another deadline, or
         the field added or dropped, under a used key is the key's **422**, and the same deadline
-        replays the stored job without the bounds being judged again.
+        replays the stored job without the bounds being judged again. A job still `received` when
+        its deadline has been reached is ended by the server (within one 30-second period) as `expired` and its vehicle lock is
+        deleted; the replay of its creation then shows the state `expired` and no `failure`.
 
         **Named objects** (8.2.6, ADR-501). Each `irDigests` entry must be an IR document the
         caller's tenant has stored (`PUT /v1/documents/{sha256}`), and `artifactDigest`, when
@@ -121,10 +123,6 @@ paths:
         `DOCUMENT_NOT_STORED` or `ARTIFACT_NOT_STORED` (the documents are judged first), judged
         after the start deadline's bounds and before the instruction key (**503**), with nothing
         created and the key still free. A replay is answered before this check.
-
-        A job still `received` when
-        its deadline has been reached is ended by the server (within one 30-second period) as `expired` and its vehicle lock is
-        deleted; the replay of its creation then shows the state `expired` and no `failure`.
 
         Like every operator route the request needs a live session and, as a POST, the pinned
         Origin (**403**) before the cookie is read (**401**). The body is read within 5 seconds

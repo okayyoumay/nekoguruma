@@ -12,7 +12,8 @@
 //! `confirmation_defaults` (500 without a row, ADR-488), the signing of the instruction and the
 //! insert, which loses to a concurrent insert of the same key and then answers like the first
 //! read. A 400 means the request can never be valid, a 422 that the key belongs to another
-//! request, that the deadline lies outside the bounds or that a named object is not stored. A job's ID is made here, never taken from the client.
+//! request, that the deadline lies outside the bounds or that a named object is not stored. A
+//! job's ID is made here, never taken from the client.
 //!
 //! What the 403 refused goes to the log only, through a gate per reason. Never logged: the
 //! body, the idempotency key, the VCI ID and the VIN.

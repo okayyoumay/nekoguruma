@@ -228,6 +228,10 @@ async fn changed_from(ecu_state: &Path, previous: Vec<u8>) -> Vec<u8> {
 }
 
 #[test]
+#[expect(
+    unsafe_code,
+    reason = "`std::env::set_var`/`remove_var` are unsafe (edition 2024) and have no safe form (ADR-502)"
+)]
 fn a_run_goes_on_on_a_new_link_when_the_vci_returns_in_time() {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -410,11 +414,7 @@ async fn unsafe_reads_end_on_site(paths: &TempPaths, setup: &GuardSetup) {
     // new link and ends where the loss caught it.
     let (run, lines, worker) =
         lose_and_return(paths, setup, Idempotency::Unsafe, "unsafe", true).await;
-    let JobRun {
-        result,
-        guards,
-        comm_log: _,
-    } = run;
+    let JobRun { result, guards, .. } = run;
     let text = || format!("{lines:#?}");
     assert!(
         matches!(&result, Err(JobError::OnSiteInterventionRequired(_))),

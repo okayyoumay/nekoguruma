@@ -91,6 +91,12 @@ pub struct OpenedDevice {
     timeout: Duration,
 }
 
+impl std::fmt::Debug for OpenedDevice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenedDevice").finish_non_exhaustive()
+    }
+}
+
 impl OpenedDevice {
     /// The ABI of the worker that opened the device.
     pub fn abi(&self) -> Abi {

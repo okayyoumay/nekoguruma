@@ -32,6 +32,10 @@ pub(crate) fn now_us() -> Option<u64> {
 
 /// Reads `clock` in microseconds.
 #[cfg(target_os = "linux")]
+#[expect(
+    unsafe_code,
+    reason = "libc FFI with no safe std equivalent: `clock_gettime` reads a POSIX clock (ADR-502)"
+)]
 fn read(clock: libc::clockid_t) -> Option<u64> {
     let mut time = libc::timespec {
         tv_sec: 0,

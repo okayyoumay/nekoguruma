@@ -2015,7 +2015,7 @@ mod tests {
         stack.stack.push(Value::F64(f64::INFINITY));
         let mut global = finite.clone();
         global.globals.push(Some(Value::F64(f64::NAN)));
-        let mut frame = finite.clone();
+        let mut frame = finite;
         frame.call_stack[0]
             .locals
             .push(Some(Value::F64(f64::NEG_INFINITY)));

@@ -184,6 +184,10 @@ async fn assert_device_not_connected(client: &mut WorkerClient, link: &Link) {
 }
 
 #[test]
+#[expect(
+    unsafe_code,
+    reason = "`std::env::set_var`/`remove_var` are unsafe (edition 2024) and have no safe form (ADR-502)"
+)]
 fn control_commands_reach_sim_vci_in_the_worker() {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

@@ -642,6 +642,10 @@ mod with_store {
     }
 
     #[cfg(unix)]
+    #[expect(
+        unsafe_code,
+        reason = "libc FFI with no safe std equivalent: `kill` sends a signal (ADR-502)"
+    )]
     fn signal(child: &Child, signal: i32) {
         // SAFETY: `kill` takes a process ID and a signal number and touches no memory.
         let result = unsafe { libc::kill(child.id() as i32, signal) };

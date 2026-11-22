@@ -8,6 +8,10 @@ fn usage(bin: &str) {
     eprintln!("Example: {bin} C:\\Vendor\\J2534.dll");
 }
 
+#[expect(
+    unsafe_code,
+    reason = "reads a NUL-terminated string that the vendor library wrote into a buffer (ADR-502)"
+)]
 fn c_buf_to_string(buf: &[c_char]) -> String {
     let ptr = buf.as_ptr();
     // J2534 version APIs are expected to write NUL-terminated ASCII strings.
@@ -15,6 +19,10 @@ fn c_buf_to_string(buf: &[c_char]) -> String {
     s.to_string_lossy().into_owned()
 }
 
+#[expect(
+    unsafe_code,
+    reason = "loads a vendor J2534 library and calls its PassThru entry points; this example exists to show those calls (ADR-502)"
+)]
 fn main() {
     let mut args = std::env::args();
     let bin = args.next().unwrap_or_else(|| "read_version".to_string());
@@ -42,9 +50,9 @@ fn main() {
         std::process::exit(1);
     }
 
-    let mut firmware = [0 as c_char; 80];
-    let mut dll = [0 as c_char; 80];
-    let mut api_version = [0 as c_char; 80];
+    let mut firmware = [0; 80];
+    let mut dll = [0; 80];
+    let mut api_version = [0; 80];
     let version_status = unsafe {
         api.PassThruReadVersion(
             device_id,

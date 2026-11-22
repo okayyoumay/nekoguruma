@@ -51,6 +51,10 @@ struct Fixture {
 }
 
 impl Fixture {
+    #[expect(
+        unsafe_code,
+        reason = "loads the mock library and looks up its `__mock_*` test-control symbol; libloading's `Library::new` and `get` are unsafe (ADR-502)"
+    )]
     fn new() -> Self {
         let serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let path: PathBuf = iso22900_mock::mock_library_path()

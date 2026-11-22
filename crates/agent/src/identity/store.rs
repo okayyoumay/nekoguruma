@@ -156,6 +156,12 @@ struct MemoryInner {
 #[derive(Default)]
 pub struct MemoryStore(Mutex<MemoryInner>);
 
+impl std::fmt::Debug for MemoryStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemoryStore").finish_non_exhaustive()
+    }
+}
+
 impl MemoryStore {
     pub fn new() -> Self {
         Self::default()

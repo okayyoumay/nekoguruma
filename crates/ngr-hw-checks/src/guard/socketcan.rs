@@ -263,6 +263,10 @@ impl GuardedSocketCan {
 
 /// The Linux raw CAN socket (`PF_CAN`, `SOCK_RAW`, `CAN_RAW`).
 #[cfg(target_os = "linux")]
+#[allow(
+    unsafe_code,
+    reason = "the raw CAN socket is built on libc socket, bind, read, write and poll calls that std does not offer (ADR-502)"
+)]
 mod raw {
     use std::ffi::CString;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};

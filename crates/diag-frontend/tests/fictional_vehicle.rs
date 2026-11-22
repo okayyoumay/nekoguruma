@@ -801,17 +801,15 @@ fn the_coding_program_writes_and_decides_inside_one_uninterruptible_section() {
                         assert!(held[pc], "{variant}: the fail {code} is interruptible");
                     }
                 }
-                Op::Call(target) => {
-                    // The call into the section: the one whose target is held.
-                    if held[*target as usize] && !held[pc] {
-                        calls += 1;
-                        // Main's last statement: a return follows it at once.
-                        let next = program.code.get(pc + 1);
-                        assert!(
-                            matches!(next, Some(Op::Ret)),
-                            "{variant}: the section call is followed by {next:?}"
-                        );
-                    }
+                // The call into the section: the one whose target is held.
+                Op::Call(target) if held[*target as usize] && !held[pc] => {
+                    calls += 1;
+                    // Main's last statement: a return follows it at once.
+                    let next = program.code.get(pc + 1);
+                    assert!(
+                        matches!(next, Some(Op::Ret)),
+                        "{variant}: the section call is followed by {next:?}"
+                    );
                 }
                 _ => {}
             }

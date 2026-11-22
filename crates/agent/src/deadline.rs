@@ -52,6 +52,7 @@ pub trait Clock: Send + Sync {
 }
 
 /// The device's wall clock.
+#[derive(Debug)]
 pub struct SystemClock;
 
 impl Clock for SystemClock {
@@ -113,6 +114,12 @@ struct Stored {
 #[derive(Clone)]
 pub struct IssueMark {
     inner: Arc<Inner>,
+}
+
+impl std::fmt::Debug for IssueMark {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IssueMark").finish_non_exhaustive()
+    }
 }
 
 struct Inner {

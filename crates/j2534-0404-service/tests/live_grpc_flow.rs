@@ -178,6 +178,10 @@ async fn comparam_object_id(
 /// Resolves the connection target from the environment into a `library_name`
 /// for the service startup argument. Returns `None` when nothing is
 /// configured (the caller should skip the test in that case).
+#[allow(
+    unsafe_code,
+    reason = "`std::env::set_var`/`remove_var` are unsafe (edition 2024) and have no safe form; the calls exist only in debug builds (ADR-502)"
+)]
 fn resolve_library_name() -> Option<String> {
     // The J2534_DLL_PATH mode relies on the debug-only
     // NGR_J2534_DEFINITION_DIR override (ADR-282), so it only exists in debug

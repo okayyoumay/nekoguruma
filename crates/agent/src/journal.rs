@@ -701,6 +701,12 @@ pub struct FileStore {
     _writer: WriterLock,
 }
 
+impl std::fmt::Debug for FileStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileStore").finish_non_exhaustive()
+    }
+}
+
 /// An exclusive OS lock on the journal's sidecar `.journal.lock` file (ADR-255). It makes the
 /// `Journal` that holds it the journal's only writer. Dropping it unlocks the file; the OS drops
 /// the lock with the file handle when the process dies, so a crashed run never blocks the next one. The sidecar is
@@ -758,6 +764,12 @@ pub struct Journal<S = FileStore> {
     store: S,
     state: JournalState,
     poisoned: bool,
+}
+
+impl<S> std::fmt::Debug for Journal<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Journal").finish_non_exhaustive()
+    }
 }
 
 impl Journal<FileStore> {
@@ -2898,7 +2910,7 @@ mod tests {
         bytes[second..second + 4].fill(0xFF);
         damaged.push(bytes);
         // Two whole records zeroed.
-        let mut bytes = good.clone();
+        let mut bytes = good;
         bytes[header_end..third].fill(0);
         damaged.push(bytes);
         for (index, bytes) in damaged.iter().enumerate() {
@@ -4269,7 +4281,7 @@ mod tests {
         legacy_journal(
             &dir,
             vec![
-                Record::TargetVin(vin.clone()),
+                Record::TargetVin(vin),
                 Record::IntendedSoftwareVersion(VERSION.to_vec()),
                 Record::ArtifactSha256([1; 32]),
                 content(),

@@ -13,6 +13,10 @@ pub(crate) const MOCK_LIBRARY_NAME: &str = "TestLib";
 ///
 /// Callers must be `#[serial]`: this rewrites shared files and sets process-global environment
 /// variables.
+#[expect(
+    unsafe_code,
+    reason = "`std::env::set_var`/`remove_var` are unsafe (edition 2024) and have no safe form (ADR-502)"
+)]
 pub(crate) fn use_mock_library(tag: &str, config_toml: &str) {
     let library =
         iso22900_mock::mock_library_path().expect("mock cdylib should be discoverable after build");

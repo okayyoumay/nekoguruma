@@ -400,13 +400,13 @@ pub(crate) fn conversions(sheet: &Sheet, errors: &mut Errors) -> Vec<ConversionR
         let Some(kind) = kind else {
             // With no valid kind, each cell is still checked for its own syntax.
             for column in ["numerator", "offset"] {
-                row.optional(e, column, values::float).ok();
+                let _ = row.optional(e, column, values::float);
             }
-            row.optional(e, "denominator", nonzero_float).ok();
+            let _ = row.optional(e, "denominator", nonzero_float);
             for column in ["numerator_coeffs", "denominator_coeffs"] {
-                row.optional(e, column, floats).ok();
+                let _ = row.optional(e, column, floats);
             }
-            row.optional(e, "default_text", values::key).ok();
+            let _ = row.optional(e, "default_text", values::key);
             return None;
         };
         let kind = match kind {
@@ -1624,11 +1624,11 @@ pub(crate) fn repeats(sheet: &Sheet, errors: &mut Errors) -> Vec<RepeatRow> {
         });
         let Some(count) = count else {
             // With no valid count, each cell is still checked for its own syntax.
-            row.optional(e, "items", as_u32(1)).ok();
-            row.optional(e, "item_bytes", as_u32(1)).ok();
-            row.optional(e, "marker_bits", marker_bits).ok();
+            let _ = row.optional(e, "items", as_u32(1));
+            let _ = row.optional(e, "item_bytes", as_u32(1));
+            let _ = row.optional(e, "marker_bits", marker_bits);
             for column in ["marker_lower", "marker_upper"] {
-                row.optional(e, column, as_u64(0)).ok();
+                let _ = row.optional(e, column, as_u64(0));
             }
             return None;
         };

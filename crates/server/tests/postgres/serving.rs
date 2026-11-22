@@ -45,10 +45,9 @@ pub(crate) async fn exchange(addr: std::net::SocketAddr, raw: &str) -> Reply {
     let mut stream = TcpStream::connect(addr).await.unwrap();
     stream.write_all(raw.as_bytes()).await.unwrap();
     let mut buf = Vec::new();
-    tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut buf))
+    let _ = tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut buf))
         .await
-        .expect("the server closes the connection after the answer")
-        .ok();
+        .expect("the server closes the connection after the answer");
     let text = String::from_utf8_lossy(&buf).into_owned();
     let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
     let status = head
@@ -392,10 +391,9 @@ async fn a_cleartext_http2_preface_is_refused_as_http1() {
         .await
         .unwrap();
     let mut buf = Vec::new();
-    tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut buf))
+    let _ = tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut buf))
         .await
-        .expect("the connection ends")
-        .ok();
+        .expect("the connection ends");
     let text = String::from_utf8_lossy(&buf);
     assert!(
         buf.is_empty() || text.starts_with("HTTP/1.1 4") || text.starts_with("HTTP/1.1 5"),
@@ -436,10 +434,9 @@ async fn a_slow_request_head_is_dropped_after_the_header_read_timeout() {
         .unwrap();
     let mut buf = Vec::new();
     let started = std::time::Instant::now();
-    tokio::time::timeout(Duration::from_secs(20), idle.read_to_end(&mut buf))
+    let _ = tokio::time::timeout(Duration::from_secs(20), idle.read_to_end(&mut buf))
         .await
-        .expect("the server drops the connection")
-        .ok();
+        .expect("the server drops the connection");
     let waited = started.elapsed();
     assert!(
         waited >= server::HEADER_READ_TIMEOUT.mul_f32(0.5)
@@ -469,10 +466,9 @@ async fn a_request_in_flight_finishes_during_the_grace_period() {
         .await
         .unwrap();
     let mut buf = Vec::new();
-    tokio::time::timeout(Duration::from_secs(10), partial.read_to_end(&mut buf))
+    let _ = tokio::time::timeout(Duration::from_secs(10), partial.read_to_end(&mut buf))
         .await
-        .expect("the answer arrives")
-        .ok();
+        .expect("the answer arrives");
     let text = String::from_utf8_lossy(&buf);
     assert!(text.starts_with("HTTP/1.1 200"), "{text}");
     s.joined().await;

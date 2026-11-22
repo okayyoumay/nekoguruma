@@ -1993,7 +1993,7 @@ fn a_raw_mode_link_is_refused_outside_t0() {
     // T0 keeps RawMode.
     let env = Env::new(loopback());
     let mut request = create_request(create::Resource::RscData(channel_resource("ISO15765_CH1")));
-    request.cll_create_flag = Some(raw.clone());
+    request.cll_create_flag = Some(raw);
     assert_eq!(
         env.decide(Request::CreateComLogicalLink(&request)),
         Ok(Grant::CreatesLink {

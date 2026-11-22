@@ -40,8 +40,32 @@ Flag as P1:
   does not show the test run locally under the nextest profile `core-windows` gives it
   (`ci-windows-parallel` for the agent's tests, `ci-windows` for the rest) and say that its Windows
   run happens only on main (`pr-review-loop`, Step 3).
-- **Warnings silenced the wrong way**: `#[allow(...)]` for code that is unused only until later
-  work lands. Use `#[expect(..., reason = "...")]`, which fails once the code is used.
+- **Warnings silenced the wrong way** (ADR-502): `#[allow(...)]` for code that is unused only
+  until later work lands (use `#[expect(..., reason = "...")]`, which fails once the code is
+  used); a lint override whose reason does not hold for that code; a lint level lowered, or an
+  override added or widened (to a whole module or crate), to get a change through; a crate
+  `Cargo.toml` that drops `[lints] workspace = true` or adds its own `[lints]` table; a
+  crate-wide `unsafe_code` grant outside the FFI and C-ABI crates (`*-sys`, `iso22900`,
+  `j2534-0404`, the two mocks, `sim-vci`); a crate-level `#![expect]` of a staged lint left in a
+  crate the same pull request makes clean.
+- **Clones to get past the borrow checker** (`CLAUDE.md` "Rust code"): a clone of a buffer,
+  collection or other large value on a per-message, per-instruction or loop path that exists
+  only so a borrow ends, where shortening the borrow, a field split, `std::mem::take`, an index
+  or a shared `Arc`/`Cow` would do; or a parameter taken by value that the function does not
+  keep, forcing callers to clone. Do not flag a clone of an `Arc`, a `Copy`-sized value, a value
+  the receiver keeps, or a deliberate snapshot taken to release a lock.
+
+Flag as Medium:
+
+- **Tests that check nothing**: a new test that restates a constant or mirrors the branches of
+  the code under test, so it passes by construction.
+- **Design narrative in code docs**: a doc comment or crate doc that describes how the change
+  was designed or which alternatives were rejected, instead of how the code behaves; that
+  belongs in an ADR.
+- **A second public path**: a `pub use` left at an item's old path after it moved, so the same
+  public item is reachable two ways.
+- **Panics without a message**: an intentional `panic!`, `assert!` or `unreachable!` in non-test
+  code that does not say which invariant broke.
 - **Out-of-scope targets**: Windows workers target `*-pc-windows-gnullvm` only (ADR-227). An MSVC
   worker target or MSVC-only build path is P1.
 - **Interrupted-transfer recovery that departs from ADR-229**, in the framework and the bundled

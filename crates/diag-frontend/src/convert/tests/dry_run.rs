@@ -254,7 +254,7 @@ fn a_refusal_that_not_every_variant_gives_names_the_variants_that_do() {
         1,
         "the dry run on answers built from the declarations stopped: x".to_owned(),
     );
-    let merged = merge(vec![("v1", vec![error.clone()]), ("v2", vec![])], 2);
+    let merged = merge(vec![("v1", vec![error]), ("v2", vec![])], 2);
     assert_eq!(merged.len(), 1);
     assert!(
         merged[0].hint.ends_with("x (in variant v1)"),

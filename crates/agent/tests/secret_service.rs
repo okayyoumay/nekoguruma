@@ -418,6 +418,10 @@ fn silent_bus(dir: &std::path::Path) -> String {
 /// A bus that accepts the connection and never speaks: both calls are `Unavailable` after about
 /// the call timeout, not never. Needs no daemon.
 #[test]
+#[expect(
+    unsafe_code,
+    reason = "`std::env::set_var`/`remove_var` are unsafe (edition 2024) and have no safe form (ADR-502)"
+)]
 fn a_silent_bus_is_unavailable_within_the_timeout() {
     let _serial = serial();
     const VAR: &str = "DBUS_SESSION_BUS_ADDRESS";
@@ -455,6 +459,10 @@ fn a_silent_bus_is_unavailable_within_the_timeout() {
 /// A bus address that leads nowhere: both calls are `Unavailable`, and so is `ngr-agent identity`
 /// (exit 3, nothing written). Needs no daemon.
 #[test]
+#[expect(
+    unsafe_code,
+    reason = "`std::env::set_var`/`remove_var` are unsafe (edition 2024) and have no safe form (ADR-502)"
+)]
 fn no_session_bus_is_unavailable() {
     let _serial = serial();
     const VAR: &str = "DBUS_SESSION_BUS_ADDRESS";

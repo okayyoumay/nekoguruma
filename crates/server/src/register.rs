@@ -201,8 +201,8 @@ struct StrictVisitor<const N: usize> {
 impl<'de, const N: usize> Visitor<'de> for StrictVisitor<N> {
     type Value = [String; N];
 
-    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("an object with the expected string fields")
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an object with the expected string fields")
     }
 
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<[String; N], A::Error> {
@@ -351,6 +351,12 @@ impl Gates {
 /// The route's state: the pool, the key, and the limiter and log gates of this router.
 #[derive(Clone)]
 pub struct Registrar(Arc<Inner>);
+
+impl std::fmt::Debug for Registrar {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Registrar").finish_non_exhaustive()
+    }
+}
 
 struct Inner {
     pool: PgPool,

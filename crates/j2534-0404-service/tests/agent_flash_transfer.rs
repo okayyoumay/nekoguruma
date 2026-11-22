@@ -328,6 +328,10 @@ impl Drop for TempDir {
 }
 
 #[test]
+#[expect(
+    unsafe_code,
+    reason = "`std::env::set_var`/`remove_var` are unsafe (edition 2024) and have no safe form (ADR-502)"
+)]
 fn agent_job_downloads_more_blocks_than_the_counter_holds() {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

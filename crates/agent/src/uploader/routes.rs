@@ -227,7 +227,7 @@ fn counts_match(length: u64, part_bytes: u64, part_count: u64) -> bool {
 }
 
 /// The four routes of one server.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Routes {
     client: Client,
     origin: ServerOrigin,

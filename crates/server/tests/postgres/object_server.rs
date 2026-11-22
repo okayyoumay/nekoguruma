@@ -175,6 +175,10 @@ fn tuning(ready_ms: u64, stop_ms: u64) -> Tuning {
 }
 
 /// Whether the process has ended: gone, or a zombie that nobody has reaped yet.
+#[allow(
+    unsafe_code,
+    reason = "libc FFI with no safe std equivalent: `kill` sends a signal (ADR-502)"
+)]
 fn ended(pid: u32) -> bool {
     #[cfg(unix)]
     {
@@ -733,6 +737,10 @@ async fn dropping_the_handle_or_the_start_future_kills_the_child() {
 /// thread that spawned).
 #[cfg(target_os = "linux")]
 #[test]
+#[expect(
+    unsafe_code,
+    reason = "libc FFI with no safe std equivalent: `kill` sends a signal (ADR-502)"
+)]
 fn the_child_outlives_the_thread_that_started_it() {
     let fx = Fixture::new("");
     let config = fx.config.clone();
@@ -763,6 +771,10 @@ fn the_child_outlives_the_thread_that_started_it() {
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
+#[expect(
+    unsafe_code,
+    reason = "libc FFI with no safe std equivalent: `getpgrp` reads the process group id (ADR-502)"
+)]
 async fn the_child_gets_a_rebuilt_environment_a_group_of_its_own_and_no_extra_descriptors() {
     let mut fx = Fixture::new("report 1\n");
     let server = fx.start(5000, 1000).await.unwrap();
@@ -995,6 +1007,10 @@ async fn a_child_that_is_gone_already_is_only_reaped() {
 /// another waiter, so the wait fails).
 #[cfg(target_os = "linux")]
 #[tokio::test]
+#[expect(
+    unsafe_code,
+    reason = "libc FFI with no safe std equivalent: `kill` sends a signal, `waitpid` waits for a child (ADR-502)"
+)]
 async fn a_failing_wait_is_logged_and_the_stop_returns() {
     let (log, _guard) = capture();
     let mut fx = Fixture::new("");
@@ -1017,6 +1033,10 @@ async fn a_failing_wait_is_logged_and_the_stop_returns() {
 /// keeps open is aborted after one second.
 #[cfg(unix)]
 #[tokio::test]
+#[expect(
+    unsafe_code,
+    reason = "libc FFI with no safe std equivalent: `kill` sends a signal (ADR-502)"
+)]
 async fn a_forwarder_held_open_by_a_grandchild_is_aborted_after_a_second() {
     let mut fx = Fixture::new("grandchild group\n");
     let server = fx.start(5000, 1000).await.unwrap();
@@ -1582,6 +1602,10 @@ fn the_server_listens_only_after_the_object_server_is_ready() {
 /// server by the default disposition, and the child ends with it (Linux: parent-death signal).
 #[cfg(target_os = "linux")]
 #[test]
+#[expect(
+    unsafe_code,
+    reason = "libc FFI with no safe std equivalent: `kill` sends a signal (ADR-502)"
+)]
 fn a_stop_signal_during_the_start_ends_the_child_with_the_server() {
     let pg = TestPostgres::start();
     let dir = tempfile::tempdir().unwrap();

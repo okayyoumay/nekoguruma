@@ -15,3 +15,6 @@ thiserror.workspace = true
 [dev-dependencies]
 serde_json.workspace = true
 sim-ecu.workspace = true
+
+[lints]
+workspace = true

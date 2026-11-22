@@ -14,3 +14,6 @@ iso22900-sys = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
 sim-ecu.workspace = true
+
+[lints]
+workspace = true

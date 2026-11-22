@@ -20,3 +20,6 @@ name = "fake-vci-service"
 path = "src/bin/fake-vci-service.rs"
 test = false
 doc = false
+
+[lints]
+workspace = true

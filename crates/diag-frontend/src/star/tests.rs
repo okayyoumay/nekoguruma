@@ -2135,7 +2135,7 @@ fn a_section_function_inlined_in_a_plan_does_not_nest() {
         + "\ndef relay():\n    helper()\n";
     passes(&through);
     // A section that calls `helper` outside every plan still nests.
-    let outside = inlined.clone()
+    let outside = inlined
         + "\n# @section interruptible\ndef other():\n    helper()\n"
         + "\ndef extra():\n    other()\n";
     let outside = outside.replace("    write()\n", "    write()\n    extra()\n");

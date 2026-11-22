@@ -388,6 +388,10 @@ mod tests {
     // K5
     #[cfg(unix)]
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "libc FFI with no safe std equivalent: `mkfifo` creates a FIFO (ADR-502)"
+    )]
     fn a_symbolic_link_a_fifo_and_a_directory_are_refused_without_blocking() {
         use std::os::unix::ffi::OsStrExt;
         let dir = tempfile::tempdir().unwrap();

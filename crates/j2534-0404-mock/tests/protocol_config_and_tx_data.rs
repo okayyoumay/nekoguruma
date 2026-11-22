@@ -24,6 +24,10 @@ use j2534_0404_sys::bindings::{
     IOCTL_SET_CONFIG, PASSTHRU_MSG, SCONFIG, SCONFIG_LIST, STATUS_NOERROR,
 };
 
+#[expect(
+    unsafe_code,
+    reason = "calls the mock library's exported J2534 C entry points directly (ADR-502)"
+)]
 fn connect(protocol_id: u32, flags: u32, baud_rate: u32) -> u32 {
     let mut device_id = 0u32;
     let rc = unsafe { PassThruOpen(std::ptr::null_mut(), &mut device_id) };
@@ -35,6 +39,10 @@ fn connect(protocol_id: u32, flags: u32, baud_rate: u32) -> u32 {
     channel_id
 }
 
+#[expect(
+    unsafe_code,
+    reason = "calls the mock library's exported J2534 C entry points directly (ADR-502)"
+)]
 fn set_config(channel_id: u32, params: &[(u32, u32)]) {
     let mut configs: Vec<SCONFIG> = params
         .iter()
@@ -68,6 +76,10 @@ fn assert_config(channel_id: u32, params: &[(u32, u32)]) {
     }
 }
 
+#[expect(
+    unsafe_code,
+    reason = "calls the mock library's exported J2534 C entry points directly (ADR-502)"
+)]
 fn write_message(channel_id: u32, message: &mut PassThruMessage) {
     let mut num_messages = 1u32;
     let rc = unsafe {

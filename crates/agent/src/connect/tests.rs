@@ -648,16 +648,13 @@ fn a_corrupt_mark_file_does_not_open_and_one_in_use_is_exit_3() {
     let registration = dirs.dir.path().join("registration");
     let file = registration.join(format!("{AGENT_ID}.issue-mark.v1.json"));
     std::fs::write(&file, b"not a mark").unwrap();
-    let error = IssueMark::open_in(&registration, AGENT_ID)
-        .err()
-        .expect("a corrupt file does not open");
+    let error =
+        IssueMark::open_in(&registration, AGENT_ID).expect_err("a corrupt file does not open");
     assert!(matches!(error, MarkError::Corrupt(_)), "{error}");
     assert_eq!(mark_error(&error).exit_code(), 1);
     std::fs::remove_file(&file).unwrap();
     let first = IssueMark::open_in(&registration, AGENT_ID).unwrap();
-    let error = IssueMark::open_in(&registration, AGENT_ID)
-        .err()
-        .expect("a second store is in use");
+    let error = IssueMark::open_in(&registration, AGENT_ID).expect_err("a second store is in use");
     assert_eq!(mark_error(&error).exit_code(), 3);
     drop(first);
 }
@@ -678,8 +675,7 @@ fn a_corrupt_outbox_file_does_not_open_and_maps_to_exit_1() {
     .unwrap();
     let opened = dirs.open().unwrap();
     let error = Outbox::open_in(&outbox_dir, &opened.record().agent_id)
-        .err()
-        .expect("a corrupt file does not open");
+        .expect_err("a corrupt file does not open");
     assert!(matches!(error, OutboxError::Corrupt(_)), "{error}");
     assert_eq!(outbox_error(&error).exit_code(), 1);
     drop(opened);
@@ -743,9 +739,8 @@ fn a_corrupt_ledger_file_does_not_open_and_one_in_use_is_exit_3() {
     let registration = dirs.dir.path().join("registration");
     let file = registration.join(format!("{AGENT_ID}.received-jobs.v1"));
     std::fs::write(&file, b"not a ledger").unwrap();
-    let error = ReceivedJobs::open_in(&registration, AGENT_ID)
-        .err()
-        .expect("a corrupt file does not open");
+    let error =
+        ReceivedJobs::open_in(&registration, AGENT_ID).expect_err("a corrupt file does not open");
     assert!(matches!(error, LedgerError::Corrupt(_)), "{error}");
     assert_eq!(ledger_error(&error).exit_code(), 1);
     assert_eq!(
@@ -755,9 +750,8 @@ fn a_corrupt_ledger_file_does_not_open_and_one_in_use_is_exit_3() {
     );
     std::fs::remove_file(&file).unwrap();
     let first = ReceivedJobs::open_in(&registration, AGENT_ID).unwrap();
-    let error = ReceivedJobs::open_in(&registration, AGENT_ID)
-        .err()
-        .expect("a second store is in use");
+    let error =
+        ReceivedJobs::open_in(&registration, AGENT_ID).expect_err("a second store is in use");
     assert_eq!(ledger_error(&error).exit_code(), 3);
     drop(first);
 }

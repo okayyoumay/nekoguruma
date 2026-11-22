@@ -51,6 +51,10 @@ impl TestServer {
     /// `[config.apis.iso22900.libs."TestLib".vendor_struct_types]` table,
     /// ADR-218 Decision item 4a) to the generated `config.toml` before the
     /// service loads it.
+    #[expect(
+        unsafe_code,
+        reason = "`std::env::set_var`/`remove_var` are unsafe (edition 2024) and have no safe form (ADR-502)"
+    )]
     async fn start_with_extra_config(extra_config_toml: &str) -> Self {
         let lib_path = iso22900_mock::mock_library_path()
             .expect("mock cdylib should be discoverable after build");
@@ -142,6 +146,10 @@ struct MockBackdoor {
 }
 
 impl MockBackdoor {
+    #[expect(
+        unsafe_code,
+        reason = "loads the mock library and looks up its `__mock_*` test-control symbol; libloading's `Library::new` and `get` are unsafe (ADR-502)"
+    )]
     fn open(path: &Path) -> Self {
         let lib = unsafe { Library::new(path) }.expect("mock library should be loadable");
         Self { lib }
@@ -161,6 +169,10 @@ impl MockBackdoor {
     /// and the `i686-pc-windows-gnullvm` cross-check target -- a mismatched
     /// hardcoded `extern "C"` here would corrupt the stack on 32-bit
     /// Windows (Codex review, PR #153).
+    #[expect(
+        unsafe_code,
+        reason = "loads the mock library and looks up its `__mock_*` test-control symbol; libloading's `Library::new` and `get` are unsafe (ADR-502)"
+    )]
     fn reset(&self) {
         unsafe {
             let f: Symbol<unsafe extern "system" fn() -> T_PDU_ERROR> = self
@@ -175,6 +187,10 @@ impl MockBackdoor {
     /// call. `code == PDU_STATUS_NOERROR` clears the override. See
     /// `reset`'s doc comment for why this is `extern "system"`, not
     /// `extern "C"`.
+    #[expect(
+        unsafe_code,
+        reason = "loads the mock library and looks up its `__mock_*` test-control symbol; libloading's `Library::new` and `get` are unsafe (ADR-502)"
+    )]
     fn set_lock_resource_error(&self, code: T_PDU_ERROR) {
         unsafe {
             let f: Symbol<unsafe extern "system" fn(T_PDU_ERROR) -> T_PDU_ERROR> = self
@@ -188,6 +204,10 @@ impl MockBackdoor {
     /// Configures the response `PDUGetLastError` reports on every subsequent
     /// call. See `reset`'s doc comment for why this is `extern "system"`,
     /// not `extern "C"`.
+    #[expect(
+        unsafe_code,
+        reason = "loads the mock library and looks up its `__mock_*` test-control symbol; libloading's `Library::new` and `get` are unsafe (ADR-502)"
+    )]
     fn set_last_error(
         &self,
         error_code: T_PDU_ERR_EVT,
@@ -1331,6 +1351,10 @@ async fn set_com_param_rejects_mismatched_vendor_structfield_size_at_the_rpc_bou
 }
 
 /// Sends a `SimEcuCommand` (as JSON) to the mock's simulated ECU (ADR-299).
+#[expect(
+    unsafe_code,
+    reason = "loads the mock library and looks up its `__mock_*` test-control symbol; libloading's `Library::new` and `get` are unsafe (ADR-502)"
+)]
 fn sim_ecu_control(backdoor: &MockBackdoor, command: &str) {
     let command = std::ffi::CString::new(command).expect("no NUL in the command");
     let status = unsafe {
@@ -1899,6 +1923,10 @@ const CLL_COMM_STARTED: i32 = 0x8052;
 /// lets the session lapse.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
+#[expect(
+    unsafe_code,
+    reason = "`std::env::set_var`/`remove_var` are unsafe (edition 2024) and have no safe form (ADR-502)"
+)]
 async fn a_started_link_keeps_the_session_alive_and_reports_a_missing_answer() {
     // The mock reads the commands when the service constructs it; the library is loaded into
     // this process, so the variable is set only around the start.

@@ -614,6 +614,7 @@ impl Opened {
 }
 
 /// What [`Opened::check`] parsed.
+#[derive(Debug)]
 pub struct Checked {
     origin: ServerOrigin,
     audience: Audience,

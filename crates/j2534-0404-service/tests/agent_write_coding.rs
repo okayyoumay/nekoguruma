@@ -345,6 +345,10 @@ async fn run_the_jobs(dir: &Path) {
 }
 
 #[test]
+#[expect(
+    unsafe_code,
+    reason = "`std::env::set_var`/`remove_var` are unsafe (edition 2024) and have no safe form (ADR-502)"
+)]
 fn the_coding_procedure_runs_as_a_write_job_against_the_simulators() {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

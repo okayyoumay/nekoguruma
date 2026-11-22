@@ -13,6 +13,7 @@ pub trait MessageCodec {
     ) -> impl Future<Output = io::Result<()>>;
 }
 
+#[derive(Debug)]
 pub struct OneLinerCodec;
 
 impl MessageCodec for OneLinerCodec {

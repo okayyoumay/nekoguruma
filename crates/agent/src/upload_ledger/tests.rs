@@ -410,7 +410,7 @@ fn damage_among_the_retained_entries_is_corrupt_the_last_one_too() {
     let mut short = good.clone();
     short.truncate(good.len() - 3);
     assert_corrupt("last torn", &short);
-    let mut last_bad = good.clone();
+    let mut last_bad = good;
     last_bad[starts[4] + FRAME_HEADER + 1] ^= 0xFF;
     assert_corrupt("last checksum", &last_bad);
     // The last retained entry with an appended one after it.

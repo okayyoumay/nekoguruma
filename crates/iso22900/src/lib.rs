@@ -1,4 +1,7 @@
-#![allow(unsafe_code)]
+#![allow(
+    unsafe_code,
+    reason = "wraps the D-PDU API of a loaded vendor library; every call crosses the C ABI (ADR-502)"
+)]
 //! Rust wrapper for ISO 22900-2 D-PDU API.
 //!
 //! This crate provides typed wrappers over the native D-PDU C API, including
@@ -528,6 +531,12 @@ impl From<iso22900_sys::libloading::Error> for DPduApiError {
 pub struct DPduApi {
     sys: DPduApiSys,
     api_tag_context: Box<ApiTagContext>,
+}
+
+impl std::fmt::Debug for DPduApi {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DPduApi").finish_non_exhaustive()
+    }
 }
 
 impl DPduApi {

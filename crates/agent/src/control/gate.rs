@@ -67,6 +67,7 @@ pub trait Intake: Send + Sync {
 
 /// The default intake, connected to no job runner: it logs the job ID at `debug` and drops the
 /// instruction.
+#[derive(Debug)]
 pub struct LogIntake;
 
 impl Intake for LogIntake {

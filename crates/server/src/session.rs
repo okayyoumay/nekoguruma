@@ -408,6 +408,12 @@ impl Gates {
 #[derive(Clone)]
 pub struct Exchange(Arc<Inner>);
 
+impl std::fmt::Debug for Exchange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Exchange").finish_non_exhaustive()
+    }
+}
+
 struct Inner {
     pool: PgPool,
     sessions: Sessions,
@@ -914,10 +920,7 @@ mod tests {
             assert_eq!(shape_of(&h, bytes), Err(ShapeError::Json), "{name}");
         }
         // Whitespace after the value is not bytes of another value.
-        assert_eq!(
-            shape_of(&h, &[good.clone(), b"\n ".to_vec()].concat()),
-            Ok(())
-        );
+        assert_eq!(shape_of(&h, &[good, b"\n ".to_vec()].concat()), Ok(()));
 
         // The agent ID.
         let ids = [
@@ -977,7 +980,7 @@ mod tests {
             );
         }
         // The last data character's spare bits must be zero.
-        let mut bent = c.clone().into_bytes();
+        let mut bent = c.into_bytes();
         let last = bent.len() - 2;
         assert_eq!(
             bent[last], b'c',

@@ -140,6 +140,41 @@ the IR's FlatBuffers bindings (`crates/diag-ir/src/generated/`) are generated an
 hand-edit them, and never regenerate FFI bindings without asking first (slow cross builds). The
 details are in `.claude/rules/generated-code.md`, which loads when you open files in those crates.
 
+### Rust code
+
+Lints are set once, in the root `Cargo.toml`'s `[workspace.lints]`; every crate opts in with
+`[lints] workspace = true` and has no `[lints]` table of its own (ADR-502). Compiler lints fail
+CI; Clippy lints are checked by the local `cargo clippy` run before a pull request.
+
+- **Overrides**: on the narrowest item, with a reason: `#[expect(<lint>, reason = "...")]`, or
+  `#[allow]` with a reason where the lint fires only on some targets, cfgs or features, and for
+  generated code. Never lower a lint's level, or add or widen an override, to get a change
+  through: fix the code, or say in the reason why the lint is wrong there. A lint adopted in a
+  later stage starts with a crate-level `#![expect]` in each crate not yet clean, removed when the
+  crate is fixed (ADR-502).
+- **`unsafe`**: `unsafe_code` is denied. Only the FFI and C-ABI crates (`*-sys`, `iso22900`,
+  `j2534-0404`, the two mocks, `sim-vci`) grant it crate-wide; elsewhere the override
+  (`#[expect(unsafe_code, reason = "...")]`, or `#[allow]` when the `unsafe` exists only on some
+  targets or in some builds) goes on the item or small module that makes the operating-system or
+  mock-library call.
+- **Clones**: do not clone to get past the borrow checker. First end the borrow sooner (copy out
+  the small value you need before the mutation), borrow distinct fields separately, use
+  `std::mem::take` or `std::mem::replace`, keep an index or key instead of a reference, or share
+  with `Arc`, `Arc<[u8]>` or `Cow`. A clone is fine when the receiver keeps the value, when it is
+  cheap (`Copy` types, `Arc`, small values), or when it is a deliberate snapshot (for example to
+  release a lock early). Cloning a large buffer or collection in a loop or on a per-message path
+  needs a comment saying why. Take a parameter by reference unless the function keeps it.
+- **Panics**: an intentional `panic!`, `assert!`, `unreachable!` or `expect` in non-test code says
+  which invariant broke and gives the values involved. A failure that external input can cause
+  returns an error instead.
+- **Tests** check behaviour seen from outside or a property the code must hold; a test that
+  restates a constant or mirrors the implementation's branches passes by construction and checks
+  nothing.
+- **Docs**: crate docs and doc comments describe how the code behaves now. How it came to be
+  designed, and the alternatives rejected, go in an ADR.
+- **Re-exports**: a public item is reachable by one path. When an item moves, update its users
+  instead of leaving a `pub use` at the old path.
+
 ### Path-scoped rules
 
 Rules that matter only for part of the repository live in `.claude/rules/` and load when Claude
@@ -258,9 +293,11 @@ any other.
 
 Compiler warnings fail CI: `core-linux`, `core-windows` and `worker-check` build with
 `RUSTFLAGS=-D warnings`, and `core-linux` runs `cargo fmt --check`. Clippy is not run in CI
-(it would add a build to every pull request); run it locally before pushing. Silence a warning for code that
+(it would add a build to every pull request); run it locally before pushing, and say in the PR's
+test plan that it was clean. Silence a warning for code that
 is unused only until later work lands with `#[expect(..., reason = "...")]`, not `#[allow]`, so
-the attribute fails the build once the code is used and gets removed.
+the attribute fails the build once the code is used and gets removed ("Rust code" above has the
+rest of the lint rules).
 
 ## Pull requests
 

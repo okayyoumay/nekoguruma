@@ -112,6 +112,7 @@ pub struct Backend {
 /// A request held between its read of the row and the start of its completion, until a test lets
 /// it go. Tests only.
 #[doc(hidden)]
+#[derive(Debug)]
 pub struct Pause {
     entered: tokio::sync::Notify,
     gate: tokio::sync::Semaphore,
@@ -366,6 +367,12 @@ pub struct Uploads {
     download_gates: Arc<DownloadGates>,
     /// The completion tasks of this process, by tenant and upload (ADR-493 item 20).
     completions: Registry,
+}
+
+impl std::fmt::Debug for Uploads {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Uploads").finish_non_exhaustive()
+    }
 }
 
 impl Uploads {
@@ -950,8 +957,8 @@ impl<'de> Deserialize<'de> for Number {
         impl Visitor<'_> for NumberVisitor {
             type Value = Number;
 
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("a number")
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a number")
             }
 
             fn visit_u64<E: de::Error>(self, v: u64) -> Result<Number, E> {
@@ -995,8 +1002,8 @@ impl<'de> Deserialize<'de> for Raw {
         impl<'de> Visitor<'de> for RawVisitor {
             type Value = Raw;
 
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("an upload declaration")
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("an upload declaration")
             }
 
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Raw, A::Error> {
@@ -1283,12 +1290,8 @@ pub async fn part_url(State(u): State<Uploads>, request: Request) -> Response {
         return bad_request("The part is beyond the upload's part count");
     }
     if row.state != "open" {
-        return Problem::with_state(
-            StatusCode::CONFLICT,
-            "The upload is not open",
-            row.state.clone(),
-        )
-        .into_response();
+        return Problem::with_state(StatusCode::CONFLICT, "The upload is not open", row.state)
+            .into_response();
     }
     let Some(store) = u.backend.store.as_deref() else {
         return no_store();

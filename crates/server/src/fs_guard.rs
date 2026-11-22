@@ -32,6 +32,10 @@ pub(crate) enum DirectoryFault {
 
 /// The effective user ID of the process.
 #[cfg(unix)]
+#[expect(
+    unsafe_code,
+    reason = "libc FFI with no safe std equivalent: `geteuid` reads the effective user id (ADR-502)"
+)]
 pub(crate) fn euid() -> u32 {
     // SAFETY: geteuid has no preconditions and cannot fail.
     unsafe { libc::geteuid() }

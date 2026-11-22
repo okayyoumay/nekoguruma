@@ -164,6 +164,10 @@ impl Policy {
     ///
     /// On Windows, if the process token cannot be read.
     #[cfg(any(test, debug_assertions))]
+    #[allow(
+        unsafe_code,
+        reason = "libc FFI with no safe std equivalent: `geteuid` reads the effective user id; the call is compiled on Unix only (ADR-502)"
+    )]
     pub fn trusting_current_user(mut self) -> Policy {
         #[cfg(unix)]
         {

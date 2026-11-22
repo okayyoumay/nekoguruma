@@ -27,7 +27,10 @@ use vci_service_interface::{
 // reach it transitively via `use super::*;` for their `LogicalLinkState`
 // test fixtures' `can_channel_mode` field -- unused outside `cfg(test)`,
 // hence the explicit allow rather than dropping the import.
-#[allow(unused_imports)]
+#[allow(
+    unused_imports,
+    reason = "only the `cfg(test)` fixtures that glob-import this module use the name, so it is unused in a non-test build"
+)]
 use super::CanChannelMode;
 use super::rpc_link::{
     PointToPointFilterEligibility, point_to_point_filter_eligibility, usdt_resp_id, uudt_resp_id,
@@ -2683,7 +2686,11 @@ fn observe_registrant_timing_change(
     (ecu_timing_change, superseded_timing_seq)
 }
 
-#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    reason = "its arguments are independent inputs with no common type, so they stay plain parameters"
+)]
 fn bind_registrant(
     registrants: &mut [CopRegistrant],
     entry_connect_generation: u64,
@@ -3848,7 +3855,10 @@ struct FrameContext<'a> {
 /// (ADR-147) -- see `bind_registrant`'s own doc comment for the write-site
 /// contract this function applies immediately after each `bind_registrant`
 /// call returns a classification.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "its arguments are independent inputs with no common type, so they stay plain parameters"
+)]
 fn bind_frame(
     entry: &mut CllRxEntry,
     frame_ctx: FrameContext<'_>,
@@ -5320,11 +5330,8 @@ async fn poll_rx_inner(
 
         // Extract the 4-byte CAN ID from the leading bytes of the frame data for
         // UniqueRespIdTable matching (CAN and ISO15765 frames embed CAN ID at [0..4]).
-        let frame_can_id: Option<u32> = if data.len() >= 4 {
-            Some(u32::from_be_bytes([data[0], data[1], data[2], data[3]]))
-        } else {
-            None
-        };
+        let frame_can_id: Option<u32> =
+            (data.len() >= 4).then(|| u32::from_be_bytes([data[0], data[1], data[2], data[3]]));
 
         // ADR-203: this frame's own KWP/J1850 source-address byte, read once
         // per message (not per CLL entry) directly off the raw wire bytes --
@@ -5389,7 +5396,7 @@ async fn poll_rx_inner(
         // above: an unconditional `continue` before the frame ever reaches
         // `cll_entries`/`process_frame_for_entry`/`route_frame`.
         //
-        // Safety: a genuine established-connection TX-side echo can never
+        // Why the check is exact: a genuine established-connection TX-side echo can never
         // be misclassified here. `data[0]` of a connection-bound send is
         // `tp20_established_tx_id.to_be_bytes()[0]` -- the TX-ID's own top
         // byte -- and the TX-ID is masked to SAE J2534-1's 29-bit CAN
@@ -6590,7 +6597,10 @@ fn confirm_cyclic_deadline_writeback(
 /// it as "nothing to apply" is behaviorally identical to the pre-restructure
 /// caller-side no-op and skips the (harmless but pointless) wake-eligibility
 /// check at the call site too.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "its arguments are independent inputs with no common type, so they stay plain parameters"
+)]
 fn queue_error_class_to_apply(
     queue_error_class: Option<QueueErrorClass>,
     entry_connect_generation: u64,
@@ -7195,7 +7205,10 @@ async fn write_can_frame(
 /// a later step in this same send (FlowControl wait, a subsequent
 /// ConsecutiveFrame write) goes on to fail -- see `write_can_frame` and
 /// `transmit_request`'s doc comments (ADR-083).
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "its arguments are independent inputs with no common type, so they stay plain parameters"
+)]
 async fn isotp_send(
     cll_handle: u32,
     cop_handle: u32,
@@ -7517,7 +7530,10 @@ async fn isotp_send(
 /// frame write. For the non-ISO-TP hardware-transport path (`isotp_tx.is_none()`),
 /// this post-hoc stamp remains the *only* stamp: `write_messages` there is a
 /// single atomic call with no partial-success-then-later-failure scenario.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "its arguments are independent inputs with no common type, so they stay plain parameters"
+)]
 async fn transmit_request(
     cll_handle: u32,
     cop_handle: u32,
@@ -7547,7 +7563,10 @@ async fn transmit_request(
     result
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "its arguments are independent inputs with no common type, so they stay plain parameters"
+)]
 async fn transmit_request_inner(
     cll_handle: u32,
     cop_handle: u32,
@@ -8047,7 +8066,10 @@ fn tester_present_state_token(state: &TesterPresentState) -> TesterPresentToken 
 /// corrected (edge-case-hunter finding, caught before this round was
 /// committed) to thread the live `connect_generation`, captured in that same
 /// pre-call critical section, through as `Some(..)` too.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "its arguments are independent inputs with no common type, so they stay plain parameters"
+)]
 async fn send_tester_present_once(
     cll_handle: u32,
     protocol_id: u32,
@@ -15696,43 +15718,42 @@ async fn handle_update_param(
     let live_ctx: Option<Option<(u32, ComParamSet, bool, bool)>> = {
         let links = ctx.logical_links.lock().await;
         links.get(&cll_handle).map(|l| {
-            if l.channel_id == Some(ctx.channel_id) && l.connect_generation == connect_generation {
-                let locked_by_other = find_physical_lock_holder(
-                    &links,
-                    cll_handle,
-                    l.hw_protocol_id,
-                    l.pin_select,
-                    l.channel_key,
-                    LOCK_PHYSICAL_COM_PARAMS,
-                )
-                .is_some();
-                // ADR-158 (corrected, supersedes this comment's prior
-                // ADR-157 Plane B framing): the raw hw id, same as
-                // `find_physical_lock_holder` just above -- both
-                // `to_j2534_config_id` and `expand_tidle`, the two
-                // protocol-family-sensitive consumers
-                // `apply_params_to_hardware_locked` drives, self-normalize
-                // internally from a single raw id, so passing the raw id
-                // here costs nothing for a non-FD link and lets
-                // `to_j2534_config_id` correctly suppress
-                // `BIT_SAMPLE_POINT`/`SYNC_JUMP_WIDTH` (clause 21.3.2.5.1)
-                // for a `CoptUpdateparam` push on an FD_CAN_PS link.
-                // `l.comm_started` -- the LIVE value at this same poll-task
-                // pass, not any enqueue-time snapshot a caller may have
-                // captured (e.g. `rpc_primitive.rs`'s own
-                // `CoptUpdateparam` enqueue-time guard) -- feeds the
-                // CP_J1939TargetAddress re-check below, mirroring why
-                // `l.active` itself is captured live here rather than reused
-                // from a call-time read.
-                Some((
-                    l.hw_protocol_id,
-                    l.active.clone(),
-                    locked_by_other,
-                    l.comm_started,
-                ))
-            } else {
-                None
-            }
+            (l.channel_id == Some(ctx.channel_id) && l.connect_generation == connect_generation)
+                .then(|| {
+                    let locked_by_other = find_physical_lock_holder(
+                        &links,
+                        cll_handle,
+                        l.hw_protocol_id,
+                        l.pin_select,
+                        l.channel_key,
+                        LOCK_PHYSICAL_COM_PARAMS,
+                    )
+                    .is_some();
+                    // ADR-158 (corrected, supersedes this comment's prior
+                    // ADR-157 Plane B framing): the raw hw id, same as
+                    // `find_physical_lock_holder` just above -- both
+                    // `to_j2534_config_id` and `expand_tidle`, the two
+                    // protocol-family-sensitive consumers
+                    // `apply_params_to_hardware_locked` drives, self-normalize
+                    // internally from a single raw id, so passing the raw id
+                    // here costs nothing for a non-FD link and lets
+                    // `to_j2534_config_id` correctly suppress
+                    // `BIT_SAMPLE_POINT`/`SYNC_JUMP_WIDTH` (clause 21.3.2.5.1)
+                    // for a `CoptUpdateparam` push on an FD_CAN_PS link.
+                    // `l.comm_started` -- the LIVE value at this same poll-task
+                    // pass, not any enqueue-time snapshot a caller may have
+                    // captured (e.g. `rpc_primitive.rs`'s own
+                    // `CoptUpdateparam` enqueue-time guard) -- feeds the
+                    // CP_J1939TargetAddress re-check below, mirroring why
+                    // `l.active` itself is captured live here rather than reused
+                    // from a call-time read.
+                    (
+                        l.hw_protocol_id,
+                        l.active.clone(),
+                        locked_by_other,
+                        l.comm_started,
+                    )
+                })
         })
     };
 

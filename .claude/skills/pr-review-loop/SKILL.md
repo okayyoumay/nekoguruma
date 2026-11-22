@@ -309,7 +309,8 @@ round's fixes, and make its fixes, so that checks 1 to 5 below verify the tree t
 If a later check leads to another edit, sweep that edit too and run the checks again on it.
 
 1. Run what CLAUDE.md's "Building and testing" lists, delegated to `cargo-runner` when the output
-   is long. Run the whole changed crate (`cargo test -p <crate>` runs unit and integration
+   is long. That includes `cargo clippy --workspace --all-targets --locked`: CI does not run
+   Clippy, so a skipped run lets a Clippy lint of the workspace table (ADR-502) reach `main`. Run the whole changed crate (`cargo test -p <crate>` runs unit and integration
    tests; `--lib` alone skips `tests/`).
    **Tests that pull requests skip or run differently on Windows.** `core-windows` leaves out
    on pull requests `j2534-0404-service`'s tests (all but `agent_restart_end_to_end`) and the

@@ -49,6 +49,10 @@ fn status_of<T: std::fmt::Debug>(result: Result<T, Error>) -> u32 {
 }
 
 #[test]
+#[expect(
+    unsafe_code,
+    reason = "`std::env::set_var`/`remove_var` are unsafe (edition 2024) and have no safe form (ADR-502)"
+)]
 fn a_lost_device_stays_lost_until_closed_and_reopens_with_a_new_id() {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

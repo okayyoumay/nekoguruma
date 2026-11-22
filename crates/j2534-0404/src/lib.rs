@@ -1,14 +1,13 @@
-#![allow(unsafe_code)]
+#![allow(
+    unsafe_code,
+    reason = "wraps the J2534 v04.04 API of a loaded vendor library; every call crosses the C ABI (ADR-502)"
+)]
 //! Safe-ish Rust wrapper around the SAE J2534 v04.04 API.
 //!
 //! This crate loads a vendor J2534 shared library and exposes typed wrappers
 //! for device, channel, message, filter, and common IOCTL operations.
 
-use std::{
-    ffi::CStr,
-    os::raw::{c_char, c_void},
-    path::Path,
-};
+use std::{ffi::CStr, os::raw::c_void, path::Path};
 
 use tracing::{debug, info, trace};
 
@@ -685,6 +684,12 @@ pub struct J2534Api0404 {
     api: SysJ2534Api0404,
 }
 
+impl std::fmt::Debug for J2534Api0404 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("J2534Api0404").finish_non_exhaustive()
+    }
+}
+
 impl J2534Api0404 {
     // ── Construction ──────────────────────────────────────────────────────────
 
@@ -771,9 +776,9 @@ impl J2534Api0404 {
 
     /// Reads firmware, DLL, and API version strings from the device.
     pub fn read_version(&self, device_id: DeviceId) -> Result<VersionInfo, Error> {
-        let mut firmware = [0 as c_char; LAST_ERROR_BUFFER_SIZE];
-        let mut dll = [0 as c_char; LAST_ERROR_BUFFER_SIZE];
-        let mut api_ver = [0 as c_char; LAST_ERROR_BUFFER_SIZE];
+        let mut firmware = [0; LAST_ERROR_BUFFER_SIZE];
+        let mut dll = [0; LAST_ERROR_BUFFER_SIZE];
+        let mut api_ver = [0; LAST_ERROR_BUFFER_SIZE];
         self.check(unsafe {
             self.api.PassThruReadVersion(
                 device_id.0,
@@ -804,7 +809,7 @@ impl J2534Api0404 {
 
     /// Returns the implementation-defined last error text.
     pub fn last_error_text(&self) -> Result<String, Error> {
-        let mut message = [0 as c_char; LAST_ERROR_BUFFER_SIZE];
+        let mut message = [0; LAST_ERROR_BUFFER_SIZE];
         error::check(unsafe { self.api.PassThruGetLastError(message.as_mut_ptr()) })?;
         error::c_buf_to_string(&message)
     }

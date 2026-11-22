@@ -6,6 +6,7 @@ use axum::response::{IntoResponse, Response};
 
 /// A problem response, with a `code` when the client has to tell the case from others of the
 /// same status.
+#[derive(Debug)]
 pub struct Problem {
     status: StatusCode,
     title: &'static str,

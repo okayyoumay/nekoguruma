@@ -20,6 +20,10 @@ use worker_host::service::{LaunchOptions, OperatingMode, ServiceKind, WorkerProc
 const TEST_LIBRARY_NAME: &str = "mock-worker-host-library";
 
 #[tokio::test]
+#[expect(
+    unsafe_code,
+    reason = "`std::env::set_var`/`remove_var` are unsafe (edition 2024) and have no safe form (ADR-502)"
+)]
 async fn worker_host_client_authenticates_with_minted_tokens() {
     let mock_library =
         mock_library_path().expect("mock library should be discoverable after build");

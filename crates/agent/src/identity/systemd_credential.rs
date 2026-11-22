@@ -28,6 +28,7 @@ use super::store::{SecretName, SecretStore, StoreError, StoreErrorKind};
 pub const MAX_LEN: usize = 16 * 1024;
 
 /// The store over the credential directory `dir`.
+#[derive(Debug)]
 pub struct SystemdCredential {
     dir: PathBuf,
 }
@@ -117,6 +118,10 @@ mod tests {
         store.get(&name()).unwrap_err().kind()
     }
 
+    #[expect(
+        unsafe_code,
+        reason = "libc FFI with no safe std equivalent: `geteuid` reads the effective user id (ADR-502)"
+    )]
     fn is_root() -> bool {
         // SAFETY: geteuid has no preconditions and cannot fail.
         unsafe { libc::geteuid() == 0 }
@@ -207,7 +212,7 @@ mod tests {
         fs::write(&target, b"valid").unwrap();
         let link = dir.join(DEVICE_CREDENTIAL_NAME);
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        let store = SystemdCredential::new(dir.clone());
+        let store = SystemdCredential::new(dir);
         assert_eq!(kind_of(&store), StoreErrorKind::Unavailable);
         fs::remove_file(&link).unwrap();
         std::os::unix::fs::symlink(temp.path().join("nothing"), &link).unwrap();
@@ -216,6 +221,10 @@ mod tests {
 
     /// A10: a directory or a FIFO at the name is unavailable, and the FIFO open does not hang.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "libc FFI with no safe std equivalent: `mkfifo` creates a FIFO (ADR-502)"
+    )]
     fn a_directory_or_a_fifo_is_unavailable_without_hanging() {
         let temp = tempfile::tempdir().unwrap();
         let store = SystemdCredential::new(temp.path().to_owned());

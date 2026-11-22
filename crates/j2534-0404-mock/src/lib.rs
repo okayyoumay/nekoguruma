@@ -1,6 +1,15 @@
-#![allow(clippy::too_many_arguments)]
-#![allow(unsafe_code)]
-#![allow(non_snake_case)]
+#![allow(
+    clippy::too_many_arguments,
+    reason = "the exported functions mirror the C signatures of the J2534 API"
+)]
+#![allow(
+    unsafe_code,
+    reason = "a mock J2534 v04.04 library that exports the C ABI of a vendor library for tests (ADR-502)"
+)]
+#![allow(
+    non_snake_case,
+    reason = "the exported symbols keep the C names of the J2534 API"
+)]
 
 use std::collections::{HashMap, VecDeque};
 use std::os::raw::{c_char, c_long, c_void};
@@ -601,10 +610,10 @@ fn is_ft_protocol(protocol_id: u32) -> bool {
 /// on the narrow predicate, unchanged) that needs family-wide FT treatment --
 /// unlike TP2.0's own round, this mock has no FT-specific write-size-limit or
 /// broadcast-address validation for this predicate to widen.
-#[allow(dead_code)] // no real call site yet, ADR-211: kept for API-shape
-// consistency with every other in-scope family's mock predicate, and so a
-// future FT-specific mock validation rule (should one ever be added) has
-// this ready to use rather than needing to be reinvented.
+#[expect(
+    dead_code,
+    reason = "no call site yet; kept for API-shape consistency with the other families' predicates, and ready for an FT-specific mock rule (ADR-211)"
+)]
 fn is_ft_family_protocol(protocol_id: u32) -> bool {
     protocol_id == PROTOCOL_FT_CAN_PS
         || protocol_id == PROTOCOL_FT_ISO15765_PS
@@ -931,14 +940,14 @@ const MOCK_NDIS_ETHERNET_PIN_CONFIG: u32 = 1;
 /// to `pOutput` -- `AdapterUniqueID`/`AdapterName` are null-padded fixed-size
 /// `c_char` arrays, per the native struct's own char-array semantics.
 fn mock_ndis_adapter_info() -> NDIS_ADAPTER_INFORMATION {
-    let mut adapter_unique_id = [0 as c_char; 128];
+    let mut adapter_unique_id = [0; 128];
     for (dst, &src) in adapter_unique_id
         .iter_mut()
         .zip(MOCK_NDIS_ADAPTER_UNIQUE_ID)
     {
         *dst = src as c_char;
     }
-    let mut adapter_name = [0 as c_char; 64];
+    let mut adapter_name = [0; 64];
     for (dst, &src) in adapter_name.iter_mut().zip(MOCK_NDIS_ADAPTER_NAME) {
         *dst = src as c_char;
     }
@@ -2587,11 +2596,11 @@ exported_fn!(PassThruOpen(p_name: *mut c_void, p_device_id: *mut u32) -> c_long 
     } else {
         // Read a NUL-terminated narrow string, mirroring how a real J2534
         // DLL reads `pName` (ADR-106's out-of-spec device-selection
-        // extension). SAFETY: the caller contract (see `exported_fn!`)
-        // requires a non-null pName to point at a valid NUL-terminated
-        // buffer.
+        // extension).
         let mut bytes = Vec::new();
         let mut ptr = p_name as *const u8;
+        // SAFETY: the caller contract (see `exported_fn!`) requires a
+        // non-null pName to point at a valid NUL-terminated buffer.
         unsafe {
             while *ptr != 0 {
                 bytes.push(*ptr);
@@ -2610,11 +2619,7 @@ exported_fn!(PassThruOpen(p_name: *mut c_void, p_device_id: *mut u32) -> c_long 
 exported_fn!(PassThruClose(_device_id: u32) -> c_long {
     let mut guard = state().lock().expect("mock state poisoned");
     if let Some((code, remaining)) = guard.close_failures {
-        guard.close_failures = if remaining > 1 {
-            Some((code, remaining - 1))
-        } else {
-            None
-        };
+        guard.close_failures = (remaining > 1).then(|| (code, remaining - 1));
         return code;
     }
     guard.counters.close += 1;
@@ -7318,7 +7323,7 @@ mod tests {
         let base = std::time::SystemTime::now();
         set_mtime(&uplifted, base - std::time::Duration::from_secs(100));
         set_mtime(&fresh, base);
-        assert_eq!(search_directory(&root), Some(fresh.clone()));
+        assert_eq!(search_directory(&root), Some(fresh));
 
         // The preference is by mtime, not by location in the tree.
         set_mtime(&uplifted, base + std::time::Duration::from_secs(100));

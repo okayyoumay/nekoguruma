@@ -520,9 +520,9 @@ fn d16_the_log_names_the_decisions_and_keeps_the_origin_in_external() {
     #[derive(Clone, Default)]
     struct Log(std::sync::Arc<Mutex<Vec<u8>>>);
     impl io::Write for Log {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
         }
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
@@ -632,6 +632,10 @@ fn set_mode(path: &Path, mode: u32) {
 
 /// Whether the tests run as the super-user, for whom mode bits and ownership do not apply.
 #[cfg(unix)]
+#[expect(
+    unsafe_code,
+    reason = "libc FFI with no safe std equivalent: `geteuid` reads the effective user id (ADR-502)"
+)]
 fn is_root() -> bool {
     // SAFETY: geteuid has no preconditions and cannot fail.
     unsafe { libc::geteuid() == 0 }

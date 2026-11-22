@@ -278,6 +278,10 @@ fn the_hashing_writer_counts_and_hashes_what_it_writes() {
 /// A pipe in the name's place is refused, and the open does not wait for a writer.
 #[cfg(unix)]
 #[test]
+#[expect(
+    unsafe_code,
+    reason = "libc FFI with no safe std equivalent: `mkfifo` creates a FIFO (ADR-502)"
+)]
 fn a_pipe_is_refused_without_blocking() {
     use std::os::unix::ffi::OsStrExt;
     let (_temp, root) = objects();

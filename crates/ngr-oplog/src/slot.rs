@@ -120,6 +120,10 @@ mod tests {
     /// A lock file that is a FIFO, a symbolic link or a directory is skipped, not opened.
     #[cfg(unix)]
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "libc FFI with no safe std equivalent: `mkfifo` creates a FIFO (ADR-502)"
+    )]
     fn an_unusable_lock_file_is_skipped() {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path();

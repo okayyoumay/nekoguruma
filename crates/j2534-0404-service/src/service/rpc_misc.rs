@@ -1710,6 +1710,10 @@ impl AlignedByteBuf {
 
     /// A byte-slice view of exactly the requested (not chunk-rounded-up)
     /// byte length.
+    #[expect(
+        unsafe_code,
+        reason = "views the vendor IOCTL parameter block as bytes; the buffer is the backing store of the J2534 call (ADR-502)"
+    )]
     fn as_bytes(&self) -> &[u8] {
         // Safety: `chunks` is a valid, initialized `Vec<Align16Chunk>`
         // allocation of at least `self.len` bytes (rounded up to whole
@@ -1721,6 +1725,10 @@ impl AlignedByteBuf {
     }
 
     /// The mutable counterpart of [`Self::as_bytes`].
+    #[expect(
+        unsafe_code,
+        reason = "views the vendor IOCTL parameter block as bytes; the buffer is the backing store of the J2534 call (ADR-502)"
+    )]
     fn as_bytes_mut(&mut self) -> &mut [u8] {
         // Safety: see `as_bytes` -- same allocation, mutable borrow.
         unsafe { std::slice::from_raw_parts_mut(self.chunks.as_mut_ptr().cast::<u8>(), self.len) }
@@ -1904,6 +1912,10 @@ impl VendorIoCtl {
 // buffer on each call -- valid and writable for the native call's entire
 // duration, since neither buffer is resized after construction and `self`
 // is never moved while `J2534Api0404::ioctl` holds its `&mut self` borrow.
+#[expect(
+    unsafe_code,
+    reason = "implements the J2534 IOCTL command trait, which is unsafe because the buffer layout must match the vendor call (ADR-502)"
+)]
 unsafe impl j2534_0404::IoCtlCommand for VendorIoCtl {
     fn ioctl_id(&self) -> u32 {
         match self {
@@ -3022,6 +3034,10 @@ impl J2534Service {
     /// handed a pointer into), issues the call, then encodes the output
     /// back into `DataItem.bytearray_data` per Decision item 2's output
     /// rules.
+    #[expect(
+        unsafe_code,
+        reason = "issues the vendor IOCTL through the unsafe J2534 wrapper call (ADR-502)"
+    )]
     async fn run_vendor_ioctl(
         &self,
         handle: u32,
@@ -10710,6 +10726,10 @@ mod clear_periodic_msgs_epoch_gating_tests {
     /// channel before returning `no_error()` -- so this counter is the only
     /// available signal for whether `ioctl_clear_tx_queue`'s native call was
     /// actually reached.
+    #[expect(
+        unsafe_code,
+        reason = "loads the mock library and looks up its `__mock_*` test-control symbol; libloading's `Library::new` and `get` are unsafe (ADR-502)"
+    )]
     fn clear_tx_buffer_count() -> usize {
         let lib_path = j2534_0404_mock::mock_library_path().expect("mock cdylib should be built");
         unsafe {
@@ -10900,6 +10920,10 @@ mod terminate_tp20_broadcast_periodic_for_suspension_tests {
     /// `Library::new` on the identical path resolves to the SAME
     /// dynamically-loaded shared object `service.api` itself mutates, not a
     /// separate statically-linked copy of `MockState`.
+    #[expect(
+        unsafe_code,
+        reason = "loads the mock library and looks up its `__mock_*` test-control symbol; libloading's `Library::new` and `get` are unsafe (ADR-502)"
+    )]
     fn set_stop_periodic_message_error(code: Option<c_long>) {
         let lib_path = j2534_0404_mock::mock_library_path().expect("mock cdylib should be built");
         unsafe {

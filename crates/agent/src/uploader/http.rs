@@ -167,6 +167,12 @@ pub struct Client {
     no_progress: Duration,
 }
 
+impl std::fmt::Debug for Client {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Client").finish_non_exhaustive()
+    }
+}
+
 impl Client {
     /// The production client: TCP to the loopback address, at the port each call names.
     pub fn loopback() -> Self {
@@ -386,9 +392,9 @@ impl AsyncWrite for Tracked {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        data: &[u8],
+        buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let polled = Pin::new(&mut self.inner).poll_write(cx, data);
+        let polled = Pin::new(&mut self.inner).poll_write(cx, buf);
         if matches!(polled, Poll::Ready(Ok(n)) if n > 0) {
             self.progress.moved();
         }

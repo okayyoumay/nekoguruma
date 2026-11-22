@@ -142,6 +142,12 @@ pub struct PendingRecord {
     armed: bool,
 }
 
+impl std::fmt::Debug for PendingRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingRecord").finish_non_exhaustive()
+    }
+}
+
 impl PendingRecord {
     /// Removes a stale temporary file and creates a new one with mode 0600 (on Windows the
     /// profile's inherited access list stands in for that). An entry that cannot be removed or

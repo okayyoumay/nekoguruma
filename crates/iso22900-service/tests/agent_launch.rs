@@ -37,6 +37,10 @@ fn install_worker(workers: &Path, abi_name: &str) {
 
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
+#[expect(
+    unsafe_code,
+    reason = "`std::env::set_var`/`remove_var` are unsafe (edition 2024) and have no safe form (ADR-502)"
+)]
 async fn the_agent_launches_iso22900_service_for_a_d_pdu_api_vci() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let root = temp.path();
@@ -130,14 +134,17 @@ async fn the_agent_launches_iso22900_service_for_a_d_pdu_api_vci() {
         None,
     )
     .await
-    .err()
-    .expect("an unknown name should not launch")
+    .expect_err("an unknown name should not launch")
     .to_string();
     assert!(error.contains("Unknown D-PDU API"), "{error}");
 }
 
 /// Points the agent's lookup at the mock, as the launch test above does; returns the workers
 /// directory (holding the host-ABI worker) and the mock's ABI.
+#[expect(
+    unsafe_code,
+    reason = "`std::env::set_var`/`remove_var` are unsafe (edition 2024) and have no safe form (ADR-502)"
+)]
 fn set_up_mock(root: &Path) -> (WorkerLayout, Abi) {
     let library = iso22900_mock::mock_library_path().expect("the mock cdylib should be built");
     let abi = worker_host::abi::detect_file(&library).expect("the mock should have a known ABI");
@@ -204,8 +211,7 @@ async fn naming_another_abi_is_refused_without_a_fallback() {
         Some(other),
     )
     .await
-    .err()
-    .expect("another ABI should not launch");
+    .expect_err("another ABI should not launch");
     assert!(matches!(error, LaunchError::Resolve { .. }), "{error}");
     assert!(error.to_string().contains("is built for"), "{error}");
 }
@@ -230,8 +236,7 @@ async fn naming_an_abi_the_host_cannot_run_is_refused_first() {
         Some(foreign),
     )
     .await
-    .err()
-    .expect("an ABI this agent build cannot run should not launch");
+    .expect_err("an ABI this agent build cannot run should not launch");
     assert!(
         matches!(error, LaunchError::AbiNotRunnable { abi, .. } if abi == foreign),
         "{error}"

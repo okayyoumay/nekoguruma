@@ -360,6 +360,10 @@ fn embedded_signature_size<R: Read + Seek>(r: &mut R) -> io::Result<u32> {
 }
 
 #[cfg(windows)]
+#[expect(
+    unsafe_code,
+    reason = "verifies a file's Authenticode signature through WinVerifyTrust and the wintrust helper functions (ADR-502)"
+)]
 mod imp {
     use std::{
         ffi::c_void,

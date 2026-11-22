@@ -48,6 +48,10 @@ esac
 "#;
 
 #[cfg(not(debug_assertions))]
+#[expect(
+    unsafe_code,
+    reason = "libc::geteuid reads the effective user id; std has no equivalent (ADR-502)"
+)]
 fn is_root() -> bool {
     // SAFETY: geteuid has no preconditions and cannot fail.
     unsafe { libc::geteuid() == 0 }
@@ -627,6 +631,10 @@ mod hardening {
     /// A descendant that left the group (`setsid`) and holds standard output is caught by the
     /// bound: exit 3 within it, and nothing is linked.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "libc FFI with no safe std equivalent: `kill` sends a signal (ADR-502)"
+    )]
     fn a_descendant_outside_the_group_is_caught_by_the_bound() {
         let fixture = Fixture::new();
         fixture.mode("escape");
@@ -653,6 +661,10 @@ mod hardening {
     /// is refused (exit 1) before the tool runs. As root the directory is given to an unused uid
     /// first; without that power the test has nothing to show and returns.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "libc FFI with no safe std equivalent: `geteuid` reads the effective user id, `chown` changes file ownership (ADR-502)"
+    )]
     fn a_target_directory_of_another_owner_is_refused() {
         let fixture = Fixture::new();
         fs::create_dir(fixture.target()).unwrap();

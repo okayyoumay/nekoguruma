@@ -233,7 +233,7 @@ impl Stub {
                 }
             };
             stream.set_nonblocking(false).unwrap();
-            stream.set_read_timeout(Some(Duration::from_secs(20))).ok();
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(20)));
             let mut raw = Vec::new();
             let mut byte = [0u8; 1];
             while !raw.ends_with(b"\r\n\r\n") {
@@ -614,6 +614,10 @@ fn a_value_that_is_not_utf8_is_exit_2() {
 /// A8: a terminal on standard input with no `--code-file` is exit 2, and nothing is touched.
 #[cfg(target_os = "linux")]
 #[test]
+#[expect(
+    unsafe_code,
+    reason = "opens a pseudo-terminal with libc::openpty and wraps its raw descriptors (ADR-502)"
+)]
 fn a_terminal_on_stdin_is_exit_2() {
     use std::os::fd::{FromRawFd, OwnedFd};
     let (mut master, mut slave) = (0, 0);

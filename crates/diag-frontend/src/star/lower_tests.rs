@@ -881,7 +881,7 @@ def main():
             )
         })
         .collect();
-    let mut sorted = attributes.clone();
+    let mut sorted = attributes;
     sorted.sort();
     assert_eq!(sorted, [(false, 0), (true, 10)]);
 }
@@ -968,16 +968,13 @@ fn ints_and_floats_compare_by_exact_value() {
     assert_eq!(order(above.clone(), float.clone()), Greater);
     assert_eq!(order(float.clone(), above.clone()), Less);
     assert!(!equal(&above, &float));
-    assert_eq!(
-        fold_builtin("max", &[float.clone(), above.clone()]),
-        Ok(above)
-    );
+    assert_eq!(fold_builtin("max", &[float, above.clone()]), Ok(above));
     assert_eq!(
         order(Const::Int(i64::MAX), Const::Float(2f64.powi(63))),
         Less
     );
     assert_eq!(
-        order(Const::Int(i64::MIN), Const::Float(-2f64.powi(63))),
+        order(Const::Int(i64::MIN), Const::Float(-(2f64.powi(63)))),
         Equal
     );
     assert_eq!(order(Const::Int(i64::MIN), Const::Float(-1e19)), Greater);
@@ -990,7 +987,7 @@ fn ints_and_floats_compare_by_exact_value() {
 #[test]
 fn int_of_a_float_accepts_every_value_in_range() {
     assert_eq!(
-        fold_builtin("int", &[Const::Float(-2f64.powi(63))]),
+        fold_builtin("int", &[Const::Float(-(2f64.powi(63)))]),
         Ok(Const::Int(i64::MIN))
     );
     assert_eq!(

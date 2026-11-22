@@ -765,9 +765,9 @@ fn flow_control_filters_are_validated() {
 #[test]
 fn version_and_other_exports() {
     let f = fixture();
-    let mut fw = [1 as c_char; 80];
-    let mut dll = [1 as c_char; 80];
-    let mut api = [1 as c_char; 80];
+    let mut fw = [1; 80];
+    let mut dll = [1; 80];
+    let mut api = [1; 80];
     assert_eq!(
         unsafe {
             PassThruReadVersion(
@@ -804,7 +804,7 @@ fn version_and_other_exports() {
         ERR_NULL_PARAMETER
     );
 
-    let mut desc = [1 as c_char; 80];
+    let mut desc = [1; 80];
     assert_eq!(
         unsafe { PassThruGetLastError(desc.as_mut_ptr()) },
         STATUS_NOERROR
@@ -1285,7 +1285,7 @@ fn the_control_export_rejects_what_it_cannot_parse() {
 fn a_lost_device_stays_lost_until_closed_and_reopens_with_a_new_id() {
     let f = fixture();
     assert_eq!(control(r#"{"command": "disconnect_vci"}"#), STATUS_NOERROR);
-    let mut version = [[0 as c_char; 80]; 3];
+    let mut version = [[0; 80]; 3];
     let [fw, dll, api] = &mut version;
     assert_eq!(
         unsafe {
@@ -1464,7 +1464,7 @@ fn every_call_but_get_last_error_fails_on_a_lost_device() {
     let m = msg(ECU_PHYSICAL_REQUEST_ID, &[0x3E, 0x00]);
     let mask = msg_bytes(&[0xFF; 4]);
     let mut out = 0;
-    let mut version = [[0 as c_char; 80]; 3];
+    let mut version = [[0; 80]; 3];
     let [fw, dll, api] = &mut version;
     let calls: [(&str, PassThruUlong); 13] = [
         ("Open", unsafe { PassThruOpen(ptr::null(), &mut out) }),
@@ -1520,7 +1520,7 @@ fn every_call_but_get_last_error_fails_on_a_lost_device() {
         ERR_DEVICE_NOT_CONNECTED
     );
     assert_eq!(n, 0);
-    let mut text = [0 as c_char; 80];
+    let mut text = [0; 80];
     assert_eq!(
         unsafe { PassThruGetLastError(text.as_mut_ptr()) },
         STATUS_NOERROR
@@ -2143,7 +2143,7 @@ fn a_crashed_vci_fails_every_call_until_it_restarts() {
         unsafe { PassThruIoctl(f.channel, 0, ptr::null_mut(), ptr::null_mut()) },
         ERR_FAILED
     );
-    let mut description = [0 as c_char; 80];
+    let mut description = [0; 80];
     assert_eq!(
         unsafe { PassThruGetLastError(description.as_mut_ptr()) },
         STATUS_NOERROR

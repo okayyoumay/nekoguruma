@@ -230,6 +230,16 @@ pub struct LaunchedWorker {
     pub recipe: LaunchRecipe,
 }
 
+impl std::fmt::Debug for LaunchedWorker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LaunchedWorker")
+            .field("abi", &self.abi)
+            .field("library", &self.library)
+            .field("long_size", &self.long_size)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Launches the worker of `api` that matches the ABI of `vci`'s library in the device's
 /// operating `mode` and connects a client to it.
 ///
@@ -327,6 +337,12 @@ pub struct RelaunchingWorker {
     /// [`WorkerSource::end`]), and no worker was started since: the next client is a new worker's.
     /// A process the run was never told about is not started again, so the log tells every exit.
     gone: bool,
+}
+
+impl std::fmt::Debug for RelaunchingWorker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RelaunchingWorker").finish_non_exhaustive()
+    }
 }
 
 /// How long [`WorkerSource::end`] waits for a worker it killed to be reaped.

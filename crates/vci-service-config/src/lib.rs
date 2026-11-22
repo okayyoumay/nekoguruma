@@ -657,6 +657,10 @@ fn windows_known_folder_root() -> PathBuf {
 /// `config-root-*` feature: it compiles, and is callable, on every Windows
 /// build regardless of which of those features is active.
 #[cfg(windows)]
+#[expect(
+    unsafe_code,
+    reason = "calls the Shell's `SHGetKnownFolderPath` and frees its result with `CoTaskMemFree` (ADR-502)"
+)]
 fn known_folder(rfid: &windows_sys::core::GUID) -> PathBuf {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;

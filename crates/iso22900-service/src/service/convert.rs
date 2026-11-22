@@ -45,7 +45,10 @@ const VENDOR_TYPE_URL_PREFIX: &str = "pdu-cpst:0x";
 // wraps `c_int` -- see the doc comments above. Suppress
 // `clippy::unnecessary_cast`, which only sees the former on this
 // environment's default target.
-#[allow(clippy::unnecessary_cast)]
+#[allow(
+    clippy::unnecessary_cast,
+    reason = "`E_PDU_CPST` wraps `c_int` on msvc and `u32` elsewhere, so the cast is a no-op on some targets"
+)]
 pub(super) fn cpst_from_raw(raw: u32) -> E_PDU_CPST {
     E_PDU_CPST(raw as _)
 }
@@ -53,7 +56,10 @@ pub(super) fn cpst_from_raw(raw: u32) -> E_PDU_CPST {
 /// Reads the raw `ComParamStructType` discriminant out of an `E_PDU_CPST`.
 /// See [`cpst_from_raw`] for why this is a plain `as` cast rather than a
 /// checked conversion.
-#[allow(clippy::unnecessary_cast)]
+#[allow(
+    clippy::unnecessary_cast,
+    reason = "`E_PDU_CPST` wraps `c_int` on msvc and `u32` elsewhere, so the cast is a no-op on some targets"
+)]
 pub(super) fn cpst_raw(struct_type: E_PDU_CPST) -> u32 {
     struct_type.0 as u32
 }
@@ -151,6 +157,10 @@ fn map_raw_param_class(class: T_PDU_PC) -> Result<ParamClass, Status> {
 /// `from_unique_response_item` share the identical resolver shape on write,
 /// so the resolution algorithm cannot drift between any of these call sites
 /// (ADR-218 Decision item 5, extended to the write path).
+#[expect(
+    unsafe_code,
+    reason = "reads a borrowed C struct array through the D-PDU API binding; the bytes come from the vendor library (ADR-502)"
+)]
 pub(super) fn read_borrowed_param_value(
     borrowed: &BorrowedParamItem,
     resolve_vendor_entry_size: &mut dyn FnMut(E_PDU_CPST) -> Result<u32, Status>,
@@ -1043,6 +1053,10 @@ mod tests {
     /// `PDUGetComParam`/`PDUSetComParam` call would read/write for a standard
     /// struct type -- used so tests never have to hand-compute field offsets
     /// or byte order themselves.
+    #[expect(
+        unsafe_code,
+        reason = "views a plain-data D-PDU API struct as its native bytes for the wire (ADR-502)"
+    )]
     fn native_bytes<T: Copy>(value: &T) -> Vec<u8> {
         unsafe { std::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) }
             .to_vec()

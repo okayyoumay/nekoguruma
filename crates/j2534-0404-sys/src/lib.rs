@@ -1,3 +1,7 @@
+#![allow(
+    unsafe_code,
+    reason = "raw FFI bindings to the J2534 v04.04 API and the run-time loader over a vendor library (ADR-502)"
+)]
 pub mod bindings;
 pub mod libloading;
 // Run-time `unsigned long` width facade (docs/worker-crates.md).

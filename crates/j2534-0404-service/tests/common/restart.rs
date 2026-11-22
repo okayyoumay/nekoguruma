@@ -283,6 +283,10 @@ impl Env {
     ///
     /// The caller must make sure no other thread reads or writes the environment: the test
     /// file runs its tests serially and calls this before it builds a runtime.
+    #[expect(
+        unsafe_code,
+        reason = "`std::env::set_var`/`remove_var` are unsafe (edition 2024); the caller guarantees no other thread reads the environment meanwhile (ADR-502)"
+    )]
     unsafe fn apply_here(&self) {
         // SAFETY: the caller's contract.
         unsafe {
@@ -504,6 +508,10 @@ impl Env {
     }
 
     /// Sets the scenario's environment in this process and builds the runtime its runs use.
+    #[expect(
+        unsafe_code,
+        reason = "calls the unsafe `apply_here`, which edits the process environment (ADR-502)"
+    )]
     fn runtime(&self) -> tokio::runtime::Runtime {
         // SAFETY: every test of the test file that reads or writes the environment is
         // `#[serial]` (the entry test as well, which reads the role variable), so none runs
@@ -703,6 +711,10 @@ async fn launch_worker() -> WorkerProcess {
 
 /// Ends the worker process `pid` at once, as a crash would: nothing in it is closed or flushed.
 #[cfg(unix)]
+#[expect(
+    unsafe_code,
+    reason = "libc FFI with no safe std equivalent: `kill` sends a signal (ADR-502)"
+)]
 fn kill_worker(pid: u32) {
     let pid = i32::try_from(pid).expect("a process ID fits in pid_t");
     // SAFETY: kill(2) takes a process ID and a signal number and touches no memory.
@@ -718,6 +730,10 @@ fn kill_worker(pid: u32) {
 /// Ends the worker process `pid` at once, as a crash would: `TerminateProcess`, so nothing in
 /// it is closed or flushed.
 #[cfg(windows)]
+#[expect(
+    unsafe_code,
+    reason = "ends the worker with the Win32 `OpenProcess` and `TerminateProcess` calls, which std has no form of (ADR-502)"
+)]
 fn kill_worker(pid: u32) {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
@@ -739,6 +755,10 @@ fn kill_worker(pid: u32) {
 /// Ends the agent process `pid` and its worker at once. The agent leads its own process group
 /// (`process_group(0)`), which holds its worker, and SIGKILL to the group ends both.
 #[cfg(unix)]
+#[expect(
+    unsafe_code,
+    reason = "libc FFI with no safe std equivalent: `kill` sends a signal (ADR-502)"
+)]
 fn kill_agent_and_worker(pid: u32) -> std::io::Result<()> {
     let group = i32::try_from(pid).expect("a process ID fits in pid_t");
     // SAFETY: kill(2) takes a process group and a signal number and touches no memory.
@@ -755,6 +775,10 @@ fn kill_agent_and_worker(pid: u32) -> std::io::Result<()> {
 struct Job(windows_sys::Win32::Foundation::HANDLE);
 
 #[cfg(windows)]
+#[expect(
+    unsafe_code,
+    reason = "holds the agent and its worker in a Win32 job object, so that the pair can be ended together (ADR-502)"
+)]
 impl Job {
     /// A new job object holding `child`. Closing the job's handle, which only the test holds,
     /// terminates whatever it still holds, so a test that fails on any path, a failed kill
@@ -854,6 +878,10 @@ fn start_in_job(mut child: Child) -> (Child, Job) {
 
 /// Resumes the only thread of `child`, which was created suspended.
 #[cfg(windows)]
+#[expect(
+    unsafe_code,
+    reason = "resumes the suspended agent through the Win32 toolhelp and thread calls (ADR-502)"
+)]
 fn resume(child: &Child) -> std::io::Result<()> {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
@@ -902,6 +930,10 @@ fn resume(child: &Child) -> std::io::Result<()> {
 
 #[cfg(windows)]
 impl Drop for Job {
+    #[expect(
+        unsafe_code,
+        reason = "closes the job object handle with `CloseHandle` (ADR-502)"
+    )]
     fn drop(&mut self) {
         // SAFETY: the handle is open and not used after this.
         unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };

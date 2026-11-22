@@ -7460,7 +7460,7 @@ def main():
         );
         let state = Journal::read(&dir, &job_key()).unwrap();
         assert!(state.facts.transfer.is_some(), "the transfer was started");
-        let stopped = state.facts.run_stopped.clone().expect("the stop record");
+        let stopped = state.facts.run_stopped.expect("the stop record");
         assert_eq!(stopped.at.pc, ERASE + 1);
         assert_eq!(stopped.reason, RunStop::Vm(VmError::StackUnderflow));
 
@@ -10434,7 +10434,7 @@ def main():
         let mirror = Arc::new(Mutex::new(Vec::new()));
         let cancelled = Arc::new(AtomicBool::new(false));
         let job = {
-            let (program, dir) = (program.clone(), dir.clone());
+            let (program, dir) = (program, dir.clone());
             let (slot, mirror, cancelled) = (
                 Arc::clone(&slot),
                 Arc::clone(&mirror),
@@ -10850,7 +10850,7 @@ def main():
         // requests of the replay, and nothing else.
         assert_eq!(after.records, before.records + 1 + 1 + 3);
         assert_eq!(after.facts.transfer, {
-            let mut transfer = before.facts.transfer.clone().unwrap();
+            let mut transfer = before.facts.transfer.unwrap();
             transfer.interrupted = true;
             Some(transfer)
         });
@@ -10923,7 +10923,7 @@ def main():
         let result = resume(&program, &dir, &mut host, false);
         assert!(matches!(result, Err(JobError::Host { .. })), "{result:?}");
         let second_point = restart_point(&program, &dir);
-        let mut expected = first_point.entry_state.clone();
+        let mut expected = first_point.entry_state;
         expected.steps = second_point.entry_state.steps;
         assert_eq!(second_point.entry_state, expected);
         std::fs::remove_dir_all(&dir).unwrap();
@@ -11766,7 +11766,7 @@ def main():
             );
         }
         // No document: the caller's table, even an empty one.
-        let plain = Job::from(program.clone());
+        let plain = Job::from(program);
         let mode =
             use_document_sources(&plain, Some(journal_mode_with_empty_table(&dir, false))).unwrap();
         assert_eq!(sources_of(mode), crate::inputs::ServiceSources::default());
@@ -19932,8 +19932,7 @@ def main():
             };
             let error = link::open(&mut client, &config, Duration::from_secs(5))
                 .await
-                .err()
-                .expect("refused");
+                .expect_err("refused");
             assert!(
                 matches!(&error, HostError::DeclaredLink(why) if why.contains(expected)),
                 "{name}: {error}"
@@ -20750,7 +20749,7 @@ def main():
         let named = *empty.sha256();
         let job = flash_job_of(&[(0, 0, 4)], &[]).with_artifact(named, empty.clone());
         check_flash(&job).expect("a zero-length segment at 0 is inside");
-        let job = flash_job_of(&[(0, 1, 4)], &[(0, 0)]).with_artifact(named, empty.clone());
+        let job = flash_job_of(&[(0, 1, 4)], &[(0, 0)]).with_artifact(named, empty);
         assert!(matches!(
             check_flash(&job),
             Err(JobError::SegmentOutsideArtifact {
@@ -21043,15 +21042,15 @@ def main():
             fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
                 true
             }
-            fn new_span(&self, attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            fn new_span(&self, span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
                 let id = NEXT_SPAN.fetch_add(1, Ordering::Relaxed);
-                let mut text = Text(format!("{}{{", attrs.metadata().name()));
-                attrs.record(&mut text);
+                let mut text = Text(format!("{}{{", span.metadata().name()));
+                span.record(&mut text);
                 text.0.push('}');
                 spans()
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .insert(id, (text.0, attrs.metadata()));
+                    .insert(id, (text.0, span.metadata()));
                 tracing::span::Id::from_u64(id)
             }
             fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
@@ -21073,15 +21072,15 @@ def main():
                     .unwrap_or_else(|e| e.into_inner())
                     .push(text.0);
             }
-            fn enter(&self, id: &tracing::span::Id) {
-                ENTERED.with(|entered| entered.borrow_mut().push(id.into_u64()));
+            fn enter(&self, span: &tracing::span::Id) {
+                ENTERED.with(|entered| entered.borrow_mut().push(span.into_u64()));
             }
-            fn exit(&self, id: &tracing::span::Id) {
+            fn exit(&self, span: &tracing::span::Id) {
                 ENTERED.with(|entered| {
                     let mut entered = entered.borrow_mut();
                     if let Some(at) = entered
                         .iter()
-                        .rposition(|entered| *entered == id.into_u64())
+                        .rposition(|entered| *entered == span.into_u64())
                     {
                         entered.remove(at);
                     }
@@ -24526,7 +24525,13 @@ def main():
                 keep_alive: (!setup.keep_alive_off).then_some(Duration::from_secs(2)),
                 ..LinkConfig::iso15765(0x7E0, 0x7E8)
             };
-            #[cfg_attr(not(debug_assertions), expect(unused_mut))]
+            #[cfg_attr(
+                not(debug_assertions),
+                expect(
+                    unused_mut,
+                    reason = "only a debug build sets the link's permission below"
+                )
+            )]
             let mut link = link::open(&mut client, &config, Duration::from_secs(5))
                 .await
                 .expect("the link opens");

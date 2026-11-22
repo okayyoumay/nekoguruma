@@ -664,10 +664,9 @@ async fn a_body_past_the_bound_or_the_time_is_cut() {
     stream.write_all(b"0123456789").await.unwrap();
     let began = Instant::now();
     let mut buf = Vec::new();
-    tokio::time::timeout(Duration::from_secs(30), stream.read_to_end(&mut buf))
+    let _ = tokio::time::timeout(Duration::from_secs(30), stream.read_to_end(&mut buf))
         .await
-        .expect("the server answers")
-        .ok();
+        .expect("the server answers");
     let text = String::from_utf8_lossy(&buf).into_owned();
     assert!(text.starts_with("HTTP/1.1 408"), "{text}");
     assert!(text.to_ascii_lowercase().contains("connection: close"));
@@ -686,10 +685,9 @@ async fn a_body_past_the_bound_or_the_time_is_cut() {
     stream.write_all(b"0123456789").await.unwrap();
     stream.shutdown().await.unwrap();
     let mut buf = Vec::new();
-    tokio::time::timeout(Duration::from_secs(30), stream.read_to_end(&mut buf))
+    let _ = tokio::time::timeout(Duration::from_secs(30), stream.read_to_end(&mut buf))
         .await
-        .expect("the connection ends")
-        .ok();
+        .expect("the connection ends");
     let text = String::from_utf8_lossy(&buf).into_owned();
     assert!(
         text.is_empty() || text.starts_with("HTTP/1.1 400"),

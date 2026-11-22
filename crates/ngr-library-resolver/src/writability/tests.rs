@@ -184,6 +184,10 @@ mod unix {
     }
 
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "libc FFI with no safe std equivalent: `geteuid` reads the effective user id (ADR-502)"
+    )]
     fn untrusted_owner_is_found() {
         // The same tree under the system policy alone: the fixtures belong to the test user,
         // which is not root unless the test runs as root.

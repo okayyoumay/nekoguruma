@@ -53,6 +53,10 @@ impl Drop for TempDir {
 }
 
 #[test]
+#[expect(
+    unsafe_code,
+    reason = "`std::env::set_var`/`remove_var` are unsafe (edition 2024) and have no safe form (ADR-502)"
+)]
 fn a_definition_runs_end_to_end_through_the_j2534_worker() {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

@@ -490,6 +490,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-498](ADR-498-the-linux-device-mode-key-is-a-systemd-credential-only-an-administrator-provisions.md) | The Linux Device-Mode Key Is a systemd Credential Only an Administrator Provisions | Accepted | design 6.4, 6.7, `crates/agent` (`identity::systemd_credential`, `identity::provision`, `ngr-agent provision-key`), `packaging/systemd`; details ADR-459 item 4 and refines ADR-460 items 4, 5 and 7 |
 | [ADR-499](ADR-499-an-uploader-that-ends-on-its-own-leaves-the-control-session-running-and-an-upload-ledger-that-cannot-open-ends-connect-at-start.md) | An Uploader That Ends on Its Own Leaves the Control Session Running, and an Upload Ledger That Cannot Open Ends `connect` at Start | Accepted | design 5.2, `crates/agent` (`connect`, `uploader`, `upload_ledger`); details ADR-493 item 10 |
 | [ADR-500](ADR-500-the-server-stores-a-jobs-ir-documents-by-their-sha-256-through-a-put-route-for-a-worker.md) | The Server Stores a Job's IR Documents by Their SHA-256 Through a PUT Route for a Worker | Accepted | design 6.8, 8.2.6, 11.1, 14.3, `crates/server` (`documents`, `storage`), `db/`, `api/openapi.yaml`; extends ADR-454 and ADR-492; the writer ADR-497 leaves |
+| [ADR-502](ADR-502-lints-are-set-once-for-the-workspace-and-added-in-stages.md) | Lints Are Set Once for the Workspace and Added in Stages | Accepted | `Cargo.toml` (`[workspace.lints]`), every crate's `[lints]`, `CLAUDE.md` ("Rust code"), `.claude/agents/implementer.md`, `.claude/skills/pr-review-loop/SKILL.md`, `.github/` review guidelines, `docs/worker-crates.md` |
 
 ## Status Legend
 
@@ -883,6 +884,7 @@ the predecessor repository these ADRs came from.
 - ADR-464
 - ADR-482
 - ADR-490
+- ADR-502
 
 ### Timestamps / Clock
 - ADR-057 (amended by ADR-102)

@@ -44,7 +44,7 @@ struct Answer {
 }
 
 /// The download route of one server.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Downloads {
     client: Client,
     origin: ServerOrigin,

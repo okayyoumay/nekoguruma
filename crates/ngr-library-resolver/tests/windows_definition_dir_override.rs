@@ -11,6 +11,10 @@ use j2534_0404_registry::RegistryViewMode;
 use ngr_library_resolver::j2534_0404::{self, Source};
 
 #[test]
+#[expect(
+    unsafe_code,
+    reason = "`std::env::set_var`/`remove_var` are unsafe (edition 2024) and have no safe form (ADR-502)"
+)]
 fn the_runtime_override_replaces_the_registry() {
     const NAME: &str = "__ngr_windows_override_only__";
     let dir = tempfile::tempdir().expect("create temp dir");

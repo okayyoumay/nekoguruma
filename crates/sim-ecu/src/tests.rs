@@ -2370,7 +2370,7 @@ fn a_restored_ecu_keeps_its_faults_and_counters() {
 fn restore_brings_back_every_field() {
     let clock = ManualClock::default();
     clock.advance(ms(1_000));
-    let mut ecu = SimEcu::with_clock(config(), clock.clone());
+    let mut ecu = SimEcu::with_clock(config(), clock);
     // Every field away from its power-up value.
     ecu.config.drop_at_block = Some(9);
     ecu.session = Session::Programming;

@@ -352,6 +352,12 @@ pub struct Server {
     job_expiry: Option<job_expiry::Settings>,
 }
 
+impl std::fmt::Debug for Server {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Server").finish_non_exhaustive()
+    }
+}
+
 impl Server {
     /// Connects to the database (within the connect timeout), applies the migrations (within
     /// [`db::MIGRATION_TIMEOUT`]), makes the instruction key ready ([`InstructionKey::open`]),

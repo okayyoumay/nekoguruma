@@ -26,6 +26,12 @@ pub type VciServerHandle = tokio::task::JoinHandle<Result<(), tonic::transport::
 #[derive(Clone)]
 pub struct AuthKey(std::sync::Arc<tokio::sync::RwLock<Option<[u8; 32]>>>);
 
+impl std::fmt::Debug for AuthKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AuthKey(<redacted>)")
+    }
+}
+
 impl Default for AuthKey {
     fn default() -> Self {
         Self(std::sync::Arc::new(tokio::sync::RwLock::new(None)))
@@ -100,6 +106,12 @@ pub struct VciServerContext {
     auth_key: AuthKey,
 }
 
+impl std::fmt::Debug for VciServerContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VciServerContext").finish_non_exhaustive()
+    }
+}
+
 impl JsonRpcContext for VciServerContext {
     async fn shutdown(self) {
         info!("shutting down gRPC server");
@@ -121,6 +133,7 @@ impl JsonRpcHandler for VciServerContext {
 }
 
 /// Identity of a running service instance, used to look up configuration.
+#[derive(Debug)]
 pub struct ServiceIdentity {
     /// API family name: `"iso22900"` or `"j2534-0404"`.
     pub api_name: &'static str,

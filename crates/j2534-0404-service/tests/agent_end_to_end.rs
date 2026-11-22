@@ -253,6 +253,10 @@ fn read_dtc_job() -> Job {
 }
 
 #[test]
+#[expect(
+    unsafe_code,
+    reason = "`std::env::set_var`/`remove_var` are unsafe (edition 2024) and have no safe form (ADR-502)"
+)]
 fn agent_job_reads_the_vin_from_sim_vci() {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

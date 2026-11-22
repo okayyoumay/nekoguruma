@@ -644,6 +644,12 @@ pub struct WorkerHost<C: WorkerApi> {
     stream_failed: Option<HostError>,
 }
 
+impl<C: WorkerApi> std::fmt::Debug for WorkerHost<C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkerHost").finish_non_exhaustive()
+    }
+}
+
 /// The link that is open on the worker: the client it was opened on and its handles.
 #[derive(Clone)]
 pub(crate) struct OpenOn<C> {
@@ -5792,7 +5798,7 @@ mod tests {
             },
             LinkConfig {
                 tx_id: 0x18DA_10F1,
-                ..good.clone()
+                ..good
             },
         ] {
             assert!(
@@ -6560,7 +6566,7 @@ mod tests {
                 expectation: crate::send_receive::Expectation {
                     sid: progress.sid,
                     positive: progress.positive_prefix.clone(),
-                    negative: progress.negative.clone(),
+                    negative: progress.negative,
                 },
                 seq: Some(1),
                 exchange: Some(1),
@@ -8282,7 +8288,7 @@ mod tests {
                 expectation: crate::send_receive::Expectation {
                     sid: progress.sid,
                     positive: progress.positive_prefix.clone(),
-                    negative: progress.negative.clone(),
+                    negative: progress.negative,
                 },
                 seq: Some(1),
                 exchange: Some(1),
@@ -8404,7 +8410,7 @@ mod tests {
                 expectation: crate::send_receive::Expectation {
                     sid: progress.sid,
                     positive: progress.positive_prefix.clone(),
-                    negative: progress.negative.clone(),
+                    negative: progress.negative,
                 },
                 seq: Some(seq),
                 exchange: Some(seq),
@@ -8747,7 +8753,7 @@ mod tests {
                 expectation: crate::send_receive::Expectation {
                     sid: progress.sid,
                     positive: progress.positive_prefix.clone(),
-                    negative: progress.negative.clone(),
+                    negative: progress.negative,
                 },
                 seq: Some(1),
                 exchange: Some(1),
@@ -8798,7 +8804,7 @@ mod tests {
             expectation: crate::send_receive::Expectation {
                 sid: progress.sid,
                 positive: progress.positive_prefix.clone(),
-                negative: progress.negative.clone(),
+                negative: progress.negative,
             },
             seq: Some(seq),
             exchange: Some(seq),
@@ -9025,7 +9031,7 @@ mod tests {
                     expectation: crate::send_receive::Expectation {
                         sid: progress.sid,
                         positive: progress.positive_prefix.clone(),
-                        negative: progress.negative.clone(),
+                        negative: progress.negative,
                     },
                     seq: Some(seq),
                     exchange: Some(seq),

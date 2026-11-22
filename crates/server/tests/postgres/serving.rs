@@ -210,6 +210,14 @@ async fn the_listener_is_on_loopback_and_health_is_200() {
     s.finish().await;
 }
 
+/// ADR-504 item 5: while the server listens, no other socket can take its address.
+#[tokio::test]
+async fn the_listener_shares_its_address_with_nobody() {
+    let s = Running::start().await;
+    crate::listener_probe::assert_unshared(s.addr).await;
+    s.finish().await;
+}
+
 #[tokio::test]
 async fn health_is_503_when_the_database_is_down_and_200_when_it_is_up() {
     let mut pg = TestPostgres::start();

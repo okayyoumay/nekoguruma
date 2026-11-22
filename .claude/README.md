@@ -67,7 +67,8 @@ Every agent spawn starts cold and re-reads context, so match the pipeline to the
 1. **Small** (one file, or a question answered by one or two targeted reads): do it inline. No
    agents.
 2. **Medium** (a few files in one crate, clear scope): the main session plans and reviews;
-   `implementer` edits, `cargo-runner` verifies, `doc-sync-checker` audits before commit.
+   `implementer` edits, `cargo-runner` verifies, `doc-sync-checker` audits before commit (and,
+   in `pr-review-loop`, the whole diff before the first review request, ADR-503).
 3. **Large** (several crates, a new subsystem, or unclear scope): as Medium, plus `scope-shaper`
    first when the request is genuinely fuzzy, `code-scout` for the fan-out search, and
    `edge-case-hunter` before commit.

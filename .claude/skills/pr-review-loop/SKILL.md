@@ -28,8 +28,8 @@ kinds that recur", below) over the whole diff, and take what it fixes through St
 before pushing it. Also run `doc-sync-checker` over the whole diff (`git diff
 origin/main...HEAD`), giving it the PR description and the branch's commit messages, which are
 not in the diff, and fix what it reports before the request: a missing ADR or a document left
-stale is otherwise the first round's finding. Step 3's check 3 still runs it on each round's
-fix. Then make the first request: Step 4's re-request rule governs only rounds
+stale is otherwise the first round's finding (ADR-503). Step 3's check 3 still runs it on each
+round's fix. Then make the first request: Step 4's re-request rule governs only rounds
 after a review, so a push of sweep fixes never skips the first review. The reviewer is Codex until a case below switches the PR
 to Copilot; from then on it stays Copilot for the rest of the PR. Never switch back, and never ask
 both: each reviewer reads the whole diff again from scratch, so a second reviewer on the same PR

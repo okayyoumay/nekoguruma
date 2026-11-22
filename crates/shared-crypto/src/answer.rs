@@ -174,6 +174,24 @@ mod tests {
 
     const AGENT: &str = "3f1c2a52-6a0e-4c0d-9d3e-0a1b2c3d4e5f";
 
+    /// A nonce made fresh for the test run, as the agent makes one per request; the same value
+    /// for every call within the run, so two transcripts built from it compare equal.
+    fn nonce() -> [u8; 32] {
+        static NONCE: std::sync::LazyLock<[u8; 32]> =
+            std::sync::LazyLock::new(|| crate::random_32().unwrap());
+        *NONCE
+    }
+
+    /// Another fresh nonce, different from [`nonce`].
+    fn other_nonce() -> [u8; 32] {
+        loop {
+            let n = crate::random_32().unwrap();
+            if n != nonce() {
+                return n;
+            }
+        }
+    }
+
     fn aud(text: &str) -> Audience {
         Audience::canonicalise(text).unwrap()
     }
@@ -182,7 +200,7 @@ mod tests {
         AnswerTranscript::new(
             &aud("http://127.0.0.1:8080"),
             AGENT,
-            [1; 32],
+            nonce(),
             "POST",
             "/api/v1/agent/session",
             [2; 32],
@@ -203,29 +221,29 @@ mod tests {
             n(
                 &aud("http://127.0.0.1:8081"),
                 AGENT,
-                [1; 32],
+                nonce(),
                 "POST",
                 t,
                 [2; 32],
                 200,
                 [3; 32],
             ),
-            n(&a, "other", [1; 32], "POST", t, [2; 32], 200, [3; 32]),
-            n(&a, AGENT, [9; 32], "POST", t, [2; 32], 200, [3; 32]),
-            n(&a, AGENT, [1; 32], "GET", t, [2; 32], 200, [3; 32]),
+            n(&a, "other", nonce(), "POST", t, [2; 32], 200, [3; 32]),
+            n(&a, AGENT, other_nonce(), "POST", t, [2; 32], 200, [3; 32]),
+            n(&a, AGENT, nonce(), "GET", t, [2; 32], 200, [3; 32]),
             n(
                 &a,
                 AGENT,
-                [1; 32],
+                nonce(),
                 "POST",
                 "/api/v1/agent/uploads",
                 [2; 32],
                 200,
                 [3; 32],
             ),
-            n(&a, AGENT, [1; 32], "POST", t, [9; 32], 200, [3; 32]),
-            n(&a, AGENT, [1; 32], "POST", t, [2; 32], 409, [3; 32]),
-            n(&a, AGENT, [1; 32], "POST", t, [2; 32], 200, [9; 32]),
+            n(&a, AGENT, nonce(), "POST", t, [9; 32], 200, [3; 32]),
+            n(&a, AGENT, nonce(), "POST", t, [2; 32], 409, [3; 32]),
+            n(&a, AGENT, nonce(), "POST", t, [2; 32], 200, [9; 32]),
         ]
     }
 
@@ -241,7 +259,7 @@ mod tests {
         let t = AnswerTranscript::new(
             &aud("http://ab"),
             "c",
-            [1; 32],
+            nonce(),
             "GET",
             "/x?y=1",
             [2; 32],
@@ -255,7 +273,7 @@ mod tests {
         want.extend(b"http://ab");
         want.extend(1u32.to_be_bytes());
         want.extend(b"c");
-        want.extend([1u8; 32]);
+        want.extend(nonce());
         want.extend(3u32.to_be_bytes());
         want.extend(b"GET");
         want.extend(6u32.to_be_bytes());
@@ -291,7 +309,7 @@ mod tests {
     fn field_boundaries_are_unambiguous() {
         let a = aud("http://ab");
         let mk = |id: &str, m: &str, t: &str| {
-            AnswerTranscript::new(&a, id, [0; 32], m, t, [0; 32], 200, [0; 32]).unwrap()
+            AnswerTranscript::new(&a, id, nonce(), m, t, [0; 32], 200, [0; 32]).unwrap()
         };
         assert_ne!(
             mk("ab", "GET", "/c").encode(),
@@ -315,7 +333,7 @@ mod tests {
     fn bounds_are_refused() {
         let a = aud("http://127.0.0.1:8080");
         let mk = |id: &str, m: &str, t: &str| {
-            AnswerTranscript::new(&a, id, [0; 32], m, t, [0; 32], 200, [0; 32])
+            AnswerTranscript::new(&a, id, nonce(), m, t, [0; 32], 200, [0; 32])
         };
         let field = |f| Err(TranscriptError::BadField { field: f });
         assert_eq!(mk("", "GET", "/"), field("agent_id"));

@@ -8,10 +8,10 @@
 
 `.claude/README.md`'s medium and large pipelines have `doc-sync-checker` audit a change before it
 is committed, but `pr-review-loop` named the agent only in Step 3, for the fix of each review
-round. In the backlog loop of 2026-11-20 it ran before no first review request, and on two pull
-requests (#616 and #623) the reviewer's first round raised that an ADR was missing, each costing
-a round. Run afterwards on those diffs, the agent reported both missing ADRs; on a third (#622),
-which needed none, it reported none. The maintainer approved the change on 2026-11-22.
+round. So a pull request reached its first review with no documentation audit, and a missing ADR
+or a stale document became the reviewer's first finding and cost a round, although the agent
+reports exactly that kind of gap when it is run on the same diff. The maintainer approved the
+change on 2026-11-22.
 
 ## Decision
 

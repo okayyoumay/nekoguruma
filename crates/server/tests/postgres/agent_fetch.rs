@@ -1,9 +1,9 @@
 //! `ngr-agent debug fetch` against a real local-profile server and the bundled RustFS (design
 //! 14.3, ADR-497): a registered agent asks the download route for a document its job's signed
 //! instruction names, and the file it caches is byte-identical to the object that was uploaded.
-//! The object is seeded as the later writer of `ir_documents` must (begin, PUT the parts,
-//! `complete`, which reads it back) and given its row by SQL; the job row holds an instruction
-//! signed by the server's key, which the agent verifies with the key its record holds.
+//! The document is stored through the server's own route (`PUT /api/v1/documents/{sha256}`,
+//! ADR-500) by a worker of the agent's tenant; the job row holds an instruction signed by the
+//! server's key, which the agent verifies with the key its record holds.
 //!
 //! A release agent has no plain-file key store and no debug command, so this module is compiled
 //! in debug builds only. The test needs `NGR_TEST_RUSTFS_BIN` (`scripts/fetch-rustfs.sh`).
@@ -16,13 +16,14 @@ use std::time::Duration;
 use server::Server;
 use server::config::Http;
 use server::storage::{MultipartStore, S3Store, S3Tuning};
-use server::uploads::{Backend, PART_BYTES};
+use server::uploads::Backend;
 use shared_proto::{AgentId, INSTRUCTION_VERSION, JobId, JobInstruction, JobKind, VciId};
 
 use crate::agent_register::{AgentEnv, fingerprint, run, text};
+use crate::documents::{Operator, document_of, operator_at, put_document};
 use crate::redeem::World;
 use crate::serving::Running;
-use crate::storage::{content, put, sha256};
+use crate::storage::sha256;
 use crate::uploads::{hex, v4};
 
 /// A registered agent, a server over the real object server, and what is needed to fetch.
@@ -32,9 +33,10 @@ struct Fixture {
     real: server::object_server::ObjectServer,
     /// Owns the object server's data directory, which must outlive it.
     _object: crate::object_server_rustfs::Real,
-    store: Arc<S3Store>,
     env: AgentEnv,
     agent_id: String,
+    /// A worker of the agent's tenant with an empty scope, who stores the documents.
+    worker: Operator,
 }
 
 impl Fixture {
@@ -65,6 +67,7 @@ impl Fixture {
         let server = Server::bind_with_store(&http, world.pg.pool(), world.key.clone(), backend)
             .await
             .unwrap();
+        let sessions = server.operator_sessions();
         let server = Running::spawn(server);
         let env = AgentEnv::new();
         let fingerprint = fingerprint(&env).await;
@@ -87,14 +90,23 @@ impl Fixture {
         let output = run(env.command(&args), issued.code.as_str().to_owned()).await;
         assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
         let agent_id = world.sql("SELECT id::text FROM agents").await;
+        let tenant = world.sql("SELECT tenant_id::text FROM agents").await;
+        let worker = operator_at(
+            &world.pool,
+            &sessions,
+            &tenant,
+            "wanda",
+            &[("worker", "{}")],
+        )
+        .await;
         Fixture {
             world,
             server,
             real,
             _object: object,
-            store,
             env,
             agent_id,
+            worker,
         }
     }
 
@@ -104,30 +116,11 @@ impl Fixture {
         self.world.finish().await;
     }
 
-    /// Uploads `bytes` to the store as an object that was read back, and gives the agent's
-    /// tenant a document row for its digest.
-    async fn seed_document(&self, bytes: &[u8]) {
-        let upload = self.store.begin().await.unwrap();
-        for (i, chunk) in bytes.chunks(PART_BYTES as usize).enumerate() {
-            let url = self.store.presign_part(&upload, (i + 1) as u16).unwrap();
-            let (status, _) = put(url.expose(), chunk.to_vec()).await;
-            assert_eq!(status, 200);
-        }
-        self.store
-            .complete(&upload, sha256(bytes), bytes.len() as u64)
-            .await
-            .unwrap();
-        sqlx::query(
-            "INSERT INTO ir_documents (tenant_id, digest, extension_id, schema_version, \
-                 variant_name, source_format, storage_key) \
-             SELECT tenant_id, $2, 'ext', 1, 'variant', 'odx', $3 FROM agents WHERE id = $1::uuid",
-        )
-        .bind(&self.agent_id)
-        .bind(hex(&sha256(bytes)))
-        .bind(upload.key.as_str())
-        .execute(&self.world.pool)
-        .await
-        .unwrap();
+    /// Stores `bytes` through the document route: the store reads the object back, and the
+    /// agent's tenant gets its row.
+    async fn store_document(&self, bytes: &[u8]) {
+        let r = put_document(self.server.addr, &self.worker.cookie, bytes).await;
+        assert_eq!(r.status, 201, "{} {}", r.head, r.body);
     }
 
     /// A job of the agent's owner naming `documents`, signed by the server's key; returns the
@@ -204,11 +197,11 @@ impl Fixture {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn an_agent_fetches_a_seeded_document_byte_identical_and_a_revoked_agent_is_refused() {
+async fn an_agent_fetches_a_stored_document_byte_identical_and_a_revoked_agent_is_refused() {
     let fx = Fixture::new().await;
-    let bytes = content(5, 300_000);
+    let bytes = document_of(300_000);
     let digest = sha256(&bytes);
-    fx.seed_document(&bytes).await;
+    fx.store_document(&bytes).await;
     let job = fx.job_naming(vec![digest]).await;
 
     let output = fx.fetch(&job, &digest).await;

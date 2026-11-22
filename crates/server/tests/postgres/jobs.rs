@@ -36,6 +36,8 @@ use crate::session::{audience_of, get_challenge, proof, send_session, session_bo
 
 const DIGEST_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const DIGEST_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+/// A digest no tenant of these tests holds unless a test gives it one.
+const DIGEST_C: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 const VIN: &str = "1HGCM82633A004352";
 const VIN_2: &str = "WVWZZZ1JZXW000001";
 const CLEARED: &str = "ngr_session=; Max-Age=0; Path=/; HttpOnly; SameSite=Strict";
@@ -136,7 +138,11 @@ fn job_id(r: &Reply) -> String {
 // The world
 
 /// A migrated database with the local users `alice` (role worker, the agent's owner) and a
-/// registered agent, and a server on it.
+/// registered agent, and a server on it. The agent's tenant holds the IR documents `DIGEST_A` and
+/// `DIGEST_B` and the artifact `DIGEST_B` (ADR-501), given their rows by SQL: those digests name
+/// no real document, and the route that stores one (ADR-500) writes an audit row these tests
+/// would count. The server has the upload tests' fake store, so a test can store a real document
+/// through that route.
 struct Lab {
     w: World,
     agent: Agent,
@@ -162,6 +168,50 @@ pub(crate) async fn add_user(
         .operator_id
 }
 
+/// The upload tests' store with no real store behind it: a document stored through the route is
+/// read back as matching and keeps no bytes.
+fn fake_store() -> server::uploads::Backend {
+    let store: Arc<dyn server::MultipartStore> = Arc::new(crate::uploads::Wrap::default());
+    server::uploads::Backend::new(Some(store))
+}
+
+/// Gives the agent's tenant the rows that make the IR documents `DIGEST_A` and `DIGEST_B` and the
+/// artifact `DIGEST_B` stored.
+pub(crate) async fn hold_named(pool: &sqlx::PgPool, agent_id: &str) {
+    let tenant: String =
+        sqlx::query_scalar("SELECT tenant_id::text FROM agents WHERE id = $1::uuid")
+            .bind(agent_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    hold(pool, &tenant, &[DIGEST_A, DIGEST_B], &[DIGEST_B]).await;
+}
+
+/// Gives `tenant` a row for each of `documents` in `ir_documents` and each of `artifacts` in
+/// `artifacts`, each with a storage key of its own, so that a job may name them (ADR-501).
+async fn hold(pool: &sqlx::PgPool, tenant: &str, documents: &[&str], artifacts: &[&str]) {
+    sqlx::query(
+        "INSERT INTO ir_documents (tenant_id, digest, extension_id, schema_version, \
+             variant_name, source_format, storage_key) \
+         SELECT $1::uuid, d, 'ext', 1, 'variant', 'odx', gen_random_uuid()::text \
+         FROM unnest($2::text[]) AS d",
+    )
+    .bind(tenant)
+    .bind(documents)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO artifacts (tenant_id, digest, size_bytes, storage_key) \
+         SELECT $1::uuid, d, 1, gen_random_uuid()::text FROM unnest($2::text[]) AS d",
+    )
+    .bind(tenant)
+    .bind(artifacts)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
 fn http() -> Http {
     Http {
         port: 0,
@@ -180,7 +230,8 @@ impl Lab {
         add_user(&w.pool, "alice", &["worker"], &hash).await;
         let agent = Agent::new();
         let agent_id = w.register(&agent).await;
-        let server = Server::bind(&http(), w.pg.pool(), w.key.clone())
+        hold_named(&w.pool, &agent_id).await;
+        let server = Server::bind_with_store(&http(), w.pg.pool(), w.key.clone(), fake_store())
             .await
             .unwrap();
         let server = match queue {
@@ -201,9 +252,10 @@ impl Lab {
 
     /// Another server on the same database, with its own pool and session table.
     async fn another_server(&mut self) -> SocketAddr {
-        let server = Server::bind(&http(), self.w.pg.pool(), self.w.key.clone())
-            .await
-            .unwrap();
+        let server =
+            Server::bind_with_store(&http(), self.w.pg.pool(), self.w.key.clone(), fake_store())
+                .await
+                .unwrap();
         let running = Running::spawn(server);
         let addr = running.addr;
         self.more.push(running);
@@ -215,7 +267,8 @@ impl Lab {
     }
 
     /// A worker of a second tenant with an agent that lists the worker, and a session of the
-    /// worker; the session's cookie, the agent's ID and the tenant's ID. The login route serves
+    /// worker; the session's cookie, the agent's ID and the tenant's ID. The tenant holds the
+    /// same named objects as the first. The login route serves
     /// the local tenant only, so the session is made in the table, which a login would fill the
     /// same way.
     async fn second_tenant(&self) -> (String, String, String) {
@@ -232,6 +285,7 @@ impl Lab {
         let (_, r) = self.w.redeem("bob", &agent).await;
         assert_eq!(r.status, 201, "{}", r.head);
         let agent_id = json(&r)["agentId"].as_str().unwrap().to_owned();
+        hold_named(&self.w.pool, &agent_id).await;
         let token = random_32().unwrap();
         self.operator_sessions.establish(
             &[],
@@ -2383,5 +2437,155 @@ async fn an_expired_job_frees_its_vehicle_and_its_replay_shows_expired_with_no_f
     let second = job_id(&lab.post(&cookie, "k2", &next).await);
     assert_eq!(lab.locks().await, format!("{VIN}>{second}"));
     lab.assert_one_audit_per_job("E6").await;
+    lab.finish().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// What a job names must be stored (ADR-501)
+
+/// The answer is a 422 with `code`, and no job, audit row or vehicle lock was written.
+async fn assert_not_stored(lab: &Lab, r: &Reply, code: &str, what: &str) {
+    assert_problem(r, 422, what);
+    assert_eq!(json(r)["code"], code, "{what}");
+    for digest in [DIGEST_A, DIGEST_B, DIGEST_C] {
+        assert!(
+            !r.body.contains(digest),
+            "{what}: the problem names no digest"
+        );
+    }
+    lab.assert_jobs(0, what).await;
+    lab.assert_audits(0, what).await;
+    assert_eq!(
+        lab.w.sql("SELECT count(*) FROM vehicle_locks").await,
+        "0",
+        "{what}"
+    );
+}
+
+#[tokio::test]
+async fn a_job_naming_a_document_or_an_artifact_its_tenant_does_not_hold_is_a_422_with_its_code() {
+    let lab = Lab::new().await;
+    let cookie = lab.login("alice").await;
+    let (_, _, tenant_2) = lab.second_tenant().await;
+    // DIGEST_C is a document and an artifact of the second tenant only: the check is per tenant.
+    hold(&lab.w.pool, &tenant_2, &[DIGEST_C], &[DIGEST_C]).await;
+    for (what, extra, code) in [
+        (
+            "one of two documents",
+            json!({ "vin": VIN, "irDigests": [DIGEST_A, DIGEST_C] }),
+            "DOCUMENT_NOT_STORED",
+        ),
+        (
+            "the only document",
+            json!({ "vin": VIN, "irDigests": [DIGEST_C], "artifactDigest": DIGEST_B }),
+            "DOCUMENT_NOT_STORED",
+        ),
+        (
+            "the artifact",
+            json!({ "vin": VIN, "artifactDigest": DIGEST_C }),
+            "ARTIFACT_NOT_STORED",
+        ),
+        (
+            // A digest stored as a document is not an artifact: the tables are apart.
+            "a document named as the artifact",
+            json!({ "vin": VIN, "artifactDigest": DIGEST_A }),
+            "ARTIFACT_NOT_STORED",
+        ),
+        (
+            // The documents are judged first.
+            "both",
+            json!({ "vin": VIN, "irDigests": [DIGEST_C], "artifactDigest": DIGEST_C }),
+            "DOCUMENT_NOT_STORED",
+        ),
+    ] {
+        let r = lab.post(&cookie, "k", &lab.body(extra)).await;
+        assert_not_stored(&lab, &r, code, what).await;
+    }
+    // The key is unbound: the same key creates the job once what it names is stored.
+    let good = lab.body(json!({
+        "vin": VIN,
+        "irDigests": [DIGEST_B, DIGEST_A],
+        "artifactDigest": DIGEST_B,
+    }));
+    job_id(&lab.post(&cookie, "k", &good).await);
+    lab.assert_one_audit_per_job("stored").await;
+    lab.finish().await;
+}
+
+#[tokio::test]
+async fn the_store_check_answers_after_the_permission_and_the_deadline_and_before_the_key() {
+    let lab = Lab::new().await;
+    lab.user("viewer", &["viewer"]).await;
+    let cookie = lab.login("alice").await;
+    let viewer = lab.login("viewer").await;
+    let unstored = json!({ "irDigests": [DIGEST_C] });
+    // No permission is a 403 whatever the job names.
+    assert_problem(
+        &lab.post(&viewer, "k", &lab.body(unstored.clone())).await,
+        403,
+        "permission",
+    );
+    // A deadline out of its bounds is answered before the store.
+    let now = db_seconds(&lab).await;
+    let late = json!({ "irDigests": [DIGEST_C], "startDeadline": utc(&lab, now + 10).await });
+    let r = lab.post(&cookie, "k", &lab.body(late)).await;
+    assert_problem(&r, 422, "deadline");
+    assert_eq!(json(&r)["code"], "START_DEADLINE_OUT_OF_BOUNDS");
+    // An instruction key that is not the active one is judged after the store.
+    lab.exec("UPDATE instruction_keys SET retired_at = now()")
+        .await;
+    let r = lab.post(&cookie, "k", &lab.body(unstored)).await;
+    assert_not_stored(&lab, &r, "DOCUMENT_NOT_STORED", "before the key").await;
+    assert_problem(
+        &lab.post(&cookie, "k", &lab.body(json!({}))).await,
+        503,
+        "the key",
+    );
+    lab.assert_jobs(0, "refusals").await;
+    lab.finish().await;
+}
+
+#[tokio::test]
+async fn a_replay_is_answered_before_the_store_check() {
+    // ADR-477 item 5: a replay is of a job created once; what it named is not judged again.
+    let lab = Lab::new().await;
+    let cookie = lab.login("alice").await;
+    let body = lab.body(json!({ "artifactDigest": DIGEST_B }));
+    let first = lab.post(&cookie, "k", &body).await;
+    job_id(&first);
+    // Nothing deletes these rows; a test may, as the superuser, to show the order.
+    lab.exec("DELETE FROM ir_documents; DELETE FROM artifacts")
+        .await;
+    let again = lab.post(&cookie, "k", &body).await;
+    assert_eq!(normalized(&again), normalized(&first));
+    // A new key is a creation, and is judged.
+    let r = lab.post(&cookie, "k-2", &body).await;
+    assert_problem(&r, 422, "new key");
+    assert_eq!(json(&r)["code"], "DOCUMENT_NOT_STORED");
+    lab.assert_jobs(1, "one job").await;
+    lab.finish().await;
+}
+
+#[tokio::test]
+async fn a_document_stored_through_the_route_can_be_named_by_a_job() {
+    let lab = Lab::new().await;
+    let cookie = lab.login("alice").await;
+    let bytes = crate::documents::doc("job");
+    let digest = crate::documents::name_of(&bytes);
+    let body = lab.body(json!({ "irDigests": [digest] }));
+    let r = lab.post(&cookie, "k", &body).await;
+    assert_problem(&r, 422, "before the store");
+    assert_eq!(json(&r)["code"], "DOCUMENT_NOT_STORED");
+    let stored = crate::documents::put_document(lab.addr(), &cookie, &bytes).await;
+    assert_eq!(stored.status, 201, "{} {}", stored.head, stored.body);
+    let id = job_id(&lab.post(&cookie, "k", &body).await);
+    assert_eq!(
+        lab.w
+            .sql(&format!(
+                "SELECT array_to_string(ir_digests, ',') FROM jobs WHERE id = '{id}'"
+            ))
+            .await,
+        digest
+    );
     lab.finish().await;
 }

@@ -1,7 +1,7 @@
 # ADR-487: The Server Ends a Received Job Past Its Start Deadline as Expired and Frees Its Vehicle Lock
 
 **Date:** 2026-11-17
-**Status:** Accepted
+**Status:** Accepted (item 7's order gains the store check between the bounds and the key, ADR-501)
 **Affects:** design 5.3, 8.8, 12; `api/openapi.yaml` (`POST /v1/jobs`, `JobRequest`, `Job`); `crates/server` (`job_expiry`, `jobs`, `db`, `agent_events`, `job_queue`, `lib`), `crates/server/docs/ngr-server.md`; annotates ADR-476 item 3, ADR-477 items 2 and 6 and ADR-480 item 4
 
 ## Context

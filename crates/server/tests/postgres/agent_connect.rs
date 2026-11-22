@@ -34,7 +34,7 @@ use shared_proto::{
 use tokio::sync::mpsc::Receiver;
 
 use crate::agent_register::{AgentEnv, fingerprint, run, text};
-use crate::jobs::{add_user, login, password, post_to};
+use crate::jobs::{add_user, hold_named, login, password, post_to};
 use crate::redeem::World;
 use crate::serving::Running;
 
@@ -652,6 +652,8 @@ async fn a_job_created_through_the_route_is_accepted_and_acknowledged_by_the_age
     f.wait_connected(Some(&mut agent), true).await;
     let addr = f.server.as_ref().unwrap().addr;
     let cookie = login(addr, "alice").await;
+    // The job names documents its tenant holds (ADR-501).
+    hold_named(&f.world.pool, &f.agent_id).await;
     let body = serde_json::json!({
         "kind": "acquire",
         "agentId": f.agent_id,

@@ -39,6 +39,11 @@ impl Reply {
     }
 }
 
+/// The `Host` header line of a request to the server at `addr`.
+pub(crate) fn host_header(addr: std::net::SocketAddr) -> String {
+    format!("Host: 127.0.0.1:{}", addr.port())
+}
+
 /// Sends `raw` (a full request head ending in a blank line, plus any body) and reads the answer
 /// until the server closes the connection.
 pub(crate) async fn exchange(addr: std::net::SocketAddr, raw: &str) -> Reply {
@@ -158,7 +163,7 @@ impl Running {
     }
 
     pub(crate) fn host(&self) -> String {
-        format!("Host: 127.0.0.1:{}", self.addr.port())
+        host_header(self.addr)
     }
 
     /// Sends the first stop signal and returns at once, without waiting for the listener to

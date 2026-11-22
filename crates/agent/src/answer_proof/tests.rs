@@ -63,6 +63,16 @@ fn every_way_an_answer_differs_from_the_one_proved_is_not_proved() {
     let proof = proof_of(&p, nonce);
     let other = pair();
     let other_nonce = shared_crypto::random_32().unwrap();
+    let another_agent = Verifier {
+        key: p.verifier.key,
+        audience: p.verifier.audience.clone(),
+        agent_id: "0194f0a2-7c3e-7d11-8a52-3f6f9b1c2d4f".to_owned(),
+    };
+    let another_audience = Verifier {
+        key: p.verifier.key,
+        audience: Audience::parse_canonical("http://127.0.0.1:8081").unwrap(),
+        agent_id: AGENT_ID.to_owned(),
+    };
     let cases: Vec<(&str, bool)> = vec![
         (
             "missing",
@@ -78,6 +88,14 @@ fn every_way_an_answer_differs_from_the_one_proved_is_not_proved() {
             "another nonce",
             p.verifier
                 .proved(&sent(other_nonce), 200, ANSWER, Some(&proof)),
+        ),
+        (
+            "another agent ID",
+            another_agent.proved(&sent(nonce), 200, ANSWER, Some(&proof)),
+        ),
+        (
+            "another audience",
+            another_audience.proved(&sent(nonce), 200, ANSWER, Some(&proof)),
         ),
         (
             "body altered",

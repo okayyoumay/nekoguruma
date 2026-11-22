@@ -113,9 +113,10 @@ pub enum FetchError {
         /// A usable `Retry-After` (1 to 60 seconds), which lengthens the wait.
         retry_after_secs: Option<u32>,
     },
-    /// The exchange was refused (403 or 429 from the session route): the server will not have
-    /// this agent for now, and the back-off goes to its cap, as the uploader's does.
-    #[error("try again: the server refused the token exchange")]
+    /// The exchange gave no token and the back-off goes to its cap, as the uploader's does: the
+    /// session route refused (403 or 429), or its 200 was not proved by the server. It is retried
+    /// and never reported as a refusal by its class.
+    #[error("try again: the token exchange was refused or not proved")]
     ExchangeRefused,
     #[error("refused: {why}")]
     Refused {

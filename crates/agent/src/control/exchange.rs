@@ -128,7 +128,13 @@ fn value_32(text: &str) -> Option<[u8; 32]> {
 }
 
 /// One POST: the connect within its bound, the whole call within the total (`server_http`).
-async fn call(w: &Seams<'_>, path: &str, body: &[u8]) -> Result<Reply, PostError> {
+/// The body is read when the status is one of `body_statuses`.
+async fn call(
+    w: &Seams<'_>,
+    path: &str,
+    body: &[u8],
+    body_statuses: &[u16],
+) -> Result<Reply, PostError> {
     let (connect_by, deadline) = server_http::deadlines(Instant::now(), Timeouts::default());
     let stream = match dial::connect(w.dial, connect_by).await {
         Ok(stream) => stream,
@@ -144,7 +150,7 @@ async fn call(w: &Seams<'_>, path: &str, body: &[u8]) -> Result<Reply, PostError
         path,
         body: body.to_vec(),
     };
-    server_http::post_over(stream, &request, 200, deadline).await
+    server_http::post_over(stream, &request, body_statuses, deadline).await
 }
 
 /// The 200 body when the answer is JSON and within the limit.
@@ -157,7 +163,7 @@ fn json_body(reply: &Reply) -> Option<&[u8]> {
 
 /// Step B: the challenge.
 async fn challenge(w: &Seams<'_>, warn: &mut dyn Log) -> Result<[u8; 32], Fail> {
-    let reply = match call(w, CHALLENGE_PATH, &[]).await {
+    let reply = match call(w, CHALLENGE_PATH, &[], &[200]).await {
         Ok(reply) => reply,
         Err(_) => {
             warn.failure("challenge-transport", None);
@@ -225,7 +231,7 @@ pub(crate) async fn token(w: &Seams<'_>, warn: &mut dyn Log) -> Result<Token, Fa
         })
         .to_string()
         .into_bytes();
-        let reply = match call(w, SESSION_PATH, &body).await {
+        let reply = match call(w, SESSION_PATH, &body, SESSION_RESULTS).await {
             Ok(reply) => reply,
             Err(_) => {
                 warn.failure("session-transport", None);
@@ -241,12 +247,13 @@ pub(crate) async fn token(w: &Seams<'_>, warn: &mut dyn Log) -> Result<Token, Fa
                     target: SESSION_PATH,
                     body: &body,
                 };
+                // A body over the limit or cut is unproven, even if the server proved it.
                 let proved = match &reply.body {
                     Some(ReplyBody::Bytes(answer)) => {
                         w.verifier
                             .proved(&sent, status, answer, reply.proof.as_deref())
                     }
-                    _ => false,
+                    Some(ReplyBody::TooLarge | ReplyBody::Cut) | None => false,
                 };
                 if !proved {
                     warn.unproven("session-unproven", status);

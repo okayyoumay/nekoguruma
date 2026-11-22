@@ -310,6 +310,24 @@ async fn an_unproven_session_200_is_no_token_and_waits_the_cap() {
                 &text,
             )
         }),
+        ("an answer cut before its end", |p, request| {
+            let text = token_json(&value());
+            let proof = p.proof_of_request(
+                "POST",
+                SESSION_PATH,
+                None,
+                &request.body,
+                200,
+                text.as_bytes(),
+            );
+            let cut = &text[..text.len() / 2];
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nNgr-Server-Proof: {proof}\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{cut}",
+                text.len()
+            )
+            .into_bytes()
+        }),
         ("an answer over the limit", |p, request| {
             let text = format!(r#"{{"pad":"{}"}}"#, "a".repeat(70_000));
             proved_json(p, request, 200, &text)
@@ -352,7 +370,13 @@ async fn only_a_200_needs_the_proof_and_a_proved_200_of_the_wrong_shape_is_ordin
     assert_eq!(log.lines, ["uploader failure session-answer Some(200)"]);
 
     for (status, how, line) in [
-        (403u16, Fail::Cap, "uploader refusal session-refused 403"),
+        (
+            401u16,
+            Fail::Ord,
+            "uploader failure session-unauthorized Some(401)",
+        ),
+        (403, Fail::Cap, "uploader refusal session-refused 403"),
+        (429, Fail::Cap, "uploader refusal session-refused 429"),
         (
             400,
             Fail::Ord,
@@ -371,7 +395,12 @@ async fn only_a_200_needs_the_proof_and_a_proved_200_of_the_wrong_shape_is_ordin
             });
             let mut log = Uploader::default();
             assert_eq!(run(&dial, &prover, &mut log).await.unwrap_err(), how);
-            assert_eq!(log.lines, [line]);
+            if status == 401 {
+                // The first 401 asks for a new challenge.
+                assert_eq!(log.lines, ["uploader stale", line]);
+            } else {
+                assert_eq!(log.lines, [line]);
+            }
         }
     }
 }

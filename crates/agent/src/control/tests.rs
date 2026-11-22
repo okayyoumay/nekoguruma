@@ -502,14 +502,24 @@ struct Env {
 
 type Ws = WebSocketStream<DuplexStream>;
 
-/// What the upgrade request carried.
+/// What the upgrade request carried, and the proofs the fake server put on its 101.
 #[derive(Default, Clone)]
 struct Seen {
     path: String,
     headers: Vec<(String, String)>,
+    proofs: Vec<String>,
 }
 
 impl Seen {
+    /// The upgrade's nonce and the 101's proofs: values the log must not hold.
+    fn secrets(&self) -> Vec<String> {
+        self.header("ngr-nonce")
+            .into_iter()
+            .map(str::to_owned)
+            .chain(self.proofs.iter().cloned())
+            .collect()
+    }
+
     fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
@@ -799,25 +809,27 @@ impl Env {
         let (at, challenge) = self.challenge().await;
         let (_, mut stream, body) = self.session(challenge).await;
         let token = token_text();
-        self.proved_reply(&mut stream, &body, 200, &token_body(&token))
+        let server_proof = self
+            .proved_reply(&mut stream, &body, 200, &token_body(&token))
             .await;
         let secrets = ["challenge", "nonce", "proof"]
             .iter()
             .map(|name| body[name].as_str().unwrap().to_owned())
-            .chain([token.clone()])
+            .chain([token.clone(), server_proof])
             .collect();
         Exchanged { at, token, secrets }
     }
 
-    /// The answer to the session request `session`, with the server's proof of it.
+    /// The answer to the session request `session`, with the server's proof of it, which is
+    /// returned.
     async fn proved_reply(
         &self,
         stream: &mut DuplexStream,
         session: &Session,
         status: u16,
         body: &str,
-    ) {
-        proved_reply(&self.fx.prover(), stream, session, status, body).await;
+    ) -> String {
+        proved_reply(&self.fx.prover(), stream, session, status, body).await
     }
 
     /// The upgrade: the fake server accepts the WebSocket handshake, picks the subprotocol and
@@ -975,14 +987,15 @@ fn token_body(token: &str) -> String {
     format!(r#"{{"token":"{token}","expiresInSecs":3600}}"#)
 }
 
-/// A JSON answer to the session request `session` that carries the server's proof of it.
+/// A JSON answer to the session request `session` that carries the server's proof of it, which
+/// is returned.
 async fn proved_reply<S: AsyncWrite + Unpin>(
     prover: &TestProver,
     stream: &mut S,
     session: &Session,
     status: u16,
     body: &str,
-) {
+) -> String {
     let proof = prover.proof_of_request(
         "POST",
         SESSION_PATH,
@@ -1001,6 +1014,7 @@ async fn proved_reply<S: AsyncWrite + Unpin>(
         body.as_bytes(),
     )
     .await;
+    proof
 }
 
 /// The proof of the 101 for the upgrade request `request`, which carries the agent's nonce.
@@ -1046,6 +1060,7 @@ where
     )]
     let callback =
         move |request: &Request, mut response: Response| -> Result<Response, ErrorResponse> {
+            let proofs = proofs(request);
             *seen.lock().unwrap() = Seen {
                 path: request.uri().path().to_owned(),
                 headers: request
@@ -1058,12 +1073,13 @@ where
                         )
                     })
                     .collect(),
+                proofs: proofs.clone(),
             };
             response.headers_mut().insert(
                 "Sec-WebSocket-Protocol",
                 HeaderValue::from_static(CONTROL_SUBPROTOCOL),
             );
-            for proof in proofs(request) {
+            for proof in proofs {
                 response
                     .headers_mut()
                     .append("Ngr-Server-Proof", HeaderValue::from_str(&proof).unwrap());
@@ -3788,7 +3804,7 @@ fn j_the_session_reads_no_wall_clock() {
 async fn l_one_info_line_at_hello_and_one_at_the_end_and_no_secret_is_logged() {
     let mut env = Env::new();
     let exchanged = env.exchange().await;
-    let (_, mut ws, _) = env.upgrade().await;
+    let (_, mut ws, seen) = env.upgrade().await;
     send(&mut ws, &hello(10)).await;
     env.wait_phase(Phase::Connected).await;
     send(&mut ws, &job_command("command-id-that-must-not-be-logged")).await;
@@ -3809,7 +3825,8 @@ async fn l_one_info_line_at_hello_and_one_at_the_end_and_no_secret_is_logged() {
             .count(),
         1
     );
-    for secret in exchanged.secrets.iter().map(String::as_str).chain([
+    let secrets = [exchanged.secrets, seen.secrets()].concat();
+    for secret in secrets.iter().map(String::as_str).chain([
         "command-id-that-must-not-be-logged",
         "reason-text-that-must-not-be-logged",
         "c2lnbmVk",

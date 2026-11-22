@@ -793,8 +793,8 @@ mod tests {
 
     /// ADR-504 item 5: while the server's listener is up, no other socket can take its address.
     /// A second bind of `127.0.0.1:<port>` with address reuse (and on Unix with port reuse)
-    /// fails, and where a wildcard socket on the same port can be bound at all, every connection
-    /// to `127.0.0.1` still reaches the server's listener.
+    /// fails; a wildcard bind fails on Linux, and where one succeeds every connection to
+    /// `127.0.0.1` still reaches the server's listener.
     #[tokio::test]
     async fn the_listener_shares_its_address_with_nobody() {
         let listener = loopback_listener(0).await.unwrap();
@@ -812,15 +812,26 @@ mod tests {
             assert!(second.bind(addr).is_err(), "a port reuse bind took it");
         }
 
-        // A wildcard listener on the port, if one can be had, must get no connection that the
-        // loopback listener should get.
+        // A wildcard socket on the same port. Linux refuses the bind while the loopback listener
+        // is up, with or without address reuse. Elsewhere (Windows) it may bind, and then every
+        // connection to `127.0.0.1` must still reach the server's listener.
         for reuse in [false, true] {
             let wildcard = TcpSocket::new_v4().unwrap();
             wildcard.set_reuseaddr(reuse).unwrap();
             let bound = wildcard.bind((Ipv4Addr::UNSPECIFIED, addr.port()).into());
-            if bound.is_err() {
+            if cfg!(target_os = "linux") {
+                assert!(
+                    bound.is_err(),
+                    "a wildcard bind took the port (reuse {reuse})"
+                );
+                eprintln!("wildcard bind refused (reuse {reuse}): the Linux variant");
                 continue;
             }
+            if bound.is_err() {
+                eprintln!("wildcard bind refused (reuse {reuse}): nothing to connect to");
+                continue;
+            }
+            eprintln!("wildcard bind taken (reuse {reuse}): checking the connections");
             let wildcard = wildcard.listen(16).unwrap();
             let mut clients = Vec::new();
             for _ in 0..16 {

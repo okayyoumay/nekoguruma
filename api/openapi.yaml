@@ -1289,15 +1289,18 @@ components:
       in: path
       required: true
       schema: { type: string }
-
-  headers:
     NgrNonce:
+      name: Ngr-Nonce
+      in: header
+      required: false
       description: |
-        A request header of the data routes and the control upgrade (ADR-504): the agent's
+        The request header of the data routes and the control upgrade (ADR-504): the agent's
         32-byte nonce, standard padded base64 (44 characters). A request that carries it is
         answered with `Ngr-Server-Proof`; one that does not is served as before. A repeated or
         malformed value is a **400**. The session route reads no such header.
       schema: { type: string, minLength: 44, maxLength: 44 }
+
+  headers:
     NgrServerProof:
       description: |
         The server's answer proof (ADR-504, 14.4): the base64 of the 64-byte signature under

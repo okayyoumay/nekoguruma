@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 
 use axum::extract::{Request, State};
 use axum::http::header::{self, HeaderMap};
-use axum::http::{HeaderName, HeaderValue, StatusCode};
+use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -35,7 +35,7 @@ use sha2::{Digest, Sha256};
 use shared_crypto::answer::body_digest;
 use shared_crypto::proof::{Audience, ProofTranscript, VALUE_LEN, verify_proof};
 use shared_crypto::{PublicKey, RandomError, Signature, random_32};
-use shared_proto::{AgentId, PROOF_HEADER};
+use shared_proto::AgentId;
 use sqlx::PgPool;
 
 use crate::answer_proof::{Asked, Prover};
@@ -560,8 +560,13 @@ pub async fn session(State(exchange): State<Exchange>, request: Request) -> Resp
             let body = serialize(
                 &serde_json::json!({ "token": token, "expiresInSecs": TOKEN_LIFETIME_SECS }),
             );
-            // The proof is signed over the bytes sent. If it cannot be made the token is
-            // discarded and nothing was given out.
+            // The proof is signed over the bytes sent. If it cannot be made, or the handler is
+            // dropped while it is made, the token is discarded and nothing was given out.
+            let mut unsent = Unsent {
+                sessions: &inner.sessions,
+                token: &token,
+                given: false,
+            };
             let proof = inner
                 .prover
                 .header(
@@ -574,20 +579,31 @@ pub async fn session(State(exchange): State<Exchange>, request: Request) -> Resp
                 .await;
             match proof {
                 Ok(proof) => {
+                    unsent.given = true;
                     tracing::info!(agent_id = %shaped.agent_id, "session issued");
                     let mut response = ok_bytes(body);
-                    response
-                        .headers_mut()
-                        .insert(HeaderName::from_static(PROOF_HEADER), proof);
+                    Prover::attach(response.headers_mut(), proof);
                     response
                 }
-                Err(unprovable) => {
-                    inner.sessions.discard(&token);
-                    unprovable.into_response()
-                }
+                Err(unprovable) => unprovable.into_response(),
             }
         }
         Err(_) => inner.internal(Some(&shaped.agent_id), "the random source failed", now),
+    }
+}
+
+/// A minted token that is discarded when this drops before it is marked given out.
+struct Unsent<'a> {
+    sessions: &'a Sessions,
+    token: &'a str,
+    given: bool,
+}
+
+impl Drop for Unsent<'_> {
+    fn drop(&mut self) {
+        if !self.given {
+            self.sessions.discard(self.token);
+        }
     }
 }
 

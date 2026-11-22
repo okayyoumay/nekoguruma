@@ -39,15 +39,7 @@ fn post_with(
     headers: &[String],
     body: &str,
 ) -> String {
-    let mut raw = format!("POST {path} HTTP/1.1\r\n{host}\r\nConnection: close\r\n");
-    for header in headers {
-        raw.push_str(&format!("{header}\r\n"));
-    }
-    if let Some(content_type) = content_type {
-        raw.push_str(&format!("Content-Type: {content_type}\r\n"));
-    }
-    raw.push_str(&format!("Content-Length: {}\r\n\r\n{body}", body.len()));
-    raw
+    crate::support::post_with(host, path, content_type, headers, body)
 }
 
 async fn ask_challenge(s: &Running) -> Reply {
@@ -827,18 +819,23 @@ async fn a_session_200_is_proved_with_the_bodys_nonce() {
     // The proof is bound to the request: another nonce, target or status does not verify it.
     let public = u.w.key.public_key();
     let audience = u.audience();
-    let other = Answered {
-        public: &public,
-        audience: &audience,
-        agent_id: &u.id,
-        nonce: random_32().unwrap(),
-        method: "POST",
-        target: SESSION,
-        request_body: body.as_bytes(),
+    let verifies = |nonce: [u8; 32], method: &str, target: &str, status: u16| {
+        let other = Answered {
+            public: &public,
+            audience: &audience,
+            agent_id: &u.id,
+            nonce,
+            method,
+            target,
+            request_body: body.as_bytes(),
+        };
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| other.verify(status, &r))).is_ok()
     };
-    assert!(
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| other.verify(200, &r))).is_err()
-    );
+    assert!(verifies(nonce, "POST", SESSION, 200), "the control case");
+    assert!(!verifies(random_32().unwrap(), "POST", SESSION, 200));
+    assert!(!verifies(nonce, "GET", SESSION, 200));
+    assert!(!verifies(nonce, "POST", CHALLENGE, 200));
+    assert!(!verifies(nonce, "POST", SESSION, 201));
     u.finish().await;
 }
 
@@ -973,6 +970,7 @@ async fn a_signing_failure_at_the_session_route_leaves_no_token() {
         "{text}"
     );
     assert!(!text.contains(&STANDARD.encode(nonce)));
+    assert!(!text.contains(SESSION), "{text}");
 
     // The next exchange succeeds once the signer does.
     fail.store(false, Ordering::SeqCst);

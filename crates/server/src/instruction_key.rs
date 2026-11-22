@@ -490,11 +490,12 @@ mod tests {
         let key = InstructionKey::from_signer(Arc::new(SigningKey::generate().unwrap()));
         let audience =
             shared_crypto::proof::Audience::canonicalise("http://127.0.0.1:8080").unwrap();
+        let nonce = shared_crypto::random_32().unwrap();
         let transcript = |status| {
             AnswerTranscript::new(
                 &audience,
                 "agent-id",
-                [1; 32],
+                nonce,
                 "POST",
                 "/api/v1/agent/session",
                 [2; 32],

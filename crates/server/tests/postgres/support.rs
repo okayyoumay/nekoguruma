@@ -671,3 +671,23 @@ pub fn assert_unproved(reply: &crate::serving::Reply, what: &str) {
         reply.head
     );
 }
+
+/// A raw HTTP/1 POST to `path` with the `Host` line `host`, `Connection: close`, the header lines
+/// `headers` and an optional content type.
+pub fn post_with<H: AsRef<str>>(
+    host: &str,
+    path: &str,
+    content_type: Option<&str>,
+    headers: &[H],
+    body: &str,
+) -> String {
+    let mut raw = format!("POST {path} HTTP/1.1\r\n{host}\r\nConnection: close\r\n");
+    for header in headers {
+        raw.push_str(&format!("{}\r\n", header.as_ref()));
+    }
+    if let Some(content_type) = content_type {
+        raw.push_str(&format!("Content-Type: {content_type}\r\n"));
+    }
+    raw.push_str(&format!("Content-Length: {}\r\n\r\n{body}", body.len()));
+    raw
+}

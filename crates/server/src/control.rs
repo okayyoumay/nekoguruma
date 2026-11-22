@@ -22,14 +22,14 @@ use std::time::Duration;
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{FromRequestParts, Request, State};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use shared_crypto::answer::body_digest;
 use shared_proto::{
     AgentId, AgentMessage, CLOSE_CODE_BINARY, CLOSE_CODE_GOING_AWAY, CLOSE_CODE_IDLE,
     CLOSE_CODE_PROTOCOL, CLOSE_CODE_REVOKED, CLOSE_CODE_TOO_BIG, CONTROL_SUBPROTOCOL, ControlError,
-    DEFAULT_HEARTBEAT_SECS, HEARTBEAT_MISSED_LIMIT, MAX_CONTROL_MESSAGE_LEN, PROOF_HEADER,
-    ServerMessage, close_reason,
+    DEFAULT_HEARTBEAT_SECS, HEARTBEAT_MISSED_LIMIT, MAX_CONTROL_MESSAGE_LEN, ServerMessage,
+    close_reason,
 };
 use sqlx::PgPool;
 use tokio::sync::mpsc::error::TrySendError;
@@ -197,9 +197,7 @@ pub async fn upgrade(State(control): State<Control>, request: Request) -> Respon
             hub.adopt(session(control, agent, socket));
         });
     if let Some(proof) = proof {
-        response
-            .headers_mut()
-            .insert(HeaderName::from_static(PROOF_HEADER), proof);
+        Prover::attach(response.headers_mut(), proof);
     }
     response
 }

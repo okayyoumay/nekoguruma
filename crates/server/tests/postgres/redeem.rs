@@ -39,16 +39,7 @@ fn post(host: &str, content_type: Option<&str>, body: &str) -> String {
 
 /// [`post`] with more header lines.
 fn post_with(host: &str, content_type: Option<&str>, headers: &[&str], body: &str) -> String {
-    let mut raw =
-        format!("POST /api/v1/agents/register HTTP/1.1\r\n{host}\r\nConnection: close\r\n");
-    for header in headers {
-        raw.push_str(&format!("{header}\r\n"));
-    }
-    if let Some(content_type) = content_type {
-        raw.push_str(&format!("Content-Type: {content_type}\r\n"));
-    }
-    raw.push_str(&format!("Content-Length: {}\r\n\r\n{body}", body.len()));
-    raw
+    crate::support::post_with(host, "/api/v1/agents/register", content_type, headers, body)
 }
 
 async fn send(s: &Running, body: &str) -> Reply {
@@ -1471,7 +1462,7 @@ async fn the_registration_answer_is_never_proved() {
     let nonce = format!(
         "{}: {}",
         shared_proto::NONCE_HEADER,
-        STANDARD.encode([5u8; 32])
+        STANDARD.encode(shared_crypto::random_32().unwrap())
     );
     let (_, r) = w
         .redeem_with("alice", &Agent::new(), &[nonce.as_str()])

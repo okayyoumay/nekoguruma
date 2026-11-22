@@ -2,7 +2,7 @@
 
 **Date:** 2026-11-22
 **Status:** Accepted
-**Affects:** design 5.2, 5.3, 6.4, 11.1, 13.3, 14.4, `crates/shared-crypto` (`answer`), `crates/server`, `crates/agent`, `api/openapi.yaml`, `api/asyncapi.yaml`; annotates ADR-459, ADR-461, ADR-466, ADR-467, ADR-468, ADR-471, ADR-478, ADR-493, ADR-495, ADR-497
+**Affects:** design 5.2, 5.3, 6.4, 11.1, 13.3, 14.4, `crates/shared-crypto` (`answer`), `crates/server`, `crates/agent`, `api/openapi.yaml`, `api/asyncapi.yaml`; annotates ADR-456, ADR-459, ADR-461, ADR-466, ADR-467, ADR-468, ADR-471, ADR-478, ADR-493, ADR-495, ADR-497
 
 ## Context
 
@@ -38,6 +38,7 @@ The agent already holds the one key that the server's own signatures verify unde
 
 ## Consequences
 
+- The listener probe's first `core-windows` run (the server's listener bound with default options) refused a same-account bind of the listener's address with address reuse, so the server's listener takes no exclusive address use: item 5's first outcome. The probe keeps running there and decides again if the bind or the runner image changes.
 - A process that holds the port in the server's place (the server is down or not yet started) can no longer be sent a job's bytes, direct a download, or have a forged answer, acknowledgement or command accepted. It can refuse service and read what the agent sends before the first unproven answer: the agent's proof, a token that died with the server that issued it, and one request body. Design 14.4 uses the same "in the server's place" wording.
 - A proved "revoked" answer is not built: on the local profile a revoked agent's answer is a 401 like an expired token's and carries no proof, so the agent cannot yet tell revocation from an impostor. Erasure on revocation depends on it and is a backlog item.
 - The object server's presigned part URL still names a loopback port of the server's child; a process that takes that port after the whole stack has died could receive a part. That window is a backlog item, and so is the pinned RustFS object server's listener options: whether another account can share its address is not yet checked. The server's own listener is covered by item 5.

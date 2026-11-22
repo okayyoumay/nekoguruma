@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::request::Parts;
-use axum::http::{HeaderName, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -92,10 +92,7 @@ impl Asked {
     pub(crate) fn with_nonce(parts: &Parts, nonce: [u8; VALUE_LEN]) -> Result<Asked, AskError> {
         // The target as the parser gives it (it takes no byte outside ASCII, and the rule the
         // transcript applies refuses whatever else it cannot carry).
-        let target = parts
-            .uri
-            .path_and_query()
-            .map_or("/", |target| target.as_str());
+        let target = parts.uri.path_and_query().ok_or(AskError::Target)?.as_str();
         if answer::check_target(target).is_err() {
             return Err(AskError::Target);
         }
@@ -205,13 +202,16 @@ impl Prover {
             .await
         {
             Ok(value) => {
-                parts
-                    .headers
-                    .insert(HeaderName::from_static(PROOF_HEADER), value);
+                Prover::attach(&mut parts.headers, value);
                 Response::from_parts(parts, Body::from(bytes))
             }
             Err(unprovable) => unprovable.into_response(),
         }
+    }
+
+    /// Puts a proof from [`Prover::header`] on a response's headers.
+    pub(crate) fn attach(headers: &mut HeaderMap, value: HeaderValue) {
+        headers.insert(HeaderName::from_static(PROOF_HEADER), value);
     }
 
     /// Logs a failed proof through the one gate and says it as a value.
@@ -237,8 +237,12 @@ mod tests {
         request.body(()).unwrap().into_parts().0
     }
 
-    fn nonce_text(byte: u8) -> String {
-        STANDARD.encode([byte; 32])
+    fn fresh() -> [u8; 32] {
+        shared_crypto::random_32().unwrap()
+    }
+
+    fn nonce_text(nonce: [u8; 32]) -> String {
+        STANDARD.encode(nonce)
     }
 
     #[test]
@@ -249,20 +253,29 @@ mod tests {
             Asked::from_header(&parts("GET", "/x?\u{e9}", &[])).unwrap(),
             None
         );
-        let asked = Asked::from_header(&parts("POST", "/a?b=1", &[&nonce_text(7)]))
+        let nonce = fresh();
+        let asked = Asked::from_header(&parts("POST", "/a?b=1", &[&nonce_text(nonce)]))
             .unwrap()
             .unwrap();
-        assert_eq!(asked.nonce, [7; 32]);
+        assert_eq!(asked.nonce, nonce);
         assert_eq!(asked.method, "POST");
         assert_eq!(asked.target, "/a?b=1");
     }
 
     #[test]
     fn a_malformed_or_repeated_nonce_is_an_error() {
-        let good = nonce_text(1);
+        let good = nonce_text(fresh());
         let unpadded = good.trim_end_matches('=').to_owned();
-        let short = STANDARD.encode([1u8; 31]);
-        let long = STANDARD.encode([1u8; 33]);
+        let short = STANDARD.encode(&fresh()[..31]);
+        let long = STANDARD.encode([&fresh()[..], &[0]].concat());
+        let spaced = format!("{} {}", &good[..20], &good[21..]);
+        // The last data character of 32 bytes carries two padding bits, clear in the canonical
+        // text. Setting one gives a text a lenient decoder takes as the same bytes.
+        let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let last = good.as_bytes()[42];
+        let value = alphabet.iter().position(|c| *c == last).unwrap();
+        assert_eq!(value & 3, 0);
+        let loose = format!("{}{}=", &good[..42], alphabet[value | 1] as char);
         let url_safe = base64::engine::general_purpose::URL_SAFE.encode([0xfbu8; 32]);
         for (name, nonces) in [
             ("empty", vec![""]),
@@ -270,7 +283,8 @@ mod tests {
             ("short", vec![short.as_str()]),
             ("long", vec![long.as_str()]),
             ("url safe", vec![url_safe.as_str()]),
-            ("padded with a space", vec![" ", good.as_str()]),
+            ("space inside", vec![spaced.as_str()]),
+            ("non-zero padding bits", vec![loose.as_str()]),
             ("two values", vec![good.as_str(), good.as_str()]),
         ] {
             assert_eq!(
@@ -283,7 +297,7 @@ mod tests {
 
     #[test]
     fn a_target_the_transcript_cannot_take_is_an_error_after_the_nonce() {
-        let good = nonce_text(1);
+        let good = nonce_text(fresh());
         let long = format!("/{}", "a".repeat(answer::MAX_TARGET_LEN));
         assert_eq!(
             Asked::from_header(&parts("GET", &long, &[&good])),
@@ -302,7 +316,8 @@ mod tests {
         let public = key.public_key();
         let prover = Prover::new(Arc::new(InstructionKey::from_signer(Arc::new(key))), 8080);
         let agent = AgentId("3f1c2a52-6a0e-4c0d-9d3e-0a1b2c3d4e5f".to_owned());
-        let asked = Asked::with_nonce(&parts("POST", "/p?q", &[]), [9; 32]).unwrap();
+        let nonce = fresh();
+        let asked = Asked::with_nonce(&parts("POST", "/p?q", &[]), nonce).unwrap();
         let value = prover
             .header(&asked, &agent, body_digest(b"req"), 201, b"answer")
             .await
@@ -314,7 +329,7 @@ mod tests {
             AnswerTranscript::new(
                 prover.audience(),
                 &agent.0,
-                [9; 32],
+                nonce,
                 "POST",
                 "/p?q",
                 body_digest(b"req"),
@@ -332,7 +347,7 @@ mod tests {
     async fn an_agent_id_the_transcript_refuses_is_unprovable_and_gated_once() {
         let key = SigningKey::generate().unwrap();
         let prover = Prover::new(Arc::new(InstructionKey::from_signer(Arc::new(key))), 8080);
-        let asked = Asked::with_nonce(&parts("GET", "/x", &[]), [1; 32]).unwrap();
+        let asked = Asked::with_nonce(&parts("GET", "/x", &[]), fresh()).unwrap();
         let bad = AgentId(String::new());
         for _ in 0..2 {
             assert!(

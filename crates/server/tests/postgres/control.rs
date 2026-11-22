@@ -1674,6 +1674,16 @@ fn nonce_line(nonce: &[u8; 32]) -> String {
     format!("{}: {}", shared_proto::NONCE_HEADER, STANDARD.encode(nonce))
 }
 
+/// An upgrade request with the agent's token and `nonce`.
+fn nonced_request(u: &Up, token: &str, nonce: &[u8; 32]) -> Request<()> {
+    let mut request = request(u.s.addr, Some(&format!("Bearer {token}")), &[SUBPROTOCOL]);
+    request.headers_mut().insert(
+        shared_proto::NONCE_HEADER,
+        HeaderValue::from_str(&STANDARD.encode(nonce)).unwrap(),
+    );
+    request
+}
+
 /// Checks `response`, the 101 to an upgrade made with `nonce`, against the agent's expectation.
 fn assert_proved_101(u: &Up, nonce: [u8; 32], response: &Response<Option<Vec<u8>>>) {
     let public = u.w.key.public_key();
@@ -1700,11 +1710,7 @@ async fn an_upgrade_with_a_nonce_gets_a_proved_101() {
     let u = Up::new().await;
     let t = token(&u).await;
     let nonce = random_32().unwrap();
-    let mut request = request(u.s.addr, Some(&format!("Bearer {t}")), &[SUBPROTOCOL]);
-    request.headers_mut().insert(
-        shared_proto::NONCE_HEADER,
-        HeaderValue::from_str(&STANDARD.encode(nonce)).unwrap(),
-    );
+    let request = nonced_request(&u, &t, &nonce);
     let (mut client, response) = handshake(u.s.addr, request).await.unwrap();
     assert_eq!(response.status(), 101);
     assert_proved_101(&u, nonce, &response);
@@ -1848,11 +1854,7 @@ async fn a_revoked_agent_gets_a_proved_101_then_4002() {
     let t = token(&u).await;
     revoke_row(&u, &u.id).await;
     let nonce = random_32().unwrap();
-    let mut request = request(u.s.addr, Some(&format!("Bearer {t}")), &[SUBPROTOCOL]);
-    request.headers_mut().insert(
-        shared_proto::NONCE_HEADER,
-        HeaderValue::from_str(&STANDARD.encode(nonce)).unwrap(),
-    );
+    let request = nonced_request(&u, &t, &nonce);
     let (mut client, response) = handshake(u.s.addr, request).await.unwrap();
     assert_proved_101(&u, nonce, &response);
     assert_eq!(first_frame_close_code(&mut client).await, 4002);

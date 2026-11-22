@@ -498,10 +498,11 @@ nonce, the request's method, target and body, and the answer's status and body
   signed before the upgrade, so no connection exists.
 - The proof rests on nobody else being able to receive connections to the server's address. The
   listener (`loopback_listener`) is bound to `127.0.0.1` itself, never the wildcard address, and
-  sets no address-sharing option. The unit test `the_listener_shares_its_address_with_nobody`
+  sets neither `SO_REUSEPORT` nor, on Windows, `SO_REUSEADDR` (mio sets `SO_REUSEADDR` on Unix, which
+  Linux does not let share a listening address). The unit test `the_listener_shares_its_address_with_nobody`
   pins it: the local address is `127.0.0.1`, a second bind with address reuse (and, on Unix, with
-  port reuse) fails, and where a wildcard socket on the port can be bound, 16 connections to
-  `127.0.0.1` still reach the server's listener.
+  port reuse) fails, a wildcard bind fails on Linux, and where one succeeds 16 connections to `127.0.0.1` still reach
+  the server's listener.
 - The browser side is unchanged: the guard still decides on Host and Origin, and a browser sends
   no nonce.
 

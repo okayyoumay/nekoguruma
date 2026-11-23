@@ -1,0 +1,6 @@
+# The pinned llvm-mingw toolchain (CLAUDE.md "Building and testing"): read by
+# scripts/fetch-llvm-mingw.sh, which CI's worker-windows job and the local Windows type check use.
+# version <release tag>
+# asset <file name> <SHA-256 of the file> <top-level directory inside it>
+version 20260922
+asset llvm-mingw-20260922-ucrt-ubuntu-22.04-x86_64.tar.xz bb7bb7654b33d5aa8712acb837c963b2e0c56352560c76105270a3268c665c21 llvm-mingw-20260922-ucrt-ubuntu-22.04-x86_64

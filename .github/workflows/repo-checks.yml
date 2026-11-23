@@ -21,3 +21,4 @@ jobs:
       - run: scripts/check-backlog.sh
       - run: scripts/test-classify-pr-risk.sh
       - run: scripts/test-fetch-rustfs.sh
+      - run: scripts/test-fetch-llvm-mingw.sh

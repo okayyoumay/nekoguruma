@@ -69,7 +69,8 @@ Working rules:
   when the change touches `cfg(unix)`, `cfg(windows)` or other
   platform-specific code, run CLAUDE.md's Windows type check before you
   report (`rustup update stable` and `rustup target add
-  x86_64-pc-windows-gnullvm` once per session, then the `cargo check
+  x86_64-pc-windows-gnullvm` once per session, the pinned llvm-mingw from
+  `scripts/fetch-llvm-mingw.sh` on `PATH`, then the `cargo check
   ... --target x86_64-pc-windows-gnullvm` command given there) and report
   its result.
 - Update documents only as the brief directs, but do report any document

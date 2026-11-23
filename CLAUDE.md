@@ -258,19 +258,24 @@ seeds depend on this workspace's crates. On pull requests that change only docum
 `changes` job in `ci.yml` skips the build jobs, which then count as passed required checks;
 `repo-checks.yml` always runs. CodeQL (`codeql.yml`, ADR-283) skips the same changes. Do not run cross-target builds locally unless asked; CI covers
 them. One exception: before pushing a change to `cfg(unix)`, `cfg(windows)` or other
-platform-specific code, type-check the workspace for Windows, which needs no linker, mingw or
-wine and catches the dead code and unused `mut` that only a Windows build sees:
+platform-specific code, type-check the workspace for Windows, which needs no linker or wine and
+catches the dead code and unused `mut` that only a Windows build sees. The TLS provider's C code
+(aws-lc-rs, ADR-505) is compiled even by a check, so the pinned llvm-mingw compilers go on `PATH`
+first; `scripts/fetch-llvm-mingw.sh` fetches the version CI uses, checks its SHA-256 and prints
+its `bin` directory:
 
 ```sh
 rustup update stable                            # once per session: CI uses the latest stable
 rustup target add x86_64-pc-windows-gnullvm     # once per session, about 264 MB
+PATH="$(scripts/fetch-llvm-mingw.sh):$PATH"     # once per shell; about 85 MB, 600 MB unpacked
 RUSTFLAGS="-D warnings" CARGO_INCREMENTAL=0 cargo check --locked --workspace --tests \
   --target x86_64-pc-windows-gnullvm
 ```
 
 It checks every crate, `j2534-0404-service` included (its bindings for the target are committed),
-adds a few hundred MB to `target/`, and takes about a minute once warm; say in the PR's test plan
-that you ran it.
+adds a few hundred MB to `target/`, and takes about a minute and a half once warm; say in the PR's
+test plan that you ran it. `scripts/test-fetch-llvm-mingw.sh` tests the script and runs in
+`repo-checks.yml`.
 Release builds, linking and running tests for Windows (under wine or otherwise) stay with CI.
 
 The real-hardware checks (design 13.5, ADR-275) are `#[ignore]`d `hw_` tests that CI never runs.

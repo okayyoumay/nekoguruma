@@ -340,14 +340,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      # The pinned release, its SHA-256 checked (scripts/llvm-mingw-pin.txt), as the local
+      # Windows type check fetches it.
       - name: Install llvm-mingw
-        env:
-          GH_TOKEN: ${{ github.token }}
-          LLVM_MINGW: llvm-mingw-20260922-ucrt-ubuntu-22.04-x86_64
         run: |
-          gh release download 20260922 --repo mstorsjo/llvm-mingw --pattern "$LLVM_MINGW.tar.xz" --dir "$RUNNER_TEMP"
-          tar -xf "$RUNNER_TEMP/$LLVM_MINGW.tar.xz" -C "$RUNNER_TEMP"
-          echo "$RUNNER_TEMP/$LLVM_MINGW/bin" >> "$GITHUB_PATH"
+          bin=$(NGR_LLVM_MINGW_DIR="$RUNNER_TEMP/llvm-mingw" scripts/fetch-llvm-mingw.sh)
+          echo "$bin" >> "$GITHUB_PATH"
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}

@@ -85,6 +85,10 @@ tokio = { workspace = true, features = ["test-util"] }
 # The control channel's tests are its client (ADR-468): the handshake over a stream the test opens.
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+# The real-binary test that the object server serves over TLS (ADR-505).
+rustls.workspace = true
+tokio-rustls.workspace = true
+rcgen.workspace = true
 
 [lints]
 workspace = true

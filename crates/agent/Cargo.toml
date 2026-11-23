@@ -19,6 +19,7 @@ j2534-0404-registry.workspace = true
 ngr-library-resolver.workspace = true
 vci-service-config.workspace = true
 ngr-oplog.workspace = true
+ngr-pinned-tls.workspace = true
 shared-crypto.workspace = true
 tracing-subscriber.workspace = true
 vci-service-interface.workspace = true
@@ -60,6 +61,8 @@ tokio = { workspace = true, features = ["test-util"] }
 diag-frontend = { path = "../diag-frontend" }
 sim-ecu.workspace = true
 tempfile = "3"
+# The uploader client's tests run its TLS dial against a TLS server on a pipe (ADR-505).
+ngr-pinned-tls = { workspace = true, features = ["test-server"] }
 tracing-core = "0.1"
 
 [lints]

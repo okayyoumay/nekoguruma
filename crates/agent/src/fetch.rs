@@ -548,6 +548,7 @@ impl Fetcher {
             .client
             .get(
                 target.port(),
+                None,
                 target.target(),
                 target.host(),
                 max,

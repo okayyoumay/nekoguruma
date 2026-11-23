@@ -6,7 +6,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::Instant;
 
 use super::*;
-use crate::uploader::fake::{FakeDial, Mode, answer, json, read_request, scripted};
+use crate::uploader::fake::{FakeDial, Mode, Seen, answer, json, read_request, scripted};
 
 const HOST: &str = "127.0.0.1:9000";
 
@@ -45,6 +45,7 @@ async fn the_bearer_goes_to_the_json_routes_and_never_to_a_put() {
     let put = client
         .put(
             9000,
+            None,
             "/obj?sig=1",
             HOST,
             3,
@@ -239,7 +240,10 @@ async fn a_part_larger_than_a_chunk_is_streamed_whole_and_in_pieces() {
     let received = Arc::new(Mutex::new(Vec::new()));
     let client = Client::with_dial(sizing_server(sizes.clone(), received.clone()));
     let (source, produced, biggest) = pattern(length);
-    let got = client.put(9000, "/p", HOST, length, source).await.unwrap();
+    let got = client
+        .put(9000, None, "/p", HOST, length, source)
+        .await
+        .unwrap();
     assert_eq!(got.status, 200);
     let received = received.lock().unwrap();
     assert_eq!(received.len() as u64, length);
@@ -271,7 +275,7 @@ async fn the_reader_is_held_back_by_a_server_that_does_not_read() {
     });
     let client = Client::with_dial(dial);
     let (source, produced, _) = pattern(length);
-    let put = client.put(9000, "/p", HOST, length, source);
+    let put = client.put(9000, None, "/p", HOST, length, source);
     tokio::select! {
         _ = put => panic!("the put cannot finish"),
         () = tokio::time::sleep(Duration::from_millis(300)) => {}
@@ -291,7 +295,14 @@ async fn a_source_shorter_than_declared_fails_the_put() {
     });
     let client = Client::with_dial(dial);
     let got = client
-        .put(9000, "/p", HOST, 100, Box::new(Cursor::new(vec![1u8; 10])))
+        .put(
+            9000,
+            None,
+            "/p",
+            HOST,
+            100,
+            Box::new(Cursor::new(vec![1u8; 10])),
+        )
         .await;
     assert!(got.is_err(), "{got:?}");
 }
@@ -301,7 +312,7 @@ async fn an_empty_part_is_sent_with_a_zero_length() {
     let (dial, seen) = scripted(answer(200, "", ""));
     let client = Client::with_dial(dial);
     let got = client
-        .put(9000, "/p", HOST, 0, Box::new(Cursor::new(Vec::new())))
+        .put(9000, None, "/p", HOST, 0, Box::new(Cursor::new(Vec::new())))
         .await
         .unwrap();
     assert_eq!(got.status, 200);
@@ -325,7 +336,7 @@ async fn the_connect_is_bounded_at_five_seconds_and_a_refusal_is_not_sent() {
     dial.set(Mode::Hang);
     let started = Instant::now();
     let put = client
-        .put(9000, "/p", HOST, 1, Box::new(Cursor::new(vec![0u8])))
+        .put(9000, None, "/p", HOST, 1, Box::new(Cursor::new(vec![0u8])))
         .await;
     assert_eq!(put.unwrap_err(), Error::ConnectTimeout);
     assert_eq!(started.elapsed(), CONNECT_TIMEOUT);
@@ -350,7 +361,7 @@ async fn thirty_seconds_of_silence_ends_a_request_and_twenty_nine_do_not() {
     // A PUT has no total but the same clock.
     let started = Instant::now();
     let put = client
-        .put(9000, "/p", HOST, 1, Box::new(Cursor::new(vec![0u8])))
+        .put(9000, None, "/p", HOST, 1, Box::new(Cursor::new(vec![0u8])))
         .await;
     assert_eq!(put.unwrap_err(), Error::NoProgress);
     assert_eq!(started.elapsed(), NO_PROGRESS);
@@ -380,6 +391,7 @@ async fn the_clock_runs_from_the_dial_when_nothing_is_ever_sent_back() {
     let put = client
         .put(
             9000,
+            None,
             "/p",
             HOST,
             100_000,
@@ -433,7 +445,7 @@ async fn the_total_is_for_the_json_routes_and_a_moving_put_has_none() {
 
 async fn client_put(client: &Client) -> Result<Answer, Error> {
     client
-        .put(9000, "/p", HOST, 1, Box::new(Cursor::new(vec![7u8])))
+        .put(9000, None, "/p", HOST, 1, Box::new(Cursor::new(vec![7u8])))
         .await
 }
 
@@ -528,6 +540,7 @@ async fn a_request_over_a_real_loopback_socket() {
     let put = client
         .put(
             port,
+            None,
             "/o?s=1",
             &host,
             body.len() as u64,
@@ -571,7 +584,7 @@ async fn the_reader_starts_after_the_connect_and_stops_with_the_put() {
     let client = Client::with_dial(dial.clone());
     assert_eq!(
         client
-            .put(9000, "/p", HOST, 1024 * 1024 * 1024, source)
+            .put(9000, None, "/p", HOST, 1024 * 1024 * 1024, source)
             .await
             .unwrap_err(),
         Error::NotSent
@@ -593,7 +606,7 @@ async fn the_reader_starts_after_the_connect_and_stops_with_the_put() {
     });
     let client = Client::with_dial(dial);
     let (source, produced, _) = pattern(1024 * 1024 * 1024);
-    let put = client.put(9000, "/p", HOST, 1024 * 1024 * 1024, source);
+    let put = client.put(9000, None, "/p", HOST, 1024 * 1024 * 1024, source);
     tokio::select! {
         _ = put => panic!("the put cannot finish"),
         () = tokio::time::sleep(Duration::from_millis(300)) => {}
@@ -643,6 +656,7 @@ async fn a_put_the_server_reads_slowly_is_kept_alive_by_the_bytes_it_takes() {
         client
             .put(
                 9000,
+                None,
                 "/p",
                 HOST,
                 length as u64,
@@ -709,7 +723,7 @@ async fn a_get_streams_the_body_and_sends_no_authorization_and_no_range() {
         (dial, seen)
     };
     let got = Client::with_dial(dial)
-        .get(9000, "/obj?sig=1", HOST, 1 << 20, Vec::new())
+        .get(9000, None, "/obj?sig=1", HOST, 1 << 20, Vec::new())
         .await
         .unwrap();
     let GetBody::Complete { length, writer } = got.body else {
@@ -730,7 +744,7 @@ async fn a_get_that_is_not_a_complete_200_reads_no_body() {
     let get = |reply: Vec<u8>, max: u64| async move {
         let (dial, _) = scripted(reply);
         Client::with_dial(dial)
-            .get(9000, "/o", HOST, max, Vec::new())
+            .get(9000, None, "/o", HOST, max, Vec::new())
             .await
             .unwrap()
     };
@@ -752,7 +766,7 @@ async fn a_get_that_is_not_a_complete_200_reads_no_body() {
 async fn a_get_with_a_failing_writer_is_a_write_error() {
     let (dial, _) = scripted(answer(200, "", &"x".repeat(100_000)));
     let error = Client::with_dial(dial)
-        .get(9000, "/o", HOST, 1 << 20, Failing { ok: 70_000 })
+        .get(9000, None, "/o", HOST, 1 << 20, Failing { ok: 70_000 })
         .await
         .map(|_| ())
         .unwrap_err();
@@ -764,9 +778,269 @@ async fn a_get_refused_at_connect_sends_nothing() {
     let (dial, _) = scripted(Vec::new());
     dial.set(Mode::Refuse);
     let error = Client::with_dial(dial)
-        .get(9000, "/o", HOST, 10, Vec::new())
+        .get(9000, None, "/o", HOST, 10, Vec::new())
         .await
         .map(|_| ())
         .unwrap_err();
     assert_eq!(error, Error::NotSent);
+}
+
+/// The TLS dial (ADR-505): the server's end of each pipe is a TLS server.
+mod tls {
+    use std::sync::atomic::AtomicUsize;
+
+    use ngr_pinned_tls::test_server::{Acceptor, Identity, Key};
+
+    use super::*;
+
+    const TARGET: &str = "/obj?sig=secret";
+
+    /// A fake dial whose server accepts TLS with `acceptor`, reads one request and answers it with
+    /// `reply`. What it saw is kept: the requests read, and how many handshakes it accepted.
+    struct Server {
+        dial: Arc<FakeDial>,
+        requests: Arc<Mutex<Vec<Seen>>>,
+        accepted: Arc<AtomicUsize>,
+    }
+
+    fn serving(acceptor: Acceptor, reply: Vec<u8>) -> Server {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let (seen, count) = (requests.clone(), accepted.clone());
+        let dial = FakeDial::new(64 * 1024, move |_, server| {
+            let (acceptor, reply) = (acceptor.clone(), reply.clone());
+            let (seen, count) = (seen.clone(), count.clone());
+            tokio::spawn(async move {
+                let Ok(mut stream) = acceptor.accept(server).await else {
+                    return;
+                };
+                count.fetch_add(1, Ordering::SeqCst);
+                if let Some(request) = read_request(&mut stream).await {
+                    seen.lock().unwrap().push(request);
+                    let _ = stream.write_all(&reply).await;
+                    let _ = stream.shutdown().await;
+                }
+            });
+        });
+        Server {
+            dial,
+            requests,
+            accepted,
+        }
+    }
+
+    impl Server {
+        /// Lets the server's task run to the end of what it will do.
+        async fn settle(&self) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        /// The server completed no handshake and read no request.
+        fn assert_untouched(&self) {
+            assert_eq!(self.accepted.load(Ordering::SeqCst), 0);
+            assert!(self.requests.lock().unwrap().is_empty());
+        }
+    }
+
+    fn pin_of(identity: &Identity) -> CertPin {
+        CertPin::of_certificate(identity.certificate())
+    }
+
+    async fn put(client: &Client, pin: &CertPin) -> Result<Answer, Error> {
+        client
+            .put(
+                9000,
+                Some(pin),
+                TARGET,
+                HOST,
+                3,
+                Box::new(Cursor::new(b"abc".to_vec())),
+            )
+            .await
+    }
+
+    async fn get(client: &Client, pin: &CertPin) -> Result<Got<Vec<u8>>, Error> {
+        client
+            .get(9000, Some(pin), TARGET, HOST, 1 << 20, Vec::new())
+            .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_right_certificate_carries_a_put_and_a_get() {
+        let identity = Identity::generate(Key::P256);
+        let pin = pin_of(&identity);
+        let server = serving(Acceptor::new(&identity), answer(200, "", "hello"));
+        let client = Client::with_dial(server.dial.clone());
+        let put = put(&client, &pin).await.unwrap();
+        assert_eq!(put.status, 200);
+        let got = get(&client, &pin).await.unwrap();
+        assert_eq!(got.status, 200);
+        let GetBody::Complete { length, writer } = got.body else {
+            panic!("the body was not read: {:?}", got.body);
+        };
+        assert_eq!((length, writer.as_slice()), (5, b"hello".as_slice()));
+        let seen = server.requests.lock().unwrap();
+        assert_eq!(seen[0].request_line(), format!("PUT {TARGET} HTTP/1.1"));
+        assert_eq!(seen[0].body, b"abc");
+        assert_eq!(seen[1].request_line(), format!("GET {TARGET} HTTP/1.1"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn another_certificate_is_refused_and_no_request_byte_is_sent() {
+        let served = Identity::generate(Key::P256);
+        let other = pin_of(&Identity::generate(Key::P256));
+        let server = serving(Acceptor::new(&served), answer(200, "", ""));
+        let client = Client::with_dial(server.dial.clone());
+        assert_eq!(
+            put(&client, &other).await.unwrap_err(),
+            Error::Tls(Refused::Certificate)
+        );
+        assert_eq!(
+            get(&client, &other).await.unwrap_err(),
+            Error::Tls(Refused::Certificate)
+        );
+        server.settle().await;
+        server.assert_untouched();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_right_certificate_without_its_key_is_refused_and_no_request_byte_is_sent() {
+        let real = Identity::generate(Key::P256);
+        let other_key = Identity::generate(Key::P256);
+        let impostor = Acceptor::presenting(&[real.certificate()], &other_key);
+        let server = serving(impostor, answer(200, "", ""));
+        let client = Client::with_dial(server.dial.clone());
+        // The pin is right, so the signature is what refuses.
+        assert_eq!(
+            put(&client, &pin_of(&real)).await.unwrap_err(),
+            Error::Tls(Refused::Signature)
+        );
+        server.settle().await;
+        server.assert_untouched();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_plain_http_server_is_refused_and_never_sees_the_request() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let seen = received.clone();
+        let dial = FakeDial::new(64 * 1024, move |_, mut server| {
+            let seen = seen.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                while let Ok(n) = server.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    seen.lock().unwrap().extend_from_slice(&buf[..n]);
+                    let _ = server.write_all(&answer(400, "", "")).await;
+                }
+            });
+        });
+        let client = Client::with_dial(dial);
+        let pin = pin_of(&Identity::generate(Key::P256));
+        assert_eq!(
+            put(&client, &pin).await.unwrap_err(),
+            Error::Tls(Refused::Handshake(io::ErrorKind::InvalidData))
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let received = received.lock().unwrap();
+        assert!(!received.is_empty(), "the server read the hello");
+        let text = String::from_utf8_lossy(&received);
+        assert!(
+            !text.contains("/obj") && !text.contains("sig=secret") && !text.contains("PUT"),
+            "the request reached a plain server"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_close_during_the_handshake_is_a_refusal() {
+        let dial = FakeDial::new(64 * 1024, |_, mut server| {
+            tokio::spawn(async move {
+                let mut hello = vec![0u8; 4096];
+                let _ = server.read(&mut hello).await;
+                // Dropping the server's end closes the pipe.
+            });
+        });
+        let client = Client::with_dial(dial);
+        let pin = pin_of(&Identity::generate(Key::P256));
+        assert_eq!(
+            put(&client, &pin).await.unwrap_err(),
+            Error::Tls(Refused::Handshake(io::ErrorKind::UnexpectedEof))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_silent_after_the_connect_ends_at_the_connect_bound() {
+        let dial = FakeDial::new(64 * 1024, |_, server| {
+            tokio::spawn(async move {
+                let _held = server;
+                std::future::pending::<()>().await;
+            });
+        });
+        let client = Client::with_dial(dial);
+        let pin = pin_of(&Identity::generate(Key::P256));
+        let started = Instant::now();
+        assert_eq!(put(&client, &pin).await.unwrap_err(), Error::ConnectTimeout);
+        assert_eq!(started.elapsed(), CONNECT_TIMEOUT);
+        let started = Instant::now();
+        assert_eq!(get(&client, &pin).await.unwrap_err(), Error::ConnectTimeout);
+        assert_eq!(started.elapsed(), CONNECT_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stall_after_the_handshake_ends_a_put_by_the_no_progress_clock() {
+        let identity = Identity::generate(Key::P256);
+        let acceptor = Acceptor::new(&identity);
+        let dial = FakeDial::new(64 * 1024, move |_, server| {
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(mut stream) = acceptor.accept(server).await else {
+                    return;
+                };
+                let _ = read_request(&mut stream).await;
+                std::future::pending::<()>().await;
+            });
+        });
+        let client = Client::with_dial(dial);
+        let started = Instant::now();
+        assert_eq!(
+            put(&client, &pin_of(&identity)).await.unwrap_err(),
+            Error::NoProgress
+        );
+        assert_eq!(started.elapsed(), NO_PROGRESS);
+    }
+
+    /// The same dial over a real loopback socket: the pin and the stream are the production ones.
+    #[tokio::test]
+    async fn the_loopback_client_puts_over_a_real_socket() {
+        let identity = Identity::generate(Key::P256);
+        let acceptor = Acceptor::new(&identity);
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let served = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut stream = acceptor.accept(socket).await.unwrap();
+            let seen = read_request(&mut stream).await.unwrap();
+            stream.write_all(&answer(200, "", "")).await.unwrap();
+            stream.shutdown().await.unwrap();
+            seen
+        });
+        let put = Client::loopback()
+            .put(
+                port,
+                Some(&pin_of(&identity)),
+                TARGET,
+                HOST,
+                3,
+                Box::new(Cursor::new(b"abc".to_vec())),
+            )
+            .await
+            .unwrap();
+        assert_eq!(put.status, 200);
+        let seen = served.await.unwrap();
+        assert_eq!(seen.request_line(), format!("PUT {TARGET} HTTP/1.1"));
+        assert_eq!(seen.body, b"abc");
+    }
 }

@@ -1,0 +1,30 @@
+[package]
+name = "ngr-pinned-tls"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+# The client side of TLS to the bundled object server (design 13.3, ADR-505): a stream is accepted
+# only when the server's leaf certificate has a given SHA-256 pin and the handshake is signed by
+# that certificate's key. This is the one crate whose non-test code depends on rustls directly;
+# its callers see only the types of this crate and of tokio.
+[dependencies]
+rustls.workspace = true
+tokio-rustls.workspace = true
+tokio.workspace = true
+sha2.workspace = true
+rcgen = { workspace = true, optional = true }
+
+[features]
+# `test_server`: a TLS server for tests (certificates, an acceptor, an impostor), so that the
+# tests of a caller need no rustls of their own. Not for production code.
+test-server = ["dep:rcgen"]
+
+[dev-dependencies]
+# The crate's own tests use its test server.
+ngr-pinned-tls = { path = ".", features = ["test-server"] }
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

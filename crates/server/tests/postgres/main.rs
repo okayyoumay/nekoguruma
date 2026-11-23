@@ -23,6 +23,7 @@ mod local_users;
 mod migrations;
 mod object_server;
 mod object_server_rustfs;
+mod object_server_tls;
 mod redeem;
 mod registration;
 mod serving;

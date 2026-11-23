@@ -347,7 +347,7 @@ The control channel is a WebSocket that the agent opens after a proof exchange (
 
 - Events are split into "must-deliver" (state changes, HMI requests: numbered and kept in the outbox, 5.3) and "may be thinned" (progress: unnumbered, never stored or resent) (ADR-478)
 - Artifacts are fully fetched by the time the job is issued, so that line speed does not affect the start of writing (4.1)
-- Upload bandwidth limiting (not designed yet; 15.3). Timeouts are judged by "no progress for a set period", not total time: an upload attempt that moves no byte for 30 seconds is dropped and resumed after the last leading part the server holds (5.2, ADR-493)
+- Upload bandwidth limiting (not designed yet; 15.3). Timeouts are judged by "no progress for a set period", not total time: an upload attempt that moves no byte for 30 seconds is dropped and resumed after the last leading part the server holds (5.2, ADR-493). The agent's connection to the object server is TLS to a certificate it knows by its pin, and the handshake is part of the connect and bounded with it (13.3, ADR-505)
 - Metadata and self-diagnostic data are sent first; time-series chunks are sent afterward. In the data channel the begin request carries an object's metadata (job, generation, kind, length, SHA-256) before any part, and a job's result goes before its communication log; the time-series chunks are M4 work (ADR-493)
 
 ### 5.5 Device-Side Safeguards

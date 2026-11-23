@@ -5,9 +5,13 @@
 //! One request is one connection, which the agent dials itself (a loopback literal, no name is
 //! resolved) and runs hyper's HTTP/1 client connection over. There is no pool and no redirect
 //! handling: a 3xx is an answer like any other. The request carries `Host`, `Connection: close`
-//! and the body's length. Time is judged as design 5.4 asks, by progress:
+//! and the body's length. A [`Client::put`] or [`Client::get`] given a [`CertPin`] runs a TLS
+//! handshake over the dialled stream before the request (ADR-505): the server is accepted only
+//! with that certificate, and a refused handshake is [`Error::Tls`] with nothing of the request
+//! sent. The handshake sits above the byte counting and below the request, so the no-progress
+//! clock counts the bytes on the socket. Time is judged as design 5.4 asks, by progress:
 //!
-//! - the connect within [`CONNECT_TIMEOUT`];
+//! - the connect, and the handshake when there is one, within [`CONNECT_TIMEOUT`];
 //! - at most [`NO_PROGRESS`] with no byte moved in either direction, counted from the dial, for
 //!   every request ([`Error::NoProgress`]);
 //! - [`JSON_TOTAL`] in all for the JSON routes, and no total for a part's PUT.
@@ -43,6 +47,7 @@ use hyper::header::{
 };
 use hyper::{Method, Request};
 use hyper_util::rt::TokioIo;
+use ngr_pinned_tls::{CertPin, Refused};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -74,8 +79,10 @@ pub fn reads_body(status: u16) -> bool {
 pub enum Error {
     /// The connection was refused or the address is unreachable: nothing was sent.
     NotSent,
-    /// The connect did not finish in time: nothing was sent.
+    /// The connect, or the TLS handshake after it, did not finish in time: nothing was sent.
     ConnectTimeout,
+    /// The TLS handshake did not accept the server: nothing of the request was sent.
+    Tls(Refused),
     /// No byte moved for [`NO_PROGRESS`].
     NoProgress,
     /// A JSON route did not finish within [`JSON_TOTAL`].
@@ -240,6 +247,7 @@ impl Client {
         }
         self.send(
             port,
+            None,
             || {
                 builder
                     .body(Full::new(Bytes::from(body)))
@@ -252,12 +260,14 @@ impl Client {
     }
 
     /// PUTs `length` bytes read from `source` to `target` at `port`, with no total time: the
-    /// connection is judged by progress alone. No `Authorization` is sent (the URL is the
+    /// connection is judged by progress alone. With a `pin` the connection is TLS to the server
+    /// with that certificate; without one it is plain. No `Authorization` is sent (the URL is the
     /// bearer). The body is read in [`CHUNK`]s on a blocking thread, so memory does not depend
     /// on `length`. A `source` that ends before `length` bytes, or fails, fails the request.
     pub async fn put(
         &self,
         port: u16,
+        pin: Option<&CertPin>,
         target: &str,
         host: &str,
         length: u64,
@@ -274,6 +284,7 @@ impl Client {
         // (with this future) and the channel closes.
         self.send(
             port,
+            pin,
             move || {
                 builder
                     .body(ChannelBody::start(length, source))
@@ -290,10 +301,12 @@ impl Client {
     /// exactly one canonical `Content-Length` of at most `max_len`; any other answer is returned
     /// with no body byte read. A body that is cut short, or whose reader sees more than the
     /// declared length, fails the request ([`Error::Failed`]); a writer that fails is
-    /// [`Error::Write`]. There is no total time: the connection is judged by progress alone.
+    /// [`Error::Write`]. There is no total time: the connection is judged by progress alone. A
+    /// `pin` makes the connection TLS, as for [`Client::put`].
     pub async fn get<W: Write + Send + 'static>(
         &self,
         port: u16,
+        pin: Option<&CertPin>,
         target: &str,
         host: &str,
         max_len: u64,
@@ -308,26 +321,49 @@ impl Client {
             .map_err(|_| Error::Failed)?;
         let start = Instant::now();
         let progress = Progress::new(start);
-        let stream =
-            match tokio::time::timeout_at(start + CONNECT_TIMEOUT, self.dial.dial_port(port)).await
-            {
-                Err(_) => return Err(Error::ConnectTimeout),
-                Ok(Err(_)) => return Err(Error::NotSent),
-                Ok(Ok(stream)) => stream,
-            };
-        let stream = Tracked {
-            inner: stream,
-            progress: progress.clone(),
-        };
+        let stream = self.connect(port, pin, start, &progress).await?;
         tokio::select! {
             got = exchange_get(stream, request, max_len, writer, progress.clone()) => got,
             () = progress.stalled(self.no_progress) => Err(Error::NoProgress),
         }
     }
 
+    /// Dials `port` and, given a pin, runs the TLS handshake over the dialled stream, all within
+    /// [`CONNECT_TIMEOUT`] of `start`.
+    async fn connect(
+        &self,
+        port: u16,
+        pin: Option<&CertPin>,
+        start: Instant,
+        progress: &Progress,
+    ) -> Result<Wire, Error> {
+        let connecting = async {
+            let stream = self
+                .dial
+                .dial_port(port)
+                .await
+                .map_err(|_| Error::NotSent)?;
+            let stream = Tracked {
+                inner: stream,
+                progress: progress.clone(),
+            };
+            match pin {
+                None => Ok(Wire::Plain(stream)),
+                Some(pin) => ngr_pinned_tls::connect(pin, stream)
+                    .await
+                    .map(|tls| Wire::Tls(Box::new(tls)))
+                    .map_err(Error::Tls),
+            }
+        };
+        tokio::time::timeout_at(start + CONNECT_TIMEOUT, connecting)
+            .await
+            .unwrap_or(Err(Error::ConnectTimeout))
+    }
+
     async fn send<B>(
         &self,
         port: u16,
+        pin: Option<&CertPin>,
         make_request: impl FnOnce() -> Result<Request<B>, Error>,
         total: Option<Duration>,
         reads: fn(u16) -> bool,
@@ -338,18 +374,8 @@ impl Client {
     {
         let start = Instant::now();
         let progress = Progress::new(start);
-        let stream =
-            match tokio::time::timeout_at(start + CONNECT_TIMEOUT, self.dial.dial_port(port)).await
-            {
-                Err(_) => return Err(Error::ConnectTimeout),
-                Ok(Err(_)) => return Err(Error::NotSent),
-                Ok(Ok(stream)) => stream,
-            };
+        let stream = self.connect(port, pin, start, &progress).await?;
         let request = make_request()?;
-        let stream = Tracked {
-            inner: stream,
-            progress: progress.clone(),
-        };
         let judged = async {
             tokio::select! {
                 answer = exchange(stream, request, reads) => answer,
@@ -361,6 +387,53 @@ impl Client {
                 .await
                 .unwrap_or(Err(Error::Timeout)),
             None => judged.await,
+        }
+    }
+}
+
+/// The connection a request runs over.
+enum Wire {
+    Plain(Tracked),
+    /// TLS over the byte-counting stream, so the no-progress clock counts the socket's bytes.
+    Tls(Box<ngr_pinned_tls::Stream<Tracked>>),
+}
+
+impl AsyncRead for Wire {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
+            Self::Tls(stream) => Pin::new(stream).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for Wire {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
+            Self::Tls(stream) => Pin::new(stream).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_flush(cx),
+            Self::Tls(stream) => Pin::new(stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
+            Self::Tls(stream) => Pin::new(stream).poll_shutdown(cx),
         }
     }
 }
@@ -443,7 +516,7 @@ impl Drop for Driver {
 }
 
 async fn exchange<B>(
-    stream: Tracked,
+    stream: Wire,
     request: Request<B>,
     reads: fn(u16) -> bool,
 ) -> Result<Answer, Error>
@@ -484,7 +557,7 @@ where
 }
 
 async fn exchange_get<W: Write + Send + 'static>(
-    stream: Tracked,
+    stream: Wire,
     request: Request<Empty<Bytes>>,
     max_len: u64,
     writer: W,

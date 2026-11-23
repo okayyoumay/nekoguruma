@@ -1,7 +1,7 @@
 # ADR-505: The Object Server Speaks TLS Only, With a Certificate the Server Creates and the Agent Learns From a Proved Answer
 
 **Date:** 2026-11-23
-**Status:** Accepted
+**Status:** Accepted (items 9 to 14 added with the verifier and the agent's dial)
 **Affects:** design 13, 13.3, 14.3, 14.4; `crates/server` (`object_server`, `storage/s3`), `crates/agent`, `api/openapi.yaml`, CLAUDE.md "Building and testing"; annotates ADR-491, ADR-492, ADR-493, ADR-497, ADR-504
 
 ## Context
@@ -60,6 +60,37 @@ the same exposure.
 This record annotates ADR-491 (items 2, 3, 6 and 8, and the residual about the port), ADR-492
 (item 4), ADR-493 (item 13), ADR-497 (item 6) and ADR-504 (Consequences). ADR-463 item 13 is about
 the server's own origin and is unchanged.
+
+### Decisions taken with the verifier and the agent's dial
+
+9. **The verifier judges the leaf only.** A certificate is accepted when its DER's SHA-256 equals
+   the pin. Its validity dates and names are not checked (the certificate is self-signed for the
+   loopback address, has no issuer to trust, and is named by the pin), and certificates after the
+   leaf carry no authority: a chain whose leaf is the pinned one is accepted whatever follows it,
+   and one whose leaf is another is refused whatever follows it. The handshake signature is still
+   checked with the leaf's key (item 3).
+10. **TLS 1.3 only, with no session resumption.** The client offers no other version, so the
+    handshake signature is always checked in the one place, and a connection is judged against its
+    own pin in a full handshake, never by a session another pin made. No ALPN is offered and the
+    server name is the loopback address, for which no SNI is sent.
+11. **The handshake is inside the connect bound.** The agent's dial and the handshake share the
+    5-second connect limit of ADR-493 item 12; a peer that accepts the connection and says nothing
+    ends as the connect timeout. The no-progress clock counts the socket's bytes, so TLS sits above
+    the byte counting and above the dial seam (the loopback literal stays where it is). No byte of
+    the request is written before the server is accepted.
+12. **A refused handshake is an ordinary retry.** It is not ADR-504's unproven class and has no
+    cap: no session token goes to the object port, so a peer that refuses or fakes the handshake
+    learns nothing that a retry would give away further. The words are fixed (certificate,
+    signature, handshake) and name nothing the peer sent.
+13. **The pin is compared with `==` and written as 64 lowercase hexadecimal digits.** It is a
+    public value, so a constant-time comparison protects nothing. Any other text (63 or 65 digits,
+    uppercase, a space, a non-ASCII character) is refused rather than normalized, so one pin has
+    one spelling in the proved answers.
+14. **The verifier is its own crate, `ngr-pinned-tls`.** It is the one crate whose non-test code
+    depends on rustls, and it serves both the server's store client and probe and the agent, so the
+    two sides cannot disagree on what a pin accepts. Its `test-server` feature makes self-signed test certificates and a TLS
+    acceptor, including an impostor that presents a certificate it holds no key for, so that a
+    caller's tests need no TLS crate of their own.
 
 ### Alternatives rejected
 

@@ -20,6 +20,7 @@ members = [
     "crates/j2534-0404-service",
     "crates/ngr-library-resolver",
     "crates/ngr-oplog",
+    "crates/ngr-pinned-tls",
     "crates/vci-service-config",
     "crates/vci-service-interface",
     "crates/vci-service-launcher",
@@ -81,6 +82,7 @@ j2534-0404-mock = { path = "crates/j2534-0404-mock" }
 j2534-0404-registry = { path = "crates/j2534-0404-registry" }
 ngr-library-resolver = { path = "crates/ngr-library-resolver" }
 ngr-oplog = { path = "crates/ngr-oplog" }
+ngr-pinned-tls = { path = "crates/ngr-pinned-tls" }
 vci-service-config = { path = "crates/vci-service-config" }
 vci-service-interface = { path = "crates/vci-service-interface" }
 vci-service-launcher = { path = "crates/vci-service-launcher" }

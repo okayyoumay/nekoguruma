@@ -33,6 +33,7 @@
 use std::sync::Arc;
 
 use hyper::Method;
+use ngr_pinned_tls::Refused;
 use serde::Deserialize;
 use shared_crypto::RandomError;
 use shared_proto::{
@@ -521,6 +522,7 @@ impl Routes {
             .client
             .put(
                 target.port(),
+                None,
                 target.target(),
                 target.host(),
                 length,
@@ -562,6 +564,9 @@ pub(crate) fn transport(error: Error) -> Failure {
     let why = match error {
         Error::NotSent => "not-sent",
         Error::ConnectTimeout => "connect-timeout",
+        Error::Tls(Refused::Certificate) => "object-tls-certificate",
+        Error::Tls(Refused::Signature) => "object-tls-signature",
+        Error::Tls(Refused::Handshake(_)) => "object-tls-handshake",
         Error::NoProgress => "no-progress",
         Error::Timeout => "timeout",
         Error::Failed => "transport",

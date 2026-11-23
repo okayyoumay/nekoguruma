@@ -784,3 +784,26 @@ async fn a_body_over_the_bound_or_cut_is_unproven_on_every_route() {
         }
     }
 }
+
+/// A refused TLS handshake is a retry whatever the refusal, and each refusal has its own word.
+#[test]
+fn a_refused_tls_handshake_is_a_retry_with_a_word_for_each_refusal() {
+    use ngr_pinned_tls::Refused;
+    let refusals = [
+        Refused::Certificate,
+        Refused::Signature,
+        Refused::Handshake(std::io::ErrorKind::InvalidData),
+    ];
+    let whys: Vec<_> = refusals
+        .into_iter()
+        .map(|refused| {
+            let failure = transport(Error::Tls(refused));
+            assert_eq!(failure.class, Class::Retry);
+            failure.why
+        })
+        .collect();
+    assert!(whys.iter().all(|why| !why.is_empty()), "{whys:?}");
+    for (i, why) in whys.iter().enumerate() {
+        assert!(!whys[..i].contains(why), "a word is used twice: {whys:?}");
+    }
+}

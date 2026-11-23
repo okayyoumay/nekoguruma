@@ -2,7 +2,7 @@
 
 `sim-ecu` answers UDS requests the way a server described by ISO 14229-1 (2026 edition) would, so
 that the agent, the worker services and `sim-vci` can be tested without a vehicle (design 13.4).
-Clause numbers below refer to that edition.
+Clause numbers below refer to that edition. It ships in the SDK, behind `sim-vci` (ADR-506).
 
 The standard leaves many choices to the vehicle manufacturer or system supplier. This document
 lists the ones the simulator makes, so that tests and IR programs written against it know what to

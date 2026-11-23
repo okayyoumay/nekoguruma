@@ -495,6 +495,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-503](ADR-503-the-review-loop-audits-the-whole-diff-for-documentation-before-the-first-review.md) | The Review Loop Audits the Whole Diff for Documentation Before the First Review | Accepted | `.claude/skills/pr-review-loop` (Step 0), `.claude/skills/backlog-loop` (step 4), `.claude/README.md` |
 | [ADR-504](ADR-504-the-server-proves-every-answer-an-agent-acts-on-with-its-instruction-key.md) | The Server Proves Every Answer an Agent Acts on With Its Instruction Key | Accepted (Consequences' object-server listener and port window answered by ADR-505: the object server speaks TLS and the agent pins its certificate) | design 5.2, 5.3, 6.4, 11.1, 13.3, 14.4, `crates/shared-crypto`, `crates/server`, `crates/agent`, `api/`; annotates ADR-456, ADR-459, ADR-461, ADR-466, ADR-467, ADR-468, ADR-471, ADR-478, ADR-493, ADR-495, ADR-497 |
 | [ADR-505](ADR-505-object-server-pinned-tls.md) | The Object Server Speaks TLS Only, With a Certificate the Server Creates and the Agent Learns From a Proved Answer | Accepted (items 9 to 14 added with the verifier and the agent's dial; items 15 to 19 added with the switch's design, and item 8 split by item 19; items 20 to 22 added with the switch, which meet item 6) | design 13, 13.3, 14.3, 14.4, `crates/server`, `crates/agent`, `api/openapi.yaml`, CLAUDE.md; annotates ADR-491, ADR-492, ADR-493, ADR-497, ADR-504 |
+| [ADR-506](ADR-506-release-artifacts-are-product-local-bundle-and-sdk-with-the-simulators-in-the-sdk.md) | Release Artifacts Are the Product, the Local-Profile Bundle and the SDK, With the Simulators in the SDK | Accepted | `docs/release-scope.md`, design 9.8 / 13, `sim-vci`, `sim-ecu`, the two mocks |
 
 ## Status Legend
 
@@ -819,6 +820,7 @@ the predecessor repository these ADRs came from.
 - ADR-499
 - ADR-500 (the consequence that job creation takes the digests it is given replaced by ADR-501)
 - ADR-505 (items 9 to 14 added with the verifier and the agent's dial; items 15 to 19 added with the switch's design, and item 8 split by item 19; items 20 to 22 added with the switch, which meet item 6)
+- ADR-506
 
 ### vci-service-manager Process Startup
 - ADR-073

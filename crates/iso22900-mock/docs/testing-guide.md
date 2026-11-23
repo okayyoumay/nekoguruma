@@ -4,7 +4,7 @@
 
 `iso22900-mock` is an in-process D-PDU API DLL substitute for testing without real hardware. It exports the standard D-PDU API (`PDUConstruct`, `PDUConnect`, `PDUStartComPrimitive`, etc.) with the same C ABI as a real vendor DLL, plus back-door exports (`__mock_*`) for test inspection and reset, and Rust-native helper functions for locating the mock DLL and generating a test RDF.
 
-Build artifact: `cdylib` (`.dll` / `.so`) + `rlib`.
+Build artifact: `cdylib` (`.dll` / `.so`) + `rlib`. It serves the repository's own tests and is not released (ADR-506).
 
 ---
 

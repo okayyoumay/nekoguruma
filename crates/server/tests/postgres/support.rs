@@ -502,6 +502,96 @@ pub fn free_port() -> u16 {
         .port()
 }
 
+/// The status of `GET <path>` over TLS to `addr`, within ten seconds, accepting only the
+/// certificate `pin` names (the object server's, ADR-505). An error is the connection's, the
+/// handshake's refusal included.
+pub async fn pinned_get(
+    addr: std::net::SocketAddr,
+    pin: &ngr_pinned_tls::CertPin,
+    path: &str,
+) -> std::io::Result<u16> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let attempt = async {
+        let tcp = tokio::net::TcpStream::connect(addr).await?;
+        let mut stream = ngr_pinned_tls::connect(pin, tcp)
+            .await
+            .map_err(std::io::Error::other)?;
+        stream
+            .write_all(
+                format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await?;
+        // The status line is all that is read; the peer may close without a close_notify.
+        let mut text = String::new();
+        let mut buf = [0u8; 512];
+        while !text.contains("\r\n") {
+            match stream.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => text.push_str(&String::from_utf8_lossy(&buf[..n])),
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(error) => return Err(error),
+            }
+        }
+        text.split(' ')
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .ok_or_else(|| std::io::Error::other(format!("no status line in {text:?}")))
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), attempt)
+        .await
+        .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into()))
+}
+
+/// One HTTP/1 request over TLS to the object server at `url` (a presigned URL), accepting only the
+/// certificate `pin` names (ADR-505): the status, the answer's `etag` and its body. A body with
+/// a `content-length` is always sent, empty included.
+pub(crate) async fn tls_request(
+    method: &str,
+    url: &str,
+    pin: &ngr_pinned_tls::CertPin,
+    body: Vec<u8>,
+) -> (u16, Option<String>, Vec<u8>) {
+    use http_body_util::{BodyExt, Full};
+    use hyper::body::Bytes;
+    use hyper::client::conn::http1;
+    use hyper_util::rt::TokioIo;
+    let url: url::Url = url.parse().unwrap();
+    assert_eq!(url.scheme(), "https", "an object URL is https");
+    let addr = (
+        url.host_str().unwrap(),
+        url.port_or_known_default().unwrap(),
+    );
+    let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let stream = ngr_pinned_tls::connect(pin, tcp)
+        .await
+        .expect("the object server presents the pinned certificate");
+    let (mut sender, connection) = http1::handshake(TokioIo::new(stream)).await.unwrap();
+    tokio::spawn(connection);
+    let target = format!("{}?{}", url.path(), url.query().unwrap_or_default());
+    let request = hyper::Request::builder()
+        .method(method)
+        .uri(target)
+        .header("host", format!("{}:{}", addr.0, addr.1))
+        .header("content-length", body.len())
+        .header("connection", "close")
+        .body(Full::new(Bytes::from(body)))
+        .unwrap();
+    let response = sender.send_request(request).await.unwrap();
+    let status = response.status().as_u16();
+    let etag = response
+        .headers()
+        .get("etag")
+        .map(|v| v.to_str().unwrap().to_owned());
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("the answer's body is complete")
+        .to_bytes();
+    (status, etag, body.to_vec())
+}
+
 /// 32 random hex digits.
 pub fn random_password() -> String {
     let mut bytes = [0u8; 16];

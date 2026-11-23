@@ -1,13 +1,16 @@
 //! The S3 object store (design 13, 14.3; ADR-492): a bucket on the bundled object server
-//! (ADR-491), reached over HTTP on `127.0.0.1` with presigned requests.
+//! (ADR-491), reached over TLS on `127.0.0.1` with presigned requests.
 //!
-//! Every request is a presigned URL built by rusty-s3 (SigV4, path style, region `us-east-1`)
-//! and sent by [`http`], one request per connection. The rules the code keeps:
+//! Every request is a presigned `https` URL built by rusty-s3 (SigV4, path style, region
+//! `us-east-1`) and sent by [`http`], one request per connection, to a peer that presents the
+//! pinned certificate only (ADR-505). The rules the code keeps:
 //!
 //! - [`S3Store::open`] makes the bucket ready: HeadBucket, and CreateBucket when it is absent
 //!   (an answer that the bucket exists and is ours counts as present). A refused or unusable
 //!   answer ends it at once; a connection failure or a 5xx is retried every 100 ms until the
-//!   ready budget (30 s) is spent.
+//!   ready budget (30 s) is spent. A peer that does not present the pinned certificate
+//!   ([`StoreError::Untrusted`]) counts as an unreachable server: it is retried too, since a
+//!   process sharing the port can catch a connection that the object server would have had.
 //! - Parts are checked by the store, never trusted to the object server: before a completion the
 //!   listing must be numbered consecutively from 1, every part but the last at least 5 MiB, the
 //!   sizes must add up to the length the caller names, and the total may not pass 4 GiB. The
@@ -37,6 +40,7 @@ use std::time::Duration;
 
 use hyper::Method;
 use jiff::Timestamp;
+use ngr_pinned_tls::CertPin;
 use rusty_s3::actions::{
     CompleteMultipartUpload, CompleteMultipartUploadResponse, CreateMultipartUpload, ListParts,
 };
@@ -123,6 +127,8 @@ struct Inner {
     bucket: Bucket,
     credentials: S3Credentials,
     client: http::Client,
+    /// The pin of the object server's certificate, which the URLs handed out carry.
+    pin: CertPin,
     tuning: Tuning,
     /// One mutex per key in use; an entry nobody holds is dropped at the next call.
     locks: Mutex<HashMap<ObjectKey, Arc<tokio::sync::Mutex<()>>>>,
@@ -157,17 +163,18 @@ struct RawPart {
 }
 
 impl S3Store {
-    /// Makes the bucket `bucket` ready on the object server at `127.0.0.1:port` and returns the
-    /// store: HeadBucket, then CreateBucket if it is absent, retried as the module's
+    /// Makes the bucket `bucket` ready on the object server at `127.0.0.1:port`, whose certificate
+    /// has the pin `pin`, and returns the store: HeadBucket, then CreateBucket if it is absent, retried as the module's
     /// documentation says. The future owns what it needs (the credentials are copied at the
     /// call), so the caller may race it against the object server's child ending.
     pub fn open(
         port: u16,
         credentials: &Credentials,
+        pin: &CertPin,
         bucket: &str,
         tuning: Tuning,
     ) -> StoreFuture<'static, S3Store> {
-        let made = Inner::new(port, credentials, bucket, tuning);
+        let made = Inner::new(port, credentials, pin, bucket, tuning);
         Box::pin(async move {
             let inner = Arc::new(made?);
             inner.ready().await?;
@@ -181,6 +188,7 @@ impl Inner {
     fn new(
         port: u16,
         credentials: &Credentials,
+        pin: &CertPin,
         bucket: &str,
         tuning: Tuning,
     ) -> Result<Inner, StoreError> {
@@ -190,7 +198,7 @@ impl Inner {
             });
         }
         let endpoint: Url =
-            format!("http://127.0.0.1:{port}")
+            format!("https://127.0.0.1:{port}")
                 .parse()
                 .map_err(|_| StoreError::Refused {
                     op: "build the endpoint",
@@ -204,7 +212,8 @@ impl Inner {
         Ok(Inner {
             bucket,
             credentials: S3Credentials::new(credentials.access_key(), credentials.expose_secret()),
-            client: http::Client::new(port),
+            client: http::Client::new(port, *pin),
+            pin: *pin,
             tuning,
             locks: Mutex::new(HashMap::new()),
         })
@@ -387,7 +396,7 @@ impl Inner {
                 upload.id.expose(),
             )
             .sign(PART_URL_EXPIRY);
-        Ok(PartUrl::new(url.to_string()))
+        Ok(PartUrl::new(url.to_string(), self.pin))
     }
 
     /// Sends one part from here: the same signed request a writer would be given, with the body.
@@ -427,7 +436,7 @@ impl Inner {
             .bucket
             .get_object(Some(&self.credentials), key.as_str())
             .sign(GET_URL_EXPIRY);
-        Ok(GetUrl::new(url.to_string()))
+        Ok(GetUrl::new(url.to_string(), self.pin))
     }
 
     /// The parts of `upload` (paged), or that it is gone. The numbers are ascending, within
@@ -901,7 +910,7 @@ impl Inner {
 /// Whether a failed attempt at the bucket may succeed when repeated: a connection that failed, a
 /// request that timed out, a server that is not up yet.
 fn is_transient(error: &StoreError) -> bool {
-    matches!(error, StoreError::Io { .. })
+    matches!(error, StoreError::Io { .. } | StoreError::Untrusted { .. })
         || matches!(error, StoreError::Server { status, .. } if *status >= 500)
 }
 

@@ -275,9 +275,9 @@ mod tests {
     }
 
     fn p384_key() -> String {
-        rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384)
-            .unwrap()
-            .serialize_pem()
+        ngr_pinned_tls::test_server::Identity::generate(ngr_pinned_tls::test_server::Key::P384)
+            .key_pem()
+            .to_owned()
     }
 
     fn files(dir: &Path) -> Vec<(String, Vec<u8>)> {

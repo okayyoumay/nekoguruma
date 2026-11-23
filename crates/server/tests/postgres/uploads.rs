@@ -27,7 +27,7 @@ use crate::control::{nonce_line, token};
 use crate::redeem::{Agent, bytes_of, capture, json};
 use crate::serving::{Reply, Running, exchange};
 use crate::session::{Up, audience_of};
-use crate::storage::{MIB, content, put, sha256};
+use crate::storage::{MIB, content, put_answer, sha256};
 use crate::support::{Answered, assert_unproved};
 
 const SMALL: u64 = 512 * 1024;
@@ -458,6 +458,7 @@ impl Fx {
                 S3Store::open(
                     server.port(),
                     server.credentials(),
+                    server.certificate_pin(),
                     "nekoguruma",
                     S3Tuning::default(),
                 ),
@@ -791,8 +792,8 @@ async fn send(fx: &Fx, id: &str, number: u16, len: usize) {
     let v = json(&r);
     assert_eq!(v["expiresInSecs"], 300);
     let url = v["url"].as_str().unwrap().to_owned();
-    assert!(url.starts_with("http://127.0.0.1:"), "the URL's host");
-    let (status, etag) = put(&url, content(number as u8, len)).await;
+    assert!(url.starts_with("https://127.0.0.1:"), "the URL's host");
+    let (status, etag) = put_answer(&r, content(number as u8, len)).await;
     assert_eq!(status, 200, "PUT part {number}");
     assert!(etag.is_some());
 }
@@ -1717,8 +1718,10 @@ async fn the_last_part_of_an_exact_multiple_is_a_whole_part_and_an_empty_object_
     let id = upload_id(&r);
     for n in 1..=2u16 {
         let r = fx.part(&id, &n.to_string()).await;
-        let url = json(&r)["url"].as_str().unwrap().to_owned();
-        assert_eq!(put(&url, content(n as u8, SMALL as usize)).await.0, 200);
+        assert_eq!(
+            put_answer(&r, content(n as u8, SMALL as usize)).await.0,
+            200
+        );
         assert_eq!(json(&fx.status(&id).await)["partsHeld"], n);
     }
     let job = fx.job().await;
@@ -1726,11 +1729,8 @@ async fn the_last_part_of_an_exact_multiple_is_a_whole_part_and_an_empty_object_
     assert_eq!(json(&r)["partCount"], 1);
     let id = upload_id(&r);
     assert_eq!(json(&fx.status(&id).await)["partsHeld"], 0);
-    let url = json(&fx.part(&id, "1").await)["url"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    assert_eq!(put(&url, Vec::new()).await.0, 200);
+    let r = fx.part(&id, "1").await;
+    assert_eq!(put_answer(&r, Vec::new()).await.0, 200);
     // The pinned object server lists a part of no bytes, so the empty object's only part counts.
     assert_eq!(held(&fx, &id).await, 1);
     fx.finish().await;
@@ -1746,11 +1746,8 @@ async fn the_part_size_of_the_server_is_5_mib() {
     assert_eq!(json(&r)["partCount"], 2);
     let id = upload_id(&r);
     for (n, len) in [(1u16, 5 * MIB), (2, 3)] {
-        let url = json(&fx.part(&id, &n.to_string()).await)["url"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        assert_eq!(put(&url, content(n as u8, len)).await.0, 200);
+        let r = fx.part(&id, &n.to_string()).await;
+        assert_eq!(put_answer(&r, content(n as u8, len)).await.0, 200);
     }
     assert_eq!(json(&fx.status(&id).await)["partsHeld"], 2);
     fx.finish().await;
@@ -1812,7 +1809,7 @@ async fn the_log_holds_no_token_digest_key_upload_id_url_or_database_text() {
     let id = upload_id(&r);
     let r = fx.part(&id, "1").await;
     let url = json(&r)["url"].as_str().unwrap().to_owned();
-    assert_eq!(put(&url, content(1, SMALL as usize)).await.0, 200);
+    assert_eq!(put_answer(&r, content(1, SMALL as usize)).await.0, 200);
     assert_eq!(fx.status(&id).await.status, 200);
     // Failures of every kind the routes log: the store, the database, a lost race's abort.
     Wrap::set(&fx.wrap.list_fail, Some(Fail::Io));
@@ -3140,11 +3137,18 @@ async fn a_part_url_answer_is_proved() {
     let fx = Fx::new(With::Real).await;
     let id = begin_for(&fx, b"some bytes").await;
     let r = fx.proved(&call_of("part", "", &id), 200).await;
+    let answer = json(&r);
     assert!(
-        json(&r)["url"]
+        answer["url"]
             .as_str()
             .unwrap()
-            .starts_with("http://127.0.0.1:")
+            .starts_with("https://127.0.0.1:")
+    );
+    // The proved body carries the pin of the object server's certificate, as 64 lowercase digits.
+    let (_, object_server) = fx.real.as_ref().unwrap();
+    assert_eq!(
+        answer["certificatePin"],
+        object_server.certificate_pin().to_string()
     );
     fx.finish().await;
 }

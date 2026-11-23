@@ -1,16 +1,13 @@
 //! The object store on the real object server (ADR-492): the pinned RustFS as the server's child
 //! (`NGR_TEST_RUSTFS_BIN`, as `object_server_rustfs.rs` has it), a bucket, parts PUT to presigned
-//! URLs by a plain HTTP client, completion and its read-back, deletion and listing. The scripted
+//! URLs by an HTTP client that trusts the pin, completion and its read-back, deletion and listing. The scripted
 //! units are in `src/storage/s3/tests.rs`; the local store's are in `src/storage/local/tests.rs`.
 //!
 //! The tests that start the whole server also need PostgreSQL (the start order's earlier steps).
 
 use std::time::Duration;
 
-use http_body_util::{BodyExt, Full};
-use hyper::body::Bytes;
-use hyper::client::conn::http1;
-use hyper_util::rt::TokioIo;
+use ngr_pinned_tls::CertPin;
 use server::config::{Config, Database, Http, InstructionKeyConfig, Profile};
 use server::object_server::ObjectServer;
 use server::storage::{MultipartStore, ObjectKey, S3Store, S3Tuning, StoreError, Upload};
@@ -36,44 +33,30 @@ pub(crate) fn content(seed: u8, len: usize) -> Vec<u8> {
         .collect()
 }
 
-/// A plain HTTP PUT of `body` to a presigned URL: the status and the answer's `etag`.
-pub(crate) async fn put(url: &str, body: Vec<u8>) -> (u16, Option<String>) {
-    let (status, headers) = request("PUT", url, body).await;
-    (status, headers)
+/// A PUT of `body` over TLS to a presigned URL, trusting the certificate `pin` names: the status
+/// and the answer's `etag`.
+pub(crate) async fn put(url: &str, pin: &CertPin, body: Vec<u8>) -> (u16, Option<String>) {
+    request("PUT", url, pin, body).await
 }
 
-async fn request(method: &str, url: &str, body: Vec<u8>) -> (u16, Option<String>) {
-    let url: url::Url = url.parse().unwrap();
-    let addr = (
-        url.host_str().unwrap(),
-        url.port_or_known_default().unwrap(),
-    );
-    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-    let (mut sender, connection) = http1::handshake(TokioIo::new(stream)).await.unwrap();
-    tokio::spawn(connection);
-    let target = format!("{}?{}", url.path(), url.query().unwrap_or_default());
-    let request = hyper::Request::builder()
-        .method(method)
-        .uri(target)
-        .header("host", format!("{}:{}", addr.0, addr.1))
-        .header("content-length", body.len())
-        .header("connection", "close")
-        .body(Full::new(Bytes::from(body)))
-        .unwrap();
-    let response = sender.send_request(request).await.unwrap();
-    let status = response.status().as_u16();
-    let etag = response
-        .headers()
-        .get("etag")
-        .map(|v| v.to_str().unwrap().to_owned());
-    let _ = response.into_body().collect().await;
+/// A PUT of `body` to the URL of a part-URL answer `r` (a 200), trusting the certificate its
+/// `certificatePin` names.
+pub(crate) async fn put_answer(r: &crate::serving::Reply, body: Vec<u8>) -> (u16, Option<String>) {
+    assert_eq!(r.status, 200, "{}", r.head);
+    let answer = crate::redeem::json(r);
+    let pin = CertPin::from_hex(answer["certificatePin"].as_str().unwrap()).expect("a pin");
+    put(answer["url"].as_str().unwrap(), &pin, body).await
+}
+
+async fn request(method: &str, url: &str, pin: &CertPin, body: Vec<u8>) -> (u16, Option<String>) {
+    let (status, etag, _) = crate::support::tls_request(method, url, pin, body).await;
     (status, etag)
 }
 
 /// Uploads `data` as part `number` of `upload`.
 async fn put_part(store: &S3Store, upload: &Upload, number: u16, data: Vec<u8>) {
     let url = store.presign_part(upload, number).unwrap();
-    let (status, etag) = put(url.expose(), data).await;
+    let (status, etag) = put(url.expose(), url.pin(), data).await;
     assert_eq!(status, 200);
     assert!(etag.is_some_and(|tag| tag.starts_with('"')));
 }
@@ -115,6 +98,7 @@ async fn open(server: &ObjectServer, bucket: &str) -> S3Store {
         S3Store::open(
             server.port(),
             server.credentials(),
+            server.certificate_pin(),
             bucket,
             S3Tuning::default(),
         ),
@@ -134,6 +118,7 @@ async fn paging_store(run: &Running) -> S3Store {
     S3Store::open(
         run.server.as_ref().unwrap().port(),
         run.server.as_ref().unwrap().credentials(),
+        run.server.as_ref().unwrap().certificate_pin(),
         "nekoguruma",
         tuning,
     )
@@ -423,15 +408,15 @@ async fn an_edited_part_url_and_an_anonymous_read_are_refused() {
     let url = store.presign_part(&upload, 1).unwrap();
     let edited = url.expose().replace("partNumber=1", "partNumber=2");
     assert_ne!(edited, url.expose());
-    let (status, _) = put(&edited, b"x".to_vec()).await;
+    let (status, _) = put(&edited, url.pin(), b"x".to_vec()).await;
     assert_eq!(status, 403);
     // The URL itself works.
-    let (status, _) = put(url.expose(), b"x".to_vec()).await;
+    let (status, _) = put(url.expose(), url.pin(), b"x".to_vec()).await;
     assert_eq!(status, 200);
     // The object itself is not readable without a signature.
     let port = run.server.as_ref().unwrap().port();
-    let bare = format!("http://127.0.0.1:{port}/nekoguruma/{}", upload.key);
-    let (status, _) = request("GET", &bare, Vec::new()).await;
+    let bare = format!("https://127.0.0.1:{port}/nekoguruma/{}", upload.key);
+    let (status, _) = request("GET", &bare, url.pin(), Vec::new()).await;
     assert_eq!(status, 403);
     run.stop().await;
 }
@@ -531,7 +516,7 @@ async fn a_start_opens_the_store_and_a_restart_finds_what_it_held() {
     let upload = store.begin().await.unwrap();
     let data = content(9, 50);
     let url = store.presign_part(&upload, 1).unwrap();
-    assert_eq!(put(url.expose(), data.clone()).await.0, 200);
+    assert_eq!(put(url.expose(), url.pin(), data.clone()).await.0, 200);
     store.complete(&upload, sha256(&data), 50).await.unwrap();
     server.run(async {}, std::future::pending()).await.unwrap();
     drop(store);
@@ -593,7 +578,7 @@ async fn unfinished_uploads_are_listed_one_page_at_a_time_against_the_real_serve
         server.credentials().expose_secret(),
     );
     let bucket = rusty_s3::Bucket::new(
-        format!("http://127.0.0.1:{}", server.port())
+        format!("https://127.0.0.1:{}", server.port())
             .parse()
             .unwrap(),
         rusty_s3::UrlStyle::Path,
@@ -605,7 +590,12 @@ async fn unfinished_uploads_are_listed_one_page_at_a_time_against_the_real_serve
         &bucket.create_multipart_upload(Some(&credentials), first.key.as_str()),
         Duration::from_secs(60),
     );
-    assert_eq!(request("POST", url.as_str(), Vec::new()).await.0, 200);
+    assert_eq!(
+        request("POST", url.as_str(), server.certificate_pin(), Vec::new())
+            .await
+            .0,
+        200
+    );
     let listed = store.list_unfinished().await.unwrap();
     assert_eq!(listed.skipped, 0);
     let of_first: Vec<_> = listed

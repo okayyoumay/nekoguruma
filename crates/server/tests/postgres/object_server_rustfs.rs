@@ -7,7 +7,6 @@
 //! The fake child's tests (`object_server.rs`) cover the lifecycle's edge cases; these tests are
 //! the ones that need what only the real program does.
 
-use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -18,7 +17,7 @@ use server::object_server::tls::{CERTIFICATE_FILE, KEY_FILE};
 use server::object_server::{ObjectServer, Tuning};
 
 use crate::redeem::capture;
-use crate::support::free_port;
+use crate::support::{free_port, pinned_get};
 
 /// The pinned binary, or a panic that names the script that fetches it.
 pub(crate) fn rustfs_bin() -> PathBuf {
@@ -84,29 +83,6 @@ impl Real {
     }
 }
 
-/// The status code of `GET <path>` to `addr`, or the error of the connection.
-fn get(addr: SocketAddr, path: &str) -> std::io::Result<u16> {
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-    write!(
-        stream,
-        "GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
-    )?;
-    let mut text = String::new();
-    let mut buf = [0u8; 512];
-    while !text.contains("\r\n") {
-        let n = stream.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        text.push_str(&String::from_utf8_lossy(&buf[..n]));
-    }
-    text.split(' ')
-        .nth(1)
-        .and_then(|code| code.parse().ok())
-        .ok_or_else(|| std::io::Error::other(format!("no status line in {text:?}")))
-}
-
 fn loopback(port: u16) -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
 }
@@ -121,15 +97,14 @@ async fn the_real_server_is_ready_and_refuses_an_anonymous_request() {
     let server = real.start().await;
     assert!(began.elapsed() < Duration::from_secs(30));
     let port = real.port();
-    let (ready, anonymous, bucket) = tokio::task::spawn_blocking(move || {
-        (
-            get(loopback(port), "/health/ready").unwrap(),
-            get(loopback(port), "/").unwrap(),
-            get(loopback(port), "/some-bucket/some-key").unwrap(),
-        )
-    })
-    .await
-    .unwrap();
+    let pin = *server.certificate_pin();
+    let ready = pinned_get(loopback(port), &pin, "/health/ready")
+        .await
+        .unwrap();
+    let anonymous = pinned_get(loopback(port), &pin, "/").await.unwrap();
+    let bucket = pinned_get(loopback(port), &pin, "/some-bucket/some-key")
+        .await
+        .unwrap();
     assert_eq!(ready, 200);
     assert_eq!(anonymous, 403, "an anonymous request must be refused");
     assert!(bucket == 403 || bucket == 404, "{bucket}");
@@ -145,9 +120,9 @@ async fn the_real_server_is_ready_and_refuses_an_anonymous_request() {
     );
     assert!(!log.text().contains(&secret), "the secret is in the log");
     assert!(
-        tokio::task::spawn_blocking(move || get(loopback(port), "/health/ready").is_err())
+        pinned_get(loopback(port), &pin, "/health/ready")
             .await
-            .unwrap(),
+            .is_err(),
         "the listener must be closed after the stop"
     );
 }
@@ -200,7 +175,11 @@ async fn the_real_server_refuses_connections_that_are_not_loopback() {
     };
     let control = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
     let control_port = control.local_addr().unwrap().port();
-    let (control_ok, refused, ipv6_refused, loopback_ok) = tokio::task::spawn_blocking(move || {
+    let pin = *server.certificate_pin();
+    let loopback_ok = pinned_get(loopback(port), &pin, "/health/ready")
+        .await
+        .is_ok();
+    let (control_ok, refused, ipv6_refused) = tokio::task::spawn_blocking(move || {
         let reachable = TcpStream::connect_timeout(
             &SocketAddr::new(IpAddr::V4(host), control_port),
             Duration::from_secs(5),
@@ -216,12 +195,7 @@ async fn the_real_server_refuses_connections_that_are_not_loopback() {
             Duration::from_secs(5),
         )
         .is_err();
-        (
-            reachable,
-            refused,
-            ipv6_refused,
-            get(loopback(port), "/health/ready").is_ok(),
-        )
+        (reachable, refused, ipv6_refused)
     })
     .await
     .unwrap();

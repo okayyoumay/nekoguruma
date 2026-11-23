@@ -5,10 +5,11 @@
 //! One request is one connection, which the agent dials itself (a loopback literal, no name is
 //! resolved) and runs hyper's HTTP/1 client connection over. There is no pool and no redirect
 //! handling: a 3xx is an answer like any other. The request carries `Host`, `Connection: close`
-//! and the body's length. A [`Client::put`] or [`Client::get`] given a [`CertPin`] runs a TLS
+//! and the body's length. A [`Client::put`] or [`Client::get`] takes a [`CertPin`] and runs a TLS
 //! handshake over the dialled stream before the request (ADR-505): the server is accepted only
 //! with that certificate, and a refused handshake is [`Error::Tls`] with nothing of the request
-//! sent. The handshake sits above the byte counting and below the request, so the no-progress
+//! sent. The JSON routes are the server's own and are plain; no object is sent or read without
+//! TLS. The handshake sits above the byte counting and below the request, so the no-progress
 //! clock counts the bytes on the socket. Time is judged as design 5.4 asks, by progress:
 //!
 //! - the connect, and the handshake when there is one, within [`CONNECT_TIMEOUT`];
@@ -260,14 +261,14 @@ impl Client {
     }
 
     /// PUTs `length` bytes read from `source` to `target` at `port`, with no total time: the
-    /// connection is judged by progress alone. With a `pin` the connection is TLS to the server
-    /// with that certificate; without one it is plain. No `Authorization` is sent (the URL is the
-    /// bearer). The body is read in [`CHUNK`]s on a blocking thread, so memory does not depend
+    /// connection is judged by progress alone. The connection is TLS to the server with the
+    /// certificate `pin` names, and nothing of the request is sent unless the server presents
+    /// it. No `Authorization` is sent (the URL is the bearer). The body is read in [`CHUNK`]s on a blocking thread, so memory does not depend
     /// on `length`. A `source` that ends before `length` bytes, or fails, fails the request.
     pub async fn put(
         &self,
         port: u16,
-        pin: Option<&CertPin>,
+        pin: &CertPin,
         target: &str,
         host: &str,
         length: u64,
@@ -284,7 +285,7 @@ impl Client {
         // (with this future) and the channel closes.
         self.send(
             port,
-            pin,
+            Some(pin),
             move || {
                 builder
                     .body(ChannelBody::start(length, source))
@@ -301,12 +302,12 @@ impl Client {
     /// exactly one canonical `Content-Length` of at most `max_len`; any other answer is returned
     /// with no body byte read. A body that is cut short, or whose reader sees more than the
     /// declared length, fails the request ([`Error::Failed`]); a writer that fails is
-    /// [`Error::Write`]. There is no total time: the connection is judged by progress alone. A
-    /// `pin` makes the connection TLS, as for [`Client::put`].
+    /// [`Error::Write`]. There is no total time: the connection is judged by progress alone. The
+    /// connection is TLS with the certificate `pin` names, as for [`Client::put`].
     pub async fn get<W: Write + Send + 'static>(
         &self,
         port: u16,
-        pin: Option<&CertPin>,
+        pin: &CertPin,
         target: &str,
         host: &str,
         max_len: u64,
@@ -321,7 +322,7 @@ impl Client {
             .map_err(|_| Error::Failed)?;
         let start = Instant::now();
         let progress = Progress::new(start);
-        let stream = self.connect(port, pin, start, &progress).await?;
+        let stream = self.connect(port, Some(pin), start, &progress).await?;
         tokio::select! {
             got = exchange_get(stream, request, max_len, writer, progress.clone()) => got,
             () = progress.stalled(self.no_progress) => Err(Error::NoProgress),

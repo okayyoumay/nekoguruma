@@ -23,7 +23,7 @@ use shared_crypto::random_32;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use crate::downloads::{get, url_of};
+use crate::downloads::{get, pin_of, url_of};
 use crate::redeem::{capture, json};
 use crate::serving::{Reply, host_header};
 use crate::storage::content;
@@ -1337,7 +1337,7 @@ async fn a_stored_document_reads_back_byte_identical() {
                 &body,
             )
             .await;
-        let (status, got) = get(&url_of(&r)).await;
+        let (status, got) = get(&url_of(&r), &pin_of(&r)).await;
         assert_eq!(status, 200);
         assert!(got == bytes, "the signed URL serves the body");
     }

@@ -1,9 +1,15 @@
 //! A stand-in for the object server (RustFS) that the server's tests start (ADR-491). It takes
 //! the arguments and the environment the server gives RustFS (`server`, `RUSTFS_ADDRESS`,
-//! `RUSTFS_VOLUMES`, `RUSTFS_ACCESS_KEY_FILE`, `RUSTFS_SECRET_KEY_FILE`), listens on the address,
-//! answers `GET /health/ready`, and misbehaves as the file `fake-object-server.cfg` in its
-//! working directory (the server's data directory) says. The file has one `key value` per line:
+//! `RUSTFS_VOLUMES`, `RUSTFS_ACCESS_KEY_FILE`, `RUSTFS_SECRET_KEY_FILE`, `RUSTFS_TLS_PATH`),
+//! listens on the address, serves TLS with the certificate and key in the directory
+//! `RUSTFS_TLS_PATH` names (`rustfs_cert.pem`, `rustfs_key.pem`, as RustFS reads them), answers
+//! `GET /health/ready`, and misbehaves as the file `fake-object-server.cfg` in its working
+//! directory (the server's data directory) says. It closes a connection without a TLS
+//! close_notify, as RustFS does. The file has one `key value` per line:
 //!
+//! - `tls off`: speaks plain HTTP instead (a port that does not serve TLS), and answers at the
+//!   first bytes it reads, as a server that does not wait for the end of a request it cannot
+//!   parse would;
 //! - `mode`: `ok` (the default), `never-ready` (503), `garbage` (a reply that is no HTTP),
 //!   `silent` (never listens), `hang` (accepts and never answers) or `exit` (ends at once, with
 //!   the code of `code`, default 3);
@@ -30,9 +36,11 @@
 //! It always writes its process ID to `pid` and prints a line when it is up.
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
+
+use ngr_pinned_tls::test_server::{Acceptor, Identity};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 #[allow(
     unsafe_code,
@@ -142,18 +150,60 @@ fn main() {
             number("die_code").unwrap_or(4) as i32,
         )
     });
+    let acceptor = (get("tls") != Some("off")).then(load_acceptor);
     for stream in listener.incoming().flatten() {
         let mode = mode.clone();
-        std::thread::spawn(move || {
-            answer(
-                stream,
-                &mode,
-                started.elapsed() >= ready_after,
-                die,
-                s3_status,
-            )
-        });
+        let acceptor = acceptor.clone();
+        let ready = started.elapsed() >= ready_after;
+        std::thread::spawn(move || serve(stream, acceptor, &mode, ready, die, s3_status));
     }
+}
+
+/// The acceptor for the certificate and key in the directory `RUSTFS_TLS_PATH` names.
+fn load_acceptor() -> Acceptor {
+    let dir =
+        std::path::PathBuf::from(std::env::var_os("RUSTFS_TLS_PATH").expect("RUSTFS_TLS_PATH"));
+    let read = |name: &str| {
+        std::fs::read_to_string(dir.join(name))
+            .unwrap_or_else(|error| panic!("read {name} in RUSTFS_TLS_PATH: {error}"))
+    };
+    let identity = Identity::from_pem(&read("rustfs_cert.pem"), &read("rustfs_key.pem"))
+        .expect("rustfs_cert.pem and rustfs_key.pem hold a certificate and a key");
+    Acceptor::new(&identity)
+}
+
+/// Serves one connection on a runtime of its own: the handshake, if the fake speaks TLS, then the
+/// answer. A connection whose handshake fails is dropped.
+fn serve(
+    stream: TcpStream,
+    acceptor: Option<Acceptor>,
+    mode: &str,
+    ready: bool,
+    die: Option<(u64, bool, i32)>,
+    s3_status: Option<u64>,
+) {
+    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return;
+    };
+    runtime.block_on(async {
+        if stream.set_nonblocking(true).is_err() {
+            return;
+        }
+        let Ok(stream) = tokio::net::TcpStream::from_std(stream) else {
+            return;
+        };
+        match acceptor {
+            Some(acceptor) => {
+                if let Ok(stream) = acceptor.accept(stream).await {
+                    answer(stream, true, mode, ready, die, s3_status).await;
+                }
+            }
+            None => answer(stream, false, mode, ready, die, s3_status).await,
+        }
+    });
 }
 
 fn read_config() -> HashMap<String, String> {
@@ -168,20 +218,23 @@ fn read_config() -> HashMap<String, String> {
     unsafe_code,
     reason = "libc FFI with no safe std equivalent, Unix only: `raise` raises a signal (ADR-502)"
 )]
-fn answer(
-    mut stream: TcpStream,
+async fn answer<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
+    whole_request: bool,
     mode: &str,
     ready: bool,
     die: Option<(u64, bool, i32)>,
     s3_status: Option<u64>,
 ) {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let mut head = Vec::new();
     let mut buf = [0u8; 512];
     while head.len() < 4096 && !head.windows(4).any(|w| w == b"\r\n\r\n") {
-        match stream.read(&mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => head.extend_from_slice(&buf[..n]),
+        match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf)).await {
+            Ok(Ok(0) | Err(_)) | Err(_) => break,
+            Ok(Ok(n)) => head.extend_from_slice(&buf[..n]),
+        }
+        if !whole_request {
+            break;
         }
     }
     // The request target: the second word of the request line.
@@ -191,10 +244,15 @@ fn answer(
         .map(|t| t.to_vec())
         .unwrap_or_default();
     if let Some(status) = s3_status.filter(|_| !target.starts_with(b"/health/")) {
-        let _ = stream.write_all(
-            format!("HTTP/1.1 {status} Steered\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+        let _ = stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 {status} Steered\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                )
                 .as_bytes(),
-        );
+            )
+            .await;
+        let _ = stream.flush().await;
         return;
     }
     let reply: &[u8] = match mode {
@@ -209,7 +267,8 @@ fn answer(
         _ if ready => b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
         _ => b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
     };
-    let _ = stream.write_all(reply);
+    let _ = stream.write_all(reply).await;
+    let _ = stream.flush().await;
     if ready && mode != "garbage" && mode != "never-ready" {
         static ONCE: std::sync::Once = std::sync::Once::new();
         if let Some((ms, signal, code)) = die {

@@ -51,6 +51,7 @@ impl Fixture {
                 S3Store::open(
                     real.port(),
                     real.credentials(),
+                    real.certificate_pin(),
                     "nekoguruma",
                     S3Tuning::default(),
                 ),

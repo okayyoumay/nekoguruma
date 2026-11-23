@@ -3,11 +3,13 @@
 //! `crates/server/src/downloads.rs`.
 //!
 //! `POST /api/v1/agent/downloads` carries the job, the ownership generation, the kind and the
-//! SHA-256 as JSON and the session token as a bearer; the answer is a presigned GET URL and its
-//! life in seconds. The answer is strict: an unknown member, a missing `url`, a zero life, a body
-//! over 64 KiB and anything that is not that JSON object are answers the route does not promise.
-//! The URL goes through the part URL's host rule before any byte is sent to it, and a URL that
-//! breaks the rule is a retry.
+//! SHA-256 as JSON and the session token as a bearer; the answer is a presigned GET URL, the pin of
+//! the certificate the object server presents, and the URL's life in seconds. The answer is
+//! strict, and judged as the part-URL answer is (`routes::object_target`): an unknown member, a
+//! missing `url` or `certificatePin`, a pin that is not 64 lowercase hexadecimal digits, a zero
+//! life, a body over 64 KiB and anything that is not that JSON object are answers the route does
+//! not promise. The URL goes through the object URL's rule (`https` and the registered host)
+//! before any byte is sent to it, and a URL that breaks the rule is a retry.
 //!
 //! The request carries a fresh `Ngr-Nonce`. The answer is verified with the server's proof before
 //! any of it is read, for the 200 and for every status that would end the fetch (400, 404, 413,
@@ -24,7 +26,6 @@
 use std::sync::Arc;
 
 use hyper::Method;
-use serde::Deserialize;
 use shared_crypto::RandomError;
 use shared_proto::DOWNLOAD_RESULTS;
 
@@ -32,8 +33,8 @@ use super::Kind;
 use crate::answer_proof::Verifier;
 use crate::registration::origin::ServerOrigin;
 use crate::uploader::http::Client;
-use crate::uploader::part_url::{self, PartTarget};
-use crate::uploader::routes::{Class, Failure, Requester, parse};
+use crate::uploader::part_url::PartTarget;
+use crate::uploader::routes::{Failure, Requester, object_target};
 
 /// The route's path.
 pub const PATH: &str = "/api/v1/agent/downloads";
@@ -46,13 +47,6 @@ pub struct Want<'a> {
     pub kind: Kind,
     /// 64 lowercase hexadecimal digits.
     pub sha256: &'a str,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct Answer {
-    url: String,
-    expires_in_secs: u64,
 }
 
 /// Whether the answer with this status is verified before it is used: all but the statuses the
@@ -94,12 +88,8 @@ impl Downloads {
             .call(token, Method::POST, PATH, Some(body), verified)
             .await?;
         let (status, body) = self.requester.judge(called, DOWNLOAD_RESULTS, verified)?;
-        let parsed: Answer = parse(status, &body)?;
-        if parsed.expires_in_secs == 0 {
-            return Err(Failure::unpromised(status));
-        }
-        part_url::check(&self.requester.origin, &parsed.url)
-            .map_err(|_| Failure::new(Class::Retry, "download-url-host", Some(status)))
+        object_target(&self.requester.origin, status, &body, "download-url-host")
+            .map(|(target, _)| target)
     }
 }
 

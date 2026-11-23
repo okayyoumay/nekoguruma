@@ -616,6 +616,9 @@ async fn a_server_that_never_becomes_ready_is_stopped_and_the_start_names_the_la
         ("mode never-ready\n", "status 503"),
         ("mode garbage\n", "unparseable answer"),
         ("mode silent\n", "cannot connect"),
+        // A port that answers a plain HTTP 200 where TLS is expected is never ready, and the
+        // words say so without quoting what the peer sent.
+        ("tls off\n", "did not complete a TLS handshake"),
     ] {
         let mut fx = Fixture::new(cfg);
         let began = Instant::now();
@@ -814,6 +817,7 @@ async fn the_child_gets_a_rebuilt_environment_a_group_of_its_own_and_no_extra_de
             "RUSTFS_ADDRESS",
             "RUSTFS_CONSOLE_ENABLE",
             "RUSTFS_SECRET_KEY_FILE",
+            "RUSTFS_TLS_PATH",
             "RUSTFS_VOLUMES",
         ]
     );
@@ -824,6 +828,11 @@ async fn the_child_gets_a_rebuilt_environment_a_group_of_its_own_and_no_extra_de
     );
     let volume = fx.data().join("volume");
     assert!(report.contains(&format!("env RUSTFS_VOLUMES={}\n", volume.display())));
+    // The TLS directory is the credentials directory, where the certificate and key files are.
+    assert!(report.contains(&format!(
+        "env RUSTFS_TLS_PATH={}\n",
+        fx.credentials().display()
+    )));
     assert!(report.contains(&format!(
         "env RUSTFS_SECRET_KEY_FILE={}\n",
         fx.credentials().join(SECRET_KEY_FILE).display()

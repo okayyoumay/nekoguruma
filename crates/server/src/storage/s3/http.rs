@@ -3,6 +3,13 @@
 //! after its response (the request says `connection: close`), and the task that drives it ends
 //! with the response.
 //!
+//! The connection is TLS, accepted only when the peer presents the certificate the client's pin
+//! names (ADR-505): nothing, the request line and its signed URL included, is written before the
+//! handshake accepted the peer. The object server may close the connection without a TLS
+//! close_notify after a complete response; a body that is complete by its length is then read in
+//! full, and one that is cut short, or that has no length and ends in such a close, is an error,
+//! never a short success.
+//!
 //! Nothing here formats a URL, a header or a body: a presigned URL carries its signature in its
 //! query, and the object server's messages may repeat keys and upload IDs. Errors are an
 //! operation name and an [`io::ErrorKind`].
@@ -19,6 +26,7 @@ use hyper::client::conn::http1;
 use hyper::header::{CONNECTION, CONTENT_LENGTH, HOST};
 use hyper::{HeaderMap, Method, Request};
 use hyper_util::rt::TokioIo;
+use ngr_pinned_tls::CertPin;
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
@@ -36,16 +44,17 @@ impl Drop for EndOnDrop {
     }
 }
 
-/// The client of one object server: its address and the `host` header the requests were signed
-/// with.
+/// The client of one object server: its address and the pin of the certificate it must present.
 pub(super) struct Client {
     addr: SocketAddr,
+    pin: CertPin,
 }
 
 impl Client {
-    pub(super) fn new(port: u16) -> Client {
+    pub(super) fn new(port: u16, pin: CertPin) -> Client {
         Client {
             addr: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port),
+            pin,
         }
     }
 
@@ -94,6 +103,9 @@ impl Client {
                 })?;
         let stream = TcpStream::connect(self.addr).await.map_err(io_error)?;
         let _ = stream.set_nodelay(true);
+        let stream = ngr_pinned_tls::connect(&self.pin, stream)
+            .await
+            .map_err(|refused| StoreError::Untrusted { op, refused })?;
         let (mut sender, connection) =
             http1::handshake(TokioIo::new(stream))
                 .await

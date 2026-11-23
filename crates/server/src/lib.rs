@@ -436,6 +436,7 @@ impl Server {
                 let open = S3Store::open(
                     object_server.port(),
                     object_server.credentials(),
+                    object_server.certificate_pin(),
                     &object.bucket,
                     store_tuning,
                 );

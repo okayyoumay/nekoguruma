@@ -548,7 +548,7 @@ impl Fetcher {
             .client
             .get(
                 target.port(),
-                None,
+                target.pin(),
                 target.target(),
                 target.host(),
                 max,

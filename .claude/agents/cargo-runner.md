@@ -59,7 +59,8 @@ Hard rules (these override anything else in your brief):
   for that exact command. The exception is CLAUDE.md's Windows type check
   (`cargo check ... --target x86_64-pc-windows-gnullvm`, after `rustup update
   stable` and `rustup target add x86_64-pc-windows-gnullvm` once per
-  session), which you run when the brief's change touches `cfg(unix)`,
+  session, with the pinned llvm-mingw from `scripts/fetch-llvm-mingw.sh` on
+  `PATH`), which you run when the brief's change touches `cfg(unix)`,
   `cfg(windows)` or other platform-specific code. A bindgen build rewrites committed files in
   `crates/*-sys/src/bindings/`, which conflicts with the first rule; report
   back instead.

@@ -11,10 +11,20 @@
 //!    a batch file that records `set`, `whoami /user` and the debug `ngr-agent identity --mode
 //!    device` (with `NGR_AGENT_KEY_STORE=dpapi` and no state override, so the key lands in the
 //!    service account's own profile) into a directory the account may write;
-//! 2. starts the service twice: the key is created by the first run and found by the second;
+//! 2. starts the service twice and checks the account from the recorded environment
+//!    (`USERDOMAIN` is `NT SERVICE`, `USERNAME` the service name, `USERPROFILE` its service
+//!    profile); the key is created by the first run (exit 0, a key file with the `NGRDPAPI`
+//!    magic) and found by the second (exit 0, the file byte for byte and in modification time
+//!    unchanged), and the identity directory holds nothing but the key file and its lock;
 //! 3. as the account running the test, copies the service's key file and reads it through the
 //!    store, which must refuse it (another account's blob);
 //! 4. prints the facts it recorded, always, and deletes the service and the directory.
+//!
+//! A service has no console, and on the CI image the output of every external program it runs
+//! (`whoami`, the agent) is lost: the redirected files stay empty although the programs exit 0.
+//! Only the `cmd` builtins (`set`, `echo`) write. The assertions therefore rest on the
+//! environment, exit codes and the files the agent leaves, never on a program's output; the
+//! output is still printed in case a machine does deliver it.
 
 #![cfg(windows)]
 
@@ -226,8 +236,31 @@ fn start_and_collect(service: &str, dir: &Path) -> RunFacts {
     facts
 }
 
-fn json(facts: &RunFacts) -> Option<serde_json::Value> {
-    serde_json::from_str(facts.stdout.trim()).ok()
+/// The key file and its directory as a run left them.
+struct BlobSnapshot {
+    bytes: Result<Vec<u8>, String>,
+    modified: Result<std::time::SystemTime, String>,
+    /// The names of all entries in the identity directory.
+    entries: Vec<String>,
+}
+
+fn snapshot(identity: &Path, file: &str) -> BlobSnapshot {
+    let path = identity.join(file);
+    let mut entries: Vec<String> = fs::read_dir(identity)
+        .map(|dir| {
+            dir.flatten()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    entries.sort();
+    BlobSnapshot {
+        bytes: fs::read(&path).map_err(|error| error.to_string()),
+        modified: fs::metadata(&path)
+            .and_then(|meta| meta.modified())
+            .map_err(|error| error.to_string()),
+        entries,
+    }
 }
 
 #[test]
@@ -307,27 +340,31 @@ fn the_device_key_is_created_once_and_found_again_as_a_service_account() {
         println!("--- icacls {target}\n{}", acl.trim());
     }
 
+    let name = SecretName::agent_key(OperatingMode::Device);
+    let file = format!("{name}.dpapi");
     let first = start_and_collect(&service, &dir);
     first.print("first run");
     print_service_state(&first, "after the first run");
-    let second = start_and_collect(&service, &dir);
-    second.print("second run");
-    print_service_state(&second, "after the second run");
     println!(
         "--- the service's environment\n{}",
         first.env.trim().replace("\r\n", "\n")
     );
-
-    // The service account's blob, read by the account running the test.
     let local = first
         .env_var("LOCALAPPDATA")
         .expect("the service has no LOCALAPPDATA: see the environment above");
-    let name = SecretName::agent_key(OperatingMode::Device);
-    let file = format!("{name}.dpapi");
-    let theirs = Path::new(&local)
-        .join("nekoguruma")
-        .join("identity")
-        .join(&file);
+    let identity_dir = Path::new(&local).join("nekoguruma").join("identity");
+    let after_first = snapshot(&identity_dir, &file);
+    let second = start_and_collect(&service, &dir);
+    second.print("second run");
+    print_service_state(&second, "after the second run");
+    let after_second = snapshot(&identity_dir, &file);
+    println!(
+        "--- identity directory: after the first run {:?}, after the second {:?}",
+        after_first.entries, after_second.entries
+    );
+
+    // The service account's blob, read by the account running the test.
+    let theirs = identity_dir.join(&file);
     let mine = tempfile::tempdir().unwrap();
     let identity = mine.path().join("state").join("identity");
     fs::create_dir_all(&identity).unwrap();
@@ -335,20 +372,62 @@ fn the_device_key_is_created_once_and_found_again_as_a_service_account() {
     println!("--- copy of {}: {copied:?}", theirs.display());
     let read = copied.map(|_| dpapi::open(mine.path().join("state")).get(&name));
 
-    assert!(
-        first
-            .whoami
-            .to_lowercase()
-            .contains(&account.to_lowercase()),
-        "the command did not run as {account}; whoami wrote {:?}",
-        first.whoami
+    // The account, from the environment the builtin `set` recorded (see the module docs).
+    assert_eq!(
+        first.env_var("USERDOMAIN").as_deref(),
+        Some("NT SERVICE"),
+        "the command did not run as {account}: see the environment above"
     );
+    let username = first.env_var("USERNAME").unwrap_or_default();
+    assert!(
+        username.eq_ignore_ascii_case(&service),
+        "USERNAME is {username:?}, expected {service:?}"
+    );
+    let profile = first.env_var("USERPROFILE").unwrap_or_default();
+    let expected_profile = format!("\\ServiceProfiles\\{service}").to_lowercase();
+    assert!(
+        profile.to_lowercase().ends_with(&expected_profile),
+        "USERPROFILE {profile:?} is not the profile of {service}"
+    );
+    assert!(
+        local.to_lowercase().starts_with(&profile.to_lowercase()),
+        "LOCALAPPDATA {local:?} is not under USERPROFILE {profile:?}"
+    );
+
+    // Created once: the first run leaves the key file.
     assert_eq!(first.exit.trim(), "0", "the first run failed");
+    let created = after_first
+        .bytes
+        .as_ref()
+        .unwrap_or_else(|error| panic!("the first run left no key file: {error}"));
+    assert!(
+        created.starts_with(b"NGRDPAPI"),
+        "the key file does not start with the store's magic: {} bytes",
+        created.len()
+    );
+    // Found again: the second run leaves the file as it was, so it did not write a new one.
     assert_eq!(second.exit.trim(), "0", "the second run failed");
-    let (first_json, second_json) = (json(&first).unwrap(), json(&second).unwrap());
-    assert_eq!(first_json["created"], true, "{first_json}");
-    assert_eq!(second_json["created"], false, "{second_json}");
-    assert_eq!(first_json["fingerprint"], second_json["fingerprint"]);
+    assert_eq!(
+        after_second.bytes.as_ref().ok(),
+        Some(created),
+        "the second run changed or lost the key file"
+    );
+    assert_eq!(
+        after_second.modified, after_first.modified,
+        "the second run rewrote the key file"
+    );
+    // Nothing else is left in the directory: no other key and no stray temporary file.
+    for entries in [&after_first.entries, &after_second.entries] {
+        let others: Vec<&String> = entries
+            .iter()
+            .filter(|entry| **entry != file && !entry.ends_with(".lock"))
+            .collect();
+        assert!(others.is_empty(), "unexpected files in {entries:?}");
+        assert!(
+            entries.contains(&file),
+            "the key file is missing: {entries:?}"
+        );
+    }
     match read.expect("the service account's key file cannot be copied") {
         Err(error) => assert_eq!(error.kind(), StoreErrorKind::Undecryptable, "{error}"),
         Ok(_) => panic!("another account read the service account's key"),

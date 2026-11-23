@@ -3,7 +3,8 @@
 `sim-vci` is a cdylib exporting the J2534 v04.04 PassThru API. A worker loads it like a vendor
 library, so the agent -> worker -> VCI path runs in CI without hardware (design 13.4). Behind the
 API sits one simulated ECU from `sim-ecu` (`crates/sim-ecu/docs/simulated-ecu.md`). Clause numbers
-below refer to SAE J2534-1 (v04.04).
+below refer to SAE J2534-1 (v04.04). It ships in the SDK as the mock VCI of design 9.8's
+conformance test suite, not in the product installation (ADR-506).
 
 `sim-vci` does not build on `j2534-0404-mock`, the J2534 test double for the worker's own tests,
 and the two stay separate crates (ADR-260). They differ where it matters:

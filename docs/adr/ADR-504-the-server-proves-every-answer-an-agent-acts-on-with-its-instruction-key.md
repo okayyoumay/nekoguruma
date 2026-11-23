@@ -1,7 +1,7 @@
 # ADR-504: The Server Proves Every Answer an Agent Acts on With Its Instruction Key
 
 **Date:** 2026-11-22
-**Status:** Accepted
+**Status:** Accepted (Consequences' object-server listener and port window answered by ADR-505: the object server speaks TLS and the agent pins its certificate)
 **Affects:** design 5.2, 5.3, 6.4, 11.1, 13.3, 14.4, `crates/shared-crypto` (`answer`), `crates/server`, `crates/agent`, `api/openapi.yaml`, `api/asyncapi.yaml`; annotates ADR-456, ADR-459, ADR-461, ADR-466, ADR-467, ADR-468, ADR-471, ADR-478, ADR-493, ADR-495, ADR-497
 
 ## Context

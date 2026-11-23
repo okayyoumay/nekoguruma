@@ -41,6 +41,8 @@ pub mod s3;
 pub use local::{LocalStore, StorageConfig};
 pub use s3::{S3Store, Tuning as S3Tuning};
 
+use ngr_pinned_tls::{CertPin, Refused};
+
 /// The boxed future of an [`ObjectStore`] or [`MultipartStore`] method. Written by hand so that the trait stays object
 /// safe without a macro crate.
 pub type StoreFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, StoreError>> + Send + 'a>>;
@@ -184,6 +186,11 @@ pub enum StoreError {
     /// that could not be read.
     #[error("the object server answered {status} to {op}")]
     Server { op: &'static str, status: u16 },
+    /// The peer at the object server's port did not present the object server's certificate (or
+    /// not its handshake), so nothing was sent to it: the request, with its signed URL, is written
+    /// only after the handshake accepted the peer (ADR-505).
+    #[error("the object server's certificate was refused while trying to {op}: {refused}")]
+    Untrusted { op: &'static str, refused: Refused },
     /// The store's directory, or one of its areas, is gone.
     #[error("the object store's directory is unavailable")]
     Unavailable,
@@ -255,20 +262,26 @@ pub struct Upload {
     pub id: UploadId,
 }
 
-/// A presigned URL a part is PUT to. It carries its signature in the query, so `Debug` shows
-/// nothing of it and there is no `Display`; [`PartUrl::expose`] gives the text to hand to the
-/// writer, and it must not be logged.
+/// A presigned `https` URL a part is PUT to, with the pin of the certificate the object server
+/// at that URL presents (ADR-505), so that a URL and its certificate cannot be paired wrongly. It
+/// carries its signature in the query, so `Debug` shows nothing of it and there is no `Display`;
+/// [`PartUrl::expose`] gives the text to hand to the writer, and it must not be logged.
 #[derive(Clone, PartialEq, Eq)]
-pub struct PartUrl(String);
+pub struct PartUrl(String, CertPin);
 
 impl PartUrl {
-    pub(crate) fn new(url: String) -> PartUrl {
-        PartUrl(url)
+    pub(crate) fn new(url: String, pin: CertPin) -> PartUrl {
+        PartUrl(url, pin)
     }
 
     /// The URL as signed.
     pub fn expose(&self) -> &str {
         &self.0
+    }
+
+    /// The pin of the certificate the object server at the URL presents.
+    pub fn pin(&self) -> &CertPin {
+        &self.1
     }
 }
 
@@ -278,20 +291,26 @@ impl std::fmt::Debug for PartUrl {
     }
 }
 
-/// A presigned URL an object is GET from. It carries its signature in the query, so `Debug` shows
+/// A presigned `https` URL an object is GET from, with the pin of the certificate the object
+/// server at that URL presents (ADR-505). It carries its signature in the query, so `Debug` shows
 /// nothing of it and there is no `Display`; [`GetUrl::expose`] gives the text to hand to the
 /// reader, and it must not be logged.
 #[derive(Clone, PartialEq, Eq)]
-pub struct GetUrl(String);
+pub struct GetUrl(String, CertPin);
 
 impl GetUrl {
-    pub(crate) fn new(url: String) -> GetUrl {
-        GetUrl(url)
+    pub(crate) fn new(url: String, pin: CertPin) -> GetUrl {
+        GetUrl(url, pin)
     }
 
     /// The URL as signed.
     pub fn expose(&self) -> &str {
         &self.0
+    }
+
+    /// The pin of the certificate the object server at the URL presents.
+    pub fn pin(&self) -> &CertPin {
+        &self.1
     }
 }
 

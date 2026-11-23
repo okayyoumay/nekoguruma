@@ -198,15 +198,17 @@ readiness probe.
   space around it: text before or after the section, or a second section of any label, is
   refused. A `.object-server-tls-*.tmp` file left by a crash between a write and a link holds a
   copy of the key or the certificate, is ignored and is safe to delete; it is the kind of stray
-  file the credentials directory must not keep. Keep nothing else of your own in the
-  credentials directory: the object server reads its TLS directory as a namespace.
+  file the credentials directory must not keep. This directory is the child's
+  `RUSTFS_TLS_PATH`, and the object server serves **TLS only** with the two files in it (it
+  refuses plain HTTP, ADR-505): keep nothing else of your own in it, since the object server
+  reads its TLS directory as a namespace and a stray file there could stop its start.
 - **The data directory** holds `.lock` (the local store's lock code: a second server on the
   directory exits 1 before it spawns anything) and `volume/`, which the child is given as its
   volume. The server creates the directory (mode 0700 on Unix) when it is absent and its parent
   exists, and checks it as it checked the local store's directory.
 - **The child.** The binary's `server` subcommand, with a cleared environment holding
   `RUSTFS_ADDRESS=127.0.0.1:<port>`, `RUSTFS_VOLUMES`, the two `_FILE` variables,
-  `RUSTFS_CONSOLE_ENABLE=false` (RustFS 1.0.6 otherwise opens its console on `0.0.0.0:9001`) and the
+  `RUSTFS_TLS_PATH=<credentials_dir>`, `RUSTFS_CONSOLE_ENABLE=false` (RustFS 1.0.6 otherwise opens its console on `0.0.0.0:9001`) and the
   minimum a process needs (`HOME` and `PATH` on Unix, `SystemRoot` on Windows); standard input
   null; the data directory as working directory; its own process group on Unix and no console on
   Windows, so a Ctrl-C at a terminal reaches the server alone, which orders the stop; no
@@ -215,12 +217,16 @@ readiness probe.
   and the secret key redacted. The listener is fixed to loopback: the tests check that the host's
   other IPv4 address and `[::1]` refuse, that the child has one listening socket, and that an
   anonymous request is answered 403.
-- **Readiness.** After the spawn, `GET /health/ready` on the loopback port every 100 ms, each
-  probe at most 1 second, until it answers 200, the child ends or 30 seconds pass. The failure
-  names the last probe ("status 503", "cannot connect", "no answer within 1 s", "unparseable
-  answer") or how the child ended, and the output the child wrote is in the log above it. Another
-  process that answers on the port between the port check and the child's bind is an accepted
-  residual.
+- **Readiness.** After the spawn, `GET /health/ready` on the loopback port over TLS every
+  100 ms, each probe at most 1 second with its connect and handshake, until it answers 200, the
+  child ends or 30 seconds pass. The probe connects with `ngr_pinned_tls::connect` and the pin of
+  the certificate in `credentials_dir`: a peer that presents another certificate, the right one
+  without its key, or no TLS at all is "not ready" ("the port did not present the object
+  server's certificate", "the port did not complete a TLS handshake"), is retried until the
+  budget is spent and never ends the start by itself (a process sharing the port may catch
+  some of the connections), and it receives no byte of the request. The failure names the last
+  probe ("status 503", "cannot connect", "no answer within 1 s", "unparseable answer", the two
+  sentences above) or how the child ended, and the output the child wrote is in the log above it.
 - **Ending with the server.** The server stops the child in its own stop (above) and in every
   failed start. If the server is killed or aborted instead: on Linux the child has a parent-death
   SIGKILL, bound to the thread that spawned it, which is why a thread of its own spawns it and lives
@@ -232,8 +238,11 @@ readiness probe.
 - **The stop's tail.** After the child is reaped the server kills its process group (Unix), so a
   grandchild that holds the child's pipes or port does not outlive the stop, and then joins the
   two log forwarders together for at most 1 second, aborting what is left.
-- **Not covered.** A hung child is not detected (no probe after the start), and a stranger on the
-  object server's port is not told from it.
+- **Not covered.** A hung child is not detected (no probe after the start). A process of the
+  same account that shares the object server's port (Linux lets one with `SO_REUSEPORT` bind it;
+  Windows probably lets any with `SO_REUSEADDR`) gets some of the connections, and can only deny
+  service: it receives the client's handshake records and nothing else, since the store, the
+  probe and the agent send no byte before they have accepted the pinned certificate.
 
 ## The instruction key
 
@@ -347,8 +356,16 @@ hand, so `Arc<dyn MultipartStore>` works, and `Server::object_store()` returns t
 
 The rules the implementation keeps:
 
-- Every request is a presigned URL built by rusty-s3 and sent over its own HTTP/1 connection to
-  `127.0.0.1:<port>` (`connection: close`): no pool, no retry, no redirect, no HTTP/2. A request
+- Every request is a presigned `https` URL built by rusty-s3 and sent over its own HTTP/1
+  connection to `127.0.0.1:<port>` (`connection: close`), over TLS to a peer that presents the
+  pinned certificate only (`S3Store::open` takes the pin; a refusal is `StoreError::Untrusted`,
+  and nothing, the signed URL included, is written before the handshake accepted the peer): no
+  pool, no retry, no redirect, no HTTP/2. The object server may close the connection without a TLS
+  close_notify after a response: a body that is complete by its length is read in full, and a
+  body that is cut short, or that has no length and ends in such a close, is an error.
+  `presign_part` and `presign_get` return URLs with the scheme `https` and the pin they were
+  signed for (`PartUrl::pin`, `GetUrl::pin`), which the part-URL and download routes put in their
+  proved answers as `certificatePin`. A request
   with a body always sends `content-length`, `0` included. A control request is bounded by 30
   seconds, a presigned URL of the store's own is valid at most 60 seconds, an XML answer is read up to
   4 MiB and an error body up to 64 KiB (the rest is not read).
@@ -361,8 +378,8 @@ The rules the implementation keeps:
 - The key lock serialises `complete` and `delete` on one key within this process; other calls
   take none. It does not cross processes.
 - At open the bucket is checked (HeadBucket) and created if absent (409 "owned by you" counts as
-  present); a refusal or an unexpected 4xx ends the open at once, a connection failure or a 5xx is
-  retried.
+  present); a refusal or an unexpected 4xx ends the open at once, a connection failure, a peer
+  that is refused (`Untrusted`) or a 5xx is retried.
 - The bounds above are the constants of a hidden `Tuning` that tests shorten; the store has no
   configuration key.
 
@@ -787,7 +804,7 @@ than the request's, a digest the stored instruction does not name (a `document` 
 document hashes, an `artifact` as its artifact hash) and a digest with no `ir_documents` or
 `artifacts` row for the tenant are all one 404 with one body. A stored instruction that does not
 decode and a stored key that does not parse are 500; no store is 503. The job's state plays no
-part. The answer is 200 with the URL and `expiresInSecs: 60` and `Cache-Control: no-store`; the
+part. The answer is 200 with the URL, the `certificatePin` of the object server and `expiresInSecs: 60` and `Cache-Control: no-store`; the
 route writes nothing and calls the store for no I/O. Nothing logs the URL, the token, the digest or
 the body (ADR-497 items 1 to 5). Its log gates are its own, apart from the upload routes', and
 every reason has one: the database unavailable (503), a statement that failed (500), the store, an
@@ -1147,8 +1164,11 @@ a new migration file rebuilds the crate. How migrations are written and applied 
   `NGR_TEST_RUSTFS_BIN` to the path it prints (CI does this in the `core-linux` and
   `core-windows` jobs). A missing binary fails the real-binary tests with one message that names
   the script. The tests of the child's lifecycle run against a fake child, the second binary of
-  this package, `ngr-fake-object-server` (`src/bin/`; an installation does not use it), which
-  takes RustFS's arguments and environment and is steered by `fake-object-server.cfg` in its data
+  this package, `ngr-fake-object-server` (`src/bin/`; an installation does not use it: the
+  binary is built only with the `fake-object-server` feature, which the package's own
+  dev-dependency turns on for its tests, so a release build does not have it), which
+  takes RustFS's arguments and environment, serves TLS from the files in `RUSTFS_TLS_PATH`
+  (`tls off` makes it speak plain HTTP) and is steered by `fake-object-server.cfg` in its data
   directory: late or never ready, garbage or no answer, ending at once or later (by a code or a
   signal), ignoring SIGTERM, printing the secret, leaving a grandchild on its pipes, reporting
   its environment and descriptors.
@@ -1178,8 +1198,12 @@ a new migration file rebuilds the crate. How migrations are written and applied 
   on Linux). `object_server_rustfs.rs` runs the real binary: readiness, 403 for an anonymous
   request, the stop, the loopback-only listener, the one listening socket, no secret in the
   command line, environment or log, new keys after the files are deleted, and a killed server
-  taking the child. Units are in `src/` (`config.rs`, `object_server/credentials.rs`,
-  `object_server/forward.rs`, `object_server.rs`).
+  taking the child. `object_server_tls.rs` runs it over TLS: the readiness route to a client that
+  trusts the pin and not to one that trusts another, no HTTP answer to plain HTTP, and (Linux) a
+  same-account process sharing the port with `SO_REUSEPORT` receiving, during forty store
+  operations, handshake records only. Units are in `src/` (`config.rs`,
+  `object_server/credentials.rs`, `object_server/forward.rs`, `object_server.rs`, whose probe
+  test runs listeners that present another certificate, the right one without its key and no TLS).
   `redeem.rs` covers the route over TCP. Without a database (a pool that points at nothing): a 400
   for each shape rule, 405, 4096 and 4097 bytes, the 408 after 5 seconds, eleven bad proofs giving
   ten identical 403s and then a 429 with `Retry-After` while 400, 405 and 413 stay as they were,
@@ -1336,7 +1360,8 @@ a new migration file rebuilds the crate. How migrations are written and applied 
   refused key gives exit 1 and nothing listens. Every server test config names a key path; the tests
   that start several servers on one cluster share the key path (`TestPostgres::key_path`).
 - `storage.rs` (database) tests the S3 store on the real pinned RustFS (`NGR_TEST_RUSTFS_BIN`, as
-  `object_server_rustfs.rs`), with a plain HTTP client PUTting to the part URLs: an upload in two
+  `object_server_rustfs.rs`), with an HTTP client over TLS that trusts the pin PUTting to the
+  part URLs: an upload in two
   parts that completes and reads back (and no signature or secret in the child's log); a resume
   that re-sends a part and a second completion that verifies again; a digest mismatch that leaves
   neither object nor upload and the same on a retry; the store's own part checks (none, a gap, a

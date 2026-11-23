@@ -13,9 +13,11 @@
 //! 5. the child is spawned: a cleared and rebuilt environment, standard input null, output piped
 //!    and forwarded line by line to the log ([`forward`]), the data directory as its working
 //!    directory, its own process group on Unix, no console on Windows;
-//! 6. the server waits for `GET /health/ready` on the loopback port to answer 200, at most
-//!    [`READY_TIMEOUT`], each probe at most [`PROBE_TIMEOUT`], and for no longer than the child
-//!    lives.
+//! 6. the server waits for `GET /health/ready` on the loopback port to answer 200 over TLS, at
+//!    most [`READY_TIMEOUT`], each probe at most [`PROBE_TIMEOUT`] with its handshake, and for no
+//!    longer than the child lives. A probe accepts only the certificate the server pinned (ADR-505
+//!    item 2): a port whose peer presents another certificate, or none, is not ready, and the
+//!    peer receives no application byte.
 //!
 //! Every failure after the spawn runs the one stop sequence ([`ObjectServer::stop`]): SIGTERM
 //! (Windows: terminate), a wait of [`STOP_TIMEOUT`], SIGKILL, the reap. The child handle is
@@ -27,7 +29,8 @@
 //! start fails at step 4 with a hint.
 //!
 //! The listener is the object server's: `RUSTFS_ADDRESS` is `127.0.0.1:<port>` and no
-//! configuration key changes it. The credentials are given as the paths of their two files
+//! configuration key changes it. The object server speaks TLS only: `RUSTFS_TLS_PATH` is the
+//! credentials directory, in which it reads the certificate and key files ([`tls`]). The credentials are given as the paths of their two files
 //! (`RUSTFS_ACCESS_KEY_FILE`, `RUSTFS_SECRET_KEY_FILE`), which the object server reads; that is
 //! not configuration by environment in the sense of ADR-456 item 7, which is about the server's
 //! own settings, and no secret is in the environment, in an argument or in the configuration.
@@ -60,7 +63,7 @@ use crate::fs_guard::sync_directory;
 use crate::storage::StoreError;
 use crate::storage::local::{ProcessLock, ensure_area, open_locked_dir};
 pub use credentials::{Credentials, CredentialsError};
-use ngr_pinned_tls::CertPin;
+use ngr_pinned_tls::{CertPin, Refused};
 use tls::{TlsFiles, TlsFilesError};
 
 /// How long the server waits for the object server to answer its readiness probe.
@@ -227,7 +230,14 @@ impl ObjectServer {
             Ok(listener) => drop(listener),
             Err(_) => return Err(ObjectServerError::PortTaken { port }),
         }
-        let command = command(&binary, &config.data_dir, &volume, port, &credentials);
+        let command = command(
+            &binary,
+            &config.data_dir,
+            &volume,
+            port,
+            &credentials,
+            &config.credentials_dir,
+        );
         let (child, spawner) = spawn(command).await?;
         let group = child.id();
         let mut server = ObjectServer {
@@ -285,7 +295,7 @@ impl ObjectServer {
         let mut last = String::from("no probe finished");
         loop {
             let probing = async {
-                match probe(self.port).await {
+                match probe(self.port, self.tls.pin()).await {
                     Ok(()) => Ok(()),
                     Err(outcome) => {
                         tokio::time::sleep(PROBE_INTERVAL).await;
@@ -566,7 +576,7 @@ fn prepare_data_dir(dir: &Path) -> Result<(ProcessLock, PathBuf), ObjectServerEr
 
 /// The child's command: the pinned binary's `server` subcommand with a cleared environment that
 /// holds what the object server reads (the address, the volume, the two credential file paths, the
-/// console switched off) and the minimum a process needs, and nothing of the
+/// directory of its TLS certificate and key, the console switched off) and the minimum a process needs, and nothing of the
 /// server's own. The secret is not in it: only the paths of the credential files are.
 #[allow(
     unsafe_code,
@@ -578,6 +588,7 @@ fn command(
     volume: &Path,
     port: u16,
     credentials: &Credentials,
+    tls_dir: &Path,
 ) -> std::process::Command {
     let mut command = std::process::Command::new(binary);
     command
@@ -590,6 +601,9 @@ fn command(
         .env("RUSTFS_CONSOLE_ENABLE", "false")
         .env("RUSTFS_ACCESS_KEY_FILE", credentials.access_key_path())
         .env("RUSTFS_SECRET_KEY_FILE", credentials.secret_key_path())
+        // The object server serves TLS only, with `rustfs_cert.pem` and `rustfs_key.pem` in this
+        // directory (ADR-505 item 1).
+        .env("RUSTFS_TLS_PATH", tls_dir)
         .current_dir(data_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -722,9 +736,11 @@ async fn spawn(
     }
 }
 
-/// One readiness probe: `GET /health/ready` on the loopback port, answered 200 or not. The
-/// error is a short description for the log and the start's error.
-async fn probe(port: u16) -> Result<(), String> {
+/// One readiness probe: `GET /health/ready` on the loopback port over TLS, answered 200 or not,
+/// where the peer must present the certificate `pin` names. The error is a short description for
+/// the log and the start's error; a peer that is refused is "not ready" in fixed words that say
+/// nothing the peer sent, and receives no application byte.
+async fn probe(port: u16, pin: &CertPin) -> Result<(), String> {
     // One bound for the whole probe, and a shorter one for its connect (CONNECT_TIMEOUT), so a
     // connect that is slow to be refused is cut and the next probe is made soon.
     let deadline = Instant::now() + PROBE_TIMEOUT;
@@ -733,12 +749,21 @@ async fn probe(port: u16) -> Result<(), String> {
         TcpStream::connect((Ipv4Addr::LOCALHOST, port)),
     )
     .await;
-    let mut stream = match connected {
+    let stream = match connected {
         Ok(Ok(stream)) => stream,
         Ok(Err(error)) => return Err(format!("cannot connect: {}", error.kind())),
         Err(_) => return Err("cannot connect (timed out)".to_owned()),
     };
     let attempt = async {
+        let mut stream =
+            ngr_pinned_tls::connect(pin, stream)
+                .await
+                .map_err(|refused| match refused {
+                    Refused::Certificate | Refused::Signature => {
+                        "the port did not present the object server's certificate".to_owned()
+                    }
+                    Refused::Handshake(_) => "the port did not complete a TLS handshake".to_owned(),
+                })?;
         let request = format!(
             "GET /health/ready HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
         );
@@ -746,14 +771,16 @@ async fn probe(port: u16) -> Result<(), String> {
             .write_all(request.as_bytes())
             .await
             .map_err(|error| format!("cannot send: {}", error.kind()))?;
-        // The status line is all that is read.
+        // The status line is all that is read. A close without a TLS close_notify after the line
+        // is complete is not a failure.
         let mut head = Vec::new();
         let mut buf = [0u8; 256];
         while head.len() < 512 && !head.windows(2).any(|w| w == b"\r\n") {
-            let n = stream
-                .read(&mut buf)
-                .await
-                .map_err(|error| format!("cannot read: {}", error.kind()))?;
+            let n = match stream.read(&mut buf).await {
+                Ok(n) => n,
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => 0,
+                Err(error) => return Err(format!("cannot read: {}", error.kind())),
+            };
             if n == 0 {
                 break;
             }
@@ -803,6 +830,91 @@ mod tests {
             b"\xff\xfe\r\n",
         ] {
             assert!(parse_status(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// A listener on a loopback port that serves `acceptor` (or plain HTTP when `None`), answers
+    /// every request with 200, and records every byte it reads after the handshake (for a plain
+    /// peer, every byte it reads at all). Returns the port and the record.
+    async fn listener(
+        acceptor: Option<ngr_pinned_tls::test_server::Acceptor>,
+    ) -> (u16, Arc<std::sync::Mutex<Vec<u8>>>) {
+        let socket = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = Arc::clone(&seen);
+        tokio::spawn(async move {
+            const OK: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n";
+            loop {
+                let (stream, _) = socket.accept().await.unwrap();
+                let acceptor = acceptor.clone();
+                let record = Arc::clone(&record);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    match acceptor {
+                        Some(acceptor) => {
+                            let Ok(mut stream) = acceptor.accept(stream).await else {
+                                return;
+                            };
+                            let n = stream.read(&mut buf).await.unwrap_or(0);
+                            record.lock().unwrap().extend_from_slice(&buf[..n]);
+                            let _ = stream.write_all(OK).await;
+                        }
+                        None => {
+                            let mut stream = stream;
+                            let n = stream.read(&mut buf).await.unwrap_or(0);
+                            record.lock().unwrap().extend_from_slice(&buf[..n]);
+                            let _ = stream.write_all(OK).await;
+                        }
+                    }
+                });
+            }
+        });
+        (port, seen)
+    }
+
+    /// The readiness probe accepts the pinned certificate and refuses, in fixed words, a peer that
+    /// presents another certificate, the right certificate without its key, or no TLS at all (a
+    /// plain HTTP 200); none of them receives the request.
+    #[tokio::test]
+    async fn the_probe_accepts_only_the_pinned_certificate() {
+        use ngr_pinned_tls::test_server::{Acceptor, Identity, Key};
+        let real = Identity::generate(Key::P256);
+        let pin = CertPin::of_certificate(real.certificate());
+        let other = Identity::generate(Key::P256);
+
+        let (port, seen) = listener(Some(Acceptor::new(&real))).await;
+        assert_eq!(probe(port, &pin).await, Ok(()));
+        assert!(
+            seen.lock().unwrap().starts_with(b"GET /health/ready "),
+            "the pinned server must get the request"
+        );
+
+        let impostors = [
+            ("another certificate", Some(Acceptor::new(&other))),
+            (
+                "the certificate without its key",
+                Some(Acceptor::presenting(&[real.certificate()], &other)),
+            ),
+            ("plain HTTP", None),
+        ];
+        for (what, acceptor) in impostors {
+            let (port, seen) = listener(acceptor).await;
+            let outcome = probe(port, &pin).await;
+            let words = outcome.expect_err(what);
+            assert!(
+                words == "the port did not present the object server's certificate"
+                    || words == "the port did not complete a TLS handshake",
+                "{what}: {words}"
+            );
+            // The peer saw at most the client's hello: no request line, no host, no path.
+            let seen = seen.lock().unwrap();
+            assert!(
+                !seen.windows(4).any(|w| w == b"GET ") && !seen.windows(6).any(|w| w == b"health"),
+                "{what}: the peer saw the request"
+            );
         }
     }
 

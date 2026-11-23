@@ -16,10 +16,12 @@ use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use ngr_pinned_tls::CertPin;
+use ngr_pinned_tls::test_server::{Acceptor, Identity, Key};
 use sha2::{Digest, Sha256};
 use shared_crypto::{PublicKey, SigningKey, instruction as envelope};
 use shared_proto::{AgentId, INSTRUCTION_VERSION, JobId, JobInstruction, JobKind, VciId, Vin};
-use tokio::io::{AsyncWriteExt, DuplexStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::time::Instant;
 use tracing_subscriber::fmt::MakeWriter;
@@ -30,7 +32,7 @@ use crate::control::dial::Dialled;
 use crate::control::exchange::{CHALLENGE_PATH, SESSION_PATH};
 use crate::instruction;
 use crate::uploader::fake::{
-    FakeDial, Proof, Seen, Served, accept_with, answer, json, proved_json, read_request,
+    FakeDial, Proof, Seen, Served, ServerEnd, accept_with, answer, json, proved_json, read_request,
 };
 
 const API: u16 = 8080;
@@ -88,10 +90,32 @@ fn ok(body: &[u8]) -> Vec<u8> {
     out
 }
 
-fn download_url() -> String {
+/// A pin as a forger's answer, or an answer that is never acted on, carries one.
+const FORGED_PIN: &str = "ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12";
+
+/// The download route's answer for the object port, naming the certificate `pin`.
+fn download_json(pin: &str) -> String {
     format!(
-        r#"{{"url":"http://127.0.0.1:{OBJ}/bucket/key?X-Amz-Signature=sig","expiresInSecs":60}}"#
+        r#"{{"url":"https://127.0.0.1:{OBJ}/bucket/key?X-Amz-Signature=sig","certificatePin":"{pin}","expiresInSecs":60}}"#
     )
+}
+
+/// An answer whose pin is not the object server's, for the tests whose answer is never acted on.
+fn download_url() -> String {
+    download_json(FORGED_PIN)
+}
+
+/// Who answers on the object port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Peer {
+    /// The object server: the certificate the download answers carry the pin of.
+    Real,
+    /// Another process that took the port, with a certificate of its own.
+    Another,
+    /// A process that has the object server's certificate and not its key.
+    WithoutKey,
+    /// A process that speaks plain HTTP and answers 200 to whatever it first reads.
+    Plain,
 }
 
 /// What the object port does with a GET.
@@ -120,6 +144,13 @@ struct Script {
     downloads: VecDeque<Served>,
     objects: VecDeque<Obj>,
     object_default: Option<Obj>,
+    /// The object server's certificate (DER), the acceptor that serves it and its pin.
+    certificate: Vec<u8>,
+    acceptor: Acceptor,
+    pin: CertPin,
+    peer: Peer,
+    /// Every byte a [`Peer::Plain`] object port read.
+    plain_read: Vec<u8>,
     /// Every request: the port, the request line and the `Authorization` header.
     log: Vec<(u16, String, Option<String>)>,
     /// The `Ngr-Nonce` of every request that carried one, with its port.
@@ -131,8 +162,14 @@ struct Script {
 
 impl Script {
     fn new(prover: TestProver) -> Self {
+        let identity = Identity::generate(Key::P256);
         Self {
             prover,
+            certificate: identity.certificate().to_vec(),
+            acceptor: Acceptor::new(&identity),
+            pin: CertPin::of_certificate(identity.certificate()),
+            peer: Peer::Real,
+            plain_read: Vec::new(),
             challenge: VecDeque::new(),
             session: VecDeque::new(),
             downloads: VecDeque::new(),
@@ -143,6 +180,27 @@ impl Script {
             proofs: Vec::new(),
             sessions: 0,
         }
+    }
+
+    /// The acceptor the object port uses now, or `None` for a peer that is not TLS.
+    fn object_acceptor(&self) -> Option<Acceptor> {
+        match self.peer {
+            Peer::Real => Some(self.acceptor.clone()),
+            Peer::Another => Some(Acceptor::new(&Identity::generate(Key::P256))),
+            Peer::WithoutKey => Some(Acceptor::presenting(
+                &[&self.certificate],
+                &Identity::generate(Key::P256),
+            )),
+            Peer::Plain => None,
+        }
+    }
+
+    /// The object server gets a new certificate: an answer given before names the old pin.
+    fn regenerate_certificate(&mut self) {
+        let identity = Identity::generate(Key::P256);
+        self.certificate = identity.certificate().to_vec();
+        self.acceptor = Acceptor::new(&identity);
+        self.pin = CertPin::of_certificate(identity.certificate());
     }
 
     fn count(&self, port: u16, line: &str) -> usize {
@@ -206,15 +264,38 @@ impl Script {
         let reply = self
             .downloads
             .pop_front()
-            .unwrap_or_else(|| Served::new(200, &download_url()));
+            .unwrap_or_else(|| Served::new(200, &download_json(&self.pin.to_string())));
         raw(reply.bytes(&self.prover, seen))
     }
 }
 
-fn serve(script: Arc<Mutex<Script>>) -> impl Fn(u16, DuplexStream) + Send + Sync + 'static {
+fn serve(script: Arc<Mutex<Script>>) -> impl Fn(u16, ServerEnd) + Send + Sync + 'static {
     move |port, mut server| {
         let script = script.clone();
         tokio::spawn(async move {
+            if port == OBJ {
+                let acceptor = script.lock().unwrap().object_acceptor();
+                match acceptor {
+                    Some(acceptor) => match acceptor.accept(server).await {
+                        Ok(tls) => server = Box::new(tls),
+                        Err(_) => return,
+                    },
+                    None => {
+                        // A plain server answers the first bytes it reads, as one that does not
+                        // wait for the end of a request it cannot parse would.
+                        let mut buf = [0u8; 4096];
+                        let n = server.read(&mut buf).await.unwrap_or(0);
+                        script
+                            .lock()
+                            .unwrap()
+                            .plain_read
+                            .extend_from_slice(&buf[..n]);
+                        let _ = server.write_all(&ok(b"from a plain server")).await;
+                        let _ = server.shutdown().await;
+                        return;
+                    }
+                }
+            }
             let Some(seen) = read_request(&mut server).await else {
                 return;
             };
@@ -814,21 +895,132 @@ async fn an_unavailable_route_is_retried_after_the_back_off() {
     assert_eq!(rig.downloads(), 3);
 }
 
-/// A7: a URL that breaks the host rule is a retry and nothing is sent to it.
+/// A7: a URL that breaks the host rule (`https` and the registered host) is a retry and nothing
+/// is sent to it.
 #[tokio::test(start_paused = true)]
 async fn a_url_off_the_host_rule_is_a_retry_and_is_never_dialled() {
+    for url in [
+        "http://127.0.0.1:9000/x",
+        "HTTPS://127.0.0.1:9000/x",
+        "https://127.0.0.2:9000/x",
+    ] {
+        let rig = Rig::one(b"d");
+        rig.serve_body(b"d");
+        rig.script.lock().unwrap().downloads.push_back(Served::new(
+            200,
+            &format!(r#"{{"url":"{url}","certificatePin":"{FORGED_PIN}","expiresInSecs":60}}"#),
+        ));
+        assert_eq!(
+            retry_why(rig.doc(0).await.unwrap_err()),
+            "download-url-host",
+            "{url}"
+        );
+        assert_eq!(rig.dialled(OBJ), 0);
+        assert_eq!(rig.tmp_files(), 0);
+    }
+}
+
+/// A proved 200 whose pin is missing, or is not 64 lowercase hexadecimal digits, is an answer the
+/// route never promises: the fetch ends, nothing is dialled and nothing is stored.
+#[tokio::test(start_paused = true)]
+async fn a_missing_or_malformed_pin_ends_the_fetch_and_nothing_is_dialled() {
+    let url = format!(r#""url":"https://127.0.0.1:{OBJ}/x""#);
+    let mut answers = vec![format!(r#"{{{url},"expiresInSecs":60}}"#)];
+    for pin in [
+        FORGED_PIN[1..].to_owned(),
+        format!("{FORGED_PIN}0"),
+        FORGED_PIN.to_uppercase(),
+        FORGED_PIN.replacen('a', "g", 1),
+        String::new(),
+    ] {
+        answers.push(format!(
+            r#"{{{url},"certificatePin":"{pin}","expiresInSecs":60}}"#
+        ));
+    }
+    for body in answers {
+        let rig = Rig::one(b"d");
+        rig.serve_body(b"d");
+        rig.script
+            .lock()
+            .unwrap()
+            .downloads
+            .push_back(Served::new(200, &body));
+        let error = rig.doc(0).await.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                FetchError::Refused {
+                    why: "answer",
+                    status: Some(200)
+                }
+            ),
+            "{body}: {error:?}"
+        );
+        assert_eq!((rig.dialled(OBJ), rig.gets(), rig.tmp_files()), (0, 0, 0));
+    }
+}
+
+/// A fetch from a peer on the object port that is not the object server stores nothing and is
+/// retried with the class of the refusal, whoever the peer is: a process that took the port with
+/// a certificate of its own, one that has the real certificate without its key, and a plain HTTP
+/// server. None of them sees the request.
+#[tokio::test(start_paused = true)]
+async fn an_impostor_on_the_object_port_is_refused_and_nothing_is_stored() {
+    for (peer, why) in [
+        (Peer::Another, "object-tls-certificate"),
+        (Peer::WithoutKey, "object-tls-signature"),
+        (Peer::Plain, "object-tls-handshake"),
+    ] {
+        let rig = Rig::one(b"d");
+        rig.serve_body(b"d");
+        rig.script.lock().unwrap().peer = peer;
+        assert_eq!(retry_why(rig.doc(0).await.unwrap_err()), why, "{peer:?}");
+        assert_eq!((rig.gets(), rig.tmp_files()), (0, 0), "{peer:?}");
+        assert!(!rig.cached(Kind::Document, b"d").exists(), "{peer:?}");
+        let read = rig.script.lock().unwrap().plain_read.clone();
+        let text = String::from_utf8_lossy(&read);
+        assert!(
+            !text.contains("GET ") && !text.contains("X-Amz"),
+            "{peer:?}: the peer read the request"
+        );
+        // The real server comes back, and the next attempt gets the object.
+        rig.script.lock().unwrap().peer = Peer::Real;
+        assert!(rig.doc(0).await.is_ok(), "{peer:?}");
+    }
+}
+
+/// The object server's certificate is regenerated while the agent holds an answer that names the
+/// old pin: the fetch is refused on the certificate and retried, and the next answer carries the
+/// new pin and works.
+#[tokio::test(start_paused = true)]
+async fn a_regenerated_certificate_is_refused_once_and_the_next_answer_works() {
     let rig = Rig::one(b"d");
     rig.serve_body(b"d");
-    rig.script.lock().unwrap().downloads.push_back(Served::new(
-        200,
-        r#"{"url":"http://127.0.0.2:9000/x","expiresInSecs":60}"#,
-    ));
+    let old = rig.script.lock().unwrap().pin.to_string();
+    rig.script
+        .lock()
+        .unwrap()
+        .downloads
+        .push_back(Served::new(200, &download_json(&old)));
+    rig.script.lock().unwrap().regenerate_certificate();
     assert_eq!(
         retry_why(rig.doc(0).await.unwrap_err()),
-        "download-url-host"
+        "object-tls-certificate"
     );
-    assert_eq!(rig.dialled(OBJ), 0);
-    assert_eq!(rig.tmp_files(), 0);
+    assert_eq!(rig.gets(), 0);
+    // The next answer is the script's own, with the pin of the new certificate.
+    assert!(rig.doc(0).await.is_ok());
+    assert_eq!(rig.gets(), 1);
+}
+
+/// A download over TLS with the pin the answer carried succeeds.
+#[tokio::test(start_paused = true)]
+async fn a_download_over_tls_with_the_pin_of_the_answer_is_cached() {
+    let rig = Rig::one(b"d");
+    rig.serve_body(b"d");
+    let got = rig.doc(0).await.unwrap();
+    assert_eq!(got.length, 1);
+    assert_eq!(rig.gets(), 1);
 }
 
 // ---------------------------------------------------------------- A8 to A13
@@ -1486,15 +1678,19 @@ async fn an_unproved_404_over_a_real_socket_is_retried_and_not_refused() {
         .downloads
         .push_back(Served::new(404, r#"{"title":"x"}"#).unproved());
     let script = rig.script.clone();
-    let server = tokio::spawn(accept_with(listener, move |seen, mut stream| {
-        let reply = script.lock().unwrap().react(API, &seen);
-        async move {
-            if let Obj::Raw(bytes) = reply {
-                let _ = stream.write_all(&bytes).await;
-                let _ = stream.shutdown().await;
+    let server = tokio::spawn(accept_with(
+        listener,
+        || None,
+        move |seen, mut stream| {
+            let reply = script.lock().unwrap().react(API, &seen);
+            async move {
+                if let Obj::Raw(bytes) = reply {
+                    let _ = stream.write_all(&bytes).await;
+                    let _ = stream.shutdown().await;
+                }
             }
-        }
-    }));
+        },
+    ));
     let error = rig.doc(0).await.unwrap_err();
     assert_eq!(error, FetchError::Unproven { status: Some(404) });
     assert!(error.may_retry());

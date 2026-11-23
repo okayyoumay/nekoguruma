@@ -1,7 +1,9 @@
 use std::io::Cursor;
 
 use super::*;
-use crate::uploader::fake::{FakeDial, Proof, Served, proving, scripted, scripted_served};
+use crate::uploader::fake::{
+    FakeDial, Proof, Served, proving, scripted, scripted_served, scripted_tls_with,
+};
 
 const ORIGIN: &str = "http://127.0.0.1:8080";
 const AGENT: &str = "0194f0a2-7c3e-7d11-8a52-3f6f9b1c2d4e";
@@ -29,6 +31,22 @@ fn with_reply(reply: Served) -> (Routes, Seen) {
     let (prover, verifier) = proving(ORIGIN, AGENT);
     let (dial, seen) = scripted_served(prover, reply);
     (routes_over(dial, verifier), seen)
+}
+
+/// A pin as a proved answer carries one.
+const PIN: &str = "ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12";
+
+/// A part-URL answer for `url`.
+fn part_answer(url: &str) -> String {
+    format!(r#"{{"url":"{url}","certificatePin":"{PIN}","expiresInSecs":300}}"#)
+}
+
+/// Routes against an object server that is TLS and answers every request with `reply`, which is
+/// not proved (a PUT's answer is not), and the pin of its certificate.
+fn with_object_reply(reply: Served) -> (Routes, Seen, CertPin) {
+    let (prover, verifier) = proving(ORIGIN, AGENT);
+    let (dial, seen, pin) = scripted_tls_with(move |request| reply.bytes(&prover, request));
+    (routes_over(dial, verifier), seen, pin)
 }
 
 /// Routes against a server that answers every request with these bytes.
@@ -261,13 +279,11 @@ async fn retry_after_is_carried_for_429_and_503_when_usable() {
 
 #[tokio::test(start_paused = true)]
 async fn part_url_asks_by_path_and_applies_the_host_rule() {
-    let url = r#"http://127.0.0.1:9000/bucket/key?X-Amz-Signature=abc"#;
-    let (routes, seen) = with_reply(Served::new(
-        200,
-        &format!(r#"{{"url":"{url}","expiresInSecs":300}}"#),
-    ));
+    let url = r#"https://127.0.0.1:9000/bucket/key?X-Amz-Signature=abc"#;
+    let (routes, seen) = with_reply(Served::new(200, &part_answer(url)));
     let got = routes.part_url("tok", &id(), 3).await.unwrap();
     assert_eq!(got.expires_in_secs(), 300);
+    assert_eq!(got.target().pin(), &CertPin::from_hex(PIN).unwrap());
     assert_eq!(got.target().port(), 9000);
     assert_eq!(got.target().host(), "127.0.0.1:9000");
     assert_eq!(got.target().target(), "/bucket/key?X-Amz-Signature=abc");
@@ -286,40 +302,66 @@ async fn part_url_asks_by_path_and_applies_the_host_rule() {
 #[tokio::test(start_paused = true)]
 async fn a_part_url_that_breaks_the_rule_is_a_retry_and_other_bodies_are_unpromised() {
     for url in [
-        "http://127.0.0.10:9000/x",
-        "https://127.0.0.1:9000/x",
-        "http://evil.example/x",
+        "https://127.0.0.10:9000/x",
+        "http://127.0.0.1:9000/x",
+        "http://127.0.0.1/x",
+        "HTTPS://127.0.0.1:9000/x",
+        "https://evil.example/x",
     ] {
-        let (routes, _) = with_reply(Served::new(
-            200,
-            &format!(r#"{{"url":"{url}","expiresInSecs":300}}"#),
-        ));
+        let (routes, seen) = with_reply(Served::new(200, &part_answer(url)));
         assert_eq!(
             routes.part_url("t", &id(), 1).await.unwrap_err(),
             failure(Class::Retry, "part-url-host", Some(200)),
             "{url}"
         );
+        assert_eq!(seen.lock().unwrap().len(), 1, "only the route was asked");
     }
-    for body in [
-        "{}",
-        "nope",
-        r#"{"url":"http://127.0.0.1:9000/x"}"#,
-        r#"{"url":"http://127.0.0.1:9000/x","expiresInSecs":0}"#,
-        r#"{"url":"http://127.0.0.1:9000/x","expiresInSecs":300,"extra":1}"#,
-        r#"{"url":5,"expiresInSecs":300}"#,
-    ] {
-        let (routes, _) = with_reply(Served::new(200, body));
+    let pin = format!(r#""certificatePin":"{PIN}""#);
+    let url = r#""url":"https://127.0.0.1:9000/x""#;
+    let wrong_pins = [
+        // Missing, 63 and 65 digits, uppercase, not hexadecimal, padded, and not text.
+        String::new(),
+        format!(r#","certificatePin":"{}""#, &PIN[1..]),
+        format!(r#","certificatePin":"{PIN}0""#),
+        format!(r#","certificatePin":"{}""#, PIN.to_uppercase()),
+        format!(r#","certificatePin":"{}""#, PIN.replacen('a', "g", 1)),
+        format!(r#","certificatePin":" {PIN}""#),
+        r#","certificatePin":5"#.to_owned(),
+    ];
+    let mut bodies: Vec<String> = wrong_pins
+        .into_iter()
+        .map(|wrong| format!(r#"{{{url}{wrong},"expiresInSecs":300}}"#))
+        .collect();
+    bodies.extend([
+        "{}".to_owned(),
+        "nope".to_owned(),
+        format!(r#"{{{url},{pin}}}"#),
+        format!(r#"{{{url},{pin},"expiresInSecs":0}}"#),
+        format!(r#"{{{url},{pin},"expiresInSecs":300,"extra":1}}"#),
+        format!(r#"{{"url":5,{pin},"expiresInSecs":300}}"#),
+    ]);
+    for body in bodies {
+        let (routes, seen) = with_reply(Served::new(200, &body));
         assert_eq!(
             routes.part_url("t", &id(), 1).await.unwrap_err(),
             failure(Class::PassOver, "answer", Some(200)),
             "{body}"
         );
+        assert_eq!(seen.lock().unwrap().len(), 1, "only the route was asked");
     }
+    // A malformed pin is judged before the host rule: a body with both faults is not promised.
+    let both = format!(
+        r#"{{"url":"http://127.0.0.1:9000/x","certificatePin":"{}","expiresInSecs":300}}"#,
+        PIN.to_uppercase()
+    );
+    let (routes, seen) = with_reply(Served::new(200, &both));
+    assert_eq!(
+        routes.part_url("t", &id(), 1).await.unwrap_err(),
+        failure(Class::PassOver, "answer", Some(200))
+    );
+    assert_eq!(seen.lock().unwrap().len(), 1, "only the route was asked");
     // A 201 is not what the route answers.
-    let (routes, _) = with_reply(Served::new(
-        201,
-        r#"{"url":"http://127.0.0.1:9000/x","expiresInSecs":300}"#,
-    ));
+    let (routes, _) = with_reply(Served::new(201, &part_answer("https://127.0.0.1:9000/x")));
     assert_eq!(
         routes.part_url("t", &id(), 1).await.unwrap_err().class,
         Class::PassOver
@@ -531,15 +573,15 @@ async fn a_request_with_no_answer_is_a_retry() {
 #[tokio::test(start_paused = true)]
 async fn the_put_carries_no_token_and_any_failure_is_a_retry() {
     let origin = ServerOrigin::parse("http://127.0.0.1:8080").unwrap();
-    let url = PartUrl {
-        target: part_url::check(&origin, "http://127.0.0.1:9000/b/k?sig=1").unwrap(),
-        expires_in_secs: 300,
-    };
-    let (routes, seen) = with_reply(
+    let (routes, seen, pin) = with_object_reply(
         Served::new(200, "")
             .with_headers("ETag: \"x\"\r\n")
             .unproved(),
     );
+    let url = PartUrl {
+        target: part_url::check(&origin, "https://127.0.0.1:9000/b/k?sig=1", pin).unwrap(),
+        expires_in_secs: 300,
+    };
     routes
         .put_part(&url, 4, Box::new(Cursor::new(b"abcd".to_vec())))
         .await
@@ -552,7 +594,11 @@ async fn the_put_carries_no_token_and_any_failure_is_a_retry() {
         assert_eq!(seen[0].body, b"abcd");
     }
     for status in [301, 400, 401, 403, 404, 409, 500, 503] {
-        let (routes, _) = with_reply(Served::new(status, "").unproved());
+        let (routes, _, pin) = with_object_reply(Served::new(status, "").unproved());
+        let url = PartUrl {
+            target: part_url::check(&origin, "https://127.0.0.1:9000/b/k?sig=1", pin).unwrap(),
+            expires_in_secs: 300,
+        };
         assert_eq!(
             routes
                 .put_part(&url, 1, Box::new(Cursor::new(vec![1])))
@@ -563,13 +609,40 @@ async fn the_put_carries_no_token_and_any_failure_is_a_retry() {
     }
 }
 
+/// A part's PUT to a peer that does not present the pinned certificate is a retry named for the
+/// refusal, and the peer reads no byte of the part or of the request.
+#[tokio::test(start_paused = true)]
+async fn a_put_to_a_peer_that_is_not_the_object_server_is_a_retry_and_sends_no_byte() {
+    let origin = ServerOrigin::parse("http://127.0.0.1:8080").unwrap();
+    let (_, verifier) = proving(ORIGIN, AGENT);
+    let (dial, seen, served_pin) = scripted_tls_with(|_| b"HTTP/1.1 200 X\r\n\r\n".to_vec());
+    let routes = routes_over(dial.clone(), verifier);
+    // The answer named a pin that is not the certificate the peer presents.
+    let wrong = CertPin::of_certificate(b"another certificate");
+    assert_ne!(wrong, served_pin);
+    let url = PartUrl {
+        target: part_url::check(&origin, "https://127.0.0.1:9000/b/k?sig=1", wrong).unwrap(),
+        expires_in_secs: 300,
+    };
+    let refused = routes
+        .put_part(&url, 4, Box::new(Cursor::new(b"abcd".to_vec())))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refused,
+        failure(Class::Retry, "object-tls-certificate", None)
+    );
+    assert!(seen.lock().unwrap().is_empty(), "the peer read a request");
+}
+
 /// Nothing that holds a token, a signed URL or an answer body shows it in `{:?}`.
 #[tokio::test(start_paused = true)]
 async fn debug_output_shows_no_token_url_query_or_body() {
     let origin = ServerOrigin::parse("http://127.0.0.1:8080").unwrap();
     let target = part_url::check(
         &origin,
-        "http://127.0.0.1:9000/bucket/key?X-Amz-Signature=hunter2",
+        "https://127.0.0.1:9000/bucket/key?X-Amz-Signature=hunter2",
+        CertPin::from_hex(PIN).unwrap(),
     )
     .unwrap();
     let url = PartUrl {
@@ -631,7 +704,9 @@ fn calls() -> Vec<RouteCase> {
             |r| Box::pin(async move { r.part_url("t", &id(), 1).await.map(drop) }),
             vec![(
                 200,
-                r#"{"url":"http://127.0.0.1:9000/x?s=1","expiresInSecs":60}"#.to_owned(),
+                format!(
+                    r#"{{"url":"https://127.0.0.1:9000/x?s=1","certificatePin":"{PIN}","expiresInSecs":60}}"#
+                ),
             )],
         ),
         (
@@ -755,11 +830,11 @@ async fn every_json_request_carries_a_fresh_nonce_and_the_put_none() {
             .all(|n| crate::answer_proof::canonical_base64::<32>(n).is_some())
     );
     let origin = ServerOrigin::parse(ORIGIN).unwrap();
+    let (routes, seen, pin) = with_object_reply(Served::new(200, "").unproved());
     let url = PartUrl {
-        target: part_url::check(&origin, "http://127.0.0.1:9000/b/k?sig=1").unwrap(),
+        target: part_url::check(&origin, "https://127.0.0.1:9000/b/k?sig=1", pin).unwrap(),
         expires_in_secs: 300,
     };
-    let (routes, seen) = with_reply(Served::new(200, "").unproved());
     routes
         .put_part(&url, 1, Box::new(Cursor::new(vec![1])))
         .await

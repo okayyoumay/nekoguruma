@@ -1,13 +1,16 @@
 //! A scripted data channel server for the loop's tests: the exchange and the four routes with
-//! the rows' states as the server keeps them, and a PUT endpoint of its own port. A test queues
-//! canned answers per route and may tap each request. It serves over the in-memory dial and, for
-//! the one real-socket test, over TCP.
+//! the rows' states as the server keeps them, and a PUT endpoint of its own port that speaks TLS
+//! under a certificate of its own, whose pin the part-URL answers carry (ADR-505). A test queues
+//! canned answers per route, may tap each request, and may change who answers on the object port
+//! ([`Peer`]). It serves over the in-memory dial and, for the one real-socket test, over TCP.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use ngr_pinned_tls::CertPin;
+use ngr_pinned_tls::test_server::{Acceptor, Identity, Key};
 use sha2::{Digest as _, Sha256};
 use shared_crypto::{PublicKey, Signer as _, SigningKey};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -16,13 +19,26 @@ use tokio::time::Instant;
 use crate::answer_proof::TestProver;
 use crate::control::exchange::{CHALLENGE_PATH, SESSION_PATH};
 use crate::uploader::fake::{
-    FakeDial, Proof, Seen, Served, accept_with, answer, json, proved_json, read_request,
+    FakeDial, Proof, Seen, Served, ServerEnd, accept_with, answer, json, proved_json, read_request,
 };
 use crate::uploader::routes::BEGIN_PATH;
 
 /// The port of the API routes and the port of the object PUTs, over the in-memory dial.
 pub(super) const API_PORT: u16 = 8080;
 pub(super) const OBJECT_PORT: u16 = 9000;
+
+/// Who answers on the object port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Peer {
+    /// The object server: the certificate the part-URL answers carry the pin of.
+    Real,
+    /// Another process that took the port: TLS under a certificate of its own.
+    Another,
+    /// A process that has the object server's certificate (it is public) and not its key.
+    WithoutKey,
+    /// A process that speaks plain HTTP and answers 200 to whatever it first reads.
+    Plain,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum Route {
@@ -112,6 +128,17 @@ struct State {
     log: Vec<Logged>,
     part_bytes: u64,
     object_port: u16,
+    /// The object server's certificate (DER) and its pin; the answers of the part-URL route
+    /// carry the pin.
+    certificate: Vec<u8>,
+    acceptor: Acceptor,
+    pin: CertPin,
+    peer: Peer,
+    /// Replace the certificate right after the next part-URL answer, so that the URL just given
+    /// is for a certificate the object server no longer has.
+    rotate_after_part_url: bool,
+    /// Every byte a [`Peer::Plain`] port read.
+    plain_read: Vec<u8>,
 }
 
 type Tap = Arc<dyn Fn(&Logged) + Send + Sync>;
@@ -139,6 +166,7 @@ impl Sim {
     /// `agent_id`; the registration record must name [`Sim::instruction_key`].
     pub(super) fn new(part_bytes: u64, object_port: u16, origin: &str, agent_id: &str) -> Arc<Sim> {
         let key = Arc::new(SigningKey::generate().unwrap());
+        let identity = Identity::generate(Key::P256);
         Arc::new(Sim {
             state: Mutex::new(State {
                 prover: TestProver::new(key, origin, agent_id),
@@ -150,6 +178,12 @@ impl Sim {
                 log: Vec::new(),
                 part_bytes,
                 object_port,
+                certificate: identity.certificate().to_vec(),
+                acceptor: Acceptor::new(&identity),
+                pin: CertPin::of_certificate(identity.certificate()),
+                peer: Peer::Real,
+                rotate_after_part_url: false,
+                plain_read: Vec::new(),
             }),
             tap: Mutex::new(None),
         })
@@ -158,6 +192,35 @@ impl Sim {
     /// The public half of the key the server signs with: the record's instruction key.
     pub(super) fn instruction_key(&self) -> PublicKey {
         self.state.lock().unwrap().prover.key.public_key()
+    }
+
+    /// Who answers on the object port from now on.
+    pub(super) fn set_peer(&self, peer: Peer) {
+        self.state.lock().unwrap().peer = peer;
+    }
+
+    /// The object server gets a new certificate right after it answers the next part URL.
+    pub(super) fn regenerate_certificate_after_next_part_url(&self) {
+        self.state.lock().unwrap().rotate_after_part_url = true;
+    }
+
+    /// Every byte a [`Peer::Plain`] object port read.
+    pub(super) fn plain_read(&self) -> Vec<u8> {
+        self.state.lock().unwrap().plain_read.clone()
+    }
+
+    /// The acceptor the object port uses now, or `None` for a peer that is not TLS.
+    fn object_acceptor(&self) -> Option<Acceptor> {
+        let state = self.state.lock().unwrap();
+        match state.peer {
+            Peer::Real => Some(state.acceptor.clone()),
+            Peer::Another => Some(Acceptor::new(&Identity::generate(Key::P256))),
+            Peer::WithoutKey => Some(Acceptor::presenting(
+                &[&state.certificate],
+                &Identity::generate(Key::P256),
+            )),
+            Peer::Plain => None,
+        }
     }
 
     /// The next request of `route` is answered with `reply` instead of the default.
@@ -389,8 +452,17 @@ impl Sim {
     }
 }
 
+/// Gives the object server a new certificate.
+fn rotate(state: &mut State) {
+    let identity = Identity::generate(Key::P256);
+    state.certificate = identity.certificate().to_vec();
+    state.acceptor = Acceptor::new(&identity);
+    state.pin = CertPin::of_certificate(identity.certificate());
+}
+
 fn api(state: &mut State, route: Route, path: &str, seen: &Seen) -> Reply {
     let object_port = state.object_port;
+    let pin = state.pin;
     if route == Route::Begin {
         let body: serde_json::Value = serde_json::from_slice(&seen.body).unwrap();
         let (job, kind) = (
@@ -468,13 +540,18 @@ fn api(state: &mut State, route: Route, path: &str, seen: &Seen) -> Reply {
                 return problem(409, Some(row.state));
             }
             let n = path.rsplit('/').next().unwrap();
-            status(
+            let answer = status(
                 200,
                 &format!(
-                    r#"{{"url":"http://127.0.0.1:{object_port}/obj/{}/{n}?sig=s","expiresInSecs":60}}"#,
+                    r#"{{"url":"https://127.0.0.1:{object_port}/obj/{}/{n}?sig=s","certificatePin":"{pin}","expiresInSecs":60}}"#,
                     row.id
                 ),
-            )
+            );
+            if state.rotate_after_part_url {
+                state.rotate_after_part_url = false;
+                rotate(state);
+            }
+            answer
         }
         Route::Complete => match row.state {
             "finished" => status(200, r#"{"state":"finished"}"#),
@@ -499,12 +576,36 @@ fn api(state: &mut State, route: Route, path: &str, seen: &Seen) -> Reply {
     }
 }
 
-/// The in-memory dial the server answers on.
+/// The in-memory dial the server answers on: the object port is TLS (or whatever [`Peer`] is
+/// there), the API port is plain.
 pub(super) fn dial(sim: &Arc<Sim>) -> Arc<FakeDial> {
     let sim = sim.clone();
-    FakeDial::new(64 * 1024, move |port, mut stream| {
+    FakeDial::new(64 * 1024, move |port, stream| {
         let sim = sim.clone();
         tokio::spawn(async move {
+            let mut stream = stream;
+            if port == sim.state.lock().unwrap().object_port {
+                match sim.object_acceptor() {
+                    Some(acceptor) => match acceptor.accept(stream).await {
+                        Ok(tls) => stream = Box::new(tls),
+                        Err(_) => return,
+                    },
+                    None => {
+                        // A plain server answers the first bytes it reads, as one that does not
+                        // wait for the end of a request it cannot parse would.
+                        let mut buf = [0u8; 4096];
+                        let n = stream.read(&mut buf).await.unwrap_or(0);
+                        sim.state
+                            .lock()
+                            .unwrap()
+                            .plain_read
+                            .extend_from_slice(&buf[..n]);
+                        let _ = stream.write_all(&answer(200, "", "")).await;
+                        let _ = stream.shutdown().await;
+                        return;
+                    }
+                }
+            }
             let Some(seen) = read_request(&mut stream).await else {
                 return;
             };
@@ -536,7 +637,16 @@ async fn play<S: AsyncRead + AsyncWrite + Unpin>(reply: Reply, stream: &mut S) {
 
 /// Serves `sim` on a real listener: one request per connection, read whole, answered, closed.
 pub(super) async fn serve_tcp(listener: tokio::net::TcpListener, port: u16, sim: Arc<Sim>) {
-    serve_with(listener, move |seen| sim.handle(port, seen)).await;
+    let tls = {
+        let sim = sim.clone();
+        let object_port = sim.state.lock().unwrap().object_port;
+        move || {
+            (port == object_port)
+                .then(|| sim.object_acceptor())
+                .flatten()
+        }
+    };
+    serve_with_tls(listener, tls, move |seen| sim.handle(port, seen)).await;
 }
 
 /// Accepts connections on a real listener until the task is dropped and answers each request, read
@@ -545,7 +655,16 @@ pub(super) async fn serve_with(
     listener: tokio::net::TcpListener,
     handle: impl Fn(&Seen) -> Reply + Send + Sync + 'static,
 ) {
-    accept_with(listener, move |seen, mut stream| {
+    serve_with_tls(listener, || None, handle).await;
+}
+
+/// [`serve_with`] with a TLS handshake first on the connections `tls` gives an acceptor for.
+async fn serve_with_tls(
+    listener: tokio::net::TcpListener,
+    tls: impl Fn() -> Option<Acceptor> + Send + Sync + 'static,
+    handle: impl Fn(&Seen) -> Reply + Send + Sync + 'static,
+) {
+    accept_with(listener, tls, move |seen, mut stream: ServerEnd| {
         let reply = handle(&seen);
         async move { play(reply, &mut stream).await }
     })

@@ -8,10 +8,7 @@
 
 use std::time::Duration;
 
-use http_body_util::{BodyExt, Full};
-use hyper::body::Bytes;
-use hyper::client::conn::http1;
-use hyper_util::rt::TokioIo;
+use ngr_pinned_tls::CertPin;
 use rusty_s3::{Bucket, Credentials as S3Credentials, S3Action, UrlStyle};
 use server::storage::{GET_URL_EXPIRY, MultipartStore, ObjectKey};
 use server::uploads::PART_BYTES;
@@ -126,7 +123,7 @@ async fn seed(fx: &Fx, bytes: &[u8]) -> ObjectKey {
     for (i, chunk) in bytes.chunks(PART_BYTES as usize).enumerate() {
         let number = (i + 1) as u16;
         let url = fx.wrap.presign_part(&upload, number).unwrap();
-        let (status, _) = put(url.expose(), chunk.to_vec()).await;
+        let (status, _) = put(url.expose(), url.pin(), chunk.to_vec()).await;
         assert_eq!(status, 200, "PUT part {number}");
     }
     fx.wrap
@@ -136,33 +133,21 @@ async fn seed(fx: &Fx, bytes: &[u8]) -> ObjectKey {
     upload.key
 }
 
-/// A plain HTTP GET: the status and the body.
-pub(crate) async fn get(url: &str) -> (u16, Vec<u8>) {
-    let url: url::Url = url.parse().unwrap();
-    let addr = (
-        url.host_str().unwrap(),
-        url.port_or_known_default().unwrap(),
-    );
-    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-    let (mut sender, connection) = http1::handshake(TokioIo::new(stream)).await.unwrap();
-    tokio::spawn(connection);
-    let target = format!("{}?{}", url.path(), url.query().unwrap_or_default());
-    let request = hyper::Request::builder()
-        .method("GET")
-        .uri(target)
-        .header("host", format!("{}:{}", addr.0, addr.1))
-        .header("connection", "close")
-        .body(Full::new(Bytes::new()))
-        .unwrap();
-    let response = sender.send_request(request).await.unwrap();
-    let status = response.status().as_u16();
-    let body = response.into_body().collect().await.unwrap().to_bytes();
-    (status, body.to_vec())
+/// A GET over TLS that trusts the certificate `pin` names: the status and the body.
+pub(crate) async fn get(url: &str, pin: &CertPin) -> (u16, Vec<u8>) {
+    let (status, _, body) = crate::support::tls_request("GET", url, pin, Vec::new()).await;
+    (status, body)
 }
 
 pub(crate) fn url_of(r: &Reply) -> String {
     assert_eq!(r.status, 200, "{}", r.head);
     json(r)["url"].as_str().unwrap().to_owned()
+}
+
+/// The pin in a download answer (a proved 200).
+pub(crate) fn pin_of(r: &Reply) -> CertPin {
+    assert_eq!(r.status, 200, "{}", r.head);
+    CertPin::from_hex(json(r)["certificatePin"].as_str().unwrap()).expect("a canonical pin")
 }
 
 async fn set_agent_revoked(fx: &Fx, revoked: bool) {
@@ -605,10 +590,16 @@ async fn the_url_returns_the_object_byte_for_byte() {
         assert_eq!(r.header("cache-control"), Some("no-store"));
         let v = json(&r);
         assert_eq!(v["expiresInSecs"], GET_URL_EXPIRY.as_secs());
-        assert_eq!(v.as_object().unwrap().len(), 2);
+        assert_eq!(v.as_object().unwrap().len(), 3);
         let url = v["url"].as_str().unwrap().to_owned();
-        assert!(url.starts_with("http://127.0.0.1:"), "the URL's host");
-        let (status, bytes) = get(&url).await;
+        assert!(url.starts_with("https://127.0.0.1:"), "the URL's host");
+        // The pin in the proved body is the object server's own.
+        let pin = pin_of(&r);
+        assert_eq!(
+            Some(&pin),
+            fx.real.as_ref().map(|(_, server)| server.certificate_pin())
+        );
+        let (status, bytes) = get(&url, &pin).await;
         assert_eq!(status, 200);
         assert!(bytes == *want, "the object differs from what was stored");
         // A second request is a new URL (the signature carries the time and nothing else is
@@ -658,11 +649,15 @@ async fn the_job_state_plays_no_part_and_the_route_does_not_look_in_the_store() 
     }
     // The object is deleted from the store: the row is still there, and so is the URL.
     fx.wrap.delete(&key).await.unwrap();
-    let url = url_of(&ask(&fx, &n.doc(1)).await);
-    assert_eq!(get(&url).await.0, 404, "the object server has nothing");
+    let r = ask(&fx, &n.doc(1)).await;
+    assert_eq!(
+        get(&url_of(&r), &pin_of(&r)).await.0,
+        404,
+        "the object server has nothing"
+    );
     // A row whose key never named an object (the artifact's row, with a made-up key).
-    let url = url_of(&ask(&fx, &n.art(1)).await);
-    assert_eq!(get(&url).await.0, 404);
+    let r = ask(&fx, &n.art(1)).await;
+    assert_eq!(get(&url_of(&r), &pin_of(&r)).await.0, 404);
     fx.finish().await;
 }
 
@@ -680,10 +675,11 @@ async fn a_url_issued_before_a_revocation_still_works_until_it_expires() {
         .execute(&fx.u.w.pool)
         .await
         .unwrap();
-    let url = url_of(&ask(&fx, &n.doc(1)).await);
+    let issued = ask(&fx, &n.doc(1)).await;
+    let (url, pin) = (url_of(&issued), pin_of(&issued));
     set_agent_revoked(&fx, true).await;
     assert_eq!(ask(&fx, &n.doc(1)).await.status, 401);
-    let (status, got) = get(&url).await;
+    let (status, got) = get(&url, &pin).await;
     assert_eq!((status, got == bytes), (200, true));
     fx.finish().await;
 }
@@ -700,12 +696,16 @@ async fn a_transfer_started_before_the_expiry_completes_after_it() {
     // the signature runs out.
     let bytes = content(5, 40 * 1024 * 1024);
     let key = seed(&fx, &bytes).await;
-    let (port, credentials) = {
+    let (port, credentials, pin) = {
         let (_, object_server) = fx.real.as_ref().unwrap();
-        (object_server.port(), object_server.credentials())
+        (
+            object_server.port(),
+            object_server.credentials(),
+            *object_server.certificate_pin(),
+        )
     };
     let bucket = Bucket::new(
-        format!("http://127.0.0.1:{port}").parse().unwrap(),
+        format!("https://127.0.0.1:{port}").parse().unwrap(),
         UrlStyle::Path,
         "nekoguruma".to_owned(),
         "us-east-1".to_owned(),
@@ -716,9 +716,10 @@ async fn a_transfer_started_before_the_expiry_completes_after_it() {
         .get_object(Some(&signer), key.as_str())
         .sign(Duration::from_secs(5));
     let target = format!("{}?{}", url.path(), url.query().unwrap_or_default());
-    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
         .await
         .unwrap();
+    let mut stream = ngr_pinned_tls::connect(&pin, tcp).await.unwrap();
     stream
         .write_all(
             format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n")
@@ -744,7 +745,7 @@ async fn a_transfer_started_before_the_expiry_completes_after_it() {
     let mut late_status = 0;
     for _ in 0..20 {
         tokio::time::sleep(Duration::from_secs(1)).await;
-        late_status = get(url.as_str()).await.0;
+        late_status = get(url.as_str(), &pin).await.0;
         if late_status != 200 {
             break;
         }

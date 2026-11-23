@@ -14,7 +14,8 @@
 //! and not checked (ADR-504). Answers are strict: an
 //! unknown member, a wrong type, an `uploadId` that is not a canonical UUID (it goes into a
 //! path), a `partCount` that is not the agent's own `max(1, ceil(length / partBytes))` or is over
-//! 10000, and a `partsHeld` above the count are all answers the route does not promise.
+//! 10000, a `partsHeld` above the count, and a part-URL answer whose `certificatePin` is missing or
+//! is not 64 lowercase hexadecimal digits are all answers the route does not promise.
 //!
 //! Every outcome that is not the route's result is a [`Failure`] whose [`Class`] tells the loop
 //! what to do with the entry:
@@ -23,7 +24,8 @@
 //! - [`Class::Unproven`]: an answer that was to be a result and is not proved by the server: the
 //!   token is dropped, the wait is the back-off's cap, and nothing of the answer is acted on.
 //! - [`Class::Retry`]: no answer, a cut, no progress, a time out, a 3xx, 408, 429, 502, 503, 504,
-//!   any failure of the part's PUT, a part URL answered 409 (the next begin reads the row), and a part URL that breaks the host rule. The server (or the
+//!   any failure of the part's PUT (a refused TLS handshake with the object server included, which
+//!   sends nothing of the part), a part URL answered 409 (the next begin reads the row), and a part URL that breaks the host rule. The server (or the
 //!   network) may be better soon.
 //! - [`Class::PassOver`]: a refusal the same request will meet again: 400, 404, 409 of begin,
 //!   413, 500, any other 4xx, and an answer the route does not promise (a status it never
@@ -33,7 +35,7 @@
 use std::sync::Arc;
 
 use hyper::Method;
-use ngr_pinned_tls::Refused;
+use ngr_pinned_tls::{CertPin, Refused};
 use serde::Deserialize;
 use shared_crypto::RandomError;
 use shared_proto::{
@@ -223,11 +225,36 @@ struct StatusAnswer {
     parts_held: Option<u64>,
 }
 
+/// What the part-URL answer and the download answer both are: an object URL, the pin of the
+/// certificate its server presents, and the URL's life.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct PartAnswer {
+struct ObjectAnswer {
     url: String,
+    certificate_pin: String,
     expires_in_secs: u64,
+}
+
+/// The target and life of a proved part-URL or download answer, judged in one order for both
+/// routes: the body's shape (the pin is a required member), a life above zero, the pin's
+/// spelling, then the host rule. A shape, a zero life or a pin that is not 64 lowercase
+/// hexadecimal digits is an answer the route does not promise ([`Failure::unpromised`]), and a
+/// URL that breaks the rule is a retry named `host_why`. Nothing is dialled for any of them.
+pub(crate) fn object_target(
+    origin: &ServerOrigin,
+    status: u16,
+    body: &[u8],
+    host_why: &'static str,
+) -> Result<(PartTarget, u64), Failure> {
+    let parsed: ObjectAnswer = parse(status, body)?;
+    if parsed.expires_in_secs == 0 {
+        return Err(Failure::unpromised(status));
+    }
+    let pin =
+        CertPin::from_hex(&parsed.certificate_pin).map_err(|_| Failure::unpromised(status))?;
+    let target = part_url::check(origin, &parsed.url, pin)
+        .map_err(|_| Failure::new(Class::Retry, host_why, Some(status)))?;
+    Ok((target, parsed.expires_in_secs))
 }
 
 #[derive(Deserialize)]
@@ -441,15 +468,11 @@ impl Routes {
             return Err(Failure::new(Class::Retry, "not-open", Some(409)));
         }
         let (status, body) = self.judge(called, PART_URL_RESULTS)?;
-        let parsed: PartAnswer = parse(status, &body)?;
-        if parsed.expires_in_secs == 0 {
-            return Err(Failure::unpromised(status));
-        }
-        let target = part_url::check(&self.requester.origin, &parsed.url)
-            .map_err(|_| Failure::new(Class::Retry, "part-url-host", Some(status)))?;
+        let (target, expires_in_secs) =
+            object_target(&self.requester.origin, status, &body, "part-url-host")?;
         Ok(PartUrl {
             target,
-            expires_in_secs: parsed.expires_in_secs,
+            expires_in_secs,
         })
     }
 
@@ -522,7 +545,7 @@ impl Routes {
             .client
             .put(
                 target.port(),
-                None,
+                target.pin(),
                 target.target(),
                 target.host(),
                 length,

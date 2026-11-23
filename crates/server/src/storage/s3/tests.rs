@@ -1,13 +1,15 @@
 //! The S3 store's units (ADR-492), against a scripted loopback listener that stands in for the
-//! object server: it records every request and answers as the test says. They need no database
+//! object server and serves TLS under a certificate of its own (ADR-505): it records every
+//! request and answers as the test says. They need no database
 //! and no RustFS, so every platform's CI runs them. The real object server is tested in
 //! `tests/postgres/storage_s3.rs`.
 
 use std::io::ErrorKind;
 use std::time::Duration;
 
+use ngr_pinned_tls::test_server::{Acceptor, Identity, Key};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
@@ -98,6 +100,9 @@ enum Step {
         send: Vec<u8>,
         hold: bool,
     },
+    /// An answer with no length, `body` after the head, which the end of the connection ends. The
+    /// connection is closed without a TLS close_notify.
+    CloseDelimited { status: u16, body: Vec<u8> },
     /// Reads the request and never answers.
     Hang,
     /// Waits for a permit, then does the step.
@@ -120,10 +125,40 @@ fn error_body(code: &str) -> String {
 
 type Responder = dyn Fn(&Seen, usize) -> Step + Send + Sync;
 
+/// The TLS identity a scripted peer serves, and the pin of its certificate.
+struct Peer {
+    acceptor: Acceptor,
+    pin: CertPin,
+}
+
+impl Peer {
+    fn new() -> Peer {
+        Peer::of(&Identity::generate(Key::P256))
+    }
+
+    fn of(identity: &Identity) -> Peer {
+        Peer {
+            acceptor: Acceptor::new(identity),
+            pin: CertPin::of_certificate(identity.certificate()),
+        }
+    }
+
+    /// Accepts one connection on `listener` and runs the handshake.
+    async fn accept(&self, listener: &TcpListener) -> impl AsyncRead + AsyncWrite + Unpin {
+        let (stream, _) = listener.accept().await.unwrap();
+        self.acceptor.accept(stream).await.unwrap()
+    }
+}
+
 /// The listener: every request is recorded, then answered by `responder(request, index)`.
 struct Fake {
     port: u16,
+    /// The pin of the certificate the listener serves (the real one, unless the listener is an
+    /// impostor).
+    pin: CertPin,
     seen: Arc<Mutex<Vec<Seen>>>,
+    /// Every byte read from a connection after its handshake (all of them, for a plain peer).
+    raw: Arc<Mutex<Vec<u8>>>,
     task: JoinHandle<()>,
 }
 
@@ -134,24 +169,87 @@ impl Drop for Fake {
 }
 
 impl Fake {
+    /// A listener with a certificate of its own.
     async fn start(responder: impl Fn(&Seen, usize) -> Step + Send + Sync + 'static) -> Fake {
+        let peer = Peer::new();
+        Fake::serving(peer.acceptor, peer.pin, responder).await
+    }
+
+    /// A listener that serves `acceptor`; `pin` is the pin a store of the test is given.
+    async fn serving(
+        acceptor: Acceptor,
+        pin: CertPin,
+        responder: impl Fn(&Seen, usize) -> Step + Send + Sync + 'static,
+    ) -> Fake {
+        Fake::listen(
+            pin,
+            move |stream, responder, recorded, raw| {
+                let acceptor = acceptor.clone();
+                async move {
+                    if let Ok(stream) = acceptor.accept(stream).await {
+                        let _ = serve(stream, responder, recorded, raw).await;
+                    }
+                }
+            },
+            responder,
+        )
+        .await
+    }
+
+    /// A listener that does not speak TLS: it answers whatever it first reads with a plain
+    /// HTTP 200 and closes.
+    async fn plain(pin: CertPin) -> Fake {
+        Fake::listen(
+            pin,
+            |mut stream, _, _, raw| async move {
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                raw.lock().unwrap().extend_from_slice(&buf[..n]);
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    .await;
+            },
+            |_, _| reply(200, ""),
+        )
+        .await
+    }
+
+    async fn listen<F, Fut>(
+        pin: CertPin,
+        handle: F,
+        responder: impl Fn(&Seen, usize) -> Step + Send + Sync + 'static,
+    ) -> Fake
+    where
+        F: Fn(TcpStream, Arc<Responder>, Arc<Mutex<Vec<Seen>>>, Arc<Mutex<Vec<u8>>>) -> Fut
+            + Send
+            + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
         let port = listener.local_addr().unwrap().port();
         let seen = Arc::new(Mutex::new(Vec::new()));
+        let raw = Arc::new(Mutex::new(Vec::new()));
         let responder: Arc<Responder> = Arc::new(responder);
-        let recorded = Arc::clone(&seen);
+        let (recorded, read) = (Arc::clone(&seen), Arc::clone(&raw));
         let task = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                let responder = Arc::clone(&responder);
-                let recorded = Arc::clone(&recorded);
-                tokio::spawn(async move {
-                    let _ = serve(stream, responder, recorded).await;
-                });
+                tokio::spawn(handle(
+                    stream,
+                    Arc::clone(&responder),
+                    Arc::clone(&recorded),
+                    Arc::clone(&read),
+                ));
             }
         });
-        Fake { port, seen, task }
+        Fake {
+            port,
+            pin,
+            seen,
+            raw,
+            task,
+        }
     }
 
     fn seen(&self) -> Vec<Seen> {
@@ -161,12 +259,18 @@ impl Fake {
     fn ops(&self) -> Vec<&'static str> {
         self.seen().iter().map(Seen::op).collect()
     }
+
+    /// What the listener read after the handshake, as text.
+    fn raw_text(&self) -> String {
+        String::from_utf8_lossy(&self.raw.lock().unwrap()).into_owned()
+    }
 }
 
 async fn serve(
-    mut stream: TcpStream,
+    mut stream: impl AsyncRead + AsyncWrite + Unpin,
     responder: Arc<Responder>,
     recorded: Arc<Mutex<Vec<Seen>>>,
+    raw: Arc<Mutex<Vec<u8>>>,
 ) -> std::io::Result<()> {
     let mut data = Vec::new();
     let mut buf = [0u8; 4096];
@@ -178,6 +282,7 @@ async fn serve(
         if n == 0 {
             return Ok(());
         }
+        raw.lock().unwrap().extend_from_slice(&buf[..n]);
         data.extend_from_slice(&buf[..n]);
     };
     let head = String::from_utf8_lossy(&data[..head_end]).into_owned();
@@ -199,6 +304,7 @@ async fn serve(
         if n == 0 {
             break;
         }
+        raw.lock().unwrap().extend_from_slice(&buf[..n]);
         data.extend_from_slice(&buf[..n]);
     }
     let seen = Seen {
@@ -248,6 +354,13 @@ async fn serve(
                 }
                 return Ok(());
             }
+            Step::CloseDelimited { status, body } => {
+                let head = format!("HTTP/1.1 {status} X\r\nconnection: close\r\n\r\n");
+                stream.write_all(head.as_bytes()).await?;
+                stream.write_all(&body).await?;
+                stream.flush().await?;
+                return Ok(());
+            }
             Step::Hang => {
                 tokio::time::sleep(Duration::from_secs(60)).await;
                 return Ok(());
@@ -281,18 +394,28 @@ fn fast() -> Tuning {
     }
 }
 
-fn store_with(port: u16, tuning: Tuning) -> S3Store {
-    store_with_credentials(port, &credentials(), tuning)
+fn store_with(port: u16, pin: &CertPin, tuning: Tuning) -> S3Store {
+    store_with_credentials(port, pin, &credentials(), tuning)
 }
 
-fn store_with_credentials(port: u16, creds: &Credentials, tuning: Tuning) -> S3Store {
+fn store_with_credentials(
+    port: u16,
+    pin: &CertPin,
+    creds: &Credentials,
+    tuning: Tuning,
+) -> S3Store {
     S3Store {
-        inner: Arc::new(Inner::new(port, creds, "nekoguruma", tuning).unwrap()),
+        inner: Arc::new(Inner::new(port, creds, pin, "nekoguruma", tuning).unwrap()),
     }
 }
 
 fn store(fake: &Fake) -> S3Store {
-    store_with(fake.port, fast())
+    store_with(fake.port, &fake.pin, fast())
+}
+
+/// A pin for a store that is never connected (presigning does no I/O).
+fn any_pin() -> CertPin {
+    CertPin::of_certificate(b"no certificate")
 }
 
 fn upload() -> Upload {
@@ -388,7 +511,7 @@ async fn read_all(body: ObjectBody) -> std::io::Result<Vec<u8>> {
 #[tokio::test]
 async fn open_finds_an_existing_bucket_with_one_head() {
     let fake = Fake::start(|_, _| reply(200, "")).await;
-    let _store = S3Store::open(fake.port, &credentials(), "nekoguruma", fast())
+    let _store = S3Store::open(fake.port, &credentials(), &fake.pin, "nekoguruma", fast())
         .await
         .unwrap();
     assert_eq!(fake.ops(), ["head-bucket"]);
@@ -401,7 +524,7 @@ async fn open_creates_an_absent_bucket_with_an_empty_body_and_content_length_zer
         _ => reply(200, ""),
     })
     .await;
-    S3Store::open(fake.port, &credentials(), "nekoguruma", fast())
+    S3Store::open(fake.port, &credentials(), &fake.pin, "nekoguruma", fast())
         .await
         .unwrap();
     assert_eq!(fake.ops(), ["head-bucket", "create-bucket"]);
@@ -423,7 +546,7 @@ async fn a_bucket_that_is_ours_already_counts_as_present_and_another_owner_is_re
         _ => reply(409, error_body("BucketAlreadyOwnedByYou")),
     })
     .await;
-    S3Store::open(ours.port, &credentials(), "nekoguruma", fast())
+    S3Store::open(ours.port, &credentials(), &ours.pin, "nekoguruma", fast())
         .await
         .unwrap();
     let theirs = Fake::start(|seen, _| match seen.op() {
@@ -431,9 +554,15 @@ async fn a_bucket_that_is_ours_already_counts_as_present_and_another_owner_is_re
         _ => reply(409, error_body("BucketAlreadyExists")),
     })
     .await;
-    let error = S3Store::open(theirs.port, &credentials(), "nekoguruma", fast())
-        .await
-        .unwrap_err();
+    let error = S3Store::open(
+        theirs.port,
+        &credentials(),
+        &theirs.pin,
+        "nekoguruma",
+        fast(),
+    )
+    .await
+    .unwrap_err();
     assert!(matches!(error, StoreError::Refused { .. }), "{error}");
     assert_eq!(theirs.ops(), ["head-bucket", "create-bucket"]);
 }
@@ -442,7 +571,7 @@ async fn a_bucket_that_is_ours_already_counts_as_present_and_another_owner_is_re
 async fn a_refused_head_ends_the_open_at_once() {
     for status in [401, 403] {
         let fake = Fake::start(move |_, _| reply(status, error_body("AccessDenied"))).await;
-        let error = S3Store::open(fake.port, &credentials(), "nekoguruma", fast())
+        let error = S3Store::open(fake.port, &credentials(), &fake.pin, "nekoguruma", fast())
             .await
             .unwrap_err();
         assert!(matches!(error, StoreError::Refused { .. }), "{error}");
@@ -450,7 +579,7 @@ async fn a_refused_head_ends_the_open_at_once() {
     }
     // An unexpected 4xx is no reason to retry either.
     let fake = Fake::start(|_, _| reply(400, "")).await;
-    let error = S3Store::open(fake.port, &credentials(), "nekoguruma", fast())
+    let error = S3Store::open(fake.port, &credentials(), &fake.pin, "nekoguruma", fast())
         .await
         .unwrap_err();
     assert!(
@@ -470,7 +599,7 @@ async fn a_server_that_is_not_up_yet_is_retried_until_it_is() {
         }
     })
     .await;
-    S3Store::open(fake.port, &credentials(), "nekoguruma", fast())
+    S3Store::open(fake.port, &credentials(), &fake.pin, "nekoguruma", fast())
         .await
         .unwrap();
     assert_eq!(fake.ops().len(), 4);
@@ -480,7 +609,7 @@ async fn a_server_that_is_not_up_yet_is_retried_until_it_is() {
 async fn a_server_that_stays_down_fails_when_the_budget_is_spent() {
     let fake = Fake::start(|_, _| reply(503, "")).await;
     let began = std::time::Instant::now();
-    let error = S3Store::open(fake.port, &credentials(), "nekoguruma", fast())
+    let error = S3Store::open(fake.port, &credentials(), &fake.pin, "nekoguruma", fast())
         .await
         .unwrap_err();
     assert!(
@@ -491,7 +620,7 @@ async fn a_server_that_stays_down_fails_when_the_budget_is_spent() {
     assert!(fake.seen().len() > 2, "retried");
     // A listener that never answers is cut by the budget too, and the error is an I/O one.
     let hang = Fake::start(|_, _| Step::Hang).await;
-    let error = S3Store::open(hang.port, &credentials(), "nekoguruma", fast())
+    let error = S3Store::open(hang.port, &credentials(), &hang.pin, "nekoguruma", fast())
         .await
         .unwrap_err();
     assert!(
@@ -516,7 +645,8 @@ async fn a_port_nothing_listens_on_fails_with_an_io_error() {
         .bind((std::net::Ipv4Addr::LOCALHOST, 0).into())
         .unwrap();
     let port = socket.local_addr().unwrap().port();
-    let error = S3Store::open(port, &credentials(), "nekoguruma", fast())
+    let peer = Peer::new();
+    let error = S3Store::open(port, &credentials(), &peer.pin, "nekoguruma", fast())
         .await
         .unwrap_err();
     assert!(matches!(error, StoreError::Io { .. }), "{error}");
@@ -532,10 +662,12 @@ async fn a_port_nothing_listens_on_fails_with_an_io_error() {
         "{error}"
     );
     // The same port starts listening after a while: the refused connects were retried.
+    let acceptor = peer.acceptor.clone();
     let server = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let listener = socket.listen(16).unwrap();
-        let (mut stream, _) = listener.accept().await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut stream = acceptor.accept(stream).await.unwrap();
         let mut buf = [0u8; 2048];
         let _ = stream.read(&mut buf).await;
         stream
@@ -545,7 +677,7 @@ async fn a_port_nothing_listens_on_fails_with_an_io_error() {
     });
     let mut tuning = fast();
     tuning.ready_timeout = Duration::from_secs(5);
-    S3Store::open(port, &credentials(), "nekoguruma", tuning)
+    S3Store::open(port, &credentials(), &peer.pin, "nekoguruma", tuning)
         .await
         .unwrap();
     server.await.unwrap();
@@ -555,7 +687,7 @@ async fn a_port_nothing_listens_on_fails_with_an_io_error() {
 async fn a_bucket_name_the_store_does_not_accept_is_refused_before_any_request() {
     let fake = Fake::start(|_, _| reply(200, "")).await;
     for bad in ["", "ab", "Upper", "-x-", "health", "a/b"] {
-        let error = S3Store::open(fake.port, &credentials(), bad, fast())
+        let error = S3Store::open(fake.port, &credentials(), &fake.pin, bad, fast())
             .await
             .unwrap_err();
         assert!(
@@ -613,7 +745,7 @@ async fn a_control_request_is_bounded_by_the_request_timeout() {
     let fake = Fake::start(|_, _| Step::Hang).await;
     let mut tuning = fast();
     tuning.request_timeout = Duration::from_millis(200);
-    let store = store_with(fake.port, tuning);
+    let store = store_with(fake.port, &fake.pin, tuning);
     let began = std::time::Instant::now();
     let error = store.begin().await.unwrap_err();
     assert!(
@@ -656,7 +788,7 @@ async fn an_xml_answer_over_the_bound_is_refused_and_an_error_body_over_its_boun
     let mut tuning = fast();
     tuning.request_timeout = Duration::from_secs(2);
     let began = std::time::Instant::now();
-    let error = store_with(fake.port, tuning)
+    let error = store_with(fake.port, &fake.pin, tuning)
         .delete(&ObjectKey::generate().unwrap())
         .await
         .unwrap_err();
@@ -703,7 +835,7 @@ async fn errors_hold_no_url_key_upload_id_or_server_text() {
     })
     .await;
     let creds = credentials();
-    let store = store_with_credentials(fake.port, &creds, fast());
+    let store = store_with_credentials(fake.port, &fake.pin, &creds, fast());
     let up = upload();
     let secret = creds.expose_secret().to_owned();
     let mut errors = vec![store.begin().await.unwrap_err()];
@@ -732,7 +864,7 @@ async fn errors_hold_no_url_key_upload_id_or_server_text() {
 
 #[test]
 fn debug_of_a_part_url_an_upload_id_and_the_store_shows_nothing() {
-    let store = store_with(1, fast());
+    let store = store_with(1, &any_pin(), fast());
     let up = upload();
     let url = store.presign_part(&up, 1).unwrap();
     for shown in [
@@ -755,11 +887,14 @@ fn debug_of_a_part_url_an_upload_id_and_the_store_shows_nothing() {
 #[test]
 fn a_part_url_is_signed_for_five_minutes_and_binds_the_part_without_io() {
     // Nothing listens on this port: presigning does no I/O.
-    let store = store_with(1, fast());
+    let store = store_with(1, &any_pin(), fast());
     let up = upload();
     let url = store.presign_part(&up, 7).unwrap();
     let text = url.expose();
-    assert!(text.starts_with("http://127.0.0.1:1/nekoguruma/"), "{text}");
+    assert!(
+        text.starts_with("https://127.0.0.1:1/nekoguruma/"),
+        "{text}"
+    );
     assert!(text.contains(up.key.as_str()));
     assert!(text.contains("X-Amz-Expires=300"));
     assert!(text.contains("partNumber=7"));
@@ -780,11 +915,14 @@ fn a_part_url_is_signed_for_five_minutes_and_binds_the_part_without_io() {
 #[test]
 fn a_get_url_is_signed_for_a_minute_names_the_key_and_shows_nothing_without_io() {
     // Nothing listens on this port: presigning does no I/O.
-    let store = store_with(1, fast());
+    let store = store_with(1, &any_pin(), fast());
     let up = upload();
     let url = store.presign_get(&up.key).unwrap();
     let text = url.expose();
-    assert!(text.starts_with("http://127.0.0.1:1/nekoguruma/"), "{text}");
+    assert!(
+        text.starts_with("https://127.0.0.1:1/nekoguruma/"),
+        "{text}"
+    );
     assert!(text.contains(up.key.as_str()));
     assert!(text.contains("X-Amz-Expires=60"), "{text}");
     assert_eq!(GET_URL_EXPIRY, Duration::from_secs(60));
@@ -805,7 +943,7 @@ fn a_get_url_is_signed_for_a_minute_names_the_key_and_shows_nothing_without_io()
 
 #[test]
 fn part_numbers_outside_1_to_10000_are_refused() {
-    let store = store_with(1, fast());
+    let store = store_with(1, &any_pin(), fast());
     let up = upload();
     for bad in [0u16, 10_001, u16::MAX] {
         assert!(matches!(
@@ -844,7 +982,7 @@ async fn parts_are_listed_page_by_page_without_their_tags() {
     .await;
     let mut tuning = fast();
     tuning.page_size = 2;
-    let store = store_with(fake.port, tuning);
+    let store = store_with(fake.port, &fake.pin, tuning);
     let parts = store.list_parts(&upload()).await.unwrap();
     assert_eq!(
         parts,
@@ -1282,7 +1420,7 @@ async fn a_completion_over_ten_thousand_parts_is_never_built() {
     let fake = Fake::start(move |_, _| reply(200, parts_xml(&many, Some(10_000)))).await;
     let mut tuning = fast();
     tuning.max_xml_bytes = 4 * 1024 * 1024;
-    let error = store_with(fake.port, tuning)
+    let error = store_with(fake.port, &fake.pin, tuning)
         .complete(&upload(), [0; 32], 1)
         .await
         .unwrap_err();
@@ -1428,8 +1566,10 @@ async fn a_slow_get_body_that_keeps_progressing_has_no_total_bound() {
         .await
         .unwrap();
     let port = listener.local_addr().unwrap().port();
+    let peer = Peer::new();
+    let pin = peer.pin;
     let task = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut stream = peer.accept(&listener).await;
         let mut buf = [0u8; 2048];
         let _ = stream.read(&mut buf).await;
         stream
@@ -1444,7 +1584,7 @@ async fn a_slow_get_body_that_keeps_progressing_has_no_total_bound() {
     });
     let mut tuning = fast();
     tuning.read_idle_timeout = Duration::from_secs(1);
-    let store = store_with(port, tuning);
+    let store = store_with(port, &pin, tuning);
     let body = store.get(&ObjectKey::generate().unwrap()).await.unwrap();
     assert_eq!(read_all(body).await.unwrap(), b"abcdef");
     task.abort();
@@ -1456,8 +1596,10 @@ async fn a_get_answer_with_no_length_is_refused() {
         .await
         .unwrap();
     let port = listener.local_addr().unwrap().port();
+    let peer = Peer::new();
+    let pin = peer.pin;
     let task = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut stream = peer.accept(&listener).await;
         let mut buf = [0u8; 2048];
         let _ = stream.read(&mut buf).await;
         // No length: the body ends with the connection.
@@ -1466,7 +1608,7 @@ async fn a_get_answer_with_no_length_is_refused() {
             .await
             .unwrap();
     });
-    let error = store_with(port, fast())
+    let error = store_with(port, &pin, fast())
         .get(&ObjectKey::generate().unwrap())
         .await
         .unwrap_err();
@@ -1770,7 +1912,7 @@ async fn put_part_is_bounded_by_the_request_timeout() {
         request_timeout: Duration::from_millis(200),
         ..fast()
     };
-    let error = store_with(fake.port, tuning)
+    let error = store_with(fake.port, &fake.pin, tuning)
         .put_part(&upload(), 1, vec![1])
         .await
         .unwrap_err();
@@ -1783,5 +1925,188 @@ async fn put_part_is_bounded_by_the_request_timeout() {
             }
         ),
         "{error}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// TLS: the pinned certificate (ADR-505)
+
+/// The peers a store must not talk to, each with the pin of the real certificate: one that
+/// presents another certificate, one that presents the real certificate without its key and one
+/// that does not speak TLS.
+async fn impostors() -> Vec<(&'static str, Fake)> {
+    let real = Identity::generate(Key::P256);
+    let pin = CertPin::of_certificate(real.certificate());
+    let other = Identity::generate(Key::P256);
+    let answer = |_: &Seen, _: usize| reply(200, "");
+    vec![
+        (
+            "another certificate",
+            Fake::serving(Acceptor::new(&other), pin, answer).await,
+        ),
+        (
+            "the certificate without its key",
+            Fake::serving(
+                Acceptor::presenting(&[real.certificate()], &other),
+                pin,
+                answer,
+            )
+            .await,
+        ),
+        ("plain HTTP", Fake::plain(pin).await),
+    ]
+}
+
+/// What an impostor may have seen: no request, and nothing a request holds (the signed URL's
+/// path, query or credential, a method, a header).
+fn assert_nothing_sent(what: &str, fake: &Fake) {
+    assert!(fake.seen().is_empty(), "{what}: a request reached the peer");
+    let raw = fake.raw_text();
+    for word in [
+        "nekoguruma",
+        "X-Amz",
+        "Signature",
+        "HTTP/1.1",
+        "PUT ",
+        "GET ",
+        "HEAD ",
+    ] {
+        assert!(!raw.contains(word), "{what}: the peer read {word:?}");
+    }
+}
+
+#[tokio::test]
+async fn open_against_an_impostor_is_untrusted_after_the_retries_and_sends_nothing() {
+    for (what, fake) in impostors().await {
+        let mut tuning = fast();
+        tuning.ready_timeout = Duration::from_millis(300);
+        let error = S3Store::open(fake.port, &credentials(), &fake.pin, "nekoguruma", tuning)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, StoreError::Untrusted { .. }),
+            "{what}: {error}"
+        );
+        assert_nothing_sent(what, &fake);
+    }
+}
+
+#[tokio::test]
+async fn get_and_put_part_against_an_impostor_are_untrusted_and_send_nothing() {
+    for (what, fake) in impostors().await {
+        let store = store(&fake);
+        let error = store
+            .put_part(&upload(), 1, b"part bytes".to_vec())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, StoreError::Untrusted { .. }),
+            "{what}: {error}"
+        );
+        let error = store
+            .get(&ObjectKey::generate().unwrap())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, StoreError::Untrusted { .. }),
+            "{what}: {error}"
+        );
+        assert_nothing_sent(what, &fake);
+        assert!(
+            !fake.raw_text().contains("part bytes"),
+            "{what}: the part reached the peer"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_urls_carry_the_pin_of_the_certificate_the_store_trusts() {
+    let fake = Fake::start(|_, _| reply(200, "")).await;
+    let store = store(&fake);
+    let part = store.presign_part(&upload(), 1).unwrap();
+    let get = store.presign_get(&ObjectKey::generate().unwrap()).unwrap();
+    assert_eq!(part.pin(), &fake.pin);
+    assert_eq!(get.pin(), &fake.pin);
+    assert!(part.expose().starts_with("https://"));
+    assert!(get.expose().starts_with("https://"));
+}
+
+// ---------------------------------------------------------------------------------------------
+// TLS: a close without close_notify
+
+#[tokio::test]
+async fn a_body_complete_by_its_length_succeeds_when_the_peer_then_closes_without_close_notify() {
+    // The scripted `Stream` step drops the connection after the bytes, which sends no
+    // close_notify.
+    let fake = Fake::start(|_, _| Step::Stream {
+        status: 200,
+        length: 6,
+        send: b"abcdef".to_vec(),
+        hold: false,
+    })
+    .await;
+    let body = store(&fake)
+        .get(&ObjectKey::generate().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(read_all(body).await.unwrap(), b"abcdef");
+    // A control request: an empty answer, and one with a body.
+    let empty = Fake::start(|_, _| Step::Stream {
+        status: 200,
+        length: 0,
+        send: Vec::new(),
+        hold: false,
+    })
+    .await;
+    store(&empty)
+        .put_part(&upload(), 1, b"x".to_vec())
+        .await
+        .unwrap();
+    let listing = parts_xml(&[(1, 3)], None);
+    let length = listing.len();
+    let fake = Fake::start(move |_, _| Step::Stream {
+        status: 200,
+        length,
+        send: listing.clone().into_bytes(),
+        hold: false,
+    })
+    .await;
+    let parts = store(&fake).list_parts(&upload()).await.unwrap();
+    assert_eq!(parts, [Part { number: 1, size: 3 }]);
+}
+
+#[tokio::test]
+async fn a_body_cut_short_or_ended_by_the_close_is_an_error_never_a_short_success() {
+    // A control request whose body is cut short.
+    let cut = Fake::start(|_, _| Step::Stream {
+        status: 200,
+        length: 10,
+        send: b"abc".to_vec(),
+        hold: false,
+    })
+    .await;
+    let error = store(&cut)
+        .put_part(&upload(), 1, b"x".to_vec())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, StoreError::Io { .. }), "{error}");
+    // A control request whose answer has no length and ends with a close that is not a TLS
+    // close: the bytes before it may be all of the body or not, so it is not a success.
+    let delimited = Fake::start(|_, _| Step::CloseDelimited {
+        status: 200,
+        body: b"abc".to_vec(),
+    })
+    .await;
+    let error = store(&delimited)
+        .put_part(&upload(), 1, b"x".to_vec())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, StoreError::Io { .. }), "{error}");
+    // The same on an object being read.
+    let key = ObjectKey::generate().unwrap();
+    let body = store(&delimited).get(&key).await;
+    assert!(
+        body.is_err() || read_all(body.unwrap()).await.is_err(),
+        "a close-delimited object must not read as a success"
     );
 }

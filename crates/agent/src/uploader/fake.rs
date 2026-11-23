@@ -1,10 +1,17 @@
 //! A dial that hands the client one end of an in-memory pipe, and the helpers that play the
-//! server's end, so a request runs against an in-process server on a paused clock.
+//! server's end, so a request runs against an in-process server on a paused clock. The server's
+//! end is plain, or TLS under a certificate the test holds the pin of ([`FakeDial::tls`]): the
+//! object server's side of the data channel is TLS only (ADR-505).
 
 use std::io;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, ready};
+use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, DuplexStream};
+use ngr_pinned_tls::CertPin;
+use ngr_pinned_tls::test_server::{Acceptor, Identity, Key};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 
 use shared_crypto::Signer as _;
 
@@ -20,12 +27,71 @@ pub(crate) enum Mode {
     Hang,
 }
 
-type Handler = dyn Fn(u16, DuplexStream) + Send + Sync;
+/// The server's end of a pipe whose every read waits `per_read` and returns at most 128 bytes: a
+/// server that takes its input slowly but steadily, below the TLS that runs over it.
+struct Throttled {
+    inner: DuplexStream,
+    per_read: Duration,
+    wait: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl AsyncRead for Throttled {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let per_read = self.per_read;
+        let wait = self
+            .wait
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(per_read)));
+        ready!(wait.as_mut().poll(cx));
+        let mut bytes = [0u8; 128];
+        let mut part = ReadBuf::new(&mut bytes[..buf.remaining().min(128)]);
+        ready!(Pin::new(&mut self.inner).poll_read(cx, &mut part))?;
+        buf.put_slice(part.filled());
+        self.wait = None;
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWrite for Throttled {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// A connection's server end, as a byte stream.
+pub(crate) trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
+
+/// The server's end of a connection the handler plays: the pipe itself, or the TLS stream the
+/// handshake made over it.
+pub(crate) type ServerEnd = Box<dyn Io>;
+
+type Handler = dyn Fn(u16, ServerEnd) + Send + Sync;
 
 /// The fake dial: each call makes a pipe, gives the server's end to the handler and returns the
 /// client's.
 pub(crate) struct FakeDial {
-    handler: Box<Handler>,
+    handler: Arc<Handler>,
+    /// Set when the server's end is TLS: the handshake runs before the handler gets the stream.
+    acceptor: Option<Acceptor>,
+    /// Set when the server reads its end of the pipe slowly ([`FakeDial::tls_throttled`]).
+    throttle: Option<Duration>,
     pub(crate) mode: Mutex<Mode>,
     /// The ports dialled, in order.
     pub(crate) dialled: Mutex<Vec<u16>>,
@@ -34,16 +100,59 @@ pub(crate) struct FakeDial {
 }
 
 impl FakeDial {
+    /// A dial whose server end is a plain pipe.
     pub(crate) fn new(
         capacity: usize,
-        handler: impl Fn(u16, DuplexStream) + Send + Sync + 'static,
+        handler: impl Fn(u16, ServerEnd) + Send + Sync + 'static,
     ) -> Arc<Self> {
         Arc::new(Self {
-            handler: Box::new(handler),
+            handler: Arc::new(handler),
+            acceptor: None,
+            throttle: None,
             mode: Mutex::new(Mode::Connect),
             dialled: Mutex::new(Vec::new()),
             capacity,
         })
+    }
+
+    /// A dial whose server end is TLS under a new certificate, whose pin is returned: the
+    /// handler gets the stream once the handshake is done, and a connection whose handshake
+    /// fails is dropped.
+    pub(crate) fn tls(
+        capacity: usize,
+        handler: impl Fn(u16, ServerEnd) + Send + Sync + 'static,
+    ) -> (Arc<Self>, CertPin) {
+        let identity = Identity::generate(Key::P256);
+        let pin = CertPin::of_certificate(identity.certificate());
+        let dial = Arc::new(Self {
+            handler: Arc::new(handler),
+            acceptor: Some(Acceptor::new(&identity)),
+            throttle: None,
+            mode: Mutex::new(Mode::Connect),
+            dialled: Mutex::new(Vec::new()),
+            capacity,
+        });
+        (dial, pin)
+    }
+
+    /// [`FakeDial::tls`] whose server reads the bytes of the pipe (handshake included) slowly:
+    /// at most 128 bytes per read, each read `per_read` after the last.
+    pub(crate) fn tls_throttled(
+        capacity: usize,
+        per_read: Duration,
+        handler: impl Fn(u16, ServerEnd) + Send + Sync + 'static,
+    ) -> (Arc<Self>, CertPin) {
+        let identity = Identity::generate(Key::P256);
+        let pin = CertPin::of_certificate(identity.certificate());
+        let dial = Arc::new(Self {
+            handler: Arc::new(handler),
+            acceptor: Some(Acceptor::new(&identity)),
+            throttle: Some(per_read),
+            mode: Mutex::new(Mode::Connect),
+            dialled: Mutex::new(Vec::new()),
+            capacity,
+        });
+        (dial, pin)
     }
 
     pub(crate) fn set(&self, mode: Mode) {
@@ -61,7 +170,32 @@ impl PortDial for FakeDial {
         let mode = *self.mode.lock().unwrap();
         let (client, server) = tokio::io::duplex(self.capacity);
         if matches!(mode, Mode::Connect) {
-            (self.handler)(port, server);
+            match &self.acceptor {
+                None => (self.handler)(port, Box::new(server)),
+                Some(acceptor) => {
+                    let (acceptor, handler) = (acceptor.clone(), Arc::clone(&self.handler));
+                    let throttle = self.throttle;
+                    tokio::spawn(async move {
+                        let accepted = match throttle {
+                            None => acceptor
+                                .accept(server)
+                                .await
+                                .map(|stream| Box::new(stream) as ServerEnd),
+                            Some(per_read) => acceptor
+                                .accept(Throttled {
+                                    inner: server,
+                                    per_read,
+                                    wait: None,
+                                })
+                                .await
+                                .map(|stream| Box::new(stream) as ServerEnd),
+                        };
+                        if let Ok(stream) = accepted {
+                            handler(port, stream);
+                        }
+                    });
+                }
+            }
         }
         Box::pin(async move {
             match mode {
@@ -310,21 +444,31 @@ pub(crate) fn proved_json(prover: &TestProver, request: &Seen, status: u16, body
     Served::new(status, body).bytes(prover, request)
 }
 
-/// Accepts connections on a real listener until the task is dropped and, for each, reads one
-/// request whole and hands it and the connection to `serve`, which answers it.
+/// Accepts connections on a real listener until the task is dropped and, for each, runs the TLS
+/// handshake when `tls` gives an acceptor for it (a connection whose handshake fails is dropped),
+/// reads one request whole and hands it and the connection to `serve`, which answers it.
 pub(crate) async fn accept_with<Fut>(
     listener: tokio::net::TcpListener,
-    serve: impl Fn(Seen, tokio::net::TcpStream) -> Fut + Send + Sync + 'static,
+    tls: impl Fn() -> Option<Acceptor> + Send + Sync + 'static,
+    serve: impl Fn(Seen, ServerEnd) -> Fut + Send + Sync + 'static,
 ) where
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
     let serve = Arc::new(serve);
     loop {
-        let Ok((mut stream, _)) = listener.accept().await else {
+        let Ok((stream, _)) = listener.accept().await else {
             return;
         };
         let serve = serve.clone();
+        let acceptor = tls();
         tokio::spawn(async move {
+            let mut stream: ServerEnd = match acceptor {
+                None => Box::new(stream),
+                Some(acceptor) => match acceptor.accept(stream).await {
+                    Ok(stream) => Box::new(stream),
+                    Err(_) => return,
+                },
+            };
             let Some(seen) = read_request(&mut stream).await else {
                 return;
             };
@@ -333,15 +477,14 @@ pub(crate) async fn accept_with<Fut>(
     }
 }
 
-/// A dial whose server answers every request with what `reply` makes of it, after reading it
-/// whole, and records what it read.
-pub(crate) fn scripted_with(
+/// The handler of the scripted dials: reads a request whole, answers what `reply` makes of it and
+/// records what it read.
+fn scripted_handler(
     reply: impl Fn(&Seen) -> Vec<u8> + Send + Sync + 'static,
-) -> (Arc<FakeDial>, Arc<Mutex<Vec<Seen>>>) {
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let log = seen.clone();
+    log: Arc<Mutex<Vec<Seen>>>,
+) -> impl Fn(u16, ServerEnd) + Send + Sync + 'static {
     let reply = Arc::new(reply);
-    let dial = FakeDial::new(64 * 1024, move |_, mut server| {
+    move |_, mut server| {
         let reply = reply.clone();
         let log = log.clone();
         tokio::spawn(async move {
@@ -356,8 +499,31 @@ pub(crate) fn scripted_with(
             let _ = server.write_all(&bytes).await;
             let _ = server.shutdown().await;
         });
-    });
+    }
+}
+
+/// A dial whose server answers every request with what `reply` makes of it, after reading it
+/// whole, and records what it read.
+pub(crate) fn scripted_with(
+    reply: impl Fn(&Seen) -> Vec<u8> + Send + Sync + 'static,
+) -> (Arc<FakeDial>, Arc<Mutex<Vec<Seen>>>) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let dial = FakeDial::new(64 * 1024, scripted_handler(reply, seen.clone()));
     (dial, seen)
+}
+
+/// [`scripted_with`] over TLS: also the pin of the server's certificate.
+pub(crate) fn scripted_tls_with(
+    reply: impl Fn(&Seen) -> Vec<u8> + Send + Sync + 'static,
+) -> (Arc<FakeDial>, Arc<Mutex<Vec<Seen>>>, CertPin) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let (dial, pin) = FakeDial::tls(64 * 1024, scripted_handler(reply, seen.clone()));
+    (dial, seen, pin)
+}
+
+/// [`scripted`] over TLS: also the pin of the server's certificate.
+pub(crate) fn scripted_tls(reply: Vec<u8>) -> (Arc<FakeDial>, Arc<Mutex<Vec<Seen>>>, CertPin) {
+    scripted_tls_with(move |_| reply.clone())
 }
 
 /// A dial whose server answers every request with `reply` as it is.

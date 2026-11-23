@@ -19,7 +19,8 @@ use crate::control::exchange::{CHALLENGE_PATH, SESSION_PATH};
 use crate::upload_ledger::{Probe, Step, digest_file};
 use crate::uploader::fake::{FakeDial, Mode, Proof, Seen, answer, json};
 use sim::{
-    Logged, Reply, Route, Sim, problem, serve_tcp, serve_with, status as reply, tampered, unproved,
+    Logged, Peer, Reply, Route, Sim, problem, serve_tcp, serve_with, status as reply, tampered,
+    unproved,
 };
 
 mod sim;
@@ -1085,6 +1086,87 @@ async fn a_part_url_409_is_a_retry_and_the_next_begin_reads_the_row() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The object port is TLS under the pin of the answer (ADR-505)
+
+// O1
+#[tokio::test(start_paused = true)]
+async fn a_part_goes_to_an_https_url_with_the_pin_of_its_answer() {
+    let mut rig = Rig::new();
+    rig.result(1, DATA).await;
+    rig.start();
+    rig.until(|s| s.delivered == 1).await;
+    assert_eq!(rig.sim.puts(), [1, 2, 3]);
+    assert_eq!(rig.sim.object("job-1", "result"), Some(DATA.to_vec()));
+    assert_eq!(rig.counters().retries, 0);
+}
+
+// O2
+#[tokio::test(start_paused = true)]
+async fn a_peer_that_is_not_the_object_server_gets_no_part_and_the_entry_stays() {
+    for peer in [Peer::Another, Peer::WithoutKey, Peer::Plain] {
+        let mut rig = Rig::new();
+        let seq = rig.result(1, DATA).await;
+        rig.sim.set_peer(peer);
+        rig.start();
+        rig.until(|s| s.retries >= 1).await;
+        assert!(rig.sim.puts().is_empty(), "{peer:?}: a part reached it");
+        assert_eq!(rig.pending().await, [seq], "{peer:?}");
+        assert!(rig.object_file(seq).exists(), "{peer:?}");
+        let read = rig.sim.plain_read();
+        assert!(
+            !read.windows(DATA.len()).any(|w| w == DATA) && !read.windows(3).any(|w| w == b"PUT"),
+            "{peer:?}: the peer read the request"
+        );
+        // The object server is back: the same entry is delivered.
+        rig.sim.set_peer(Peer::Real);
+        rig.until(|s| s.delivered == 1).await;
+        assert_eq!(rig.sim.object("job-1", "result"), Some(DATA.to_vec()));
+        assert!(rig.pending().await.is_empty());
+    }
+}
+
+// O3
+#[tokio::test(start_paused = true)]
+async fn a_port_taken_after_the_stack_ended_gets_no_part_and_the_entry_stays() {
+    let mut rig = Rig::new();
+    let seq = rig.result(1, DATA).await;
+    // The first part is stored; then the stack is gone and another process answers on the object
+    // port, while the agent still holds the pin of the object server's certificate.
+    let sim = rig.sim.clone();
+    let taken = flag(false);
+    rig.sim.tap(move |logged| {
+        if logged.route == Route::Put && !taken.swap(true, Ordering::SeqCst) {
+            sim.set_peer(Peer::Another);
+        }
+    });
+    rig.start();
+    rig.until(|s| s.retries >= 1).await;
+    assert_eq!(rig.sim.puts(), [1], "no part reached the taker");
+    assert_eq!(rig.pending().await, [seq]);
+    assert!(rig.object_file(seq).exists());
+    assert_eq!(rig.sim.count(Route::Complete), 0);
+    // The object server is back: the entry goes on from the part the status gives.
+    rig.sim.set_peer(Peer::Real);
+    rig.until(|s| s.delivered == 1).await;
+    assert_eq!(rig.sim.object("job-1", "result"), Some(DATA.to_vec()));
+}
+
+// O4
+#[tokio::test(start_paused = true)]
+async fn a_certificate_regenerated_while_the_agent_holds_an_old_url_is_refused_and_the_next_answer_works()
+ {
+    let mut rig = Rig::new();
+    rig.result(1, DATA).await;
+    // The first part URL names the pin of the certificate the object server has just lost.
+    rig.sim.regenerate_certificate_after_next_part_url();
+    rig.start();
+    rig.until(|s| s.delivered == 1).await;
+    assert_eq!(rig.counters().retries, 1);
+    assert_eq!(rig.sim.puts(), [1, 2, 3], "no part before the new pin");
+    assert_eq!(rig.sim.object("job-1", "result"), Some(DATA.to_vec()));
+}
+
+// ---------------------------------------------------------------------------------------------
 // Restarts: R1 to R3
 
 // R1
@@ -1447,9 +1529,14 @@ fn begin_body(state: &str) -> String {
     format!(r#"{{"uploadId":"{UPLOAD_ID}","partBytes":4,"partCount":3,"state":"{state}"}}"#)
 }
 
+/// A pin as a forger's answer might carry one.
+const FORGED_PIN: &str = "ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12";
+
 /// A part URL that names the server's object port, as a forger's answer might.
 fn part_body(port: u16) -> String {
-    format!(r#"{{"url":"http://127.0.0.1:{port}/obj/{UPLOAD_ID}/1?sig=s","expiresInSecs":60}}"#)
+    format!(
+        r#"{{"url":"https://127.0.0.1:{port}/obj/{UPLOAD_ID}/1?sig=s","certificatePin":"{FORGED_PIN}","expiresInSecs":60}}"#
+    )
 }
 
 fn status_body(state: &str) -> String {

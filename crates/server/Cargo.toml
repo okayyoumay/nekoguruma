@@ -13,12 +13,19 @@ name = "ngr-server"
 path = "src/main.rs"
 
 # A stand-in for the object server (RustFS), which the tests start where they need a child that
-# misbehaves on demand (ADR-491). Not part of an installation.
+# misbehaves on demand (ADR-491). It serves TLS through the test server of `ngr-pinned-tls`, so it
+# is built only with the `fake-object-server` feature, which the package's own dev-dependency turns
+# on for its tests (below): it is absent from an installation and from a release build.
 [[bin]]
 name = "ngr-fake-object-server"
 path = "src/bin/ngr-fake-object-server.rs"
 test = false
 doc = false
+required-features = ["fake-object-server"]
+
+[features]
+# Builds the fake object server (the binary above) and the test TLS server it needs. For tests.
+fake-object-server = ["ngr-pinned-tls/test-server"]
 
 [dependencies]
 shared-proto.workspace = true
@@ -87,10 +94,9 @@ tokio = { workspace = true, features = ["test-util"] }
 # The control channel's tests are its client (ADR-468): the handshake over a stream the test opens.
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
-# The real-binary test that the object server serves over TLS (ADR-505).
-rustls.workspace = true
-tokio-rustls.workspace = true
-rcgen.workspace = true
+# The package itself, with the fake object server and the test TLS server on, so that the tests
+# build the fake and their own TLS peers need no TLS crate of their own (ADR-505).
+server = { path = ".", features = ["fake-object-server"] }
 
 [lints]
 workspace = true

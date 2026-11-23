@@ -1,7 +1,7 @@
 # ADR-505: The Object Server Speaks TLS Only, With a Certificate the Server Creates and the Agent Learns From a Proved Answer
 
 **Date:** 2026-11-23
-**Status:** Accepted (items 9 to 14 added with the verifier and the agent's dial; items 15 to 19 added with the switch's design, and item 8 split by item 19)
+**Status:** Accepted (items 9 to 14 added with the verifier and the agent's dial; items 15 to 19 added with the switch's design, and item 8 split by item 19; items 20 to 22 added with the switch, which meet item 6)
 **Affects:** design 13, 13.3, 14.3, 14.4; `crates/server` (`object_server`, `storage/s3`), `crates/agent`, `api/openapi.yaml`, CLAUDE.md "Building and testing"; annotates ADR-491, ADR-492, ADR-493, ADR-497, ADR-504
 
 ## Context
@@ -20,7 +20,7 @@ ours. A probe against the real binary showed:
 A process beside the object server on that port, or one that takes the port after the object
 server is gone, can receive an agent's part bytes and the part's presigned URL (a 300-second bearer
 that also lets the holder overwrite the part), a download's presigned URL (60 seconds), and the
-server's own store traffic, which is plain HTTP over presigned URLs too: document bodies,
+server's own store traffic, which was plain HTTP over presigned URLs too: document bodies,
 read-backs, and replayable signed get, delete and abort URLs. Integrity is already detected (the
 completion's read-back against the SHA-256 declared on a proved route; the instruction's hash on
 downloads). Confidentiality and availability are not. The window after the whole stack has died is
@@ -52,6 +52,7 @@ the same exposure.
    release CI's `worker-windows` job uses); CLAUDE.md says so.
 6. **No real data is enqueued by the agent until its side is built.** A result or a log, in a build
    that is not a test, is enqueued on neither OS until the agent side of this record is built.
+   (Met with items 20 to 22: the agent dials the object server only with TLS and the pin.)
 7. **Hardening upstream.** The maintainer reports the Windows address reuse to the RustFS project
    as hardening; nothing here depends on it.
 8. **Built in steps**, each a change of its own: the server's TLS and its store client; the pin in
@@ -124,6 +125,27 @@ the server's own origin and is unchanged.
     URLs are `https`, the pin is in both proved answers and in `api/openapi.yaml`, and the agent
     dials with it. No agent or server from one side of the switch works with the other, so the
     routes' change and the agent's are not separate changes.
+
+### Decisions taken in building the switch
+
+20. **A close without a TLS close_notify is not a failure when nothing is missing.** RustFS may
+    close a connection without one. A response whose body is complete by its `Content-Length` (or
+    its chunked end) is a success in the store client and in the agent's client; a body that is
+    cut short, and a body that has no length and ends in such a close, are errors, since the
+    close cannot then be told from a cut. The probe reads only the status line and ends the same
+    way. The store never accepts a short body as a success.
+21. **One check judges both answers, in one order.** The part-URL and download answers are read
+    by one function: the body's shape (`certificatePin` is a required member), a life above zero,
+    the pin's spelling, then the URL's rule (`https`, in lowercase, on the registration origin's
+    host; a URL with no port means 443). A shape, a life or a pin that fails is an answer the
+    route never promises, and a URL that breaks the rule is a retry; nothing is dialled for
+    either. The pin lives in the target an answer makes and in no requester or client, and the
+    client's `put` and `get` take a pin and have no plain variant: no object leaves or enters
+    the agent without TLS.
+22. **The fake object server is built for tests only.** It serves TLS from the files `RUSTFS_TLS_PATH`
+    names through the crate's test server, so its binary needs that feature: the server's
+    `fake-object-server` feature builds it, the package's own dev-dependency turns the feature on for
+    its tests, and a release build has neither the binary nor the test server.
 
 ### Alternatives rejected
 

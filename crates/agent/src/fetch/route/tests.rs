@@ -2,13 +2,15 @@
 //! agent's case table) and the server's proof of the answers that decide (ADR-504 item 3, F1 to
 //! F5), over the in-memory dial on a paused clock.
 
-use tokio::io::{AsyncWriteExt, DuplexStream};
+use ngr_pinned_tls::CertPin;
+use tokio::io::AsyncWriteExt;
 
 use super::*;
 use crate::answer_proof::Verifier;
 use crate::uploader::fake::{
-    FakeDial, Mode, Proof, Served, proving, read_request, scripted_served, scripted_with,
+    FakeDial, Mode, Proof, Served, ServerEnd, proving, read_request, scripted_served, scripted_with,
 };
+use crate::uploader::routes::Class;
 
 const API: u16 = 8080;
 const JOB: &str = "0194f0a2-7c3e-7d11-8a52-3f6f9b1c2d4e";
@@ -27,8 +29,16 @@ fn want() -> Want<'static> {
     }
 }
 
+/// A pin as a proved answer carries one.
+const PIN: &str = "ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12";
+
+/// A download answer for `url`.
+fn answer_for(url: &str) -> String {
+    serde_json::json!({"url": url, "certificatePin": PIN, "expiresInSecs": 60}).to_string()
+}
+
 fn good_url() -> String {
-    r#"{"url":"http://127.0.0.1:9000/bucket/key?X-Amz-Signature=s","expiresInSecs":60}"#.to_owned()
+    answer_for("https://127.0.0.1:9000/bucket/key?X-Amz-Signature=s")
 }
 
 const AGENT: &str = "0194f0a2-7c3e-7d11-8a52-3f6f9b1c2d4e";
@@ -57,6 +67,7 @@ async fn the_request_is_a_post_with_the_bearer_and_the_four_members() {
     let target = route.url("tok-1", &want()).await.unwrap();
     assert_eq!((target.port(), target.host()), (9000, "127.0.0.1:9000"));
     assert_eq!(target.target(), "/bucket/key?X-Amz-Signature=s");
+    assert_eq!(target.pin(), &CertPin::from_hex(PIN).unwrap());
     assert_eq!(*dial.dialled.lock().unwrap(), vec![API]);
     {
         let seen = seen.lock().unwrap();
@@ -97,15 +108,34 @@ async fn refusals_are_passed_over() {
 /// A5: an answer the route does not promise.
 #[tokio::test(start_paused = true)]
 async fn an_answer_that_is_not_promised_is_passed_over() {
-    let cases = [
-        r#"{"url":"http://127.0.0.1:9000/x","expiresInSecs":60,"extra":1}"#.to_owned(),
-        r#"{"expiresInSecs":60}"#.to_owned(),
-        r#"{"url":"http://127.0.0.1:9000/x"}"#.to_owned(),
-        r#"{"url":"http://127.0.0.1:9000/x","expiresInSecs":0}"#.to_owned(),
-        r#"{"url":5,"expiresInSecs":60}"#.to_owned(),
+    let url = r#""url":"https://127.0.0.1:9000/x""#;
+    let pin = format!(r#""certificatePin":"{PIN}""#);
+    let mut cases = vec![
+        format!(r#"{{{url},{pin},"expiresInSecs":60,"extra":1}}"#),
+        format!(r#"{{{pin},"expiresInSecs":60}}"#),
+        format!(r#"{{{url},{pin}}}"#),
+        format!(r#"{{{url},{pin},"expiresInSecs":0}}"#),
+        format!(r#"{{"url":5,{pin},"expiresInSecs":60}}"#),
         "not json".to_owned(),
         String::new(),
+        // The pin: missing, 63 and 65 digits, uppercase, not hexadecimal, padded, not text.
+        format!(r#"{{{url},"expiresInSecs":60}}"#),
     ];
+    for wrong in [
+        PIN[1..].to_owned(),
+        format!("{PIN}0"),
+        PIN.to_uppercase(),
+        PIN.replacen('a', "g", 1),
+        format!(" {PIN}"),
+        String::new(),
+    ] {
+        cases.push(format!(
+            r#"{{{url},"certificatePin":"{wrong}","expiresInSecs":60}}"#
+        ));
+    }
+    cases.push(format!(
+        r#"{{{url},"certificatePin":5,"expiresInSecs":60}}"#
+    ));
     for body in cases {
         let failure = ask(Served::new(200, &body)).await.unwrap_err();
         assert_eq!(
@@ -165,7 +195,7 @@ async fn a_dead_server_is_retried() {
         .unwrap_err();
     assert_eq!(failure.class, Class::Retry);
 
-    let silent = FakeDial::new(4096, |_, mut server: DuplexStream| {
+    let silent = FakeDial::new(4096, |_, mut server: ServerEnd| {
         tokio::spawn(async move {
             let _ = read_request(&mut server).await;
             let _ = server.write_all(b"HTTP/1.1 200 X\r\nContent-Le").await;
@@ -182,19 +212,21 @@ async fn a_dead_server_is_retried() {
 /// A7: a URL that breaks the host rule is a retry, whatever the breach.
 #[tokio::test(start_paused = true)]
 async fn a_url_that_breaks_the_host_rule_is_a_retry() {
-    let long = format!("http://127.0.0.1:9000/{}", "a".repeat(5000));
+    let long = format!("https://127.0.0.1:9000/{}", "a".repeat(5000));
     for url in [
-        "https://127.0.0.1:9000/x",
-        "http://127.0.0.2:9000/x",
-        "http://user@127.0.0.1:9000/x",
-        "http://127.0.0.1.example:9000/x",
-        "http://127.0.0.1:9000/x#frag",
-        "http://127.0.0.1:09000/x",
-        "http://127.0.0.1:70000/x",
-        "http://127.0.0.1:9000",
+        "http://127.0.0.1:9000/x",
+        "http://127.0.0.1/x",
+        "HTTPS://127.0.0.1:9000/x",
+        "https://127.0.0.2:9000/x",
+        "https://user@127.0.0.1:9000/x",
+        "https://127.0.0.1.example:9000/x",
+        "https://127.0.0.1:9000/x#frag",
+        "https://127.0.0.1:09000/x",
+        "https://127.0.0.1:70000/x",
+        "https://127.0.0.1:9000",
         long.as_str(),
     ] {
-        let body = serde_json::json!({"url": url, "expiresInSecs": 60}).to_string();
+        let body = answer_for(url);
         let failure = ask(Served::new(200, &body)).await.unwrap_err();
         assert_eq!(
             (failure.class, failure.why),
@@ -203,6 +235,29 @@ async fn a_url_that_breaks_the_host_rule_is_a_retry() {
             url.len()
         );
     }
+}
+
+/// A pin that is not 64 lowercase hexadecimal digits is judged before the host rule: one body
+/// with both faults ends the fetch, and nothing but the route is dialled.
+#[tokio::test(start_paused = true)]
+async fn a_malformed_pin_is_judged_before_the_host_rule() {
+    let body = serde_json::json!({
+        "url": "http://127.0.0.1:9000/x",
+        "certificatePin": PIN.to_uppercase(),
+        "expiresInSecs": 60,
+    })
+    .to_string();
+    let (prover, verifier) = proving(&format!("http://127.0.0.1:{API}"), AGENT);
+    let (dial, _) = scripted_served(prover, Served::new(200, &body));
+    let failure = downloads(dial.clone(), verifier)
+        .url("tok", &want())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (failure.class, failure.why, failure.status),
+        (Class::PassOver, "answer", Some(200))
+    );
+    assert_eq!(*dial.dialled.lock().unwrap(), vec![API]);
 }
 
 /// The statuses the fetch ends on when the server proved them.

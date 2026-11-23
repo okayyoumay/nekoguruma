@@ -1545,9 +1545,10 @@ components:
       enum: [open, completing, finished, failed]
     UploadPartUrl:
       type: object
-      required: [url, expiresInSecs]
+      required: [url, certificatePin, expiresInSecs]
       properties:
-        url: { type: string, description: A presigned PUT URL; a bearer for its life }
+        url: { type: string, description: 'A presigned PUT URL with the scheme https (exactly, in lowercase) on the registration origin''s host; a bearer for its life' }
+        certificatePin: { type: string, pattern: '^[0-9a-f]{64}$', description: 'The SHA-256 of the DER of the leaf certificate the object server at `url` presents. The agent connects to `url` with TLS 1.3 and sends nothing unless the server presents exactly that certificate and proves it holds its key (design 14.3, ADR-505). It is in every answer, since the port holder can change between requests' }
         expiresInSecs: { type: integer, description: 300 }
     DownloadRequest:
       type: object
@@ -1560,9 +1561,10 @@ components:
         sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
     DownloadUrl:
       type: object
-      required: [url, expiresInSecs]
+      required: [url, certificatePin, expiresInSecs]
       properties:
-        url: { type: string, description: A presigned GET URL; a bearer for its life }
+        url: { type: string, description: 'A presigned GET URL with the scheme https (exactly, in lowercase) on the registration origin''s host; a bearer for its life' }
+        certificatePin: { type: string, pattern: '^[0-9a-f]{64}$', description: 'The SHA-256 of the DER of the leaf certificate the object server at `url` presents; the agent connects with TLS 1.3 and accepts only that certificate (design 14.4, ADR-505)' }
         expiresInSecs: { type: integer, description: '60: the URL lapses within 60 seconds of its issue (the signing time is cut to the second)' }
     DocumentStored:
       type: object

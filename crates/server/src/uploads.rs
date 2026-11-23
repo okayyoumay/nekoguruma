@@ -1347,7 +1347,11 @@ async fn part_url_answer(u: &Uploads, caller: &Caller, id: &str, part: u16) -> R
     match store.presign_part(&upload, part) {
         Ok(url) => json_answer(
             StatusCode::OK,
-            json!({"url": url.expose(), "expiresInSecs": PART_URL_EXPIRY.as_secs()}),
+            json!({
+                "url": url.expose(),
+                "certificatePin": url.pin().to_string(),
+                "expiresInSecs": PART_URL_EXPIRY.as_secs(),
+            }),
         ),
         Err(error) => store_failure(u, &error),
     }
@@ -1601,6 +1605,10 @@ mod tests {
         for none in [
             io(),
             StoreError::Refused { op: "t" },
+            StoreError::Untrusted {
+                op: "t",
+                refused: ngr_pinned_tls::Refused::Certificate,
+            },
             StoreError::Server {
                 op: "t",
                 status: 500,

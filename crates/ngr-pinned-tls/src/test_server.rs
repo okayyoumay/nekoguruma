@@ -9,6 +9,7 @@ use std::sync::Arc;
 use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256, PKCS_ECDSA_P384_SHA384};
 use rustls::ServerConfig;
 use rustls::crypto::aws_lc_rs;
+use rustls::pki_types::pem::{self, SectionKind};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::sign::{CertifiedKey, SingleCertAndKey};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -25,6 +26,8 @@ pub enum Key {
 pub struct Identity {
     certificate: Vec<u8>,
     key: Vec<u8>,
+    certificate_pem: String,
+    key_pem: String,
 }
 
 impl std::fmt::Debug for Identity {
@@ -54,9 +57,33 @@ impl Identity {
         Self::make(Key::P256, Validity::Current, false)
     }
 
+    /// An identity from the PEM text of a certificate and of its PKCS#8 private key, as the
+    /// files of the object server's credentials directory hold them. The key is not checked
+    /// against the certificate. `None` when either text holds no section of its kind.
+    pub fn from_pem(certificate_pem: &str, key_pem: &str) -> Option<Self> {
+        let certificate = section(certificate_pem, SectionKind::Certificate)?;
+        let key = section(key_pem, SectionKind::PrivateKey)?;
+        Some(Self {
+            certificate,
+            key,
+            certificate_pem: certificate_pem.to_owned(),
+            key_pem: key_pem.to_owned(),
+        })
+    }
+
     /// The certificate's DER encoding.
     pub fn certificate(&self) -> &[u8] {
         &self.certificate
+    }
+
+    /// The certificate as PEM text.
+    pub fn certificate_pem(&self) -> &str {
+        &self.certificate_pem
+    }
+
+    /// The private key as PKCS#8 PEM text.
+    pub fn key_pem(&self) -> &str {
+        &self.key_pem
     }
 
     fn make(key: Key, validity: Validity, name: bool) -> Self {
@@ -86,8 +113,21 @@ impl Identity {
         Self {
             certificate: certificate.der().to_vec(),
             key: key.serialize_der(),
+            certificate_pem: certificate.pem(),
+            key_pem: key.serialize_pem(),
         }
     }
+}
+
+/// The DER of the first section of `kind` in `text`.
+fn section(text: &str, kind: SectionKind) -> Option<Vec<u8>> {
+    let mut rest = text.as_bytes();
+    while let Ok(Some((found, der))) = pem::from_buf(&mut rest) {
+        if found == kind {
+            return Some(der);
+        }
+    }
+    None
 }
 
 enum Validity {
@@ -143,5 +183,21 @@ impl Acceptor {
         S: AsyncRead + AsyncWrite + Unpin,
     {
         self.0.accept(stream).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_identity_is_rebuilt_from_its_pem_text() {
+        let made = Identity::generate(Key::P384);
+        let rebuilt = Identity::from_pem(made.certificate_pem(), made.key_pem()).unwrap();
+        assert_eq!(rebuilt.certificate(), made.certificate());
+        assert_eq!(rebuilt.key, made.key);
+        // A text without the section of its kind is not an identity.
+        assert!(Identity::from_pem(made.key_pem(), made.key_pem()).is_none());
+        assert!(Identity::from_pem(made.certificate_pem(), "").is_none());
     }
 }

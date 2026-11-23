@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use server::config::ObjectServerConfig;
 use server::object_server::credentials::{ACCESS_KEY_FILE, SECRET_KEY_FILE};
+use server::object_server::tls::{CERTIFICATE_FILE, KEY_FILE};
 use server::object_server::{ObjectServer, Tuning};
 
 use crate::redeem::capture;
@@ -327,6 +328,33 @@ async fn deleted_credential_files_are_made_again_and_used() {
     assert_ne!(new, old);
     assert_eq!(second.credentials().expose_secret(), new);
     second.stop(std::future::pending()).await;
+}
+
+/// The certificate pin the server computes is the same at every start of one pair, and is new when
+/// both TLS files are deleted (ADR-505 items 1 and 17).
+#[tokio::test]
+async fn the_certificate_pin_survives_a_restart_and_changes_with_new_files() {
+    let mut real = Real::new();
+    let first = real.start().await;
+    let pin = *first.certificate_pin();
+    let key = std::fs::read(real.config.credentials_dir.join(KEY_FILE)).unwrap();
+    first.stop(std::future::pending()).await;
+
+    let second = real.start().await;
+    assert_eq!(*second.certificate_pin(), pin);
+    assert_eq!(
+        std::fs::read(real.config.credentials_dir.join(KEY_FILE)).unwrap(),
+        key,
+        "the key is not rewritten"
+    );
+    second.stop(std::future::pending()).await;
+
+    for name in [KEY_FILE, CERTIFICATE_FILE] {
+        std::fs::remove_file(real.config.credentials_dir.join(name)).unwrap();
+    }
+    let third = real.start().await;
+    assert_ne!(*third.certificate_pin(), pin);
+    third.stop(std::future::pending()).await;
 }
 
 /// R5: a server that is killed takes the real child with it (Linux).

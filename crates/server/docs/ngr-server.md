@@ -181,6 +181,21 @@ readiness probe.
   the child the two paths as `RUSTFS_ACCESS_KEY_FILE` and `RUSTFS_SECRET_KEY_FILE`; that is the
   child's own interface and not configuration of the server by environment (ADR-456 item 7). The
   secret is in no configuration, environment, argument or log line.
+- **TLS key and certificate.** Two more owner-only files directly in `credentials_dir`,
+  `rustfs_key.pem` (a P-256 key, PKCS#8 PEM) and `rustfs_cert.pem` (a self-signed certificate for
+  `127.0.0.1`), under the same rules as the credential files (a temporary file, a hard link and a
+  directory sync; the same checks of the directory and the files). The key is made first and read
+  back, then the certificate is made from the key as read back, so servers that start together
+  end with one pair. At every start the server reads both files and checks that they are one
+  certificate, one P-256 key and a pair, and computes the pin of the certificate (the SHA-256 of
+  its DER, `ObjectServer::certificate_pin`, ADR-505); the pin is logged as 64 hexadecimal digits
+  at creation and when the object server is ready. A key without a certificate (a crash between
+  the two links) gets a certificate made from it. Every other fault ends the start with the files
+  untouched: a certificate without a key (nothing is created), a certificate and key that do not
+  match, a file that is empty, over 4096 bytes, not text or PEM, with two sections or another
+  label, a key of another curve, and the unsafe files above. To make a new pair, stop the server,
+  delete both files and start it; the pin changes. Keep nothing else of your own in the
+  credentials directory: the object server reads its TLS directory as a namespace.
 - **The data directory** holds `.lock` (the local store's lock code: a second server on the
   directory exits 1 before it spawns anything) and `volume/`, which the child is given as its
   volume. The server creates the directory (mode 0700 on Unix) when it is absent and its parent

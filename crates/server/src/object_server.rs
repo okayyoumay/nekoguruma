@@ -7,7 +7,8 @@
 //! 1. the port is resolved, then the binary is checked (nothing else exists yet);
 //! 2. the data directory is created if absent, checked and locked (`.lock`, the object store's
 //!    lock code), and its `volume` directory, which the object server needs to exist, is created;
-//! 3. the credential files are read or created ([`credentials`]);
+//! 3. the credential files are read or created ([`credentials`]), then the TLS key and certificate
+//!    files in the same directory, whose pin the server keeps ([`tls`]);
 //! 4. the port is tried on `127.0.0.1` (a taken port names `object_server.port`);
 //! 5. the child is spawned: a cleared and rebuilt environment, standard input null, output piped
 //!    and forwarded line by line to the log ([`forward`]), the data directory as its working
@@ -36,6 +37,8 @@ pub mod credentials;
 mod forward;
 #[cfg(windows)]
 mod job;
+mod private_files;
+pub mod tls;
 
 use std::future::Future;
 use std::io;
@@ -57,6 +60,8 @@ use crate::fs_guard::sync_directory;
 use crate::storage::StoreError;
 use crate::storage::local::{ProcessLock, ensure_area, open_locked_dir};
 pub use credentials::{Credentials, CredentialsError};
+use ngr_pinned_tls::CertPin;
+use tls::{TlsFiles, TlsFilesError};
 
 /// How long the server waits for the object server to answer its readiness probe.
 pub const READY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -146,6 +151,8 @@ pub enum ObjectServerError {
     DataDirInUse,
     #[error(transparent)]
     Credentials(#[from] CredentialsError),
+    #[error(transparent)]
+    Tls(#[from] TlsFilesError),
     #[error(
         "127.0.0.1:{port} (object_server.port) is in use; if an object server of an earlier run \
          was left running (a system without a parent-death signal or job object), stop it"
@@ -179,6 +186,7 @@ pub struct ObjectServer {
     group: Option<u32>,
     port: u16,
     credentials: Credentials,
+    tls: TlsFiles,
     forwarders: Vec<JoinHandle<()>>,
     stop_timeout: Duration,
     _lock: ProcessLock,
@@ -209,6 +217,10 @@ impl ObjectServer {
         if credentials.created() {
             tracing::info!("object server credential files created");
         }
+        let tls = TlsFiles::load_or_create(&config.credentials_dir)?;
+        if tls.created() {
+            tracing::info!(pin = %tls.pin(), "object server TLS key and certificate created");
+        }
         // The port is tried here so that a port that is taken is named; the window between this
         // and the child's own bind is closed by the child ending before it is ready.
         match std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)) {
@@ -223,6 +235,7 @@ impl ObjectServer {
             group,
             port,
             credentials,
+            tls,
             forwarders: Vec::new(),
             stop_timeout: tuning.stop_timeout,
             _lock: lock,
@@ -242,7 +255,7 @@ impl ObjectServer {
                 "a step after the start failed (test hook)",
             ));
         }
-        tracing::info!(port, "object server ready");
+        tracing::info!(port, pin = %server.tls.pin(), "object server ready");
         Ok(server)
     }
 
@@ -307,6 +320,12 @@ impl ObjectServer {
     /// The credentials the object server was started with.
     pub fn credentials(&self) -> &Credentials {
         &self.credentials
+    }
+
+    /// The pin of the object server's TLS certificate: the SHA-256 of the certificate the server
+    /// made, or found, in `object_server.credentials_dir`.
+    pub fn certificate_pin(&self) -> &CertPin {
+        self.tls.pin()
     }
 
     /// The child's process ID while it is not reaped.

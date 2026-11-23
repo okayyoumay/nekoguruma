@@ -19,7 +19,11 @@ rcgen = { workspace = true, optional = true }
 [features]
 # `test-server` (the `test_server` module): a TLS server for tests (certificates, an acceptor, an impostor), so that the
 # tests of a caller need no rustls of their own. Not for production code.
-test-server = ["dep:rcgen"]
+test-server = ["identity"]
+# `identity` (the `identity` module): makes the P-256 key and the self-signed certificate the server
+# gives the object server, and computes the pin of a stored pair. Production code of the server
+# enables it.
+identity = ["dep:rcgen"]
 
 [dev-dependencies]
 # The crate's own tests use its test server.

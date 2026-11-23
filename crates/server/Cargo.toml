@@ -23,6 +23,8 @@ doc = false
 [dependencies]
 shared-proto.workspace = true
 shared-crypto.workspace = true
+# The key and certificate of the bundled object server and the pin of its certificate (ADR-505).
+ngr-pinned-tls = { workspace = true, features = ["identity"] }
 diag-ir.workspace = true
 tokio.workspace = true
 axum.workspace = true

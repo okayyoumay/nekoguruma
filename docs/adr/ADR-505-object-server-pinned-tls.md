@@ -1,7 +1,7 @@
 # ADR-505: The Object Server Speaks TLS Only, With a Certificate the Server Creates and the Agent Learns From a Proved Answer
 
 **Date:** 2026-11-23
-**Status:** Accepted (items 9 to 14 added with the verifier and the agent's dial)
+**Status:** Accepted (items 9 to 14 added with the verifier and the agent's dial; items 15 to 19 added with the switch's design, and item 8 split by item 19)
 **Affects:** design 13, 13.3, 14.3, 14.4; `crates/server` (`object_server`, `storage/s3`), `crates/agent`, `api/openapi.yaml`, CLAUDE.md "Building and testing"; annotates ADR-491, ADR-492, ADR-493, ADR-497, ADR-504
 
 ## Context
@@ -55,7 +55,8 @@ the same exposure.
 7. **Hardening upstream.** The maintainer reports the Windows address reuse to the RustFS project
    as hardening; nothing here depends on it.
 8. **Built in steps**, each a change of its own: the server's TLS and its store client; the pin in
-   the routes and `api/openapi.yaml`; the agent's TLS with tests against an impostor.
+   the routes and `api/openapi.yaml`; the agent's TLS with tests against an impostor. (Item 19
+   changes the split of the first two and the agent.)
 
 This record annotates ADR-491 (items 2, 3, 6 and 8, and the residual about the port), ADR-492
 (item 4), ADR-493 (item 13), ADR-497 (item 6) and ADR-504 (Consequences). ADR-463 item 13 is about
@@ -91,6 +92,38 @@ the server's own origin and is unchanged.
     two sides cannot disagree on what a pin accepts. Its `test-server` feature makes self-signed test certificates and a TLS
     acceptor, including an impostor that presents a certificate it holds no key for, so that a
     caller's tests need no TLS crate of their own.
+
+### Decisions taken with the switch
+
+15. **The identity code lives in `ngr-pinned-tls`.** Making the key and the certificate, and
+    checking a stored pair and computing its pin, are the crate's `identity` feature, so rustls
+    stays in one crate (item 14) and the server's own code names no TLS type. The feature adds
+    `rcgen` to the build; the server enables it.
+16. **The files sit directly in the credentials directory.** `rustfs_key.pem` and
+    `rustfs_cert.pem` (the names RustFS reads, item 1) are under ADR-462's file rules, like the
+    credential files: owner-only, made by a temporary file, a hard link and a directory sync, and
+    read back. The key is made first and the certificate is made from the key as read back, so
+    servers that start together end with one pair. The directory holds nothing else of the object
+    server's: RustFS reads its TLS directory as a namespace, so a stray file there could stop its
+    start. It could not weaken trust, since the clients pin the certificate.
+17. **A partial or bad pair is not repaired, except for one case.** A key without a certificate
+    (a crash between the two links) gets a certificate made from it. A certificate without a key,
+    a certificate and key that do not match, a file that is corrupt (empty, oversize, not PEM, two
+    sections, another label, a key that is not P-256) and a file that is unsafe (a link, a FIFO, a
+    directory, another owner, group or other bits, unreadable) end the start and are never
+    rewritten. The server computes the pin from the files at every start, after checking them as a
+    pair.
+18. **The pin is a promise of the proved answers, not of every answer.** A missing or malformed
+    pin in a proved answer is an answer the route never promises: an upload's part-URL answer is
+    set aside like a malformed `uploadId`, and a download ends. The pin travels with the store's
+    URL types, so that a URL and its certificate cannot be paired wrongly. A refused store
+    handshake is transient at the open of the store.
+19. **The switch is two changes, not three.** The first makes and checks the key and certificate
+    and exposes the pin; nothing on the wire changes. The second is the switch: the child is
+    started with `RUSTFS_TLS_PATH`, the probe and the store client pin the certificate, presigned
+    URLs are `https`, the pin is in both proved answers and in `api/openapi.yaml`, and the agent
+    dials with it. No agent or server from one side of the switch works with the other, so the
+    routes' change and the agent's are not separate changes.
 
 ### Alternatives rejected
 

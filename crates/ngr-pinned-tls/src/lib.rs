@@ -22,13 +22,22 @@
 //!
 //! The pin is a public value, so it is compared with `==`.
 //!
+//! # Feature `identity`
+//!
+//! The [`identity`] module, behind the `identity` feature, makes the P-256 key and the
+//! self-signed certificate for `127.0.0.1` that the server gives the object server, and checks
+//! a stored pair and computes its [`CertPin`]. It adds `rcgen` to the build; rustls stays in this
+//! crate.
+//!
 //! # Feature `test-server`
 //!
 //! The [`test_server`] module, behind the `test-server` feature, makes self-signed test
 //! certificates and TLS acceptors, including an impostor that presents a certificate it does not
 //! hold the key of. It exists so that a caller's tests need no TLS crate of their own; no
-//! production code enables it, and it adds `rcgen` to the build.
+//! production code enables it. It implies `identity`.
 
+#[cfg(feature = "identity")]
+pub mod identity;
 mod pin;
 mod verifier;
 

@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use server::config::{Config, Database, Http, InstructionKeyConfig, ObjectServerConfig, Profile};
 use server::object_server::credentials::{ACCESS_KEY_FILE, SECRET_KEY_FILE};
+use server::object_server::tls::{CERTIFICATE_FILE, KEY_FILE};
 use server::object_server::{ObjectServer, ObjectServerError, Tuning};
 use server::storage::{S3Tuning, StoreError};
 use server::{RunError, Server, StartError};
@@ -525,7 +526,12 @@ async fn the_first_start_creates_the_credentials_and_the_next_loads_them_unchang
     fx.log = Some(log.clone());
     let first = fx.start(5000, 1000).await.unwrap();
     let names = fx.credential_names();
-    assert_eq!(names, [ACCESS_KEY_FILE, SECRET_KEY_FILE]);
+    assert_eq!(
+        names,
+        [ACCESS_KEY_FILE, SECRET_KEY_FILE, CERTIFICATE_FILE, KEY_FILE],
+        "the credential files and the TLS pair, and nothing else"
+    );
+    let pin = *first.certificate_pin();
     let secret = fx.secret();
     let access = std::fs::read_to_string(fx.credentials().join(ACCESS_KEY_FILE)).unwrap();
     #[cfg(unix)]
@@ -546,8 +552,14 @@ async fn the_first_start_creates_the_credentials_and_the_next_loads_them_unchang
         "{text}"
     );
     assert!(!text.contains(&secret) && !text.contains(&access), "{text}");
+    assert!(
+        text.contains("object server TLS key and certificate created")
+            && text.contains(&pin.to_string()),
+        "{text}"
+    );
 
     let second = fx.start(5000, 1000).await.unwrap();
+    assert_eq!(*second.certificate_pin(), pin);
     assert_eq!(second.credentials().expose_secret(), secret);
     assert_eq!(fx.secret(), secret);
     assert_eq!(

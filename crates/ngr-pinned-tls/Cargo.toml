@@ -17,7 +17,7 @@ sha2.workspace = true
 rcgen = { workspace = true, optional = true }
 
 [features]
-# `test_server`: a TLS server for tests (certificates, an acceptor, an impostor), so that the
+# `test-server` (the `test_server` module): a TLS server for tests (certificates, an acceptor, an impostor), so that the
 # tests of a caller need no rustls of their own. Not for production code.
 test-server = ["dep:rcgen"]
 

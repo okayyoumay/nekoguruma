@@ -1,7 +1,7 @@
 # ADR-505: The Object Server Speaks TLS Only, With a Certificate the Server Creates and the Agent Learns From a Proved Answer
 
 **Date:** 2026-11-23
-**Status:** Accepted
+**Status:** Accepted (items 9 to 14 added with the verifier and the agent's dial)
 **Affects:** design 13, 13.3, 14.3, 14.4; `crates/server` (`object_server`, `storage/s3`), `crates/agent`, `api/openapi.yaml`, CLAUDE.md "Building and testing"; annotates ADR-491, ADR-492, ADR-493, ADR-497, ADR-504
 
 ## Context

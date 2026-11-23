@@ -24,7 +24,7 @@
 //!
 //! # Feature `test-server`
 //!
-//! The [`test_server`] module, behind the feature of that name, makes self-signed test
+//! The [`test_server`] module, behind the `test-server` feature, makes self-signed test
 //! certificates and TLS acceptors, including an impostor that presents a certificate it does not
 //! hold the key of. It exists so that a caller's tests need no TLS crate of their own; no
 //! production code enables it, and it adds `rcgen` to the build.

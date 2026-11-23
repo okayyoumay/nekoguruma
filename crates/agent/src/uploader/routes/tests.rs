@@ -349,6 +349,17 @@ async fn a_part_url_that_breaks_the_rule_is_a_retry_and_other_bodies_are_unpromi
         );
         assert_eq!(seen.lock().unwrap().len(), 1, "only the route was asked");
     }
+    // A malformed pin is judged before the host rule: a body with both faults is not promised.
+    let both = format!(
+        r#"{{"url":"http://127.0.0.1:9000/x","certificatePin":"{}","expiresInSecs":300}}"#,
+        PIN.to_uppercase()
+    );
+    let (routes, seen) = with_reply(Served::new(200, &both));
+    assert_eq!(
+        routes.part_url("t", &id(), 1).await.unwrap_err(),
+        failure(Class::PassOver, "answer", Some(200))
+    );
+    assert_eq!(seen.lock().unwrap().len(), 1, "only the route was asked");
     // A 201 is not what the route answers.
     let (routes, _) = with_reply(Served::new(201, &part_answer("https://127.0.0.1:9000/x")));
     assert_eq!(

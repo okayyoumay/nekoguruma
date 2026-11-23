@@ -237,6 +237,29 @@ async fn a_url_that_breaks_the_host_rule_is_a_retry() {
     }
 }
 
+/// A pin that is not 64 lowercase hexadecimal digits is judged before the host rule: one body
+/// with both faults ends the fetch, and nothing but the route is dialled.
+#[tokio::test(start_paused = true)]
+async fn a_malformed_pin_is_judged_before_the_host_rule() {
+    let body = serde_json::json!({
+        "url": "http://127.0.0.1:9000/x",
+        "certificatePin": PIN.to_uppercase(),
+        "expiresInSecs": 60,
+    })
+    .to_string();
+    let (prover, verifier) = proving(&format!("http://127.0.0.1:{API}"), AGENT);
+    let (dial, _) = scripted_served(prover, Served::new(200, &body));
+    let failure = downloads(dial.clone(), verifier)
+        .url("tok", &want())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (failure.class, failure.why, failure.status),
+        (Class::PassOver, "answer", Some(200))
+    );
+    assert_eq!(*dial.dialled.lock().unwrap(), vec![API]);
+}
+
 /// The statuses the fetch ends on when the server proved them.
 const REFUSALS: [u16; 7] = [400, 404, 413, 500, 403, 418, 501];
 

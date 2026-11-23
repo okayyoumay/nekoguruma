@@ -804,7 +804,7 @@ than the request's, a digest the stored instruction does not name (a `document` 
 document hashes, an `artifact` as its artifact hash) and a digest with no `ir_documents` or
 `artifacts` row for the tenant are all one 404 with one body. A stored instruction that does not
 decode and a stored key that does not parse are 500; no store is 503. The job's state plays no
-part. The answer is 200 with the URL and `expiresInSecs: 60` and `Cache-Control: no-store`; the
+part. The answer is 200 with the URL, the `certificatePin` of the object server and `expiresInSecs: 60` and `Cache-Control: no-store`; the
 route writes nothing and calls the store for no I/O. Nothing logs the URL, the token, the digest or
 the body (ADR-497 items 1 to 5). Its log gates are its own, apart from the upload routes', and
 every reason has one: the database unavailable (503), a statement that failed (500), the store, an

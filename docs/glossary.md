@@ -293,6 +293,9 @@ SAE J2534 ("PassThru") standard for vehicle interface adapters. The worker suppo
 **K-Line**  
 Single-wire serial automotive bus (ISO 9141-2, ISO 14230). Older protocol used in pre-CAN vehicles.
 
+**Local-profile bundle** (design 13, ADR-506)  
+The release artifact group that carries what the local deployment bundles besides the product binaries: PostgreSQL and the pinned RustFS **Object server**. It is one of a release's three groups, beside the product (server, agent, workers) and the SDK for extension authors (`release-scope.md`).
+
 **Local tenant** (design 13.3, ADR-469)  
 The one tenant of the local deployment, with an ID fixed in the server. `ngr-server user add` creates it if it is absent, and login and the other user commands look an operator up by this tenant and the username, so one username names one operator. See **Local user**.
 

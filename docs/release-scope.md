@@ -12,9 +12,9 @@ grouping of the release artifacts and the place of the simulators are decided in
 | Group | Contents | Source |
 |---|---|---|
 | Product | `ngr-server`, with the reference UI embedded and served when no UI directory is configured | design 9.6, 12 |
-| Product | `ngr-agent`, with the Linux device-mode files in `packaging/` (systemd unit, sysusers entry) | design 6.5, `crates/agent/docs/ngr-agent.md` |
+| Product | `ngr-agent`, with the Linux device-mode files in `packaging/` (systemd unit, sysusers entry) | `crates/agent/docs/ngr-agent.md` |
 | Product | The worker services `j2534-0404-service` and `iso22900-service`, one binary per worker ABI | design 7.3, `worker-crates.md` |
-| Local-profile bundle | PostgreSQL; RustFS pinned to one release, fetched and hash-checked by `scripts/fetch-rustfs.sh`; local users in place of OIDC | design 12, 13, ADR-491, ADR-492 |
+| Local-profile bundle | PostgreSQL; RustFS pinned to one release, fetched and hash-checked by `scripts/fetch-rustfs.sh` | design 12, 13, ADR-491, ADR-492 |
 | SDK | The UI framework package (npm) and the types generated from `api/openapi.yaml` and `api/asyncapi.yaml` | design 9.6, 9.8 |
 | SDK | Schemas and templates (`schemas/`), the local validation CLI, IR dry runs | design 9.8 |
 | SDK | The conformance test suite with the simulated VCI `sim-vci` and the simulated ECUs of `sim-ecu` it serves | design 9.8, 13.4, ADR-506 |
@@ -38,12 +38,13 @@ grouping of the release artifacts and the place of the simulators are decided in
 
 | Item | Source |
 |---|---|
-| Vendor J2534 and D-PDU API libraries; they are installed by the VCI vendor | design 16.2 "Licensing" |
+| Vendor J2534 and D-PDU API libraries | design 16.2 "Licensing" |
 | VCI profiles; they are installed outside this software | design 9.3, ADR-228 |
 | The text of the standards the code cites (copyrighted; cited by clause only) | `CLAUDE.md` "Spec references and copyright" |
 | ODX/PDX data supplied by OEMs or third parties; its redistribution depends on its licence | design 9.4, 16.2 |
-| MinIO; the bundled object server is RustFS | ADR-491 |
+| MinIO; the bundled object server is RustFS | ADR-491, `crates/server/docs/ngr-server.md` |
 | The test doubles `iso22900-mock` and `j2534-0404-mock`; they serve the repository's own tests | ADR-506 |
+| `sim-vci` in the product: the product installation does not register it as a VCI (it ships in the SDK only) | ADR-506 |
 
 ### Platforms out of scope
 
@@ -61,7 +62,7 @@ grouping of the release artifacts and the place of the simulators are decided in
 | J2534 v05.00 | `worker-crates.md` "Process Isolation" |
 | D-Server (ISO 22900-3, MCD-3D) | design 1 R14 |
 | Acting as a J2534 library for a maker's application; TMC RP1210 | design 16.2 "Regulatory Scope", ADR-237 |
-| Code extensions on the agent or the worker; extensions there are data only | design 9, 9.7 |
+| Code extensions on the agent or the worker; extensions there are data only | design 2 principle 5, 9, 9.7 |
 | Per-tenant UI bundle uploads | design 9.6 |
 | Certification as a regulated inspection tool | design 16.1, 16.2, ADR-237 |
 
@@ -83,4 +84,4 @@ grouping of the release artifacts and the place of the simulators are decided in
 | OTX, ExVe compatible endpoints, generic OBD package | The standards are obtained | design 8.7, 16.2, ADR-237 |
 | Tenant and contract management | Undecided | design 17 P6 |
 | Non-functional targets | Undecided | design 17 P5 |
-| State-changing requests from a release-build agent | Refused until the authorization layer replaces the rule; only a debug build sends them, and only to the simulators | ADR-247, ADR-331 |
+| State-changing requests from a release-build agent | Refused until the policy layer of design 5.5, 5.6, 6 and 8.9 replaces the rule; only a debug build sends them, and only to the simulators | ADR-247, ADR-331 |

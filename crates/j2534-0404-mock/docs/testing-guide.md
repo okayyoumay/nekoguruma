@@ -4,7 +4,7 @@
 
 `j2534-0404-mock` is an in-process J2534 v04.04 DLL substitute for testing without real hardware. It exports the standard PassThru API (`PassThruOpen`, `PassThruConnect`, etc.) with the same C ABI as a real vendor DLL, plus a set of back-door exports (`__mock_*`) for test setup, inspection, and reset.
 
-Build artifact: `cdylib` (`.dll` / `.so`) + `rlib`.
+Build artifact: `cdylib` (`.dll` / `.so`) + `rlib`. It serves the repository's own tests and is not released (ADR-506).
 
 ---
 

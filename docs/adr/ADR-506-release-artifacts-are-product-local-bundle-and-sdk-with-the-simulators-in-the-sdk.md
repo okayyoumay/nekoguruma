@@ -2,7 +2,7 @@
 
 **Date:** 2026-11-23
 **Status:** Accepted
-**Affects:** `docs/release-scope.md`, design 9.8, 13; `crates/sim-vci`, `crates/sim-ecu`, `crates/iso22900-mock`, `crates/j2534-0404-mock`
+**Affects:** `docs/release-scope.md`, `docs/glossary.md`, design 9.8, 13; `crates/sim-vci`, `crates/sim-ecu`, `crates/iso22900-mock`, `crates/j2534-0404-mock` (their docs)
 
 ## Context
 

@@ -1606,7 +1606,7 @@ The operational log tells the developers and maintainers of NGR why NGR itself m
 
 The same code is switched by configuration. Profile differences are limited to swapping interface implementations and are not scattered as code branches.
 
-What a release contains for each profile, and what it leaves out, is summarized in `release-scope.md` (ADR-506).
+What a release contains, including the local-profile bundle, and what it leaves out, is summarized in `release-scope.md` (ADR-506).
 
 | Component | Standard deployment | Local deployment (testing / personal use) |
 |---|---|---|

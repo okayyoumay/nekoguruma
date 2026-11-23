@@ -15,12 +15,13 @@
 //! is given the files' paths and reads them itself. Errors name the file in words and never a
 //! value, and [`Credentials`]' `Debug` shows nothing of either key.
 
-use std::io::{self, Read};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use shared_crypto::{Zeroizing, random_32};
 
-use crate::fs_guard::{self, DirectoryFault, FileFault, LinkFault, check_directory};
+use super::private_files::{self, Fault, Loaded};
+use crate::fs_guard::{DirectoryFault, FileFault, check_directory};
 
 /// The access key's file name in `credentials_dir`.
 pub const ACCESS_KEY_FILE: &str = "object-server-access-key";
@@ -170,15 +171,18 @@ fn file_error(fault: FileFault) -> CredentialsError {
 }
 
 /// `bytes` random bytes as hexadecimal text, upper case when `upper`.
-fn generate(bytes: usize, upper: bool) -> Result<Zeroizing<String>, CredentialsError> {
-    let random = Zeroizing::new(random_32().map_err(|_| CredentialsError::Random)?);
-    let mut text = Zeroizing::new(String::with_capacity(bytes * 2));
+fn generate(bytes: usize, upper: bool) -> Result<Zeroizing<Vec<u8>>, Fault> {
+    let random = Zeroizing::new(random_32().map_err(|_| Fault::Random)?);
+    let mut text = Zeroizing::new(Vec::with_capacity(bytes * 2));
     for b in random.iter().take(bytes) {
-        text.push_str(&if upper {
-            format!("{b:02X}")
-        } else {
-            format!("{b:02x}")
-        });
+        text.extend_from_slice(
+            if upper {
+                format!("{b:02X}")
+            } else {
+                format!("{b:02x}")
+            }
+            .as_bytes(),
+        );
     }
     Ok(text)
 }
@@ -190,45 +194,21 @@ fn load_or_create_one(
     which: &'static str,
     len: usize,
     allowed: impl Fn(u8) -> bool,
-    generate: impl FnOnce() -> Result<Zeroizing<String>, CredentialsError>,
+    generate: impl FnOnce() -> Result<Zeroizing<Vec<u8>>, Fault>,
 ) -> Result<(Zeroizing<String>, bool), CredentialsError> {
-    let mut created = false;
-    let file = match fs_guard::open_private(path).map_err(file_error)? {
-        Some(file) => file,
-        None => {
-            let value = generate()?;
-            created = match fs_guard::create_by_link(
-                dir,
-                path,
-                ".object-server-credential-",
-                value.as_bytes(),
-            ) {
-                Ok(created) => created,
-                Err(LinkFault::Random) => return Err(CredentialsError::Random),
-                Err(LinkFault::Io { op, error }) => {
-                    return Err(CredentialsError::Io {
-                        op,
-                        kind: error.kind(),
-                    });
-                }
-            };
-            // What the file holds is read back, as at every start: the winner's value, which is
-            // not necessarily this call's.
-            fs_guard::open_private(path)
-                .map_err(file_error)?
-                .ok_or(CredentialsError::Io {
-                    op: "read back",
-                    kind: io::ErrorKind::NotFound,
-                })?
-        }
-    };
-    let mut bytes = Zeroizing::new(Vec::new());
-    file.take(MAX_FILE_LEN + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| CredentialsError::Io {
-            op: "read",
-            kind: error.kind(),
-        })?;
+    let loaded = private_files::read_or_create(
+        dir,
+        path,
+        ".object-server-credential-",
+        MAX_FILE_LEN,
+        generate,
+    )
+    .map_err(|fault| match fault {
+        Fault::File(fault) => file_error(fault),
+        Fault::Random => CredentialsError::Random,
+        Fault::TooLong => CredentialsError::Corrupt { which },
+    })?;
+    let Loaded { mut bytes, created } = loaded;
     let valid = bytes.len() == len && bytes.iter().all(|&c| allowed(c));
     if !valid {
         return Err(CredentialsError::Corrupt { which });
@@ -442,7 +422,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_file_or_directory_of_another_account_is_refused() {
-        if fs_guard::euid() != 0 {
+        if crate::fs_guard::euid() != 0 {
             return; // chown to another account needs root
         }
         let other = 4_242_424;

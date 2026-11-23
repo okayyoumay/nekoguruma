@@ -1431,6 +1431,7 @@ The following are provided for extension authors.
 - Schema definitions and templates, and a CLI for local validation before ingestion
 - A conformance test suite using a mock VCI and a vehicle simulator (sharing the simulator adapter from Chapter 13)
 - IR dry runs (execution with vehicle access mocked)
+- These ship as the SDK, one of a release's three artifact groups; its mock VCI is `sim-vci` with the simulated ECUs of `sim-ecu`, and the repository's test doubles are not released (`release-scope.md`, ADR-506)
 - The verification status of extensions is shown on screen as "conformant" or "unverified". Use of unverified extensions is made explicit
 
 ---
@@ -1604,6 +1605,8 @@ The operational log tells the developers and maintainers of NGR why NGR itself m
 ## 13. Deployment Profiles
 
 The same code is switched by configuration. Profile differences are limited to swapping interface implementations and are not scattered as code branches.
+
+What a release contains for each profile, and what it leaves out, is summarized in `release-scope.md` (ADR-506).
 
 | Component | Standard deployment | Local deployment (testing / personal use) |
 |---|---|---|

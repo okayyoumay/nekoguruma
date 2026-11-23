@@ -36,9 +36,11 @@ const GATE: &str = "NGR_TEST_WINDOWS_SERVICE_ACCOUNT";
 const RUN_WAIT: Duration = Duration::from_secs(90);
 
 /// The files a run writes, which the batch file creates in the working directory.
-const OUTPUTS: [&str; 6] = [
+const OUTPUTS: [&str; 8] = [
     "env.txt",
+    "version.txt",
     "whoami.txt",
+    "whoami_exit.txt",
     "stdout.txt",
     "stderr.txt",
     "exit.txt",
@@ -84,7 +86,9 @@ impl Drop for Cleanup {
 /// What one run of the service left, as text.
 struct RunFacts {
     env: String,
+    version: String,
     whoami: String,
+    whoami_exit: String,
     stdout: String,
     stderr: String,
     exit: String,
@@ -92,7 +96,15 @@ struct RunFacts {
 
 impl RunFacts {
     fn print(&self, label: &str) {
-        println!("--- {label}: whoami /user\n{}", self.whoami.trim());
+        println!(
+            "--- {label}: agent without arguments\n{}",
+            self.version.trim()
+        );
+        println!(
+            "--- {label}: whoami /user (exit {})\n{}",
+            self.whoami_exit.trim(),
+            self.whoami.trim()
+        );
         println!(
             "--- {label}: exit {}\n--- stdout\n{}\n--- stderr\n{}",
             self.exit.trim(),
@@ -107,6 +119,74 @@ impl RunFacts {
             .lines()
             .find_map(|line| line.strip_prefix(prefix.as_str()))
             .map(|value| value.trim().to_owned())
+    }
+}
+
+/// Reads one output file as lossy text (the console tools write in the OEM code page), printing
+/// its byte length, or the error and what the directory says about the file when it cannot be read.
+fn read_lossy(dir: &Path, name: &str) -> String {
+    let path = dir.join(name);
+    match fs::read(&path) {
+        Ok(bytes) => {
+            println!("--- {name}: {} bytes", bytes.len());
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+        Err(error) => {
+            println!(
+                "--- {name}: cannot be read: {error}; metadata: {:?}",
+                fs::metadata(&path).map(|meta| (meta.len(), meta.is_file()))
+            );
+            String::new()
+        }
+    }
+}
+
+/// Prints the names and sizes under `dir`, recursively, and the tail of each file under a `logs`
+/// directory; a directory that cannot be read prints the error.
+fn print_tree(dir: &Path, in_logs: bool) {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            println!("--- {}: cannot be listed: {error}", dir.display());
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        match entry.metadata() {
+            Ok(meta) if meta.is_dir() => {
+                println!("    {} (dir)", path.display());
+                let logs = in_logs || entry.file_name() == "logs";
+                print_tree(&path, logs);
+            }
+            Ok(meta) => {
+                println!("    {} ({} bytes)", path.display(), meta.len());
+                if in_logs {
+                    match fs::read(&path) {
+                        Ok(bytes) => {
+                            let text = String::from_utf8_lossy(&bytes);
+                            let lines: Vec<&str> = text.lines().collect();
+                            let tail = &lines[lines.len().saturating_sub(60)..];
+                            println!("--- tail of {}\n{}", path.display(), tail.join("\n"));
+                        }
+                        Err(error) => println!("--- {}: cannot be read: {error}", path.display()),
+                    }
+                }
+            }
+            Err(error) => println!("    {}: no metadata: {error}", path.display()),
+        }
+    }
+}
+
+/// Prints the agent's directory under the service account's profile, from its `LOCALAPPDATA`.
+fn print_service_state(facts: &RunFacts, label: &str) {
+    match facts.env_var("LOCALAPPDATA") {
+        Some(local) => {
+            let root = Path::new(&local).join("nekoguruma");
+            println!("--- {label}: {}", root.display());
+            print_tree(&root, false);
+        }
+        None => println!("--- {label}: the service has no LOCALAPPDATA"),
     }
 }
 
@@ -125,10 +205,12 @@ fn start_and_collect(service: &str, dir: &Path) -> RunFacts {
         );
         std::thread::sleep(Duration::from_millis(200));
     }
-    let read = |name: &str| fs::read_to_string(dir.join(name)).unwrap_or_default();
+    let read = |name: &str| read_lossy(dir, name);
     let facts = RunFacts {
         env: read("env.txt"),
+        version: read("version.txt"),
         whoami: read("whoami.txt"),
+        whoami_exit: read("whoami_exit.txt"),
         stdout: read("stdout.txt"),
         stderr: read("stderr.txt"),
         exit: read("exit.txt"),
@@ -177,7 +259,9 @@ fn the_device_key_is_created_once_and_found_again_as_a_service_account() {
          set NGR_AGENT_KEY_STORE=dpapi\r\n\
          set NGR_AGENT_STATE_DIR=\r\n\
          set > \"%~dp0env.txt\"\r\n\
+         \"%~dp0ngr-agent.exe\" > \"%~dp0version.txt\" 2>&1\r\n\
          whoami /user > \"%~dp0whoami.txt\" 2>&1\r\n\
+         echo %errorlevel% > \"%~dp0whoami_exit.txt\"\r\n\
          \"%~dp0ngr-agent.exe\" identity --mode device > \"%~dp0stdout.txt\" 2> \"%~dp0stderr.txt\"\r\n\
          echo %errorlevel% > \"%~dp0exit.txt\"\r\n\
          echo done > \"%~dp0done.txt\"\r\n",
@@ -225,8 +309,10 @@ fn the_device_key_is_created_once_and_found_again_as_a_service_account() {
 
     let first = start_and_collect(&service, &dir);
     first.print("first run");
+    print_service_state(&first, "after the first run");
     let second = start_and_collect(&service, &dir);
     second.print("second run");
+    print_service_state(&second, "after the second run");
     println!(
         "--- the service's environment\n{}",
         first.env.trim().replace("\r\n", "\n")
@@ -254,7 +340,8 @@ fn the_device_key_is_created_once_and_found_again_as_a_service_account() {
             .whoami
             .to_lowercase()
             .contains(&account.to_lowercase()),
-        "the command did not run as {account}"
+        "the command did not run as {account}; whoami wrote {:?}",
+        first.whoami
     );
     assert_eq!(first.exit.trim(), "0", "the first run failed");
     assert_eq!(second.exit.trim(), "0", "the second run failed");

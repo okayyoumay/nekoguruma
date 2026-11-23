@@ -189,12 +189,16 @@ readiness probe.
   end with one pair. At every start the server reads both files and checks that they are one
   certificate, one P-256 key and a pair, and computes the pin of the certificate (the SHA-256 of
   its DER, `ObjectServer::certificate_pin`, ADR-505); the pin is logged as 64 hexadecimal digits
-  at creation and when the object server is ready. A key without a certificate (a crash between
+  at creation (with what was made: the key and certificate, or the certificate alone) and when the object server is ready. A key without a certificate (a crash between
   the two links) gets a certificate made from it. Every other fault ends the start with the files
   untouched: a certificate without a key (nothing is created), a certificate and key that do not
   match, a file that is empty, over 4096 bytes, not text or PEM, with two sections or another
   label, a key of another curve, and the unsafe files above. To make a new pair, stop the server,
-  delete both files and start it; the pin changes. Keep nothing else of your own in the
+  delete both files and start it; the pin changes. A file holds one PEM section and only white
+  space around it: text before or after the section, or a second section of any label, is
+  refused. A `.object-server-tls-*.tmp` file left by a crash between a write and a link holds a
+  copy of the key or the certificate, is ignored and is safe to delete; it is the kind of stray
+  file the credentials directory must not keep. Keep nothing else of your own in the
   credentials directory: the object server reads its TLS directory as a namespace.
 - **The data directory** holds `.lock` (the local store's lock code: a second server on the
   directory exits 1 before it spawns anything) and `volume/`, which the child is given as its

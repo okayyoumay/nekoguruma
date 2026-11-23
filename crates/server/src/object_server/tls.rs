@@ -4,14 +4,18 @@
 //! file rules, and the pin of the certificate ([`CertPin`]).
 //!
 //! The key is made first and read back, then the certificate is made from the key as read back,
-//! each by [`private_files::read_or_create`] (a temporary file, a hard link and a directory sync),
+//! each by `private_files::read_or_create` (a temporary file, a hard link and a directory sync),
 //! so a file appears complete or not at all and, of servers that start together, one link wins
 //! and the others load its file. The server then reads both files back and checks that they are
-//! one certificate, one PKCS#8 P-256 key and a pair ([`pin_of_pair`]); the pin comes from that
+//! one certificate, one PKCS#8 P-256 key and a pair ([`identity::pin_of_pair`]); the pin comes from that
 //! check, at every start.
 //!
-//! A start after a crash between the two links finds the key alone and makes the certificate from
-//! it. Every other file that is not a good pair ends the start and is never rewritten: a
+//! A file holds one PEM section and only white space around it. A start after a crash between the
+//! two links finds the key alone and makes the certificate from it. A crash between a temporary
+//! file's write and its link, or between a link and the removal of the temporary file, leaves a
+//! `.object-server-tls-*.tmp` file, which nothing reads; it holds a copy of the key or the
+//! certificate, so it is safe to delete, and it is the kind of stray file the credentials
+//! directory must not keep. Every other file that is not a good pair ends the start and is never rewritten: a
 //! certificate without a key (nothing is created), a certificate and key that do not match, a
 //! file that is empty, oversize, not PEM or of another label or key kind, and a file that is a
 //! symbolic link, a FIFO, a directory, owned by another account or open to group or others
@@ -19,7 +23,8 @@
 //! server, delete both files and start it again.
 //!
 //! The directory holds nothing else of the object server's than the credential files and these
-//! two: the object server reads its TLS directory as a namespace. Errors name the file in words
+//! two (and no leftover temporary file): the object server reads its TLS directory as a
+//! namespace. Errors name the file in words
 //! and never its content.
 
 use std::io;
@@ -94,7 +99,29 @@ pub enum TlsFilesError {
 #[derive(Debug)]
 pub struct TlsFiles {
     pin: CertPin,
-    created: bool,
+    created: Option<Created>,
+}
+
+/// What a call to [`TlsFiles::load_or_create`] made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Created {
+    KeyAndCertificate,
+    /// The key was there (after a crash between the two links, or made by a start at the same
+    /// time).
+    CertificateOnly,
+    /// A start at the same time made the certificate from the key this call made.
+    KeyOnly,
+}
+
+impl Created {
+    /// The files made, as words for a log line.
+    pub fn what(self) -> &'static str {
+        match self {
+            Created::KeyAndCertificate => "key and certificate",
+            Created::CertificateOnly => "certificate",
+            Created::KeyOnly => "key",
+        }
+    }
 }
 
 impl TlsFiles {
@@ -126,7 +153,10 @@ impl TlsFiles {
             &key_path,
             ".object-server-tls-key-",
             MAX_FILE_LEN,
-            || Ok(Zeroizing::new(identity::generate_key().into_bytes())),
+            || {
+                let key = identity::generate_key().map_err(|_| Fault::Random)?;
+                Ok(Zeroizing::new(key.as_bytes().to_vec()))
+            },
         )
         .map_err(|fault: Fault| fault_error(fault, "key"))?;
         let key_text = text(&key.bytes, "key")?;
@@ -146,7 +176,12 @@ impl TlsFiles {
             identity::pin_of_pair(certificate_text, key_text).map_err(TlsFilesError::NotAPair)?;
         Ok(TlsFiles {
             pin,
-            created: key.created || certificate.created,
+            created: match (key.created, certificate.created) {
+                (true, true) => Some(Created::KeyAndCertificate),
+                (false, true) => Some(Created::CertificateOnly),
+                (true, false) => Some(Created::KeyOnly),
+                (false, false) => None,
+            },
         })
     }
 
@@ -155,8 +190,8 @@ impl TlsFiles {
         &self.pin
     }
 
-    /// Whether this call created a file.
-    pub fn created(&self) -> bool {
+    /// Which files this call created, if any.
+    pub fn created(&self) -> Option<Created> {
         self.created
     }
 }
@@ -234,7 +269,7 @@ mod tests {
 
     /// A new key and its certificate, as PEM.
     fn pair() -> (String, String) {
-        let key = identity::generate_key();
+        let key = identity::generate_key().unwrap().to_string();
         let cert = identity::self_signed(&key).unwrap();
         (key, cert)
     }
@@ -264,7 +299,7 @@ mod tests {
     fn absent_files_are_created_and_loaded_again_unchanged() {
         let dir = tempfile::tempdir().unwrap();
         let first = TlsFiles::load_or_create(dir.path()).unwrap();
-        assert!(first.created());
+        assert_eq!(first.created(), Some(Created::KeyAndCertificate));
         let made = files(dir.path());
         assert_eq!(
             made.iter()
@@ -288,7 +323,7 @@ mod tests {
             .unwrap();
         // A second start loads the files and rewrites nothing.
         let again = TlsFiles::load_or_create(dir.path()).unwrap();
-        assert!(!again.created());
+        assert_eq!(again.created(), None);
         assert_eq!(again.pin(), first.pin());
         assert_eq!(files(dir.path()), made);
         assert_eq!(
@@ -310,7 +345,7 @@ mod tests {
         let (key, _) = pair();
         write_private(&key_path(dir.path()), key.as_bytes());
         let loaded = TlsFiles::load_or_create(dir.path()).unwrap();
-        assert!(loaded.created());
+        assert_eq!(loaded.created(), Some(Created::CertificateOnly));
         assert_eq!(std::fs::read_to_string(key_path(dir.path())).unwrap(), key);
         let cert = std::fs::read_to_string(cert_path(dir.path())).unwrap();
         assert_eq!(
@@ -430,14 +465,56 @@ mod tests {
                 write_private(&key_path(dir.path()), key.as_bytes());
             }
             std::fs::create_dir(dir.path().join(name)).unwrap();
+            let error = TlsFiles::load_or_create(dir.path()).unwrap_err();
+            // Windows opens a file without backup semantics, so a directory fails there with an
+            // access error instead of being recognized as not a file; both are refusals.
+            #[cfg(unix)]
+            assert!(
+                matches!(error, TlsFilesError::NotRegularFile { .. }),
+                "{name}: {error}"
+            );
+            #[cfg(windows)]
             assert!(
                 matches!(
-                    TlsFiles::load_or_create(dir.path()),
-                    Err(TlsFilesError::NotRegularFile { .. })
+                    error,
+                    TlsFilesError::Io {
+                        kind: io::ErrorKind::PermissionDenied,
+                        ..
+                    }
                 ),
-                "{name}"
+                "{name}: {error}"
             );
+            assert!(dir.path().join(name).is_dir(), "{name}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_others_can_write_to_is_refused_and_gets_no_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        for mode in [0o770, 0o707, 0o777] {
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(matches!(
+                TlsFiles::load_or_create(dir.path()),
+                Err(TlsFilesError::DirectoryWritable)
+            ));
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn a_leftover_temporary_file_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let (key, cert) = pair();
+        // A crash after the certificate's temporary file was written and before its link.
+        write_private(&key_path(dir.path()), key.as_bytes());
+        let leftover = dir.path().join(".object-server-tls-cert-00.tmp");
+        write_private(&leftover, cert.as_bytes());
+        let loaded = TlsFiles::load_or_create(dir.path()).unwrap();
+        assert_eq!(loaded.created(), Some(Created::CertificateOnly));
+        assert!(leftover.exists());
+        assert!(cert_path(dir.path()).exists());
     }
 
     #[cfg(unix)]
@@ -614,12 +691,12 @@ mod tests {
         write_private(&key_path(dir.path()), b"s3cret-value");
         let error = TlsFiles::load_or_create(dir.path()).unwrap_err();
         assert!(!format!("{error} / {error:?}").contains("s3cret-value"));
-        let (key, _) = pair();
         let dir = tempfile::tempdir().unwrap();
         TlsFiles::load_or_create(dir.path()).unwrap();
         let loaded = TlsFiles::load_or_create(dir.path()).unwrap();
         let shown = format!("{loaded:?}");
+        let key = std::fs::read_to_string(key_path(dir.path())).unwrap();
         let body = key.lines().nth(1).unwrap();
-        assert!(!shown.contains(body), "{shown}");
+        assert!(!body.is_empty() && !shown.contains(body), "{shown}");
     }
 }

@@ -12,6 +12,7 @@ use rustls::pki_types::pem::{self, SectionKind};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::sign::CertifiedKey;
 use rustls::{Error as TlsError, InconsistentKeys, SignatureScheme};
+use zeroize::Zeroizing;
 
 use crate::CertPin;
 
@@ -26,7 +27,8 @@ pub enum Pem {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdentityError {
     /// The text is not exactly one section of the expected label and nothing else (a missing
-    /// section, a second one, a section of another label, or text that is not PEM).
+    /// section, a second one, a section of another label, text before or after the section, or
+    /// text that is not PEM). Only white space may surround the section.
     NotOnePem { what: Pem },
     /// The key is not a P-256 key.
     NotP256,
@@ -34,6 +36,8 @@ pub enum IdentityError {
     Mismatch,
     /// The key or the certificate cannot be parsed.
     Malformed,
+    /// Operating-system randomness is unavailable, so no key could be made.
+    Random,
 }
 
 impl std::fmt::Display for IdentityError {
@@ -48,17 +52,19 @@ impl std::fmt::Display for IdentityError {
             Self::NotP256 => "the key is not a P-256 key",
             Self::Mismatch => "the key does not belong to the certificate",
             Self::Malformed => "the key or the certificate is malformed",
+            Self::Random => "operating-system randomness is unavailable",
         })
     }
 }
 
 impl std::error::Error for IdentityError {}
 
-/// A new P-256 private key as PKCS#8 PEM.
-pub fn generate_key() -> String {
+/// A new P-256 private key as PKCS#8 PEM, wiped when dropped. Fails with
+/// [`IdentityError::Random`] when the operating system has no randomness to give.
+pub fn generate_key() -> Result<Zeroizing<String>, IdentityError> {
     KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
-        .expect("the aws-lc-rs provider generates a P-256 key")
-        .serialize_pem()
+        .map(|key| Zeroizing::new(key.serialize_pem()))
+        .map_err(|_| IdentityError::Random)
 }
 
 /// A certificate for `127.0.0.1`, signed by the key `key_pem` (PKCS#8 PEM), as PEM.
@@ -74,15 +80,21 @@ pub fn self_signed(key_pem: &str) -> Result<String, IdentityError> {
 
 /// The pin of the certificate in `cert_pem`, after checking that the pair is what the server
 /// makes: exactly one certificate section and nothing else in the one text, exactly one PKCS#8
-/// private key section and nothing else in the other, the key a P-256 key, and the key the
-/// certificate's own. Both texts may have CR LF line ends.
+/// private key section and nothing else in the other (only white space may surround a section),
+/// the key a P-256 key, and the key the certificate's own. Both texts may have CR LF line ends.
+/// The key's DER is wiped when this returns, except for the copy the signing key was built from,
+/// which rustls and the provider own.
 pub fn pin_of_pair(cert_pem: &str, key_pem: &str) -> Result<CertPin, IdentityError> {
-    let certificate = CertificateDer::from(only_section(
+    let certificate = CertificateDer::from(take(only_section(
         cert_pem,
         SectionKind::Certificate,
         Pem::Certificate,
-    )?);
-    let key = PrivatePkcs8KeyDer::from(only_section(key_pem, SectionKind::PrivateKey, Pem::Key)?);
+    )?));
+    let key = PrivatePkcs8KeyDer::from(take(only_section(
+        key_pem,
+        SectionKind::PrivateKey,
+        Pem::Key,
+    )?));
     let signing = aws_lc_rs::default_provider()
         .key_provider
         .load_private_key(PrivateKeyDer::Pkcs8(key))
@@ -105,18 +117,40 @@ pub fn pin_of_pair(cert_pem: &str, key_pem: &str) -> Result<CertPin, IdentityErr
     Ok(pin)
 }
 
-/// The DER of the one section `text` holds, which must be of kind `kind`.
-fn only_section(text: &str, kind: SectionKind, what: Pem) -> Result<Vec<u8>, IdentityError> {
-    let mut rest = text.as_bytes();
-    let mut found = None;
-    while let Some((section, der)) =
-        pem::from_buf(&mut rest).map_err(|_| IdentityError::NotOnePem { what })?
-    {
-        if section != kind || found.replace(der).is_some() {
-            return Err(IdentityError::NotOnePem { what });
-        }
+/// The bytes out of their wiping holder, for a type that takes a `Vec` by value.
+fn take(mut der: Zeroizing<Vec<u8>>) -> Vec<u8> {
+    std::mem::take(&mut *der)
+}
+
+/// The DER of the one section `text` holds, which must be of kind `kind`. Only white space may
+/// come before or after the section: the first and last lines are its BEGIN and END lines, and
+/// no other BEGIN line exists, so text outside the section and a section of an unknown label
+/// (which the PEM reader would skip) are refused.
+fn only_section(
+    text: &str,
+    kind: SectionKind,
+    what: Pem,
+) -> Result<Zeroizing<Vec<u8>>, IdentityError> {
+    let refused = IdentityError::NotOnePem { what };
+    let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
+    let first = lines.next().ok_or(refused)?;
+    let last = lines.next_back().unwrap_or(first);
+    let begins = text
+        .lines()
+        .filter(|line| line.trim().starts_with("-----BEGIN "))
+        .count();
+    if !first.starts_with("-----BEGIN ") || !last.starts_with("-----END ") || begins != 1 {
+        return Err(refused);
     }
-    found.ok_or(IdentityError::NotOnePem { what })
+    let mut rest = text.as_bytes();
+    let (section, der) = pem::from_buf(&mut rest)
+        .map_err(|_| refused)?
+        .ok_or(refused)?;
+    let der = Zeroizing::new(der);
+    if section != kind || pem::from_buf(&mut rest).map_err(|_| refused)?.is_some() {
+        return Err(refused);
+    }
+    Ok(der)
 }
 
 #[cfg(test)]
@@ -124,13 +158,13 @@ mod tests {
     use super::*;
 
     fn pair() -> (String, String) {
-        let key = generate_key();
+        let key = generate_key().unwrap().to_string();
         let cert = self_signed(&key).unwrap();
         (cert, key)
     }
 
     fn cert_der(pem: &str) -> Vec<u8> {
-        only_section(pem, SectionKind::Certificate, Pem::Certificate).unwrap()
+        take(only_section(pem, SectionKind::Certificate, Pem::Certificate).unwrap())
     }
 
     fn crlf(text: &str) -> String {
@@ -184,6 +218,16 @@ mod tests {
             ("two certificates", format!("{cert}{other_cert}")),
             ("the key in the certificate's place", key.clone()),
             ("a certificate and a key", format!("{cert}{key}")),
+            ("a leading junk line", format!("junk\n{cert}")),
+            (
+                "a trailing unknown section",
+                format!("{cert}-----BEGIN OTHER THING-----\nAAAA\n-----END OTHER THING-----\n"),
+            ),
+            ("a trailing line", format!("{cert}trailer\n")),
+            (
+                "an unknown section before the certificate",
+                format!("-----BEGIN OTHER THING-----\nAAAA\n-----END OTHER THING-----\n{cert}"),
+            ),
             (
                 "a certificate with a wrong end label",
                 cert.replace("END CERTIFICATE", "END CERTIFICAT"),
@@ -205,6 +249,12 @@ mod tests {
             ("two keys", format!("{key}{other_key}")),
             ("a key and a certificate", format!("{key}{cert}")),
             ("a certificate", cert.clone()),
+            ("a leading junk line", format!("junk\n{key}")),
+            (
+                "a trailing unknown section",
+                format!("{key}-----BEGIN OTHER THING-----\nAAAA\n-----END OTHER THING-----\n"),
+            ),
+            ("a trailing line", format!("{key}trailer\n")),
             (
                 "a traditional EC key label",
                 key.replace("PRIVATE KEY", "EC PRIVATE KEY"),
@@ -213,6 +263,14 @@ mod tests {
         for (name, text) in cases {
             assert_eq!(pin_of_pair(&cert, &text), Err(expected), "{name}");
         }
+    }
+
+    #[test]
+    fn white_space_around_the_one_section_is_accepted() {
+        let (cert, key) = pair();
+        let expected = pin_of_pair(&cert, &key).unwrap();
+        let padded = |text: &str| format!("\n  \r\n{text}\n\n \t\n");
+        assert_eq!(pin_of_pair(&padded(&cert), &padded(&key)), Ok(expected));
     }
 
     #[test]

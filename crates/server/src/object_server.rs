@@ -218,8 +218,8 @@ impl ObjectServer {
             tracing::info!("object server credential files created");
         }
         let tls = TlsFiles::load_or_create(&config.credentials_dir)?;
-        if tls.created() {
-            tracing::info!(pin = %tls.pin(), "object server TLS key and certificate created");
+        if let Some(created) = tls.created() {
+            tracing::info!(pin = %tls.pin(), "object server TLS {} created", created.what());
         }
         // The port is tried here so that a port that is taken is named; the window between this
         // and the child's own bind is closed by the child ending before it is ready.

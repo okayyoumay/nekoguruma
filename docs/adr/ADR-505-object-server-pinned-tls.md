@@ -87,8 +87,8 @@ the server's own origin and is unchanged.
     uppercase, a space, a non-ASCII character) is refused rather than normalized, so one pin has
     one spelling in the proved answers.
 14. **The verifier is its own crate, `ngr-pinned-tls`.** It is the one crate whose non-test code
-    depends on rustls, and the server and the agent share it, so the two sides cannot disagree on
-    what a pin accepts. Its `test-server` feature makes self-signed test certificates and a TLS
+    depends on rustls, and it serves both the server's store client and probe and the agent, so the
+    two sides cannot disagree on what a pin accepts. Its `test-server` feature makes self-signed test certificates and a TLS
     acceptor, including an impostor that presents a certificate it holds no key for, so that a
     caller's tests need no TLS crate of their own.
 

@@ -107,8 +107,11 @@ async fn certificates_after_the_leaf_carry_no_authority() {
     );
 }
 
+/// A pin that fits the first connection's server does not carry over: the next connection to the
+/// same server is refused under another pin. (That no session is resumed is the unit test in
+/// `src/lib.rs`.)
 #[tokio::test]
-async fn a_second_connection_is_judged_against_its_own_pin() {
+async fn each_connection_is_judged_against_its_own_pin() {
     let identity = Identity::generate(Key::P256);
     let acceptor = Acceptor::new(&identity);
     let (client, _) = connect_to(&acceptor, &pin_of(&identity)).await;

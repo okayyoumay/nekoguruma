@@ -42,7 +42,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use rustls::pki_types::ServerName;
-use rustls::{CertificateError, ClientConfig, Error as TlsError};
+use rustls::{CertificateError, ClientConfig, Error as TlsError, PeerMisbehaved};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_rustls::TlsConnector;
 
@@ -55,7 +55,7 @@ pub enum Refused {
     /// The leaf certificate is not the one the pin names.
     Certificate,
     /// The certificate is the pinned one, or at least was presented, but the handshake is not
-    /// signed by its key.
+    /// signed by its key, or is signed with a scheme the client did not offer.
     Signature,
     /// The handshake failed for another reason: a peer that does not speak TLS, a close, a
     /// message that is not valid. The kind is that of the I/O error the handshake ended with.
@@ -141,7 +141,9 @@ fn client_config(pin: &CertPin) -> ClientConfig {
 
 /// What the I/O error a handshake ended with says. The verifier fails a wrong certificate with
 /// `ApplicationVerificationFailure` and a bad signature with whatever the provider reports; no
-/// other certificate error can arise in this client.
+/// other certificate error can arise in this client. A peer that signs with a scheme the client
+/// did not offer, or with an algorithm other than the one its key exchange named, failed the
+/// signature too, and rustls reports that as the peer's misbehaviour.
 fn refusal(error: io::Error) -> Refused {
     match error
         .get_ref()
@@ -151,6 +153,58 @@ fn refusal(error: io::Error) -> Refused {
             Refused::Certificate
         }
         Some(TlsError::InvalidCertificate(_)) => Refused::Signature,
+        Some(TlsError::PeerMisbehaved(
+            PeerMisbehaved::SignedHandshakeWithUnadvertisedSigScheme
+            | PeerMisbehaved::SignedKxWithWrongAlgorithm,
+        )) => Refused::Signature,
         _ => Refused::Handshake(error.kind()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rustls::HandshakeKind;
+    use tokio::io::duplex;
+
+    use super::*;
+    use crate::test_server::{Acceptor, Identity, Key};
+
+    /// Two handshakes over one shared config to a server that issues tickets are both full: the
+    /// second does not resume the first's session.
+    #[tokio::test]
+    async fn a_shared_config_does_not_resume_a_session() {
+        let identity = Identity::generate(Key::P256);
+        let pin = CertPin::of_certificate(identity.certificate());
+        let acceptor = Acceptor::new(&identity);
+        let connector = TlsConnector::from(Arc::new(client_config(&pin)));
+        let name = ServerName::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST).into());
+
+        let mut kinds = Vec::new();
+        for _ in 0..2 {
+            let (client, server) = duplex(16 * 1024);
+            let server = tokio::spawn({
+                let acceptor = acceptor.clone();
+                async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut stream = acceptor.accept(server).await.unwrap();
+                    // The tickets follow the handshake; they reach the client when it reads.
+                    stream.write_all(b"x").await.unwrap();
+                    stream.shutdown().await.unwrap();
+                    let mut rest = Vec::new();
+                    stream.read_to_end(&mut rest).await.unwrap();
+                }
+            });
+            let mut stream = connector.connect(name.clone(), client).await.unwrap();
+            let mut seen = Vec::new();
+            tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut seen)
+                .await
+                .unwrap();
+            kinds.push(stream.get_ref().1.handshake_kind());
+            tokio::io::AsyncWriteExt::shutdown(&mut stream)
+                .await
+                .unwrap();
+            server.await.unwrap();
+        }
+        assert_eq!(kinds, [Some(HandshakeKind::Full); 2]);
     }
 }

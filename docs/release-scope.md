@@ -29,8 +29,11 @@ grouping of the release artifacts and the place of the simulators are decided in
 
 ### Vendor library standards
 
-- SAE J2534-1 v04.04 with the optional features of SAE J2534-2 (`j2534-2-support-plan.md`)
-- ISO 22900-2 D-PDU API (design 1 "Assumptions", `worker-crates.md`)
+- SAE J2534-1 (DEC2004, v04.04), the API of clause 7, with the optional features of SAE J2534-2
+  (DEC2020) clauses 5 to 26 as far as `j2534-2-support-plan.md` records their coverage
+- ISO 22900-2 D-PDU API, clause 8 of the 2022 edition (clause 9 of the 2009 edition, which the
+  worker crates also cite); library discovery follows the root description file of the 2022 edition's
+  clause 8.7, the same chain as the 2009 edition's clause 9.7 (design 1 "Assumptions", 7.1, `worker-crates.md`)
 
 ## Not included
 
@@ -60,7 +63,7 @@ grouping of the release artifacts and the place of the simulators are decided in
 | Item | Source |
 |---|---|
 | J2534 v05.00 | `worker-crates.md` "Process Isolation" |
-| D-Server (ISO 22900-3, MCD-3D) | design 1 R14 |
+| D-Server (MCD-3D) | design 1 R14 |
 | Acting as a J2534 library for a maker's application; TMC RP1210 | design 16.2 "Regulatory Scope", ADR-237 |
 | Code extensions on the agent or the worker; extensions there are data only | design 2 principle 5, 9, 9.7 |
 | Per-tenant UI bundle uploads | design 9.6 |
@@ -74,7 +77,7 @@ grouping of the release artifacts and the place of the simulators are decided in
 | Business screens and operational flows; the bundled ones are a reference implementation | Framework user | design 9.6, 16.1 |
 | Registering a product with makers' secure gateways | Framework user | design 16.1, ADR-237 |
 | Certification, SERMI approval and authorisation, statutory retention periods, EU Data Act recipient duties | System operator | design 16.1, ADR-237 |
-| UNECE R156 software update management process | System operator | design 16.1 |
+| The software update management process (SUMS) | System operator | design 16.1 |
 | Correctness of extension package contents | Author | design 16.1 |
 
 ## Conditional or undecided

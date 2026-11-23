@@ -1,7 +1,7 @@
 # ADR-505: The Object Server Speaks TLS Only, With a Certificate the Server Creates and the Agent Learns From a Proved Answer
 
 **Date:** 2026-11-23
-**Status:** Accepted (items 9 to 14 added with the verifier and the agent's dial; items 15 to 19 added with the switch's design, and item 8 split by item 19; items 20 to 22 added with the switch)
+**Status:** Accepted (items 9 to 14 added with the verifier and the agent's dial; items 15 to 19 added with the switch's design, and item 8 split by item 19; items 20 to 22 added with the switch, which meet item 6)
 **Affects:** design 13, 13.3, 14.3, 14.4; `crates/server` (`object_server`, `storage/s3`), `crates/agent`, `api/openapi.yaml`, CLAUDE.md "Building and testing"; annotates ADR-491, ADR-492, ADR-493, ADR-497, ADR-504
 
 ## Context
@@ -20,7 +20,7 @@ ours. A probe against the real binary showed:
 A process beside the object server on that port, or one that takes the port after the object
 server is gone, can receive an agent's part bytes and the part's presigned URL (a 300-second bearer
 that also lets the holder overwrite the part), a download's presigned URL (60 seconds), and the
-server's own store traffic, which is plain HTTP over presigned URLs too: document bodies,
+server's own store traffic, which was plain HTTP over presigned URLs too: document bodies,
 read-backs, and replayable signed get, delete and abort URLs. Integrity is already detected (the
 completion's read-back against the SHA-256 declared on a proved route; the instruction's hash on
 downloads). Confidentiality and availability are not. The window after the whole stack has died is
@@ -52,6 +52,7 @@ the same exposure.
    release CI's `worker-windows` job uses); CLAUDE.md says so.
 6. **No real data is enqueued by the agent until its side is built.** A result or a log, in a build
    that is not a test, is enqueued on neither OS until the agent side of this record is built.
+   (Met with items 20 to 22: the agent dials the object server only with TLS and the pin.)
 7. **Hardening upstream.** The maintainer reports the Windows address reuse to the RustFS project
    as hardening; nothing here depends on it.
 8. **Built in steps**, each a change of its own: the server's TLS and its store client; the pin in

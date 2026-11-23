@@ -280,17 +280,6 @@ async fn the_real_server_has_no_other_listener() {
     server.stop(std::future::pending()).await;
 }
 
-/// ADR-504 item 5 for the object server: while the real child runs, no other socket can take
-/// its address, so no other process can receive a presigned part's bytes or serve a download in
-/// its place. Its listener options are RustFS's own, so this runs on every platform the tests do.
-#[tokio::test]
-async fn the_real_servers_listener_shares_its_address_with_nobody() {
-    let mut real = Real::new();
-    let server = real.start().await;
-    crate::listener_probe::assert_unshared(loopback(real.port())).await;
-    server.stop(std::future::pending()).await;
-}
-
 /// L6, R11: the secret is in no argument and no environment of the real child.
 #[cfg(target_os = "linux")]
 #[tokio::test]

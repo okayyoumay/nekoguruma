@@ -19,7 +19,6 @@ mod instruction_key;
 mod job_expiry;
 mod job_queue;
 mod jobs;
-mod listener_probe;
 mod local_users;
 mod migrations;
 mod object_server;

@@ -55,6 +55,15 @@ libc = "0.2"
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = { version = "6.3", default-features = false, features = ["default-rt"] }
 
+# The Windows key store: DPAPI (Win32_Security_Cryptography), `LocalFree` (Win32_Foundation) and
+# `GetProfileType` (Win32_UI_Shell), ADR-507.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+    "Win32_UI_Shell",
+] }
+
 [dev-dependencies]
 # The control channel's loop tests run on a paused clock (ADR-471).
 tokio = { workspace = true, features = ["test-util"] }

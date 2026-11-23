@@ -212,6 +212,13 @@ and then fail, rather than skip, without a session bus or a Secret Service. `cor
 after the main nextest run, in a step that installs gnome-keyring and starts it unlocked inside
 `dbus-run-session`; run them locally the same way (the step in `ci.yml`), never against the
 keyring of your own desktop session.
+The agent's Windows key store (ADR-507) has real-DPAPI tests that run in `core-windows` with no
+variable (a debug agent selects it with `NGR_AGENT_KEY_STORE=dpapi`), and one gated test,
+`crates/agent/tests/windows_service_account.rs`, that runs only with
+`NGR_TEST_WINDOWS_SERVICE_ACCOUNT=1` and then fails, rather than skips, if it cannot create a
+service under `NT SERVICE\<name>` (it needs an elevated account). A `core-windows` step runs it
+with `--success-output immediate` to keep the facts it prints; it creates and deletes a service,
+so run it locally only on a machine you can afford that on.
 
 CI runs the tests with [cargo-nextest](https://nexte.st/) instead. The `core-linux` job runs
 `cargo nextest run --workspace --locked --profile ci`, then

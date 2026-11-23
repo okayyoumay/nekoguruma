@@ -142,7 +142,7 @@ fn without_a_store_the_exit_is_1_and_nothing_is_written() {
 /// not either when a variable is missing or wrong (E3). The invariant is the same: the override
 /// directory stays empty. In a release build the command now stops at the missing installation
 /// file; that build's store selection is covered by `identity/tests.rs`'s
-/// `a_release_build_ignores_both_variables`.
+/// `the_release_choice_is_the_platforms_store_and_reads_no_variable`.
 #[test]
 fn a_missing_or_wrong_variable_selects_no_store_and_writes_no_key() {
     let home = tempfile::tempdir().unwrap();
@@ -174,7 +174,7 @@ fn a_missing_or_wrong_variable_selects_no_store_and_writes_no_key() {
 
 /// A release build ignores both variables even when they are right (E2), and the installation
 /// file's location as well (ADR-494), so it exits 1 for want of the file. The store selection
-/// itself is covered by `identity/tests.rs`'s `a_release_build_ignores_both_variables`.
+/// itself is covered by `identity/tests.rs`'s `the_release_choice_is_the_platforms_store_and_reads_no_variable`.
 #[cfg(not(debug_assertions))]
 #[test]
 fn a_release_build_has_no_file_store() {
@@ -535,4 +535,104 @@ fn a_missing_variable_exits_with_1_and_a_missing_directory_with_3() {
         .unwrap();
     assert_exit(&output, 3);
     assert!(is_empty_dir(state.path()));
+}
+
+/// `ngr-agent identity` over the Windows DPAPI store (ADR-507) with the state in `state`, and an
+/// installation file for `mode` in `home`.
+#[cfg(all(debug_assertions, windows))]
+fn dpapi_identity(home: &Path, state: &Path, mode: &str) -> Command {
+    let mut command = identity(home, state, mode);
+    command.env(KEY_STORE_VAR, "dpapi");
+    command
+}
+
+/// The key file of `mode` the DPAPI store writes in `state`.
+#[cfg(all(debug_assertions, windows))]
+fn dpapi_file(state: &Path, mode: &str) -> std::path::PathBuf {
+    state
+        .join("identity")
+        .join(format!("nekoguruma-agent-key.{mode}.v1.dpapi"))
+}
+
+/// The restart criterion on DPAPI: the first process creates the key, the next finds the same
+/// one; the file starts with the magic and no plain key file or temporary file is left.
+#[cfg(all(debug_assertions, windows))]
+#[test]
+fn dpapi_second_process_finds_the_key_the_first_created() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let first = printed(
+        &dpapi_identity(home.path(), state.path(), "device")
+            .output()
+            .unwrap(),
+    );
+    let second = printed(
+        &dpapi_identity(home.path(), state.path(), "device")
+            .output()
+            .unwrap(),
+    );
+    assert!(first.created);
+    assert!(!second.created);
+    assert_eq!(first.pem, second.pem);
+    let bytes = std::fs::read(dpapi_file(state.path(), "device")).unwrap();
+    assert_eq!(&bytes[..9], b"NGRDPAPI\x01");
+    let mut names: Vec<String> = std::fs::read_dir(state.path().join("identity"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            "nekoguruma-agent-key.device.v1.dpapi",
+            "nekoguruma-agent-key.device.v1.lock"
+        ]
+    );
+}
+
+/// Processes racing from an empty state on DPAPI all print the same key, and exactly one of them
+/// created it.
+#[cfg(all(debug_assertions, windows))]
+#[test]
+fn dpapi_processes_racing_to_create_make_one_key() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let children: Vec<Child> = (0..8)
+        .map(|_| {
+            dpapi_identity(home.path(), state.path(), "user")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    let all: Vec<Printed> = children
+        .into_iter()
+        .map(|child| printed(&child.wait_with_output().unwrap()))
+        .collect();
+    assert!(all.iter().all(|one| one.pem == all[0].pem));
+    assert_eq!(all.iter().filter(|one| one.created).count(), 1);
+}
+
+/// A changed byte in the blob is exit 4 and the file is left as it is.
+#[cfg(all(debug_assertions, windows))]
+#[test]
+fn dpapi_a_changed_blob_exits_with_4_and_is_not_replaced() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    printed(
+        &dpapi_identity(home.path(), state.path(), "user")
+            .output()
+            .unwrap(),
+    );
+    let file = dpapi_file(state.path(), "user");
+    let mut bytes = std::fs::read(&file).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 1;
+    std::fs::write(&file, &bytes).unwrap();
+    let output = dpapi_identity(home.path(), state.path(), "user")
+        .output()
+        .unwrap();
+    assert_exit(&output, 4);
+    assert_eq!(std::fs::read(&file).unwrap(), bytes);
 }

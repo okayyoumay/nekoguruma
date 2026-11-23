@@ -14,8 +14,11 @@
 //! The store is chosen by build, platform and mode ([`select_store`]): on Linux in the user mode
 //! it is the Secret Service store in [`secret_service`] (ADR-496), which a release build selects
 //! without a variable; in the device mode it is the systemd credential in [`systemd_credential`]
-//! (ADR-498), which a release build selects from `CREDENTIALS_DIRECTORY` alone. A debug build
-//! selects either, or the plain-file test store, by `NGR_AGENT_KEY_STORE`. Windows has none yet.
+//! (ADR-498), which a release build selects from `CREDENTIALS_DIRECTORY` alone; on Windows, in
+//! both modes, it is the DPAPI blob store in [`dpapi`] over [`blob_store`] (ADR-507), which a
+//! release build selects without a variable. A debug build selects any of them, or the plain-file
+//! test store, by `NGR_AGENT_KEY_STORE` (`dpapi` is opt-in there: without a variable a debug build
+//! has no store). Other platforms have none.
 //! A store that cannot create ([`SecretStore::can_create`], the credential store) turns an absent
 //! key into [`IdentityError::NotProvisioned`] at once: `ngr-agent provision-key` ([`provision`])
 //! creates the device key instead.
@@ -25,6 +28,12 @@
 //! `ngr-agent run` and `identify` never touch the store.
 
 pub mod store;
+
+#[cfg(any(windows, test))]
+pub mod blob_store;
+
+#[cfg(windows)]
+pub mod dpapi;
 
 #[cfg(debug_assertions)]
 pub mod file_store;
@@ -59,10 +68,11 @@ pub const LOCK_WAIT: Duration = Duration::from_secs(10);
 /// How often a waiting process tries the lock again (as `guards::LockFile` does).
 const LOCK_POLL: Duration = Duration::from_millis(20);
 
-/// The debug-only variable that selects a store by value: `file` (the plain-file test store) or
-/// `secret-service` (the Linux user-mode store, which a release build selects without it) or
+/// The debug-only variable that selects a store by value: `file` (the plain-file test store),
+/// `secret-service` (the Linux user-mode store, which a release build selects without it),
 /// `systemd-credential` (the Linux device-mode store, which a release build selects from
-/// `CREDENTIALS_DIRECTORY`).
+/// `CREDENTIALS_DIRECTORY`) or `dpapi` (the Windows store, which a release build selects without
+/// it).
 pub const KEY_STORE_VAR: &str = "NGR_AGENT_KEY_STORE";
 
 /// The device key's credential name (`SecretName::agent_key` for the device mode): the unit's
@@ -257,11 +267,51 @@ fn credential_store(
     Err(IdentityError::NoStore(NO_STORE))
 }
 
+/// The Windows store (ADR-507) over the state root `var` resolves, in either mode: the file is
+/// `<root>\identity\<name>.dpapi`. Selecting it does no I/O. Other platforms have no such store.
+#[cfg(windows)]
+fn windows_store(
+    mode: OperatingMode,
+    var: &dyn Fn(&str) -> Option<OsString>,
+) -> Result<Box<dyn SecretStore>, IdentityError> {
+    let root = crate::state::root_from(mode, var)
+        .map_err(|error| local_fault("the state directory", &error))?;
+    Ok(Box::new(dpapi::open(root)))
+}
+
+#[cfg(not(windows))]
+fn windows_store(
+    _mode: OperatingMode,
+    _var: &dyn Fn(&str) -> Option<OsString>,
+) -> Result<Box<dyn SecretStore>, IdentityError> {
+    Err(IdentityError::NoStore("the dpapi store is for Windows"))
+}
+
+/// The store a release build uses: on Windows the DPAPI store in both modes (no variable is
+/// read); on Linux the Secret Service store in user mode and the systemd credential in device
+/// mode (which reads `CREDENTIALS_DIRECTORY` and no `NGR_` variable); elsewhere none (ADR-459
+/// Decision item 4, ADR-496 item 7, ADR-498 item 5, ADR-507). Debug test builds compile it too,
+/// so the choice is tested wherever the tests run.
+#[cfg(any(not(debug_assertions), test))]
+fn release_store(
+    mode: OperatingMode,
+    var: &dyn Fn(&str) -> Option<OsString>,
+) -> Result<Box<dyn SecretStore>, IdentityError> {
+    if cfg!(windows) {
+        return windows_store(mode, var);
+    }
+    match mode {
+        OperatingMode::Device => credential_store(mode, var),
+        _ => user_mode_store(mode).ok_or(IdentityError::NoStore(NO_STORE)),
+    }
+}
+
 /// The store this build uses. A debug build has the plain-file test store when
 /// `NGR_AGENT_KEY_STORE=file` and an absolute `NGR_AGENT_STATE_DIR` are both set (ADR-460
 /// Decision item 6), and the store of the platform when `NGR_AGENT_KEY_STORE` is
-/// `secret-service` (user mode) or `systemd-credential` (device mode); with the variable unset
-/// it has none, as a release build has none for a platform or mode without a store.
+/// `secret-service` (user mode), `systemd-credential` (device mode) or `dpapi` (Windows); with
+/// the variable unset it has none, as a release build has none for a platform or mode without a
+/// store.
 #[cfg(debug_assertions)]
 fn select_store(
     mode: OperatingMode,
@@ -284,24 +334,20 @@ fn select_store(
             IdentityError::NoStore("the secret-service store is for the user mode on Linux"),
         ),
         Some(value) if value == "systemd-credential" => credential_store(mode, var),
+        Some(value) if value == "dpapi" => windows_store(mode, var),
         Some(_) => Err(IdentityError::NoStore(
-            "NGR_AGENT_KEY_STORE must be \"file\", \"secret-service\" or \"systemd-credential\"",
+            "NGR_AGENT_KEY_STORE must be \"file\", \"secret-service\", \"systemd-credential\" or \"dpapi\"",
         )),
     }
 }
 
-/// The store this build uses: on Linux the Secret Service store in user mode and the systemd
-/// credential in device mode (which reads `CREDENTIALS_DIRECTORY` and no `NGR_` variable), or
-/// none (ADR-459 Decision item 4, ADR-496 item 7, ADR-498 item 5).
+/// The store this build uses: [`release_store`].
 #[cfg(not(debug_assertions))]
 fn select_store(
     mode: OperatingMode,
     var: &dyn Fn(&str) -> Option<OsString>,
 ) -> Result<Box<dyn SecretStore>, IdentityError> {
-    match mode {
-        OperatingMode::Device => credential_store(mode, var),
-        _ => user_mode_store(mode).ok_or(IdentityError::NoStore(NO_STORE)),
-    }
+    release_store(mode, var)
 }
 
 /// Reads `name`: `Ok(None)` when the store positively holds nothing.

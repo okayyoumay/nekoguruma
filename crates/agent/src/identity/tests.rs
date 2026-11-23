@@ -517,24 +517,88 @@ fn abs_dir() -> String {
     std::env::temp_dir().to_string_lossy().into_owned()
 }
 
-/// S8: without the debug variables a debug build selects no store. A release build selects the
-/// Secret Service store for the user mode on Linux and none otherwise, with no variable read.
+/// The environment of an account that has a profile: `LOCALAPPDATA` is where the Windows state
+/// root comes from, and nothing else is set.
+fn profile_vars() -> Vec<(&'static str, String)> {
+    vec![("LOCALAPPDATA", abs_dir())]
+}
+
+/// Whether the release build has a store for `mode` with no variable set besides the profile: the
+/// DPAPI store on Windows in both modes, the Secret Service store in the user mode on Linux, and
+/// none otherwise (the Linux device mode needs `CREDENTIALS_DIRECTORY`).
+fn release_has_store(mode: OperatingMode) -> bool {
+    cfg!(windows) || (cfg!(target_os = "linux") && mode == OperatingMode::User)
+}
+
+/// S8: without the debug variables a debug build selects no store, on every platform.
+#[cfg(debug_assertions)]
 #[test]
-fn no_variable_selects_no_store_except_the_user_mode_one_in_a_release_build() {
-    let release_has_one =
-        |mode| !cfg!(debug_assertions) && cfg!(target_os = "linux") && mode == OperatingMode::User;
+fn a_debug_build_selects_no_store_without_a_variable() {
     for mode in [OperatingMode::Device, OperatingMode::User] {
-        let only_dir = vars(vec![(crate::state::STATE_DIR_VAR, abs_dir())]);
-        for var in [
-            &vars(vec![]) as &dyn Fn(&str) -> Option<OsString>,
-            &only_dir,
-        ] {
-            match select_store(mode, var) {
-                Ok(_) => assert!(release_has_one(mode), "{mode}"),
+        let mut with_dir = profile_vars();
+        with_dir.push((crate::state::STATE_DIR_VAR, abs_dir()));
+        for pairs in [vec![], profile_vars(), with_dir] {
+            let error = select_store(mode, &vars(pairs)).err().unwrap();
+            assert_eq!(kind(&error), "NoStore", "{mode}");
+        }
+    }
+}
+
+/// The release choice (`release_store`, tested in every build): the Windows DPAPI store in both
+/// modes, the Secret Service store for the user mode on Linux, and none otherwise, with no `NGR_`
+/// variable read.
+#[test]
+fn the_release_choice_is_the_platforms_store_and_reads_no_variable() {
+    for mode in [OperatingMode::Device, OperatingMode::User] {
+        let mut with_dir = profile_vars();
+        with_dir.push((crate::state::STATE_DIR_VAR, abs_dir()));
+        let mut noisy = profile_vars();
+        noisy.push((KEY_STORE_VAR, "file".into()));
+        noisy.push((crate::state::STATE_DIR_VAR, abs_dir()));
+        let mut wrong = profile_vars();
+        wrong.push((KEY_STORE_VAR, "nonsense".into()));
+        for pairs in [profile_vars(), with_dir, noisy, wrong] {
+            match release_store(mode, &vars(pairs)) {
+                Ok(_) => assert!(release_has_store(mode), "{mode}"),
                 Err(error) => {
-                    assert!(!release_has_one(mode), "{mode}");
+                    assert!(!release_has_store(mode), "{mode}");
                     assert_eq!(kind(&error), "NoStore");
                 }
+            }
+        }
+    }
+}
+
+/// The Windows store needs a state root: with no profile directory (and no override in a debug
+/// build) the release choice on Windows is a local fault, not a store; elsewhere there is nothing
+/// to resolve.
+#[cfg(windows)]
+#[test]
+fn the_windows_store_without_a_profile_is_a_local_fault() {
+    for mode in [OperatingMode::Device, OperatingMode::User] {
+        let error = release_store(mode, &vars(vec![])).err().unwrap();
+        assert_eq!(kind(&error), "LocalFault", "{mode}");
+        assert!(!error.retryable());
+    }
+}
+
+/// The debug value `dpapi` selects the Windows store in both modes (the root comes from the
+/// override when one is set), and on other platforms it is no store; selecting does no I/O.
+#[cfg(debug_assertions)]
+#[test]
+fn the_dpapi_value_selects_the_windows_store_on_windows_only() {
+    for mode in [OperatingMode::Device, OperatingMode::User] {
+        let mut profile = profile_vars();
+        profile.push((KEY_STORE_VAR, "dpapi".into()));
+        let moved = vec![
+            (KEY_STORE_VAR, "dpapi".to_owned()),
+            (crate::state::STATE_DIR_VAR, abs_dir()),
+        ];
+        for pairs in [profile, moved] {
+            let selected = select_store(mode, &vars(pairs));
+            assert_eq!(selected.is_ok(), cfg!(windows), "{mode}");
+            if let Err(error) = selected {
+                assert_eq!(kind(&error), "NoStore");
             }
         }
     }
@@ -610,32 +674,37 @@ fn the_systemd_credential_value_selects_the_device_mode_store_on_linux_only() {
     assert!(select_store(OperatingMode::Device, &user_value).is_err());
 }
 
-/// A13, A15: a release build in the device mode on Linux selects the credential store from
-/// `CREDENTIALS_DIRECTORY` alone and no `NGR_` variable changes that; in the user mode the
-/// variable is not read.
-#[cfg(not(debug_assertions))]
+/// A13, A15: the release choice in the device mode on Linux is the credential store, from
+/// `CREDENTIALS_DIRECTORY` alone, and no `NGR_` variable changes that; in the user mode the
+/// variable is not read. On Windows both modes have the DPAPI store whatever the variable says.
 #[test]
-fn a_release_build_selects_the_credential_store_in_the_device_mode_from_one_variable() {
-    let dir = vars(vec![(
-        CREDENTIALS_DIRECTORY_VAR,
-        DEVICE_CREDENTIAL_DIR.into(),
-    )]);
-    let noisy = vars(vec![
-        (CREDENTIALS_DIRECTORY_VAR, DEVICE_CREDENTIAL_DIR.into()),
+fn the_release_choice_selects_the_credential_store_in_the_device_mode_from_one_variable() {
+    let with = |extra: Vec<(&'static str, String)>| {
+        let mut pairs = profile_vars();
+        pairs.push((CREDENTIALS_DIRECTORY_VAR, DEVICE_CREDENTIAL_DIR.into()));
+        pairs.extend(extra);
+        vars(pairs)
+    };
+    let dir = with(vec![]);
+    let noisy = with(vec![
         (KEY_STORE_VAR, "file".into()),
         (crate::state::STATE_DIR_VAR, abs_dir()),
     ]);
+    let has_device_store = cfg!(target_os = "linux") || cfg!(windows);
     for var in [&dir as &dyn Fn(&str) -> Option<OsString>, &noisy] {
         assert_eq!(
-            select_store(OperatingMode::Device, var).is_ok(),
-            cfg!(target_os = "linux")
+            release_store(OperatingMode::Device, var).is_ok(),
+            has_device_store
         );
     }
-    assert!(select_store(OperatingMode::Device, &vars(vec![])).is_err());
-    // The user mode on Linux has the Secret Service store whatever the credential variable says.
+    // Without the directory the Linux device mode has none; Windows does not read it.
     assert_eq!(
-        select_store(OperatingMode::User, &dir).is_ok(),
-        cfg!(target_os = "linux")
+        release_store(OperatingMode::Device, &vars(profile_vars())).is_ok(),
+        cfg!(windows)
+    );
+    assert_eq!(
+        release_store(OperatingMode::User, &dir).is_ok(),
+        release_has_store(OperatingMode::User)
     );
 }
 
@@ -683,28 +752,6 @@ fn the_file_store_needs_both_variables() {
         (crate::state::STATE_DIR_VAR, abs_dir()),
     ]);
     assert!(select_store(OperatingMode::User, &good).is_ok());
-}
-
-/// E2: a release build reads neither variable: the same store with and without them, whatever
-/// they say.
-#[cfg(not(debug_assertions))]
-#[test]
-fn a_release_build_ignores_both_variables() {
-    let both = vars(vec![
-        (KEY_STORE_VAR, "file".into()),
-        (crate::state::STATE_DIR_VAR, abs_dir()),
-    ]);
-    let wrong = vars(vec![(KEY_STORE_VAR, "nonsense".into())]);
-    for mode in [OperatingMode::Device, OperatingMode::User] {
-        let none = vars(vec![]);
-        for var in [&both as &dyn Fn(&str) -> Option<OsString>, &wrong] {
-            assert_eq!(
-                select_store(mode, var).is_ok(),
-                select_store(mode, &none).is_ok(),
-                "{mode}"
-            );
-        }
-    }
 }
 
 /// S6 through the file store: a crash left a temporary file; the create succeeds and removes it.

@@ -83,7 +83,8 @@ pub fn state_root(mode: OperatingMode) -> Result<PathBuf, StateDirError> {
     root_from(mode, &|name| std::env::var_os(name))
 }
 
-fn root_from(
+/// [`state_root`] for the environment `var` reads.
+pub(crate) fn root_from(
     mode: OperatingMode,
     var: &dyn Fn(&str) -> Option<OsString>,
 ) -> Result<PathBuf, StateDirError> {

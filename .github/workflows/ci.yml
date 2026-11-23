@@ -183,6 +183,14 @@ jobs:
       - if: github.event_name == 'pull_request'
         shell: bash
         run: cargo nextest run -p j2534-0404-service --locked --profile ci-windows --test agent_restart_end_to_end
+      # The agent's Windows device-mode key as a service account (ADR-507): the runs above skip
+      # this test, which needs `NGR_TEST_WINDOWS_SERVICE_ACCOUNT=1` and an elevated account (the
+      # runner's). It creates a service under `NT SERVICE\<name>`, runs the agent through it twice
+      # and prints what it found; `--success-output immediate` keeps that output when it passes.
+      # It runs on pull requests too. `--no-tests=fail` makes a filter that matches nothing an error.
+      - name: Windows service account test
+        shell: bash
+        run: NGR_TEST_WINDOWS_SERVICE_ACCOUNT=1 cargo nextest run -p agent --locked --profile ci-windows-parallel --no-tests=fail --success-output immediate -E 'binary(windows_service_account)'
       # sim-vci is a cdylib only, which cargo runs no doc tests for.
       - shell: bash
         run: cargo test --workspace --locked --exclude sim-vci $EXCLUDE --doc

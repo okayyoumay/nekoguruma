@@ -192,9 +192,36 @@ fn the_device_key_is_created_once_and_found_again_as_a_service_account() {
         ],
     );
     assert_eq!(code, Some(0), "sc create: {text}");
-    let grant = format!("{account}:(OI)(CI)F");
-    let (code, text) = run("icacls.exe", &[&dir.to_string_lossy(), "/grant", &grant]);
-    assert_eq!(code, Some(0), "icacls: {text}");
+    // The debug agent checks its installation file (design 7.2): only SYSTEM, Administrators,
+    // TrustedInstaller and the service account itself may own or write it. The directory inherits
+    // the drive root's ACL, which gives other accounts write access, so replace it instead of
+    // adding to it. The test runs elevated, so it keeps full control as an administrator.
+    let dir_text = dir.to_string_lossy().into_owned();
+    let service_grant = format!("{account}:(OI)(CI)F");
+    let (code, text) = run(
+        "icacls.exe",
+        &[
+            &dir_text,
+            "/inheritance:r",
+            "/grant:r",
+            "*S-1-5-18:(OI)(CI)F",
+            "*S-1-5-32-544:(OI)(CI)F",
+            &service_grant,
+        ],
+    );
+    assert_eq!(code, Some(0), "icacls grant: {text}");
+    let (code, text) = run(
+        "icacls.exe",
+        &[&dir_text, "/setowner", "*S-1-5-32-544", "/T"],
+    );
+    assert_eq!(code, Some(0), "icacls setowner: {text}");
+    for target in [
+        dir_text.clone(),
+        dir.join("agent.toml").to_string_lossy().into_owned(),
+    ] {
+        let (_, acl) = run("icacls.exe", &[&target]);
+        println!("--- icacls {target}\n{}", acl.trim());
+    }
 
     let first = start_and_collect(&service, &dir);
     first.print("first run");

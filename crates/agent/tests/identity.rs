@@ -142,7 +142,7 @@ fn without_a_store_the_exit_is_1_and_nothing_is_written() {
 /// not either when a variable is missing or wrong (E3). The invariant is the same: the override
 /// directory stays empty. In a release build the command now stops at the missing installation
 /// file; that build's store selection is covered by `identity/tests.rs`'s
-/// `the_release_choice_is_the_platforms_store_and_reads_no_variable`.
+/// `the_release_choice_is_the_platforms_store_whatever_the_key_store_variable_holds`.
 #[test]
 fn a_missing_or_wrong_variable_selects_no_store_and_writes_no_key() {
     let home = tempfile::tempdir().unwrap();
@@ -174,7 +174,7 @@ fn a_missing_or_wrong_variable_selects_no_store_and_writes_no_key() {
 
 /// A release build ignores both variables even when they are right (E2), and the installation
 /// file's location as well (ADR-494), so it exits 1 for want of the file. The store selection
-/// itself is covered by `identity/tests.rs`'s `the_release_choice_is_the_platforms_store_and_reads_no_variable`.
+/// itself is covered by `identity/tests.rs`'s `the_release_choice_is_the_platforms_store_whatever_the_key_store_variable_holds`.
 #[cfg(not(debug_assertions))]
 #[test]
 fn a_release_build_has_no_file_store() {

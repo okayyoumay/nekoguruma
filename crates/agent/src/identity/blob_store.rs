@@ -179,6 +179,9 @@ impl<P: Protect, F: ProfileProbe> SecretStore for BlobStore<P, F> {
             })
     }
 
+    /// Creates the key file without replacing one. Callers hold the creation lock
+    /// (`<root>\identity\<name>.lock`): unlocked creators share one temporary name, so one could
+    /// link a file another is still writing.
     fn put_new(&self, name: &SecretName, secret: &[u8]) -> Result<(), StoreError> {
         self.require_persistent_profile()?;
         let blob = self

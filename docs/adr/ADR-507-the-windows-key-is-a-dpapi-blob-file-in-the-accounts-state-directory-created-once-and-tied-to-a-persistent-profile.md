@@ -99,8 +99,11 @@ The maintainer approved the choices below on 2026-11-23.
   rests on `GetProfileType` and the injected-flag tests.
 - Hard links are required of the state directory's file system.
 - The creators that race outside the lock share one temporary name, so a creator may link a file
-  another is still filling and be told "created" for a secret that is not its own;
-  `load_or_create` hands out what the store holds and so is not affected, and it holds the lock.
+  another is still filling and be told "created" for a secret that is not its own. What protects
+  `load_or_create` is its creation lock (`<root>\identity\<name>.lock`), not its read-back: without
+  the lock it could read a half-written file back and fail as undecryptable (exit 4). Every
+  caller of the store's create step therefore holds that lock, and so must any other user of the
+  format.
 - A device-mode command run from another account's shell (an administrator's) makes an
   unrelated key in that account's profile, which the service never reads.
 - The agent's logger makes the state root and its log directory (with any missing parent)

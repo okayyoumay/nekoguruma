@@ -545,10 +545,12 @@ fn a_debug_build_selects_no_store_without_a_variable() {
 }
 
 /// The release choice (`release_store`, tested in every build): the Windows DPAPI store in both
-/// modes, the Secret Service store for the user mode on Linux, and none otherwise, with no `NGR_`
-/// variable read.
+/// modes, the Secret Service store for the user mode on Linux, and none otherwise, whatever
+/// `NGR_AGENT_KEY_STORE` holds.
+// That the release build ignores `NGR_AGENT_STATE_DIR` rests on the cfg in `state.rs`; a debug
+// test build honours it, so this test does not check it.
 #[test]
-fn the_release_choice_is_the_platforms_store_and_reads_no_variable() {
+fn the_release_choice_is_the_platforms_store_whatever_the_key_store_variable_holds() {
     for mode in [OperatingMode::Device, OperatingMode::User] {
         let mut with_dir = profile_vars();
         with_dir.push((crate::state::STATE_DIR_VAR, abs_dir()));

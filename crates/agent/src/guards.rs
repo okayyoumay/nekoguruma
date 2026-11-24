@@ -167,6 +167,28 @@ impl JobGuards {
         })
     }
 
+    /// One attempt to take what [`JobGuards::take`] takes, without waiting and without a cancel
+    /// flag: `None` when the per-VCI lock or the reprogramming slot is held by another handle (a
+    /// lock this attempt took is released before it returns). Validates the VCI name and creates
+    /// the lock directory as `take` does; the answer is that of one `try_lock` per lock, so it
+    /// does not depend on how long the preparation took.
+    pub fn try_take(setup: &GuardSetup) -> Result<Option<Self>, GuardError> {
+        Self::prepare(setup)?;
+        let Some(vci) = LockFile::try_take(&vci_path(&setup.dir, &setup.vci))? else {
+            return Ok(None);
+        };
+        let Some(slot) = LockFile::try_take(&setup.dir.join("reprogramming.lock"))? else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            _vci: vci,
+            _slot: Some(slot),
+            dir: setup.dir.clone(),
+            _vehicle: None,
+            link_unconfirmed: false,
+        }))
+    }
+
     /// Takes only the per-VCI lock of `setup.vci`, for a job that does not reprogram. Waits and
     /// validates like [`JobGuards::take`].
     pub fn take_vci_only(
@@ -265,15 +287,20 @@ impl JobGuards {
         self.link_unconfirmed = false;
     }
 
+    /// Validates the VCI name and creates the lock directory if needed.
+    fn prepare(setup: &GuardSetup) -> Result<(), GuardError> {
+        if setup.vci.is_empty() || setup.vci.len() > MAX_VCI_NAME {
+            return Err(GuardError::InvalidVci(setup.vci.clone()));
+        }
+        prepare_dir(&setup.dir)
+    }
+
     fn take_vci(
         setup: &GuardSetup,
         poll: Duration,
         cancelled: &AtomicBool,
     ) -> Result<LockFile, GuardError> {
-        if setup.vci.is_empty() || setup.vci.len() > MAX_VCI_NAME {
-            return Err(GuardError::InvalidVci(setup.vci.clone()));
-        }
-        prepare_dir(&setup.dir)?;
+        Self::prepare(setup)?;
         LockFile::wait(&vci_path(&setup.dir, &setup.vci), poll, cancelled)
     }
 }
@@ -339,12 +366,27 @@ impl LockFile {
             if cancelled.load(Ordering::Relaxed) {
                 return Err(GuardError::Cancelled);
             }
-            match file.try_lock() {
-                Ok(()) => return Ok(Self(Some(file))),
-                Err(fs::TryLockError::WouldBlock) => std::thread::sleep(poll),
-                Err(fs::TryLockError::Error(error)) => return Err(error.into()),
+            if Self::attempt(&file)? {
+                return Ok(Self(Some(file)));
             }
+            std::thread::sleep(poll);
         }
+    }
+
+    /// One `try_lock` of `file`: whether this process now holds the lock.
+    fn attempt(file: &File) -> Result<bool, GuardError> {
+        match file.try_lock() {
+            Ok(()) => Ok(true),
+            Err(fs::TryLockError::WouldBlock) => Ok(false),
+            Err(fs::TryLockError::Error(error)) => Err(error.into()),
+        }
+    }
+
+    /// Opens `path` (creating it if missing) and makes one attempt to lock it: `None` when
+    /// another handle holds the lock.
+    fn try_take(path: &Path) -> Result<Option<Self>, GuardError> {
+        let file = Self::open(path)?;
+        Ok(Self::attempt(&file)?.then(|| Self(Some(file))))
     }
 }
 
@@ -629,6 +671,46 @@ mod tests {
     }
 
     /// The slot is per device: a job on another VCI waits for it too.
+    #[test]
+    fn a_single_attempt_takes_free_guards_and_reports_held_ones_without_keeping_any() {
+        let dir = dir("try-take");
+        let free = JobGuards::try_take(&setup(&dir, "VCI-1")).expect("no error");
+        let free = free.expect("free locks are taken");
+        assert!(free.holds_slot());
+        // While they are held, another attempt finds them held.
+        assert!(
+            JobGuards::try_take(&setup(&dir, "VCI-1"))
+                .unwrap()
+                .is_none()
+        );
+        drop(free);
+        assert!(
+            JobGuards::try_take(&setup(&dir, "VCI-1"))
+                .unwrap()
+                .is_some()
+        );
+        // Only the slot is held (by a job on another VCI): the attempt takes the VCI lock,
+        // finds the slot held and leaves nothing held.
+        let other = JobGuards::take(&setup(&dir, "VCI-2"), POLL, &AtomicBool::new(false))
+            .expect("the other job");
+        assert!(
+            JobGuards::try_take(&setup(&dir, "VCI-1"))
+                .unwrap()
+                .is_none()
+        );
+        let vci1 = File::options()
+            .write(true)
+            .open(vci_path(&dir, "VCI-1"))
+            .unwrap();
+        vci1.try_lock().expect("VCI-1's lock was let go again");
+        drop((vci1, other));
+        assert!(matches!(
+            JobGuards::try_take(&setup(&dir, "")),
+            Err(GuardError::InvalidVci(_))
+        ));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn the_reprogramming_slot_is_one_per_device() {
         let dir = dir("slot");

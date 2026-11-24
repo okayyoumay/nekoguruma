@@ -59,7 +59,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use agent::guards::{GuardError, GuardSetup, JobGuards};
+use agent::guards::{GuardSetup, JobGuards};
 use agent::inputs::ServiceSources;
 use agent::journal::{JobKey, Journal, JournalState, Vin};
 use agent::{
@@ -653,23 +653,15 @@ impl Env {
         })
     }
 
-    /// Whether the scenario's guards are held by someone else: a `JobGuards::take` on its lock
-    /// directory is still waiting when it is cancelled a while later. The cancel is set late,
-    /// since the take checks it before its first attempt.
+    /// Whether the scenario's guards are held by someone else: one attempt to take them
+    /// (`JobGuards::try_take`) finds a lock held. The answer is that of the attempt's own
+    /// `try_lock`s, not of a time: a caller asks for "held" while a live `JobGuards` of this
+    /// process holds them, and for "free" after the holder was dropped, which closes its lock
+    /// files before the call.
     pub fn guards_are_held(&self) -> bool {
-        let cancelled = std::sync::Arc::new(AtomicBool::new(false));
-        let canceller = {
-            let cancelled = cancelled.clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(200));
-                cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
-            })
-        };
-        let taken = JobGuards::take(&self.guard_setup(), Duration::from_millis(10), &cancelled);
-        canceller.join().expect("the canceller should not panic");
-        match taken {
-            Err(GuardError::Cancelled) => true,
-            Ok(_) => false,
+        match JobGuards::try_take(&self.guard_setup()) {
+            Ok(Some(_free)) => false,
+            Ok(None) => true,
             Err(other) => panic!("taking the guards failed: {other}"),
         }
     }

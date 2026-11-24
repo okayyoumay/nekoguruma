@@ -373,6 +373,9 @@ pub struct Server {
     job_queue: Option<job_queue::Settings>,
     /// The job expiry task's settings; `None` leaves it off (`bind`, which tests use).
     job_expiry: Option<job_expiry::Settings>,
+    /// The data channel's backend, which the router was built from: the completion pass takes its
+    /// store, period and registry.
+    uploads: uploads::Backend,
 }
 
 impl std::fmt::Debug for Server {
@@ -554,7 +557,7 @@ impl Server {
                 hub: hub.clone(),
                 operator_sessions: operator_sessions.clone(),
                 hasher: hasher.clone(),
-                uploads,
+                uploads: uploads.clone(),
             }),
             pool,
             sessions,
@@ -566,6 +569,7 @@ impl Server {
             object_server: None,
             job_queue: None,
             job_expiry: None,
+            uploads,
         })
     }
 
@@ -646,6 +650,7 @@ impl Server {
             mut object_server,
             job_queue,
             job_expiry,
+            uploads,
         } = self;
         // The revocation pass is one of the hub's tasks, so that the stop ends it before the pool
         // closes (ADR-468 item 11).
@@ -656,6 +661,16 @@ impl Server {
                 async move { db::live_agents(&pool, &ids).await }
             }
         }));
+        // The completion pass is another: it finishes the uploads that no request repeats
+        // (ADR-493 item 23), through the registry the routes use, and has nothing to do without
+        // a store.
+        if uploads.shared_store().is_some() {
+            hub.adopt(uploads::run_completion_pass(
+                pool.clone(),
+                hub.clone(),
+                uploads,
+            ));
+        }
         // The delivery queue is another of them, and the only consumer of the hub's inbox
         // (ADR-476).
         if let Some(settings) = job_queue {

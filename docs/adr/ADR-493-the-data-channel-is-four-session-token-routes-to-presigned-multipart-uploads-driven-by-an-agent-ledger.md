@@ -1,7 +1,7 @@
 # ADR-493: The Data Channel Is Four Session-Token Routes to Presigned Multipart Uploads, Driven by the Agent's Upload Ledger
 
 **Date:** 2026-11-19
-**Status:** Accepted (items 15 to 18 added with the begin, part URL and status routes; item 6's mapping corrected and items 19 to 23 added with the complete route; item 17 extended by item 23; item 11's record of delivery corrected and items 24 to 28 added with the upload ledger; items 6 and 17 amended and item 11 extended by ADR-495; a download route added by ADR-497; item 10's ending of either task detailed by ADR-499; their routes' answers are proved, ADR-504; item 13's scheme is `https` and the part-URL answer carries the certificate pin, ADR-505)
+**Status:** Accepted (items 15 to 18 added with the begin, part URL and status routes; item 6's mapping corrected and items 19 to 23 added with the complete route; item 17 extended by item 23; item 11's record of delivery corrected and items 24 to 28 added with the upload ledger; items 6 and 17 amended and item 11 extended by ADR-495; a download route added by ADR-497; item 10's ending of either task detailed by ADR-499; their routes' answers are proved, ADR-504; item 13's scheme is `https` and the part-URL answer carries the certificate pin, ADR-505; item 22 revised by item 29 with the completion pass)
 **Affects:** design 5.2, 5.4, 13, 13.3, 14.3, 14.4; `crates/server` (the upload routes, a migration for `job_objects`, `db/README.md`), `crates/agent` (the uploader, the ledger, `connect`, a debug-only enqueue command), `crates/shared-proto` if the route bodies are shared, `api/openapi.yaml` (the four operations, marked planned until served), `docs/glossary.md`; uses ADR-492's `MultipartStore` and ADR-466's session token; fixes the acknowledgement ADR-455 left
 
 ## Context
@@ -229,7 +229,8 @@ proposed. It is a specification: none of it is implemented when this record is w
     closes the channel, and the waiters answer 503: the row is as the task left it.
 22. **A task the stop ended is resumed by the next request, not at start.** The row stays
     `completing`, which the next completion request verifies (item 6). No sweep runs at start
-    or periodically, so a `completing` row that no request repeats stays so.
+    or periodically, so a `completing` row that no request repeats stays so. (Revised by item
+    29: a periodic pass resumes such a row.)
 23. **A status that finds the upload gone reads the row once more.** `list_parts` answering
     `NotFound` or `AlreadyFinished` for an `open` row is the sign of a completion that moved the
     row on between the status's read and its listing. The status re-reads the row once: a row
@@ -277,6 +278,31 @@ most 1 MiB (the journal's frame bound), and a run's final state can be larger.
     object. A result or log over its bound is refused as too large, and an enqueue that would
     pass the file's or the results' total bound is refused as full; nothing is dropped to make
     room.
+
+### Decisions taken with the completion pass
+
+Item 22 left a `completing` row that no request repeats as it was: the agent that completed it
+may have gone, or have given up, and the row then holds its job's slot for good.
+
+29. **A periodic pass of the hub's tasks takes the `completing` rows that no request repeats.**
+    One pass runs as the server starts and then every 60 seconds (a constant, with a test-only
+    override); a tick that is missed gives one pass, not a burst. It runs only when the server
+    has an object store. A pass reads, in one short read-only transaction, the 100 oldest
+    `completing` rows of all tenants, by `created_at`, and then takes them one at a time: it
+    starts the completion of item 20 for the row, or joins the one that runs, through the same
+    registry the routes use (so a pass and a request for one upload run one store completion),
+    and waits for its outcome. The outcomes are item 19's: `finished`, `failed` (which frees
+    the job's slot for a new begin), `open` when the parts have a problem, and a row that stays
+    `completing` on a store or database error until the next pass. There is no grace period: a
+    `completing` row whose task is not in this process is taken at once, since the registry
+    stops a second task here, and across processes the compare-and-set and the store's repeat
+    safety keep the row and the object right (item 20); a row a request is completing in
+    another process costs one extra, harmless store call. A row whose upload ID, key or digest
+    does not parse is skipped and left as it is, with a warning that names nothing; the pass
+    writes nothing for it. A failed read warns with the SQLSTATE only and writes nothing; the
+    next pass retries. The stop ends the pass in its wait and in its work, as it ends the
+    revocation pass (ADR-468 item 11), and a task that ends without an outcome (the stop, a
+    panic) ends the pass's round.
 
 ## Consequences
 

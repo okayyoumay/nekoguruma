@@ -960,7 +960,7 @@ paths:
         is `completing` once the task began (a failed compare-and-set leaves it `open`), and
         the agent repeats the request. **500** is a stored value that does not parse, a store
         without randomness or a database error that is a fault of the server. A stop of the server ends the task and leaves the row `completing`; the next
-        request resumes it.
+        request, or the server's own pass over `completing` rows, resumes it.
 
         The shape step ends with the proof's request: when the request carries `Ngr-Nonce`
         (ADR-504), the nonce and the request target are judged after the route's own shape

@@ -20,12 +20,14 @@
 //! Every database call is a short transaction of its own, and none is open while the object store
 //! is called. The writers of `job_objects` are this module's INSERT (state `open`) and the
 //! completion task's updates (`open` to `completing`, then one conditional write of the state the
-//! store's answer decides, ADR-493 items 6 and 19 to 21); the request handlers of the other
-//! routes only read.
+//! store's answer decides, ADR-493 items 6 and 19 to 21), whether a request or the completion
+//! pass started the task; the request handlers of the other routes only read.
 //!
 //! The completion of an upload is one task per upload in this process (`Uploads::completion`),
 //! adopted by the hub so that the stop ends it, which outlives the request that started it: the
-//! requests only wait for its outcome (ADR-493 items 20 and 21).
+//! requests only wait for its outcome (ADR-493 items 20 and 21). The completion pass
+//! ([`run_completion_pass`]) starts the same task for the `completing` rows that no request
+//! repeats, through the same registry (ADR-493 item 23).
 //!
 //! Never logged: a token, a body, a digest, an object key, an upload ID, a URL or the text of a
 //! database error (the SQLSTATE only).
@@ -78,6 +80,10 @@ pub const MAX_SIZE: u64 = 4 * 1024 * 1024 * 1024;
 pub const PART_BYTES: u64 = 5 * 1024 * 1024;
 /// How long a completion request waits for the task before it answers 202 (ADR-493 item 21).
 pub const COMPLETE_WAIT: Duration = Duration::from_secs(20);
+/// The time between two completion passes; the first runs at the start (ADR-493 item 23).
+pub const PASS_PERIOD: Duration = Duration::from_secs(60);
+/// The most `completing` rows one completion pass takes.
+const PASS_BATCH: i64 = 100;
 /// A failure is logged at most this often.
 const LOG_EVERY: Duration = Duration::from_secs(60);
 
@@ -115,6 +121,10 @@ pub struct Backend {
     /// The time budget of a document store's body (ADR-500).
     document_body_timeout: Duration,
     pause: Arc<Mutex<Option<Arc<Pause>>>>,
+    pass_period: Duration,
+    /// The completion tasks of this process, shared by the routes' state and the completion pass
+    /// so that a request and the pass for one upload join one task (ADR-493 item 20).
+    completions: Registry,
 }
 
 /// A request held between its read of the row and the start of its completion, until a test lets
@@ -154,6 +164,8 @@ impl Backend {
             complete_wait: COMPLETE_WAIT,
             document_body_timeout: crate::documents::BODY_TIMEOUT,
             pause: Arc::new(Mutex::new(None)),
+            pass_period: PASS_PERIOD,
+            completions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -187,6 +199,14 @@ impl Backend {
     #[doc(hidden)]
     pub fn with_complete_wait(mut self, wait: Duration) -> Backend {
         self.complete_wait = wait;
+        self
+    }
+
+    /// Another time between two completion passes, so that a test sees a later pass without
+    /// waiting [`PASS_PERIOD`]. Tests only.
+    #[doc(hidden)]
+    pub fn with_completion_pass_period(mut self, period: Duration) -> Backend {
+        self.pass_period = period;
         self
     }
 
@@ -370,12 +390,10 @@ pub struct Uploads {
     pool: PgPool,
     sessions: Sessions,
     backend: Backend,
-    hub: Hub,
     prover: Arc<Prover>,
     gate: Arc<Mutex<Option<Instant>>>,
     download_gates: Arc<DownloadGates>,
-    /// The completion tasks of this process, by tenant and upload (ADR-493 item 20).
-    completions: Registry,
+    completer: Completer,
 }
 
 impl std::fmt::Debug for Uploads {
@@ -392,15 +410,15 @@ impl Uploads {
         hub: Hub,
         prover: Arc<Prover>,
     ) -> Uploads {
+        let completer = Completer::new(pool.clone(), hub, Arc::clone(&backend.completions));
         Uploads {
             pool,
             sessions,
             backend,
-            hub,
             prover,
             gate: Arc::new(Mutex::new(None)),
             download_gates: Arc::default(),
-            completions: Arc::new(Mutex::new(HashMap::new())),
+            completer,
         }
     }
 
@@ -435,6 +453,41 @@ impl Uploads {
     /// The object store of the backend, if the server has one.
     pub(crate) fn store(&self) -> Option<&dyn MultipartStore> {
         self.backend.store.as_deref()
+    }
+}
+
+/// The part of the routes' state that runs completions: the completion route's requests and the
+/// completion pass each hold one, and they share the registry (the backend's), so that one upload
+/// has one task in this process whoever asks (ADR-493 item 20).
+#[derive(Clone)]
+struct Completer {
+    pool: PgPool,
+    hub: Hub,
+    /// The completion tasks of this process, by tenant and upload.
+    completions: Registry,
+    gate: Arc<Mutex<Option<Instant>>>,
+}
+
+impl Completer {
+    fn new(pool: PgPool, hub: Hub, completions: Registry) -> Completer {
+        Completer {
+            pool,
+            hub,
+            completions,
+            gate: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn warn(&self, what: &str, why: &str) {
+        if may_log(&self.gate, now(), LOG_EVERY) {
+            tracing::warn!(why, "upload completion: {what}");
+        }
+    }
+
+    fn db_failure_outcome(&self, error: &sqlx::Error) -> Outcome {
+        let (outcome, what, why) = classify_db_failure(error);
+        self.warn(what, &why);
+        outcome
     }
 
     /// The outcome of the completion of upload `id`, which a task of this process runs: the
@@ -471,7 +524,7 @@ impl Uploads {
             let registered = registered;
             tokio::select! {
                 // The stop ends the task at once; the row stays as it is and the next request
-                // resumes (ADR-493 item 22).
+                // or pass resumes (ADR-493 items 22 and 23).
                 _ = async { let _ = stopping.wait_for(|stop| *stop).await; } => {}
                 outcome = u.run_completion(&tenant, &id, store.as_ref(), &job) => {
                     // The entry goes before the outcome is published, so a request that
@@ -494,7 +547,7 @@ impl Uploads {
         job: &CompletionJob,
     ) -> Outcome {
         match transition(&self.pool, tenant, id, "open", "completing").await {
-            Err(error) => return db_failure_outcome(self, &error),
+            Err(error) => return self.db_failure_outcome(&error),
             Ok(true) => {}
             // Another task (or an earlier request) moved the row on: a `completing` row is
             // verified, any other state is the answer.
@@ -519,7 +572,7 @@ impl Uploads {
             return outcome;
         };
         match transition(&self.pool, tenant, id, "completing", to).await {
-            Err(error) => db_failure_outcome(self, &error),
+            Err(error) => self.db_failure_outcome(&error),
             Ok(true) => outcome,
             // The row left `completing` meanwhile: the state it is in is the answer.
             Ok(false) => match self.state_outcome(tenant, id).await {
@@ -533,7 +586,7 @@ impl Uploads {
     /// The outcome a row's current state answers: `Ok(None)` for `completing`.
     async fn state_outcome(&self, tenant: &str, id: &str) -> Result<Option<Outcome>, Outcome> {
         match row_state(&self.pool, tenant, id).await {
-            Err(error) => Err(db_failure_outcome(self, &error)),
+            Err(error) => Err(self.db_failure_outcome(&error)),
             Ok(None) => {
                 self.warn("an upload's row is gone", "");
                 Err(Outcome::Internal)
@@ -541,6 +594,85 @@ impl Uploads {
             Ok(Some(state)) => Ok(Outcome::of_state(&state)),
         }
     }
+
+    /// One completion pass: the oldest `completing` rows of every tenant, each completed in turn
+    /// by the same task a request would start (or joined to the one that runs). A row whose
+    /// stored values do not parse is skipped and stays `completing`. A task that ends without an
+    /// outcome (the stop, a panic) ends the pass; the next one resumes.
+    async fn pass(&self, store: &Arc<dyn MultipartStore>) {
+        let rows = match completing_rows(&self.pool).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                // The SQLSTATE only: the outcome of the classification is not needed.
+                let (_, _, why) = classify_db_failure(&error);
+                self.warn("the completion pass could not read the uploads", &why);
+                return;
+            }
+        };
+        for (tenant, row) in rows {
+            let Some(row) = row else {
+                self.warn("a stored upload does not parse", "");
+                continue;
+            };
+            let Some(job) = row.completion_job() else {
+                self.warn("a stored upload does not parse", "");
+                continue;
+            };
+            let mut outcome = self.completion(&tenant, &row.id, Arc::clone(store), job);
+            if outcome.wait_for(|outcome| outcome.is_some()).await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+/// Runs the completion pass until the stop: one pass at the start, then one every
+/// [`PASS_PERIOD`] (the backend's), which takes the `completing` rows that no request repeats
+/// (ADR-493 item 23). It ends at once when the backend has no store, and when the stop begins, in
+/// its wait and in its work alike, since `Server::run` waits for the hub's task set to empty.
+pub(crate) async fn run_completion_pass(pool: PgPool, hub: Hub, backend: Backend) {
+    let Some(store) = backend.shared_store() else {
+        return;
+    };
+    let completer = Completer::new(pool, hub.clone(), Arc::clone(&backend.completions));
+    let mut stopping = hub.stopping();
+    // A tick missed because the pass was slow gives one pass, not a burst.
+    let mut ticks = tokio::time::interval(backend.pass_period);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = async { let _ = stopping.wait_for(|stop| *stop).await; } => return,
+            _ = ticks.tick() => {}
+        }
+        tokio::select! {
+            _ = async { let _ = stopping.wait_for(|stop| *stop).await; } => return,
+            () = completer.pass(&store) => {}
+        }
+    }
+}
+
+/// The `completing` rows of every tenant, oldest first, at most [`PASS_BATCH`], in one short read.
+/// The row is `None` when its stored numbers do not fit.
+async fn completing_rows(pool: &PgPool) -> Result<Vec<(String, Option<Row>)>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    db::statement_timeouts(&mut tx).await?;
+    let raw: Vec<TenantRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT tenant_id::text, {ROW_COLUMNS} FROM job_objects WHERE state = 'completing' \
+         ORDER BY created_at, id LIMIT {PASS_BATCH}"
+    )))
+    .fetch_all(&mut *tx)
+    .await?;
+    Ok(raw
+        .into_iter()
+        .map(
+            |(tenant, id, agent, key, upload, part, size, digest, state)| {
+                (
+                    tenant,
+                    Row::from_raw((id, agent, key, upload, part, size, digest, state)),
+                )
+            },
+        )
+        .collect())
 }
 
 /// What the completion task needs of the row.
@@ -581,15 +713,18 @@ fn db_failure(u: &Uploads, error: &sqlx::Error) -> Response {
 }
 
 fn db_failure_outcome(u: &Uploads, error: &sqlx::Error) -> Outcome {
+    let (outcome, what, why) = classify_db_failure(error);
+    u.warn(what, &why);
+    outcome
+}
+
+/// The outcome of a failed statement, with what to warn and why (the SQLSTATE at most).
+fn classify_db_failure(error: &sqlx::Error) -> (Outcome, &'static str, String) {
     match db::failure(error) {
         db::Failure::Unavailable(why) => {
-            u.warn("the database is unavailable", &why);
-            Outcome::DbUnavailable
+            (Outcome::DbUnavailable, "the database is unavailable", why)
         }
-        db::Failure::Internal(why) => {
-            u.warn("a statement failed", &why);
-            Outcome::Internal
-        }
+        db::Failure::Internal(why) => (Outcome::Internal, "a statement failed", why),
     }
 }
 
@@ -640,6 +775,18 @@ struct Row {
 }
 
 type RawRow = (String, String, String, String, i64, i64, String, String);
+/// A [`RawRow`] with its tenant in front.
+type TenantRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    i64,
+    String,
+    String,
+);
 
 const ROW_COLUMNS: &str =
     "id::text, agent_id::text, storage_key, upload_id, part_bytes, size_bytes, digest, state";
@@ -672,6 +819,16 @@ impl Row {
                 "state": self.state,
             }),
         )
+    }
+
+    /// What the completion task needs of the row; `None` when the stored digest or the store's
+    /// handle does not parse, which is the server's fault.
+    fn completion_job(&self) -> Option<CompletionJob> {
+        Some(CompletionJob {
+            upload: self.upload()?,
+            sha256: parse_sha256(&self.digest)?,
+            size: self.size_bytes,
+        })
     }
 
     /// The row's store handle. A row that does not parse is the server's fault.
@@ -1506,13 +1663,8 @@ async fn complete_answer(
     let Some(store) = u.backend.store.clone() else {
         return no_store();
     };
-    let (Some(upload), Some(sha256)) = (row.upload(), parse_sha256(&row.digest)) else {
+    let Some(job) = row.completion_job() else {
         return unparsable(u);
-    };
-    let job = CompletionJob {
-        upload,
-        sha256,
-        size: row.size_bytes,
     };
     let pause = u
         .backend
@@ -1526,7 +1678,7 @@ async fn complete_answer(
             permit.forget();
         }
     }
-    let mut outcome = u.completion(&caller.tenant, &row.id, store, job);
+    let mut outcome = u.completer.completion(&caller.tenant, &row.id, store, job);
     match tokio::time::timeout(
         u.backend.complete_wait,
         outcome.wait_for(|outcome| outcome.is_some()),

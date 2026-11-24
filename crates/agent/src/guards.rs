@@ -171,7 +171,9 @@ impl JobGuards {
     /// flag: `None` when the per-VCI lock or the reprogramming slot is held by another handle (a
     /// lock this attempt took is released before it returns). Validates the VCI name and creates
     /// the lock directory as `take` does; the answer is that of one `try_lock` per lock, so it
-    /// does not depend on how long the preparation took.
+    /// does not depend on how long the preparation took. A probe, for tests: a job takes its
+    /// guards with [`JobGuards::take`].
+    #[doc(hidden)]
     pub fn try_take(setup: &GuardSetup) -> Result<Option<Self>, GuardError> {
         Self::prepare(setup)?;
         let Some(vci) = LockFile::try_take(&vci_path(&setup.dir, &setup.vci))? else {
@@ -670,7 +672,6 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// The slot is per device: a job on another VCI waits for it too.
     #[test]
     fn a_single_attempt_takes_free_guards_and_reports_held_ones_without_keeping_any() {
         let dir = dir("try-take");
@@ -711,6 +712,7 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// The slot is per device: a job on another VCI waits for it too.
     #[test]
     fn the_reprogramming_slot_is_one_per_device() {
         let dir = dir("slot");

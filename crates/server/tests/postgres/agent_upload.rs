@@ -1,8 +1,9 @@
 //! The agent's data channel against a real local-profile server and the bundled RustFS (design 5.2,
-//! 13.4, 14.3, ADR-493, ADR-495): `ngr-agent debug enqueue` puts a result and a communication log
-//! into the upload ledger, `ngr-agent connect` uploads them through the four routes, the test
-//! kills the agent while the log is half stored and starts it again, and the objects the store
-//! holds are byte-identical to the sources.
+//! 13.4, 14.3, ADR-493, ADR-495): `ngr-agent debug enqueue` puts a communication log (and, in
+//! the first test, a result) into the upload ledger, `ngr-agent connect` uploads them through
+//! the four routes, a test kills the agent while the log is half stored (between two parts in
+//! the first test, inside a part's PUT in the second) and starts it again, and the objects the
+//! store holds are byte-identical to the sources.
 //!
 //! The first test places its cut with the server's store, not with a sleep: the store wrapper
 //! refuses the URL of every part from the third on (503, which the agent retries after its
@@ -27,7 +28,7 @@
 //! the earlier parts and not the cut one, and the second run issues the cut part's URL again.
 //!
 //! A release agent has no plain-file key store and no debug command, so this module is compiled
-//! in debug builds only. The test needs `NGR_TEST_RUSTFS_BIN` (`scripts/fetch-rustfs.sh`).
+//! in debug builds only. The tests need `NGR_TEST_RUSTFS_BIN` (`scripts/fetch-rustfs.sh`).
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -58,8 +59,8 @@ use crate::uploads::{hex, v4};
 const LIMIT: Duration = Duration::from_secs(60);
 
 /// A TCP relay in front of the object server that copies both ways untouched, and that, once
-/// armed, stops forwarding a connection's bytes to the server after it has taken `cut_after` of
-/// them since the arming (and holds the connection) until it is released.
+/// armed, stops forwarding a connection's bytes to the server once it has taken more than
+/// `cut_after` of them since the arming (and holds the connection) until it is released.
 struct Relay {
     port: u16,
     shared: Arc<RelayShared>,
@@ -113,11 +114,26 @@ impl Relay {
         }
     }
 
-    /// Resolves once a connection was cut.
-    async fn cut(&self) {
-        tokio::time::timeout(LIMIT, self.shared.cut.notified())
+    /// Resolves once a connection was cut, panicking after [`LIMIT`] or when the agent exits
+    /// first, with the agent's log.
+    async fn cut(&self, agent: &mut Agent) {
+        let deadline = Instant::now() + LIMIT;
+        while tokio::time::timeout(Duration::from_millis(20), self.shared.cut.notified())
             .await
-            .expect("a connection is cut");
+            .is_err()
+        {
+            if let Some(status) = agent.child.as_mut().unwrap().try_wait().unwrap() {
+                panic!(
+                    "the agent exited ({status}) before a connection was cut:\n{}",
+                    agent.log_text()
+                );
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no connection was cut; the agent says:\n{}",
+                agent.log_text()
+            );
+        }
     }
 
     /// Ends the held connection and stops cutting.
@@ -196,8 +212,9 @@ async fn relay_connection(client: TcpStream, target: u16, shared: Arc<RelayShare
     }
 }
 
-/// The store the server uses: the real one, which records every part URL it issues and refuses
-/// the URL of any part from `refuse_from` on (0 refuses none).
+/// The store the server uses: the real one, which records every part URL it issues, refuses the
+/// URL of any part from `refuse_from` on (0 refuses none) and, when the fixture has a relay, arms
+/// it as it issues the URL of part 2.
 struct Gate {
     inner: Arc<S3Store>,
     refuse_from: AtomicU16,
@@ -205,7 +222,8 @@ struct Gate {
     asked: Mutex<Vec<(String, u16)>>,
     /// How many of them were refused.
     refused: Mutex<Vec<(String, u16)>>,
-    /// Armed when the URL of the log's second part is issued (the result has one part only).
+    /// Armed when the URL of part 2 is issued: with the log the only object enqueued, that is the
+    /// log's second part.
     relay: Option<Arc<RelayShared>>,
 }
 
@@ -707,7 +725,7 @@ async fn a_killed_agent_resumes_a_part_cut_inside_its_put_and_sends_the_stored_p
     let mut agent = fx.start_agent("connect-1.log");
     // The relay holds a connection that took half of part 2's body. The agent sends one part at
     // a time in order, so part 1 was stored before part 2's URL was issued.
-    relay.cut().await;
+    relay.cut(&mut agent).await;
     let (log_upload, log_key) = fx.upload_of("commLog").await;
     let (state, ..) = fx.row("commLog").await.unwrap();
     assert_eq!(state, "open", "the log is not finished");
@@ -724,17 +742,19 @@ async fn a_killed_agent_resumes_a_part_cut_inside_its_put_and_sends_the_stored_p
         [(1, PART_BYTES)],
         "part 1 is stored and the part cut inside its PUT is not"
     );
-    assert_eq!(
-        fx.gate.asked_for(log_key.as_str()),
-        [1, 2],
-        "the first run asked for parts 1 and 2 only"
+    // The first run asked for parts 1 and 2 only (it may have asked again after a failed
+    // attempt), and never for part 3.
+    let (_, _, upload_before) = fx.row("commLog").await.unwrap();
+    let asked_before = fx.gate.asked_for(log_key.as_str());
+    assert!(
+        first_run_asked_only_up_to_the_cut_part(&asked_before),
+        "{asked_before:?}"
     );
 
     // The cut: SIGKILL while the body is half sent, then the held connection goes.
     agent.kill();
     relay.release();
     let ledger_len_at_kill = fx.ledger_len();
-    assert_eq!(fx.store.list_parts(&log_upload).await.unwrap().len(), 1);
 
     // The second run.
     let mut agent = fx.start_agent("connect-2.log");
@@ -753,15 +773,66 @@ async fn a_killed_agent_resumes_a_part_cut_inside_its_put_and_sends_the_stored_p
 
     // The cut part's URL was issued again and is followed by the last part's; part 1's was not.
     let asked = fx.gate.asked_for(log_key.as_str());
-    assert_eq!(asked, [1, 2, 2, 3], "the URLs the server issued");
+    assert_eq!(asked[..asked_before.len()], asked_before[..]);
+    let after = &asked[asked_before.len()..];
+    assert!(
+        second_run_resent_the_cut_part_and_not_the_stored_one(after),
+        "the second run asked for {after:?}"
+    );
     let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM job_objects")
         .fetch_one(&fx.world.pool)
         .await
         .unwrap();
     assert_eq!(rows, 1, "the second run continued the first one's upload");
+    let (_, _, upload_after) = fx.row("commLog").await.unwrap();
+    assert_eq!(upload_after, upload_before, "the same upload");
+    let (size, digest): (i64, String) =
+        sqlx::query_as("SELECT size_bytes, digest FROM job_objects WHERE job_id = $1::uuid")
+            .bind(&fx.job)
+            .fetch_one(&fx.world.pool)
+            .await
+            .unwrap();
+    assert_eq!((size as usize, digest), (log.len(), hex(&sha256(&log))));
     let stored = read_all(&fx.store, &log_key).await.unwrap();
     assert_eq!(stored.len(), log.len());
     assert_eq!(hex(&sha256(&stored)), hex(&sha256(&log)));
     assert!(stored == log, "the object differs from the source");
     fx.finish().await;
+}
+
+/// What the first run may have asked for before the cut: parts 1 and 2 (a failed attempt may
+/// have asked again), never part 3, which comes after the cut part.
+fn first_run_asked_only_up_to_the_cut_part(asked: &[u16]) -> bool {
+    asked.iter().all(|part| *part <= 2) && asked.contains(&1) && asked.contains(&2)
+}
+
+/// What the second run must have asked for: never part 1, which was stored; part 2 again, which
+/// was cut; and part 3 after the last request for part 2 (a refused attempt may repeat either).
+fn second_run_resent_the_cut_part_and_not_the_stored_one(asked: &[u16]) -> bool {
+    let Some(last_two) = asked.iter().rposition(|part| *part == 2) else {
+        return false;
+    };
+    !asked.contains(&1) && asked[last_two..].contains(&3)
+}
+
+#[test]
+fn the_url_checks_accept_retries_and_refuse_a_resent_stored_part() {
+    assert!(first_run_asked_only_up_to_the_cut_part(&[1, 2]));
+    assert!(first_run_asked_only_up_to_the_cut_part(&[1, 1, 2]));
+    assert!(!first_run_asked_only_up_to_the_cut_part(&[1]));
+    assert!(!first_run_asked_only_up_to_the_cut_part(&[1, 2, 3]));
+    assert!(second_run_resent_the_cut_part_and_not_the_stored_one(&[
+        2, 3
+    ]));
+    assert!(second_run_resent_the_cut_part_and_not_the_stored_one(&[
+        2, 2, 3
+    ]));
+    // The agent resends the stored part, never resends the cut one, or sends part 3 first.
+    assert!(!second_run_resent_the_cut_part_and_not_the_stored_one(&[
+        1, 2, 3
+    ]));
+    assert!(!second_run_resent_the_cut_part_and_not_the_stored_one(&[3]));
+    assert!(!second_run_resent_the_cut_part_and_not_the_stored_one(&[
+        3, 2
+    ]));
 }

@@ -6,16 +6,18 @@
 //! configured from `sim/ecm.json` (a write needs the extended session, security level 1 and the
 //! gateway's authentication).
 //!
-//! The job runs three times against one simulated ECU. First the gateway has not authenticated:
+//! The job runs four times against one simulated ECU. First the gateway has not authenticated:
 //! the write is refused, the procedure reads the coding, finds it unchanged and ends as
 //! `WRITE_REFUSED`. Then the test sends `set_gateway_authentication` through the control
-//! directory and the job succeeds, leaving the coding `00 03 03 20` after the session request, the
-//! seed request, the key request and one write, in that order in the request trace. A third run
-//! finds the cruise-control bit set and sends nothing but the read.
+//! directory and arms a refusal of the second read of the coding (`occurrence` of `inject_fault`):
+//! the write is accepted but its read-back is refused, so the procedure writes the saved coding
+//! back, reads it again and ends as `CODING_ROLLED_BACK` with the coding as it was. The next run
+//! succeeds, leaving the coding `00 03 03 20` after the session request, the seed request, the
+//! key request and one write, in that order in the request trace. A last run finds the
+//! cruise-control bit set and sends nothing but the read.
 //!
-//! The roll-back path is not run here: it needs a fault that fires on the second read of the
-//! coding, which `sim-ecu` cannot arm yet; the dry runs in
-//! `crates/diag-frontend/tests/fictional_vehicle.rs` cover it.
+//! The dry runs in `crates/diag-frontend/tests/fictional_vehicle.rs` cover the other roll-back
+//! outcomes (refused or unconfirmed roll-back writes).
 //!
 //! This file holds a single test, so the process-wide environment it sets for the spawned
 //! service cannot race with another test.
@@ -300,15 +302,47 @@ async fn run_the_jobs(dir: &Path) {
     );
     requests_since(&trace, &mut seen);
 
-    // R2: authenticated, the whole procedure runs and the coding gets the cruise-control bit.
+    // R1b: authenticated, the write is accepted but the read-back, the second read of the coding
+    // since the fault was armed (the job's first read is the first), is refused. The procedure
+    // writes the saved coding back, checks it with a third read and reports the roll-back.
     send(
         &control_dir,
         "authenticate",
         r#"{"command": "set_gateway_authentication", "authenticated": true}"#,
     );
+    send(
+        &control_dir,
+        "refuse-read-back",
+        r#"{"command": "inject_fault", "fault": {"negative_response": {"nrc": "conditions_not_correct"}}, "request": [34, 1, 32], "occurrence": 2}"#,
+    );
+    let rolled_back = change_coding(&worker, &journal_dir, 4).await;
+    match rolled_back {
+        Err(JobError::ProcedureFailed { code, .. }) => assert_eq!(code, "CODING_ROLLED_BACK"),
+        other => panic!("the run with a refused read-back did not roll back: {other:?}"),
+    }
+    assert_eq!(
+        requests_since(&trace, &mut seen),
+        [
+            "uds 22 0120",
+            "uds 10 03",
+            "uds 27",
+            "uds 27",
+            "uds 2E 0120",
+            "uds 22 0120",
+            "uds 2E 0120",
+            "uds 22 0120"
+        ]
+    );
+    assert_eq!(
+        coding(&worker).await,
+        [0x62, 0x01, 0x20, 0x00, 0x01, 0x03, 0x20]
+    );
+    requests_since(&trace, &mut seen);
+
+    // R2: the whole procedure runs and the coding gets the cruise-control bit.
     change_coding(&worker, &journal_dir, 2)
         .await
-        .expect("the second run finishes");
+        .expect("the third run finishes");
     // The trace lists a sub-function for 0x10 but not for 0x27, so the seed and the key
     // requests show as two `uds 27` lines.
     assert_eq!(
@@ -331,7 +365,7 @@ async fn run_the_jobs(dir: &Path) {
     // R3: the bit is set, so nothing but the read is sent.
     change_coding(&worker, &journal_dir, 3)
         .await
-        .expect("the third run finishes");
+        .expect("the fourth run finishes");
     assert_eq!(requests_since(&trace, &mut seen), ["uds 22 0120"]);
     assert_eq!(
         coding(&worker).await,

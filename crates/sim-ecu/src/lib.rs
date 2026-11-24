@@ -9,6 +9,7 @@
 //! the seed/key algorithm, the session each service is available in) are listed in
 //! `crates/sim-ecu/docs/simulated-ecu.md`.
 
+use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -570,7 +571,7 @@ pub struct SimEcu {
     armed: Vec<Fault>,
     /// Faults waiting for a request that starts with given bytes
     /// ([`SimEcu::inject_for_request`]), in injection order.
-    armed_for_request: Vec<(Vec<u8>, Fault)>,
+    armed_for_request: Vec<RequestFault>,
     /// Power cycles so far (power loss, ECU reset, reconnection).
     power_cycles: u64,
     /// Set by [`SimEcu::hold_session`]: the non-default session does not time out until the
@@ -611,7 +612,7 @@ pub struct EcuSnapshot {
     silent: bool,
     armed: Vec<Fault>,
     #[serde(default)]
-    armed_for_request: Vec<(Vec<u8>, Fault)>,
+    armed_for_request: Vec<RequestFault>,
     power_cycles: u64,
     session_held: bool,
 }
@@ -1184,25 +1185,61 @@ impl SimEcu {
     /// kind. [`Fault::PowerLoss`] then takes effect at once, so that request gets no answer. An
     /// empty prefix matches the next request that reaches the ECU.
     pub fn inject_for_request(&mut self, prefix: &[u8], fault: Fault) {
-        self.armed_for_request.push((prefix.to_vec(), fault));
+        self.inject_for_nth_request(prefix, NonZeroU32::MIN, fault);
+    }
+
+    /// Arms `fault` for the `n`-th request that starts with `prefix` and reaches the ECU, counted
+    /// from now: the fault counts the matching requests that reach the ECU on its own, so an
+    /// earlier match is answered as it would be without this fault (it may still get another armed
+    /// fault), and the `n`-th gets the fault as in [`SimEcu::inject_for_request`] (which is
+    /// `n` = 1), after which the fault is spent. Requests that do not match, and requests lost on
+    /// the way (including to a bus error or power loss armed for that very request), do not
+    /// count. The count is part of the snapshot.
+    pub fn inject_for_nth_request(&mut self, prefix: &[u8], n: NonZeroU32, fault: Fault) {
+        self.armed_for_request.push(RequestFault {
+            prefix: prefix.to_vec(),
+            fault,
+            matches_left: n,
+        });
     }
 
     /// Faults waiting for a request ([`SimEcu::inject_for_request`]), with the prefix each waits
-    /// for.
-    pub fn faults_for_request(&self) -> &[(Vec<u8>, Fault)] {
+    /// for and how many matching requests are left before it fires.
+    pub fn faults_for_request(&self) -> &[RequestFault] {
         &self.armed_for_request
     }
 
-    /// Arms the faults waiting for `message`, ahead of the others, for the request at hand.
+    /// Arms the faults whose turn `message` is, ahead of the others, for the request at hand, and
+    /// counts `message` for the faults that wait for a later match, unless a fault that fires on
+    /// it loses it (a bus error or a power loss), since a lost request does not reach the ECU.
     /// Whether any was armed.
     fn arm_for_request(&mut self, message: &[u8]) -> bool {
-        let (now, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.armed_for_request)
-            .into_iter()
-            .partition(|(prefix, _)| message.starts_with(prefix));
-        self.armed_for_request = later;
+        let lost = self.armed_for_request.iter().any(|waiting| {
+            waiting.matches_left == NonZeroU32::MIN
+                && message.starts_with(&waiting.prefix)
+                && matches!(waiting.fault, Fault::BusError | Fault::PowerLoss)
+        });
+        let mut now = Vec::new();
+        self.armed_for_request.retain_mut(|waiting| {
+            if !message.starts_with(&waiting.prefix) {
+                return true;
+            }
+            match NonZeroU32::new(waiting.matches_left.get() - 1) {
+                Some(left) => {
+                    if !lost {
+                        waiting.matches_left = left;
+                    }
+                    true
+                }
+                None => {
+                    now.push(waiting.fault);
+                    false
+                }
+            }
+        });
         let armed = !now.is_empty();
         let mut position = 0;
-        for (_, fault) in now {
+        for fault in now {
             if fault == Fault::PowerLoss {
                 self.inject(fault);
             } else {
@@ -1285,6 +1322,19 @@ impl SimEcu {
 }
 
 // ---------------------------------------------------------------- Fault injection
+
+/// A fault waiting for a request ([`SimEcu::inject_for_request`],
+/// [`SimEcu::inject_for_nth_request`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestFault {
+    /// The bytes the request starts with.
+    pub prefix: Vec<u8>,
+    /// The fault armed when the request comes.
+    pub fault: Fault,
+    /// Requests that start with `prefix` still to come, the one that fires the fault included:
+    /// 1 means the next one.
+    pub matches_left: NonZeroU32,
+}
 
 /// Events injected during tests with [`SimEcu::inject`]. Corresponds to 13.4 "injecting delays,
 /// disconnects, crashes, and write failures". Serialized in snake case (`"power_loss"`,

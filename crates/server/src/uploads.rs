@@ -27,7 +27,7 @@
 //! adopted by the hub so that the stop ends it, which outlives the request that started it: the
 //! requests only wait for its outcome (ADR-493 items 20 and 21). The completion pass
 //! ([`run_completion_pass`]) starts the same task for the `completing` rows that no request
-//! repeats, through the same registry (ADR-493 item 23).
+//! repeats, through the same registry (ADR-493 item 29).
 //!
 //! Never logged: a token, a body, a digest, an object key, an upload ID, a URL or the text of a
 //! database error (the SQLSTATE only).
@@ -80,7 +80,7 @@ pub const MAX_SIZE: u64 = 4 * 1024 * 1024 * 1024;
 pub const PART_BYTES: u64 = 5 * 1024 * 1024;
 /// How long a completion request waits for the task before it answers 202 (ADR-493 item 21).
 pub const COMPLETE_WAIT: Duration = Duration::from_secs(20);
-/// The time between two completion passes; the first runs at the start (ADR-493 item 23).
+/// The time between two completion passes; the first runs at the start (ADR-493 item 29).
 pub const PASS_PERIOD: Duration = Duration::from_secs(60);
 /// The most `completing` rows one completion pass takes.
 const PASS_BATCH: i64 = 100;
@@ -628,7 +628,7 @@ impl Completer {
 
 /// Runs the completion pass until the stop: one pass at the start, then one every
 /// [`PASS_PERIOD`] (the backend's), which takes the `completing` rows that no request repeats
-/// (ADR-493 item 23). It ends at once when the backend has no store, and when the stop begins, in
+/// (ADR-493 item 29). It ends at once when the backend has no store, and when the stop begins, in
 /// its wait and in its work alike, since `Server::run` waits for the hub's task set to empty.
 pub(crate) async fn run_completion_pass(pool: PgPool, hub: Hub, backend: Backend) {
     let Some(store) = backend.shared_store() else {

@@ -662,7 +662,7 @@ impl Server {
             }
         }));
         // The completion pass is another: it finishes the uploads that no request repeats
-        // (ADR-493 item 23), through the registry the routes use, and has nothing to do without
+        // (ADR-493 item 29), through the registry the routes use, and has nothing to do without
         // a store.
         if uploads.shared_store().is_some() {
             hub.adopt(uploads::run_completion_pass(

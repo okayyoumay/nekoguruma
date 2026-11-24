@@ -1,7 +1,7 @@
 # ADR-493: The Data Channel Is Four Session-Token Routes to Presigned Multipart Uploads, Driven by the Agent's Upload Ledger
 
 **Date:** 2026-11-19
-**Status:** Accepted (items 15 to 18 added with the begin, part URL and status routes; item 6's mapping corrected and items 19 to 23 added with the complete route; item 17 extended by item 23; item 11's record of delivery corrected and items 24 to 28 added with the upload ledger; items 6 and 17 amended and item 11 extended by ADR-495; a download route added by ADR-497; item 10's ending of either task detailed by ADR-499; their routes' answers are proved, ADR-504; item 13's scheme is `https` and the part-URL answer carries the certificate pin, ADR-505; item 22 revised by item 29 with the completion pass)
+**Status:** Accepted (items 15 to 18 added with the begin, part URL and status routes; item 6's mapping corrected and items 19 to 23 added with the complete route; item 17 extended by item 23; item 11's record of delivery corrected and items 24 to 28 added with the upload ledger; items 6 and 17 amended and item 11 extended by ADR-495; a download route added by ADR-497; item 10's ending of either task detailed by ADR-499; their routes' answers are proved, ADR-504; item 13's scheme is `https` and the part-URL answer carries the certificate pin, ADR-505; item 22 revised by item 29 with the completion pass; items 17 and 23 revised by item 30 with the status hand-over)
 **Affects:** design 5.2, 5.4, 13, 13.3, 14.3, 14.4; `crates/server` (the upload routes, a migration for `job_objects`, `db/README.md`), `crates/agent` (the uploader, the ledger, `connect`, a debug-only enqueue command), `crates/shared-proto` if the route bodies are shared, `api/openapi.yaml` (the four operations, marked planned until served), `docs/glossary.md`; uses ADR-492's `MultipartStore` and ADR-466's session token; fixes the acknowledgement ADR-455 left
 
 ## Context
@@ -178,7 +178,7 @@ proposed. It is a specification: none of it is implemented when this record is w
     `open` row whose upload `list_parts` reports as not found or already finished is a state the
     completion decides (item 6), not the status: the status answers 503, leaves the row as it
     is, and the agent repeats it (item 23 refines this: the status reads the row once more before
-    it answers 503). A part URL for a row that is not `open` is never issued and
+    it answers 503; item 30 revises both). A part URL for a row that is not `open` is never issued and
     asks the store nothing; the status of such a row has no `partsHeld` and asks the store
     nothing either.
 18. **Settings and details.** The part size is a constant of the code, 5 MiB, with an override
@@ -235,7 +235,8 @@ proposed. It is a specification: none of it is implemented when this record is w
     `NotFound` or `AlreadyFinished` for an `open` row is the sign of a completion that moved the
     row on between the status's read and its listing. The status re-reads the row once: a row
     that is no longer `open` is answered with its state and no `partsHeld`; one that still is
-    `open` is the 503 of item 17, with nothing written.
+    `open` is the 503 of item 17, with nothing written. (Revised by item 30: such a row goes to the
+    completion task.)
 
 ### Decisions taken with the upload ledger
 
@@ -315,6 +316,29 @@ may have gone, or have given up, and the row then holds its job's slot for good.
     without an outcome for another reason (a panic, or the row case above) leaves its row to the
     next pass, and the pass goes on with the next row, so one row that always panics does not
     keep the others from their pass.
+
+### Decisions taken with the status hand-over
+
+Items 17 and 23 left an `open` row whose upload the store no longer has (an emptied bucket, an
+upload aborted by the cleanup of old uploads) as a 503 of the status: nothing but a completion
+moves such a row on, and the status was the agent's only question about it.
+
+30. **The status hands such a row to the completion task.** When `list_parts` answers `NotFound`
+    or `AlreadyFinished` and the row, read once more (item 23), is still `open`, the status
+    starts or joins the upload's completion task of item 20 with a request's semantics (the
+    compare-and-set from `open` to `completing` is the task's), so completion stays the only
+    writer of the row's state (item 6) and one upload still has one store completion whoever
+    asks. It waits for the outcome as long as the complete route does (20 seconds, the same
+    test override) and answers 200 in its usual shape with the state the task wrote: `failed`
+    when the upload and the object are gone or the read-back does not match (the job's slot
+    is free again), `finished` when the read-back matches, `open` after a part problem (with
+    `partsHeld` from a new listing, since an `open` answer carries it and the parts are
+    untouched), and `completing` when the wait runs out. A store or database error outcome, or
+    a task that ends with no outcome, answers as the complete route does (503, 500 for a store
+    without randomness) with nothing written. The waiting is shared with the complete route;
+    the answers are not: the complete route answers 409 with a `state` member for `open` and
+    `failed`, the status answers 200. The agent needs no change: it takes `finished`,
+    `failed` and `completing` from a status as it takes them from begin and complete.
 
 ## Consequences
 

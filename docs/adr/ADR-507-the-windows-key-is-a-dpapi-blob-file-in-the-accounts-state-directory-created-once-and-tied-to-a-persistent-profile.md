@@ -21,10 +21,23 @@ could not assume, so a gated test measures it (Decision item 11). Nothing Window
 on the development machines the code is written on; the policy is therefore plain `std` behind two
 traits, tested everywhere with fakes, and only the operating-system calls are Windows-only.
 
-Probe results (core-windows, runner image: to be filled in from the first CI run of
-`windows_service_account`): whether `NT SERVICE\<name>` has `LOCALAPPDATA`; what `whoami /user`
-and `set` print; the codes DPAPI returns for a changed blob, for a different entropy and for
-another account's blob.
+Probe results (`core-windows`, runner image `win25-vs2026` 20261116.315.1, measured by
+`windows_service_account`):
+
+- A demand-start service created under `NT SERVICE\<name>` runs with `USERDOMAIN` `NT SERVICE`
+  and `USERNAME` the service's name. Its `USERPROFILE` is `C:\Windows\ServiceProfiles\<name>`, and
+  `LOCALAPPDATA` lies under it, so the state root needs no known-folder fallback.
+- The profile is persistent: `GetProfileType` set neither the temporary nor the mandatory flag,
+  so the first run created the key.
+- DPAPI round-trips for that account. The first run wrote a 367-byte blob file that begins with
+  the magic; the second run found it and left it byte- and time-identical. The identity folder
+  then held only the blob and its creation lock.
+- The CI account, an administrator, reads a copy of the service's blob through the store as
+  `Undecryptable`. Real-DPAPI unit tests show the same for a changed byte and for a blob copied
+  to another name. So the closed list of codes covers those three cases.
+- Under a service with no console, the redirected output of `whoami` and of the agent itself
+  was empty. The account is therefore read from the environment the service sees, and the
+  outcome from the files left in the state root.
 
 The maintainer approved the choices below on 2026-11-23.
 

@@ -1244,8 +1244,8 @@ fn the_control_export_arms_a_fault_for_a_service_or_a_request() {
     assert_eq!(
         with_ecu(|ecu| ecu.faults_for_request().to_vec()),
         [
-            (vec![0x11], Fault::DropResponse),
-            (vec![0x22, 0xF1, 0x86], Fault::BusError)
+            waiting(&[0x11], 1, Fault::DropResponse),
+            waiting(&[0x22, 0xF1, 0x86], 1, Fault::BusError)
         ]
     );
     assert!(with_ecu(|ecu| ecu.armed_faults().is_empty()));
@@ -1257,6 +1257,50 @@ fn the_control_export_arms_a_fault_for_a_service_or_a_request() {
     ] {
         assert_eq!(control(command), ERR_FAILED, "{command}");
     }
+}
+
+/// What `faults_for_request` lists for a fault waiting for its `matches_left`-th match.
+fn waiting(prefix: &[u8], matches_left: u32, fault: Fault) -> sim_ecu::RequestFault {
+    sim_ecu::RequestFault {
+        prefix: prefix.to_vec(),
+        fault,
+        matches_left: NonZeroU32::new(matches_left).expect("a count of at least 1"),
+    }
+}
+
+#[test]
+fn the_control_export_arms_a_fault_for_the_nth_request() {
+    let _f = fixture();
+    assert_eq!(
+        control(
+            r#"{"command": "inject_fault", "fault": "drop_response", "request": [34, 241, 134], "occurrence": 3}"#
+        ),
+        STATUS_NOERROR
+    );
+    assert_eq!(
+        control(
+            r#"{"command": "inject_fault", "fault": "bus_error", "service": 17, "occurrence": 2}"#
+        ),
+        STATUS_NOERROR
+    );
+    assert_eq!(
+        with_ecu(|ecu| ecu.faults_for_request().to_vec()),
+        [
+            waiting(&[0x22, 0xF1, 0x86], 3, Fault::DropResponse),
+            waiting(&[0x11], 2, Fault::BusError)
+        ]
+    );
+    // Zero, a count that is not a whole number, and a count without a request to match.
+    for command in [
+        r#"{"command": "inject_fault", "fault": "bus_error", "request": [34], "occurrence": 0}"#,
+        r#"{"command": "inject_fault", "fault": "bus_error", "request": [34], "occurrence": -1}"#,
+        r#"{"command": "inject_fault", "fault": "bus_error", "request": [34], "occurrence": 1.5}"#,
+        r#"{"command": "inject_fault", "fault": "bus_error", "request": [34], "occurrence": "2"}"#,
+        r#"{"command": "inject_fault", "fault": "bus_error", "occurrence": 2}"#,
+    ] {
+        assert_eq!(control(command), ERR_FAILED, "{command}");
+    }
+    assert_eq!(with_ecu(|ecu| ecu.faults_for_request().len()), 2);
 }
 
 #[test]
@@ -1893,6 +1937,39 @@ fn the_state_file_round_trips_the_ecu() {
         .expect("the file exists");
     assert_eq!(loaded.session, Session::Extended);
     assert_eq!(loaded.config.vin, "NGRSIMECU00000001");
+}
+
+#[test]
+fn the_state_file_keeps_the_count_of_a_fault_for_the_nth_request() {
+    let dir = StateDir::new("nth-request");
+    let read = [0x22, 0xF1, 0x86];
+    let mut ecu = SimEcu::new(default_ecu_config());
+    ecu.inject_for_nth_request(
+        &read,
+        NonZeroU32::new(2).expect("2 is not zero"),
+        Fault::DropResponse,
+    );
+    assert!(matches!(
+        ecu.request(&read),
+        sim_ecu::SimResponse::Positive(_)
+    ));
+    save_ecu_state(&dir.file(), &mut ecu).expect("the state should be written");
+    let mut loaded = load_ecu_state(&dir.file())
+        .expect("the state should load")
+        .expect("the file exists");
+    assert_eq!(
+        loaded
+            .faults_for_request()
+            .iter()
+            .map(|waiting| waiting.matches_left.get())
+            .collect::<Vec<_>>(),
+        [1]
+    );
+    assert_eq!(loaded.request(&read), sim_ecu::SimResponse::NoResponse);
+    assert!(matches!(
+        loaded.request(&read),
+        sim_ecu::SimResponse::Positive(_)
+    ));
 }
 
 #[test]

@@ -2402,7 +2402,11 @@ fn restore_brings_back_every_field() {
     ecu.image = vec![7; 0x20];
     ecu.silent = true;
     ecu.armed = vec![Fault::DropResponse, Fault::CorruptBlock { block: 5 }];
-    ecu.armed_for_request = vec![(vec![0x11], Fault::DropResponse)];
+    ecu.armed_for_request = vec![RequestFault {
+        prefix: vec![0x11],
+        fault: Fault::DropResponse,
+        matches_left: NonZeroU32::MIN,
+    }];
     ecu.power_cycles = 3;
     let snapshot = ecu.snapshot();
 
@@ -2730,6 +2734,15 @@ fn response_pending_fault_parses_from_json() {
     );
 }
 
+/// What [`SimEcu::faults_for_request`] lists for a fault waiting for its `matches_left`-th match.
+fn waiting(prefix: &[u8], matches_left: u32, fault: Fault) -> RequestFault {
+    RequestFault {
+        prefix: prefix.to_vec(),
+        fault,
+        matches_left: NonZeroU32::new(matches_left).unwrap(),
+    }
+}
+
 #[test]
 fn a_fault_for_a_service_passes_other_services_by_and_fires_on_that_one() {
     let mut ecu = ecu();
@@ -2740,7 +2753,7 @@ fn a_fault_for_a_service_passes_other_services_by_and_fires_on_that_one() {
     );
     assert_eq!(
         ecu.faults_for_request(),
-        [(vec![0x11], Fault::DropResponse)]
+        [waiting(&[0x11], 1, Fault::DropResponse)]
     );
     // The reset takes effect although its response is lost.
     let cycles = ecu.power_cycles();
@@ -2799,7 +2812,7 @@ fn a_fault_for_a_service_keeps_waiting_through_a_request_lost_in_the_startup() {
     assert_eq!(ecu.request(&[0x11, 0x01]), SimResponse::NoResponse);
     assert_eq!(
         ecu.faults_for_request(),
-        [(vec![0x11], Fault::DropResponse)]
+        [waiting(&[0x11], 1, Fault::DropResponse)]
     );
     clock.advance(ms(100));
     let cycles = ecu.power_cycles();
@@ -2859,7 +2872,7 @@ fn a_request_lost_to_a_bus_error_leaves_the_fault_for_its_service_waiting() {
     assert_eq!(ecu.power_cycles(), cycles);
     assert_eq!(
         ecu.faults_for_request(),
-        [(vec![0x11], Fault::DropResponse)]
+        [waiting(&[0x11], 1, Fault::DropResponse)]
     );
     // A request of another service is answered as usual.
     assert_eq!(
@@ -2906,6 +2919,81 @@ fn a_fault_for_a_request_passes_other_requests_of_its_service_by() {
         ecu.request(&[0x22, 0xF1, 0x86]),
         pos(&[0x62, 0xF1, 0x86, 0x01])
     );
+}
+
+#[test]
+fn a_fault_for_the_nth_request_lets_the_matches_before_it_through_and_is_then_spent() {
+    let read = [0x22, 0xF1, 0x86];
+    let mut ecu = ecu();
+    ecu.inject_for_nth_request(
+        &read,
+        NonZeroU32::new(3).unwrap(),
+        Fault::NegativeResponse {
+            nrc: Nrc::ConditionsNotCorrect,
+        },
+    );
+    assert_eq!(ecu.request(&read), pos(&[0x62, 0xF1, 0x86, 0x01]));
+    // Requests that do not start with the prefix are not counted.
+    assert!(matches!(
+        ecu.request(&[0x22, 0xF1, 0x90]),
+        SimResponse::Positive(_)
+    ));
+    assert!(matches!(
+        ecu.request(&[0x3E, 0x00]),
+        SimResponse::Positive(_)
+    ));
+    assert_eq!(
+        ecu.faults_for_request()
+            .iter()
+            .map(|waiting| waiting.matches_left.get())
+            .collect::<Vec<_>>(),
+        [2]
+    );
+    assert_eq!(ecu.request(&read), pos(&[0x62, 0xF1, 0x86, 0x01]));
+    assert!(ecu.armed_faults().is_empty());
+    assert_eq!(ecu.request(&read), neg(0x22, Nrc::ConditionsNotCorrect));
+    assert!(ecu.faults_for_request().is_empty());
+    assert_eq!(ecu.request(&read), pos(&[0x62, 0xF1, 0x86, 0x01]));
+}
+
+#[test]
+fn a_fault_for_the_first_request_fires_as_inject_for_request_does() {
+    let read = [0x22, 0xF1, 0x86];
+    let mut ecu = ecu();
+    ecu.inject_for_nth_request(&read, NonZeroU32::MIN, Fault::DropResponse);
+    assert_eq!(ecu.request(&read), SimResponse::NoResponse);
+    assert!(ecu.faults_for_request().is_empty());
+    assert_eq!(ecu.request(&read), pos(&[0x62, 0xF1, 0x86, 0x01]));
+}
+
+#[test]
+fn the_count_of_a_fault_for_the_nth_request_survives_a_serialized_snapshot() {
+    let read = [0x22, 0xF1, 0x86];
+    let mut ecu = ecu();
+    ecu.inject_for_nth_request(
+        &read,
+        NonZeroU32::new(2).unwrap(),
+        Fault::NegativeResponse {
+            nrc: Nrc::RequestOutOfRange,
+        },
+    );
+    assert_eq!(ecu.request(&read), pos(&[0x62, 0xF1, 0x86, 0x01]));
+    // The serialized snapshot, as the state file keeps it, read by another ECU.
+    let text = serde_json::to_string(&ecu.snapshot()).unwrap();
+    let snapshot: EcuSnapshot = serde_json::from_str(&text).unwrap();
+    let mut restored = SimEcu::restore(snapshot, ManualClock::default(), ms(0)).unwrap();
+    assert_eq!(
+        restored.faults_for_request(),
+        [waiting(
+            &read,
+            1,
+            Fault::NegativeResponse {
+                nrc: Nrc::RequestOutOfRange
+            }
+        )]
+    );
+    assert_eq!(restored.request(&read), neg(0x22, Nrc::RequestOutOfRange));
+    assert_eq!(restored.request(&read), pos(&[0x62, 0xF1, 0x86, 0x01]));
 }
 
 #[test]

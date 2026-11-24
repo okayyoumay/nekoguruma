@@ -13,6 +13,7 @@
 )]
 
 use std::ffi::CStr;
+use std::num::NonZeroU32;
 use std::os::raw::{c_char, c_void};
 use std::path::{Path, PathBuf};
 
@@ -122,8 +123,9 @@ pub const ECU_STATE_ENV: &str = "NGR_SIM_ECU_STATE";
 /// left of the ECU's startup, ADR-265; version 3: the faults waiting for a request,
 /// `SimEcu::inject_for_request`; version 4: `EcuConfig::p2_server_max_ms` and
 /// `p2_star_server_max_ms`; version 5: a held session, `SimEcu::hold_session`; version 6:
-/// `EcuConfig::security_key_mask` and `EcuConfig::dids`) needs a new version.
-const STATE_FILE_VERSION: u32 = 6;
+/// `EcuConfig::security_key_mask` and `EcuConfig::dids`; version 7: the matches a fault for a
+/// request still waits for, `SimEcu::inject_for_nth_request`) needs a new version.
+const STATE_FILE_VERSION: u32 = 7;
 
 /// The contents of the [`ECU_STATE_ENV`] file (postcard).
 #[derive(Serialize, Deserialize)]
@@ -561,15 +563,20 @@ impl Bus {
                 fault,
                 service,
                 request,
-            } => match (service, request) {
-                (Some(_), Some(_)) => Err(ERR_FAILED),
-                (Some(sid), None) => self.change_ecu(|ecu| ecu.inject_for_service(sid, fault)),
+                occurrence,
+            } => match (service, request, occurrence) {
+                (Some(_), Some(_), _) => Err(ERR_FAILED),
+                // Counting matches needs a request to match.
+                (None, None, Some(_)) => Err(ERR_FAILED),
                 // An empty prefix would match any request: `inject` without it says that.
-                (None, Some(prefix)) if prefix.is_empty() => Err(ERR_FAILED),
-                (None, Some(prefix)) => {
-                    self.change_ecu(|ecu| ecu.inject_for_request(&prefix, fault))
-                }
-                (None, None) => self.change_ecu(|ecu| ecu.inject(fault)),
+                (None, Some(prefix), _) if prefix.is_empty() => Err(ERR_FAILED),
+                (Some(sid), None, n) => self.change_ecu(|ecu| {
+                    ecu.inject_for_nth_request(&[sid], n.unwrap_or(NonZeroU32::MIN), fault);
+                }),
+                (None, Some(prefix), n) => self.change_ecu(|ecu| {
+                    ecu.inject_for_nth_request(&prefix, n.unwrap_or(NonZeroU32::MIN), fault);
+                }),
+                (None, None, None) => self.change_ecu(|ecu| ecu.inject(fault)),
             },
             Command::ReconnectEcu {} => self.change_ecu(SimEcu::reconnect),
             Command::HoldSession {} => self.change_ecu(SimEcu::hold_session),
@@ -934,13 +941,17 @@ enum Command {
     /// Arms a `sim_ecu::Fault` on the ECU (`SimEcu::inject`), or, with `service`, once a
     /// request of that service reaches it (`SimEcu::inject_for_service`), or, with `request`,
     /// once a request that starts with those bytes does (`SimEcu::inject_for_request`). At most
-    /// one of the two.
+    /// one of the two. With `occurrence` (at least 1, with `service` or `request`), the fault
+    /// waits for the n-th such request instead of the first: the earlier matches are answered
+    /// as usual (`SimEcu::inject_for_nth_request`).
     InjectFault {
         fault: Fault,
         #[serde(default)]
         service: Option<u8>,
         #[serde(default)]
         request: Option<Vec<u8>>,
+        #[serde(default)]
+        occurrence: Option<NonZeroU32>,
     },
     /// Sets `SimEcu::gateway_authenticated`: what an ECU configured with `require_gateway_auth`
     /// checks before it accepts a write, routine or download request (the simulator has no

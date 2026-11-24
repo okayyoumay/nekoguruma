@@ -275,7 +275,12 @@ response) stays armed for the next request of any kind. A request a `BusError` a
 loses never reaches the ECU, so the faults waiting for it wait on; a `BusError` aimed at a
 request loses that request. This lets a test hit a request it cannot time, such as a client's
 ECUReset or session read that follows a run of other requests. `faults_for_request()` lists the
-faults still waiting, with their prefix.
+faults still waiting, with their prefix and the number of matching requests left before each fires.
+`inject_for_nth_request(prefix, n, fault)` waits for the `n`-th request that starts with `prefix`
+instead of the first (`inject_for_request` is `n` = 1): the earlier matches are answered as usual
+and counted, requests that do not match or are lost on the way do not count, and the fault is
+spent when it fires. The count is part of the snapshot, so it carries over a restart that
+continues from a saved state.
 
 While the ECU is silent (after `PowerLoss` or `drop_at_block`), requests do not reach it and the
 armed faults stay armed. `armed_faults()` lists the faults that have not fired yet.

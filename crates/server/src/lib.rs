@@ -90,6 +90,10 @@ pub struct AppState {
     /// The object store and part size of the data channel's routes (ADR-493); the routes are
     /// built from it, so it is set before the router is.
     pub uploads: uploads::Backend,
+    /// The completion tasks of this server: the router's upload routes and the completion pass
+    /// share them, so one upload has one task whoever asks (ADR-493 item 20). A server's own
+    /// state; clones of one `Backend` in two servers do not share tasks.
+    pub completions: uploads::Completions,
 }
 
 /// A route the server serves: the HTTP method and the path, as a client sends them. The control
@@ -257,6 +261,7 @@ pub fn routes_unguarded(state: AppState) -> (Router, Vec<ServedRoute>) {
             state.uploads,
             state.hub.clone(),
             Arc::clone(&prover),
+            state.completions,
         ));
     // The redemption route keeps its own limiter and log gates: one set per router.
     let register = mounts
@@ -376,6 +381,7 @@ pub struct Server {
     /// The data channel's backend, which the router was built from: the completion pass takes its
     /// store, period and registry.
     uploads: uploads::Backend,
+    completions: uploads::Completions,
 }
 
 impl std::fmt::Debug for Server {
@@ -547,6 +553,7 @@ impl Server {
         let hub = Hub::new();
         let hasher = Hasher::new();
         let operator_sessions = OperatorSessions::new();
+        let completions = uploads::Completions::default();
         Ok(Server {
             listener,
             router: router(AppState {
@@ -558,6 +565,7 @@ impl Server {
                 operator_sessions: operator_sessions.clone(),
                 hasher: hasher.clone(),
                 uploads: uploads.clone(),
+                completions: completions.clone(),
             }),
             pool,
             sessions,
@@ -570,6 +578,7 @@ impl Server {
             job_queue: None,
             job_expiry: None,
             uploads,
+            completions,
         })
     }
 
@@ -651,6 +660,7 @@ impl Server {
             job_queue,
             job_expiry,
             uploads,
+            completions,
         } = self;
         // The revocation pass is one of the hub's tasks, so that the stop ends it before the pool
         // closes (ADR-468 item 11).
@@ -669,6 +679,7 @@ impl Server {
                 pool.clone(),
                 hub.clone(),
                 uploads,
+                completions,
             ));
         }
         // The delivery queue is another of them, and the only consumer of the hub's inbox

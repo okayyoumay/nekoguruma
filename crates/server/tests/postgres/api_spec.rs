@@ -63,6 +63,7 @@ fn state() -> AppState {
         operator_sessions: OperatorSessions::new(),
         hasher: Hasher::new(),
         uploads: server::uploads::Backend::default(),
+        completions: server::uploads::Completions::default(),
     }
 }
 

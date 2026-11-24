@@ -290,19 +290,31 @@ may have gone, or have given up, and the row then holds its job's slot for good.
     has an object store. A pass reads, in one short read-only transaction, the 100 oldest
     `completing` rows of all tenants, by `created_at`, and then takes them one at a time: it
     starts the completion of item 20 for the row, or joins the one that runs, through the same
-    registry the routes use (so a pass and a request for one upload run one store completion),
-    and waits for its outcome. The outcomes are item 19's: `finished`, `failed` (which frees
-    the job's slot for a new begin), `open` when the parts have a problem, and a row that stays
-    `completing` on a store or database error until the next pass. There is no grace period: a
-    `completing` row whose task is not in this process is taken at once, since the registry
-    stops a second task here, and across processes the compare-and-set and the store's repeat
-    safety keep the row and the object right (item 20); a row a request is completing in
-    another process costs one extra, harmless store call. A row whose upload ID, key or digest
-    does not parse is skipped and left as it is, with a warning that names nothing; the pass
-    writes nothing for it. A failed read warns with the SQLSTATE only and writes nothing; the
-    next pass retries. The stop ends the pass in its wait and in its work, as it ends the
-    revocation pass (ADR-468 item 11), and a task that ends without an outcome (the stop, a
-    panic) ends the pass's round.
+    registry the routes use (a server's own, shared by its routes and its pass, so a pass and a
+    request for one upload run one store completion), and waits for its outcome. The outcomes
+    are item 19's: `finished`, `failed` (which frees the job's slot for a new begin), `open`
+    when the parts have a problem, and a row that stays `completing` on a store or database
+    error until the next pass. There is no grace period: a `completing` row whose task is not
+    in this process is taken at once, since the registry stops a second task here, and across
+    processes the compare-and-set and the store's repeat safety keep the row and the object
+    right (item 20); a row a request is completing in another process costs one extra, harmless
+    store call. **A task the pass starts only resumes a row that is still `completing`:** it
+    never makes the compare-and-set from `open`, because a request may have returned the row to
+    `open` (a part problem) after the pass read it, and the row is then the agent's again. When
+    the row is `open` at the task's start the task ends with no outcome, so a request that
+    joined it answers 503 and repeats, which starts a normal task; when it is `finished` or
+    `failed` the task's outcome is that state. **The pass completes the rows of agents revoked
+    since:** the upload was declared and its completion requested while the agent was
+    authorized, and the object is still verified against the declared digest; revocation stops
+    what the agent does next (item 2), it does not discard data already handed over. A row
+    whose upload ID, key or digest does not parse is skipped and left as it is, with a warning
+    that names nothing; the pass writes nothing for it. A failed read warns with the SQLSTATE
+    only and writes nothing; the next pass retries. The completion's warnings have a log gate
+    for each reason, so one reason's flood does not hide another's. The stop ends the pass in
+    its wait and in its work, as it ends the revocation pass (ADR-468 item 11). A task that ends
+    without an outcome for another reason (a panic, or the row case above) leaves its row to the
+    next pass, and the pass goes on with the next row, so one row that always panics does not
+    keep the others from their pass.
 
 ## Consequences
 

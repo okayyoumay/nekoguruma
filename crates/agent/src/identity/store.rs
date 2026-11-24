@@ -5,7 +5,7 @@
 //! no code path of the agent can overwrite or lose a key (ADR-387). The Linux user-mode store
 //! on the Secret Service implements [`SecretStore`] in `secret_service` (ADR-496); the Linux
 //! device-mode store on a systemd credential (`systemd_credential`, ADR-498) can read only; the
-//! Windows store (DPAPI blob) implements it later.
+//! Windows store, a DPAPI blob file, implements it in `blob_store` over `dpapi` (ADR-507).
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;

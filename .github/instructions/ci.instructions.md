@@ -18,6 +18,9 @@ Flag as P1:
   way); widening it to the whole package is a finding. On pull requests `core-windows` also leaves
   out the agent's `runner::` tests, which have no Windows-specific code and run in `core-linux`;
   main runs them on Windows too. Running them on Windows on pull requests again is a finding. So
+  is the `core-windows` step that runs the agent's `windows_service_account` test on pull
+  requests (ADR-507: it is the only test of the key store under the virtual service account);
+  widening it beyond that one test is a finding. So
   is `fuzz`, the cargo-fuzz targets of
   `fuzz/` for 60 seconds each on main only (design 12.1 asks for fuzzing against malformed IR in
   CI); running it on pull requests is a finding.

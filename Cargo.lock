@@ -37,6 +37,7 @@ dependencies = [
  "tracing-subscriber",
  "vci-service-config",
  "vci-service-interface",
+ "windows-sys 0.61.2",
  "worker-host",
  "zbus",
 ]

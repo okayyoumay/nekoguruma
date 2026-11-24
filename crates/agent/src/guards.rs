@@ -384,8 +384,10 @@ impl LockFile {
 
 /// Opens an existing lock file read-only without following a symlink or blocking on a FIFO, and
 /// requires a regular file (ADR-262 item 6). `O_NONBLOCK` and `O_NOCTTY` keep a FIFO or a
-/// terminal device from stalling or capturing the open; the type check then refuses them.
-fn open_read_only(path: &Path) -> Result<File, GuardError> {
+/// terminal device from stalling or capturing the open; the type check then refuses them. On
+/// Windows a reparse point is opened itself and refused the same way. The identity directory's
+/// Windows key store opens its file through this too.
+pub(crate) fn open_read_only(path: &Path) -> Result<File, GuardError> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]

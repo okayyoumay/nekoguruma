@@ -150,6 +150,10 @@ pub(crate) struct Wrap {
     /// The key the next fake `begin` (one with no real store behind it) issues, once.
     pub(crate) begin_key: Mutex<Option<ObjectKey>>,
     list_fail: Mutex<Option<Fail>>,
+    /// The parts a fake (no real store) lists.
+    listed: Mutex<Vec<Part>>,
+    /// A failure of the next `list_parts` only.
+    list_fail_once: Mutex<Option<Fail>>,
     delete_fail: Mutex<Option<Fail>>,
     pub(crate) presign_fail: Mutex<Option<Fail>>,
     complete_fail: Mutex<Option<Fail>>,
@@ -302,12 +306,15 @@ impl MultipartStore for Wrap {
             if let Some(hold) = hold {
                 hold.wait().await;
             }
+            if let Some(error) = self.list_fail_once.lock().unwrap().take() {
+                return Err(error.error());
+            }
             if let Some(error) = Wrap::fail(&self.list_fail) {
                 return Err(error);
             }
             match &self.inner {
                 Some(inner) => inner.list_parts(upload).await,
-                None => Ok(Vec::new()),
+                None => Ok(self.listed.lock().unwrap().clone()),
             }
         })
     }
@@ -1671,7 +1678,8 @@ async fn a_part_url_and_a_status_need_the_store_and_say_so_when_it_fails() {
         .unwrap();
     problem(&fx.part(&id, "1").await, 500, "unparsable key");
     problem(&fx.status(&id).await, 500, "unparsable key, status");
-    // A store that has lost the upload, or fails, is a 503 and the row is not written.
+    // A store that fails, or has no randomness, is a 503 or a 500 and the row is not written. A
+    // store that has lost the upload is handed to the completion (the tests of ADR-493 item 30).
     sqlx::query("UPDATE job_objects SET storage_key = gen_random_uuid()::text WHERE id = $1::uuid")
         .bind(&id)
         .execute(&fx.u.w.pool)
@@ -1682,10 +1690,8 @@ async fn a_part_url_and_a_status_need_the_store_and_say_so_when_it_fails() {
             "SELECT xmin::text || state FROM job_objects WHERE id = '{id}'"
         ))
         .await;
-    for fail in [Fail::NotFound, Fail::AlreadyFinished, Fail::Io] {
-        Wrap::set(&fx.wrap.list_fail, Some(fail));
-        problem(&fx.status(&id).await, 503, "list fails");
-    }
+    Wrap::set(&fx.wrap.list_fail, Some(Fail::Io));
+    problem(&fx.status(&id).await, 503, "list fails");
     Wrap::set(&fx.wrap.list_fail, Some(Fail::Random));
     problem(&fx.status(&id).await, 500, "list random");
     assert_eq!(
@@ -1699,6 +1705,209 @@ async fn a_part_url_and_a_status_need_the_store_and_say_so_when_it_fails() {
     // An upload with no parts holds none.
     let v = json(&fx.status(&id).await);
     assert_eq!(v["partsHeld"], 0);
+    fx.finish().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The status hands an `open` row whose upload the store lost to the completion (ADR-493 item 30)
+
+/// The status of `id` as a request text, for a request that is sent from a task of its own.
+fn status_request(fx: &Fx, id: &str) -> String {
+    fx.request_text(
+        "GET",
+        &format!("/api/v1/agent/uploads/{id}"),
+        Some(&fx.token),
+        None,
+        "",
+    )
+}
+
+/// An `open` row on a fixture whose store has lost every upload.
+async fn lost_row(fx: &Fx) -> (String, String) {
+    let job = fx.job().await;
+    let id = fx
+        .row(&job, 1, "result", 10, "open", PART_BYTES as i64)
+        .await;
+    Wrap::set(&fx.wrap.list_fail, Some(Fail::NotFound));
+    (job, id)
+}
+
+/// An upload the store no longer has ends `failed` through one store completion, and the answer
+/// says so: the job's slot is free for a new begin.
+#[tokio::test]
+async fn the_status_of_an_open_row_whose_upload_is_gone_fails_it_and_a_new_begin_is_allowed() {
+    let fx = Fx::new(With::Fake).await;
+    let (job, id) = lost_row(&fx).await;
+    Wrap::set(&fx.wrap.complete_fail, Some(Fail::NotFound));
+    let r = fx.status(&id).await;
+    assert_eq!(r.status, 200, "{}", r.head);
+    let v = json(&r);
+    assert_eq!(v["state"], "failed");
+    assert_eq!(v["partBytes"], PART_BYTES);
+    assert_eq!(v["partCount"], 1);
+    assert!(v.get("partsHeld").is_none(), "{v}");
+    assert_eq!(fx.state(&id).await, "failed");
+    assert_eq!(fx.wrap.completes.load(Ordering::SeqCst), 1);
+    Wrap::set(&fx.wrap.list_fail, None);
+    assert_eq!(fx.begin(&result_of(&job, 10)).await.status, 201);
+    fx.finish().await;
+}
+
+/// The same against the bundled object server: a begun upload deleted from the store.
+#[tokio::test]
+async fn the_status_of_a_begun_upload_that_the_object_server_lost_fails_it() {
+    let fx = Fx::new(With::Real).await;
+    let job = fx.job().await;
+    let id = upload_id(&fx.begin(&result_of(&job, 10)).await);
+    let key = ObjectKey::parse(
+        &fx.sql(&format!(
+            "SELECT storage_key FROM job_objects WHERE id = '{id}'"
+        ))
+        .await,
+    )
+    .unwrap();
+    fx.wrap.delete(&key).await.unwrap();
+    let r = fx.status(&id).await;
+    assert_eq!(r.status, 200, "{}", r.head);
+    assert_eq!(json(&r)["state"], "failed");
+    assert_eq!(fx.state(&id).await, "failed");
+    assert_eq!(fx.begin(&result_of(&job, 10)).await.status, 201);
+    fx.finish().await;
+}
+
+/// An upload the store already completed is ended by the read-back: `finished` when the object
+/// matches, `failed` when it does not.
+#[tokio::test]
+async fn the_status_of_an_open_row_whose_upload_is_already_finished_is_decided_by_the_read_back() {
+    let fx = Fx::new(With::Fake).await;
+    for (fail, state) in [(None, "finished"), (Some(Fail::HashMismatch), "failed")] {
+        let (_, id) = lost_row(&fx).await;
+        Wrap::set(&fx.wrap.list_fail, Some(Fail::AlreadyFinished));
+        Wrap::set(&fx.wrap.complete_fail, fail);
+        let r = fx.status(&id).await;
+        assert_eq!(r.status, 200, "{}", r.head);
+        assert_eq!(json(&r)["state"], state);
+        assert_eq!(fx.state(&id).await, state);
+    }
+    fx.finish().await;
+}
+
+/// A part problem returns the row to `open`; the answer lists the parts the store holds, which
+/// the agent needs of an `open` status.
+#[tokio::test]
+async fn a_part_problem_found_by_the_status_hand_over_is_open_with_the_parts_held() {
+    let fx = Fx::new(With::Fake).await;
+    let (_, id) = lost_row(&fx).await;
+    Wrap::set(&fx.wrap.list_fail, None);
+    *fx.wrap.list_fail_once.lock().unwrap() = Some(Fail::NotFound);
+    Wrap::set(&fx.wrap.complete_fail, Some(Fail::NoParts));
+    // The store holds the row's one part of 10 bytes, which only a listing after the completion
+    // can tell the answer.
+    *fx.wrap.listed.lock().unwrap() = vec![Part {
+        number: 1,
+        size: 10,
+    }];
+    let r = fx.status(&id).await;
+    assert_eq!(r.status, 200, "{}", r.head);
+    let v = json(&r);
+    assert_eq!(v["state"], "open");
+    assert_eq!(v["partsHeld"], 1);
+    // One listing found the upload gone, and one after the part problem counted the parts.
+    assert_eq!(fx.wrap.calls()[2], 2);
+    assert_eq!(fx.state(&id).await, "open");
+    assert_eq!(fx.wrap.completes.load(Ordering::SeqCst), 1);
+    fx.finish().await;
+}
+
+/// When the listing after a part problem fails too, the status is 503 and the row stays as the
+/// completion left it, `open`.
+#[tokio::test]
+async fn a_failed_listing_after_a_status_hand_over_part_problem_is_503_with_the_row_open() {
+    let fx = Fx::new(With::Fake).await;
+    let (_, id) = lost_row(&fx).await;
+    Wrap::set(&fx.wrap.complete_fail, Some(Fail::NoParts));
+    // `lost_row` keeps the listing failing, so the second listing fails as the first did.
+    problem(&fx.status(&id).await, 503, "the second listing fails");
+    assert_eq!(fx.state(&id).await, "open");
+    assert_eq!(fx.wrap.completes.load(Ordering::SeqCst), 1);
+    assert_eq!(fx.wrap.calls()[2], 2);
+    fx.finish().await;
+}
+
+/// `HEAD` is served through the status handler, so it hands the row over as `GET` does.
+#[tokio::test]
+async fn a_head_status_of_an_open_row_whose_upload_is_gone_fails_it() {
+    let fx = Fx::new(With::Fake).await;
+    let (_, id) = lost_row(&fx).await;
+    Wrap::set(&fx.wrap.complete_fail, Some(Fail::NotFound));
+    let r = fx
+        .send(
+            "HEAD",
+            &format!("/api/v1/agent/uploads/{id}"),
+            Some(&fx.token),
+            None,
+            "",
+        )
+        .await;
+    assert_eq!(r.status, 200, "{}", r.head);
+    assert_eq!(r.body, "");
+    assert_eq!(fx.state(&id).await, "failed");
+    assert_eq!(fx.wrap.completes.load(Ordering::SeqCst), 1);
+    fx.finish().await;
+}
+
+/// A store that cannot answer leaves the row `completing` and the status a 503.
+#[tokio::test]
+async fn a_store_error_in_the_status_hand_over_is_503_and_the_row_stays_completing() {
+    let fx = Fx::new(With::Fake).await;
+    let (_, id) = lost_row(&fx).await;
+    Wrap::set(&fx.wrap.complete_fail, Some(Fail::Io));
+    problem(&fx.status(&id).await, 503, "the store cannot answer");
+    assert_eq!(fx.state(&id).await, "completing");
+    assert_eq!(fx.wrap.completes.load(Ordering::SeqCst), 1);
+    fx.finish().await;
+}
+
+/// A status that waits past the backend's wait answers `completing`, and the task goes on to the
+/// state the store's answer decides.
+#[tokio::test]
+async fn a_status_hand_over_that_outlasts_the_wait_is_completing_and_ends_as_the_outcome_says() {
+    let fx = Fx::waiting(With::Fake, Duration::from_millis(300)).await;
+    let (_, id) = lost_row(&fx).await;
+    let hold = Hold::new();
+    *fx.wrap.complete_hold.lock().unwrap() = Some(Arc::clone(&hold));
+    let r = fx.status(&id).await;
+    assert_eq!(r.status, 200, "{}", r.head);
+    assert_eq!(json(&r)["state"], "completing");
+    assert_eq!(fx.state(&id).await, "completing");
+    hold.release();
+    fx.until(&id, "finished").await;
+    assert_eq!(fx.wrap.completes.load(Ordering::SeqCst), 1);
+    fx.finish().await;
+}
+
+/// A status and a completion request for one upload run one store completion: the request that
+/// comes second joins the task the first started.
+#[tokio::test]
+async fn a_status_hand_over_and_a_complete_request_run_one_store_completion() {
+    let fx = Fx::waiting(With::Fake, Duration::from_millis(300)).await;
+    let (_, id) = lost_row(&fx).await;
+    let hold = Hold::new();
+    *fx.wrap.complete_hold.lock().unwrap() = Some(Arc::clone(&hold));
+    let addr = fx.addr();
+    let raw = status_request(&fx, &id);
+    let status = tokio::spawn(async move { exchange(addr, &raw).await });
+    // The status's task is inside the store, so its registry entry exists until the release.
+    hold.entered().await;
+    let r = fx.complete(&id).await;
+    assert_eq!(r.status, 202, "{}", r.head);
+    assert_eq!(fx.wrap.completes.load(Ordering::SeqCst), 1);
+    let status = status.await.unwrap();
+    assert_eq!(status.status, 200, "{}", status.head);
+    assert_eq!(json(&status)["state"], "completing");
+    hold.release();
+    fx.until(&id, "finished").await;
+    assert_eq!(fx.wrap.completes.load(Ordering::SeqCst), 1);
     fx.finish().await;
 }
 

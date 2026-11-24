@@ -1,4 +1,5 @@
-//! The data channel's four routes (design 5.2, 13.3, 14.3; ADR-493 items 1 to 8, 15 to 23):
+//! The data channel's four routes (design 5.2, 13.3, 14.3; ADR-493 items 1 to 8, 15 to 23, 29
+//! and 30):
 //! `POST /api/v1/agent/uploads` (begin), `POST /api/v1/agent/uploads/{uploadId}/parts/{part}`
 //! (one part URL), `GET /api/v1/agent/uploads/{uploadId}` (status) and
 //! `POST /api/v1/agent/uploads/{uploadId}/complete` (complete).
@@ -27,7 +28,8 @@
 //! adopted by the hub so that the stop ends it, which outlives the request that started it: the
 //! requests only wait for its outcome (ADR-493 items 20 and 21). The completion pass
 //! ([`run_completion_pass`]) starts the same task for the `completing` rows that no request
-//! repeats, through the same registry (ADR-493 item 29).
+//! repeats, through the same registry (ADR-493 item 29), and so does the status of an `open` row
+//! whose upload the store has lost (ADR-493 item 30).
 //!
 //! Never logged: a token, a body, a digest, an object key, an upload ID, a URL or the text of a
 //! database error (the SQLSTATE only).
@@ -1675,13 +1677,9 @@ async fn status_answer(
         Ok(row) => row,
         Err(response) => return *response,
     };
-    let mut answer = json!({
-        "state": row.state,
-        "partBytes": row.part_bytes,
-        "partCount": row.count(),
-    });
+    let mut answer = status_body(&row, &row.state);
     if row.state == "open" {
-        let Some(store) = u.backend.store.as_deref() else {
+        let Some(store) = u.backend.store.clone() else {
             return no_store();
         };
         let Some(upload) = row.upload() else {
@@ -1690,24 +1688,16 @@ async fn status_answer(
         match store.list_parts(&upload).await {
             Ok(listed) => answer["partsHeld"] = parts_held(&listed, &row).into(),
             // An upload the store no longer has is the sign of a completion that moved the row
-            // on: the row is read once more. A row that is not `open` any more is answered as
-            // it is now; one that still is `open` is a 503 and nothing is written (ADR-493
-            // items 17 and 23).
+            // on, or of an upload the store lost. The row is read once more: a row that is not
+            // `open` any more is answered as it is now, and one that still is `open` is handed
+            // to the completion task, which decides it (ADR-493 item 30).
             Err(error @ (StoreError::NotFound | StoreError::AlreadyFinished)) => {
                 match upload_row(&u.pool, &caller.tenant, &caller.agent.0, &id).await {
                     Ok(Some(now)) if now.state != "open" => {
-                        return json_answer(
-                            StatusCode::OK,
-                            json!({
-                                "state": now.state,
-                                "partBytes": now.part_bytes,
-                                "partCount": now.count(),
-                            }),
-                        );
+                        return json_answer(StatusCode::OK, status_body(&now, &now.state));
                     }
-                    Ok(_) => {
-                        return store_failure(u, &error);
-                    }
+                    Ok(Some(now)) => return hand_over(u, caller, &now, store).await,
+                    Ok(None) => return store_failure(u, &error),
                     Err(error) => return db_failure(u, &error),
                 }
             }
@@ -1715,6 +1705,91 @@ async fn status_answer(
         }
     }
     json_answer(StatusCode::OK, answer)
+}
+
+/// The status answer's members without `partsHeld`.
+fn status_body(row: &Row, state: &str) -> Value {
+    json!({
+        "state": state,
+        "partBytes": row.part_bytes,
+        "partCount": row.count(),
+    })
+}
+
+/// The status of an `open` row whose upload the store lost: starts or joins the upload's
+/// completion task (the open to completing compare-and-set is the task's, as for a request to
+/// complete) and answers the outcome in the status's shape (ADR-493 item 30). `finished` and
+/// `failed` are the task's writes, `open` (a part problem) lists the parts the store holds, and a
+/// task still running when the wait is over is `completing`. An error outcome is the complete
+/// route's answer: the task has made the move to `completing`, so the row stays `completing` for
+/// a repeat, a request to complete or the pass, and nothing more is written.
+async fn hand_over(
+    u: &Uploads,
+    caller: &Caller,
+    row: &Row,
+    store: Arc<dyn MultipartStore>,
+) -> Response {
+    let Some(job) = row.completion_job() else {
+        return unparsable(u);
+    };
+    // Kept for the listing after a part problem; the job goes to the task.
+    let upload = job.upload.clone();
+    let mut outcome = u.completer.completion(
+        Start::Request,
+        &caller.tenant,
+        &row.id,
+        Arc::clone(&store),
+        job,
+    );
+    match wait_outcome(u.backend.complete_wait, &mut outcome).await {
+        Waited::Done(done @ (Outcome::Finished | Outcome::Failed)) => {
+            let state = done.written_state().unwrap_or("completing");
+            json_answer(StatusCode::OK, status_body(row, state))
+        }
+        Waited::Done(Outcome::Open) => {
+            open_after_part_problem(u, row, store.as_ref(), &upload).await
+        }
+        Waited::Done(other) => other.answer(),
+        Waited::Ended => Outcome::StoreUnavailable.answer(),
+        Waited::Running => json_answer(StatusCode::OK, status_body(row, "completing")),
+    }
+}
+
+/// The status of a row that a completion returned to `open`: its parts are untouched, so the
+/// listing gives `partsHeld`, which the agent requires of an `open` answer.
+async fn open_after_part_problem(
+    u: &Uploads,
+    row: &Row,
+    store: &dyn MultipartStore,
+    upload: &Upload,
+) -> Response {
+    match store.list_parts(upload).await {
+        Ok(listed) => {
+            let mut answer = status_body(row, "open");
+            answer["partsHeld"] = parts_held(&listed, row).into();
+            json_answer(StatusCode::OK, answer)
+        }
+        Err(error) => store_failure(u, &error),
+    }
+}
+
+/// How a wait for a completion task ended.
+enum Waited {
+    /// The task's outcome.
+    Done(Outcome),
+    /// The task ended with no outcome (it panicked or the stop ended it): the row is as it was.
+    Ended,
+    /// The wait ran out; the task goes on.
+    Running,
+}
+
+/// Waits for the outcome of a completion task at most `wait`.
+async fn wait_outcome(wait: Duration, outcome: &mut watch::Receiver<Option<Outcome>>) -> Waited {
+    match tokio::time::timeout(wait, outcome.wait_for(|outcome| outcome.is_some())).await {
+        Ok(Ok(settled)) => Waited::Done(settled.unwrap_or(Outcome::Internal)),
+        Ok(Err(_)) => Waited::Ended,
+        Err(_) => Waited::Running,
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1786,17 +1861,12 @@ async fn complete_answer(
     let mut outcome = u
         .completer
         .completion(Start::Request, &caller.tenant, &row.id, store, job);
-    match tokio::time::timeout(
-        u.backend.complete_wait,
-        outcome.wait_for(|outcome| outcome.is_some()),
-    )
-    .await
-    {
-        Ok(Ok(settled)) => settled.unwrap_or(Outcome::Internal).answer(),
+    match wait_outcome(u.backend.complete_wait, &mut outcome).await {
+        Waited::Done(outcome) => outcome.answer(),
         // The task ended without an outcome (it panicked or the stop ended it): the row is as it
         // was and a repeat resumes.
-        Ok(Err(_)) => Outcome::StoreUnavailable.answer(),
-        Err(_) => json_answer(StatusCode::ACCEPTED, json!({"state": "completing"})),
+        Waited::Ended => Outcome::StoreUnavailable.answer(),
+        Waited::Running => json_answer(StatusCode::ACCEPTED, json!({"state": "completing"})),
     }
 }
 

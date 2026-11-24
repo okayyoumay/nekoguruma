@@ -881,9 +881,20 @@ paths:
         of another agent or tenant, an ID that is not a UUID and an unknown one are **404**.
         The body is empty, as for the part URL. Token and agent row are judged as for begin. An
         `open` row whose listing fails is **503** and the row is not changed. When the store
-        lists the upload as gone (a completion may just have moved the row on) the row is read
-        once more: a row that is no longer `open` is answered with its state, as for any
-        other state; one that still is `open` is **503** and is not changed. `HEAD` is answered like `GET`, without a body.
+        lists the upload as gone (a completion may just have moved the row on, or the object
+        server lost the upload) the row is read once more: a row that is no longer `open` is
+        answered with its state, as for any other state. One that still is `open` is handed to
+        the upload's completion task, the one the complete route starts or joins, and the
+        status waits for its outcome, at most as long as the complete route does (20 seconds).
+        It then answers **200** with the state the task wrote: `failed` when the upload and
+        the object are gone or the read-back does not match (a new begin is then allowed),
+        `finished` when the read-back matches, `open` when the parts have a problem (with
+        `partsHeld`, from a new listing), and `completing` when the task is still running. A
+        store or database error ends the task with no outcome to answer: the answer is **503**
+        (**500** where the complete route answers 500) and the row is as the task left it,
+        `completing` once its first step was made, for a repeat, a request to complete or the
+        server's pass to finish. The status is thus not free of effects: it can start a
+        completion and write the row. `HEAD` is answered like `GET`, without a body.
 
         The shape step ends with the proof's request: when the request carries `Ngr-Nonce`
         (ADR-504), the nonce and the request target are judged after the route's own shape

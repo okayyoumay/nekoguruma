@@ -798,7 +798,9 @@ status waits for the outcome through `wait_outcome`, which the complete route us
 the backend's `complete_wait`. It answers 200 in its usual shape with the state the task wrote
 (`finished`, `failed`, or `open` with a fresh listing's `partsHeld`, which the agent requires of
 an `open` answer) or `completing` when the wait runs out; an error outcome is the complete
-route's 503 or 500 with nothing written (ADR-493 item 30).
+route's 503 or 500, and the row is as the task left it (`completing` once its compare-and-set
+was made), for a repeat, a request or the pass to finish (ADR-493 item 30). The status route (and
+`HEAD`, which axum serves through the `GET` handler) can thus write the row.
 
 **The download route.** `downloads.rs` serves `POST /api/v1/agent/downloads` behind the same guard
 and from the same `uploads::Backend`; the token and the agent's row are judged by the code the

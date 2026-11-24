@@ -335,10 +335,20 @@ moves such a row on, and the status was the agent's only question about it.
     `partsHeld` from a new listing, since an `open` answer carries it and the parts are
     untouched), and `completing` when the wait runs out. A store or database error outcome, or
     a task that ends with no outcome, answers as the complete route does (503, 500 for a store
-    without randomness) with nothing written. The waiting is shared with the complete route;
-    the answers are not: the complete route answers 409 with a `state` member for `open` and
-    `failed`, the status answers 200. The agent needs no change: it takes `finished`,
-    `failed` and `completing` from a status as it takes them from begin and complete.
+    without randomness); the task has already made the compare-and-set, so the row is
+    `completing` then, not as the status found it, and a repeat, a request to complete or the
+    pass finishes it. The waiting is shared with the complete route; the answers are not: the
+    complete route answers 409 with a `state` member for `open` and `failed`, the status
+    answers 200. The agent needs no change: it takes `finished`, `failed` and `completing` from
+    a status as it takes them from begin and complete. Three consequences follow. (a) After a
+    hand-over that ends in an error, the agent's next step (one completion after a status 503,
+    ADR-495 item 10) runs a second store completion, which is safe because a completion can be
+    repeated. (b) A status can join a task the completion pass started; if that task finds the
+    row `open` again (item 29, no outcome) the status answers 503, which is rare, and the
+    agent's following completion starts a fresh task. (c) The status route (`GET`, and `HEAD`,
+    which axum serves through the `GET` handler) is no longer free of effects: it can start a
+    completion and write the row. The caller is still the agent with its token, which could
+    already ask for the completion.
 
 ## Consequences
 

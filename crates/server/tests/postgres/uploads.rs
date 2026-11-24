@@ -150,6 +150,8 @@ pub(crate) struct Wrap {
     /// The key the next fake `begin` (one with no real store behind it) issues, once.
     pub(crate) begin_key: Mutex<Option<ObjectKey>>,
     list_fail: Mutex<Option<Fail>>,
+    /// The parts a fake (no real store) lists.
+    listed: Mutex<Vec<Part>>,
     /// A failure of the next `list_parts` only.
     list_fail_once: Mutex<Option<Fail>>,
     delete_fail: Mutex<Option<Fail>>,
@@ -312,7 +314,7 @@ impl MultipartStore for Wrap {
             }
             match &self.inner {
                 Some(inner) => inner.list_parts(upload).await,
-                None => Ok(Vec::new()),
+                None => Ok(self.listed.lock().unwrap().clone()),
             }
         })
     }
@@ -1799,12 +1801,57 @@ async fn a_part_problem_found_by_the_status_hand_over_is_open_with_the_parts_hel
     Wrap::set(&fx.wrap.list_fail, None);
     *fx.wrap.list_fail_once.lock().unwrap() = Some(Fail::NotFound);
     Wrap::set(&fx.wrap.complete_fail, Some(Fail::NoParts));
+    // The store holds the row's one part of 10 bytes, which only a listing after the completion
+    // can tell the answer.
+    *fx.wrap.listed.lock().unwrap() = vec![Part {
+        number: 1,
+        size: 10,
+    }];
     let r = fx.status(&id).await;
     assert_eq!(r.status, 200, "{}", r.head);
     let v = json(&r);
     assert_eq!(v["state"], "open");
-    assert_eq!(v["partsHeld"], 0);
+    assert_eq!(v["partsHeld"], 1);
+    // One listing found the upload gone, and one after the part problem counted the parts.
+    assert_eq!(fx.wrap.calls()[2], 2);
     assert_eq!(fx.state(&id).await, "open");
+    assert_eq!(fx.wrap.completes.load(Ordering::SeqCst), 1);
+    fx.finish().await;
+}
+
+/// When the listing after a part problem fails too, the status is 503 and the row stays as the
+/// completion left it, `open`.
+#[tokio::test]
+async fn a_failed_listing_after_a_status_hand_over_part_problem_is_503_with_the_row_open() {
+    let fx = Fx::new(With::Fake).await;
+    let (_, id) = lost_row(&fx).await;
+    Wrap::set(&fx.wrap.complete_fail, Some(Fail::NoParts));
+    // `lost_row` keeps the listing failing, so the second listing fails as the first did.
+    problem(&fx.status(&id).await, 503, "the second listing fails");
+    assert_eq!(fx.state(&id).await, "open");
+    assert_eq!(fx.wrap.completes.load(Ordering::SeqCst), 1);
+    assert_eq!(fx.wrap.calls()[2], 2);
+    fx.finish().await;
+}
+
+/// `HEAD` is served through the status handler, so it hands the row over as `GET` does.
+#[tokio::test]
+async fn a_head_status_of_an_open_row_whose_upload_is_gone_fails_it() {
+    let fx = Fx::new(With::Fake).await;
+    let (_, id) = lost_row(&fx).await;
+    Wrap::set(&fx.wrap.complete_fail, Some(Fail::NotFound));
+    let r = fx
+        .send(
+            "HEAD",
+            &format!("/api/v1/agent/uploads/{id}"),
+            Some(&fx.token),
+            None,
+            "",
+        )
+        .await;
+    assert_eq!(r.status, 200, "{}", r.head);
+    assert_eq!(r.body, "");
+    assert_eq!(fx.state(&id).await, "failed");
     assert_eq!(fx.wrap.completes.load(Ordering::SeqCst), 1);
     fx.finish().await;
 }

@@ -1721,7 +1721,8 @@ fn status_body(row: &Row, state: &str) -> Value {
 /// complete) and answers the outcome in the status's shape (ADR-493 item 30). `finished` and
 /// `failed` are the task's writes, `open` (a part problem) lists the parts the store holds, and a
 /// task still running when the wait is over is `completing`. An error outcome is the complete
-/// route's answer, and nothing more is written.
+/// route's answer: the task has made the move to `completing`, so the row stays `completing` for
+/// a repeat, a request to complete or the pass, and nothing more is written.
 async fn hand_over(
     u: &Uploads,
     caller: &Caller,
@@ -1731,15 +1732,23 @@ async fn hand_over(
     let Some(job) = row.completion_job() else {
         return unparsable(u);
     };
-    let mut outcome = u
-        .completer
-        .completion(Start::Request, &caller.tenant, &row.id, store, job);
+    // Kept for the listing after a part problem; the job goes to the task.
+    let upload = job.upload.clone();
+    let mut outcome = u.completer.completion(
+        Start::Request,
+        &caller.tenant,
+        &row.id,
+        Arc::clone(&store),
+        job,
+    );
     match wait_outcome(u.backend.complete_wait, &mut outcome).await {
         Waited::Done(done @ (Outcome::Finished | Outcome::Failed)) => {
             let state = done.written_state().unwrap_or("completing");
             json_answer(StatusCode::OK, status_body(row, state))
         }
-        Waited::Done(Outcome::Open) => open_after_part_problem(u, row).await,
+        Waited::Done(Outcome::Open) => {
+            open_after_part_problem(u, row, store.as_ref(), &upload).await
+        }
         Waited::Done(other) => other.answer(),
         Waited::Ended => Outcome::StoreUnavailable.answer(),
         Waited::Running => json_answer(StatusCode::OK, status_body(row, "completing")),
@@ -1748,11 +1757,13 @@ async fn hand_over(
 
 /// The status of a row that a completion returned to `open`: its parts are untouched, so the
 /// listing gives `partsHeld`, which the agent requires of an `open` answer.
-async fn open_after_part_problem(u: &Uploads, row: &Row) -> Response {
-    let (Some(store), Some(upload)) = (u.backend.store.as_deref(), row.upload()) else {
-        return unparsable(u);
-    };
-    match store.list_parts(&upload).await {
+async fn open_after_part_problem(
+    u: &Uploads,
+    row: &Row,
+    store: &dyn MultipartStore,
+    upload: &Upload,
+) -> Response {
+    match store.list_parts(upload).await {
         Ok(listed) => {
             let mut answer = status_body(row, "open");
             answer["partsHeld"] = parts_held(&listed, row).into();

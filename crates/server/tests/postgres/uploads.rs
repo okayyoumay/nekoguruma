@@ -24,6 +24,7 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::{Barrier, Notify, Semaphore};
 
 use crate::control::{nonce_line, token};
+use crate::redeem::World;
 use crate::redeem::{Agent, bytes_of, capture, json};
 use crate::serving::{Reply, Running, exchange};
 use crate::session::{Up, audience_of};
@@ -471,13 +472,21 @@ impl Fx {
         }
         let wrap = Arc::new(wrap);
         let store = (with != With::Nothing).then(|| Arc::clone(&wrap) as Arc<dyn MultipartStore>);
-        let backend = tune(Backend::new(store));
+        // The fixture's own pass runs once, as its server starts, and then an hour apart: a test
+        // that writes rows by hand is not raced by it once the fixture is built. A test that
+        // wants passes sets a period in `tune`.
+        let backend =
+            tune(Backend::new(store).with_completion_pass_period(Duration::from_secs(3600)));
+        let counted = backend.clone();
         let (u, fail) = if flaky {
             let (u, fail) = Up::flaky_with(backend).await;
             (u, Some(fail))
         } else {
             (Up::with_backend(2, None, None, backend).await, None)
         };
+        if with != With::Nothing {
+            until_first_pass(&counted).await;
+        }
         let token = token(&u).await;
         (
             Fx {
@@ -733,11 +742,38 @@ impl Fx {
         state: &str,
         part_bytes: i64,
     ) -> String {
+        self.row_with_upload_id(
+            job,
+            generation,
+            kind,
+            size,
+            state,
+            part_bytes,
+            "fake-upload-id",
+        )
+        .await
+    }
+
+    /// [`Fx::row`] with the store's upload ID the row names.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "a row's columns, as `row` has them"
+    )]
+    async fn row_with_upload_id(
+        &self,
+        job: &str,
+        generation: i64,
+        kind: &str,
+        size: i64,
+        state: &str,
+        part_bytes: i64,
+        upload_id: &str,
+    ) -> String {
         sqlx::query_scalar(
             "INSERT INTO job_objects (tenant_id, id, job_id, generation, kind, agent_id, \
                  storage_key, upload_id, part_bytes, size_bytes, digest, state, finished_at) \
              SELECT j.tenant_id, gen_random_uuid(), j.id, $2, $3, j.agent_id, \
-                 gen_random_uuid()::text, 'fake-upload-id', $6, $4, $7, $5, \
+                 gen_random_uuid()::text, $8, $6, $4, $7, $5, \
                  CASE WHEN $5 = 'finished' THEN now() END \
              FROM jobs j WHERE j.id = $1::uuid RETURNING id::text",
         )
@@ -748,6 +784,7 @@ impl Fx {
         .bind(state)
         .bind(part_bytes)
         .bind(digest())
+        .bind(upload_id)
         .fetch_one(&self.u.w.pool)
         .await
         .unwrap()
@@ -2142,6 +2179,383 @@ async fn a_completing_row_with_nothing_left_is_failed_and_a_new_begin_is_allowed
     fx.finish().await;
 }
 
+// ---------------------------------------------------------------------------------------------
+// The completion pass (ADR-493 item 29)
+
+/// The period of a pass in the tests that wait for a later one.
+const PASS: Duration = Duration::from_millis(100);
+
+/// A fixture whose server runs the completion pass every `period`.
+async fn passing(with: With, period: Duration) -> Fx {
+    Fx::tuned(with, |backend| backend.with_completion_pass_period(period)).await
+}
+
+/// A second server on the fixture's database and store, whose first pass runs as it starts and
+/// whose later ones are `period` apart, with a shutdown grace of `grace_secs`.
+async fn restarted_with(fx: &Fx, period: Duration, grace_secs: u64) -> Running {
+    restarted_counted(&fx.u.w, &fx.wrap, period, grace_secs)
+        .await
+        .0
+}
+
+/// [`restarted_with`], with the server's backend, which counts its passes.
+async fn restarted_counted(
+    world: &World,
+    wrap: &Arc<Wrap>,
+    period: Duration,
+    grace_secs: u64,
+) -> (Running, Backend) {
+    let http = Http {
+        port: 0,
+        shutdown_grace_secs: grace_secs,
+    };
+    let backend = Backend::new(Some(Arc::clone(wrap) as Arc<dyn MultipartStore>))
+        .with_completion_pass_period(period);
+    let counted = backend.clone();
+    let server = Server::bind_with_store(&http, world.pg.pool(), world.key.clone(), backend)
+        .await
+        .unwrap();
+    (Running::spawn(server), counted)
+}
+
+/// [`restarted_with`] with the fixture's grace.
+async fn restarted(fx: &Fx, period: Duration) -> Running {
+    restarted_with(fx, period, 2).await
+}
+
+/// Sets the row's state, as a cut completion leaves it.
+async fn set_state(fx: &Fx, id: &str, state: &str) {
+    sqlx::query("UPDATE job_objects SET state = $2 WHERE id = $1::uuid")
+        .bind(id)
+        .bind(state)
+        .execute(&fx.u.w.pool)
+        .await
+        .unwrap();
+}
+
+/// A `completing` row made by hand, which the fake store completes.
+async fn completing_row(fx: &Fx) -> String {
+    let job = fx.job().await;
+    fx.row(&job, 1, "result", 10, "completing", PART_BYTES as i64)
+        .await
+}
+
+/// Waits until the fake store has been asked to complete `count` times.
+async fn until_completes(fx: &Fx, count: usize) {
+    for _ in 0..500 {
+        if fx.wrap.completes.load(Ordering::SeqCst) >= count {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the store was not asked to complete {count} times");
+}
+
+/// Waits until the backend's server has ended its first pass, which runs as the server starts.
+async fn until_first_pass(backend: &Backend) {
+    for _ in 0..1000 {
+        if backend.completion_passes() >= 1 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the server's first completion pass did not end");
+}
+
+/// Gives the rows the creation times `ids` lists them in, one second apart, so that the pass's
+/// order does not rest on the clock's resolution.
+async fn order_rows(fx: &Fx, ids: &[String]) {
+    for (n, id) in ids.iter().enumerate() {
+        sqlx::query(
+            "UPDATE job_objects SET created_at = timestamptz '2020-01-01 00:00:00+00' \
+                 + $2 * interval '1 second' WHERE id = $1::uuid",
+        )
+        .bind(id)
+        .bind(n as i64)
+        .execute(&fx.u.w.pool)
+        .await
+        .unwrap();
+    }
+}
+
+/// A `completing` row that no request repeats is finished by the first pass of a server that
+/// starts on its database, and the object reads back.
+#[tokio::test]
+async fn the_first_pass_at_start_finishes_a_completing_row_no_request_repeats() {
+    let fx = Fx::new(With::Real).await;
+    let bytes = content(1, 1000);
+    let id = begin_for(&fx, &bytes).await;
+    send(&fx, &id, 1, 1000).await;
+    set_state(&fx, &id, "completing").await;
+    // The first server's own first pass ran before the row was there.
+    assert_eq!(fx.state(&id).await, "completing");
+    let second = restarted(&fx, Duration::from_secs(3600)).await;
+    fx.until(&id, "finished").await;
+    assert_eq!(fx.stored(&id).await.unwrap(), bytes);
+    second.finish().await;
+    fx.finish().await;
+}
+
+/// A `completing` row whose upload and object are gone is made `failed` by a later pass, and a
+/// new begin of the declaration is allowed.
+#[tokio::test]
+async fn a_pass_fails_a_completing_row_with_nothing_left_and_a_new_begin_is_allowed() {
+    let fx = passing(With::Real, PASS).await;
+    let job = fx.job().await;
+    let id = upload_id(&fx.begin(&result_of(&job, 10)).await);
+    let key = ObjectKey::parse(
+        &fx.sql(&format!(
+            "SELECT storage_key FROM job_objects WHERE id = '{id}'"
+        ))
+        .await,
+    )
+    .unwrap();
+    fx.wrap.delete(&key).await.unwrap();
+    set_state(&fx, &id, "completing").await;
+    fx.until(&id, "failed").await;
+    assert_eq!(fx.begin(&result_of(&job, 10)).await.status, 201);
+    fx.finish().await;
+}
+
+/// A store that cannot answer leaves the row `completing`; a later pass, once it can, finishes it.
+#[tokio::test]
+async fn a_store_error_leaves_the_row_completing_and_a_later_pass_finishes_it() {
+    let fx = passing(With::Fake, PASS).await;
+    Wrap::set(&fx.wrap.complete_fail, Some(Fail::Io));
+    let id = completing_row(&fx).await;
+    // At least two passes ask and fail.
+    until_completes(&fx, 2).await;
+    assert_eq!(fx.state(&id).await, "completing");
+    Wrap::set(&fx.wrap.complete_fail, None);
+    fx.until(&id, "finished").await;
+    fx.finish().await;
+}
+
+/// A pass and a request for the same upload at once run one store completion, and both are served.
+#[tokio::test]
+async fn a_pass_and_a_request_for_one_upload_run_one_store_completion() {
+    let fx = Fx::tuned(With::Fake, |backend| {
+        backend
+            .with_completion_pass_period(PASS)
+            .with_complete_wait(Duration::from_millis(300))
+    })
+    .await;
+    let hold = Hold::new();
+    *fx.wrap.complete_hold.lock().unwrap() = Some(Arc::clone(&hold));
+    let id = completing_row(&fx).await;
+    // The pass is inside the store for this upload, so its task is in the registry until the
+    // hold is released.
+    hold.entered().await;
+    // A request can answer 202 only by waiting for a task that has not ended: it joined the
+    // pass's task, since it made none of its own that the store would be asked for.
+    let r = fx.complete(&id).await;
+    assert_eq!(r.status, 202, "{}", r.head);
+    assert_eq!(fx.wrap.completes.load(Ordering::SeqCst), 1);
+    hold.release();
+    fx.until(&id, "finished").await;
+    let r = fx.complete(&id).await;
+    assert_eq!(r.status, 200, "{}", r.head);
+    // Later passes and the request found nothing to complete again.
+    assert_eq!(fx.wrap.completes.load(Ordering::SeqCst), 1);
+    fx.finish().await;
+}
+
+/// A row whose stored upload ID does not parse stays `completing` and costs the others of its
+/// pass nothing.
+#[tokio::test]
+async fn an_unparsable_row_is_left_completing_and_the_others_are_finished() {
+    let fx = Fx::new(With::Fake).await;
+    let job = fx.job().await;
+    // A space is not a character of an upload ID, and the column's check allows it. The row is
+    // inserted whole, so no pass can find it parsable.
+    let bad = fx
+        .row_with_upload_id(
+            &job,
+            1,
+            "result",
+            10,
+            "completing",
+            PART_BYTES as i64,
+            "not parsable",
+        )
+        .await;
+    let good = completing_row(&fx).await;
+    let second = restarted(&fx, PASS).await;
+    fx.until(&good, "finished").await;
+    tokio::time::sleep(PASS * 3).await;
+    assert_eq!(fx.state(&bad).await, "completing");
+    assert_eq!(fx.wrap.completes.load(Ordering::SeqCst), 1);
+    second.finish().await;
+    fx.finish().await;
+}
+
+/// Rows that are `open`, `finished` or `failed` are not touched by a pass.
+#[tokio::test]
+async fn a_pass_leaves_open_finished_and_failed_rows_alone() {
+    let fx = Fx::new(With::Fake).await;
+    let mut others = Vec::new();
+    for (generation, state) in [(1, "open"), (2, "finished"), (3, "failed")] {
+        let job = fx.job().await;
+        let id = fx
+            .row(&job, generation, "result", 10, state, PART_BYTES as i64)
+            .await;
+        others.push((id, state));
+    }
+    let marker = completing_row(&fx).await;
+    let second = restarted(&fx, PASS).await;
+    fx.until(&marker, "finished").await;
+    tokio::time::sleep(PASS * 3).await;
+    for (id, state) in others {
+        assert_eq!(fx.state(&id).await, state);
+    }
+    assert_eq!(fx.wrap.completes.load(Ordering::SeqCst), 1);
+    second.finish().await;
+    fx.finish().await;
+}
+
+/// A pass takes the 100 oldest `completing` rows, and the newest, behind them, waits for the next
+/// pass.
+#[tokio::test]
+async fn a_pass_takes_the_100_oldest_rows_and_a_later_pass_the_rest() {
+    // The fixture's own server has no store, so no pass of its own races the inserts; the
+    // servers below use the fixture's fake.
+    let fx = Fx::new(With::Nothing).await;
+    let job = fx.job().await;
+    let mut ids = Vec::new();
+    for generation in 1..=101 {
+        ids.push(
+            fx.row(
+                &job,
+                generation,
+                "result",
+                10,
+                "completing",
+                PART_BYTES as i64,
+            )
+            .await,
+        );
+    }
+    order_rows(&fx, &ids).await;
+    // The first pass of a server whose later passes are an hour apart.
+    let first = restarted(&fx, Duration::from_secs(3600)).await;
+    for id in &ids[..100] {
+        fx.until(id, "finished").await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(fx.state(&ids[100]).await, "completing");
+    assert_eq!(fx.wrap.completes.load(Ordering::SeqCst), 100);
+    // The first pass of another server takes the one that was left.
+    let second = restarted(&fx, Duration::from_secs(3600)).await;
+    fx.until(&ids[100], "finished").await;
+    assert_eq!(fx.wrap.completes.load(Ordering::SeqCst), 101);
+    first.finish().await;
+    second.finish().await;
+    fx.finish().await;
+}
+
+/// The stop ends a pass that waits in the store, well inside the shutdown grace, and the row stays
+/// `completing`.
+#[tokio::test]
+async fn the_stop_ends_a_pass_that_waits_in_the_store() {
+    let fx = Fx::new(With::Fake).await;
+    let hold = Hold::new();
+    *fx.wrap.complete_hold.lock().unwrap() = Some(Arc::clone(&hold));
+    let id = completing_row(&fx).await;
+    // A grace of 30 seconds: only the stop's own ending of the pass and its task returns sooner.
+    let mut second = restarted_with(&fx, Duration::from_secs(3600), 30).await;
+    hold.entered().await;
+    let stopped = std::time::Instant::now();
+    second.signal_stop();
+    second.joined().await;
+    assert!(
+        stopped.elapsed() < Duration::from_secs(8),
+        "the run waited for the grace: {:?}",
+        stopped.elapsed()
+    );
+    assert_eq!(fx.state(&id).await, "completing");
+    hold.release();
+    fx.finish().await;
+}
+
+/// The stop ends a pass that waits for its next tick, well inside the shutdown grace.
+#[tokio::test]
+async fn the_stop_ends_a_pass_that_waits_for_its_tick() {
+    let fx = Fx::new(With::Fake).await;
+    let (mut second, backend) =
+        restarted_counted(&fx.u.w, &fx.wrap, Duration::from_secs(3600), 30).await;
+    // Its first pass is over, so the pass is waiting for the tick an hour away.
+    until_first_pass(&backend).await;
+    let stopped = std::time::Instant::now();
+    second.signal_stop();
+    second.joined().await;
+    assert!(
+        stopped.elapsed() < Duration::from_secs(8),
+        "the run waited for the grace: {:?}",
+        stopped.elapsed()
+    );
+    fx.finish().await;
+}
+
+/// A task that panics does not keep the rows behind it from their pass.
+#[tokio::test]
+async fn a_task_that_panics_does_not_stop_the_rows_behind_it() {
+    let fx = Fx::new(With::Fake).await;
+    let first = completing_row(&fx).await;
+    let second = completing_row(&fx).await;
+    order_rows(&fx, &[first.clone(), second.clone()]).await;
+    fx.wrap.complete_panics.store(true, Ordering::SeqCst);
+    // One pass: both rows are asked, though the first one's task panicked.
+    let server = restarted(&fx, Duration::from_secs(3600)).await;
+    until_completes(&fx, 2).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(fx.wrap.completes.load(Ordering::SeqCst), 2);
+    assert_eq!(fx.state(&first).await, "completing");
+    assert_eq!(fx.state(&second).await, "completing");
+    server.finish().await;
+    fx.finish().await;
+}
+
+/// A row that a request returned to `open` after the pass read it as `completing` is not taken
+/// back: its task asks the store nothing and the row stays `open`.
+#[tokio::test]
+async fn a_row_a_request_returned_to_open_after_the_pass_read_it_is_left_open() {
+    let fx = Fx::new(With::Fake).await;
+    let held = completing_row(&fx).await;
+    let moved = completing_row(&fx).await;
+    let after = completing_row(&fx).await;
+    order_rows(&fx, &[held.clone(), moved.clone(), after.clone()]).await;
+    let hold = Hold::new();
+    *fx.wrap.complete_hold.lock().unwrap() = Some(Arc::clone(&hold));
+    let server = restarted(&fx, Duration::from_secs(3600)).await;
+    // The pass read all three and is inside the store for the oldest.
+    hold.entered().await;
+    set_state(&fx, &moved, "open").await;
+    hold.release();
+    fx.until(&held, "finished").await;
+    // The row behind the moved one is done, so the pass went by it.
+    fx.until(&after, "finished").await;
+    assert_eq!(fx.state(&moved).await, "open");
+    assert_eq!(fx.wrap.completes.load(Ordering::SeqCst), 2);
+    server.finish().await;
+    fx.finish().await;
+}
+
+/// The pass finishes the `completing` row of an agent revoked since (ADR-493 item 29).
+#[tokio::test]
+async fn a_pass_finishes_the_completing_row_of_a_revoked_agent() {
+    let fx = Fx::new(With::Fake).await;
+    let id = completing_row(&fx).await;
+    sqlx::query("UPDATE agents SET revoked_at = now() WHERE id = $1::uuid")
+        .bind(&fx.u.id)
+        .execute(&fx.u.w.pool)
+        .await
+        .unwrap();
+    let server = restarted(&fx, Duration::from_secs(3600)).await;
+    fx.until(&id, "finished").await;
+    server.finish().await;
+    fx.finish().await;
+}
+
 /// Case T: a store that holds past the wait is a 202 while the task goes on; the repeat after
 /// the release is 200 and the store completed once.
 #[tokio::test]
@@ -2216,9 +2630,10 @@ async fn a_status_racing_a_completion_answers_the_finished_row() {
 }
 
 /// Case Q3: the stop ends a running task at once (the waiter is answered 503), the row stays
-/// `completing`, and a request to a server started on the same database finishes it.
+/// `completing`, and the first pass of a server started on the same database finishes it (ADR-493
+/// item 29), so a later request is answered from the finished row.
 #[tokio::test]
-async fn the_stop_ends_a_running_completion_and_a_later_request_finishes_it() {
+async fn the_stop_ends_a_running_completion_and_the_next_servers_first_pass_finishes_it() {
     let mut fx = Fx::new(With::Fake).await;
     let job = fx.job().await;
     let id = fx
@@ -2253,21 +2668,18 @@ async fn the_stop_ends_a_running_completion_and_a_later_request_finishes_it() {
     );
     assert_eq!(fx.wrap.completes.load(Ordering::SeqCst), 1);
 
-    // A server on the same database resumes it on the next request.
+    // A server on the same database finishes it in its first pass, before any request.
     *fx.wrap.complete_hold.lock().unwrap() = None;
-    let http = Http {
-        port: 0,
-        shutdown_grace_secs: 2,
-    };
-    let backend = Backend::new(Some(Arc::clone(&fx.wrap) as Arc<dyn MultipartStore>));
-    let server = Server::bind_with_store(&http, fx.u.w.pg.pool(), fx.u.w.key.clone(), backend)
-        .await
-        .unwrap();
-    fx.u.s = Running::spawn(server);
+    let (server, backend) =
+        restarted_counted(&fx.u.w, &fx.wrap, Duration::from_secs(3600), 2).await;
+    fx.u.s = server;
+    until_first_pass(&backend).await;
+    assert_eq!(fx.state(&id).await, "finished");
+    assert_eq!(fx.wrap.completes.load(Ordering::SeqCst), 2);
+    // A request now is answered from the finished row and asks the store nothing.
     let fresh = token(&fx.u).await;
     let r = fx.complete_as(Some(&fresh), &id).await;
     assert_eq!(r.status, 200, "{}", r.head);
-    assert_eq!(fx.state(&id).await, "finished");
     assert_eq!(fx.wrap.completes.load(Ordering::SeqCst), 2);
     fx.finish().await;
 }

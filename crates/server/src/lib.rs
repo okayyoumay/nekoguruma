@@ -90,6 +90,10 @@ pub struct AppState {
     /// The object store and part size of the data channel's routes (ADR-493); the routes are
     /// built from it, so it is set before the router is.
     pub uploads: uploads::Backend,
+    /// The completion tasks of this server: the router's upload routes and the completion pass
+    /// share them, so one upload has one task whoever asks (ADR-493 item 20). A server's own
+    /// state; clones of one `Backend` in two servers do not share tasks.
+    pub completions: uploads::Completions,
 }
 
 /// A route the server serves: the HTTP method and the path, as a client sends them. The control
@@ -257,6 +261,7 @@ pub fn routes_unguarded(state: AppState) -> (Router, Vec<ServedRoute>) {
             state.uploads,
             state.hub.clone(),
             Arc::clone(&prover),
+            state.completions,
         ));
     // The redemption route keeps its own limiter and log gates: one set per router.
     let register = mounts
@@ -373,6 +378,10 @@ pub struct Server {
     job_queue: Option<job_queue::Settings>,
     /// The job expiry task's settings; `None` leaves it off (`bind`, which tests use).
     job_expiry: Option<job_expiry::Settings>,
+    /// The data channel's backend, which the router was built from: the completion pass takes its
+    /// store, period and registry.
+    uploads: uploads::Backend,
+    completions: uploads::Completions,
 }
 
 impl std::fmt::Debug for Server {
@@ -544,6 +553,7 @@ impl Server {
         let hub = Hub::new();
         let hasher = Hasher::new();
         let operator_sessions = OperatorSessions::new();
+        let completions = uploads::Completions::default();
         Ok(Server {
             listener,
             router: router(AppState {
@@ -554,7 +564,8 @@ impl Server {
                 hub: hub.clone(),
                 operator_sessions: operator_sessions.clone(),
                 hasher: hasher.clone(),
-                uploads,
+                uploads: uploads.clone(),
+                completions: completions.clone(),
             }),
             pool,
             sessions,
@@ -566,6 +577,8 @@ impl Server {
             object_server: None,
             job_queue: None,
             job_expiry: None,
+            uploads,
+            completions,
         })
     }
 
@@ -646,6 +659,8 @@ impl Server {
             mut object_server,
             job_queue,
             job_expiry,
+            uploads,
+            completions,
         } = self;
         // The revocation pass is one of the hub's tasks, so that the stop ends it before the pool
         // closes (ADR-468 item 11).
@@ -656,6 +671,17 @@ impl Server {
                 async move { db::live_agents(&pool, &ids).await }
             }
         }));
+        // The completion pass is another: it finishes the uploads that no request repeats
+        // (ADR-493 item 29), through the registry the routes use, and has nothing to do without
+        // a store.
+        if uploads.shared_store().is_some() {
+            hub.adopt(uploads::run_completion_pass(
+                pool.clone(),
+                hub.clone(),
+                uploads,
+                completions,
+            ));
+        }
         // The delivery queue is another of them, and the only consumer of the hub's inbox
         // (ADR-476).
         if let Some(settings) = job_queue {

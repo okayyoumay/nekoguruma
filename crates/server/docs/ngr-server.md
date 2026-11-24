@@ -140,7 +140,7 @@ bucket = "nekoguruma"        # default; the object store's bucket
    let requests in flight finish and close every control channel connection with 1001, for at
    most `shutdown_grace_secs`, and exit 0. A second signal during the grace period ends the wait
    at once (still exit 0). What is still open then is aborted: the HTTP connections first, then
-   the hub's tasks (the control channel sessions, the revocation pass, the delivery queue and the
+   the hub's tasks (the control channel sessions, the revocation pass, the completion pass, the delivery queue and the
    job expiry task), then the object server is stopped (SIGTERM, at most 10 seconds, then SIGKILL;
    a second signal kills it at once), then the database pool is closed (see "The control channel"
    below). The tasks are started by `Server::run` before it accepts a request, and each one ends
@@ -830,8 +830,30 @@ other error, a failed delete included, writes nothing and answers 503 (`Random` 
 database failure answers 503 or 500 with no further write. A request waits for the outcome at
 most `uploads::COMPLETE_WAIT` (20 seconds; the test override is `Backend::with_complete_wait`)
 and then answers 202 `{"state": "completing"}`; a task that ended with no outcome (a panic, the
-stop) answers 503 and the row stays as it was. Nothing resumes a task at start: the next request
-does, and a `completing` row that no request repeats stays so.
+stop) answers 503 and the row stays as it was. The next request resumes a row the stop cut, and so
+does the completion pass.
+
+**The completion pass (`uploads::run_completion_pass`, ADR-493 item 29).** One task of the hub's
+set, adopted by `Server::run` beside the revocation pass when the backend has a store. The routes'
+`Uploads` and the pass each hold a `Completer` (the pool, the hub, the registry and a log gate for
+each warning reason); the registry (`uploads::Completions`) is the server's own, built in
+`Server::bind_with_store` and handed to the router's state and to the pass, so a pass and a
+request for one upload join one task and two servers never share one. A pass runs as the task starts and then every `uploads::PASS_PERIOD` (60 seconds; the test
+override is `Backend::with_completion_pass_period`), a missed tick giving one pass. It reads the
+100 oldest `completing` rows of all tenants (`created_at`, then `id`) in a read-only transaction
+that ends before any store call, then takes them one at a time: it starts the upload's completion
+task, or joins the running one, and waits for its outcome, which is item 19's (`finished`,
+`failed`, `open`, or `completing` kept on a store or database error until the next pass). No grace
+period: every `completing` row is taken, including that of an agent revoked since (the object was
+declared and its completion requested while the agent was authorized). A pass's task only resumes
+a row that is still `completing` (it makes no `open` to `completing` compare-and-set): a row a
+request returned to `open` since the pass read it is left, the task ends with no outcome (a joined
+request answers 503 and repeats), and a `finished` or `failed` row is that state's outcome. A row whose key, upload ID, part size or digest does not
+parse is skipped and left as it is, with a rate-limited warning that names nothing; the pass
+writes nothing for it. A failed read warns with the SQLSTATE only and the next pass retries. A
+task that ends without an outcome (a panic, or the `open` row above) leaves its row to the next
+pass and the pass goes on with the next row. The stop ends the pass in its wait and in its work,
+so `Server::run` sees the hub's set empty.
 
 Never logged: the token, the body, the digest, the job, an object key, an upload ID, a URL and the
 text of a database error (the SQLSTATE only).

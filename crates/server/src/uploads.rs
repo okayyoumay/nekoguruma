@@ -1,4 +1,5 @@
-//! The data channel's four routes (design 5.2, 13.3, 14.3; ADR-493 items 1 to 8, 15 to 23):
+//! The data channel's four routes (design 5.2, 13.3, 14.3; ADR-493 items 1 to 8, 15 to 23, 29
+//! and 30):
 //! `POST /api/v1/agent/uploads` (begin), `POST /api/v1/agent/uploads/{uploadId}/parts/{part}`
 //! (one part URL), `GET /api/v1/agent/uploads/{uploadId}` (status) and
 //! `POST /api/v1/agent/uploads/{uploadId}/complete` (complete).
@@ -27,8 +28,8 @@
 //! adopted by the hub so that the stop ends it, which outlives the request that started it: the
 //! requests only wait for its outcome (ADR-493 items 20 and 21). The completion pass
 //! ([`run_completion_pass`]) starts the same task for the `completing` rows that no request
-//! repeats, through the same registry (ADR-493 item 29), and so does the status of an `open` row whose
-//! upload the store has lost (ADR-493 item 30).
+//! repeats, through the same registry (ADR-493 item 29), and so does the status of an `open` row
+//! whose upload the store has lost (ADR-493 item 30).
 //!
 //! Never logged: a token, a body, a digest, an object key, an upload ID, a URL or the text of a
 //! database error (the SQLSTATE only).

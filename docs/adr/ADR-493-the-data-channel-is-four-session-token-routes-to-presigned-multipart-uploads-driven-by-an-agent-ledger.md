@@ -174,7 +174,7 @@ proposed. It is a specification: none of it is implemented when this record is w
     range of a double (`1e400`, an integer of over 308 digits), which the reader refuses whole.
     `generation` is an integer from 0 to 9223372036854775807 (the column's range), else a 400. The part number is canonical decimal text from 1 to 10000, taken as text
     from the path, and an upload ID that is not a canonical UUID is a 404 after the token.
-17. **A status that finds the store without the upload answers 503 and writes nothing.** An
+17. **A status that finds the store without the upload answers 503 and writes nothing (revised by item 30).** An
     `open` row whose upload `list_parts` reports as not found or already finished is a state the
     completion decides (item 6), not the status: the status answers 503, leaves the row as it
     is, and the agent repeats it (item 23 refines this: the status reads the row once more before

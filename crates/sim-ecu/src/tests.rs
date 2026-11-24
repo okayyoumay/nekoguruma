@@ -2957,6 +2957,96 @@ fn a_fault_for_the_nth_request_lets_the_matches_before_it_through_and_is_then_sp
 }
 
 #[test]
+fn a_request_lost_to_a_bus_error_aimed_at_it_is_not_counted_for_the_nth_request() {
+    let read = [0x22, 0xF1, 0x86];
+    let mut ecu = ecu();
+    ecu.inject_for_request(&[0x22], Fault::BusError);
+    ecu.inject_for_nth_request(
+        &read,
+        NonZeroU32::new(2).unwrap(),
+        Fault::NegativeResponse {
+            nrc: Nrc::ConditionsNotCorrect,
+        },
+    );
+    // The first request is lost, so it is not a match that reached the ECU.
+    assert_eq!(ecu.request(&read), SimResponse::NoResponse);
+    assert_eq!(
+        ecu.faults_for_request(),
+        [waiting(
+            &read,
+            2,
+            Fault::NegativeResponse {
+                nrc: Nrc::ConditionsNotCorrect
+            }
+        )]
+    );
+    assert_eq!(ecu.request(&read), pos(&[0x62, 0xF1, 0x86, 0x01]));
+    assert_eq!(ecu.request(&read), neg(0x22, Nrc::ConditionsNotCorrect));
+    assert_eq!(ecu.request(&read), pos(&[0x62, 0xF1, 0x86, 0x01]));
+}
+
+#[test]
+fn a_request_lost_on_the_way_leaves_the_count_of_a_fault_for_the_nth_request_unchanged() {
+    let n = NonZeroU32::new(2).unwrap();
+    let still_waiting = |ecu: &SimEcu| ecu.faults_for_request().to_vec();
+    let expected = [waiting(&[0x11], 2, Fault::DropResponse)];
+
+    // Lost to a bus error armed by `inject`.
+    let mut bus = ecu();
+    bus.inject_for_nth_request(&[0x11], n, Fault::DropResponse);
+    bus.inject(Fault::BusError);
+    assert_eq!(bus.request(&[0x11, 0x01]), SimResponse::NoResponse);
+    assert_eq!(still_waiting(&bus), expected);
+
+    // Lost to a silent ECU.
+    let mut off = ecu();
+    off.inject(Fault::PowerLoss);
+    off.inject_for_nth_request(&[0x11], n, Fault::DropResponse);
+    assert_eq!(off.request(&[0x11, 0x01]), SimResponse::NoResponse);
+    assert_eq!(still_waiting(&off), expected);
+
+    // Lost while the ECU starts up after an ECUReset.
+    let (mut starting, _clock) = ecu_with_clock(EcuConfig {
+        startup_ms: Some(100),
+        ..config()
+    });
+    starting.request(&[0x11, 0x01]);
+    starting.inject_for_nth_request(&[0x11], n, Fault::DropResponse);
+    assert_eq!(starting.request(&[0x11, 0x01]), SimResponse::NoResponse);
+    assert_eq!(still_waiting(&starting), expected);
+}
+
+#[test]
+fn faults_for_the_nth_request_on_overlapping_prefixes_each_count_on_their_own() {
+    let read = [0x22, 0xF1, 0x86];
+    let mut ecu = ecu();
+    ecu.inject_for_nth_request(
+        &[0x22],
+        NonZeroU32::new(2).unwrap(),
+        Fault::NegativeResponse {
+            nrc: Nrc::ConditionsNotCorrect,
+        },
+    );
+    ecu.inject_for_nth_request(
+        &read,
+        NonZeroU32::new(3).unwrap(),
+        Fault::NegativeResponse {
+            nrc: Nrc::RequestOutOfRange,
+        },
+    );
+    assert_eq!(ecu.request(&read), pos(&[0x62, 0xF1, 0x86, 0x01]));
+    // The second request of service 22 fires the first fault, and is the read's second match.
+    assert_eq!(ecu.request(&read), neg(0x22, Nrc::ConditionsNotCorrect));
+    // Another read does not match the second fault's prefix.
+    assert!(matches!(
+        ecu.request(&[0x22, 0xF1, 0x90]),
+        SimResponse::Positive(_)
+    ));
+    assert_eq!(ecu.request(&read), neg(0x22, Nrc::RequestOutOfRange));
+    assert!(ecu.faults_for_request().is_empty());
+}
+
+#[test]
 fn a_fault_for_the_first_request_fires_as_inject_for_request_does() {
     let read = [0x22, 0xF1, 0x86];
     let mut ecu = ecu();

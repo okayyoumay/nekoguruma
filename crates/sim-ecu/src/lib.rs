@@ -1189,10 +1189,12 @@ impl SimEcu {
     }
 
     /// Arms `fault` for the `n`-th request that starts with `prefix` and reaches the ECU, counted
-    /// from now: the first `n - 1` such requests are answered as usual and counted, the `n`-th
-    /// gets the fault as in [`SimEcu::inject_for_request`] (which is `n` = 1), and the fault is
-    /// then spent. Requests that do not match, and requests lost on the way, do not count. The
-    /// count is part of the snapshot.
+    /// from now: the fault counts the matching requests that reach the ECU on its own, so an
+    /// earlier match is answered as it would be without this fault (it may still get another armed
+    /// fault), and the `n`-th gets the fault as in [`SimEcu::inject_for_request`] (which is
+    /// `n` = 1), after which the fault is spent. Requests that do not match, and requests lost on
+    /// the way (including to a bus error or power loss armed for that very request), do not
+    /// count. The count is part of the snapshot.
     pub fn inject_for_nth_request(&mut self, prefix: &[u8], n: NonZeroU32, fault: Fault) {
         self.armed_for_request.push(RequestFault {
             prefix: prefix.to_vec(),
@@ -1208,8 +1210,15 @@ impl SimEcu {
     }
 
     /// Arms the faults whose turn `message` is, ahead of the others, for the request at hand, and
-    /// counts `message` for the faults that wait for a later match. Whether any was armed.
+    /// counts `message` for the faults that wait for a later match, unless a fault that fires on
+    /// it loses it (a bus error or a power loss), since a lost request does not reach the ECU.
+    /// Whether any was armed.
     fn arm_for_request(&mut self, message: &[u8]) -> bool {
+        let lost = self.armed_for_request.iter().any(|waiting| {
+            waiting.matches_left == NonZeroU32::MIN
+                && message.starts_with(&waiting.prefix)
+                && matches!(waiting.fault, Fault::BusError | Fault::PowerLoss)
+        });
         let mut now = Vec::new();
         self.armed_for_request.retain_mut(|waiting| {
             if !message.starts_with(&waiting.prefix) {
@@ -1217,7 +1226,9 @@ impl SimEcu {
             }
             match NonZeroU32::new(waiting.matches_left.get() - 1) {
                 Some(left) => {
-                    waiting.matches_left = left;
+                    if !lost {
+                        waiting.matches_left = left;
+                    }
                     true
                 }
                 None => {

@@ -1290,13 +1290,17 @@ fn the_control_export_arms_a_fault_for_the_nth_request() {
             waiting(&[0x11], 2, Fault::BusError)
         ]
     );
-    // Zero, a count that is not a whole number, and a count without a request to match.
+    // Zero, a count that is not a whole number, null, and a count without a request to match.
     for command in [
         r#"{"command": "inject_fault", "fault": "bus_error", "request": [34], "occurrence": 0}"#,
         r#"{"command": "inject_fault", "fault": "bus_error", "request": [34], "occurrence": -1}"#,
         r#"{"command": "inject_fault", "fault": "bus_error", "request": [34], "occurrence": 1.5}"#,
         r#"{"command": "inject_fault", "fault": "bus_error", "request": [34], "occurrence": "2"}"#,
         r#"{"command": "inject_fault", "fault": "bus_error", "occurrence": 2}"#,
+        // An `occurrence` that is present but null is not read as absent, which would arm a
+        // plain `inject`.
+        r#"{"command": "inject_fault", "fault": "bus_error", "occurrence": null}"#,
+        r#"{"command": "inject_fault", "fault": "bus_error", "request": [34], "occurrence": null}"#,
     ] {
         assert_eq!(control(command), ERR_FAILED, "{command}");
     }

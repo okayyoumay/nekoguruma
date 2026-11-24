@@ -342,7 +342,7 @@ async fn run_the_jobs(dir: &Path) {
     // R2: the whole procedure runs and the coding gets the cruise-control bit.
     change_coding(&worker, &journal_dir, 2)
         .await
-        .expect("the second run finishes");
+        .expect("the third run finishes");
     // The trace lists a sub-function for 0x10 but not for 0x27, so the seed and the key
     // requests show as two `uds 27` lines.
     assert_eq!(
@@ -365,7 +365,7 @@ async fn run_the_jobs(dir: &Path) {
     // R3: the bit is set, so nothing but the read is sent.
     change_coding(&worker, &journal_dir, 3)
         .await
-        .expect("the third run finishes");
+        .expect("the fourth run finishes");
     assert_eq!(requests_since(&trace, &mut seen), ["uds 22 0120"]);
     assert_eq!(
         coding(&worker).await,

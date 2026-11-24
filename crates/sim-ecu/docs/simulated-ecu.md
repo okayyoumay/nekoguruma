@@ -277,9 +277,11 @@ request loses that request. This lets a test hit a request it cannot time, such 
 ECUReset or session read that follows a run of other requests. `faults_for_request()` lists the
 faults still waiting, with their prefix and the number of matching requests left before each fires.
 `inject_for_nth_request(prefix, n, fault)` waits for the `n`-th request that starts with `prefix`
-instead of the first (`inject_for_request` is `n` = 1): the earlier matches are answered as usual
-and counted, requests that do not match or are lost on the way do not count, and the fault is
-spent when it fires. The count is part of the snapshot, so it carries over a restart that
+instead of the first (`inject_for_request` is `n` = 1): each armed entry counts the matching
+requests that reach the ECU on its own, so an earlier match is answered as it would be without
+this entry (it may still get another armed fault). Requests that do not match or are lost on the
+way, including to a `BusError` or `PowerLoss` aimed at that very request, do not count, and the
+fault is spent when it fires. The count is part of the snapshot, so it carries over a restart that
 continues from a saved state.
 
 While the ECU is silent (after `PowerLoss` or `drop_at_block`), requests do not reach it and the

@@ -924,6 +924,15 @@ pub const TRACE_ENV: &str = "NGR_SIM_VCI_TRACE";
 /// How often a waiting `PassThruReadMsgs` looks for control files.
 const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
+/// Reads an `occurrence` that is present: a `null` is refused like any other value that is not an
+/// integer of at least 1, instead of reading as absent.
+fn occurrence_count<'de, D>(deserializer: D) -> Result<Option<NonZeroU32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    NonZeroU32::deserialize(deserializer).map(Some)
+}
+
 /// A control command, as JSON: `{"command": "inject_fault", "fault": "power_loss"}`,
 /// `{"command": "reconnect_ecu"}`, `{"command": "disconnect_vci"}`, `{"command": "connect_vci"}`,
 /// `{"command": "set_battery_voltage", "millivolts": 11500}`, `{"command": "fail_writes",
@@ -950,7 +959,7 @@ enum Command {
         service: Option<u8>,
         #[serde(default)]
         request: Option<Vec<u8>>,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "occurrence_count")]
         occurrence: Option<NonZeroU32>,
     },
     /// Sets `SimEcu::gateway_authenticated`: what an ECU configured with `require_gateway_auth`

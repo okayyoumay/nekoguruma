@@ -120,7 +120,10 @@ with the agent the job belongs to, the operator who asked (`requested_by`) and a
 `refusal` is `unknownJob`, `noLog`, `busy` or `tooLarge`, set exactly when the state is `refused`,
 a CHECK) or `expired` (nobody answered in time, which stops the server's delivery of the request
 and nothing else). `sent_at` and `answered_at` hold the last send of the command and the answer's
-application. "Stored" is not a state: a stored log is the job's `job_objects` row of kind
+application: the server's communication-log task stamps `sent_at` when the connection's queue
+took the command (only while the state is `requested`), sets `expired` on a `requested` row more
+than 24 hours old, and applies an agent's answer (`accepted`, or `refused` with `refusal`, and
+`answered_at`) only to that agent's row while its state is `requested`. "Stored" is not a state: a stored log is the job's `job_objects` row of kind
 `commLog`, which begin writes only for a job and generation with a row for the calling agent in a state
 other than `refused`. The primary key is `(tenant_id, job_id, generation)`; the
 foreign keys (the job through `(tenant_id, job_id)`, the agent, the operator) have no cascade; a
@@ -130,8 +133,8 @@ the migration adds a unique constraint on `jobs`); `answered_at` is set exactly 
 `accepted` or `refused` (a CHECK). A new request for a job and generation whose row is `refused`
 or `expired` updates the row in place: the state returns to `requested`, `refusal`, `sent_at` and
 `answered_at` are cleared and `requested_by` and `requested_at` are the new request's; a
-`requested` or `accepted` row is left as it is. Nothing writes the rows yet and tests seed them,
-as with `artifacts`. A job's log has no period of
+`requested` or `accepted` row is left as it is. Only tests write a request row; the Web API that
+writes them is not built, as with `artifacts`. A job's log has no period of
 its own: it is the job's `commLog` object beside its `result`, and goes with the job's objects.
 
 **Content-addressed objects: `ir_documents` and `artifacts` (migration 0014, ADR-497)**

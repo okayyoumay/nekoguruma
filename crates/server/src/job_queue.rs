@@ -25,7 +25,9 @@
 //! that fails keeps the events, which count against the same bound as the buffered messages
 //! ([`HELD_LIMIT`], past which the inbox is not read), and the next tick tries again; the first
 //! failure ends the round, and the failed agent's events go behind the others'. A connection closed for
-//! a bad event has its later events dropped until it leaves the hub's snapshot. `progress` and `reconcile` messages are dropped.
+//! a bad event has its later events dropped until it leaves the hub's snapshot. `logUploadAnswer`
+//! messages are handed to the communication-log task ([`crate::comm_log_requests`]); `progress` and
+//! `reconcile` messages are dropped.
 //!
 //! The task ends when the stop begins, in its waits and in the pass's read; once a frame has been
 //! queued the pass finishes its mark. While a pass or a write waits on the database the inbox is
@@ -47,9 +49,10 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, MissedTickBehavior, interval_at};
 
 use crate::agent_events::{self, Cause, Event, Stored};
+use crate::comm_log_requests::Answer;
 use crate::db::{delete_own_lock, failure, statement_timeouts};
 use crate::health::may_log;
-use crate::hub::{ConnectionId, Delivery, Hub, Inbound, OUTBOUND_CAPACITY, SendError};
+use crate::hub::{ConnectionId, Delivery, Hub, Inbound, OUTBOUND_CAPACITY};
 use crate::session::now;
 
 /// A failed pass or write is logged at most this often.
@@ -282,20 +285,17 @@ struct Dispatched {
 /// over the limit can never be sent and ends its job. `stopped` is asked before each send.
 fn dispatch(hub: &Hub, taken: Vec<Taken>, stopped: impl Fn() -> bool) -> Dispatched {
     let mut out = Dispatched::default();
-    let mut skipped: HashSet<AgentId> = HashSet::new();
-    for job in taken {
-        if stopped() {
-            break;
-        }
-        if skipped.contains(&job.agent) {
-            continue;
-        }
-        match hub.send_job_command(&job.agent, STANDARD.encode(&job.signed_job)) {
+    let settled = Hub::send_in_order(
+        taken,
+        |job| &job.agent,
+        stopped,
+        |job| hub.send_job_command(&job.agent, STANDARD.encode(&job.signed_job)),
+    );
+    for (job, result) in settled {
+        match result {
             Ok(delivery) => out.sent.push((job, delivery)),
-            Err(SendError::TooLarge) => out.too_large.push(job),
-            Err(SendError::Busy | SendError::NotConnected) => {
-                skipped.insert(job.agent);
-            }
+            // Anything else the helper settles is a frame that can never be sent.
+            Err(_) => out.too_large.push(job),
         }
     }
     out
@@ -497,6 +497,48 @@ fn split_events(messages: Vec<Inbound>) -> (Vec<Event>, Vec<Inbound>) {
     (events, rest)
 }
 
+/// Hands the `logUploadAnswer` messages in `messages` to `sink`, the communication-log task's
+/// channel (design 8.11, ADR-508 item 4), and returns the rest. The hand-over never waits: an
+/// answer for a full channel is dropped, which costs one repeat of the command's lease, since the
+/// agent answers again each time. With no sink the answers are returned with the rest, and the
+/// queue's step drops them.
+fn forward_log_answers(
+    sink: Option<&mpsc::Sender<Answer>>,
+    gate: &Mutex<Option<std::time::Instant>>,
+    messages: Vec<Inbound>,
+) -> Vec<Inbound> {
+    let Some(sink) = sink else {
+        return messages;
+    };
+    let mut rest = Vec::new();
+    for item in messages {
+        let AgentMessage::LogUploadAnswer {
+            job_id,
+            generation,
+            outcome,
+        } = item.message
+        else {
+            rest.push(item);
+            continue;
+        };
+        let answer = Answer {
+            agent: item.agent,
+            job_id,
+            generation,
+            outcome,
+        };
+        // A closed channel means the task has ended (the stop): nothing to say.
+        if let Err(mpsc::error::TrySendError::Full(_)) = sink.try_send(answer)
+            && may_log(gate, now(), LOG_EVERY)
+        {
+            tracing::debug!(
+                "a log upload answer was dropped: the task that applies them is behind"
+            );
+        }
+    }
+    rest
+}
+
 /// An agent's events, in the order they were read.
 type Groups = Vec<(AgentId, Vec<Event>)>;
 
@@ -648,13 +690,15 @@ async fn store_events(
     true
 }
 
-/// Runs the queue until the stop, with the receiver of the hub's inbox.
+/// Runs the queue until the stop, with the receiver of the hub's inbox. The `logUploadAnswer`
+/// messages go to `answers`, when there is one.
 pub(crate) async fn run(
     hub: Hub,
     pool: PgPool,
     mut inbox: mpsc::Receiver<Inbound>,
     mut stopping: watch::Receiver<bool>,
     settings: Settings,
+    answers: Option<mpsc::Sender<Answer>>,
 ) {
     let mut ticks = interval_at(Instant::now() + settings.period, settings.period);
     // A tick missed because the task was slow gives one pass, not a burst.
@@ -662,6 +706,7 @@ pub(crate) async fn run(
     let gate = Mutex::new(None);
     let event_gate = Mutex::new(None);
     let unapplied_gate = Mutex::new(None);
+    let answer_gate = Mutex::new(None);
     let mut queue = Queue::default();
     // The messages read while the database was waited for, and what has not been written yet.
     let mut held: Vec<Inbound> = Vec::new();
@@ -703,6 +748,7 @@ pub(crate) async fn run(
                 held.push(item);
             }
             let (numbered, others) = split_events(std::mem::take(&mut held));
+            let others = forward_log_answers(answers.as_ref(), &answer_gate, others);
             if let Some(counts) = &counts {
                 counts
                     .seen
@@ -923,7 +969,9 @@ async fn write(pool: &PgPool, step: &Step) -> Result<(), sqlx::Error> {
 
 #[cfg(test)]
 mod tests {
-    use shared_proto::{AgentEventKind, AgentEventMessage, InstructionRejectReason};
+    use shared_proto::{
+        AgentEventKind, AgentEventMessage, InstructionRejectReason, JobId, LogUploadOutcome,
+    };
 
     use super::*;
     use crate::hub::{OUTBOUND_CAPACITY, Registration};
@@ -960,6 +1008,56 @@ mod tests {
             message,
             text: None,
         }
+    }
+
+    fn log_answer(agent: &AgentId, connection: ConnectionId, outcome: LogUploadOutcome) -> Inbound {
+        inbound(
+            agent,
+            connection,
+            AgentMessage::LogUploadAnswer {
+                job_id: JobId("0194f0a2-7c3e-7d11-8a52-3f6f9b1c2d4f".to_owned()),
+                generation: 2,
+                outcome,
+            },
+        )
+    }
+
+    #[test]
+    fn log_answers_go_to_the_task_with_their_sender_and_a_full_channel_drops_them() {
+        let hub = Hub::new();
+        let a = AgentId("a".to_owned());
+        let connection = hub.register(&a).unwrap().id;
+        let gate = Mutex::new(None);
+        let (sender, mut receiver) = mpsc::channel(2);
+        let heartbeat = inbound(&a, connection, AgentMessage::Heartbeat);
+        let rest = forward_log_answers(
+            Some(&sender),
+            &gate,
+            vec![
+                log_answer(&a, connection, LogUploadOutcome::Queued),
+                heartbeat,
+                log_answer(&a, connection, LogUploadOutcome::Busy),
+                log_answer(&a, connection, LogUploadOutcome::NoLog),
+            ],
+        );
+        assert_eq!(rest.len(), 1, "only the other message is left");
+        assert!(matches!(rest[0].message, AgentMessage::Heartbeat));
+        let first = receiver.try_recv().unwrap();
+        assert_eq!(first.agent, a);
+        assert_eq!(first.outcome, LogUploadOutcome::Queued);
+        assert_eq!(first.generation, 2);
+        assert_eq!(receiver.try_recv().unwrap().outcome, LogUploadOutcome::Busy);
+        assert!(
+            receiver.try_recv().is_err(),
+            "the answer past the bound is dropped, not waited for"
+        );
+        // With no task the answers stay with the rest, for the step to drop.
+        let kept = forward_log_answers(
+            None,
+            &gate,
+            vec![log_answer(&a, connection, LogUploadOutcome::Queued)],
+        );
+        assert_eq!(kept.len(), 1);
     }
 
     fn ack(agent: &AgentId, d: &Delivery) -> Inbound {
@@ -1612,7 +1710,7 @@ mod tests {
             passes: None,
             events: Some(counts.clone()),
         };
-        let task = tokio::spawn(run(Hub::new(), pool, inbox, stopping, settings));
+        let task = tokio::spawn(run(Hub::new(), pool, inbox, stopping, settings, None));
         let limit = HELD_LIMIT as u64;
         let seen = || counts.seen.load(Ordering::Relaxed);
         let until = |n: u64| async move {

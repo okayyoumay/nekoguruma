@@ -357,7 +357,29 @@ impl Up {
         expiry: Option<server::job_expiry::Settings>,
         backend: server::uploads::Backend,
     ) -> Up {
-        Up::with_world(World::new().await, grace_secs, queue, expiry, backend).await
+        Up::with_world(
+            World::new().await,
+            grace_secs,
+            (queue, expiry, None),
+            backend,
+        )
+        .await
+    }
+
+    /// Like [`Up::with_queue`], with the communication-log delivery task on (it runs beside the
+    /// queue, which hands it the agents' answers).
+    pub(crate) async fn with_comm_log(
+        grace_secs: u64,
+        queue: Settings,
+        comm_log: server::comm_log_requests::Settings,
+    ) -> Up {
+        Up::with_world(
+            World::new().await,
+            grace_secs,
+            (Some(queue), None, Some(comm_log)),
+            Default::default(),
+        )
+        .await
     }
 
     /// Like [`Up::new`], with a signer that fails once the returned flag is set (ADR-504): the
@@ -374,17 +396,21 @@ impl Up {
             fail: fail.clone(),
         })));
         let w = World::with_key(key).await;
-        let up = Up::with_world(w, 2, None, None, backend).await;
+        let up = Up::with_world(w, 2, (None, None, None), backend).await;
         (up, fail)
     }
 
     async fn with_world(
         w: World,
         grace_secs: u64,
-        queue: Option<Settings>,
-        expiry: Option<server::job_expiry::Settings>,
+        tasks: (
+            Option<Settings>,
+            Option<server::job_expiry::Settings>,
+            Option<server::comm_log_requests::Settings>,
+        ),
         backend: server::uploads::Backend,
     ) -> Up {
+        let (queue, expiry, comm_log) = tasks;
         w.add_operator("alice").await;
         let agent = Agent::new();
         let id = w.register(&agent).await;
@@ -401,6 +427,10 @@ impl Up {
         };
         let server = match expiry {
             Some(settings) => server.with_job_expiry(settings),
+            None => server,
+        };
+        let server = match comm_log {
+            Some(settings) => server.with_comm_log_requests(settings),
             None => server,
         };
         let sessions = server.sessions();

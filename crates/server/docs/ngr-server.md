@@ -140,8 +140,8 @@ bucket = "nekoguruma"        # default; the object store's bucket
    let requests in flight finish and close every control channel connection with 1001, for at
    most `shutdown_grace_secs`, and exit 0. A second signal during the grace period ends the wait
    at once (still exit 0). What is still open then is aborted: the HTTP connections first, then
-   the hub's tasks (the control channel sessions, the revocation pass, the completion pass, the delivery queue and the
-   job expiry task), then the object server is stopped (SIGTERM, at most 10 seconds, then SIGKILL;
+   the hub's tasks (the control channel sessions, the revocation pass, the completion pass, the delivery queue, the
+   job expiry task and the communication-log task), then the object server is stopped (SIGTERM, at most 10 seconds, then SIGKILL;
    a second signal kills it at once), then the database pool is closed (see "The control channel"
    below). The tasks are started by `Server::run` before it accepts a request, and each one ends
    at the stop, so none runs against a closed pool. A connection that has not delivered a complete
@@ -789,7 +789,7 @@ the job's stored instruction (404 on a difference) and does so in any job state.
 `refused`, `expired` included (`uploads::is_requested`, in the lookup's transaction): none is a
 404, the answer for an unknown job, with nothing begun in the store (ADR-508). A repeated begin of
 an existing row is answered from the row whatever the request's state has become, and kind
-`result` needs no request. Nothing writes the request rows yet; the tests seed them. Every
+`result` needs no request. Nothing writes the request rows but the communication-log task (below); the tests seed them. Every
 database call is a short transaction of its own, and none is held while the store is called; the row is
 inserted with `ON CONFLICT ... DO NOTHING` on the partial unique index, and the loser of a race
 deletes the upload it began and answers the winner's row.
@@ -1020,7 +1020,12 @@ connection with hyper's `with_upgrades()`.
   `WRITE_TIMEOUT`. `Delivery { connection, command_id }` means queued, not written;
   `SendError::NotConnected` (no current connection, or it is closing), `Busy` and `TooLarge`
   (the frame over 131072 bytes with the widest command ID, `c-` and the 20 digits of `u64::MAX`, so that the verdict does not depend on the counter; judged before the connection is looked at). A frame queued on a
-  connection that has been told to close, or at a stop, is not written. `Hub::inbox()` gives its
+  connection that has been told to close, or at a stop, is not written. `Hub::send_log_upload_command(agent, job_id,
+  generation)` queues a `logUploadCommand` the same way, on the same queue of 16 frames, and
+  returns the connection whose queue took it, or the same `SendError` (it draws no `commandId`).
+  `Hub::send_in_order` is the loop both senders use: it sends in the order given and leaves an
+  agent whose queue is full or which is not connected (`Busy`, `NotConnected`) alone for the rest
+  of the call, so its later items keep their place and other agents' items are still sent. `Hub::inbox()` gives its
   receiver (256 messages) to the first caller: `commandAck`, `commandRejected`, `agentEvent`,
   `reconcile` and `logUploadAnswer` arrive as `Inbound { agent, connection, message, text }` in read order, never a
   heartbeat; `text` is the exact frame text of a numbered `agentEvent` (the event is stored as
@@ -1086,8 +1091,9 @@ connection with hyper's `with_upgrades()`.
   acknowledgement sets `delivered_at`; a rejection ends the job
   (`failed`, `instructionRejected`, the agent's reason as the detail); both, and a release, write only while the
   job is neither finished nor delivered and still carries a mark that delivery expects (see above)
-  with the attempts that go with it. `progress`, `reconcile` and `logUploadAnswer` messages are dropped with a
-  debug line (the answer is applied when the server sends the command, ADR-508). The numbered `agentEvent`s are split out of the buffered messages before the
+  with the attempts that go with it. `logUploadAnswer` messages are handed to the communication-log task
+  (below) and `progress` and `reconcile` messages are dropped with a
+  debug line. The numbered `agentEvent`s are split out of the buffered messages before the
   answers are applied and stored by `agent_events.rs` (ADR-478 item 6, ADR-479): the answers of
   the iteration are written first, then each agent's events, in the order read, in one
   transaction per agent (at most 64 agents per round). The transaction takes the tenant from the
@@ -1153,6 +1159,39 @@ connection with hyper's `with_upgrades()`.
   again at the next tick. The task ends when the stop begins, in its wait and in its statement
   (the dropped statement rolls back), before the pool closes. A job that an agent reports on
   after its end is stored, acknowledged and not applied (`job_state::decide`).
+- **The communication-log task (`comm_log_requests.rs`, ADR-508 item 4).** One task of the hub's
+  set, spawned by `Server::run` beside the delivery queue when it is on (`Server::start` turns it
+  on with a 10 second period and a lease of 90 seconds; `Server::bind` leaves it off, and a test
+  turns it on with `with_comm_log_requests`, which also takes the counters of passes and failures a
+  test waits on). It runs only with the delivery queue, which hands it the agents' answers. The
+  first tick is one period after the start, a missed tick is delayed. A pass reads in one transaction with the 5 second timeouts and stamps in a second one. The first sets `state = 'expired'` on the `requested` rows whose
+  `requested_at` is more than 24 hours old, then reads the rows that are `requested`, of an agent
+  the hub holds a connection for (`Hub::connected`, passed to the statement) whose `agents` row is
+  not revoked, never sent or sent more than the lease ago (or, see below, last sent on a connection
+  that is gone), and whose job and generation have no `commLog` row in `job_objects` that is live
+  (`uploads::live_state!`, the begin gate's definition: not `failed`). The statement ranks each
+  agent's rows, the ones sent longest ago first, and takes at most 16 rows of an agent (what its
+  queue holds) and 100 in all, the lowest ranks first, so that no agent's backlog keeps another
+  agent's row from the pass. The rows are sent in that order with `Hub::send_in_order`, so an agent
+  whose queue is full or which has left is not tried again in the pass. The second transaction is
+  one statement that stamps `sent_at = now()` on the rows whose frame the connection's queue took,
+  and only while the row is still `requested`; a row that was not taken stays as it was and is read
+  again at the next pass. The task also remembers, in memory, the connection each row was last sent
+  on for one lease (at most the rows sent in that time): a row whose agent has a newer connection
+  is due at the next pass without waiting for the lease, since the old connection may have lost
+  the frame. After a restart of the server the memory is empty and the lease alone applies. An
+  answer reaches the
+  task on a channel of 64 answers that the delivery queue feeds from the inbox without waiting
+  (a full channel drops the answer, with a gated debug line: the agent answers again at the next
+  command). One statement per answer sets `state` to `accepted` (`queued`) or `refused` with the
+  `refusal` (any other outcome) and `answered_at = now()`, for the row of the sender's tenant (the
+  sender's `agents` row, which must not be revoked), the
+  job, the generation and the sender as `agent_id`, and only while its state is `requested`; an
+  answer for another agent's row, a revoked agent's, an unknown row, a row that is answered or `expired`, a job ID
+  that is not a canonical UUID or a generation beyond `bigint` changes nothing. A failed pass or
+  answer is one warning (60 seconds, a gate for each) with the SQLSTATE and is tried again at the next tick
+  or command. The task ends when the stop begins, in its waits and its statements, before the pool
+  closes.
 - **After a close.** The task leaves the registry first, then writes the Close frame, then the
   disconnect stamp (above), then drains (reads and discards until the peer's reply, at most `CLOSE_WAIT`, 5 seconds). After a
   read error the stack allows no read, so the task waits `CLOSE_WAIT` without reading (a stop
@@ -1172,8 +1211,8 @@ connection with hyper's `with_upgrades()`.
   number and a word for the end; no token and no message text.
 - **Scope.** The hub holds no job state and writes no table of its own: the connection tasks
   write `agents.last_seen_at` through the stamp, the revocation pass reads `agents`, the delivery
-  queue reads and marks `jobs`, and everything else the agent says goes to the inbox, which the
-  queue takes.
+  queue reads and marks `jobs`, the communication-log task reads and writes `comm_log_requests`,
+  and everything else the agent says goes to the inbox, which the queue takes.
 
 Any other path answers 404 with a problem body, after the guard.
 
@@ -1286,6 +1325,15 @@ a new migration file rebuilds the crate. How migrations are written and applied 
   the real object server, a key another table holds, a failed audit insert rolling the row back, a
   digest per tenant, and a small and a 16 MiB document read back byte for byte from the real object
   server and signed by the download route. The metadata bounds are unit tests in `src/documents.rs`.
+  `comm_log_requests.rs` covers the task (ADR-508 item 4): a request of a connected agent sent and
+  stamped and not sent again within the lease, and sent again after it with the stamp advanced; an
+  agent that is not connected sent nothing until it connects; every outcome of an answer and its
+  row; an answer of another agent of the same or another tenant, for an unknown or an answered
+  row, a job ID that is no canonical UUID and a generation beyond `bigint` changing nothing; a row
+  a day old expired, not sent and kept expired by a late `queued`; answered, expired and
+  live-object rows never sent while a `failed` object does not stop a request; an agent with a backlog not keeping another's row from the first passes; a revoked agent that is still connected getting no command and no answer applied; a reconnect inside the lease getting the command on the new connection; and a stop during
+  the pass's statement ending the task without a failed pass. The forwarding of the answers and
+  `Hub::send_log_upload_command` and `send_in_order` are unit tests in `src/job_queue.rs` and `src/hub.rs`.
   `job_expiry.rs` covers the expiry statement and its task (ADR-487; the case names in its
   comments are the rows of the ADR's table): a job ended from its deadline and not before,
   delivered or not, with no failure and no write to the event, cursor, feed or audit tables; the

@@ -7,7 +7,7 @@
 //! session, wait for them within the grace period and abort the rest (design 13.3).
 //!
 //! The hub also holds the two queues of the channel (ADR-468 item 12): the bounded outbound queue
-//! of each connection, fed by [`Hub::send_job_command`] and drained by the connection's task, and
+//! of each connection, fed by [`Hub::send_job_command`] and [`Hub::send_log_upload_command`] and drained by the connection's task, and
 //! the one bounded inbox that [`Hub::inbox`] hands out once, fed by every task. The hub keeps no
 //! delivery table: a delivery is settled by the agent's answer, which the inbox's consumer matches
 //! by connection and command ID.
@@ -27,7 +27,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use shared_proto::{
-    AgentId, AgentMessage, CLOSE_CODE_REPLACED, CLOSE_CODES, MAX_CONTROL_MESSAGE_LEN, ServerMessage,
+    AgentId, AgentMessage, CLOSE_CODE_REPLACED, CLOSE_CODES, JobId, MAX_CONTROL_MESSAGE_LEN,
+    ServerMessage,
 };
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -139,7 +140,7 @@ pub struct Delivery {
     pub command_id: String,
 }
 
-/// Why [`Hub::send_job_command`] queued nothing.
+/// Why [`Hub::send_job_command`] or [`Hub::send_log_upload_command`] queued nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendError {
     /// The agent has no current connection, or it is closing.
@@ -303,6 +304,67 @@ impl Hub {
         {
             return Err(SendError::TooLarge);
         }
+        let connection = self.queue_frame(agent, frame)?;
+        Ok(Delivery {
+            connection,
+            command_id,
+        })
+    }
+
+    /// Queues a `logUploadCommand` on `agent`'s current connection, the way a job command is
+    /// queued: it does not wait and writes nothing itself, and `Ok` names the connection whose
+    /// queue took the frame (queued, not written or read). The command has no answer that
+    /// settles it, so its caller sends it again until the agent answers (ADR-508 item 4). The
+    /// errors are those of [`Hub::send_job_command`]; `TooLarge` means the frame cannot be
+    /// encoded within the control message limit.
+    pub fn send_log_upload_command(
+        &self,
+        agent: &AgentId,
+        job_id: &JobId,
+        generation: u64,
+    ) -> Result<ConnectionId, SendError> {
+        let frame = ServerMessage::LogUploadCommand {
+            job_id: job_id.clone(),
+            generation,
+        }
+        .encode()
+        .map_err(|_| SendError::TooLarge)?;
+        self.queue_frame(agent, frame)
+    }
+
+    /// Calls `send` for each of `items` in order, and returns the ones it settled, with its
+    /// result: an `Ok` or a `TooLarge`. An agent whose queue is full or which has no current
+    /// connection (`Busy`, `NotConnected`) gets nothing more from the call, so its later items keep
+    /// their place and the other agents' items are still sent. `stopped` is asked before each send,
+    /// and ends the call.
+    pub(crate) fn send_in_order<T, R>(
+        items: Vec<T>,
+        agent_of: impl Fn(&T) -> &AgentId,
+        stopped: impl Fn() -> bool,
+        mut send: impl FnMut(&T) -> Result<R, SendError>,
+    ) -> Vec<(T, Result<R, SendError>)> {
+        let mut settled = Vec::new();
+        let mut skipped: std::collections::HashSet<AgentId> = std::collections::HashSet::new();
+        for item in items {
+            if stopped() {
+                break;
+            }
+            if skipped.contains(agent_of(&item)) {
+                continue;
+            }
+            match send(&item) {
+                Err(SendError::Busy | SendError::NotConnected) => {
+                    skipped.insert(agent_of(&item).clone());
+                }
+                result => settled.push((item, result)),
+            }
+        }
+        settled
+    }
+
+    /// Puts an encoded frame on the agent's current connection's outbound queue, and says which
+    /// connection took it.
+    fn queue_frame(&self, agent: &AgentId, frame: String) -> Result<ConnectionId, SendError> {
         let state = self.0.lock();
         if state.tasks.is_none() {
             return Err(SendError::NotConnected);
@@ -312,10 +374,7 @@ impl Hub {
             return Err(SendError::NotConnected);
         }
         match handle.outbound.try_send(frame) {
-            Ok(()) => Ok(Delivery {
-                connection: handle.id,
-                command_id,
-            }),
+            Ok(()) => Ok(handle.id),
             Err(TrySendError::Full(_)) => Err(SendError::Busy),
             Err(TrySendError::Closed(_)) => Err(SendError::NotConnected),
         }
@@ -574,6 +633,97 @@ mod tests {
         );
         reg.outbound.try_recv().unwrap();
         assert!(hub.send_job_command(&a, "j".to_owned()).is_ok());
+    }
+
+    #[test]
+    fn a_log_upload_command_shares_the_job_commands_queue_and_names_its_connection() {
+        let hub = Hub::new();
+        let a = agent("a");
+        let job = JobId("0194f0a2-7c3e-7d11-8a52-3f6f9b1c2d4f".to_owned());
+        assert_eq!(
+            hub.send_log_upload_command(&a, &job, 3),
+            Err(SendError::NotConnected)
+        );
+        let mut reg = hub.register(&a).unwrap();
+        hub.send_job_command(&a, "j".to_owned()).unwrap();
+        assert_eq!(hub.send_log_upload_command(&a, &job, 3), Ok(reg.id));
+        let first = reg.outbound.try_recv().unwrap();
+        assert!(matches!(
+            ServerMessage::decode(&first),
+            Ok(ServerMessage::JobCommand { .. })
+        ));
+        let second = reg.outbound.try_recv().unwrap();
+        assert_eq!(
+            ServerMessage::decode(&second).unwrap(),
+            ServerMessage::LogUploadCommand {
+                job_id: job.clone(),
+                generation: 3
+            }
+        );
+        // The queue is the job commands' queue: it takes OUTBOUND_CAPACITY frames in all.
+        for _ in 0..OUTBOUND_CAPACITY {
+            hub.send_log_upload_command(&a, &job, 3).unwrap();
+        }
+        assert_eq!(
+            hub.send_log_upload_command(&a, &job, 3),
+            Err(SendError::Busy)
+        );
+        assert_eq!(
+            hub.send_job_command(&a, "j".to_owned()),
+            Err(SendError::Busy)
+        );
+        // A newer connection is the one that is named.
+        let newer = hub.register(&a).unwrap();
+        assert_eq!(hub.send_log_upload_command(&a, &job, 3), Ok(newer.id));
+    }
+
+    #[test]
+    fn items_are_sent_in_order_and_an_agent_that_is_busy_or_gone_is_skipped_for_the_rest() {
+        let item = |name: &str, n: u32| (agent(name), n);
+        let items = vec![
+            item("a", 1),
+            item("b", 1),
+            item("a", 2),
+            item("c", 1),
+            item("b", 2),
+            item("c", 2),
+        ];
+        let mut calls = Vec::new();
+        let settled = Hub::send_in_order(
+            items,
+            |item| &item.0,
+            || false,
+            |item| {
+                calls.push((item.0.0.clone(), item.1));
+                match (item.0.0.as_str(), item.1) {
+                    ("a", 1) => Err(SendError::Busy),
+                    ("b", 2) => Err(SendError::TooLarge),
+                    ("c", 1) => Err(SendError::NotConnected),
+                    _ => Ok(item.1),
+                }
+            },
+        );
+        // `a` is skipped after its Busy, `c` after its NotConnected; `b` goes on after TooLarge.
+        let called: Vec<_> = calls.iter().map(|(a, n)| (a.as_str(), *n)).collect();
+        assert_eq!(called, [("a", 1), ("b", 1), ("c", 1), ("b", 2)]);
+        let kinds: Vec<_> = settled
+            .into_iter()
+            .map(|(item, result)| (item.0.0, item.1, result))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                ("b".to_owned(), 1, Ok(1)),
+                ("b".to_owned(), 2, Err(SendError::TooLarge)),
+            ]
+        );
+        let none = Hub::send_in_order(
+            vec![item("a", 1)],
+            |item| &item.0,
+            || true,
+            |_| Ok::<_, SendError>(0),
+        );
+        assert!(none.is_empty(), "a stop ends the call before any send");
     }
 
     // D5, D6, D12

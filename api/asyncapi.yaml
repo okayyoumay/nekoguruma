@@ -527,8 +527,9 @@ components:
         generation are the whole identity of the request: there is no command ID, and the
         agent's answer is the same each time the command is repeated. The message is not signed
         and names no path; the agent reads only its own file for a job its received-jobs ledger
-        holds at that generation (ADR-508 items 4 and 5). The server may send it again until it
-        has the answer. The agent answers with `logUploadAnswer`, after the entry is durable when
+        holds at that generation (ADR-508 items 4 and 5). The server sends it to a connected agent
+        for each request that is still `requested`, and again after 90 seconds until it has the
+        answer or the request is 24 hours old. The agent answers with `logUploadAnswer`, after the entry is durable when
         it is `queued`; a ledger or file-system failure on the agent sends no answer.
       payload:
         type: object
@@ -551,7 +552,11 @@ components:
         received-jobs ledger does not hold the job with this generation as its highest. `noLog`:
         there is no log file, or the file has no complete line. `busy`: a run
         holds the log's writer lock, so a later command may find it free. `tooLarge`: the log is
-        over the largest object the data channel takes.
+        over the largest object the data channel takes. The server applies the answer to the
+        sending agent's own request for that job and generation while it is still `requested`:
+        `queued` makes it `accepted`, any other outcome makes it `refused` with that reason. An
+        answer for another agent's request, an unknown one, or one already answered or expired
+        changes nothing.
       payload:
         type: object
         additionalProperties: false

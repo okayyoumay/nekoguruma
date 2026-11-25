@@ -26,7 +26,7 @@ use shared_crypto::{
 };
 use shared_proto::{
     AgentId, AgentMessage, CLOSE_CODE_TOO_BIG, CONTROL_SUBPROTOCOL, INSTRUCTION_VERSION, JobId,
-    JobInstruction, JobKind, MAX_CONTROL_MESSAGE_LEN, ServerMessage, VciId, Vin,
+    JobInstruction, JobKind, LogUploadOutcome, MAX_CONTROL_MESSAGE_LEN, ServerMessage, VciId, Vin,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 use tokio::sync::mpsc;
@@ -49,6 +49,7 @@ use crate::deadline::{Clock, IssueMark};
 use crate::identity::load_or_create;
 use crate::identity::store::{MemoryStore, SecretName};
 use crate::instruction::VerifiedInstruction;
+use crate::log_upload::{Handled as LogHandled, NoLogUploads};
 use crate::outbox::{Kind, Outbox, Probe};
 use crate::received_jobs::ReceivedJobs;
 use crate::registration::{Request as RegisterRequest, register_in};
@@ -481,9 +482,59 @@ impl Intake for RecordingIntake {
     }
 }
 
+/// A log-request handler that records what it was asked and answers a scripted outcome. It can
+/// be held until the test releases it, which stands for a log that takes long to hash.
+struct ScriptedLogUploads {
+    asked: Mutex<Vec<(String, u64)>>,
+    outcome: Mutex<Option<LogUploadOutcome>>,
+    /// Whether a call waits for [`ScriptedLogUploads::release`].
+    hold: AtomicBool,
+    /// A call has started.
+    entered: tokio::sync::Notify,
+    gate: tokio::sync::Semaphore,
+}
+
+impl Default for ScriptedLogUploads {
+    fn default() -> Self {
+        Self {
+            asked: Mutex::default(),
+            outcome: Mutex::new(Some(LogUploadOutcome::Queued)),
+            hold: AtomicBool::new(false),
+            entered: tokio::sync::Notify::new(),
+            gate: tokio::sync::Semaphore::new(0),
+        }
+    }
+}
+
+impl ScriptedLogUploads {
+    fn asked(&self) -> Vec<(String, u64)> {
+        self.asked.lock().unwrap().clone()
+    }
+
+    /// Lets one held call finish.
+    fn release(&self) {
+        self.gate.add_permits(1);
+    }
+}
+
+impl LogUploads for ScriptedLogUploads {
+    fn handle(&self, job_id: String, generation: u64) -> LogHandled<'_> {
+        self.asked.lock().unwrap().push((job_id, generation));
+        Box::pin(async move {
+            self.entered.notify_one();
+            if self.hold.load(Ordering::SeqCst) {
+                self.gate.acquire().await.unwrap().forget();
+            }
+            let outcome = *self.outcome.lock().unwrap();
+            outcome.ok_or(LogUploadError::Task)
+        })
+    }
+}
+
 struct Env {
     fx: Fixture,
     intake: Arc<RecordingIntake>,
+    log_uploads: Arc<ScriptedLogUploads>,
     /// `None` only while a restart has the outbox closed.
     outbox: Option<SharedOutbox>,
     /// `None` only while a restart has the mark store closed.
@@ -584,6 +635,7 @@ impl Env {
             fx.key.clone()
         };
         let intake = Arc::new(RecordingIntake::default());
+        let log_uploads = Arc::new(ScriptedLogUploads::default());
         let outbox = open_outbox(&fx, opts.probe);
         let marks = open_marks(&fx, opts.mark_probe);
         let ledger = open_ledger(&fx, opts.ledger_probe);
@@ -597,6 +649,7 @@ impl Env {
             marks: marks.clone(),
             clock: clock.clone(),
             ledger: ledger.clone(),
+            log_uploads: log_uploads.clone(),
         };
         let started = Instant::now();
         let handle = fx
@@ -607,6 +660,7 @@ impl Env {
         Env {
             fx,
             intake,
+            log_uploads,
             outbox: Some(outbox),
             marks: Some(marks),
             ledger: Some(ledger),
@@ -662,6 +716,7 @@ impl Env {
             marks: marks.clone(),
             clock: self.clock.clone(),
             ledger: ledger.clone(),
+            log_uploads: self.log_uploads.clone(),
         };
         self.handle = self
             .fx
@@ -1689,6 +1744,7 @@ async fn a7_a_key_with_another_fingerprint_is_a_key_mismatch() {
         marks: open_marks(&fx, None),
         clock: TestClock::at(DEVICE_NOW),
         ledger: open_ledger(&fx, None),
+        log_uploads: Arc::new(NoLogUploads),
     };
     let error = fx.open().unwrap().start_with(&other, seams).unwrap_err();
     assert!(matches!(error, ControlError::KeyMismatch));
@@ -1760,6 +1816,7 @@ async fn a11_a_second_open_in_the_same_process_is_already_running() {
         marks: open_marks(&fx, None),
         clock: TestClock::at(DEVICE_NOW),
         ledger: open_ledger(&fx, None),
+        log_uploads: Arc::new(NoLogUploads),
     };
     let handle = first.start_with(&fx.key.public_key(), seams).unwrap();
     assert!(matches!(fx.open(), Err(ControlError::AlreadyRunning)));
@@ -1824,6 +1881,7 @@ fn a12_runtime_shutdown_and_an_unstarted_opened_release_both_locks() {
             marks: open_marks(&fx, None),
             clock: TestClock::at(DEVICE_NOW),
             ledger: open_ledger(&fx, None),
+            log_uploads: Arc::new(NoLogUploads),
         };
         let handle = fx
             .open()
@@ -5161,11 +5219,14 @@ async fn r1_over_real_loopback_an_exchange_an_upgrade_a_heartbeat_and_a_stop() {
         .unwrap()
         .start(
             agent,
-            Arc::new(LogIntake),
-            open_outbox(&fx, None),
-            open_marks(&fx, None),
-            Arc::new(crate::deadline::SystemClock),
-            open_ledger(&fx, None),
+            Collaborators {
+                intake: Arc::new(LogIntake),
+                outbox: open_outbox(&fx, None),
+                marks: open_marks(&fx, None),
+                clock: Arc::new(crate::deadline::SystemClock),
+                ledger: open_ledger(&fx, None),
+                log_uploads: Arc::new(NoLogUploads),
+            },
         )
         .unwrap();
     tokio::time::timeout(secs(30), async {
@@ -5219,11 +5280,14 @@ async fn r1_over_real_loopback_a_refused_connection_and_then_the_server_appears(
         .unwrap()
         .start(
             agent,
-            Arc::new(LogIntake),
-            open_outbox(&fx, None),
-            open_marks(&fx, None),
-            Arc::new(crate::deadline::SystemClock),
-            open_ledger(&fx, None),
+            Collaborators {
+                intake: Arc::new(LogIntake),
+                outbox: open_outbox(&fx, None),
+                marks: open_marks(&fx, None),
+                clock: Arc::new(crate::deadline::SystemClock),
+                ledger: open_ledger(&fx, None),
+                log_uploads: Arc::new(NoLogUploads),
+            },
         )
         .unwrap();
     tokio::time::timeout(secs(30), async {
@@ -6958,11 +7022,14 @@ async fn i1_an_impostor_on_a_real_port_gets_no_upgrade_and_no_frame_is_read() {
         .unwrap()
         .start(
             agent,
-            Arc::new(LogIntake),
-            outbox.clone(),
-            open_marks(&fx, None),
-            Arc::new(crate::deadline::SystemClock),
-            open_ledger(&fx, None),
+            Collaborators {
+                intake: Arc::new(LogIntake),
+                outbox: outbox.clone(),
+                marks: open_marks(&fx, None),
+                clock: Arc::new(crate::deadline::SystemClock),
+                ledger: open_ledger(&fx, None),
+                log_uploads: Arc::new(NoLogUploads),
+            },
         )
         .unwrap();
     tokio::time::timeout(secs(30), async {
@@ -7002,11 +7069,14 @@ async fn i1_an_impostor_on_a_real_port_gets_no_upgrade_and_no_frame_is_read() {
         .unwrap()
         .start(
             agent2,
-            Arc::new(LogIntake),
-            outbox2.clone(),
-            open_marks(&fx2, None),
-            Arc::new(crate::deadline::SystemClock),
-            open_ledger(&fx2, None),
+            Collaborators {
+                intake: Arc::new(LogIntake),
+                outbox: outbox2.clone(),
+                marks: open_marks(&fx2, None),
+                clock: Arc::new(crate::deadline::SystemClock),
+                ledger: open_ledger(&fx2, None),
+                log_uploads: Arc::new(NoLogUploads),
+            },
         )
         .unwrap();
     let pending = outbox2.pending_for_test().await;
@@ -7045,4 +7115,167 @@ async fn i1_an_impostor_on_a_real_port_gets_no_upgrade_and_no_frame_is_read() {
     );
     handle.stop();
     handle.stopped().await;
+}
+
+fn log_command(job: &str, generation: u64) -> String {
+    ServerMessage::LogUploadCommand {
+        job_id: JobId(job.to_owned()),
+        generation,
+    }
+    .encode()
+    .unwrap()
+}
+
+fn log_answer(job: &str, generation: u64, outcome: LogUploadOutcome) -> String {
+    AgentMessage::LogUploadAnswer {
+        job_id: JobId(job.to_owned()),
+        generation,
+        outcome,
+    }
+    .encode()
+    .unwrap()
+}
+
+/// Waits until the scripted handler has been called, as many times as there are permits.
+async fn handler_entered(env: &Env) {
+    tokio::time::timeout(DEADLINE, env.log_uploads.entered.notified())
+        .await
+        .expect("the handler was not called");
+}
+
+/// A log request is answered after its work, which runs beside the loop: while the handler is
+/// held the next frame is the heartbeat on its tick, and the answer follows the release.
+#[tokio::test(start_paused = true)]
+async fn l1_a_log_request_is_answered_when_its_work_is_done_and_heartbeats_are_not_delayed() {
+    let mut env = Env::new();
+    env.log_uploads.hold.store(true, Ordering::SeqCst);
+    let (hello_at, mut ws) = env.connected(10).await;
+    send(&mut ws, &log_command(JOB_ID, 3)).await;
+    handler_entered(&env).await;
+    assert_eq!(env.log_uploads.asked(), [(JOB_ID.to_owned(), 3)]);
+    // No answer yet: the next two frames are the ticks, on time.
+    assert_after(hello_at, heartbeat(&mut ws).await, 10, "tick 1 while held");
+    assert_after(hello_at, heartbeat(&mut ws).await, 20, "tick 2 while held");
+    env.log_uploads.release();
+    let (_, message) = got(&mut ws).await;
+    assert_eq!(
+        message,
+        Got::Text(log_answer(JOB_ID, 3, LogUploadOutcome::Queued))
+    );
+    // The answer was no job command's, and writing it did not extend the idle deadline, which
+    // counts from the command.
+    assert_eq!(env.counts(), (0, 0));
+    assert_after(hello_at, close_of(&mut ws, 4003, true).await, 30, "idle");
+}
+
+/// Each outcome the handler gives is written as it is, for the job and generation asked.
+#[tokio::test(start_paused = true)]
+async fn l2_every_outcome_is_written_with_the_job_and_generation_asked() {
+    let mut env = Env::new();
+    let (_, mut ws) = env.connected(10).await;
+    for outcome in [
+        LogUploadOutcome::Queued,
+        LogUploadOutcome::UnknownJob,
+        LogUploadOutcome::NoLog,
+        LogUploadOutcome::Busy,
+        LogUploadOutcome::TooLarge,
+    ] {
+        *env.log_uploads.outcome.lock().unwrap() = Some(outcome);
+        send(&mut ws, &log_command(JOB_ID, 9)).await;
+        let (_, message) = got(&mut ws).await;
+        assert_eq!(message, Got::Text(log_answer(JOB_ID, 9, outcome)));
+    }
+}
+
+/// A handler that fails leaves the command unanswered, with one warning per hello and the
+/// connection standing; the next command is answered.
+#[tokio::test(start_paused = true)]
+async fn l3_a_failed_log_request_sends_no_answer_and_keeps_the_connection() {
+    let mut env = Env::new();
+    let (hello_at, mut ws) = env.connected(10).await;
+    *env.log_uploads.outcome.lock().unwrap() = None;
+    send(&mut ws, &log_command(JOB_ID, 1)).await;
+    send(&mut ws, &log_command(JOB_ID, 2)).await;
+    assert_after(
+        hello_at,
+        heartbeat(&mut ws).await,
+        10,
+        "tick after two failures",
+    );
+    assert_eq!(env.log_uploads.asked().len(), 2);
+    assert_eq!(
+        env.log
+            .text()
+            .matches("a log request could not be handled")
+            .count(),
+        2,
+        "a warning and a debug line"
+    );
+    *env.log_uploads.outcome.lock().unwrap() = Some(LogUploadOutcome::NoLog);
+    send(&mut ws, &log_command(JOB_ID, 1)).await;
+    let (_, message) = got(&mut ws).await;
+    assert_eq!(
+        message,
+        Got::Text(log_answer(JOB_ID, 1, LogUploadOutcome::NoLog))
+    );
+}
+
+/// A command repeated while its work runs is dropped, so the writer lock the first holds does not
+/// make the second answer `busy`; a fifth distinct request in flight is dropped as well.
+#[tokio::test(start_paused = true)]
+async fn l4_a_log_request_in_flight_is_not_started_again_and_only_four_run_at_once() {
+    let mut env = Env::new();
+    env.log_uploads.hold.store(true, Ordering::SeqCst);
+    let (hello_at, mut ws) = env.connected(10).await;
+    send(&mut ws, &log_command(JOB_ID, 1)).await;
+    send(&mut ws, &log_command(JOB_ID, 1)).await;
+    for generation in 2..=5 {
+        send(&mut ws, &log_command(JOB_ID, generation)).await;
+    }
+    // The heartbeat tick comes after the loop has read all six frames.
+    assert_after(hello_at, heartbeat(&mut ws).await, 10, "tick");
+    let asked = env.log_uploads.asked();
+    assert_eq!(
+        asked,
+        (1..=4).map(|g| (JOB_ID.to_owned(), g)).collect::<Vec<_>>()
+    );
+    for _ in 0..4 {
+        env.log_uploads.release();
+    }
+    let mut answered = Vec::new();
+    while answered.len() < 4 {
+        let (_, message) = got(&mut ws).await;
+        match message {
+            Got::Text(text) if text == HEARTBEAT => {}
+            Got::Text(text) => answered.push(text),
+            other => panic!("an answer is next, got {other:?}"),
+        }
+    }
+    answered.sort();
+    let mut want: Vec<String> = (1..=4)
+        .map(|g| log_answer(JOB_ID, g, LogUploadOutcome::Queued))
+        .collect();
+    want.sort();
+    assert_eq!(answered, want);
+}
+
+/// A log request is a received frame, so it extends the idle deadline as a job command does.
+#[tokio::test(start_paused = true)]
+async fn l5_a_log_request_counts_as_a_frame_for_the_idle_deadline() {
+    let mut env = Env::new();
+    let (hello_at, mut ws) = env.connected(10).await;
+    assert_after(hello_at, heartbeat(&mut ws).await, 10, "tick 1");
+    assert_after(hello_at, heartbeat(&mut ws).await, 20, "tick 2");
+    until(hello_at + secs(25)).await;
+    send(&mut ws, &log_command(JOB_ID, 1)).await;
+    let (at, message) = got(&mut ws).await;
+    assert_after(hello_at, at, 25, "the answer comes at once");
+    assert_eq!(
+        message,
+        Got::Text(log_answer(JOB_ID, 1, LogUploadOutcome::Queued))
+    );
+    assert_after(hello_at, heartbeat(&mut ws).await, 30, "tick 3");
+    assert_after(hello_at, heartbeat(&mut ws).await, 40, "tick 4");
+    assert_after(hello_at, heartbeat(&mut ws).await, 50, "tick 5");
+    assert_after(hello_at, close_of(&mut ws, 4003, true).await, 55, "idle");
 }

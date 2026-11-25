@@ -116,6 +116,8 @@ channels:
       agentEvent: { $ref: '#/components/messages/AgentEvent' }
       heartbeat: { $ref: '#/components/messages/Heartbeat' }
       reconcile: { $ref: '#/components/messages/Reconcile' }
+      logUploadCommand: { $ref: '#/components/messages/LogUploadCommand' }
+      logUploadAnswer: { $ref: '#/components/messages/LogUploadAnswer' }
       commandRejected: { $ref: '#/components/messages/CommandRejected' }
 
   browserStream:
@@ -213,6 +215,20 @@ operations:
       connection with 1002 without dropping anything (5.3, ADR-478).
     messages:
       - { $ref: '#/channels/agentControl/messages/eventAck' }
+
+  askForLog:
+    action: receive
+    channel: { $ref: '#/channels/agentControl' }
+    summary: Server → agent. An operator asked for a job's communication log (8.11, ADR-508)
+    messages:
+      - { $ref: '#/channels/agentControl/messages/logUploadCommand' }
+
+  answerLogAsk:
+    action: send
+    channel: { $ref: '#/channels/agentControl' }
+    summary: Agent → server. What the agent did with a log request (8.11, ADR-508)
+    messages:
+      - { $ref: '#/channels/agentControl/messages/logUploadAnswer' }
 
   keepAlive:
     action: send
@@ -501,6 +517,52 @@ components:
           seq: { type: integer, description: Every event up to and including this one is stored }
       examples:
         - payload: {"type": "eventAck", "seq": 8}
+
+    LogUploadCommand:
+      name: logUploadCommand
+      summary: Server → agent. Send this job's communication log (8.11, ADR-508)
+      description: |
+        Asks the agent to put the communication log of one job and ownership generation into its
+        upload ledger, from where the uploader sends it over the data channel (5.2). The job and
+        generation are the whole identity of the request: there is no command ID, and the
+        agent's answer is the same each time the command is repeated. The message is not signed
+        and names no path; the agent reads only its own file for a job its received-jobs ledger
+        holds at that generation (ADR-508 items 4 and 5). The server may send it again until it
+        has the answer. The agent answers with `logUploadAnswer`, after the entry is durable when
+        it is `queued`; a ledger or file-system failure on the agent sends no answer.
+      payload:
+        type: object
+        additionalProperties: false
+        required: [type, jobId, generation]
+        properties:
+          type: { const: logUploadCommand }
+          jobId: { type: string }
+          generation: { type: integer, minimum: 0, description: The job's ownership generation }
+      examples:
+        - payload: {"type": "logUploadCommand", "jobId": "j-1", "generation": 1}
+
+    LogUploadAnswer:
+      name: logUploadAnswer
+      summary: Agent → server. What the agent did with a log request (8.11, ADR-508)
+      description: |
+        `queued`: the log's bytes up to its last complete line are in the agent's upload ledger
+        (also when an entry for the job and generation was already there, which the agent does
+        not read again). `unknownJob`: the agent's received-jobs ledger does not hold the job at
+        that generation. `noLog`: there is no log, or none with a complete line. `busy`: a run
+        holds the log's writer lock, so a later command may find it free. `tooLarge`: the log is
+        over the largest object the data channel takes.
+      payload:
+        type: object
+        additionalProperties: false
+        required: [type, jobId, generation, outcome]
+        properties:
+          type: { const: logUploadAnswer }
+          jobId: { type: string }
+          generation: { type: integer, minimum: 0 }
+          outcome: { enum: [queued, unknownJob, noLog, busy, tooLarge] }
+      examples:
+        - payload: {"type": "logUploadAnswer", "jobId": "j-1", "generation": 1, "outcome": "queued"}
+        - payload: {"type": "logUploadAnswer", "jobId": "j-1", "generation": 1, "outcome": "busy"}
 
     Heartbeat:
       name: heartbeat

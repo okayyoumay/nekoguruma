@@ -51,9 +51,10 @@ use std::time::Duration;
 
 use worker_host::service::OperatingMode;
 
-use crate::control::{self, ControlError, LogIntake, SharedOutbox};
+use crate::control::{self, Collaborators, ControlError, LogIntake, SharedOutbox};
 use crate::deadline::{IssueMark, MarkError, SystemClock};
 use crate::identity::{AgentKey, IdentityError, agent_key};
+use crate::log_upload::LogUploader;
 use crate::outbox::{Outbox, OutboxError};
 use crate::received_jobs::{LedgerError, ReceivedJobs};
 use crate::registration::origin::ServerOrigin;
@@ -300,6 +301,7 @@ pub async fn run(
     let uploads = UploadLedger::open(mode, &opened.record().agent_id)
         .map_err(|error| upload_ledger_error(&error))?;
     let uploads = SharedLedger::new(uploads);
+    let log_uploads = LogUploader::new(mode, ledger.clone(), uploads.clone());
     run_opened(
         opened,
         move || agent_key(mode),
@@ -307,11 +309,14 @@ pub async fn run(
         |opened, key| {
             opened.start(
                 key,
-                Arc::new(LogIntake),
-                outbox,
-                marks,
-                Arc::new(SystemClock),
-                ledger,
+                Collaborators {
+                    intake: Arc::new(LogIntake),
+                    outbox,
+                    marks,
+                    clock: Arc::new(SystemClock),
+                    ledger,
+                    log_uploads: Arc::new(log_uploads),
+                },
             )
         },
         UPLOADER_STOP_BOUND,

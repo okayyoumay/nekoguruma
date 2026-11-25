@@ -992,6 +992,30 @@ async fn progress_and_reconcile_messages_are_not_stored_and_do_not_count_as_even
     r.finish().await;
 }
 
+/// An agent's answer to a log request is read and dropped until the server acts on it (ADR-508):
+/// it is not an event, closes nothing, and the connection goes on with the next event and the
+/// heartbeat.
+#[tokio::test]
+async fn a_log_upload_answer_is_dropped_without_closing_the_connection() {
+    let r = Rig::new().await;
+    let mut client = r.connect().await;
+    for outcome in ["queued", "unknownJob", "noLog", "busy", "tooLarge"] {
+        send(
+            &mut client,
+            &format!(
+                r#"{{"type":"logUploadAnswer","jobId":"{JOB}","generation":1,"outcome":"{outcome}"}}"#
+            ),
+        )
+        .await;
+    }
+    send(&mut client, &frame(1)).await;
+    assert_eq!(read_ack(&mut client).await, 1);
+    assert_eq!(rows(&r.u, &r.u.id).await.len(), 1);
+    assert_eq!(r.counts.seen.load(Ordering::Relaxed), 1);
+    heartbeat(&mut client).await;
+    r.finish().await;
+}
+
 // E23
 #[tokio::test]
 async fn a_re_registered_agent_has_its_own_cursor_and_starts_at_one() {

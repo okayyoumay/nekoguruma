@@ -108,12 +108,21 @@ impl Digest {
 
 /// Reads the file at `path` to its end through one handle and returns its length and SHA-256.
 pub fn digest_file(path: &Path) -> io::Result<Digest> {
-    let mut file = File::open(path)?;
+    digest_reader(File::open(path)?)
+}
+
+/// Reads the first `length` bytes of `file` from its current position (or to its end when it is
+/// shorter) and returns the length read and its SHA-256.
+pub fn digest_prefix(file: File, length: u64) -> io::Result<Digest> {
+    digest_reader(file.take(length))
+}
+
+fn digest_reader(mut reader: impl Read) -> io::Result<Digest> {
     let mut hasher = Sha256::new();
     let mut length = 0u64;
     let mut buffer = vec![0u8; 64 << 10];
     loop {
-        match file.read(&mut buffer) {
+        match reader.read(&mut buffer) {
             Ok(0) => break,
             Ok(read) => {
                 hasher.update(&buffer[..read]);
@@ -652,6 +661,14 @@ impl UploadLedger {
     pub fn pending(&self) -> impl Iterator<Item = &Entry> + '_ {
         let of = |kind| self.entries.iter().filter(move |entry| entry.kind == kind);
         of(Kind::Result).chain(of(Kind::CommLog))
+    }
+
+    /// Whether an entry for the job, generation and a communication log is pending, whatever
+    /// bytes it holds. Served from memory, also when the ledger is poisoned.
+    pub fn has_comm_log(&self, key: &JobKey) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.kind == Kind::CommLog && entry.key == *key)
     }
 
     /// The entry to upload first, `None` when there is none.

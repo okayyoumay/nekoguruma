@@ -32,9 +32,15 @@
 //! leaves the command unanswered. A refusal is answered `commandRejected` with its reason and
 //! records nothing. Answers are written on this connection through the one writer and under the
 //! write bound.
+//! A `logUploadCommand` is handed to [`crate::log_upload::LogUploads`] as a task beside the loop
+//! (at most four at once, none repeated while it runs); the loop writes its `logUploadAnswer`
+//! when the task is done, which is after an entry is durable, and a task that fails leaves the
+//! command unanswered (ADR-508).
 //! Sending an answer does not reset the idle deadline; only a frame received does. Never logged:
 //! the token, a message's text, a `commandId`, a close reason the server sent.
 
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine;
@@ -62,6 +68,7 @@ use super::{Fail, Outcome, Phase, SessionState, Stop, Wiring};
 use crate::answer_proof::Sent;
 use crate::deadline::{MarkError, Verdict};
 use crate::instruction::VerifiedInstruction;
+use crate::log_upload::{LogUploadError, LogUploads};
 use crate::outbox::{Kind, OutboxError};
 use crate::received_jobs::LedgerError;
 use crate::server_http;
@@ -510,6 +517,7 @@ async fn connected(
 ) -> End {
     let w = state.wiring;
     let mut sender = Sender::new(&w.outbox);
+    let mut asks = LogAsks::default();
     let interval = Duration::from_secs(u64::from(secs));
     let idle = interval * HEARTBEAT_MISSED_LIMIT;
     let hello_at = Instant::now();
@@ -582,6 +590,10 @@ async fn connected(
                             }
                         }
                     }
+                    Ok(ServerMessage::LogUploadCommand { job_id, generation }) => {
+                        last_frame_at = Instant::now();
+                        asks.ask(&w.log_uploads, job_id.0, generation);
+                    }
                     Ok(
                         ServerMessage::CancelCommand { .. }
                         | ServerMessage::HmiResponse { .. }
@@ -601,6 +613,27 @@ async fn connected(
                 Some(Ok(Message::Frame(_))) => {}
                 Some(Ok(Message::Close(frame))) => return peer_close(frame, lived_now),
             },
+            Some(done) = asks.next(), if !asks.is_idle() => {
+                let answer = match done {
+                    Ok(Ok(answer)) => answer,
+                    Ok(Err(error)) => {
+                        state.warnings.log_upload_failure(&error);
+                        continue;
+                    }
+                    Err(()) => {
+                        state.warnings.log_upload_failure(&LogUploadError::Task);
+                        continue;
+                    }
+                };
+                // The answer is written only now, after the work has made its entry durable.
+                let Ok(text) = answer.encode() else {
+                    tracing::debug!("a log answer is over the size limit and is not sent");
+                    continue;
+                };
+                if let Err(end) = write_or_stop(socket, &text, state.stop, lived_now).await {
+                    return end;
+                }
+            }
             (seq, text) = sender.next() => {
                 if let Err(end) = write_or_stop(socket, &text, state.stop, lived_now).await {
                     return end;
@@ -914,5 +947,72 @@ async fn record_job_state(w: &Wiring, stop: &Stop, job_id: String, state: JobSta
             };
             Recorded::Failed(class, error)
         }
+    }
+}
+
+/// The log requests being worked on for one connection. Each runs as a task of its own beside the
+/// loop, which writes its answer when it is done, so reading and heartbeats go on while a large
+/// log is hashed. The tasks end with the connection; a task that was reading goes on unobserved
+/// and the server's next command finds its entry.
+#[derive(Default)]
+struct LogAsks {
+    tasks: tokio::task::JoinSet<(
+        String,
+        u64,
+        Result<shared_proto::LogUploadOutcome, LogUploadError>,
+    )>,
+    /// The request of each task, so that a repeat of one in flight is dropped and not answered
+    /// `busy` by the writer lock the first one holds.
+    keys: HashMap<tokio::task::Id, (String, u64)>,
+}
+
+/// The most log requests worked on at once; a command past it is dropped and the server asks
+/// again.
+const MAX_LOG_ASKS: usize = 4;
+
+impl LogAsks {
+    fn is_idle(&self) -> bool {
+        self.tasks.is_empty()
+    }
+
+    fn ask(&mut self, uploads: &Arc<dyn LogUploads>, job_id: String, generation: u64) {
+        let in_flight = self
+            .keys
+            .values()
+            .any(|(job, gen_)| *job == job_id && *gen_ == generation);
+        if in_flight || self.keys.len() >= MAX_LOG_ASKS {
+            tracing::debug!("a log request was dropped: it is in flight or too many are");
+            return;
+        }
+        let uploads = Arc::clone(uploads);
+        let key = (job_id.clone(), generation);
+        let id = self
+            .tasks
+            .spawn(async move {
+                let result = uploads.handle(job_id.clone(), generation).await;
+                (job_id, generation, result)
+            })
+            .id();
+        self.keys.insert(id, key);
+    }
+
+    /// The next finished request's answer, `Ok(Err(_))` for one that failed and `Err(())` for a
+    /// task that panicked or was cancelled.
+    async fn next(&mut self) -> Option<Result<Result<AgentMessage, LogUploadError>, ()>> {
+        let done = self.tasks.join_next_with_id().await?;
+        Some(match done {
+            Ok((id, (job_id, generation, result))) => {
+                self.keys.remove(&id);
+                Ok(result.map(|outcome| AgentMessage::LogUploadAnswer {
+                    job_id: JobId(job_id),
+                    generation,
+                    outcome,
+                }))
+            }
+            Err(error) => {
+                self.keys.remove(&error.id());
+                Err(())
+            }
+        })
     }
 }

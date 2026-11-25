@@ -22,7 +22,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use crate::artifact::to_hex;
 use crate::journal::{JobKey, JournalError, Vin, WriterLock, job_file_stem, sync_dir};
 use crate::runner::JobError;
+use crate::upload_ledger::{Digest, MAX_COMM_LOG_BYTES, digest_prefix};
 
 /// What an exchange entry carries of a message's bytes (design 8.11, ADR-347).
 pub(crate) mod redaction;
@@ -96,10 +97,89 @@ impl CommLogSetup {
 
     /// The log file of the setup's job and generation.
     pub fn path(&self) -> Result<PathBuf, JournalError> {
-        Ok(self
-            .dir
-            .join(format!("{}.commlog.jsonl", job_file_stem(&self.key)?)))
+        comm_log_path(&self.dir, &self.key)
     }
+}
+
+/// The log file of `key` in `dir`: `{job_id}.g{generation}.commlog.jsonl`. The writer
+/// ([`CommLogSetup::path`]) and the reader that sends the log to the server
+/// ([`digest_for_upload`]) both name it here.
+pub fn comm_log_path(dir: &Path, key: &JobKey) -> Result<PathBuf, JournalError> {
+    Ok(dir.join(format!("{}.commlog.jsonl", job_file_stem(key)?)))
+}
+
+/// The writer lock of `key`'s log in `dir`: `{job_id}.g{generation}.commlog.lock`.
+fn comm_log_lock_path(dir: &Path, key: &JobKey) -> Result<PathBuf, JournalError> {
+    Ok(dir.join(format!("{}.commlog.lock", job_file_stem(key)?)))
+}
+
+/// What reading a job's log for the upload ledger found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadRead {
+    /// The log's writer lock is held: a run is appending to it.
+    Busy,
+    /// There is no log file, or it holds no complete line.
+    NoLog,
+    /// Its complete lines are over the largest communication log the upload ledger takes.
+    TooLarge,
+    /// The length and SHA-256 of the log up to its last line end.
+    Ready(Digest),
+}
+
+/// Reads the log of `key` in `dir` up to its last line end under the log's writer lock, tried
+/// once, for the upload ledger (design 8.11, ADR-508 item 5). A torn last line is left out: a
+/// run that reopens the log cuts after the last line end and appends from there (ADR-347), so
+/// the bytes counted here never change. The lock is held while the log is hashed and released
+/// before this returns. Blocking (file reads of up to the largest log): the caller runs it on a
+/// blocking task.
+pub fn digest_for_upload(dir: &Path, key: &JobKey) -> io::Result<UploadRead> {
+    let path = comm_log_path(dir, key).map_err(io::Error::other)?;
+    // A log that is not there is judged before the lock is taken, which would create the lock
+    // file of a job that has no log.
+    if !path.try_exists()? {
+        return Ok(UploadRead::NoLog);
+    }
+    let lock = match WriterLock::at(&comm_log_lock_path(dir, key).map_err(io::Error::other)?) {
+        Ok(lock) => lock,
+        Err(JournalError::InUse) => return Ok(UploadRead::Busy),
+        Err(JournalError::Io(error)) => return Err(error),
+        Err(error) => return Err(io::Error::other(error)),
+    };
+    let mut file = match File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(UploadRead::NoLog),
+        Err(error) => return Err(error),
+    };
+    let complete = last_line_end(&mut file)?;
+    let read = if complete == 0 {
+        UploadRead::NoLog
+    } else if complete > MAX_COMM_LOG_BYTES {
+        UploadRead::TooLarge
+    } else {
+        file.rewind()?;
+        UploadRead::Ready(digest_prefix(file, complete)?)
+    };
+    drop(lock);
+    Ok(read)
+}
+
+/// The offset just after the last `\n` of `file`, 0 when it holds none, found by reading back
+/// from the end.
+fn last_line_end(file: &mut File) -> io::Result<u64> {
+    const CHUNK: u64 = 64 << 10;
+    let mut end = file.seek(SeekFrom::End(0))?;
+    let mut buffer = vec![0u8; CHUNK as usize];
+    while end > 0 {
+        let start = end.saturating_sub(CHUNK);
+        let chunk = &mut buffer[..(end - start) as usize];
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(chunk)?;
+        if let Some(at) = chunk.iter().rposition(|byte| *byte == b'\n') {
+            return Ok(start + at as u64 + 1);
+        }
+        end = start;
+    }
+    Ok(0)
 }
 
 /// How a job's log ended, which a run returns beside its result (`JobRun::comm_log`). The

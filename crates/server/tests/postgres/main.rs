@@ -13,6 +13,7 @@ mod agent_upload;
 mod api_spec;
 mod binary;
 mod comm_log_requests;
+mod comm_log_uploads;
 mod control;
 mod documents;
 mod downloads;

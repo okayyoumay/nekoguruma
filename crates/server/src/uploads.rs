@@ -989,12 +989,18 @@ pub(crate) async fn stored_instruction(
     let Some((signed,)) = signed else {
         return Ok(StoredInstruction::NoJob);
     };
-    let decoded = shared_crypto::instruction::Envelope::split(&signed)
-        .ok()
-        .and_then(|envelope| JobInstruction::decode(envelope.payload()).ok());
-    Ok(decoded.map_or(StoredInstruction::Undecodable, |i| {
-        StoredInstruction::Instruction(Box::new(i))
-    }))
+    Ok(
+        decode_instruction(&signed).map_or(StoredInstruction::Undecodable, |i| {
+            StoredInstruction::Instruction(Box::new(i))
+        }),
+    )
+}
+
+/// The instruction a stored `signed_job` holds, or `None` when it does not decode. The server
+/// wrote the envelope, so its signature is not checked again.
+pub(crate) fn decode_instruction(signed: &[u8]) -> Option<JobInstruction> {
+    let envelope = shared_crypto::instruction::Envelope::split(signed).ok()?;
+    JobInstruction::decode(envelope.payload()).ok()
 }
 
 /// The instruction's ownership generation of the job, then the row that holds the declaration, in

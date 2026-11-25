@@ -30,6 +30,7 @@ security:
 
 tags:
   - name: jobs
+  - name: comm-logs
   - name: agents
   - name: artifacts
   - name: extensions
@@ -261,6 +262,167 @@ paths:
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
+
+  # ------------------------------------------------------------ Communication logs
+  /v1/comm-log-uploads/scope:
+    get:
+      tags: [comm-logs]
+      summary: Show the scope of a request for jobs' communication logs (8.11, 16.2, ADR-455, ADR-508)
+      description: |
+        Shows what a request for the communication logs of 1 to 32 jobs would cover, so that the
+        operator sees it before asking. `jobId` is given once per job, each a lowercase UUID, none
+        twice; any other query parameter, a repeated job, no job, more than 32 or a value that is
+        not a canonical UUID is **400**, judged before the database is read. The caller must hold
+        the role `worker` with no scope (**403**, one answer whatever the IDs). Each job must be one
+        the caller created: a job that does not exist, belongs to another tenant or was created by
+        another operator is **404**, one answer for the three, and then no job of the call is shown.
+        A stored job instruction that does not decode is **500**. The request writes nothing, and
+        the answer is not cached since it holds VINs.
+
+        Each job shows its ID, ownership generation (read from the stored instruction), agent,
+        kind, VIN (null when the job has none), creation time and end time (null while the job has
+        not ended), the state of its log, and its request. The log's state is read from the job's
+        `commLog` object at that generation, not from the request: `none` when there is no object,
+        `failed` when only failed attempts exist, otherwise the live object's state (`open`,
+        `completing` or `finished`, the last being a stored log). The `request` is the request row
+        of that generation, or null. `requestable` says whether `POST` would accept the job: the
+        job's agent is not revoked and still lists the caller among its allowed operators, the agent acknowledged its delivery and the job has ended, by
+        its times and not by the name of its state. A job that is not `requestable` is listed all
+        the same, so that a client can see which of the jobs stops the request. `period` runs from
+        the earliest creation to the latest end of the listed jobs; `to` is null while any of them
+        has not ended.
+
+        `scopeDigest` is a SHA-256, 64 lowercase hex digits, over the jobs' IDs, generations,
+        agents, kinds, VINs, creation times and end times in ascending job-ID order, under the tag
+        `ngr-comm-log-scope-v1`. The log's and the request's state are not in it, so a request
+        repeated after its answer was lost is still the scope that was shown. It is not a
+        credential: `POST` judges every permission again. Like every operator route the request
+        needs a live session (**401**). A database failure, or a lock wait over 5 seconds, is
+        **503**.
+      security:
+        - operatorSession: []
+      parameters:
+        - name: jobId
+          in: query
+          required: true
+          style: form
+          explode: true
+          schema:
+            type: array
+            minItems: 1
+            maxItems: 32
+            uniqueItems: true
+            items: { type: string, pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' }
+      responses:
+        '200':
+          description: The scope; not cached
+          headers:
+            Cache-Control: { schema: { type: string }, description: '`no-store`' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CommLogScope' }
+        '400': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/Problem' }
+        '403':
+          description: The caller does not hold the role `worker` with no scope (no code)
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: A named job does not exist or is not the caller's (one answer for both)
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '405':
+          description: A method other than GET
+          headers:
+            Allow: { schema: { type: string }, description: '`GET, HEAD`' }
+        '500': { $ref: '#/components/responses/Problem' }
+        '503': { $ref: '#/components/responses/Problem' }
+
+  /v1/comm-log-uploads:
+    post:
+      tags: [comm-logs]
+      summary: Request jobs' communication logs for a scope that was shown (8.11, 16.2, ADR-455, ADR-508)
+      description: |
+        Requests the communication logs of the jobs named, for the scope `GET
+        /v1/comm-log-uploads/scope` showed, and answers **202**: the request is written and the
+        server tells each job's agent, which then sends its log over the data channel. The body is
+        one JSON object of `jobIds` (1 to 32 distinct lowercase UUIDs) and `scopeDigest` (64
+        lowercase hex digits), each once and none null, in at most 4096 bytes. A body that does not
+        have this shape is **400**, judged before the database is read and before the permission.
+
+        The request is judged in this order, the first step that applies answering, in one
+        transaction that writes nothing for any answer but 202: the caller must hold the role
+        `worker` with no scope (**403**, one answer whatever the IDs); every job must be one the
+        caller created (**404**, one answer for a job that does not exist, belongs to another
+        tenant or was created by another operator, which outranks every other refusal); a stored
+        instruction that does not decode is **500**; a job whose agent is revoked, or whose agent no longer lists the caller among its allowed operators, is **403** (the same document as the missing role's), judged with the agents' rows held until the commit; a job
+        the agent never acknowledged is **422** with the `code` `JOB_NOT_DELIVERED`, then a job
+        that has not ended is **422** with `JOB_NOT_ENDED`; and a `scopeDigest` that is not the
+        digest of the named jobs as they are now (another job set, or a job that ended or was
+        otherwise changed since it was shown) is **409** with the `code` `SCOPE_CHANGED`, which
+        repeats neither the digest nor any job. When jobs differ, the answer is the first class in
+        this order that any job has, whatever the order of the IDs. A database failure, or a lock
+        wait over 5 seconds, is **503** and writes nothing; the same request may be repeated.
+
+        Then each job is written, in job-ID order, in the same transaction. A job with no request
+        gets a new one; a request that was `refused` or `expired` is renewed in place (state
+        `requested` again, the refusal and the delivery and answer times cleared, the new
+        operator and time recorded); a request that is `requested` or `accepted` is left as it is;
+        and a job whose log is already stored (its `commLog` is `finished`) is left alone, since a
+        stored log is not replaced. Each job newly requested or renewed has one audit record
+        (`commLogUploadRequested`); the others have none. The answer lists each job with its
+        request state after the write, and is 202 also when nothing was written.
+
+        Like every operator route the request needs a live session and, as a POST, the pinned
+        Origin (**403**) before the cookie is read (**401**). The body is read within 5 seconds
+        (**408**); a body over the limit is **413**; each of them closes the connection.
+      security:
+        - operatorSession: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CommLogRequest' }
+      responses:
+        '202':
+          description: The request is written for every job; not cached
+          headers:
+            Cache-Control: { schema: { type: string }, description: '`no-store`' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CommLogRequested' }
+        '400': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/Problem' }
+        '403':
+          description: The Origin is not the pinned one, the caller does not hold the role `worker` with no scope, or the agent of a job is revoked or does not list the caller (no code; one document for every reason)
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: A named job does not exist or is not the caller's (one answer for both)
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '405':
+          description: A method other than POST
+          headers:
+            Allow: { schema: { type: string }, description: '`POST`' }
+        '408': { $ref: '#/components/responses/Problem' }
+        '409':
+          description: The digest is not the scope's (`code` `SCOPE_CHANGED`); nothing was written
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '413': { $ref: '#/components/responses/Problem' }
+        '422':
+          description: A job was never acknowledged by its agent (`code` `JOB_NOT_DELIVERED`) or has not ended (`code` `JOB_NOT_ENDED`); nothing was written
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '500': { $ref: '#/components/responses/Problem' }
+        '503': { $ref: '#/components/responses/Problem' }
 
   # ------------------------------------------------------------ Agents
   /v1/agents:
@@ -1598,6 +1760,95 @@ components:
       required: [state]
       properties:
         state: { $ref: '#/components/schemas/UploadState' }
+    CommLogRequest:
+      type: object
+      additionalProperties: false
+      required: [jobIds, scopeDigest]
+      properties:
+        jobIds:
+          type: array
+          minItems: 1
+          maxItems: 32
+          uniqueItems: true
+          items: { type: string, pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' }
+          description: The jobs whose logs are requested, the jobs `GET /v1/comm-log-uploads/scope` showed
+        scopeDigest: { type: string, pattern: '^[0-9a-f]{64}$', description: The `scopeDigest` of that answer }
+    CommLogRequestState:
+      type: object
+      additionalProperties: false
+      required: [state]
+      description: A communication-log request row (ADR-508)
+      properties:
+        state: { type: string, enum: [requested, accepted, refused, expired] }
+        refusal:
+          type: string
+          enum: [unknownJob, noLog, busy, tooLarge]
+          description: Present when the state is `refused`; the agent's reason
+    CommLogScope:
+      type: object
+      additionalProperties: false
+      required: [jobs, period, scopeDigest]
+      properties:
+        jobs:
+          type: array
+          minItems: 1
+          maxItems: 32
+          description: In ascending job-ID order
+          items:
+            type: object
+            additionalProperties: false
+            required: [jobId, generation, agentId, kind, vin, created, ended, log, request, requestable]
+            properties:
+              jobId: { type: string, format: uuid }
+              generation: { type: integer, minimum: 0, description: The job's ownership generation, from its stored instruction }
+              agentId: { type: string, format: uuid }
+              kind: { type: string }
+              vin: { type: [string, 'null'], description: Null when the job has none }
+              created: { type: string, format: date-time }
+              ended: { type: [string, 'null'], format: date-time, description: Null while the job has not ended }
+              log:
+                type: object
+                additionalProperties: false
+                required: [state]
+                properties:
+                  state:
+                    type: string
+                    enum: [none, failed, open, completing, finished]
+                    description: The job's `commLog` object at this generation; `finished` is a stored log
+              request:
+                description: The request row of this generation, or null
+                oneOf:
+                  - { type: 'null' }
+                  - { $ref: '#/components/schemas/CommLogRequestState' }
+              requestable: { type: boolean, description: Whether `POST` would accept this job now }
+        period:
+          type: object
+          additionalProperties: false
+          required: [from, to]
+          properties:
+            from: { type: string, format: date-time, description: The earliest creation of the listed jobs }
+            to: { type: [string, 'null'], format: date-time, description: The latest end, null while a listed job has not ended }
+        scopeDigest: { type: string, pattern: '^[0-9a-f]{64}$', description: Tagged SHA-256 of the scope (`ngr-comm-log-scope-v1`) }
+    CommLogRequested:
+      type: object
+      additionalProperties: false
+      required: [jobs]
+      properties:
+        jobs:
+          type: array
+          description: In ascending job-ID order
+          items:
+            type: object
+            additionalProperties: false
+            required: [jobId, generation, request]
+            properties:
+              jobId: { type: string, format: uuid }
+              generation: { type: integer, minimum: 0 }
+              request:
+                description: The job's request after the write; null for a job whose log is stored and which had no request
+                oneOf:
+                  - { type: 'null' }
+                  - { $ref: '#/components/schemas/CommLogRequestState' }
     Problem:
       type: object
       description: RFC 9457. `code` holds a machine-readable value
@@ -1631,6 +1882,9 @@ components:
             - UNSUPPORTED_IR_SCHEMA
             - SUBSET_VIOLATION
             - CONFLICT
+            - SCOPE_CHANGED
+            - JOB_NOT_DELIVERED
+            - JOB_NOT_ENDED
 
     JobRequest:
       type: object

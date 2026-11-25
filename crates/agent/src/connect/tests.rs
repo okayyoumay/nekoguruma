@@ -14,6 +14,7 @@ use tracing_subscriber::fmt::MakeWriter;
 use super::*;
 use crate::identity::load_or_create;
 use crate::identity::store::{MemoryStore, SecretName};
+use crate::log_upload::NoLogUploads;
 use crate::outbox::{Outbox, OutboxError};
 use crate::registration::record::{self, Record, RecordError};
 
@@ -130,11 +131,14 @@ fn start_session(
 ) -> Result<control::Handle, ControlError> {
     opened.start(
         key,
-        Arc::new(LogIntake),
-        outbox_in(dir),
-        marks_in(dir),
-        Arc::new(SystemClock),
-        ledger_in(dir),
+        Collaborators {
+            intake: Arc::new(LogIntake),
+            outbox: outbox_in(dir),
+            marks: marks_in(dir),
+            clock: Arc::new(SystemClock),
+            ledger: ledger_in(dir),
+            log_uploads: Arc::new(NoLogUploads),
+        },
     )
 }
 
@@ -408,11 +412,14 @@ async fn an_uploader_that_ends_on_its_own_does_not_end_the_session() {
         |opened, key| {
             opened.start(
                 key,
-                Arc::new(LogIntake),
-                outbox_in(dirs.dir.path()),
-                marks_in(dirs.dir.path()),
-                Arc::new(SystemClock),
-                ledger_in(dirs.dir.path()),
+                Collaborators {
+                    intake: Arc::new(LogIntake),
+                    outbox: outbox_in(dirs.dir.path()),
+                    marks: marks_in(dirs.dir.path()),
+                    clock: Arc::new(SystemClock),
+                    ledger: ledger_in(dirs.dir.path()),
+                    log_uploads: Arc::new(NoLogUploads),
+                },
             )
         },
         UPLOADER_STOP_BOUND,

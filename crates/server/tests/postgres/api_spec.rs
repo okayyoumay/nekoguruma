@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 use server::{AppState, Hasher, Hub, InstructionKey, OperatorSessions, Sessions};
 use shared_proto::{
     AgentEventKind, AgentEventMessage, AgentMessage, Checkpoint, HmiRequestBody,
-    InstructionRejectReason, JobId, OpenJob, ServerMessage,
+    InstructionRejectReason, JobId, LogUploadOutcome, OpenJob, ServerMessage,
 };
 use tower::ServiceExt;
 
@@ -450,6 +450,10 @@ samples! { server_samples, ServerMessage, Sample;
         let m = ServerMessage::EventAck { seq: 1 };
         vec![server(m.clone(), m)]
     };
+    ServerMessage::LogUploadCommand { .. } => {
+        let m = ServerMessage::LogUploadCommand { job_id: job(), generation: 1 };
+        vec![server(m.clone(), m)]
+    };
     ServerMessage::Heartbeat => vec![server(ServerMessage::Heartbeat, ServerMessage::Heartbeat)];
 }
 
@@ -524,6 +528,14 @@ samples! { agent_samples, AgentMessage, Sample;
     };
     AgentMessage::AgentEvent(_) => event_samples();
     AgentMessage::Heartbeat => vec![agent(AgentMessage::Heartbeat, AgentMessage::Heartbeat)];
+    AgentMessage::LogUploadAnswer { .. } => {
+        let m = AgentMessage::LogUploadAnswer {
+            job_id: job(),
+            generation: 1,
+            outcome: LogUploadOutcome::Queued,
+        };
+        vec![agent(m.clone(), m)]
+    };
     AgentMessage::Reconcile { .. } => vec![agent(
         AgentMessage::Reconcile { open_jobs: vec![] },
         AgentMessage::Reconcile {

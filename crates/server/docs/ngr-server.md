@@ -1021,8 +1021,8 @@ connection with hyper's `with_upgrades()`.
   `SendError::NotConnected` (no current connection, or it is closing), `Busy` and `TooLarge`
   (the frame over 131072 bytes with the widest command ID, `c-` and the 20 digits of `u64::MAX`, so that the verdict does not depend on the counter; judged before the connection is looked at). A frame queued on a
   connection that has been told to close, or at a stop, is not written. `Hub::inbox()` gives its
-  receiver (256 messages) to the first caller: `commandAck`, `commandRejected`, `agentEvent`
-  and `reconcile` arrive as `Inbound { agent, connection, message, text }` in read order, never a
+  receiver (256 messages) to the first caller: `commandAck`, `commandRejected`, `agentEvent`,
+  `reconcile` and `logUploadAnswer` arrive as `Inbound { agent, connection, message, text }` in read order, never a
   heartbeat; `text` is the exact frame text of a numbered `agentEvent` (the event is stored as
   it was sent) and `None` for every other message. The task asks the hub per message: with no receiver (not taken yet, or dropped) the
   message is dropped with a gated debug line, never buffered. With the inbox full the task holds
@@ -1086,8 +1086,8 @@ connection with hyper's `with_upgrades()`.
   acknowledgement sets `delivered_at`; a rejection ends the job
   (`failed`, `instructionRejected`, the agent's reason as the detail); both, and a release, write only while the
   job is neither finished nor delivered and still carries a mark that delivery expects (see above)
-  with the attempts that go with it. `progress` and `reconcile` messages are dropped with a
-  debug line. The numbered `agentEvent`s are split out of the buffered messages before the
+  with the attempts that go with it. `progress`, `reconcile` and `logUploadAnswer` messages are dropped with a
+  debug line (the answer is applied when the server sends the command, ADR-508). The numbered `agentEvent`s are split out of the buffered messages before the
   answers are applied and stored by `agent_events.rs` (ADR-478 item 6, ADR-479): the answers of
   the iteration are written first, then each agent's events, in the order read, in one
   transaction per agent (at most 64 agents per round). The transaction takes the tenant from the

@@ -22,7 +22,8 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -32,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use crate::artifact::to_hex;
 use crate::journal::{JobKey, JournalError, Vin, WriterLock, job_file_stem, sync_dir};
 use crate::runner::JobError;
+use crate::upload_ledger::{Digest, digest_prefix};
 
 /// What an exchange entry carries of a message's bytes (design 8.11, ADR-347).
 pub(crate) mod redaction;
@@ -96,10 +98,137 @@ impl CommLogSetup {
 
     /// The log file of the setup's job and generation.
     pub fn path(&self) -> Result<PathBuf, JournalError> {
-        Ok(self
-            .dir
-            .join(format!("{}.commlog.jsonl", job_file_stem(&self.key)?)))
+        comm_log_path(&self.dir, &self.key)
     }
+}
+
+/// The log file of `key` in `dir`: `{job_id}.g{generation}.commlog.jsonl`. The writer
+/// ([`CommLogSetup::path`]) and the reader that sends the log to the server
+/// ([`digest_for_upload`]) both name it here.
+pub fn comm_log_path(dir: &Path, key: &JobKey) -> Result<PathBuf, JournalError> {
+    Ok(dir.join(format!("{}.commlog.jsonl", job_file_stem(key)?)))
+}
+
+/// The writer lock of `key`'s log in `dir`: `{job_id}.g{generation}.commlog.lock`.
+fn comm_log_lock_path(dir: &Path, key: &JobKey) -> Result<PathBuf, JournalError> {
+    Ok(dir.join(format!("{}.commlog.lock", job_file_stem(key)?)))
+}
+
+/// What reading a job's log for the upload ledger found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadRead {
+    /// The log's writer lock is held: a run is appending to it.
+    Busy,
+    /// There is no log file, or it holds no complete line.
+    NoLog,
+    /// Its complete lines are over the largest log asked for.
+    TooLarge,
+    /// The length and SHA-256 of the log up to its last line end.
+    Ready(Digest),
+    /// The caller's cancel flag was set: nothing was found, and the lock is released.
+    Cancelled,
+}
+
+/// Where [`digest_for_upload_traced`] is, for a test that holds it there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UploadStage {
+    /// The writer lock is taken; the log is not read yet.
+    Locked,
+    /// The lock is released; the result is about to be returned. `true` when the read ended
+    /// because its cancel flag was set.
+    Released(bool),
+}
+
+/// Reads the log of `key` in `dir` up to its last line end under the log's writer lock, tried
+/// once, for the upload ledger (design 8.11, ADR-508 item 5). A torn last line is left out: a
+/// run that reopens the log cuts after the last line end and appends from there (ADR-347), so
+/// the bytes counted here never change. The lock is held while the log is read and hashed and
+/// released before this returns. `max` is the longest log that is [`UploadRead::TooLarge`] no
+/// longer. `cancel` is looked at before each chunk read, so a read whose caller has gone ends,
+/// and frees the lock, within one chunk. Blocking (file reads of up to `max`): the caller runs
+/// it on a blocking task.
+pub fn digest_for_upload(
+    dir: &Path,
+    key: &JobKey,
+    max: u64,
+    cancel: &AtomicBool,
+) -> io::Result<UploadRead> {
+    digest_for_upload_traced(dir, key, max, cancel, &|_| {})
+}
+
+/// [`digest_for_upload`] that calls `trace` at each [`UploadStage`].
+pub(crate) fn digest_for_upload_traced(
+    dir: &Path,
+    key: &JobKey,
+    max: u64,
+    cancel: &AtomicBool,
+    trace: &dyn Fn(UploadStage),
+) -> io::Result<UploadRead> {
+    let path = comm_log_path(dir, key).map_err(io::Error::other)?;
+    // A log that is not there is judged before the lock is taken, which would create the lock
+    // file of a job that has no log.
+    if !path.try_exists()? {
+        return Ok(UploadRead::NoLog);
+    }
+    let lock = match WriterLock::at(&comm_log_lock_path(dir, key).map_err(io::Error::other)?) {
+        Ok(lock) => lock,
+        Err(JournalError::InUse) => return Ok(UploadRead::Busy),
+        Err(JournalError::Io(error)) => return Err(error),
+        Err(error) => return Err(io::Error::other(error)),
+    };
+    trace(UploadStage::Locked);
+    let read = read_locked(&path, max, cancel);
+    drop(lock);
+    trace(UploadStage::Released(matches!(
+        read,
+        Ok(UploadRead::Cancelled)
+    )));
+    read
+}
+
+/// The part of [`digest_for_upload`] that holds the lock.
+fn read_locked(path: &Path, max: u64, cancel: &AtomicBool) -> io::Result<UploadRead> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(UploadRead::NoLog),
+        Err(error) => return Err(error),
+    };
+    let Some(complete) = last_line_end(&mut file, cancel)? else {
+        return Ok(UploadRead::Cancelled);
+    };
+    if complete == 0 {
+        return Ok(UploadRead::NoLog);
+    }
+    if complete > max {
+        return Ok(UploadRead::TooLarge);
+    }
+    file.rewind()?;
+    Ok(match digest_prefix(file, complete, cancel)? {
+        Some(digest) => UploadRead::Ready(digest),
+        None => UploadRead::Cancelled,
+    })
+}
+
+/// The offset just after the last `\n` of `file`, 0 when it holds none, found by reading back
+/// from the end, or `None` when `cancel` was set before a chunk.
+fn last_line_end(file: &mut File, cancel: &AtomicBool) -> io::Result<Option<u64>> {
+    const CHUNK: u64 = 64 << 10;
+    let mut end = file.seek(SeekFrom::End(0))?;
+    let mut buffer = vec![0u8; CHUNK as usize];
+    while end > 0 {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        let start = end.saturating_sub(CHUNK);
+        let chunk = &mut buffer[..(end - start) as usize];
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(chunk)?;
+        if let Some(at) = chunk.iter().rposition(|byte| *byte == b'\n') {
+            return Ok(Some(start + at as u64 + 1));
+        }
+        end = start;
+    }
+    Ok(Some(0))
 }
 
 /// How a job's log ended, which a run returns beside its result (`JobRun::comm_log`). The

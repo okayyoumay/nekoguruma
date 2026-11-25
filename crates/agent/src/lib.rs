@@ -5,6 +5,8 @@
 //! - [`client`]: the worker client as a trait, so the hardware harness can guard a job's calls (ADR-334)
 //! - [`comm_log`]: the log of a job's communication, kept beside its journal (design 8.11, ADR-346,
 //!   ADR-347)
+//! - [`log_upload`]: what the agent does with a request for a job's communication log (design 8.11,
+//!   ADR-508)
 //! - [`logging`]: the agent's operational log, its `tracing` subscriber (design 12.2, ADR-348)
 //! - [`control`]: the control channel session library: the exchange, the upgrade and the
 //!   keepalive loop that connect the agent to the server (design 5.2, 5.3, 14.1, ADR-466, ADR-471)
@@ -67,6 +69,7 @@ mod journaling;
 mod keep_alive;
 pub mod launch;
 pub mod link;
+pub mod log_upload;
 pub mod logging;
 mod oplog;
 pub mod outbox;

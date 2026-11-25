@@ -160,6 +160,13 @@ pub enum ServerMessage {
     EventAck {
         seq: u64,
     },
+    /// An operator asked for the log of one job and generation; the agent sends it over the data
+    /// channel if it holds the job (8.11, ADR-508). The job and generation are the whole identity
+    /// of the request: there is no command ID, and the answer is the same each time.
+    LogUploadCommand {
+        job_id: JobId,
+        generation: u64,
+    },
     /// The echo of the agent's heartbeat.
     Heartbeat,
 }
@@ -193,6 +200,28 @@ pub enum AgentMessage {
     Reconcile {
         open_jobs: Vec<OpenJob>,
     },
+    /// What the agent did with a `logUploadCommand` (8.11, ADR-508).
+    LogUploadAnswer {
+        job_id: JobId,
+        generation: u64,
+        outcome: LogUploadOutcome,
+    },
+}
+
+/// What an agent answers to a `logUploadCommand` (ADR-508 item 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LogUploadOutcome {
+    /// The log's bytes up to its last complete line are in the agent's upload ledger, durably.
+    Queued,
+    /// The agent's received-jobs ledger holds no such job at that generation.
+    UnknownJob,
+    /// There is no log file for the job, or the file has no complete line.
+    NoLog,
+    /// A run holds the log's writer lock now.
+    Busy,
+    /// The log is over the largest object the data channel takes.
+    TooLarge,
 }
 
 /// An event, with its place in the agent's outbox when it is one that must be delivered (5.3,
@@ -284,9 +313,11 @@ fn allowed(direction: Direction, ty: &str) -> Option<&'static [&'static str]> {
         (ToAgent, "hmiResponse") => &["jobId", "requestId", "values"],
         (ToAgent, "seedKeyResponse") => &["jobId", "requestId", "key"],
         (ToAgent, "eventAck") => &["seq"],
+        (ToAgent, "logUploadCommand") => &["jobId", "generation"],
         (ToServer, "commandAck") => &["commandId"],
         (ToServer, "commandRejected") => &["commandId", "reason"],
         (ToServer, "reconcile") => &["openJobs"],
+        (ToServer, "logUploadAnswer") => &["jobId", "generation", "outcome"],
         (_, "heartbeat") => &[],
         // The properties of `agentEvent` depend on its `kind`; see `check_keys`.
         (ToServer, "agentEvent") => &["seq", "occurredAtAgent", "kind"],
@@ -470,21 +501,23 @@ mod tests {
         v["type"].as_str().unwrap()
     }
 
-    const SERVER_TYPES: [&str; 7] = [
+    const SERVER_TYPES: [&str; 8] = [
         "hello",
         "jobCommand",
         "cancelCommand",
         "hmiResponse",
         "seedKeyResponse",
         "eventAck",
+        "logUploadCommand",
         "heartbeat",
     ];
-    const AGENT_TYPES: [&str; 5] = [
+    const AGENT_TYPES: [&str; 6] = [
         "commandAck",
         "commandRejected",
         "agentEvent",
         "heartbeat",
         "reconcile",
+        "logUploadAnswer",
     ];
 
     #[test]
@@ -600,6 +633,69 @@ mod tests {
             panic!("not a job state");
         };
         assert_eq!(detail, None);
+    }
+
+    #[test]
+    fn a_log_upload_command_and_its_answer_name_the_job_and_generation_and_each_outcome() {
+        let command = ServerMessage::LogUploadCommand {
+            job_id: JobId("j-1".to_owned()),
+            generation: 3,
+        };
+        assert_eq!(
+            command.encode().unwrap(),
+            r#"{"type":"logUploadCommand","jobId":"j-1","generation":3}"#
+        );
+        assert_eq!(
+            ServerMessage::decode(&command.encode().unwrap()).unwrap(),
+            command
+        );
+        for (outcome, word) in [
+            (LogUploadOutcome::Queued, "queued"),
+            (LogUploadOutcome::UnknownJob, "unknownJob"),
+            (LogUploadOutcome::NoLog, "noLog"),
+            (LogUploadOutcome::Busy, "busy"),
+            (LogUploadOutcome::TooLarge, "tooLarge"),
+        ] {
+            let text = format!(
+                r#"{{"type":"logUploadAnswer","jobId":"j-1","generation":3,"outcome":"{word}"}}"#
+            );
+            let answer = AgentMessage::LogUploadAnswer {
+                job_id: JobId("j-1".to_owned()),
+                generation: 3,
+                outcome,
+            };
+            assert_eq!(answer.encode().unwrap(), text);
+            let Ok(AgentMessage::LogUploadAnswer { outcome: read, .. }) =
+                AgentMessage::decode(&text)
+            else {
+                panic!("{text} did not decode as an answer");
+            };
+            assert_eq!(read, outcome);
+        }
+    }
+
+    #[test]
+    fn a_log_upload_message_with_another_outcome_property_or_generation_is_refused() {
+        for text in [
+            r#"{"type":"logUploadAnswer","jobId":"j","generation":1,"outcome":"stored"}"#,
+            r#"{"type":"logUploadAnswer","jobId":"j","generation":-1,"outcome":"queued"}"#,
+            r#"{"type":"logUploadAnswer","jobId":"j","outcome":"queued"}"#,
+            r#"{"type":"logUploadAnswer","jobId":"j","generation":1,"outcome":"queued","commandId":"c"}"#,
+        ] {
+            assert!(AgentMessage::decode(text).is_err(), "{text}");
+        }
+        for text in [
+            r#"{"type":"logUploadCommand","jobId":"j"}"#,
+            r#"{"type":"logUploadCommand","jobId":"j","generation":"1"}"#,
+            r#"{"type":"logUploadCommand","jobId":"j","generation":1,"path":"/etc/passwd"}"#,
+        ] {
+            assert!(ServerMessage::decode(text).is_err(), "{text}");
+        }
+        // A command is not an agent message, nor an answer a server message.
+        assert!(
+            AgentMessage::decode(r#"{"type":"logUploadCommand","jobId":"j","generation":1}"#)
+                .is_err()
+        );
     }
 
     #[test]

@@ -105,6 +105,11 @@ impl SharedLedger {
         .await
     }
 
+    /// [`UploadLedger::has_comm_log`], from memory.
+    pub async fn has_comm_log(&self, key: &JobKey) -> bool {
+        self.inner.ledger.lock().await.has_comm_log(key)
+    }
+
     async fn blocking<T: Send + 'static>(
         &self,
         call: impl FnOnce(&mut UploadLedger) -> Result<T, LedgerError> + Send + 'static,
@@ -137,6 +142,12 @@ impl SharedLedger {
                 entry: entry.clone(),
             })
             .collect()
+    }
+
+    /// The pending entries, for tests of whoever enqueues.
+    #[cfg(test)]
+    pub(crate) async fn entries_for_test(&self) -> Vec<Entry> {
+        self.pending().await.into_iter().map(|p| p.entry).collect()
     }
 
     /// Reopens the ledger when it is poisoned: `Ok(true)` when it did.

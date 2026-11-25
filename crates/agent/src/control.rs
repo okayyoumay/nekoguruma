@@ -58,6 +58,7 @@ use crate::answer_proof::{UNPROVEN_CAUSES, Verifier};
 use crate::deadline::{Clock, IssueMark, MarkError};
 use crate::identity::AgentKey;
 use crate::journal::{JournalError, WriterLock};
+use crate::log_upload::{LogUploadError, LogUploads};
 use crate::outbox::OutboxError;
 use crate::received_jobs::{LedgerError, ReceivedJobs};
 use crate::registration::origin::ServerOrigin;
@@ -342,6 +343,8 @@ struct Wiring {
     clock: Arc<dyn Clock>,
     /// The jobs this agent has taken (ADR-489).
     ledger: ReceivedJobs,
+    /// What a `logUploadCommand` goes to (ADR-508).
+    log_uploads: Arc<dyn LogUploads>,
     /// The key, the audience and the agent ID the server's answers are checked with (ADR-504).
     verifier: Verifier,
     /// The `Host` header's value.
@@ -411,6 +414,16 @@ impl Warnings {
             tracing::warn!(class = "intake", %error, "the intake failed; the command is not acknowledged");
         } else {
             tracing::debug!(class = "intake", %error, "the intake failed; the command is not acknowledged");
+        }
+    }
+
+    /// A `logUploadCommand` could not be handled: one warning per `hello` cycle, debug after
+    /// that. The command is left unanswered, and the server asks again.
+    fn log_upload_failure(&mut self, error: &LogUploadError) {
+        if self.seen.insert("log-upload") {
+            tracing::warn!(class = "log-upload", %error, "a log request could not be handled; it is not answered");
+        } else {
+            tracing::debug!(class = "log-upload", %error, "a log request could not be handled; it is not answered");
         }
     }
 
@@ -495,6 +508,29 @@ struct Seams {
     marks: IssueMark,
     clock: Arc<dyn Clock>,
     ledger: ReceivedJobs,
+    log_uploads: Arc<dyn LogUploads>,
+}
+
+/// What [`Opened::start`] connects the session to.
+pub struct Collaborators {
+    /// Takes every instruction the gate verifies and allows (ADR-483).
+    pub intake: Arc<dyn Intake>,
+    /// The open outbox of the record's agent ID, whose events each connection sends.
+    pub outbox: SharedOutbox,
+    /// The open store of the record's agent ID (ADR-486).
+    pub marks: IssueMark,
+    /// The device clock a job's start deadline is judged with.
+    pub clock: Arc<dyn Clock>,
+    /// The jobs this agent has taken (ADR-489).
+    pub ledger: ReceivedJobs,
+    /// Takes every `logUploadCommand` (ADR-508).
+    pub log_uploads: Arc<dyn LogUploads>,
+}
+
+impl std::fmt::Debug for Collaborators {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Collaborators").finish_non_exhaustive()
+    }
 }
 
 impl Opened {
@@ -504,30 +540,21 @@ impl Opened {
     }
 
     /// Step 2: compares `key`'s fingerprint with the record's and starts the loop, whose first
-    /// exchange begins at once; `intake` takes every instruction the gate verifies and allows (ADR-483) and `outbox`
-    /// is the open outbox of the record's agent ID, whose events each connection sends. Needs a
-    /// running tokio runtime. `marks` is the open store of the record's agent ID (ADR-486) and
-    /// `clock` the device clock a job's start deadline is judged with. On an error nothing was
-    /// sent and both locks are released.
-    pub fn start(
-        self,
-        key: AgentKey,
-        intake: Arc<dyn Intake>,
-        outbox: SharedOutbox,
-        marks: IssueMark,
-        clock: Arc<dyn Clock>,
-        ledger: ReceivedJobs,
-    ) -> Result<Handle, ControlError> {
+    /// exchange begins at once, connected to `with` (the intake, the outbox, the issue-time marks,
+    /// the clock, the ledger and the log requests' handling). Needs a running tokio runtime. On
+    /// an error nothing was sent and both locks are released.
+    pub fn start(self, key: AgentKey, with: Collaborators) -> Result<Handle, ControlError> {
         let port = self.origin()?.port();
         let seams = Seams {
             dial: Arc::new(Loopback { port }),
             signer: key.signer(),
             random: shared_crypto::random_32,
-            intake,
-            outbox,
-            marks,
-            clock,
-            ledger,
+            intake: with.intake,
+            outbox: with.outbox,
+            marks: with.marks,
+            clock: with.clock,
+            ledger: with.ledger,
+            log_uploads: with.log_uploads,
         };
         self.start_with(&key.public_key(), seams)
     }
@@ -557,6 +584,7 @@ impl Opened {
             marks,
             clock: Arc::new(crate::deadline::SystemClock),
             ledger,
+            log_uploads: Arc::new(crate::log_upload::NoLogUploads),
         };
         self.start_with(&key.public_key(), seams)
     }
@@ -590,6 +618,7 @@ impl Opened {
             marks: seams.marks,
             clock: seams.clock,
             ledger: seams.ledger,
+            log_uploads: seams.log_uploads,
             instruction_key: verifier.key,
             record: self.record,
             verifier,

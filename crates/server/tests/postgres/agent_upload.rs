@@ -27,6 +27,14 @@
 //! multipart upload (the object server keeps a part only once its PUT ends), so the listing shows
 //! the earlier parts and not the cut one, and the second run issues the cut part's URL again.
 //!
+//! The third test is ADR-508 step 5: nothing is enqueued by hand. The server's delivery queue
+//! hands the agent two jobs, which it accepts and acknowledges (so its received-jobs ledger holds
+//! them at generation 1); the jobs are then ended on the server; the test places a log with
+//! complete lines and a torn last line at the path the agent reads for one of them (the runner
+//! does not write a server job's log there yet); the operator requests that job's log through the
+//! Web API, and the server's delivery task sends the command to the connected agent, which
+//! queues the log and uploads it. The second job, which nobody requested, has no log object.
+//!
 //! A release agent has no plain-file key store and no debug command, so this module is compiled
 //! in debug builds only. The tests need `NGR_TEST_RUSTFS_BIN` (`scripts/fetch-rustfs.sh`).
 
@@ -51,6 +59,7 @@ use tokio::sync::Notify;
 
 use crate::agent_connect::Agent;
 use crate::agent_register::{AgentEnv, fingerprint, run, text};
+use crate::comm_log_uploads::{Site, alice, request};
 use crate::redeem::World;
 use crate::serving::Running;
 use crate::storage::{content, read_all, sha256};
@@ -321,19 +330,44 @@ struct Fixture {
     env: AgentEnv,
     agent_id: String,
     job: String,
+    sessions: server::OperatorSessions,
+}
+
+impl Site for Fixture {
+    fn addr(&self) -> std::net::SocketAddr {
+        self.server.addr
+    }
+
+    fn pool(&self) -> &sqlx::PgPool {
+        &self.world.pool
+    }
+
+    fn agent_id(&self) -> &str {
+        &self.agent_id
+    }
+
+    fn operator_sessions(&self) -> &server::OperatorSessions {
+        &self.sessions
+    }
 }
 
 impl Fixture {
     async fn new() -> Fixture {
-        Fixture::build(false).await
+        Fixture::build(false, false).await
+    }
+
+    /// A fixture whose server runs the delivery queue and the communication-log task with a short
+    /// period, and whose job has no request row: the operator makes it through the Web API.
+    async fn delivering() -> Fixture {
+        Fixture::build(false, true).await
     }
 
     /// A fixture whose store reaches the object server through a [`Relay`] that cuts at half a part.
     async fn through_relay() -> Fixture {
-        Fixture::build(true).await
+        Fixture::build(true, false).await
     }
 
-    async fn build(relayed: bool) -> Fixture {
+    async fn build(relayed: bool, delivering: bool) -> Fixture {
         let world = World::new().await;
         world.add_operator("alice").await;
         let mut object = crate::object_server_rustfs::Real::new();
@@ -373,13 +407,33 @@ impl Fixture {
         let server = Server::bind_with_store(&http, world.pg.pool(), world.key.clone(), backend)
             .await
             .unwrap();
+        let server = if delivering {
+            let queue = server::job_queue::Settings {
+                period: Duration::from_millis(50),
+                lease: LIMIT,
+                passes: None,
+                events: None,
+            };
+            let comm_log = server::comm_log_requests::Settings {
+                period: Duration::from_millis(50),
+                lease: LIMIT,
+                passes: None,
+                failures: None,
+            };
+            server
+                .with_job_queue(queue)
+                .with_comm_log_requests(comm_log)
+        } else {
+            server
+        };
+        let sessions = server.operator_sessions();
         let server = Running::spawn(server);
         let env = AgentEnv::new();
         let fingerprint = fingerprint(&env).await;
-        let request =
+        let issue_request =
             server::registration::IssueRequest::new("alice", "Bench PC", &fingerprint, None)
                 .unwrap();
-        let issued = server::registration::issue(&world.pool, &request)
+        let issued = server::registration::issue(&world.pool, &issue_request)
             .await
             .unwrap();
         env.install(server.addr.port());
@@ -406,8 +460,9 @@ impl Fixture {
             env,
             agent_id,
             job: String::new(),
+            sessions,
         };
-        fx.job = fx.seed_job().await;
+        fx.job = fx.seed_job(!delivering).await;
         fx
     }
 
@@ -418,8 +473,9 @@ impl Fixture {
     }
 
     /// A job of the agent's owner at ownership generation 1, with its signed instruction, so that
-    /// begin's judgment of the job and its generation passes.
-    async fn seed_job(&self) -> String {
+    /// begin's judgment of the job and its generation passes. With `requested` the job also has an
+    /// operator's request row for its log, which the begin of a `commLog` needs.
+    async fn seed_job(&self, requested: bool) -> String {
         let owner: String =
             sqlx::query_scalar("SELECT owner_id::text FROM agents WHERE id = $1::uuid")
                 .bind(&self.agent_id)
@@ -464,15 +520,17 @@ impl Fixture {
         .execute(&self.world.pool)
         .await
         .unwrap();
-        // An operator's request for the job's log, which the begin of a `commLog` needs.
-        sqlx::query(
-            "INSERT INTO comm_log_requests (tenant_id, job_id, generation, agent_id, requested_by) \
-             SELECT tenant_id, id, 1, agent_id, operator_id FROM jobs WHERE id = $1::uuid",
-        )
-        .bind(&id)
-        .execute(&self.world.pool)
-        .await
-        .unwrap();
+        if requested {
+            sqlx::query(
+                "INSERT INTO comm_log_requests (tenant_id, job_id, generation, agent_id, \
+                     requested_by) \
+                 SELECT tenant_id, id, 1, agent_id, operator_id FROM jobs WHERE id = $1::uuid",
+            )
+            .bind(&id)
+            .execute(&self.world.pool)
+            .await
+            .unwrap();
+        }
         id
     }
 
@@ -806,6 +864,132 @@ async fn a_killed_agent_resumes_a_part_cut_inside_its_put_and_sends_the_stored_p
     assert_eq!(stored.len(), log.len());
     assert_eq!(hex(&sha256(&stored)), hex(&sha256(&log)));
     assert!(stored == log, "the object differs from the source");
+    fx.finish().await;
+}
+
+/// ADR-508 step 5: an operator's request over the Web API reaches the real agent through the
+/// server's delivery task, the agent uploads the log it holds for the job, and the object the
+/// store ends up with is the log up to its last line end. A job nobody requested has no object
+/// even though the agent holds a log for it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_requested_log_is_stored_up_to_its_last_line_and_an_unrequested_one_is_not() {
+    let fx = Fixture::delivering().await;
+    let requested = fx.job.clone();
+    let unrequested = fx.seed_job(false).await;
+
+    let mut agent = fx.start_agent("connect.log");
+    let agent_log = fx.env.home.path().join("connect.log");
+    // The queue delivers both jobs and the agent acknowledges them, which puts them in its
+    // received-jobs ledger at generation 1.
+    fx.until("both jobs to be received", &mut agent, || async {
+        let delivered: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM jobs WHERE state = 'received' AND delivered_at IS NOT NULL",
+        )
+        .fetch_one(&fx.world.pool)
+        .await
+        .unwrap();
+        delivered == 2
+    })
+    .await;
+    sqlx::query(
+        "UPDATE jobs SET state = 'completed', progress_permille = 1000, finished_at = now() \
+         WHERE id = ANY($1::uuid[])",
+    )
+    .bind(
+        [requested.as_str(), unrequested.as_str()]
+            .map(str::to_owned)
+            .to_vec(),
+    )
+    .execute(&fx.world.pool)
+    .await
+    .unwrap();
+
+    // The logs: complete lines and a torn last line, at the path the agent reads.
+    let journal = fx.env.state.path().join("journal");
+    std::fs::create_dir_all(&journal).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let complete = b"{\"seq\":1,\"dir\":\"tx\"}\n{\"seq\":2,\"dir\":\"rx\"}\n".to_vec();
+    let mut written = complete.clone();
+    written.extend_from_slice(b"{\"seq\":3,\"dir\"");
+    for job in [&requested, &unrequested] {
+        std::fs::write(journal.join(format!("{job}.g1.commlog.jsonl")), &written).unwrap();
+    }
+
+    let operator = alice(&fx).await;
+    let reply = request(&fx, &operator, &[&requested]).await;
+    assert_eq!(reply.status, 202, "{} {}", reply.head, reply.body);
+
+    fx.until("the request to be accepted", &mut agent, || async {
+        let (state, refusal): (String, Option<String>) =
+            sqlx::query_as("SELECT state, refusal FROM comm_log_requests WHERE job_id = $1::uuid")
+                .bind(&requested)
+                .fetch_one(&fx.world.pool)
+                .await
+                .unwrap();
+        assert_ne!(
+            state,
+            "refused",
+            "the agent refused the request: {refusal:?}; it says:\n{}",
+            std::fs::read_to_string(&agent_log).unwrap_or_default()
+        );
+        state == "accepted"
+    })
+    .await;
+    fx.until("the log to be finished", &mut agent, || async {
+        matches!(fx.row("commLog").await, Some((state, ..)) if state == "finished")
+    })
+    .await;
+
+    let (_, key) = fx.upload_of("commLog").await;
+    let stored = read_all(&fx.store, &key).await.unwrap();
+    assert!(
+        stored == complete,
+        "the object is not the log up to its last line end: {} bytes",
+        stored.len()
+    );
+    let (size, digest): (i64, String) = sqlx::query_as(
+        "SELECT size_bytes, digest FROM job_objects WHERE job_id = $1::uuid AND kind = 'commLog'",
+    )
+    .bind(&requested)
+    .fetch_one(&fx.world.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        (size as usize, digest),
+        (complete.len(), hex(&sha256(&complete)))
+    );
+
+    // The other job's log was never asked for: no request, no object, and the agent is still up.
+    let others: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM job_objects WHERE job_id = $1::uuid) \
+              + (SELECT count(*) FROM comm_log_requests WHERE job_id = $1::uuid)",
+    )
+    .bind(&unrequested)
+    .fetch_one(&fx.world.pool)
+    .await
+    .unwrap();
+    assert_eq!(others, 0);
+    let objects: i64 = sqlx::query_scalar("SELECT count(*) FROM job_objects")
+        .fetch_one(&fx.world.pool)
+        .await
+        .unwrap();
+    assert_eq!(objects, 1);
+    assert!(agent.running(), "{}", agent.log_text());
+    let status = agent.stop().await;
+    if cfg!(unix) {
+        assert_eq!(status, Some(0), "{}", agent.log_text());
+    }
+    // Ledger numbers are never reused, so the next entry's number shows how many entries this
+    // agent made in its lifetime: 2 means the requested log's entry was the only one, which
+    // rules out the unrequested log ever having been queued (not just not yet). A result is
+    // enqueued because a log's enqueue could be answered with a pending entry's number.
+    let result_file = fx.env.home.path().join("result.json");
+    std::fs::write(&result_file, b"{}").unwrap();
+    assert_eq!(fx.enqueue("result", &result_file).await, 2);
     fx.finish().await;
 }
 

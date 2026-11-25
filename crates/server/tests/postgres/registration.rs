@@ -466,12 +466,17 @@ async fn without_an_active_key_row_the_command_exits_1_and_writes_nothing() {
 #[tokio::test]
 async fn a_database_that_was_never_migrated_is_refused_and_left_as_it_was() {
     let pg = TestPostgres::start();
+    // The test makes the cluster's first connection itself. A fresh cluster's first connection
+    // also builds its catalog caches, which on a loaded Windows runner can take longer than the
+    // command's 2 s connect bound; every other test here connects through its fixture first.
+    assert_eq!(pg.scalar("SELECT 1").await, "1");
     let dir = tempfile::tempdir().unwrap();
     let config = write_config(dir.path(), &pg.url());
     let output = run_issue(&config, &fingerprint());
-    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
     assert!(output.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("not been migrated"));
+    assert!(stderr.contains("not been migrated"), "{stderr}");
     assert_eq!(
         pg.scalar("SELECT to_regclass('_sqlx_migrations')").await,
         "",

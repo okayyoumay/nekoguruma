@@ -378,6 +378,8 @@ struct Opts {
     mark_probe: Option<Probe>,
     /// A hook on the received-jobs ledger's write path.
     ledger_probe: Option<Probe>,
+    /// What log requests go to, in place of the scripted handler.
+    log_uploads: Option<Arc<dyn LogUploads>>,
 }
 
 impl Default for Opts {
@@ -390,6 +392,7 @@ impl Default for Opts {
             probe: None,
             mark_probe: None,
             ledger_probe: None,
+            log_uploads: None,
         }
     }
 }
@@ -518,7 +521,7 @@ impl ScriptedLogUploads {
 }
 
 impl LogUploads for ScriptedLogUploads {
-    fn handle(&self, job_id: String, generation: u64) -> LogHandled<'_> {
+    fn handle(&self, job_id: String, generation: u64, _cancel: Arc<AtomicBool>) -> LogHandled<'_> {
         self.asked.lock().unwrap().push((job_id, generation));
         Box::pin(async move {
             self.entered.notify_one();
@@ -535,6 +538,8 @@ struct Env {
     fx: Fixture,
     intake: Arc<RecordingIntake>,
     log_uploads: Arc<ScriptedLogUploads>,
+    /// What the session's log requests go to: the scripted handler unless a test brings its own.
+    log_seam: Arc<dyn LogUploads>,
     /// `None` only while a restart has the outbox closed.
     outbox: Option<SharedOutbox>,
     /// `None` only while a restart has the mark store closed.
@@ -636,6 +641,7 @@ impl Env {
         };
         let intake = Arc::new(RecordingIntake::default());
         let log_uploads = Arc::new(ScriptedLogUploads::default());
+        let log_seam: Arc<dyn LogUploads> = opts.log_uploads.unwrap_or_else(|| log_uploads.clone());
         let outbox = open_outbox(&fx, opts.probe);
         let marks = open_marks(&fx, opts.mark_probe);
         let ledger = open_ledger(&fx, opts.ledger_probe);
@@ -649,7 +655,7 @@ impl Env {
             marks: marks.clone(),
             clock: clock.clone(),
             ledger: ledger.clone(),
-            log_uploads: log_uploads.clone(),
+            log_uploads: log_seam.clone(),
         };
         let started = Instant::now();
         let handle = fx
@@ -661,6 +667,7 @@ impl Env {
             fx,
             intake,
             log_uploads,
+            log_seam,
             outbox: Some(outbox),
             marks: Some(marks),
             ledger: Some(ledger),
@@ -716,7 +723,7 @@ impl Env {
             marks: marks.clone(),
             clock: self.clock.clone(),
             ledger: ledger.clone(),
-            log_uploads: self.log_uploads.clone(),
+            log_uploads: self.log_seam.clone(),
         };
         self.handle = self
             .fx
@@ -7221,7 +7228,7 @@ async fn l3_a_failed_log_request_sends_no_answer_and_keeps_the_connection() {
 }
 
 /// A command repeated while its work runs is dropped, so the writer lock the first holds does not
-/// make the second answer `busy`; a fifth distinct request in flight is dropped as well.
+/// make the second answer `busy`; at most four run at once and the rest wait their turn.
 #[tokio::test(start_paused = true)]
 async fn l4_a_log_request_in_flight_is_not_started_again_and_only_four_run_at_once() {
     let mut env = Env::new();
@@ -7239,12 +7246,20 @@ async fn l4_a_log_request_in_flight_is_not_started_again_and_only_four_run_at_on
         asked,
         (1..=4).map(|g| (JOB_ID.to_owned(), g)).collect::<Vec<_>>()
     );
-    for _ in 0..4 {
+    // The fifth waited for a place: it starts when one is free, and every request is answered.
+    for _ in 0..5 {
         env.log_uploads.release();
     }
+    let answered = answers(&mut ws, 5).await;
+    assert_eq!(answered, want_answers(1..=5));
+    assert_eq!(env.log_uploads.asked().len(), 5, "the repeat never started");
+}
+
+/// The next `count` answers of the agent, heartbeats left out, sorted.
+async fn answers(ws: &mut Ws, count: usize) -> Vec<String> {
     let mut answered = Vec::new();
-    while answered.len() < 4 {
-        let (_, message) = got(&mut ws).await;
+    while answered.len() < count {
+        let (_, message) = got(ws).await;
         match message {
             Got::Text(text) if text == HEARTBEAT => {}
             Got::Text(text) => answered.push(text),
@@ -7252,11 +7267,34 @@ async fn l4_a_log_request_in_flight_is_not_started_again_and_only_four_run_at_on
         }
     }
     answered.sort();
-    let mut want: Vec<String> = (1..=4)
+    answered
+}
+
+/// The sorted `queued` answers for `generations` of the test's job.
+fn want_answers(generations: std::ops::RangeInclusive<u64>) -> Vec<String> {
+    let mut want: Vec<String> = generations
         .map(|g| log_answer(JOB_ID, g, LogUploadOutcome::Queued))
         .collect();
     want.sort();
-    assert_eq!(answered, want);
+    want
+}
+
+/// A burst of distinct requests to a handler that answers at once: every one is answered, those
+/// past the four that run at once after the first ones finish.
+#[tokio::test(start_paused = true)]
+async fn l6_a_burst_of_log_requests_is_answered_whole() {
+    let mut env = Env::new();
+    let (_, mut ws) = env.connected(10).await;
+    for generation in 1..=6 {
+        send(&mut ws, &log_command(JOB_ID, generation)).await;
+    }
+    assert_eq!(answers(&mut ws, 6).await, want_answers(1..=6));
+    assert_eq!(env.log_uploads.asked().len(), 6);
+    // The most one server request names, 32, with the four that run, are all answered.
+    for generation in 10..46 {
+        send(&mut ws, &log_command(JOB_ID, generation)).await;
+    }
+    assert_eq!(answers(&mut ws, 36).await, want_answers(10..=45));
 }
 
 /// A log request is a received frame, so it extends the idle deadline as a job command does.
@@ -7278,4 +7316,78 @@ async fn l5_a_log_request_counts_as_a_frame_for_the_idle_deadline() {
     assert_after(hello_at, heartbeat(&mut ws).await, 40, "tick 4");
     assert_after(hello_at, heartbeat(&mut ws).await, 50, "tick 5");
     assert_after(hello_at, close_of(&mut ws, 4003, true).await, 55, "idle");
+}
+
+/// A connection that ends while a log is being read does not leave the log's writer lock held
+/// for the next connection's command: the read sees the end at its next chunk, releases the lock
+/// and enqueues nothing, and the repeated command is queued, not `busy`. This runs the real
+/// `LogUploader` in a session; the read is held after it took the lock, by a gate, in real time.
+#[tokio::test]
+async fn l7_a_log_read_cut_off_by_a_reconnect_frees_the_lock_for_the_next_command() {
+    use crate::comm_log::{UploadStage, comm_log_path};
+    use crate::journal::JobKey;
+    use crate::log_upload::LogUploader;
+    use crate::upload_ledger::UploadLedger;
+    use crate::uploader::SharedLedger;
+
+    let dir = tempfile::tempdir().unwrap();
+    for sub in ["journal", "received", "uploads"] {
+        std::fs::create_dir(dir.path().join(sub)).unwrap();
+    }
+    let received = ReceivedJobs::open_in(&dir.path().join("received"), AGENT_ID).unwrap();
+    received.record(JOB_ID, 3, b"envelope").unwrap();
+    let uploads =
+        SharedLedger::new(UploadLedger::open_in(&dir.path().join("uploads"), AGENT_ID).unwrap());
+    let key = JobKey {
+        job_id: JobId(JOB_ID.to_owned()),
+        generation: 3,
+    };
+    std::fs::write(
+        comm_log_path(&dir.path().join("journal"), &key).unwrap(),
+        b"a\nb\n",
+    )
+    .unwrap();
+    let (locked_tx, mut locked_rx) = mpsc::unbounded_channel::<()>();
+    let (released_tx, mut released_rx) = mpsc::unbounded_channel::<bool>();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let go_rx = Mutex::new(go_rx);
+    let first = AtomicBool::new(true);
+    let uploader = LogUploader::in_dir(dir.path().join("journal"), received, uploads.clone())
+        .with_trace(Arc::new(move |stage| match stage {
+            UploadStage::Locked => {
+                // Only the first read is held.
+                if first.swap(false, Ordering::SeqCst) {
+                    locked_tx.send(()).unwrap();
+                    go_rx.lock().unwrap().recv().unwrap();
+                }
+            }
+            UploadStage::Released(cancelled) => released_tx.send(cancelled).unwrap(),
+        }));
+    let mut env = Env::with(Opts {
+        log_uploads: Some(Arc::new(uploader)),
+        ..Opts::default()
+    });
+    let (_, mut ws) = env.connected(60).await;
+    send(&mut ws, &log_command(JOB_ID, 3)).await;
+    locked_rx.recv().await.unwrap();
+    // The connection ends with the read holding the lock; the next one is up before it goes on.
+    drop(ws);
+    let (_, mut ws) = env.connected(60).await;
+    go_tx.send(()).unwrap();
+    assert!(
+        released_rx.recv().await.unwrap(),
+        "the read held across the reconnect ended as cancelled"
+    );
+    assert!(
+        uploads.entries_for_test().await.is_empty(),
+        "the cut-off read enqueued nothing"
+    );
+    send(&mut ws, &log_command(JOB_ID, 3)).await;
+    let (_, message) = got(&mut ws).await;
+    assert_eq!(
+        message,
+        Got::Text(log_answer(JOB_ID, 3, LogUploadOutcome::Queued))
+    );
+    let entries = uploads.entries_for_test().await;
+    assert_eq!((entries.len(), entries[0].length), (1, 4));
 }

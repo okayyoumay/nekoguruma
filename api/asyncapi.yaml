@@ -539,7 +539,7 @@ components:
           jobId: { type: string }
           generation: { type: integer, minimum: 0, description: The job's ownership generation }
       examples:
-        - payload: {"type": "logUploadCommand", "jobId": "j-1", "generation": 1}
+        - payload: {"type": "logUploadCommand", "jobId": "0194f0a2-7c3e-7d11-8a52-3f6f9b1c2d4f", "generation": 1}
 
     LogUploadAnswer:
       name: logUploadAnswer
@@ -547,8 +547,9 @@ components:
       description: |
         `queued`: the log's bytes up to its last complete line are in the agent's upload ledger
         (also when an entry for the job and generation was already there, which the agent does
-        not read again). `unknownJob`: the agent's received-jobs ledger does not hold the job at
-        that generation. `noLog`: there is no log, or none with a complete line. `busy`: a run
+        not read again). `unknownJob`: the job ID is not a canonical UUID, or the agent's
+        received-jobs ledger does not hold the job with this generation as its highest. `noLog`:
+        there is no log file, or the file has no complete line. `busy`: a run
         holds the log's writer lock, so a later command may find it free. `tooLarge`: the log is
         over the largest object the data channel takes.
       payload:
@@ -561,8 +562,8 @@ components:
           generation: { type: integer, minimum: 0 }
           outcome: { enum: [queued, unknownJob, noLog, busy, tooLarge] }
       examples:
-        - payload: {"type": "logUploadAnswer", "jobId": "j-1", "generation": 1, "outcome": "queued"}
-        - payload: {"type": "logUploadAnswer", "jobId": "j-1", "generation": 1, "outcome": "busy"}
+        - payload: {"type": "logUploadAnswer", "jobId": "0194f0a2-7c3e-7d11-8a52-3f6f9b1c2d4f", "generation": 1, "outcome": "queued"}
+        - payload: {"type": "logUploadAnswer", "jobId": "0194f0a2-7c3e-7d11-8a52-3f6f9b1c2d4f", "generation": 1, "outcome": "busy"}
 
     Heartbeat:
       name: heartbeat

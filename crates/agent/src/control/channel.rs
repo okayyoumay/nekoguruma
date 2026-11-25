@@ -33,14 +33,15 @@
 //! records nothing. Answers are written on this connection through the one writer and under the
 //! write bound.
 //! A `logUploadCommand` is handed to [`crate::log_upload::LogUploads`] as a task beside the loop
-//! (at most four at once, none repeated while it runs); the loop writes its `logUploadAnswer`
+//! (at most four at once, the rest in order, none repeated while it is in hand); the loop writes its `logUploadAnswer`
 //! when the task is done, which is after an entry is durable, and a task that fails leaves the
 //! command unanswered (ADR-508).
 //! Sending an answer does not reset the idle deadline; only a frame received does. Never logged:
 //! the token, a message's text, a `commandId`, a close reason the server sent.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use base64::Engine;
@@ -517,7 +518,7 @@ async fn connected(
 ) -> End {
     let w = state.wiring;
     let mut sender = Sender::new(&w.outbox);
-    let mut asks = LogAsks::default();
+    let mut asks = LogAsks::new(Arc::clone(&w.log_uploads));
     let interval = Duration::from_secs(u64::from(secs));
     let idle = interval * HEARTBEAT_MISSED_LIMIT;
     let hello_at = Instant::now();
@@ -592,7 +593,7 @@ async fn connected(
                     }
                     Ok(ServerMessage::LogUploadCommand { job_id, generation }) => {
                         last_frame_at = Instant::now();
-                        asks.ask(&w.log_uploads, job_id.0, generation);
+                        asks.ask(job_id.0, generation);
                     }
                     Ok(
                         ServerMessage::CancelCommand { .. }
@@ -952,44 +953,76 @@ async fn record_job_state(w: &Wiring, stop: &Stop, job_id: String, state: JobSta
 
 /// The log requests being worked on for one connection. Each runs as a task of its own beside the
 /// loop, which writes its answer when it is done, so reading and heartbeats go on while a large
-/// log is hashed. The tasks end with the connection; a task that was reading goes on unobserved
-/// and the server's next command finds its entry.
-#[derive(Default)]
+/// log is hashed. A request past the running limit waits in a queue, in the order asked. When the
+/// connection ends the tasks are aborted and the flag handed to each is set: a read that was
+/// blocking stops at its next chunk, releases the log's writer lock and enqueues nothing, and the
+/// server's next command starts it again.
 struct LogAsks {
+    uploads: Arc<dyn LogUploads>,
     tasks: tokio::task::JoinSet<(
         String,
         u64,
         Result<shared_proto::LogUploadOutcome, LogUploadError>,
     )>,
-    /// The request of each task, so that a repeat of one in flight is dropped and not answered
-    /// `busy` by the writer lock the first one holds.
+    /// The request of each running task, so that a repeat of one in flight is dropped and not
+    /// answered `busy` by the writer lock the first one holds.
     keys: HashMap<tokio::task::Id, (String, u64)>,
+    /// Requests waiting for a running one to end.
+    waiting: VecDeque<(String, u64)>,
+    /// Set when this ends: the connection is over.
+    cancel: Arc<AtomicBool>,
 }
 
-/// The most log requests worked on at once; a command past it is dropped and the server asks
-/// again.
+/// The most log requests worked on at once.
 const MAX_LOG_ASKS: usize = 4;
 
+/// The most requests that wait: the most one server request names.
+const MAX_WAITING_LOG_ASKS: usize = 32;
+
+impl Drop for LogAsks {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
 impl LogAsks {
+    fn new(uploads: Arc<dyn LogUploads>) -> Self {
+        Self {
+            uploads,
+            tasks: tokio::task::JoinSet::new(),
+            keys: HashMap::new(),
+            waiting: VecDeque::new(),
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     fn is_idle(&self) -> bool {
         self.tasks.is_empty()
     }
 
-    fn ask(&mut self, uploads: &Arc<dyn LogUploads>, job_id: String, generation: u64) {
-        let in_flight = self
-            .keys
-            .values()
-            .any(|(job, gen_)| *job == job_id && *gen_ == generation);
-        if in_flight || self.keys.len() >= MAX_LOG_ASKS {
-            tracing::debug!("a log request was dropped: it is in flight or too many are");
-            return;
+    /// Starts the request, queues it behind the running ones, or drops it when it is already
+    /// running or waiting, or the queue is full (the server asks again).
+    fn ask(&mut self, job_id: String, generation: u64) {
+        let known = |(job, gen_): &(String, u64)| *job == job_id && *gen_ == generation;
+        if self.keys.values().any(known) || self.waiting.iter().any(known) {
+            tracing::debug!("a log request was dropped: it is already in hand");
+        } else if self.keys.len() < MAX_LOG_ASKS {
+            self.start(job_id, generation);
+        } else if self.waiting.len() < MAX_WAITING_LOG_ASKS {
+            self.waiting.push_back((job_id, generation));
+        } else {
+            tracing::debug!("a log request was dropped: too many are waiting");
         }
-        let uploads = Arc::clone(uploads);
+    }
+
+    fn start(&mut self, job_id: String, generation: u64) {
+        let uploads = Arc::clone(&self.uploads);
+        let cancel = Arc::clone(&self.cancel);
         let key = (job_id.clone(), generation);
         let id = self
             .tasks
             .spawn(async move {
-                let result = uploads.handle(job_id.clone(), generation).await;
+                let result = uploads.handle(job_id.clone(), generation, cancel).await;
                 (job_id, generation, result)
             })
             .id();
@@ -997,10 +1030,10 @@ impl LogAsks {
     }
 
     /// The next finished request's answer, `Ok(Err(_))` for one that failed and `Err(())` for a
-    /// task that panicked or was cancelled.
+    /// task that panicked or was cancelled. A waiting request takes the place of the finished one.
     async fn next(&mut self) -> Option<Result<Result<AgentMessage, LogUploadError>, ()>> {
         let done = self.tasks.join_next_with_id().await?;
-        Some(match done {
+        let finished = match done {
             Ok((id, (job_id, generation, result))) => {
                 self.keys.remove(&id);
                 Ok(result.map(|outcome| AgentMessage::LogUploadAnswer {
@@ -1013,6 +1046,13 @@ impl LogAsks {
                 self.keys.remove(&error.id());
                 Err(())
             }
-        })
+        };
+        while self.keys.len() < MAX_LOG_ASKS {
+            let Some((job_id, generation)) = self.waiting.pop_front() else {
+                break;
+            };
+            self.start(job_id, generation);
+        }
+        Some(finished)
     }
 }

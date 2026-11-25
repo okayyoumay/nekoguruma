@@ -1,12 +1,12 @@
 use sha2::{Digest as _, Sha256};
 use shared_proto::JobId;
 
-use std::fs::File;
-use std::io::{Seek, SeekFrom, Write};
+use std::io::Write;
+use std::sync::atomic::AtomicBool;
 
 use super::*;
 use crate::comm_log::{CommLog, CommLogSetup};
-use crate::upload_ledger::{Kind, MAX_COMM_LOG_BYTES, Probe, Source, Step, UploadLedger};
+use crate::upload_ledger::{Kind, Probe, Source, Step, UploadLedger};
 
 const AGENT_ID: &str = "0194f0a2-7c3e-7d11-8a52-3f6f9b1c2d4e";
 const JOB: &str = "0194f0a2-7c3e-7d11-8a52-3f6f9b1c2d4f";
@@ -65,7 +65,9 @@ impl Rig {
     }
 
     async fn ask(&self) -> Result<LogUploadOutcome, LogUploadError> {
-        self.uploader.handle(JOB.to_owned(), GENERATION).await
+        self.uploader
+            .handle(JOB.to_owned(), GENERATION, not_cancelled())
+            .await
     }
 
     /// The log's writer, as a running job holds it.
@@ -73,6 +75,10 @@ impl Rig {
         let setup = CommLogSetup::for_run_key(self.dir.path().join("journal"), self.key()).unwrap();
         CommLog::open(&setup).unwrap()
     }
+}
+
+fn not_cancelled() -> Arc<AtomicBool> {
+    Arc::new(AtomicBool::new(false))
 }
 
 fn sha(bytes: &[u8]) -> [u8; 32] {
@@ -86,7 +92,11 @@ async fn a_job_the_agent_does_not_hold_is_unknown_whatever_its_log() {
     assert_eq!(rig.ask().await.unwrap(), LogUploadOutcome::UnknownJob);
     // Not a canonical UUID: never looked up as a file name.
     for job in ["../x", "not-a-uuid", ""] {
-        let outcome = rig.uploader.handle(job.to_owned(), 1).await.unwrap();
+        let outcome = rig
+            .uploader
+            .handle(job.to_owned(), 1, not_cancelled())
+            .await
+            .unwrap();
         assert_eq!(outcome, LogUploadOutcome::UnknownJob, "{job:?}");
     }
     assert!(rig.uploads.entries_for_test().await.is_empty());
@@ -99,7 +109,7 @@ async fn an_earlier_or_later_generation_than_the_held_one_is_unknown() {
     for generation in [GENERATION - 1, GENERATION + 1] {
         let outcome = rig
             .uploader
-            .handle(JOB.to_owned(), generation)
+            .handle(JOB.to_owned(), generation, not_cancelled())
             .await
             .unwrap();
         assert_eq!(outcome, LogUploadOutcome::UnknownJob, "{generation}");
@@ -219,17 +229,41 @@ async fn a_queued_log_is_answered_queued_without_reading_it_again_or_trying_the_
 }
 
 #[tokio::test]
-async fn a_log_over_the_largest_object_is_too_large_and_is_not_hashed() {
+async fn a_log_over_the_maximum_is_too_large_and_one_at_it_is_queued() {
     let rig = Rig::new();
+    let uploader = LogUploader::in_dir(
+        rig.dir.path().join("journal"),
+        rig.received.clone(),
+        rig.uploads.clone(),
+    )
+    .with_max_bytes(8);
     rig.take(JOB, GENERATION);
-    // A sparse file whose last byte is a line end: its complete lines are one byte over.
-    let mut file = File::create(rig.log_path()).unwrap();
-    file.set_len(MAX_COMM_LOG_BYTES).unwrap();
-    file.seek(SeekFrom::End(0)).unwrap();
-    file.write_all(b"\n").unwrap();
-    drop(file);
-    assert_eq!(rig.ask().await.unwrap(), LogUploadOutcome::TooLarge);
+    // Ten bytes of complete lines against a maximum of eight; the torn tail does not count.
+    std::fs::write(rig.log_path(), b"aaaa\nbbbb\ncc").unwrap();
+    let ask = || uploader.handle(JOB.to_owned(), GENERATION, not_cancelled());
+    assert_eq!(ask().await.unwrap(), LogUploadOutcome::TooLarge);
     assert!(rig.uploads.entries_for_test().await.is_empty());
+    std::fs::write(rig.log_path(), b"aaa\nbbb\ncc").unwrap();
+    assert_eq!(ask().await.unwrap(), LogUploadOutcome::Queued);
+    assert_eq!(rig.uploads.entries_for_test().await[0].length, 8);
+}
+
+#[tokio::test]
+async fn a_read_whose_connection_ended_enqueues_nothing_and_frees_the_lock() {
+    let rig = Rig::new();
+    rig.job_with_log(b"a\nb\n");
+    let cancel = Arc::new(AtomicBool::new(true));
+    let outcome = rig
+        .uploader
+        .handle(JOB.to_owned(), GENERATION, cancel)
+        .await;
+    assert!(
+        matches!(outcome, Err(LogUploadError::Cancelled)),
+        "{outcome:?}"
+    );
+    assert!(rig.uploads.entries_for_test().await.is_empty());
+    drop(rig.writer());
+    assert_eq!(rig.ask().await.unwrap(), LogUploadOutcome::Queued);
 }
 
 #[tokio::test]
@@ -249,12 +283,14 @@ async fn a_ledger_that_cannot_make_the_entry_durable_gives_an_error_and_no_entry
 #[tokio::test]
 async fn a_directory_that_cannot_be_resolved_gives_an_error() {
     let rig = Rig::new();
-    let uploader = LogUploader {
-        dir: Arc::new(|| Err(io::Error::other("no journal directory"))),
-        received: rig.received.clone(),
-        uploads: rig.uploads.clone(),
-    };
+    let uploader = LogUploader::with(
+        Arc::new(|| Err(io::Error::other("no journal directory"))),
+        rig.received.clone(),
+        rig.uploads.clone(),
+    );
     rig.take(JOB, GENERATION);
-    let outcome = uploader.handle(JOB.to_owned(), GENERATION).await;
+    let outcome = uploader
+        .handle(JOB.to_owned(), GENERATION, not_cancelled())
+        .await;
     assert!(matches!(outcome, Err(LogUploadError::Io(_))));
 }

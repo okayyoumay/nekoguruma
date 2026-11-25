@@ -6,31 +6,38 @@
 //! answers, in this order:
 //!
 //! 1. `unknownJob` unless the job ID is a canonical UUID and the received-jobs ledger's highest
-//!    generation for it is the one asked for (an earlier generation is as unknown as a job the
-//!    agent never took);
+//!    generation for it is the one asked for (an earlier or later generation is as unknown as a
+//!    job the agent never took);
 //! 2. `queued` when the upload ledger already holds an entry for the log, without reading the
-//!    file and before the writer lock is tried, so a repeated command never answers `busy`
-//!    for a log that is already queued;
-//! 3. `busy`, `noLog` or `tooLarge` as [`digest_for_upload`] finds the log (the lock is tried
-//!    once);
-//! 4. `queued` once the entry that covers the log's bytes up to its last line end is durable.
+//!    file and before the writer lock is tried, so a repeated command never answers `busy` for
+//!    a log that is already queued;
+//! 3. `noLog` when there is no log file, before the lock is touched, so no lock file is made
+//!    for a job without a log;
+//! 4. `busy` when a run holds the log's writer lock, which is tried once;
+//! 5. `noLog` when the file has no complete line, and `tooLarge` when its complete lines are over
+//!    the maximum;
+//! 6. otherwise the bytes up to the last line end are hashed under the lock and enqueued, and
+//!    the answer is `queued` once the entry is durable.
 //!
-//! A ledger or file-system failure is an [`LogUploadError`]: the control channel sends no answer
-//! and the server asks again.
+//! A failure (a journal directory or a log that cannot be read, a ledger that cannot take the
+//! entry because it is full or refuses the source, the work cancelled because its connection
+//! ended) is a [`LogUploadError`]: the control channel sends no answer and the server asks again
+//! until the request expires.
 
 use std::future::Future;
 use std::io;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use shared_proto::{LogUploadOutcome, is_canonical_uuid};
 use worker_host::service::OperatingMode;
 
-use crate::comm_log::{UploadRead, comm_log_path, digest_for_upload};
+use crate::comm_log::{UploadRead, UploadStage, comm_log_path, digest_for_upload_traced};
 use crate::journal::{JobKey, journal_dir};
 use crate::received_jobs::ReceivedJobs;
-use crate::upload_ledger::LedgerError;
+use crate::upload_ledger::{LedgerError, MAX_COMM_LOG_BYTES};
 use crate::uploader::SharedLedger;
 
 /// Why a command was left without an answer. The cause is for the log; nothing of the command
@@ -46,6 +53,9 @@ pub enum LogUploadError {
     /// The task that does the work ended without a result.
     #[error("the task for the log ended without a result")]
     Task,
+    /// The connection the command came on ended while the log was being read.
+    #[error("the connection ended while the log was being read")]
+    Cancelled,
 }
 
 /// What [`LogUploads::handle`] returns: a future the control channel polls beside its frames.
@@ -55,10 +65,11 @@ pub type Handled<'a> =
 /// Where a `logUploadCommand` goes. The control channel runs the returned future beside its
 /// reads and heartbeats and writes the answer when it is done, so a call may take as long as
 /// hashing a large log; it must tolerate being dropped before it finishes, as a closed
-/// connection does.
+/// connection does. `cancel` is set when the connection ends: work that goes on after its future
+/// is dropped (a blocking read) stops at its next chunk and enqueues nothing.
 pub trait LogUploads: Send + Sync {
     /// Judges the request for the log of `job_id` at `generation`.
-    fn handle(&self, job_id: String, generation: u64) -> Handled<'_>;
+    fn handle(&self, job_id: String, generation: u64, cancel: Arc<AtomicBool>) -> Handled<'_>;
 }
 
 /// The default, connected to no job store: every command is for an unknown job.
@@ -66,7 +77,7 @@ pub trait LogUploads: Send + Sync {
 pub struct NoLogUploads;
 
 impl LogUploads for NoLogUploads {
-    fn handle(&self, _job_id: String, _generation: u64) -> Handled<'_> {
+    fn handle(&self, _job_id: String, _generation: u64, _cancel: Arc<AtomicBool>) -> Handled<'_> {
         Box::pin(std::future::ready(Ok(LogUploadOutcome::UnknownJob)))
     }
 }
@@ -79,6 +90,10 @@ pub struct LogUploader {
     dir: LogDir,
     received: ReceivedJobs,
     uploads: SharedLedger,
+    /// The longest log that is sent: the largest the upload ledger takes, which tests lower.
+    max_bytes: u64,
+    /// Called at the stages of a read, which tests hold.
+    trace: Arc<dyn Fn(UploadStage) + Send + Sync>,
 }
 
 impl std::fmt::Debug for LogUploader {
@@ -92,26 +107,43 @@ impl LogUploader {
     /// resolve it is a command left unanswered).
     pub fn new(mode: OperatingMode, received: ReceivedJobs, uploads: SharedLedger) -> Self {
         let dir = Arc::new(move || journal_dir(mode).map_err(io::Error::other));
-        Self {
-            dir,
-            received,
-            uploads,
-        }
+        Self::with(dir, received, uploads)
     }
 
     /// The handling for logs in `dir`, which must be an absolute path.
     pub fn in_dir(dir: PathBuf, received: ReceivedJobs, uploads: SharedLedger) -> Self {
+        Self::with(Arc::new(move || Ok(dir.clone())), received, uploads)
+    }
+
+    fn with(dir: LogDir, received: ReceivedJobs, uploads: SharedLedger) -> Self {
         Self {
-            dir: Arc::new(move || Ok(dir.clone())),
+            dir,
             received,
             uploads,
+            max_bytes: MAX_COMM_LOG_BYTES,
+            trace: Arc::new(|_| {}),
         }
+    }
+
+    /// The handling with `max_bytes` as the longest log sent.
+    #[cfg(test)]
+    pub(crate) fn with_max_bytes(mut self, max_bytes: u64) -> Self {
+        self.max_bytes = max_bytes;
+        self
+    }
+
+    /// The handling that calls `trace` at the stages of each read.
+    #[cfg(test)]
+    pub(crate) fn with_trace(mut self, trace: Arc<dyn Fn(UploadStage) + Send + Sync>) -> Self {
+        self.trace = trace;
+        self
     }
 
     async fn run(
         &self,
         job_id: String,
         generation: u64,
+        cancel: Arc<AtomicBool>,
     ) -> Result<LogUploadOutcome, LogUploadError> {
         if !is_canonical_uuid(&job_id) || self.received.highest(&job_id) != Some(generation) {
             return Ok(LogUploadOutcome::UnknownJob);
@@ -123,11 +155,11 @@ impl LogUploader {
         if self.uploads.has_comm_log(&key).await {
             return Ok(LogUploadOutcome::Queued);
         }
-        let dir = self.dir.clone();
-        let read_key = key.clone();
+        let (dir, read_key) = (self.dir.clone(), key.clone());
+        let (max, trace) = (self.max_bytes, self.trace.clone());
         let found = tokio::task::spawn_blocking(move || {
             let dir = dir()?;
-            digest_for_upload(&dir, &read_key).map(|read| (read, dir))
+            digest_for_upload_traced(&dir, &read_key, max, &cancel, &*trace).map(|read| (read, dir))
         })
         .await
         .map_err(|_| LogUploadError::Task)??;
@@ -135,6 +167,7 @@ impl LogUploader {
             (UploadRead::Busy, _) => return Ok(LogUploadOutcome::Busy),
             (UploadRead::NoLog, _) => return Ok(LogUploadOutcome::NoLog),
             (UploadRead::TooLarge, _) => return Ok(LogUploadOutcome::TooLarge),
+            (UploadRead::Cancelled, _) => return Err(LogUploadError::Cancelled),
             (UploadRead::Ready(digest), dir) => (digest, dir),
         };
         let path = comm_log_path(&dir, &key).map_err(io::Error::other)?;
@@ -149,8 +182,8 @@ impl LogUploader {
 }
 
 impl LogUploads for LogUploader {
-    fn handle(&self, job_id: String, generation: u64) -> Handled<'_> {
-        Box::pin(self.run(job_id, generation))
+    fn handle(&self, job_id: String, generation: u64, cancel: Arc<AtomicBool>) -> Handled<'_> {
+        Box::pin(self.run(job_id, generation, cancel))
     }
 }
 

@@ -216,7 +216,7 @@ pub enum LogUploadOutcome {
     Queued,
     /// The agent's received-jobs ledger holds no such job at that generation.
     UnknownJob,
-    /// The agent has no log for the job, or only a header-less or empty one.
+    /// There is no log file for the job, or the file has no complete line.
     NoLog,
     /// A run holds the log's writer lock now.
     Busy,

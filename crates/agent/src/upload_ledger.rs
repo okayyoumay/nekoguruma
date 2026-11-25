@@ -32,6 +32,7 @@ use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -108,20 +109,25 @@ impl Digest {
 
 /// Reads the file at `path` to its end through one handle and returns its length and SHA-256.
 pub fn digest_file(path: &Path) -> io::Result<Digest> {
-    digest_reader(File::open(path)?)
+    digest_reader(File::open(path)?, &AtomicBool::new(false))?
+        .ok_or_else(|| io::Error::other("a digest nobody cancelled was cancelled"))
 }
 
 /// Reads the first `length` bytes of `file` from its current position (or to its end when it is
-/// shorter) and returns the length read and its SHA-256.
-pub fn digest_prefix(file: File, length: u64) -> io::Result<Digest> {
-    digest_reader(file.take(length))
+/// shorter) and returns the length read and its SHA-256, or `None` when `cancel` was set: it is
+/// looked at before each chunk, so a cancelled read ends within one.
+pub fn digest_prefix(file: File, length: u64, cancel: &AtomicBool) -> io::Result<Option<Digest>> {
+    digest_reader(file.take(length), cancel)
 }
 
-fn digest_reader(mut reader: impl Read) -> io::Result<Digest> {
+fn digest_reader(mut reader: impl Read, cancel: &AtomicBool) -> io::Result<Option<Digest>> {
     let mut hasher = Sha256::new();
     let mut length = 0u64;
     let mut buffer = vec![0u8; 64 << 10];
     loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
         match reader.read(&mut buffer) {
             Ok(0) => break,
             Ok(read) => {
@@ -132,10 +138,10 @@ fn digest_reader(mut reader: impl Read) -> io::Result<Digest> {
             Err(error) => return Err(error),
         }
     }
-    Ok(Digest {
+    Ok(Some(Digest {
         length,
         sha256: hasher.finalize().into(),
-    })
+    }))
 }
 
 /// One thing still to upload.

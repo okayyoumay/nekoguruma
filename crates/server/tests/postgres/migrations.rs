@@ -794,6 +794,156 @@ async fn confirmation_defaults_hold_the_six_seeded_rows_and_refuse_an_unknown_ki
     db::close(&pool).await;
 }
 
+// Migration 0016 (ADR-508): a request is one row per job and generation; its state and refusal
+// are the lists, a refusal goes with the `refused` state and only with it, and the job, the agent
+// and the operator must exist.
+#[tokio::test]
+async fn a_comm_log_request_is_one_row_per_job_and_generation_with_its_state_and_refusal_checked() {
+    let pg = TestPostgres::start();
+    let pool = pg.pool();
+    db::migrate_with(&pool, &db::MIGRATOR, Duration::from_secs(30))
+        .await
+        .expect("the migrations apply");
+    pg.execute("INSERT INTO tenants (id, name) VALUES (gen_random_uuid(), 'requests')")
+        .await;
+    pg.execute(
+        "INSERT INTO operators (id, tenant_id, subject, display_name) \
+         SELECT gen_random_uuid(), id, 'op', 'op' FROM tenants",
+    )
+    .await;
+    pg.execute(
+        "INSERT INTO agents (id, tenant_id, display_name, mode, public_key) \
+         SELECT gen_random_uuid(), id, 'agent', 'user', '\\x01' FROM tenants",
+    )
+    .await;
+    sqlx::query(sqlx::AssertSqlSafe(job_insert("acquire", "", "")))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let insert = |generation: i64| {
+        format!(
+            "INSERT INTO comm_log_requests (tenant_id, job_id, generation, agent_id, \
+                 requested_by) \
+             SELECT tenant_id, id, {generation}, agent_id, operator_id FROM jobs"
+        )
+    };
+    let run = |sql: String| {
+        let pool = pool.clone();
+        async move { sqlx::query(sqlx::AssertSqlSafe(sql)).execute(&pool).await }
+    };
+    // The state starts as `requested`, with no refusal, no send and no answer.
+    run(insert(1)).await.unwrap();
+    assert_eq!(
+        pg.scalar(
+            "SELECT concat_ws('|', state, refusal IS NULL, sent_at IS NULL, answered_at IS NULL) \
+             FROM comm_log_requests"
+        )
+        .await,
+        "requested|t|t|t"
+    );
+    // One row per job and generation.
+    let again = run(insert(1)).await;
+    assert_eq!(sqlstate(&again).as_deref(), Some("23505"), "{again:?}");
+    // The generation is not negative.
+    let negative = run(insert(-1)).await;
+    assert_eq!(
+        sqlstate(&negative).as_deref(),
+        Some("23514"),
+        "{negative:?}"
+    );
+    // Each state is accepted; a refusal belongs to `refused` alone, and an answer's time to
+    // `accepted` and `refused` alone.
+    for (generation, state, refusal, answered, ok) in [
+        (2, "accepted", "NULL", "now()", true),
+        (3, "expired", "NULL", "NULL", true),
+        (4, "refused", "'busy'", "now()", true),
+        (5, "refused", "NULL", "now()", false),
+        (6, "accepted", "'busy'", "now()", false),
+        (7, "refused", "'other'", "now()", false),
+        (8, "stored", "NULL", "NULL", false),
+        (13, "accepted", "NULL", "NULL", false),
+        (14, "refused", "'busy'", "NULL", false),
+        (15, "expired", "NULL", "now()", false),
+        (16, "requested", "NULL", "now()", false),
+    ] {
+        let outcome = run(format!(
+            "INSERT INTO comm_log_requests (tenant_id, job_id, generation, agent_id, \
+                 requested_by, state, refusal, answered_at) \
+             SELECT tenant_id, id, {generation}, agent_id, operator_id, '{state}', {refusal}, \
+                 {answered} FROM jobs"
+        ))
+        .await;
+        assert_eq!(
+            outcome.is_ok(),
+            ok,
+            "{state} {refusal} {answered}: {outcome:?}"
+        );
+        if !ok {
+            assert_eq!(
+                sqlstate(&outcome).as_deref(),
+                Some("23514"),
+                "{state} {refusal} {answered}"
+            );
+        }
+    }
+    // The four reasons an agent gives are the refusals the column takes.
+    for (generation, refusal) in [
+        (9, "unknownJob"),
+        (10, "noLog"),
+        (11, "busy"),
+        (12, "tooLarge"),
+    ] {
+        let outcome = run(format!(
+            "INSERT INTO comm_log_requests (tenant_id, job_id, generation, agent_id, \
+                 requested_by, state, refusal, answered_at) \
+             SELECT tenant_id, id, {generation}, agent_id, operator_id, 'refused', \
+                 '{refusal}', now() FROM jobs"
+        ))
+        .await;
+        assert!(outcome.is_ok(), "{refusal}: {outcome:?}");
+    }
+    // The job, the agent and the operator must exist, and the agent is the job's own.
+    pg.execute(
+        "INSERT INTO agents (id, tenant_id, display_name, mode, public_key) \
+         SELECT gen_random_uuid(), tenant_id, 'other', 'user', '\\x02' FROM agents",
+    )
+    .await;
+    for (what, sql) in [
+        (
+            "another agent",
+            "INSERT INTO comm_log_requests (tenant_id, job_id, generation, agent_id, requested_by) \
+             SELECT j.tenant_id, j.id, 23, a.id, j.operator_id FROM jobs j \
+             JOIN agents a ON a.id <> j.agent_id",
+        ),
+        (
+            "job",
+            "INSERT INTO comm_log_requests (tenant_id, job_id, generation, agent_id, requested_by) \
+             SELECT tenant_id, gen_random_uuid(), 20, agent_id, operator_id FROM jobs",
+        ),
+        (
+            "agent",
+            "INSERT INTO comm_log_requests (tenant_id, job_id, generation, agent_id, requested_by) \
+             SELECT tenant_id, id, 21, gen_random_uuid(), operator_id FROM jobs",
+        ),
+        (
+            "operator",
+            "INSERT INTO comm_log_requests (tenant_id, job_id, generation, agent_id, requested_by) \
+             SELECT tenant_id, id, 22, agent_id, gen_random_uuid() FROM jobs",
+        ),
+    ] {
+        let outcome = run(sql.to_owned()).await;
+        assert_eq!(
+            sqlstate(&outcome).as_deref(),
+            Some("23503"),
+            "{what}: {outcome:?}"
+        );
+    }
+    // A job that has requests is not deleted under them.
+    let delete = sqlx::query("DELETE FROM jobs").execute(&pool).await;
+    assert_eq!(sqlstate(&delete).as_deref(), Some("23503"), "{delete:?}");
+    db::close(&pool).await;
+}
+
 /// The SQLSTATE of a failed statement.
 fn sqlstate<T>(outcome: &Result<T, sqlx::Error>) -> Option<String> {
     match outcome {

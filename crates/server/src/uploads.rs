@@ -954,6 +954,9 @@ enum JobLookup {
     Undecodable,
     /// The job's generation is not the one declared.
     OtherGeneration,
+    /// A communication log no operator asked this agent for (design 8.11, ADR-508): answered as
+    /// an unknown job.
+    NotRequested,
     Found(Option<Row>),
 }
 
@@ -1013,7 +1016,40 @@ async fn lookup_job(
         return Ok(JobLookup::OtherGeneration);
     }
     let row = live_row(&mut tx, tenant, declared).await?;
+    // A live row is answered whatever the request's state is now: a repeated begin of an upload
+    // in flight must not meet a refusal or an expiry that came after it started (a row begun
+    // before migration 0016 has no request and is answered the same way).
+    if row.is_none()
+        && declared.kind == "commLog"
+        && !is_requested(&mut tx, tenant, agent, declared).await?
+    {
+        return Ok(JobLookup::NotRequested);
+    }
     Ok(JobLookup::Found(row))
+}
+
+/// Whether the agent has a request for the declared job's communication log at the declared
+/// generation that admits a begin: a row in state `requested` (not yet answered), `accepted`
+/// (the agent has queued the log and may begin before its answer is applied) or `expired` (the
+/// server stopped asking, but an agent that queued the log just before, or whose answer was
+/// lost, may still send it). A `refused` row admits nothing.
+async fn is_requested(
+    tx: &mut sqlx::PgConnection,
+    tenant: &str,
+    agent: &str,
+    declared: &Declared,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM comm_log_requests WHERE tenant_id = $1::uuid \
+         AND job_id = $2::uuid AND generation = $3 AND agent_id = $4::uuid \
+         AND state <> 'refused')",
+    )
+    .bind(tenant)
+    .bind(&declared.job_id)
+    .bind(declared.generation as i64)
+    .bind(agent)
+    .fetch_one(tx)
+    .await
 }
 
 /// The row that is not `failed` for the declared job, generation and kind.
@@ -1430,7 +1466,7 @@ pub async fn begin(State(u): State<Uploads>, request: Request) -> Response {
 async fn begin_answer(u: &Uploads, caller: &Caller, declared: &Declared) -> Response {
     match lookup_job(&u.pool, &caller.tenant, &caller.agent.0, declared).await {
         Err(error) => return db_failure(u, &error),
-        Ok(JobLookup::NoJob | JobLookup::OtherGeneration) => {
+        Ok(JobLookup::NoJob | JobLookup::OtherGeneration | JobLookup::NotRequested) => {
             return problem(StatusCode::NOT_FOUND, "No such job");
         }
         Ok(JobLookup::Undecodable) => {

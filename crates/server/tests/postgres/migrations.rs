@@ -851,29 +851,38 @@ async fn a_comm_log_request_is_one_row_per_job_and_generation_with_its_state_and
         Some("23514"),
         "{negative:?}"
     );
-    // Each state is accepted; a refusal belongs to `refused` alone.
-    for (generation, state, refusal, ok) in [
-        (2, "accepted", "NULL", true),
-        (3, "expired", "NULL", true),
-        (4, "refused", "'busy'", true),
-        (5, "refused", "NULL", false),
-        (6, "accepted", "'busy'", false),
-        (7, "refused", "'other'", false),
-        (8, "stored", "NULL", false),
+    // Each state is accepted; a refusal belongs to `refused` alone, and an answer's time to
+    // `accepted` and `refused` alone.
+    for (generation, state, refusal, answered, ok) in [
+        (2, "accepted", "NULL", "now()", true),
+        (3, "expired", "NULL", "NULL", true),
+        (4, "refused", "'busy'", "now()", true),
+        (5, "refused", "NULL", "now()", false),
+        (6, "accepted", "'busy'", "now()", false),
+        (7, "refused", "'other'", "now()", false),
+        (8, "stored", "NULL", "NULL", false),
+        (13, "accepted", "NULL", "NULL", false),
+        (14, "refused", "'busy'", "NULL", false),
+        (15, "expired", "NULL", "now()", false),
+        (16, "requested", "NULL", "now()", false),
     ] {
         let outcome = run(format!(
             "INSERT INTO comm_log_requests (tenant_id, job_id, generation, agent_id, \
-                 requested_by, state, refusal) \
-             SELECT tenant_id, id, {generation}, agent_id, operator_id, '{state}', {refusal} \
-             FROM jobs"
+                 requested_by, state, refusal, answered_at) \
+             SELECT tenant_id, id, {generation}, agent_id, operator_id, '{state}', {refusal}, \
+                 {answered} FROM jobs"
         ))
         .await;
-        assert_eq!(outcome.is_ok(), ok, "{state} {refusal}: {outcome:?}");
+        assert_eq!(
+            outcome.is_ok(),
+            ok,
+            "{state} {refusal} {answered}: {outcome:?}"
+        );
         if !ok {
             assert_eq!(
                 sqlstate(&outcome).as_deref(),
                 Some("23514"),
-                "{state} {refusal}"
+                "{state} {refusal} {answered}"
             );
         }
     }
@@ -886,15 +895,26 @@ async fn a_comm_log_request_is_one_row_per_job_and_generation_with_its_state_and
     ] {
         let outcome = run(format!(
             "INSERT INTO comm_log_requests (tenant_id, job_id, generation, agent_id, \
-                 requested_by, state, refusal) \
-             SELECT tenant_id, id, {generation}, agent_id, operator_id, 'refused', '{refusal}' \
-             FROM jobs"
+                 requested_by, state, refusal, answered_at) \
+             SELECT tenant_id, id, {generation}, agent_id, operator_id, 'refused', \
+                 '{refusal}', now() FROM jobs"
         ))
         .await;
         assert!(outcome.is_ok(), "{refusal}: {outcome:?}");
     }
-    // The job, the agent and the operator must exist.
+    // The job, the agent and the operator must exist, and the agent is the job's own.
+    pg.execute(
+        "INSERT INTO agents (id, tenant_id, display_name, mode, public_key) \
+         SELECT gen_random_uuid(), tenant_id, 'other', 'user', '\\x02' FROM agents",
+    )
+    .await;
     for (what, sql) in [
+        (
+            "another agent",
+            "INSERT INTO comm_log_requests (tenant_id, job_id, generation, agent_id, requested_by) \
+             SELECT j.tenant_id, j.id, 23, a.id, j.operator_id FROM jobs j \
+             JOIN agents a ON a.id <> j.agent_id",
+        ),
         (
             "job",
             "INSERT INTO comm_log_requests (tenant_id, job_id, generation, agent_id, requested_by) \

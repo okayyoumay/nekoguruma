@@ -15,8 +15,20 @@
 --   sent_at             when the server last sent the command to the agent
 --   answered_at         when the agent's answer was applied
 --
+-- A new request for a job and generation whose row is `refused` or `expired` is made by updating
+-- the row in place: the state goes back to `requested`, `refusal`, `sent_at` and `answered_at` are
+-- cleared, and `requested_by` and `requested_at` become the new request's. A row in state
+-- `requested` or `accepted` is left as it is. The state `accepted` or `refused` is set with
+-- `answered_at` and no other state has one (a CHECK); expiry applies to `requested` alone.
+--
+-- The agent is the job's own: the foreign key over `(tenant_id, job_id, agent_id)` needs the
+-- unique constraint on `jobs` that the migration adds (nothing changes a job's agent). The agent
+-- and operator keys do not carry the tenant, as `job_objects` has them: `agents` and `operators`
+-- have no unique `(tenant_id, id)`, and the job's key already ties the row's tenant to the job's.
 -- The foreign keys have no cascade: a job, an agent or an operator that has requests is not
 -- deleted under them. The partial index serves the delivery's scan of one agent's open requests.
+ALTER TABLE jobs ADD CONSTRAINT jobs_tenant_id_id_agent_id_key UNIQUE (tenant_id, id, agent_id);
+
 CREATE TABLE comm_log_requests (
     tenant_id       uuid NOT NULL REFERENCES tenants(id),
     job_id          uuid NOT NULL,
@@ -30,8 +42,9 @@ CREATE TABLE comm_log_requests (
     sent_at         timestamptz,
     answered_at     timestamptz,
     PRIMARY KEY (tenant_id, job_id, generation),
-    FOREIGN KEY (tenant_id, job_id) REFERENCES jobs (tenant_id, id),
-    CHECK ((state = 'refused') = (refusal IS NOT NULL))
+    FOREIGN KEY (tenant_id, job_id, agent_id) REFERENCES jobs (tenant_id, id, agent_id),
+    CHECK ((state = 'refused') = (refusal IS NOT NULL)),
+    CHECK ((state IN ('accepted','refused')) = (answered_at IS NOT NULL))
 );
 
 CREATE INDEX comm_log_requests_open ON comm_log_requests (tenant_id, agent_id)

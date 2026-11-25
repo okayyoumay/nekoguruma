@@ -1016,8 +1016,9 @@ async fn lookup_job(
         return Ok(JobLookup::OtherGeneration);
     }
     let row = live_row(&mut tx, tenant, declared).await?;
-    // A row that exists was begun under a request, so a repeated begin is answered from it
-    // whatever the request's state has become since.
+    // A live row is answered whatever the request's state is now: a repeated begin of an upload
+    // in flight must not meet a refusal or an expiry that came after it started (a row begun
+    // before migration 0016 has no request and is answered the same way).
     if row.is_none()
         && declared.kind == "commLog"
         && !is_requested(&mut tx, tenant, agent, declared).await?
@@ -1027,11 +1028,11 @@ async fn lookup_job(
     Ok(JobLookup::Found(row))
 }
 
-/// Whether the agent has an open request for the declared job's communication log at the declared
-/// generation: a row in state `requested` (not yet answered), `accepted` (the agent has queued
-/// the log and may begin before its answer is applied) or `expired` (the server stopped asking,
-/// but an agent that queued the log just before, or whose answer was lost, may still send it). A `refused` row admits
-/// nothing.
+/// Whether the agent has a request for the declared job's communication log at the declared
+/// generation that admits a begin: a row in state `requested` (not yet answered), `accepted`
+/// (the agent has queued the log and may begin before its answer is applied) or `expired` (the
+/// server stopped asking, but an agent that queued the log just before, or whose answer was
+/// lost, may still send it). A `refused` row admits nothing.
 async fn is_requested(
     tx: &mut sqlx::PgConnection,
     tenant: &str,

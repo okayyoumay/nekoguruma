@@ -750,9 +750,11 @@ impl Fx {
     ) {
         sqlx::query(
             "INSERT INTO comm_log_requests (tenant_id, job_id, generation, agent_id, \
-                 requested_by, state, refusal) \
+                 requested_by, state, refusal, answered_at) \
              SELECT tenant_id, id, $2, $3::uuid, operator_id, $4, \
-                 CASE WHEN $4 = 'refused' THEN 'noLog' END FROM jobs WHERE id = $1::uuid",
+                 CASE WHEN $4 = 'refused' THEN 'noLog' END, \
+                 CASE WHEN $4 IN ('accepted','refused') THEN now() END \
+             FROM jobs WHERE id = $1::uuid",
         )
         .bind(job)
         .bind(generation)
@@ -1324,30 +1326,31 @@ async fn a_failed_row_is_ignored_and_a_new_begin_makes_a_new_one() {
 }
 
 /// A communication log is begun only under an operator's request for this agent, job and
-/// generation that the agent has not refused (ADR-508); the refusal is the answer for an unknown job and
-/// begins nothing in the store.
+/// generation that the agent has not refused (ADR-508); the refusal is the answer for an unknown
+/// job and begins nothing in the store.
 #[tokio::test]
 async fn a_comm_log_begin_needs_an_unrefused_request_of_this_agent() {
     let fx = Fx::new(With::Fake).await;
     let log = |job: &str| decl(job, 1, "commLog", 10, &digest());
+    let calls_before = fx.wrap.calls()[0];
     let no_row = fx.job().await;
     problem(&fx.begin(&log(&no_row)).await, 404, "no request");
     // The same job's result needs no request.
     let r = fx.begin(&result_of(&no_row, 10)).await;
     assert_eq!(r.status, 201, "{}", r.head);
-    let calls_before = fx.wrap.calls()[0];
     let refused = fx.job().await;
     fx.comm_log_request(&refused, 1, &fx.u.id, "refused").await;
     problem(&fx.begin(&log(&refused)).await, 404, "refused");
-    // A request of another agent, and one of another generation, do not count.
+    // A request for another agent's job does not count for this caller, and one of another
+    // generation does not either.
     let (other_id, _) = fx.other_agent().await;
-    let foreign = fx.job().await;
+    let foreign = fx.job_for(&other_id, 1).await;
     fx.comm_log_request(&foreign, 1, &other_id, "requested")
         .await;
     problem(
         &fx.begin(&log(&foreign)).await,
         404,
-        "other agent's request",
+        "other agent's job and request",
     );
     let later = fx.job().await;
     fx.comm_log_request(&later, 2, &fx.u.id, "requested").await;
@@ -1357,7 +1360,8 @@ async fn a_comm_log_begin_needs_an_unrefused_request_of_this_agent() {
         "other generation's request",
     );
     // Nothing was begun in the store or the table for any of them.
-    assert_eq!(fx.wrap.calls()[0], calls_before);
+    // Only the result's begin, which needs no request, called the store.
+    assert_eq!(fx.wrap.calls()[0], calls_before + 1);
     assert_eq!(
         fx.sql("SELECT count(*) FROM job_objects WHERE kind = 'commLog'")
             .await,
@@ -1371,15 +1375,45 @@ async fn a_comm_log_begin_needs_an_unrefused_request_of_this_agent() {
         let r = fx.begin(&log(&job)).await;
         assert_eq!(r.status, 201, "{state}: {}", r.head);
         sqlx::query(
-            "UPDATE comm_log_requests SET state = 'refused', refusal = 'busy' \
-             WHERE job_id = $1::uuid",
+            "UPDATE comm_log_requests SET state = 'refused', refusal = 'busy', \
+                 answered_at = now() WHERE job_id = $1::uuid",
         )
         .bind(&job)
         .execute(&fx.u.w.pool)
         .await
         .unwrap();
         assert_eq!(fx.begin(&log(&job)).await.status, 200, "{state}, repeated");
+        // The live row is judged first: another declaration is the conflict of ADR-493 item 3,
+        // not the request's refusal.
+        let other = decl(&job, 1, "commLog", 10, &"cd".repeat(32));
+        problem(
+            &fx.begin(&other).await,
+            409,
+            &format!("{state}, other digest"),
+        );
     }
+    // A failed upload frees the slot, and a new begin needs a request that is not refused.
+    let failed = fx.job().await;
+    fx.comm_log_request(&failed, 1, &fx.u.id, "requested").await;
+    assert_eq!(fx.begin(&log(&failed)).await.status, 201);
+    sqlx::query("UPDATE job_objects SET state = 'failed' WHERE job_id = $1::uuid")
+        .bind(&failed)
+        .execute(&fx.u.w.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE comm_log_requests SET state = 'refused', refusal = 'busy', \
+             answered_at = now() WHERE job_id = $1::uuid",
+    )
+    .bind(&failed)
+    .execute(&fx.u.w.pool)
+    .await
+    .unwrap();
+    problem(
+        &fx.begin(&log(&failed)).await,
+        404,
+        "failed row, refused request",
+    );
     fx.finish().await;
 }
 

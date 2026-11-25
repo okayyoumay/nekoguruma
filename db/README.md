@@ -125,7 +125,13 @@ application. "Stored" is not a state: a stored log is the job's `job_objects` ro
 other than `refused`. The primary key is `(tenant_id, job_id, generation)`; the
 foreign keys (the job through `(tenant_id, job_id)`, the agent, the operator) have no cascade; a
 partial index on `(tenant_id, agent_id) WHERE state = 'requested'` serves the delivery's scan.
-Nothing writes the rows yet and tests seed them, as with `artifacts`. A job's log has no period of
+The agent is the job's own (a composite foreign key to `jobs (tenant_id, id, agent_id)`, for which
+the migration adds a unique constraint on `jobs`); `answered_at` is set exactly when the state is
+`accepted` or `refused` (a CHECK). A new request for a job and generation whose row is `refused`
+or `expired` updates the row in place: the state returns to `requested`, `refusal`, `sent_at` and
+`answered_at` are cleared and `requested_by` and `requested_at` are the new request's; a
+`requested` or `accepted` row is left as it is. Nothing writes the rows yet and tests seed them,
+as with `artifacts`. A job's log has no period of
 its own: it is the job's `commLog` object beside its `result`, and goes with the job's objects.
 
 **Content-addressed objects: `ir_documents` and `artifacts` (migration 0014, ADR-497)**

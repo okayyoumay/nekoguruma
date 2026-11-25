@@ -1,7 +1,7 @@
 # ADR-455: The Agent's Communication Log Goes to the Server Only by Explicit User Action
 
 **Date:** 2026-11-11
-**Status:** Accepted (item 2's acknowledgement is the object's `finished` state, ADR-493)
+**Status:** Accepted (item 2's acknowledgement is the object's `finished` state, ADR-493; items 1 to 3 detailed by ADR-508: the request is a row, and begin refuses a log without one)
 **Affects:** design 8.11, 16.2; `agent` communication log, the server's storage of a job's result (M3)
 
 ## Context

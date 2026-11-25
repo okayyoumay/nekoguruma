@@ -709,7 +709,9 @@ paths:
         (0 to 4 GiB) and the SHA-256 as 64 lowercase hex digits. There is no free-form
         metadata. A job that does not exist, is another agent's or whose stored instruction
         names another ownership generation than the one declared is **404**, in any state of
-        the job; a length over 4 GiB is **413**. A length written
+        the job, and so is a `commLog` for a job and generation that no operator has requested
+        from this agent (a request in any state but `refused`; ADR-508), whose
+        begin starts nothing in the store; a length over 4 GiB is **413**. A length written
         with a fraction or an exponent is judged as a double: an integral value of 2^64 or more
         (`18446744073709551616`, `1e30`) is over the limit (**413**), any other (`1.5`, `5e9`, a
         negative number) and a number beyond a double (`1e400`) is **400**.

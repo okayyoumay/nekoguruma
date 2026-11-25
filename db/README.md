@@ -113,6 +113,21 @@ kind) WHERE state <> 'failed'` holds the idempotency of begin: two racing begins
 begin. The foreign keys (tenant, agent, and the job through `(tenant_id, job_id)`) have no cascade:
 a job, an agent or a tenant that has objects cannot be deleted under them.
 
+**Requests for a communication log: `comm_log_requests` (migration 0016, ADR-508)**
+One row per job and ownership generation: an operator's request for the job's communication log,
+with the agent the job belongs to, the operator who asked (`requested_by`) and a state:
+`requested`, then `accepted` (the agent has queued the log), `refused` (the agent cannot send one:
+`refusal` is `unknownJob`, `noLog`, `busy` or `tooLarge`, set exactly when the state is `refused`,
+a CHECK) or `expired` (nobody answered in time, which stops the server's delivery of the request
+and nothing else). `sent_at` and `answered_at` hold the last send of the command and the answer's
+application. "Stored" is not a state: a stored log is the job's `job_objects` row of kind
+`commLog`, which begin writes only for a job and generation with a row for the calling agent in a state
+other than `refused`. The primary key is `(tenant_id, job_id, generation)`; the
+foreign keys (the job through `(tenant_id, job_id)`, the agent, the operator) have no cascade; a
+partial index on `(tenant_id, agent_id) WHERE state = 'requested'` serves the delivery's scan.
+Nothing writes the rows yet and tests seed them, as with `artifacts`. A job's log has no period of
+its own: it is the job's `commLog` object beside its `result`, and goes with the job's objects.
+
 **Content-addressed objects: `ir_documents` and `artifacts` (migration 0014, ADR-497)**
 The download route finds a job's IR document or artifact here, by tenant and digest, and signs a
 GET URL for the row's `storage_key`. Migration 0014 makes each `digest` 64 lowercase hex digits,

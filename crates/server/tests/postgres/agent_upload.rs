@@ -464,6 +464,15 @@ impl Fixture {
         .execute(&self.world.pool)
         .await
         .unwrap();
+        // An operator's request for the job's log, which the begin of a `commLog` needs.
+        sqlx::query(
+            "INSERT INTO comm_log_requests (tenant_id, job_id, generation, agent_id, requested_by) \
+             SELECT tenant_id, id, 1, agent_id, operator_id FROM jobs WHERE id = $1::uuid",
+        )
+        .bind(&id)
+        .execute(&self.world.pool)
+        .await
+        .unwrap();
         id
     }
 

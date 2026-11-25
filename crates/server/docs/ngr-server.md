@@ -783,7 +783,13 @@ agent's tokens; 503 when it cannot be read), the job or the upload (404, also fo
 agent's or tenant's), the request against the row (a part past the count 400, a row that is not
 `open` 409 with its `state`) and the store (503, or 500 for a stored key or upload ID that does not
 parse and for a store without randomness). Begin compares the declared generation with the one in
-the job's stored instruction (404 on a difference) and does so in any job state. Every database
+the job's stored instruction (404 on a difference) and does so in any job state. For kind
+`commLog` it then reads the row of the declaration, and when none exists it requires a
+`comm_log_requests` row of the calling agent for the job and generation in a state other than
+`refused`, `expired` included (`uploads::is_requested`, in the lookup's transaction): none is a 404, the answer for
+an unknown job, with nothing begun in the store (ADR-508). A repeated begin of an existing row
+is answered from the row whatever the request's state has become, and kind `result` needs no
+request. Nothing writes the request rows yet; the tests seed them. Every database
 call is a short transaction of its own, and none is held while the store is called; the row is
 inserted with `ON CONFLICT ... DO NOTHING` on the partial unique index, and the loser of a race
 deletes the upload it began and answers the winner's row.

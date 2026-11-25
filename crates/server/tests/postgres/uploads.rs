@@ -739,6 +739,30 @@ impl Fx {
         self.job_for(&self.u.id, 1).await
     }
 
+    /// An operator's request for the job's log at `generation`, written for `agent` in `state`
+    /// (a `refused` request carries a reason).
+    pub(crate) async fn comm_log_request(
+        &self,
+        job: &str,
+        generation: i64,
+        agent: &str,
+        state: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO comm_log_requests (tenant_id, job_id, generation, agent_id, \
+                 requested_by, state, refusal) \
+             SELECT tenant_id, id, $2, $3::uuid, operator_id, $4, \
+                 CASE WHEN $4 = 'refused' THEN 'noLog' END FROM jobs WHERE id = $1::uuid",
+        )
+        .bind(job)
+        .bind(generation)
+        .bind(agent)
+        .bind(state)
+        .execute(&self.u.w.pool)
+        .await
+        .unwrap();
+    }
+
     /// A row written by hand, for the cases the routes do not reach by themselves.
     async fn row(
         &self,
@@ -1265,7 +1289,8 @@ async fn begin_makes_a_row_and_answers_the_same_row_again() {
         .await;
     problem(&other_digest, 409, "digest");
     assert_eq!(fx.wrap.calls()[0], 1);
-    // The other kind is its own upload.
+    // The other kind is its own upload, and it needs an operator's request.
+    fx.comm_log_request(&job, 1, &fx.u.id, "requested").await;
     let log = fx.begin(&decl(&job, 1, "commLog", 3, &digest())).await;
     assert_eq!(log.status, 201, "{}", log.head);
     assert_ne!(upload_id(&log), id);
@@ -1298,6 +1323,66 @@ async fn a_failed_row_is_ignored_and_a_new_begin_makes_a_new_one() {
     fx.finish().await;
 }
 
+/// A communication log is begun only under an operator's request for this agent, job and
+/// generation that the agent has not refused (ADR-508); the refusal is the answer for an unknown job and
+/// begins nothing in the store.
+#[tokio::test]
+async fn a_comm_log_begin_needs_an_unrefused_request_of_this_agent() {
+    let fx = Fx::new(With::Fake).await;
+    let log = |job: &str| decl(job, 1, "commLog", 10, &digest());
+    let no_row = fx.job().await;
+    problem(&fx.begin(&log(&no_row)).await, 404, "no request");
+    // The same job's result needs no request.
+    let r = fx.begin(&result_of(&no_row, 10)).await;
+    assert_eq!(r.status, 201, "{}", r.head);
+    let calls_before = fx.wrap.calls()[0];
+    let refused = fx.job().await;
+    fx.comm_log_request(&refused, 1, &fx.u.id, "refused").await;
+    problem(&fx.begin(&log(&refused)).await, 404, "refused");
+    // A request of another agent, and one of another generation, do not count.
+    let (other_id, _) = fx.other_agent().await;
+    let foreign = fx.job().await;
+    fx.comm_log_request(&foreign, 1, &other_id, "requested")
+        .await;
+    problem(
+        &fx.begin(&log(&foreign)).await,
+        404,
+        "other agent's request",
+    );
+    let later = fx.job().await;
+    fx.comm_log_request(&later, 2, &fx.u.id, "requested").await;
+    problem(
+        &fx.begin(&log(&later)).await,
+        404,
+        "other generation's request",
+    );
+    // Nothing was begun in the store or the table for any of them.
+    assert_eq!(fx.wrap.calls()[0], calls_before);
+    assert_eq!(
+        fx.sql("SELECT count(*) FROM job_objects WHERE kind = 'commLog'")
+            .await,
+        "0"
+    );
+    // A request the agent has not refused admits the begin, whether it has answered it or not and
+    // after its expiry, and a repeated begin keeps its answer once the request is refused.
+    for state in ["requested", "accepted", "expired"] {
+        let job = fx.job().await;
+        fx.comm_log_request(&job, 1, &fx.u.id, state).await;
+        let r = fx.begin(&log(&job)).await;
+        assert_eq!(r.status, 201, "{state}: {}", r.head);
+        sqlx::query(
+            "UPDATE comm_log_requests SET state = 'refused', refusal = 'busy' \
+             WHERE job_id = $1::uuid",
+        )
+        .bind(&job)
+        .execute(&fx.u.w.pool)
+        .await
+        .unwrap();
+        assert_eq!(fx.begin(&log(&job)).await.status, 200, "{state}, repeated");
+    }
+    fx.finish().await;
+}
+
 /// The job: any state, the generation of the stored instruction (ADR-493 item 15), a decodable
 /// instruction, and a row of another agent.
 #[tokio::test]
@@ -1323,6 +1408,7 @@ async fn begin_judges_the_job_and_its_generation() {
         .execute(&fx.u.w.pool)
         .await
         .unwrap();
+    fx.comm_log_request(&job, 3, &fx.u.id, "requested").await;
     let r = fx.begin(&decl(&job, 3, "commLog", 10, &digest())).await;
     assert_eq!(r.status, 201, "{}", r.head);
     // An instruction that does not decode is the server's fault.

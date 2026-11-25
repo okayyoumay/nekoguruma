@@ -200,7 +200,10 @@ The `SocketAddr` (e.g. `127.0.0.1:54321`, or `[::1]:54321` on an IPv6-only host 
 ## H–J
 
 **Job object** (design 14.3, ADR-493)  
-A stored object that belongs to a job and its ownership generation: its final result (the run's final VM state as JSON, kind `result`) or its communication log (kind `commLog`). The server holds one row per object in `job_objects` (the store's key and upload ID, the declared length and SHA-256, the part size, a state of `open`, `completing`, `finished` or `failed`); the object is delivered when the row is `finished`, after the store's read-back verified it. See **Data channel**, **Object store**.
+A stored object that belongs to a job and its ownership generation: its final result (the run's final VM state as JSON, kind `result`) or its communication log (kind `commLog`). The server holds one row per object in `job_objects` (the store's key and upload ID, the declared length and SHA-256, the part size, a state of `open`, `completing`, `finished` or `failed`); the object is delivered when the row is `finished`, after the store's read-back verified it. A `commLog` object is stored only for a job and generation that an operator's **Communication log request** names. See **Data channel**, **Object store**.
+
+**Communication log request** (design 8.11, ADR-508)  
+An operator's request that the agent send one job's communication log to the server: a row of `comm_log_requests` per job and ownership generation, in state `requested`, `accepted`, `refused` or `expired`. The data channel's begin refuses a `commLog` upload (404, as for an unknown job) that has no such row for the calling agent in a state other than `refused` (an `expired` request still admits it: expiry only stops the server's delivery). The log, once stored, is the job's `commLog` object, with no retention period of its own.
 
 **Handle**  
 An opaque numeric identifier for an API object. In this project, handles are newtype-wrapped `u32` values.

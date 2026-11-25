@@ -1052,6 +1052,16 @@ async fn is_requested(
     .await
 }
 
+/// The SQL condition, as a string literal, for a `job_objects` row (named by `$alias`) that is
+/// live: any state but `failed`. The begin gate ([`live_row`]) and the delivery of a log request
+/// ([`crate::comm_log_requests`]) judge a stored object by it (ADR-397).
+macro_rules! live_state {
+    ($alias:literal) => {
+        concat!($alias, ".state <> 'failed'")
+    };
+}
+pub(crate) use live_state;
+
 /// The row that is not `failed` for the declared job, generation and kind.
 async fn live_row(
     tx: &mut sqlx::PgConnection,
@@ -1060,7 +1070,8 @@ async fn live_row(
 ) -> Result<Option<Row>, sqlx::Error> {
     let raw: Option<RawRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {ROW_COLUMNS} FROM job_objects WHERE tenant_id = $1::uuid AND job_id = $2::uuid \
-         AND generation = $3 AND kind = $4 AND state <> 'failed'"
+         AND generation = $3 AND kind = $4 AND {}",
+        live_state!("job_objects")
     )))
     .bind(tenant)
     .bind(&declared.job_id)

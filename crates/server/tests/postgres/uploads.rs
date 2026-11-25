@@ -1417,6 +1417,32 @@ async fn a_comm_log_begin_needs_an_unrefused_request_of_this_agent() {
     fx.finish().await;
 }
 
+/// A communication log whose upload finished while the agent's answer to the command was lost:
+/// the agent's repeated begin with the same declaration is answered `finished` whatever the
+/// request's state is (ADR-508 item 3), so the agent's entry is removed, and a begin with another
+/// digest is the conflict of ADR-493 item 3.
+#[tokio::test]
+async fn a_repeated_comm_log_begin_after_the_upload_finished_is_answered_finished() {
+    let fx = Fx::new(With::Fake).await;
+    for state in ["requested", "accepted", "expired"] {
+        let job = fx.job().await;
+        fx.comm_log_request(&job, 1, &fx.u.id, state).await;
+        fx.row(&job, 1, "commLog", 3, "finished", PART_BYTES as i64)
+            .await;
+        let same = fx.begin(&decl(&job, 1, "commLog", 3, &digest())).await;
+        assert_eq!(same.status, 200, "{state}: {}", same.head);
+        assert_eq!(json(&same)["state"], "finished", "{state}");
+        let other = decl(&job, 1, "commLog", 3, &"cd".repeat(32));
+        problem(
+            &fx.begin(&other).await,
+            409,
+            &format!("{state}, other digest"),
+        );
+    }
+    assert_eq!(fx.wrap.calls(), [0, 0, 0, 0], "the store is not asked");
+    fx.finish().await;
+}
+
 /// The job: any state, the generation of the stored instruction (ADR-493 item 15), a decodable
 /// instruction, and a row of another agent.
 #[tokio::test]

@@ -13,6 +13,7 @@ pub(crate) mod agent_caller;
 pub(crate) mod agent_events;
 pub(crate) mod answer_proof;
 pub(crate) mod audit;
+pub mod comm_log_requests;
 pub mod config;
 pub mod control;
 pub mod db;
@@ -52,7 +53,7 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
 use sqlx::PgPool;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tower::Layer;
 
@@ -378,6 +379,9 @@ pub struct Server {
     job_queue: Option<job_queue::Settings>,
     /// The job expiry task's settings; `None` leaves it off (`bind`, which tests use).
     job_expiry: Option<job_expiry::Settings>,
+    /// The communication-log delivery task's settings; `None` leaves it off (`bind`, which tests
+    /// use). It needs the delivery queue, which hands it the agents' answers.
+    comm_log_requests: Option<comm_log_requests::Settings>,
     /// The data channel's backend, which the router was built from: the completion pass takes its
     /// store, period and registry.
     uploads: uploads::Backend,
@@ -484,6 +488,7 @@ impl Server {
         server.object_store = store;
         server.job_queue = Some(job_queue::Settings::default());
         server.job_expiry = Some(job_expiry::Settings::default());
+        server.comm_log_requests = Some(comm_log_requests::Settings::default());
         Ok(server)
     }
 
@@ -497,6 +502,12 @@ impl Server {
     #[doc(hidden)]
     pub fn job_expiry_enabled(&self) -> bool {
         self.job_expiry.is_some()
+    }
+
+    /// Whether the communication-log delivery task is on (ADR-508). Tests only.
+    #[doc(hidden)]
+    pub fn comm_log_requests_enabled(&self) -> bool {
+        self.comm_log_requests.is_some()
     }
 
     /// The object server `start` started (`None` on a server made by `bind`, and when no
@@ -577,6 +588,7 @@ impl Server {
             object_server: None,
             job_queue: None,
             job_expiry: None,
+            comm_log_requests: None,
             uploads,
             completions,
         })
@@ -595,6 +607,14 @@ impl Server {
     #[doc(hidden)]
     pub fn with_job_expiry(mut self, settings: job_expiry::Settings) -> Server {
         self.job_expiry = Some(settings);
+        self
+    }
+
+    /// Turns the communication-log delivery task on with `settings` (ADR-508); `start` does so
+    /// with the defaults. It runs only beside the delivery queue. Tests only.
+    #[doc(hidden)]
+    pub fn with_comm_log_requests(mut self, settings: comm_log_requests::Settings) -> Server {
+        self.comm_log_requests = Some(settings);
         self
     }
 
@@ -659,6 +679,7 @@ impl Server {
             mut object_server,
             job_queue,
             job_expiry,
+            comm_log_requests,
             uploads,
             completions,
         } = self;
@@ -686,13 +707,29 @@ impl Server {
         // (ADR-476).
         if let Some(settings) = job_queue {
             match hub.inbox() {
-                Some(inbox) => hub.adopt(job_queue::run(
-                    hub.clone(),
-                    pool.clone(),
-                    inbox,
-                    hub.stopping(),
-                    settings,
-                )),
+                Some(inbox) => {
+                    // The communication-log task is the queue's partner (ADR-508 item 4): the
+                    // queue reads the agents' answers from the inbox and the task applies them.
+                    let answers = comm_log_requests.map(|settings| {
+                        let (sender, receiver) = mpsc::channel(comm_log_requests::ANSWER_CAPACITY);
+                        hub.adopt(comm_log_requests::run(
+                            hub.clone(),
+                            pool.clone(),
+                            receiver,
+                            hub.stopping(),
+                            settings,
+                        ));
+                        sender
+                    });
+                    hub.adopt(job_queue::run(
+                        hub.clone(),
+                        pool.clone(),
+                        inbox,
+                        hub.stopping(),
+                        settings,
+                        answers,
+                    ));
+                }
                 None => tracing::warn!("the hub's inbox is taken; no job is delivered"),
             }
         }

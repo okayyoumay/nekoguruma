@@ -166,19 +166,15 @@ impl Spec {
     /// (ADR-487) follows the artifact as a named field, its normalized seconds, so a request with
     /// no deadline and one that names the default are different requests.
     pub fn request_hash(&self) -> [u8; 32] {
-        fn put(hasher: &mut Sha256, bytes: &[u8]) {
-            hasher.update((bytes.len() as u32).to_be_bytes());
-            hasher.update(bytes);
-        }
         let mut hasher = Sha256::new();
-        put(&mut hasher, HASH_TAG);
-        put(&mut hasher, self.kind.name().as_bytes());
-        put(&mut hasher, self.agent_id.as_bytes());
-        put(&mut hasher, self.vci_id.as_bytes());
+        put_text(&mut hasher, HASH_TAG);
+        put_text(&mut hasher, self.kind.name().as_bytes());
+        put_text(&mut hasher, self.agent_id.as_bytes());
+        put_text(&mut hasher, self.vci_id.as_bytes());
         match &self.vin {
             Some(vin) => {
                 hasher.update([1]);
-                put(&mut hasher, vin.as_bytes());
+                put_text(&mut hasher, vin.as_bytes());
             }
             None => hasher.update([0]),
         }
@@ -194,10 +190,26 @@ impl Spec {
             None => hasher.update([0]),
         }
         if let Some(deadline) = self.start_deadline {
-            put(&mut hasher, b"startDeadline");
+            put_text(&mut hasher, b"startDeadline");
             hasher.update(deadline.to_be_bytes());
         }
         hasher.finalize().into()
+    }
+}
+
+/// Feeds `bytes` to `hasher` after a 4-byte big-endian length: the encoding of every text in the
+/// digests this API computes (a request's hash, a communication-log scope's digest).
+pub(crate) fn put_text(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u32).to_be_bytes());
+    hasher.update(bytes);
+}
+
+/// Stores `value` in `slot` and fails when the slot is taken: a property of a JSON object that
+/// is given twice.
+pub(crate) fn put_once<T, E: de::Error>(slot: &mut Option<T>, value: T) -> Result<(), E> {
+    match slot.replace(value) {
+        None => Ok(()),
+        Some(_) => Err(E::custom("duplicate property")),
     }
 }
 
@@ -229,26 +241,22 @@ impl<'de> Deserialize<'de> for Raw {
             }
 
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Raw, A::Error> {
-                fn put<T, E: de::Error>(slot: &mut Option<T>, value: T) -> Result<(), E> {
-                    match slot.replace(value) {
-                        None => Ok(()),
-                        Some(_) => Err(E::custom("duplicate property")),
-                    }
-                }
                 let mut raw = Raw::default();
                 while let Some(name) = map.next_key::<String>()? {
                     match name.as_str() {
-                        "kind" => put(&mut raw.kind, map.next_value()?)?,
-                        "agentId" => put(&mut raw.agent_id, map.next_value()?)?,
-                        "vciId" => put(&mut raw.vci_id, map.next_value()?)?,
-                        "vin" => put(&mut raw.vin, map.next_value()?)?,
-                        "irDigests" => put(&mut raw.ir_digests, map.next_value()?)?,
-                        "artifactDigest" => put(&mut raw.artifact_digest, map.next_value()?)?,
-                        "parameters" => put(&mut raw.parameters, map.next_value()?)?,
-                        "startDeadline" => put(&mut raw.start_deadline, map.next_value()?)?,
-                        "executionWindow" => put(&mut raw.execution_window, map.next_value()?)?,
-                        "remote" => put(&mut raw.remote, map.next_value()?)?,
-                        "onSiteContact" => put(&mut raw.on_site_contact, map.next_value()?)?,
+                        "kind" => put_once(&mut raw.kind, map.next_value()?)?,
+                        "agentId" => put_once(&mut raw.agent_id, map.next_value()?)?,
+                        "vciId" => put_once(&mut raw.vci_id, map.next_value()?)?,
+                        "vin" => put_once(&mut raw.vin, map.next_value()?)?,
+                        "irDigests" => put_once(&mut raw.ir_digests, map.next_value()?)?,
+                        "artifactDigest" => put_once(&mut raw.artifact_digest, map.next_value()?)?,
+                        "parameters" => put_once(&mut raw.parameters, map.next_value()?)?,
+                        "startDeadline" => put_once(&mut raw.start_deadline, map.next_value()?)?,
+                        "executionWindow" => {
+                            put_once(&mut raw.execution_window, map.next_value()?)?
+                        }
+                        "remote" => put_once(&mut raw.remote, map.next_value()?)?,
+                        "onSiteContact" => put_once(&mut raw.on_site_contact, map.next_value()?)?,
                         _ => return Err(de::Error::custom("unknown property")),
                     }
                 }
@@ -270,7 +278,7 @@ fn parse(body: &[u8]) -> Option<Raw> {
 }
 
 /// 64 lowercase hex digits as 32 bytes.
-fn parse_digest(text: &str) -> Option<[u8; 32]> {
+pub(crate) fn parse_digest(text: &str) -> Option<[u8; 32]> {
     let bytes = text.as_bytes();
     if bytes.len() != 64 {
         return None;
@@ -287,7 +295,7 @@ fn parse_digest(text: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -650,7 +658,8 @@ enum Outcome {
     ArtifactNotStored,
 }
 
-/// What a failed creation is.
+/// What a failed statement of a job route is: the database is unavailable, or this code has a
+/// fault.
 pub(crate) enum JobError {
     /// The pool, the connection or a statement failed, or timed out.
     Unavailable(String),

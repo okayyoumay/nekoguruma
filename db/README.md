@@ -123,7 +123,8 @@ and nothing else). `sent_at` and `answered_at` hold the last send of the command
 application: the server's communication-log task stamps `sent_at` when the connection's queue
 took the command (only while the state is `requested`), sets `expired` on a `requested` row more
 than 24 hours old, and applies an agent's answer (`accepted`, or `refused` with `refusal`, and
-`answered_at`) only to that agent's row while its state is `requested`. "Stored" is not a state: a stored log is the job's `job_objects` row of kind
+`answered_at`) only to that agent's row while its state is `requested` and `sent_at` is set (a
+row written or renewed and not yet sent has no command to answer). "Stored" is not a state: a stored log is the job's `job_objects` row of kind
 `commLog`, which begin writes only for a job and generation with a row for the calling agent in a state
 other than `refused`. The primary key is `(tenant_id, job_id, generation)`; the
 foreign keys (the job through `(tenant_id, job_id)`, the agent, the operator) have no cascade; a
@@ -133,8 +134,10 @@ the migration adds a unique constraint on `jobs`); `answered_at` is set exactly 
 `accepted` or `refused` (a CHECK). A new request for a job and generation whose row is `refused`
 or `expired` updates the row in place: the state returns to `requested`, `refusal`, `sent_at` and
 `answered_at` are cleared and `requested_by` and `requested_at` are the new request's; a
-`requested` or `accepted` row is left as it is. Only tests write a request row; the Web API that
-writes them is not built, as with `artifacts`. A job's log has no period of
+`requested` or `accepted` row is left as it is, as is the row of a job whose `commLog` object is
+`finished`. The Web API (`POST /api/v1/comm-log-uploads`, ADR-508) writes the rows, in one
+transaction for all the named jobs and in job-ID order, with one `commLogUploadRequested` audit
+row per job inserted or renewed. A job's log has no period of
 its own: it is the job's `commLog` object beside its `result`, and goes with the job's objects.
 
 **Content-addressed objects: `ir_documents` and `artifacts` (migration 0014, ADR-497)**
@@ -248,6 +251,11 @@ updated or deleted; the server only writes them. The actions written today:
 - `jobCreated` (`POST /api/v1/jobs`, one row per created job, none for a replay or a refusal):
   `detail` has `kind`, `irDigests` (the sorted unique hex digests), `artifactDigest` when the job
   has one and `signingKeyId`. It holds no request hash, idempotency key or VCI ID.
+- `commLogUploadRequested` (`POST /api/v1/comm-log-uploads`, ADR-508; one row per job whose
+  request was inserted or renewed, in the request's transaction, none for a job left as it is
+  or a refusal): `operator_id` is the caller, `agent_id`, `job_id`, `vin` and
+  `confirmation_level` are the job's, and `detail` has `generation` only: no VIN and no scope
+  digest, which is derived from the VINs. `on_site_approved` and `agent_reported_at` are NULL.
 - `documentStored` (`PUT /api/v1/documents/{sha256}`, ADR-500; one row per stored document, in the
   insert's transaction, none for a second store or a refusal): `tenant_id` and `operator_id`
   name the caller; `detail` has `digest` and `size` (bytes). `agent_id`, `job_id`, `vin`,

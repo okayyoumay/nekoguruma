@@ -1,8 +1,9 @@
 //! The server's delivery of communication-log requests and its application of the agents'
 //! answers against a throwaway PostgreSQL (design 8.11, ADR-508 items 3 and 4): fake agents are
 //! WebSocket clients of a server whose delivery queue and communication-log task run with a short
-//! period, and the requests are rows the test inserts (the Web API that writes them is a later
-//! step).
+//! period. The requests are rows the test inserts, or are made through the Web API
+//! (`comm_log_uploads.rs`) where a test is about a request that is written while a command or an
+//! answer is in flight.
 //!
 //! The tests run on the current-thread runtime and wait in real time. A negative (a frame that
 //! must not come, a row that must not change) is asserted only after something positive that
@@ -18,8 +19,9 @@ use server::comm_log_requests::Settings;
 use shared_proto::ServerMessage;
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::comm_log_uploads::{Seed, alice, job_of, object, request, row};
 use crate::control::{Client, heartbeat, open, quiet_for, second_agent, text, token};
-use crate::job_queue::{LONG, PERIOD, add_job, settings};
+use crate::job_queue::{LONG, PERIOD, settings};
 use crate::session::Up;
 
 const LIMIT: Duration = Duration::from_secs(15);
@@ -57,37 +59,20 @@ impl Rig {
         open(self.u.s.addr, &token(&self.u).await).await
     }
 
-    /// An ended job of `agent`: it is not delivered by the queue, so no job command comes.
+    /// A job of `agent` that was delivered and has ended, so that the queue does not deliver it
+    /// and an operator may ask for its log.
     async fn job(&self, agent: &str) -> String {
-        let job = add_job(&self.u.w, agent, 1, b"x").await;
-        sqlx::query(
-            "UPDATE jobs SET state = 'completed', progress_permille = 1000, delivered_at = now(), \
-                 delivery_attempts = 1, finished_at = now() WHERE id = $1::uuid",
-        )
-        .bind(&job)
-        .execute(&self.u.w.pool)
-        .await
-        .unwrap();
-        job
+        job_of(&self.u, agent).await
     }
 
     /// A request for the job's log at generation 1, in `state`, made `age_hours` ago.
     async fn request(&self, job: &str, state: &str, age_hours: i64) {
-        sqlx::query(
-            "INSERT INTO comm_log_requests (tenant_id, job_id, generation, agent_id, \
-                 requested_by, requested_at, state, refusal, answered_at) \
-             SELECT tenant_id, id, 1, agent_id, operator_id, \
-                 now() - $3 * interval '1 hour', $2, \
-                 CASE WHEN $2 = 'refused' THEN 'noLog' END, \
-                 CASE WHEN $2 IN ('accepted','refused') THEN now() END \
-             FROM jobs WHERE id = $1::uuid",
-        )
-        .bind(job)
-        .bind(state)
-        .bind(age_hours)
-        .execute(&self.u.w.pool)
-        .await
-        .unwrap();
+        Seed {
+            age_secs: age_hours * 3600,
+            ..Seed::new(state)
+        }
+        .put(&self.u, job)
+        .await;
     }
 
     /// `n` requests for generations 1 to `n` of the job, all in state `requested`.
@@ -106,31 +91,12 @@ impl Rig {
 
     /// A `commLog` object of the job at generation 1 in `state`.
     async fn object(&self, job: &str, state: &str) {
-        sqlx::query(
-            "INSERT INTO job_objects (tenant_id, id, job_id, generation, kind, agent_id, \
-                 storage_key, upload_id, part_bytes, size_bytes, digest, state, finished_at) \
-             SELECT tenant_id, gen_random_uuid(), id, 1, 'commLog', agent_id, \
-                 gen_random_uuid()::text, 'u', 1048576, 3, repeat('ab', 32), $2, \
-                 CASE WHEN $2 = 'finished' THEN now() END \
-             FROM jobs WHERE id = $1::uuid",
-        )
-        .bind(job)
-        .bind(state)
-        .execute(&self.u.w.pool)
-        .await
-        .unwrap();
+        object(&self.u, job, 1, "commLog", state).await;
     }
 
     /// The row as one line: state, refusal, whether sent, whether answered.
     async fn row(&self, job: &str) -> String {
-        sqlx::query_scalar(
-            "SELECT concat_ws('|', state, coalesce(refusal, '-'), (sent_at IS NOT NULL)::text, \
-                 (answered_at IS NOT NULL)::text) FROM comm_log_requests WHERE job_id = $1::uuid",
-        )
-        .bind(job)
-        .fetch_one(&self.u.w.pool)
-        .await
-        .unwrap()
+        row(&self.u, job).await
     }
 
     async fn until_row(&self, job: &str, expected: &str) {
@@ -231,6 +197,10 @@ async fn queued_makes_the_row_accepted_and_a_refusal_makes_it_refused_with_its_r
     for _ in 0..jobs.len() {
         command(&mut client).await;
     }
+    // An answer applies only to a row that has been sent (ADR-508 item 4).
+    for job in &jobs {
+        r.until_row(job, "requested|-|true|false").await;
+    }
     for (job, outcome) in jobs
         .iter()
         .zip(["queued", "unknownJob", "noLog", "busy", "tooLarge"])
@@ -270,6 +240,7 @@ async fn an_answer_of_another_agent_of_the_same_or_another_tenant_changes_nothin
     let mut same = open(r.u.s.addr, &same_token).await;
     let mut other = open(r.u.s.addr, &other_token).await;
     assert_eq!(command(&mut owner).await.0, job);
+    r.until_row(&job, "requested|-|true|false").await;
     // Each answer is applied in the order it reaches the task, and the owner's comes last: a
     // foreign answer that had changed the row would leave `accepted`, not `refused`.
     answer(&mut same, &job, "queued").await;
@@ -295,6 +266,8 @@ async fn an_answer_for_an_unknown_row_or_an_answered_row_changes_nothing_and_the
     let mut client = r.connect().await;
     command(&mut client).await;
     command(&mut client).await;
+    r.until_row(&first, "requested|-|true|false").await;
+    r.until_row(&second, "requested|-|true|false").await;
     answer(&mut client, &first, "queued").await;
     r.until_row(&first, "accepted|-|true|true").await;
     // A later answer for the answered row, one for a job nobody asked for, one that is no
@@ -496,6 +469,7 @@ async fn a_revoked_agent_that_is_still_connected_gets_no_command_and_its_answer_
     r.request(&live_job, "requested", 0).await;
     // The live agent's command shows a pass has judged both rows, and a second one the repeat.
     assert_eq!(command(&mut live).await.0, live_job);
+    r.until_row(&live_job, "requested|-|true|false").await;
     r.passes(2).await;
     assert_eq!(r.row(&revoked_job).await, "requested|-|false|false");
     // Its answer is applied after the revoked agent's, which was sent first.
@@ -521,5 +495,188 @@ async fn a_reconnect_inside_the_lease_gets_the_command_again_on_the_new_connecti
     let mut second = open(r.u.s.addr, &t).await;
     assert_eq!(command(&mut second).await.0, job);
     r.until_sent_after(&job, &stamped).await;
+    r.finish().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The Web API's writes beside the delivery (ADR-508 items 1 and 4)
+
+#[tokio::test]
+async fn an_answer_and_a_request_for_one_row_each_take_effect_in_the_order_they_come() {
+    // X4: the answer first, the renewal after; and the request first, the answer after.
+    let r = Rig::new(LONG).await;
+    let alice = alice(&r.u).await;
+    let answered = r.job(&r.u.id).await;
+    let asked = r.job(&r.u.id).await;
+    r.request(&answered, "requested", 0).await;
+    r.request(&asked, "requested", 0).await;
+    let mut client = r.connect().await;
+    for _ in 0..2 {
+        command(&mut client).await;
+    }
+    r.until_row(&answered, "requested|-|true|false").await;
+    r.until_row(&asked, "requested|-|true|false").await;
+    // The answer first: the row is refused, and the request renews it and sends it again.
+    answer(&mut client, &answered, "busy").await;
+    r.until_row(&answered, "refused|busy|true|true").await;
+    assert_eq!(request(&r.u, &alice, &[&answered]).await.status, 202);
+    assert_eq!(command(&mut client).await.0, answered, "sent again");
+    r.until_row(&answered, "requested|-|true|false").await;
+    // The request first: the row is left, and the answer then applies.
+    assert_eq!(request(&r.u, &alice, &[&asked]).await.status, 202);
+    assert_eq!(r.row(&asked).await, "requested|-|true|false");
+    answer(&mut client, &asked, "busy").await;
+    r.until_row(&asked, "refused|busy|true|true").await;
+    let audits: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_log WHERE action = 'commLogUploadRequested'",
+    )
+    .fetch_one(&r.u.w.pool)
+    .await
+    .unwrap();
+    assert_eq!(audits, 1, "only the renewal");
+    r.finish().await;
+}
+
+#[tokio::test]
+async fn a_request_and_the_expiry_of_one_row_take_effect_in_the_order_they_come() {
+    // X5, P1: the expiry first, then the renewal, whose new day is not cut short; and the
+    // request first, which leaves the row and its first time, so that it expires on schedule.
+    let r = Rig::new(LONG).await;
+    let alice = alice(&r.u).await;
+    let expired = r.job(&r.u.id).await;
+    let left = r.job(&r.u.id).await;
+    r.request(&expired, "requested", 25).await;
+    r.until_row(&expired, "expired|-|false|false").await;
+    assert_eq!(request(&r.u, &alice, &[&expired]).await.status, 202);
+    assert_eq!(r.row(&expired).await, "requested|-|false|false");
+    r.passes(3).await;
+    assert_eq!(
+        r.row(&expired).await,
+        "requested|-|false|false",
+        "a new day"
+    );
+    // A fresh request: the request leaves its first time, and it expires once that time is a
+    // day past.
+    Seed::new("requested").put(&r.u, &left).await;
+    let at = |job: &str| {
+        let job = job.to_owned();
+        let pool = r.u.w.pool.clone();
+        async move {
+            sqlx::query_scalar::<_, String>(
+                "SELECT requested_at::text FROM comm_log_requests WHERE job_id = $1::uuid",
+            )
+            .bind(job)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    let first = at(&left).await;
+    assert_eq!(request(&r.u, &alice, &[&left]).await.status, 202);
+    assert_eq!(at(&left).await, first, "the first time is kept");
+    sqlx::query(
+        "UPDATE comm_log_requests SET requested_at = requested_at - interval '25 hours' \
+         WHERE job_id = $1::uuid",
+    )
+    .bind(&left)
+    .execute(&r.u.w.pool)
+    .await
+    .unwrap();
+    r.until_row(&left, "expired|-|false|false").await;
+    r.finish().await;
+}
+
+#[tokio::test]
+async fn a_request_left_as_it_is_is_still_sent_and_stamped_when_the_agent_connects() {
+    // X6: a request that is repeated while the agent is away changes nothing, and the delivery
+    // that follows stamps it.
+    let r = Rig::new(LONG).await;
+    let alice = alice(&r.u).await;
+    let job = r.job(&r.u.id).await;
+    assert_eq!(request(&r.u, &alice, &[&job]).await.status, 202);
+    assert_eq!(r.row(&job).await, "requested|-|false|false");
+    assert_eq!(request(&r.u, &alice, &[&job]).await.status, 202);
+    let mut client = r.connect().await;
+    assert_eq!(command(&mut client).await.0, job);
+    r.until_row(&job, "requested|-|true|false").await;
+    r.finish().await;
+}
+
+#[tokio::test]
+async fn an_answer_to_a_command_sent_before_a_renewal_is_ignored_until_the_row_is_sent_again() {
+    // X7, X8, X9, X10, X11: a live object keeps the renewed rows from being sent until the test
+    // frees them, so that the stale answers arrive while the rows are unsent. The answers of a
+    // sent row that is not renewed (X12) are the tests above.
+    let r = Rig::new(LONG).await;
+    let alice = alice(&r.u).await;
+    let refused = r.job(&r.u.id).await;
+    let queued = r.job(&r.u.id).await;
+    let expired = r.job(&r.u.id).await;
+    let fresh = r.job(&r.u.id).await;
+    let barrier = r.job(&r.u.id).await;
+    for job in [&refused, &queued] {
+        Seed {
+            refusal: Some("busy"),
+            sent: true,
+            age_secs: 5 * 60,
+            ..Seed::new("refused")
+        }
+        .put(&r.u, job)
+        .await;
+    }
+    Seed {
+        sent: true,
+        age_secs: 25 * 3600,
+        ..Seed::new("expired")
+    }
+    .put(&r.u, &expired)
+    .await;
+    Seed {
+        sent: true,
+        ..Seed::new("requested")
+    }
+    .put(&r.u, &barrier)
+    .await;
+    let renewed = [&refused, &queued, &expired, &fresh];
+    for job in renewed {
+        r.object(job, "open").await;
+    }
+    let mut client = r.connect().await;
+    let mut ids: Vec<&str> = renewed.iter().map(|j| j.as_str()).collect();
+    ids.sort_unstable();
+    let asked = request(&r.u, &alice, &ids).await;
+    assert_eq!(asked.status, 202, "{}", asked.body);
+    for job in renewed {
+        assert_eq!(r.row(job).await, "requested|-|false|false");
+    }
+    // The answers to the commands of before the renewal, and an answer nobody asked for.
+    answer(&mut client, &refused, "busy").await;
+    answer(&mut client, &queued, "queued").await;
+    answer(&mut client, &expired, "busy").await;
+    answer(&mut client, &fresh, "noLog").await;
+    // The answer to a sent row that comes after them has been applied when they all were.
+    answer(&mut client, &barrier, "queued").await;
+    r.until_row(&barrier, "accepted|-|true|true").await;
+    for job in renewed {
+        assert_eq!(r.row(job).await, "requested|-|false|false");
+    }
+    // Free the rows: each is sent and stamped, and then its answer applies.
+    sqlx::query("UPDATE job_objects SET state = 'failed'")
+        .execute(&r.u.w.pool)
+        .await
+        .unwrap();
+    let mut sent = Vec::new();
+    for _ in renewed {
+        sent.push(command(&mut client).await.0);
+    }
+    sent.sort_unstable();
+    assert_eq!(sent, ids);
+    for job in renewed {
+        r.until_row(job, "requested|-|true|false").await;
+    }
+    answer(&mut client, &refused, "busy").await;
+    answer(&mut client, &queued, "queued").await;
+    r.until_row(&refused, "refused|busy|true|true").await;
+    r.until_row(&queued, "accepted|-|true|true").await;
     r.finish().await;
 }

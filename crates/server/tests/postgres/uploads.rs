@@ -379,6 +379,67 @@ impl MultipartStore for Wrap {
     }
 }
 
+/// A job of `agent` with a signed instruction of the ownership generation `generation` that names
+/// the given documents (ascending), artifact and plan; its ID. The job's creator is the tenant's
+/// first operator. An `ended` job is inserted delivered and completed, in the same statement.
+pub(crate) async fn signed_job(
+    w: &World,
+    agent: &str,
+    generation: u64,
+    document_hashes: Vec<[u8; 32]>,
+    artifact_hash: Option<[u8; 32]>,
+    plan_hash: Option<[u8; 32]>,
+    ended: bool,
+) -> String {
+    let id: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
+        .fetch_one(&w.pool)
+        .await
+        .unwrap();
+    let instruction = JobInstruction {
+        version: INSTRUCTION_VERSION,
+        job_id: JobId(id.clone()),
+        ownership_generation: generation,
+        agent_id: AgentId(agent.to_owned()),
+        operator_id: "operator".to_owned(),
+        kind: JobKind::Acquire,
+        vci: VciId("vci".to_owned()),
+        vin: None,
+        document_hashes,
+        artifact_hash,
+        plan_hash,
+        issued_at: 1,
+        start_deadline: 2,
+    };
+    let sealed = w.key.seal(&instruction).await.unwrap();
+    insert_job(w, &id, agent, &sealed, ended).await;
+    id
+}
+
+/// Inserts the job row `id` of `agent` holding `signed`, created by the tenant's first operator;
+/// `ended` makes it delivered and completed.
+pub(crate) async fn insert_job(w: &World, id: &str, agent: &str, signed: &[u8], ended: bool) {
+    sqlx::query(
+        "INSERT INTO jobs (tenant_id, id, kind, agent_id, operator_id, vci_id, \
+             confirmation_level, start_deadline, signed_job, signing_key_id, idempotency_key, \
+             state, progress_permille, delivered_at, delivery_attempts, finished_at) \
+         SELECT a.tenant_id, $1::uuid, 'acquire', a.id, o.id, 'vci', 'notifyOnly', \
+             now() + interval '1 hour', $3, $4, gen_random_uuid()::text, \
+             CASE WHEN $5 THEN 'completed' ELSE 'received' END, \
+             CASE WHEN $5 THEN 1000 ELSE 0 END, CASE WHEN $5 THEN now() END, \
+             CASE WHEN $5 THEN 1 ELSE 0 END, CASE WHEN $5 THEN now() END \
+         FROM agents a JOIN LATERAL (SELECT id FROM operators WHERE tenant_id = a.tenant_id \
+             ORDER BY created_at, id LIMIT 1) o ON true WHERE a.id = $2::uuid",
+    )
+    .bind(id)
+    .bind(agent)
+    .bind(signed)
+    .bind(w.key.key_id())
+    .bind(ended)
+    .execute(&w.pool)
+    .await
+    .unwrap();
+}
+
 // ---------------------------------------------------------------------------------------------
 // The fixture
 
@@ -693,46 +754,20 @@ impl Fx {
         artifact_hash: Option<[u8; 32]>,
         plan_hash: Option<[u8; 32]>,
     ) -> String {
-        let id: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
-            .fetch_one(&self.u.w.pool)
-            .await
-            .unwrap();
-        let instruction = JobInstruction {
-            version: INSTRUCTION_VERSION,
-            job_id: JobId(id.clone()),
-            ownership_generation: generation,
-            agent_id: AgentId(agent.to_owned()),
-            operator_id: "operator".to_owned(),
-            kind: JobKind::Acquire,
-            vci: VciId("vci".to_owned()),
-            vin: None,
+        signed_job(
+            &self.u.w,
+            agent,
+            generation,
             document_hashes,
             artifact_hash,
             plan_hash,
-            issued_at: 1,
-            start_deadline: 2,
-        };
-        let sealed = self.u.w.key.seal(&instruction).await.unwrap();
-        self.insert_job(&id, agent, &sealed).await;
-        id
+            false,
+        )
+        .await
     }
 
     pub(crate) async fn insert_job(&self, id: &str, agent: &str, signed: &[u8]) {
-        sqlx::query(
-            "INSERT INTO jobs (tenant_id, id, kind, agent_id, operator_id, vci_id, \
-                 confirmation_level, start_deadline, signed_job, signing_key_id, idempotency_key) \
-             SELECT a.tenant_id, $1::uuid, 'acquire', a.id, o.id, 'vci', 'notifyOnly', \
-                 now() + interval '1 hour', $3, $4, gen_random_uuid()::text \
-             FROM agents a JOIN LATERAL (SELECT id FROM operators WHERE tenant_id = a.tenant_id \
-                 ORDER BY created_at, id LIMIT 1) o ON true WHERE a.id = $2::uuid",
-        )
-        .bind(id)
-        .bind(agent)
-        .bind(signed)
-        .bind(self.u.w.key.key_id())
-        .execute(&self.u.w.pool)
-        .await
-        .unwrap();
+        insert_job(&self.u.w, id, agent, signed, false).await;
     }
 
     pub(crate) async fn job(&self) -> String {
@@ -1414,6 +1449,24 @@ async fn a_comm_log_begin_needs_an_unrefused_request_of_this_agent() {
         404,
         "failed row, refused request",
     );
+    fx.finish().await;
+}
+
+/// A request the Web API renewed from `refused` (state `requested` again, no refusal, no stamp,
+/// no answer) admits the agent's begin that the refusal did not (ADR-508 items 1 and 3).
+#[tokio::test]
+async fn a_comm_log_request_renewed_from_refused_admits_the_agents_begin_again() {
+    let fx = Fx::new(With::Fake).await;
+    let alice = crate::comm_log_uploads::alice(&fx.u).await;
+    let job = fx.job().await;
+    crate::comm_log_uploads::end(&fx.u, &job).await;
+    let begin = decl(&job, 1, "commLog", 10, &digest());
+    fx.comm_log_request(&job, 1, &fx.u.id, "refused").await;
+    problem(&fx.begin(&begin).await, 404, "refused");
+    let renewed = crate::comm_log_uploads::request(&fx.u, &alice, &[&job]).await;
+    assert_eq!(renewed.status, 202, "{}", renewed.body);
+    let r = fx.begin(&begin).await;
+    assert_eq!(r.status, 201, "renewed: {}", r.head);
     fx.finish().await;
 }
 

@@ -154,6 +154,34 @@ struct Lab {
     operator_sessions: server::OperatorSessions,
 }
 
+/// A login session of `operator` in the session table, which the login route cannot make for a
+/// tenant other than the local one; the session's cookie. `hash` is the operator's stored
+/// password hash.
+pub(crate) fn session_cookie(
+    sessions: &server::OperatorSessions,
+    tenant: &str,
+    operator: &str,
+    hash: &str,
+) -> String {
+    let token = random_32().unwrap();
+    sessions.establish(
+        &[],
+        sha2::Sha256::digest(token).into(),
+        server::operator_session::Holder {
+            operator: operator.to_owned(),
+            tenant: tenant.to_owned(),
+            fingerprint: server::operator_session::fingerprint(hash),
+        },
+        Instant::now(),
+        std::time::SystemTime::now(),
+    );
+    format!(
+        "{}={}",
+        server::operator_session::COOKIE_NAME,
+        URL_SAFE_NO_PAD.encode(token)
+    )
+}
+
 pub(crate) async fn add_user(
     pool: &sqlx::PgPool,
     name: &str,
@@ -286,23 +314,7 @@ impl Lab {
         assert_eq!(r.status, 201, "{}", r.head);
         let agent_id = json(&r)["agentId"].as_str().unwrap().to_owned();
         hold_named(&self.w.pool, &agent_id).await;
-        let token = random_32().unwrap();
-        self.operator_sessions.establish(
-            &[],
-            sha2::Sha256::digest(token).into(),
-            server::operator_session::Holder {
-                operator,
-                tenant: tenant.clone(),
-                fingerprint: server::operator_session::fingerprint(&self.hash),
-            },
-            Instant::now(),
-            std::time::SystemTime::now(),
-        );
-        let cookie = format!(
-            "{}={}",
-            server::operator_session::COOKIE_NAME,
-            URL_SAFE_NO_PAD.encode(token)
-        );
+        let cookie = session_cookie(&self.operator_sessions, &tenant, &operator, &self.hash);
         (cookie, agent_id, tenant)
     }
 

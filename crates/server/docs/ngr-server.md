@@ -760,6 +760,10 @@ also refuses a route mounted any other way.
   configuration write job behind the operator session. See "Creating a job" above.
 - `PUT /api/v1/documents/{sha256}` (`api/openapi.yaml`; `documents.rs`; ADR-500): stores an IR
   document for the caller's tenant behind the operator session. See "Storing a document" below.
+- `GET /api/v1/comm-log-uploads/scope` and `POST /api/v1/comm-log-uploads` (`api/openapi.yaml`;
+  `comm_log_uploads.rs`; ADR-508): show the scope of a request for jobs' communication logs and
+  write the request for the scope shown, behind the operator session. See "The communication-log
+  Web API" below.
 - `POST /api/v1/agent/uploads`, `POST /api/v1/agent/uploads/{uploadId}/parts/{part}`,
   `GET /api/v1/agent/uploads/{uploadId}` and `POST /api/v1/agent/uploads/{uploadId}/complete`
   (`api/openapi.yaml`; `uploads.rs`; ADR-493): the data channel's begin, part URL, status and
@@ -789,7 +793,7 @@ the job's stored instruction (404 on a difference) and does so in any job state.
 `refused`, `expired` included (`uploads::is_requested`, in the lookup's transaction): none is a
 404, the answer for an unknown job, with nothing begun in the store (ADR-508). A repeated begin of
 an existing row is answered from the row whatever the request's state has become, and kind
-`result` needs no request. Nothing writes the request rows but the communication-log task (below); the tests seed them. Every
+`result` needs no request. The request rows are written by the communication-log Web API and by the communication-log task (below). Every
 database call is a short transaction of its own, and none is held while the store is called; the row is
 inserted with `ON CONFLICT ... DO NOTHING` on the partial unique index, and the loser of a race
 deletes the upload it began and answers the winner's row.
@@ -1159,6 +1163,31 @@ connection with hyper's `with_upgrades()`.
   again at the next tick. The task ends when the stop begins, in its wait and in its statement
   (the dropped statement rolls back), before the pool closes. A job that an agent reports on
   after its end is stored, acknowledged and not applied (`job_state::decide`).
+- **The communication-log Web API (`comm_log_uploads.rs`, ADR-508 items 1 and 2).**
+  `GET /api/v1/comm-log-uploads/scope?jobId=...` and `POST /api/v1/comm-log-uploads`, both behind
+  the operator session layer (the POST also checks the Origin). Both take 1 to 32 distinct
+  lowercase UUIDs (a query of `jobId` parameters and nothing else; a JSON body of `jobIds` and
+  `scopeDigest` in at most 4 KiB, each property once) and judge that shape (400) before the
+  database is asked. Then one transaction with the 5 second timeouts: the permission (the role
+  `worker` with an empty scope, one 403 whatever the IDs), then `comm_log_uploads::load`, one
+  statement that reads the caller's own jobs among the IDs (the tenant and `operator_id` filter,
+  so an unknown, another tenant's and another operator's job are one 404) with each job's agent,
+  its `commLog` objects and its request rows at every generation. The generation is the stored
+  instruction's (`uploads::decode_instruction`; an instruction that does not decode is a 500), and
+  the log state and the request shown are those of that generation. A job is requestable when its
+  agent is not revoked and still lists the caller (`agent_allowed_operators`), the agent acknowledged it (`delivered_at`) and it has an end time
+  (`finished_at`); the POST answers the first class any job fails (403 for a revoked agent or an operator off the allow-list, with the agents' rows held `FOR SHARE` from the read to the commit; 422
+  `JOB_NOT_DELIVERED`, 422 `JOB_NOT_ENDED`) and the GET lists the job with `requestable` false.
+  The scope digest (`ngr-comm-log-scope-v1`, 64 lowercase hex digits) is computed over the jobs
+  in ID order by `scope_digest`, which encodes as `Spec::request_hash` does; the POST compares it
+  after eligibility (409 `SCOPE_CHANGED`). Then, in job-ID order, `comm_log_requests::request`
+  inserts a row (`ON CONFLICT DO NOTHING`) or renews a `refused` or `expired` one in one
+  statement, and the job's audit row (`audit::comm_log_upload_requested`: the caller, the job's
+  agent, VIN and confirmation level, the generation alone in `detail`) is written for each job
+  inserted or renewed. A job whose `commLog` object is `finished` is not written. The answer is
+  202 with each job's request after the write, `no-store`. A lock wait over 5 seconds fails the
+  call with 503 and rolls everything back, so a retry is safe. Nothing in a log line, a problem
+  document or an audit row holds a VIN or the digest.
 - **The communication-log task (`comm_log_requests.rs`, ADR-508 item 4).** One task of the hub's
   set, spawned by `Server::run` beside the delivery queue when it is on (`Server::start` turns it
   on with a 10 second period and a lease of 90 seconds; `Server::bind` leaves it off, and a test
@@ -1176,7 +1205,8 @@ connection with hyper's `with_upgrades()`.
   whose queue is full or which has left is not tried again in the pass. The second transaction is
   one statement that stamps `sent_at = now()` on the rows whose frame the connection's queue took,
   and only while the row is still `requested`; a row that was not taken stays as it was and is read
-  again at the next pass. The task also remembers, in memory, the connection each row was last sent
+  again at the next pass. An answer is applied only to a row that has a stamp, so an answer to a
+  command from before a renewal (which clears the stamp) changes nothing. The task also remembers, in memory, the connection each row was last sent
   on for one lease (at most the rows sent in that time): a row whose agent has a newer connection
   is due at the next pass without waiting for the lease, since the old connection may have lost
   the frame. After a restart of the server the memory is empty and the lease alone applies. An
@@ -1325,7 +1355,22 @@ a new migration file rebuilds the crate. How migrations are written and applied 
   the real object server, a key another table holds, a failed audit insert rolling the row back, a
   digest per tenant, and a small and a 16 MiB document read back byte for byte from the real object
   server and signed by the download route. The metadata bounds are unit tests in `src/documents.rs`.
-  `comm_log_requests.rs` covers the task (ADR-508 item 4): a request of a connected agent sent and
+  `comm_log_uploads.rs` covers the Web API (ADR-508 items 1 and 2) against the real router: the
+  shape rules before the permission, the session and Origin, the permission and its loss between
+  the calls, the 404 that is one answer for an unknown, another tenant's and another operator's
+  job, every job state that is or is not delivered and ended, a revoked agent, a stored
+  instruction that does not decode, the class of an answer over several jobs in either order of
+  the IDs, the generation of the instruction, each log and request state of a job (inserted,
+  left, renewed, a stored log left alone) with its audit row, a mixed batch, 32 jobs, what the
+  scope shows and its period, what changes the digest and what does not (a repeat after a lost
+  answer), two requests at once for a new and a refused row, two in opposite order of the IDs,
+  and an audit log held for 5 seconds (503, nothing written, a retry succeeds); the pure parts
+  (the shape, the digest's encoding, the class order, the log state, the period) are unit tests in
+  `src/comm_log_uploads.rs`.
+  `comm_log_requests.rs` covers the task (ADR-508 item 4) and its meeting with the Web API's
+  writes: an answer and a request for one row in each order, the expiry and a request in each
+  order, a repeated request before the agent connects, and the answers to a command sent before a
+  renewal ignored until the row is sent again: a request of a connected agent sent and
   stamped and not sent again within the lease, and sent again after it with the stamp advanced; an
   agent that is not connected sent nothing until it connects; every outcome of an answer and its
   row; an answer of another agent of the same or another tenant, for an unknown or an answered

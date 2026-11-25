@@ -67,3 +67,39 @@ pub(crate) async fn document_stored(
     .await?;
     Ok(())
 }
+
+/// Writes the `commLogUploadRequested` row of a communication-log request that this transaction
+/// inserted or renewed (design 8.11, ADR-484, ADR-508).
+///
+/// The row names the operator who asked; the agent, the job, the VIN and the confirmation level
+/// are copied from the job's row by the database. The detail holds the ownership generation
+/// only: no VIN, and no scope digest, which is derived from the VIN. A count other than one row
+/// is an internal error: the request is not committed without its record.
+pub(crate) async fn comm_log_upload_requested(
+    tx: &mut PgConnection,
+    tenant_id: &str,
+    operator_id: &str,
+    job_id: &str,
+    generation: i64,
+) -> Result<(), JobError> {
+    let written = sqlx::query(
+        "INSERT INTO audit_log (tenant_id, operator_id, agent_id, job_id, vin, action, \
+             confirmation_level, detail) \
+         SELECT tenant_id, $3::uuid, agent_id, id, vin, 'commLogUploadRequested', \
+             confirmation_level, jsonb_build_object('generation', $4::bigint) \
+         FROM jobs WHERE tenant_id = $1::uuid AND id = $2::uuid",
+    )
+    .bind(tenant_id)
+    .bind(job_id)
+    .bind(operator_id)
+    .bind(generation)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if written != 1 {
+        return Err(JobError::Internal(format!(
+            "the audit row of a log request was written {written} times"
+        )));
+    }
+    Ok(())
+}

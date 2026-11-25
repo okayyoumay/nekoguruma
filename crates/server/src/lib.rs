@@ -14,6 +14,7 @@ pub(crate) mod agent_events;
 pub(crate) mod answer_proof;
 pub(crate) mod audit;
 pub mod comm_log_requests;
+pub mod comm_log_uploads;
 pub mod config;
 pub mod control;
 pub mod db;
@@ -195,6 +196,27 @@ pub fn routes_unguarded(state: AppState) -> (Router, Vec<ServedRoute>) {
             state.pool.clone(),
             Arc::clone(&state.instruction_key),
         ));
+    // The communication-log routes take the same layer and have their own state.
+    let comm_log_uploads = mounts.mount(
+        Router::new(),
+        Method::GET,
+        comm_log_uploads::SCOPE_PATH,
+        get(comm_log_uploads::scope).route_layer(middleware::from_fn_with_state(
+            auth.clone(),
+            operator_session::require_session,
+        )),
+    );
+    let comm_log_uploads = mounts
+        .mount(
+            comm_log_uploads,
+            Method::POST,
+            comm_log_uploads::PATH,
+            post(comm_log_uploads::create).route_layer(middleware::from_fn_with_state(
+                auth.clone(),
+                operator_session::require_session,
+            )),
+        )
+        .with_state(comm_log_uploads::CommLogUploads::new(state.pool.clone()));
     // The document store takes the operator session's layer and the object store the data
     // channel's routes use; its state holds its own slots and log gates (ADR-500).
     let documents = mounts
@@ -314,6 +336,7 @@ pub fn routes_unguarded(state: AppState) -> (Router, Vec<ServedRoute>) {
     let routes = health
         .merge(operator)
         .merge(jobs)
+        .merge(comm_log_uploads)
         .merge(documents)
         .merge(uploads)
         .merge(register)

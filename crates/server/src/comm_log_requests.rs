@@ -1,5 +1,6 @@
-//! The delivery of an operator's communication-log requests to the agents, and the application of
-//! the agents' answers (design 8.11, ADR-508 items 3 and 4): one task of the hub's set.
+//! The operator's communication-log requests as rows (design 8.11, ADR-508): the statements that
+//! write a request ([`request`], called by [`crate::comm_log_uploads`]), and the task of the hub's
+//! set that delivers the requests to the agents and applies the agents' answers.
 //!
 //! Every [`Settings::period`] a pass first ends the requests that are [`EXPIRY`] old and still
 //! `requested` (state `expired`, which stops the delivery and nothing else: the begin gate still
@@ -24,8 +25,10 @@
 //! The answers reach the task through a bounded channel the delivery queue feeds with the
 //! `logUploadAnswer` messages it reads from the hub's inbox ([`Answer`]). Each is applied by one
 //! statement that changes a row only when it is the sending agent's, for that job and generation,
-//! and still `requested`: an answer from another agent, for an unknown row, or for a row already
-//! answered or expired changes nothing. `queued` makes the row `accepted`; any refusal makes it
+//! still `requested` and stamped `sent_at`: an answer from another agent, for an unknown row, for
+//! a row already answered or expired, or for one that was written or renewed and not yet sent
+//! changes nothing, so an answer to a command sent before a renewal cannot refuse the renewed
+//! request (an answer that comes after the renewed row's next stamp is applied). `queued` makes the row `accepted`; any refusal makes it
 //! `refused` with that reason. An answer that is lost, or fails to apply, is repeated by the
 //! agent when the next command comes.
 //!
@@ -149,10 +152,42 @@ const STAMP_SQL: &str = "UPDATE comm_log_requests r SET sent_at = now() \
        AND r.state = 'requested'";
 
 /// Applies one answer: only the sending agent's row, for the job and generation, that is still
-/// `requested` (`$1` job, `$2` generation, `$3` the agent, `$4` the state, `$5` the refusal).
+/// `requested` and has been sent (`$1` job, `$2` generation, `$3` the agent, `$4` the state, `$5`
+/// the refusal). A row not yet sent has no command the answer could be to: it was written or
+/// renewed after the command the answer is for.
 const ANSWER_SQL: &str = "UPDATE comm_log_requests SET state = $4, refusal = $5, answered_at = now() \
      WHERE tenant_id = (SELECT tenant_id FROM agents WHERE id = $3::uuid AND revoked_at IS NULL) \
-       AND job_id = $1::uuid AND generation = $2 AND agent_id = $3::uuid AND state = 'requested'";
+       AND job_id = $1::uuid AND generation = $2 AND agent_id = $3::uuid AND state = 'requested' \
+       AND sent_at IS NOT NULL";
+
+/// Writes a new request for the job (`$1` tenant, `$2` job, `$3` generation, `$4` the operator).
+/// The agent is the job's own; the state, `requested_at` and the empty columns are the table's
+/// defaults. A row that exists is left as it is, and so is a job whose log is stored (a
+/// `finished` `commLog` object at the generation).
+const INSERT_SQL: &str = "INSERT INTO comm_log_requests \
+         (tenant_id, job_id, generation, agent_id, requested_by) \
+     SELECT tenant_id, id, $3, agent_id, $4::uuid FROM jobs \
+     WHERE tenant_id = $1::uuid AND id = $2::uuid \
+       AND NOT EXISTS (SELECT 1 FROM job_objects o WHERE o.tenant_id = $1::uuid \
+           AND o.job_id = $2::uuid AND o.generation = $3 AND o.kind = 'commLog' \
+           AND o.state = 'finished') \
+     ON CONFLICT (tenant_id, job_id, generation) DO NOTHING";
+
+/// Renews a `refused` or `expired` request in place, in the one statement that keeps both of the
+/// table's state checks true (same parameters as [`INSERT_SQL`]): back to `requested`, with the
+/// refusal, the stamp and the answer's time cleared and the new request's operator and time.
+/// A job whose log is stored is left as it is.
+const RENEW_SQL: &str = "UPDATE comm_log_requests SET state = 'requested', refusal = NULL, \
+         sent_at = NULL, answered_at = NULL, requested_by = $4::uuid, requested_at = now() \
+     WHERE tenant_id = $1::uuid AND job_id = $2::uuid AND generation = $3 \
+       AND state IN ('refused', 'expired') \
+       AND NOT EXISTS (SELECT 1 FROM job_objects o WHERE o.tenant_id = $1::uuid \
+           AND o.job_id = $2::uuid AND o.generation = $3 AND o.kind = 'commLog' \
+           AND o.state = 'finished')";
+
+/// The state and the refusal of a request (`$1` tenant, `$2` job, `$3` generation).
+const STATE_SQL: &str = "SELECT state, refusal FROM comm_log_requests \
+     WHERE tenant_id = $1::uuid AND job_id = $2::uuid AND generation = $3";
 
 /// A request's row: tenant, job and generation.
 type RowKey = (String, String, i64);
@@ -341,7 +376,80 @@ async fn read(
         .collect())
 }
 
-/// Applies `answer` to the sender's own `requested` row, if there is one. A job ID that is not a
+/// What [`request`] did to the job's row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Written {
+    /// There was no row; one was inserted, `requested`.
+    Inserted,
+    /// The row was `refused` or `expired` and is `requested` again.
+    Renewed,
+    /// The row was `requested` or `accepted` (or another transaction wrote it first), and is as
+    /// it was.
+    Left,
+}
+
+/// A request's state, and its refusal when it is `refused`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RequestState {
+    pub(crate) state: String,
+    pub(crate) refusal: Option<String>,
+}
+
+/// Writes the operator's request for the job's log at `generation`, in the caller's transaction
+/// (ADR-508 item 1): inserts a row, or renews one that is `refused` or `expired`, or leaves one
+/// that is `requested` or `accepted`, or whose job's log is stored. The caller has judged that the operator may ask. Two
+/// requests for one row meet at its key: the second waits for the first's commit and then finds
+/// the row it wrote.
+pub(crate) async fn request(
+    tx: &mut sqlx::PgConnection,
+    tenant: &str,
+    job: &str,
+    generation: i64,
+    operator: &str,
+) -> Result<Written, sqlx::Error> {
+    let inserted = sqlx::query(INSERT_SQL)
+        .bind(tenant)
+        .bind(job)
+        .bind(generation)
+        .bind(operator)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if inserted > 0 {
+        return Ok(Written::Inserted);
+    }
+    let renewed = sqlx::query(RENEW_SQL)
+        .bind(tenant)
+        .bind(job)
+        .bind(generation)
+        .bind(operator)
+        .execute(tx)
+        .await?
+        .rows_affected();
+    Ok(if renewed > 0 {
+        Written::Renewed
+    } else {
+        Written::Left
+    })
+}
+
+/// The job's request at `generation` as it is now, if there is one.
+pub(crate) async fn state(
+    tx: &mut sqlx::PgConnection,
+    tenant: &str,
+    job: &str,
+    generation: i64,
+) -> Result<Option<RequestState>, sqlx::Error> {
+    let row: Option<(String, Option<String>)> = sqlx::query_as(STATE_SQL)
+        .bind(tenant)
+        .bind(job)
+        .bind(generation)
+        .fetch_optional(tx)
+        .await?;
+    Ok(row.map(|(state, refusal)| RequestState { state, refusal }))
+}
+
+/// Applies `answer` to the sender's own `requested`, sent row, if there is one. A job ID that is not a
 /// canonical UUID, or a generation beyond `bigint`, names no row.
 async fn apply(pool: &PgPool, answer: &Answer) -> Result<(), sqlx::Error> {
     let Ok(generation) = i64::try_from(answer.generation) else {

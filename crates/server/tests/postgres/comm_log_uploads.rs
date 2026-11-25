@@ -56,6 +56,33 @@ pub(crate) struct Who {
     pub(crate) cookie: String,
 }
 
+/// What the Web API helpers need of a server under test: where it listens, the database its
+/// operators are in, the agent whose tenant they belong to and its operator sessions.
+pub(crate) trait Site {
+    fn addr(&self) -> SocketAddr;
+    fn pool(&self) -> &sqlx::PgPool;
+    fn agent_id(&self) -> &str;
+    fn operator_sessions(&self) -> &server::OperatorSessions;
+}
+
+impl Site for Up {
+    fn addr(&self) -> SocketAddr {
+        self.s.addr
+    }
+
+    fn pool(&self) -> &sqlx::PgPool {
+        &self.w.pool
+    }
+
+    fn agent_id(&self) -> &str {
+        &self.id
+    }
+
+    fn operator_sessions(&self) -> &server::OperatorSessions {
+        &self.operator_sessions
+    }
+}
+
 /// The password hash the sessions of these tests are bound to, made once.
 async fn hash() -> &'static str {
     static HASH: OnceCell<String> = OnceCell::const_new();
@@ -66,7 +93,7 @@ async fn hash() -> &'static str {
 /// A session for the operator `subject` of the agent's tenant, who holds `roles`; the operator
 /// is made when there is none. `alice` is the operator `Up` made, the creator of every job
 /// these tests make.
-pub(crate) async fn who(u: &Up, subject: &str, roles: &[&str]) -> Who {
+pub(crate) async fn who(u: &impl Site, subject: &str, roles: &[&str]) -> Who {
     let (tenant, id): (String, String) = sqlx::query_as(
         "WITH t AS (SELECT tenant_id FROM agents WHERE id = $1::uuid), \
               made AS (INSERT INTO operators (id, tenant_id, subject, display_name) \
@@ -78,9 +105,9 @@ pub(crate) async fn who(u: &Up, subject: &str, roles: &[&str]) -> Who {
          UNION ALL SELECT o.tenant_id::text, o.id::text FROM operators o, t \
              WHERE o.tenant_id = t.tenant_id AND o.subject = $2",
     )
-    .bind(&u.id)
+    .bind(u.agent_id())
     .bind(subject)
-    .fetch_one(&u.w.pool)
+    .fetch_one(u.pool())
     .await
     .unwrap();
     for role in roles {
@@ -88,7 +115,7 @@ pub(crate) async fn who(u: &Up, subject: &str, roles: &[&str]) -> Who {
             .bind(&tenant)
             .bind(&id)
             .bind(role)
-            .execute(&u.w.pool)
+            .execute(u.pool())
             .await
             .unwrap();
     }
@@ -99,15 +126,15 @@ pub(crate) async fn who(u: &Up, subject: &str, roles: &[&str]) -> Who {
     )
     .bind(&id)
     .bind(hash)
-    .execute(&u.w.pool)
+    .execute(u.pool())
     .await
     .unwrap();
-    let cookie = session_cookie(&u.operator_sessions, &tenant, &id, hash);
+    let cookie = session_cookie(u.operator_sessions(), &tenant, &id, hash);
     Who { id, cookie }
 }
 
 /// `alice` with the role `worker`.
-pub(crate) async fn alice(u: &Up) -> Who {
+pub(crate) async fn alice(u: &impl Site) -> Who {
     who(u, "alice", &["worker"]).await
 }
 
@@ -158,26 +185,26 @@ pub(crate) fn body(ids: &[&str], digest: &str) -> String {
     json!({ "jobIds": ids, "scopeDigest": digest }).to_string()
 }
 
-fn raw_request(u: &Up, who: &Who, body: &str) -> String {
+fn raw_request(u: &impl Site, who: &Who, body: &str) -> String {
     raw_post(
-        u.s.addr,
+        u.addr(),
         Some(&who.cookie),
-        Some(&pinned_origin(u.s.addr.port())),
+        Some(&pinned_origin(u.addr().port())),
         Some("application/json"),
         body,
     )
 }
 
-pub(crate) async fn scope(u: &Up, who: &Who, ids: &[&str]) -> Reply {
+pub(crate) async fn scope(u: &impl Site, who: &Who, ids: &[&str]) -> Reply {
     exchange(
-        u.s.addr,
-        &raw_get(u.s.addr, &scope_target(ids), Some(&who.cookie)),
+        u.addr(),
+        &raw_get(u.addr(), &scope_target(ids), Some(&who.cookie)),
     )
     .await
 }
 
-pub(crate) async fn post(u: &Up, who: &Who, body: &str) -> Reply {
-    exchange(u.s.addr, &raw_request(u, who, body)).await
+pub(crate) async fn post(u: &impl Site, who: &Who, body: &str) -> Reply {
+    exchange(u.addr(), &raw_request(u, who, body)).await
 }
 
 /// The digest an answer of the scope read carries.
@@ -187,7 +214,7 @@ pub(crate) fn digest_of(scope: &Reply) -> String {
 }
 
 /// What an operator does: reads the scope of `ids`, then asks for it with the digest it was shown.
-pub(crate) async fn request(u: &Up, who: &Who, ids: &[&str]) -> Reply {
+pub(crate) async fn request(u: &impl Site, who: &Who, ids: &[&str]) -> Reply {
     let shown = scope(u, who, ids).await;
     post(u, who, &body(ids, &digest_of(&shown))).await
 }

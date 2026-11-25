@@ -1367,6 +1367,11 @@ a new migration file rebuilds the crate. How migrations are written and applied 
   and an audit log held for 5 seconds (503, nothing written, a retry succeeds); the pure parts
   (the shape, the digest's encoding, the class order, the log state, the period) are unit tests in
   `src/comm_log_uploads.rs`.
+  `agent_upload.rs` also runs the whole path of a communication log (ADR-508 item 5) with the real
+  `ngr-agent connect` and the bundled object server: two jobs delivered by the queue and
+  acknowledged by the agent, a log with a torn last line placed for each, a request for one made
+  through the Web API, and the stored object equal to that log up to its last line end while the
+  other job has no object and no request row.
   `comm_log_requests.rs` covers the task (ADR-508 item 4) and its meeting with the Web API's
   writes: an answer and a request for one row in each order, the expiry and a request in each
   order, a repeated request before the agent connects, and the answers to a command sent before a

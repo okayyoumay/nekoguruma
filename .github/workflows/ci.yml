@@ -127,6 +127,9 @@ jobs:
       # password the tests know. `--no-tests=fail` makes a filter that matches nothing an error.
       - name: Secret Service tests
         run: |
+          # The runner image lists Microsoft's package source, which nothing here installs from
+          # and which sometimes answers 403; a failed source fails the whole update.
+          { sudo grep -lr packages.microsoft.com /etc/apt/sources.list.d || true; } | xargs -r sudo rm -f
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends gnome-keyring dbus
           export KEYRING_HOME=$(mktemp -d)
@@ -429,6 +432,9 @@ jobs:
           targets: x86_64-unknown-linux-gnu,i686-unknown-linux-gnu,aarch64-unknown-linux-gnu,armv7-unknown-linux-gnueabihf
       # The 32-bit x86 runtime, and qemu-user with the ARM targets' libraries (used as -L sysroots).
       - run: |
+          # The runner image lists Microsoft's package source, which nothing here installs from
+          # and which sometimes answers 403; a failed source fails the whole update.
+          { sudo grep -lr packages.microsoft.com /etc/apt/sources.list.d || true; } | xargs -r sudo rm -f
           sudo apt-get update
           sudo apt-get install -y libc6-i386 lib32gcc-s1 qemu-user \
             libc6-arm64-cross libgcc-s1-arm64-cross libc6-armhf-cross libgcc-s1-armhf-cross

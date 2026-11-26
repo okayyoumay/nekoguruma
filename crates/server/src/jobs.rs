@@ -1165,7 +1165,7 @@ mod tests {
     // R4
     #[test]
     fn the_body_is_one_object_of_the_known_properties_typed_right() {
-        assert!(shaped(serde_json::json!({})).is_ok());
+        shaped(serde_json::json!({})).unwrap();
         let bad = [
             "".to_owned(),
             "[]".to_owned(),

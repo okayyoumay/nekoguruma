@@ -431,6 +431,6 @@ mod tests {
             parse_response(json!({"id": 1, "error": {"code": -32601, "message": "nope"}})),
             Err(ServiceError::Rpc { code: -32601, .. })
         ));
-        assert!(parse_endpoints(&json!({"running": true, "endpoints": null})).is_err());
+        parse_endpoints(&json!({"running": true, "endpoints": null})).unwrap_err();
     }
 }

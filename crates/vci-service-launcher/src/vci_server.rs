@@ -419,7 +419,7 @@ mod tests {
             let mut req = tonic::Request::new(());
             req.metadata_mut()
                 .insert("authorization", format!("Bearer {token}").parse().unwrap());
-            assert!(auth.verify_request(req).is_ok());
+            auth.verify_request(req).unwrap();
         }
 
         /// HTTP auth-scheme names are case-insensitive (RFC 7235 SS2.1) --
@@ -458,7 +458,7 @@ mod tests {
                 "authorization",
                 format!("Bearer   {token}").parse().unwrap(),
             );
-            assert!(auth.verify_request(req).is_ok());
+            auth.verify_request(req).unwrap();
         }
     }
 

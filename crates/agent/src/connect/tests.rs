@@ -332,7 +332,7 @@ async fn a_stop_during_the_key_retry_is_ok_and_frees_the_locks() {
         tokio::time::sleep(Duration::from_secs(5)),
     )
     .await;
-    assert!(result.is_ok());
+    result.unwrap();
     let text = log.text();
     assert!(text.contains("stopped before it started"), "{text}");
     assert!(text.contains("key store"), "{text}");
@@ -403,7 +403,10 @@ async fn an_uploader_that_ends_on_its_own_does_not_end_the_session() {
         job_id: shared_proto::JobId("0194f0a2-7c3e-7d11-8a52-3f6f9b1c2d4f".to_owned()),
         generation: 1,
     };
-    assert!(ledger.enqueue_result(key_of, vec![1, 2, 3]).await.is_err());
+    ledger
+        .enqueue_result(key_of, vec![1, 2, 3])
+        .await
+        .unwrap_err();
     std::fs::write(uploads_dir.join(AGENT_ID), b"not a ledger").unwrap();
     let result = run_opened(
         opened,

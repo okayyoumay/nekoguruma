@@ -814,7 +814,7 @@ mod tests {
             Outbox::open_with(dir.path(), ID, failing_at(Step::AfterWrite, &armed)).unwrap();
         put(&mut outbox, 1);
         armed.store(true, Ordering::SeqCst);
-        assert!(outbox.append(Kind::Other, text).is_err());
+        outbox.append(Kind::Other, text).unwrap_err();
         // The open's own durability step fails through the probe.
         let failing = Arc::new(AtomicBool::new(true));
         let flag = Arc::clone(&failing);
@@ -1235,7 +1235,7 @@ mod tests {
         // Acknowledgements and the rewrite make room again.
         let highest = outbox.highest();
         outbox.ack(highest).unwrap();
-        assert!(outbox.append(Kind::Received, text).is_ok());
+        outbox.append(Kind::Received, text).unwrap();
     }
 
     // S14
@@ -1352,7 +1352,7 @@ mod tests {
             Err(OutboxError::InUse)
         ));
         drop(first);
-        assert!(Outbox::open_in(dir.path(), ID).is_ok());
+        Outbox::open_in(dir.path(), ID).unwrap();
     }
 
     #[test]

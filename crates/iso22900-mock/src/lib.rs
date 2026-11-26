@@ -3076,16 +3076,16 @@ mod sim_ecu_tests {
             .expect("a configuration");
         assert_eq!(config.vin, "WVWZZZ1KZAW000001");
         let invalid = temp_file("invalid", "not json");
-        assert!(ecu_config_from(Some(invalid.clone().into_os_string())).is_err());
+        ecu_config_from(Some(invalid.clone().into_os_string())).unwrap_err();
         let too_long = EcuConfig {
             part_number: "NGR-SIM-ECU-X".into(),
             ..default_ecu_config()
         };
         let too_long = temp_file("too-long", &serde_json::to_string(&too_long).unwrap());
-        assert!(ecu_config_from(Some(too_long.clone().into_os_string())).is_err());
+        ecu_config_from(Some(too_long.clone().into_os_string())).unwrap_err();
         std::fs::remove_file(too_long).unwrap();
         let missing = std::env::temp_dir().join("iso22900-mock-no-such-config.json");
-        assert!(ecu_config_from(Some(missing.into_os_string())).is_err());
+        ecu_config_from(Some(missing.into_os_string())).unwrap_err();
         std::fs::remove_file(valid).unwrap();
         std::fs::remove_file(invalid).unwrap();
     }
@@ -3102,7 +3102,7 @@ mod sim_ecu_tests {
         assert!(apply_sim_ecu_command(&mut state, command(both)).is_err());
         apply_sim_ecu_command(&mut state, command(r#"{"detach":{}}"#)).unwrap();
         assert!(state.ecu.is_none());
-        assert!(serde_json::from_str::<SimEcuCommand>(r#"{"reboot":{}}"#).is_err());
+        serde_json::from_str::<SimEcuCommand>(r#"{"reboot":{}}"#).unwrap_err();
         let misspelled = r#"{"attach":{"config":{"s3_ms":300}}}"#;
         assert!(apply_sim_ecu_command(&mut state, command(misspelled)).is_err());
         assert!(state.ecu.is_none());
@@ -3958,8 +3958,8 @@ mod tester_present_tests {
         assert!(ecu_commands_from(None).unwrap().is_empty());
         let text = r#"[{"inject_fault":{"fault":"drop_response","service":62}},{"detach":{}}]"#;
         assert_eq!(ecu_commands_from(Some(text.into())).unwrap().len(), 2);
-        assert!(ecu_commands_from(Some(r#"{"detach":{}}"#.into())).is_err());
-        assert!(ecu_commands_from(Some("[{\"reboot\":{}}]".into())).is_err());
+        ecu_commands_from(Some(r#"{"detach":{}}"#.into())).unwrap_err();
+        ecu_commands_from(Some("[{\"reboot\":{}}]".into())).unwrap_err();
         // Set but blank: no commands.
         assert!(ecu_commands_from(Some("".into())).unwrap().is_empty());
         assert!(ecu_commands_from(Some(" \n\t ".into())).unwrap().is_empty());

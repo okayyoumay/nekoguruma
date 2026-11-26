@@ -127,7 +127,7 @@ mod tests {
         assert_eq!(artifact.slice(0, 3), Some(&[1, 2, 3][..]));
         std::fs::write(&path, [9, 9, 9]).unwrap();
         assert_eq!(artifact.slice(0, 3), Some(&[1, 2, 3][..]), "held in memory");
-        assert!(Artifact::read(&dir.join("missing")).is_err());
+        Artifact::read(&dir.join("missing")).unwrap_err();
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -137,10 +137,10 @@ mod tests {
         let text = to_hex(hash.sha256());
         assert_eq!(parse_sha256(&text), Ok(*hash.sha256()));
         assert_eq!(parse_sha256(&text.to_uppercase()), Ok(*hash.sha256()));
-        assert!(parse_sha256(&text[1..]).is_err());
-        assert!(parse_sha256(&format!("{text}0")).is_err());
-        assert!(parse_sha256(&format!("g{}", &text[1..])).is_err());
-        assert!(parse_sha256(&format!("+{}", &text[1..])).is_err());
-        assert!(parse_sha256("").is_err());
+        parse_sha256(&text[1..]).unwrap_err();
+        parse_sha256(&format!("{text}0")).unwrap_err();
+        parse_sha256(&format!("g{}", &text[1..])).unwrap_err();
+        parse_sha256(&format!("+{}", &text[1..])).unwrap_err();
+        parse_sha256("").unwrap_err();
     }
 }

@@ -769,7 +769,7 @@ async fn an_xml_answer_over_the_bound_is_refused_and_an_error_body_over_its_boun
         "<Bucket>",
         &format!("<!-- {} --><Bucket>", "x".repeat(100 * 1024)),
     );
-    assert!(CreateMultipartUpload::parse_response(&padded).is_ok());
+    CreateMultipartUpload::parse_response(&padded).unwrap();
     let fake = Fake::start(move |_, _| reply(200, padded.clone())).await;
     let error = store(&fake).begin().await.unwrap_err();
     assert!(
@@ -816,7 +816,7 @@ async fn a_garbled_answer_is_a_server_error_not_a_panic() {
     }
     // An upload ID that is not printable ASCII is not taken.
     let fake = Fake::start(|_, _| reply(200, create_xml("has space"))).await;
-    assert!(store(&fake).begin().await.is_err());
+    store(&fake).begin().await.unwrap_err();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -958,15 +958,15 @@ fn part_numbers_outside_1_to_10000_are_refused() {
 
 #[test]
 fn an_upload_id_is_one_to_1024_printable_ascii_characters() {
-    assert!(UploadId::parse("a").is_ok());
-    assert!(UploadId::parse(&"x".repeat(1024)).is_ok());
+    UploadId::parse("a").unwrap();
+    UploadId::parse(&"x".repeat(1024)).unwrap();
     for bad in ["", "a b", "tab\t", "nul\0", "é", "\n"] {
         assert!(
             matches!(UploadId::parse(bad), Err(StoreError::InvalidUploadId)),
             "{bad:?}"
         );
     }
-    assert!(UploadId::parse(&"x".repeat(1025)).is_err());
+    UploadId::parse(&"x".repeat(1025)).unwrap_err();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1109,7 +1109,7 @@ async fn a_listing_that_does_not_advance_or_never_ends_is_a_server_error() {
         )
     })
     .await;
-    assert!(store(&no_marker).list_unfinished().await.is_err());
+    store(&no_marker).list_unfinished().await.unwrap_err();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1556,7 +1556,7 @@ async fn a_get_body_that_stalls_fails_with_a_timeout_and_one_that_is_cut_fails_t
     })
     .await;
     let body = store(&cut).get(&key).await.unwrap();
-    assert!(read_all(body).await.is_err());
+    read_all(body).await.unwrap_err();
 }
 
 #[tokio::test]
@@ -1855,14 +1855,14 @@ async fn put_part_refuses_a_part_number_or_a_size_before_any_request() {
         let error = store.put_part(&upload(), part, vec![1]).await.unwrap_err();
         assert!(matches!(error, StoreError::InvalidPartNumber), "{error}");
     }
-    assert!(store.put_part(&upload(), MAX_PARTS, vec![1]).await.is_ok());
+    store.put_part(&upload(), MAX_PARTS, vec![1]).await.unwrap();
     // The fast tuning's object limit is 1000 bytes.
     let error = store
         .put_part(&upload(), 1, vec![0; 1001])
         .await
         .unwrap_err();
     assert!(matches!(error, StoreError::ObjectTooLarge), "{error}");
-    assert!(store.put_part(&upload(), 1, vec![0; 1000]).await.is_ok());
+    store.put_part(&upload(), 1, vec![0; 1000]).await.unwrap();
     assert_eq!(
         fake.seen().len(),
         2,

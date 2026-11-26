@@ -559,8 +559,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = key_path(&dir);
         std::fs::create_dir(&path).unwrap();
-        assert!(read_key(&path).is_err());
-        assert!(create_or_load(&path).is_err());
+        read_key(&path).unwrap_err();
+        create_or_load(&path).unwrap_err();
         assert!(path.is_dir());
     }
 
@@ -579,7 +579,7 @@ mod tests {
                 ..
             })
         ));
-        assert!(create_or_load(&path).is_err());
+        create_or_load(&path).unwrap_err();
     }
 
     #[cfg(unix)]
@@ -623,7 +623,7 @@ mod tests {
         }
         // Readable by others is fine; only writability matters.
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(create_or_load(&path).is_ok());
+        create_or_load(&path).unwrap();
     }
 
     #[cfg(unix)]

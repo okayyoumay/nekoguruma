@@ -91,7 +91,7 @@ fn dropping_never_panics_even_when_a_step_does() {
     let mut teardown = Teardown::new();
     teardown.register("session", || panic!("no answer from the ECU"));
     let result = catch_unwind(AssertUnwindSafe(move || drop(teardown)));
-    assert!(result.is_ok());
+    result.unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -1985,10 +1985,10 @@ fn a_damaged_or_foreign_state_file_is_refused() {
     );
     // A directory where the file should be cannot be read, which is not the same as no file.
     std::fs::create_dir(dir.file()).expect("directory should be created");
-    assert!(load_ecu_state(&dir.file()).is_err());
+    load_ecu_state(&dir.file()).unwrap_err();
     std::fs::remove_dir(dir.file()).expect("directory should be removed");
     std::fs::write(dir.file(), b"not a state file").expect("file should be writable");
-    assert!(load_ecu_state(&dir.file()).is_err());
+    load_ecu_state(&dir.file()).unwrap_err();
 
     let mut ecu = SimEcu::new(default_ecu_config());
     let other_version = StateFile {
@@ -2001,7 +2001,7 @@ fn a_damaged_or_foreign_state_file_is_refused() {
         postcard::to_allocvec(&other_version).expect("state should encode"),
     )
     .expect("file should be writable");
-    assert!(load_ecu_state(&dir.file()).is_err());
+    load_ecu_state(&dir.file()).unwrap_err();
 
     // A file of the previous version is refused on its version, whatever follows it, before the
     // rest is decoded in this version's layout.
@@ -2009,7 +2009,7 @@ fn a_damaged_or_foreign_state_file_is_refused() {
         postcard::to_allocvec(&(STATE_FILE_VERSION - 1)).expect("version should encode");
     previous.extend(postcard::to_allocvec(&other_version.ecu).expect("state should encode"));
     std::fs::write(dir.file(), previous).expect("file should be writable");
-    assert!(load_ecu_state(&dir.file()).is_err());
+    load_ecu_state(&dir.file()).unwrap_err();
 }
 
 #[test]

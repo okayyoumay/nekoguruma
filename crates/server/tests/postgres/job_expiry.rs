@@ -354,7 +354,7 @@ async fn a_lock_that_cannot_be_deleted_leaves_the_job_unended_because_it_is_one_
          FOR EACH ROW EXECUTE FUNCTION refuse_delete()",
     )
     .await;
-    assert!(expire(&u.w.pool).await.is_err());
+    expire(&u.w.pool).await.unwrap_err();
     assert_eq!(snapshot(&u, &job).await, before);
     assert_eq!(holders(&u).await, format!("{VIN_A}>{job}"));
     run(&u, "DROP TRIGGER refuse ON vehicle_locks").await;

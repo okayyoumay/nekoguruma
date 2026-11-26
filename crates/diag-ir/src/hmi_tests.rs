@@ -30,7 +30,7 @@ fn forms_and_templates_round_trip() {
     );
     assert_eq!(decode_form(&encode_form(&form).unwrap()).unwrap(), form);
     // A form is not a template, and neither takes trailing bytes.
-    assert!(decode_form(&bytes).is_err());
+    decode_form(&bytes).unwrap_err();
     let mut longer = encode_form(&form).unwrap();
     longer.push(0);
     assert_eq!(decode_form(&longer), Err(HmiError::Malformed));

@@ -526,6 +526,6 @@ async fn start_fails_when_the_port_is_taken() {
         shutdown_grace_secs: 2,
     };
     let pool = db::pool_lazy(options, Duration::from_secs(1));
-    assert!(Server::bind(&http, pool, test_key()).await.is_err());
+    Server::bind(&http, pool, test_key()).await.unwrap_err();
     s.finish().await;
 }

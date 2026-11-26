@@ -1763,7 +1763,7 @@ def main():
         ["both"]
     );
     // The call used as a statement still sends: without a third answer the run fails.
-    assert!(answered(source, &[&[0x7F, 0x22, 0x31], &[0x62]]).is_err());
+    answered(source, &[&[0x7F, 0x22, 0x31], &[0x62]]).unwrap_err();
 }
 
 #[test]

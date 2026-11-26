@@ -1875,7 +1875,7 @@ mod tests {
     fn validate_vendor_struct_type_keys_passes_when_table_absent() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let _guard = test_support::set(temp.path());
-        assert!(validate_vendor_struct_type_keys("iso22900", None, "TestLib").is_ok());
+        validate_vendor_struct_type_keys("iso22900", None, "TestLib").unwrap();
     }
 
     #[test]
@@ -1905,8 +1905,8 @@ mod tests {
             "0x80000002" = 16
         "#,
         );
-        assert!(validate_vendor_struct_type_keys("iso22900", Some("x86_64"), "TestLib").is_ok());
-        assert!(validate_vendor_struct_type_keys("iso22900", None, "TestLib").is_ok());
+        validate_vendor_struct_type_keys("iso22900", Some("x86_64"), "TestLib").unwrap();
+        validate_vendor_struct_type_keys("iso22900", None, "TestLib").unwrap();
     }
 
     #[test]
@@ -2003,7 +2003,7 @@ mod tests {
             "0x00000004" = 16
         "#,
         );
-        assert!(validate_vendor_struct_type_keys("iso22900", None, "TestLib").is_ok());
+        validate_vendor_struct_type_keys("iso22900", None, "TestLib").unwrap();
     }
 
     #[test]
@@ -2082,7 +2082,7 @@ mod tests {
             "0x80000001" = 0
         "#,
         );
-        assert!(validate_vendor_struct_type_keys("iso22900", Some("x86_64"), "TestLib").is_ok());
+        validate_vendor_struct_type_keys("iso22900", Some("x86_64"), "TestLib").unwrap();
     }
 
     #[test]

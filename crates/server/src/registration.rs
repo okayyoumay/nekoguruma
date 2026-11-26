@@ -243,9 +243,9 @@ mod tests {
 
     #[test]
     fn the_name_is_one_to_128_characters_without_control_characters() {
-        assert!(request("a", &"x".repeat(128), KEY, None).is_ok());
+        request("a", &"x".repeat(128), KEY, None).unwrap();
         // Characters, not bytes.
-        assert!(request("a", &"\u{732b}".repeat(128), KEY, None).is_ok());
+        request("a", &"\u{732b}".repeat(128), KEY, None).unwrap();
         for bad in [
             String::new(),
             "x".repeat(129),

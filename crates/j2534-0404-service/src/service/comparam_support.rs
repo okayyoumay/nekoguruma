@@ -1899,28 +1899,24 @@ mod tests {
             }
         }
         for proto in [ChannelProtocol::CAN, ChannelProtocol::ISO14230] {
-            assert!(check_param_allowed(proto, PARAM_P2_STAR, None).is_ok());
+            check_param_allowed(proto, PARAM_P2_STAR, None).unwrap();
         }
     }
 
     #[test]
     fn can_bit_sample_point_only_for_can_family() {
-        assert!(
-            check_param_allowed(
-                ChannelProtocol::CAN,
-                ComParamId(j2534_0404::BIT_SAMPLE_POINT),
-                None,
-            )
-            .is_ok()
-        );
-        assert!(
-            check_param_allowed(
-                ChannelProtocol::ISO15765,
-                ComParamId(j2534_0404::BIT_SAMPLE_POINT),
-                None,
-            )
-            .is_ok()
-        );
+        check_param_allowed(
+            ChannelProtocol::CAN,
+            ComParamId(j2534_0404::BIT_SAMPLE_POINT),
+            None,
+        )
+        .unwrap();
+        check_param_allowed(
+            ChannelProtocol::ISO15765,
+            ComParamId(j2534_0404::BIT_SAMPLE_POINT),
+            None,
+        )
+        .unwrap();
         assert!(
             check_param_allowed(
                 ChannelProtocol::ISO9141,
@@ -1973,18 +1969,13 @@ mod tests {
     /// already made pass even before this fix).
     #[test]
     fn canfd_tx_max_data_length_is_allowed_for_can_family() {
-        assert!(
-            check_param_allowed(ChannelProtocol::CAN, PARAM_CANFD_TX_MAX_DATA_LENGTH, None,)
-                .is_ok()
-        );
-        assert!(
-            check_param_allowed(
-                ChannelProtocol::ISO15765,
-                PARAM_CANFD_TX_MAX_DATA_LENGTH,
-                None,
-            )
-            .is_ok()
-        );
+        check_param_allowed(ChannelProtocol::CAN, PARAM_CANFD_TX_MAX_DATA_LENGTH, None).unwrap();
+        check_param_allowed(
+            ChannelProtocol::ISO15765,
+            PARAM_CANFD_TX_MAX_DATA_LENGTH,
+            None,
+        )
+        .unwrap();
         assert!(
             check_param_allowed(
                 ChannelProtocol::ISO9141,
@@ -1997,22 +1988,18 @@ mod tests {
 
     #[test]
     fn kwp_p_timers_only_for_kwp_family() {
-        assert!(
-            check_param_allowed(
-                ChannelProtocol::ISO9141,
-                ComParamId(j2534_0404::P1_MIN),
-                None,
-            )
-            .is_ok()
-        );
-        assert!(
-            check_param_allowed(
-                ChannelProtocol::ISO14230,
-                ComParamId(j2534_0404::P1_MIN),
-                None,
-            )
-            .is_ok()
-        );
+        check_param_allowed(
+            ChannelProtocol::ISO9141,
+            ComParamId(j2534_0404::P1_MIN),
+            None,
+        )
+        .unwrap();
+        check_param_allowed(
+            ChannelProtocol::ISO14230,
+            ComParamId(j2534_0404::P1_MIN),
+            None,
+        )
+        .unwrap();
         assert!(
             check_param_allowed(ChannelProtocol::CAN, ComParamId(j2534_0404::P1_MIN), None,)
                 .is_err()
@@ -2065,14 +2052,12 @@ mod tests {
 
     #[test]
     fn network_line_only_for_j1850pwm() {
-        assert!(
-            check_param_allowed(
-                ChannelProtocol::J1850PWM,
-                ComParamId(j2534_0404::NETWORK_LINE),
-                None,
-            )
-            .is_ok()
-        );
+        check_param_allowed(
+            ChannelProtocol::J1850PWM,
+            ComParamId(j2534_0404::NETWORK_LINE),
+            None,
+        )
+        .unwrap();
         assert!(
             check_param_allowed(
                 ChannelProtocol::J1850VPW,
@@ -2098,22 +2083,18 @@ mod tests {
     /// ADR-170's rejected-alternatives section discusses) is rejected.
     #[test]
     fn uart_echo_byte_ps_allows_only_universal_params() {
-        assert!(
-            check_param_allowed(
-                ChannelProtocol::UART_ECHO_BYTE_PS,
-                ComParamId(j2534_0404::DATA_RATE),
-                None,
-            )
-            .is_ok()
-        );
-        assert!(
-            check_param_allowed(
-                ChannelProtocol::UART_ECHO_BYTE_PS,
-                ComParamId(j2534_0404::LOOPBACK),
-                None,
-            )
-            .is_ok()
-        );
+        check_param_allowed(
+            ChannelProtocol::UART_ECHO_BYTE_PS,
+            ComParamId(j2534_0404::DATA_RATE),
+            None,
+        )
+        .unwrap();
+        check_param_allowed(
+            ChannelProtocol::UART_ECHO_BYTE_PS,
+            ComParamId(j2534_0404::LOOPBACK),
+            None,
+        )
+        .unwrap();
         assert!(
             check_param_allowed(
                 ChannelProtocol::UART_ECHO_BYTE_PS,
@@ -2354,22 +2335,10 @@ mod tests {
         // KWP family (ISO 9141-2, ISO 14230-2/-4) and SAE J1850 VPW/PWM
         // only, not CAN/ISO15765 or SCI (the 2009(E) edition disagreed --
         // see ADR-148).
-        assert!(
-            check_param_allowed(ChannelProtocol::ISO9141, PARAM_ENABLE_CONCATENATION, None,)
-                .is_ok()
-        );
-        assert!(
-            check_param_allowed(ChannelProtocol::ISO14230, PARAM_ENABLE_CONCATENATION, None,)
-                .is_ok()
-        );
-        assert!(
-            check_param_allowed(ChannelProtocol::J1850VPW, PARAM_ENABLE_CONCATENATION, None,)
-                .is_ok()
-        );
-        assert!(
-            check_param_allowed(ChannelProtocol::J1850PWM, PARAM_ENABLE_CONCATENATION, None,)
-                .is_ok()
-        );
+        check_param_allowed(ChannelProtocol::ISO9141, PARAM_ENABLE_CONCATENATION, None).unwrap();
+        check_param_allowed(ChannelProtocol::ISO14230, PARAM_ENABLE_CONCATENATION, None).unwrap();
+        check_param_allowed(ChannelProtocol::J1850VPW, PARAM_ENABLE_CONCATENATION, None).unwrap();
+        check_param_allowed(ChannelProtocol::J1850PWM, PARAM_ENABLE_CONCATENATION, None).unwrap();
         assert!(
             check_param_allowed(ChannelProtocol::CAN, PARAM_ENABLE_CONCATENATION, None,).is_err()
         );
@@ -2389,22 +2358,18 @@ mod tests {
 
     #[test]
     fn sci_timing_only_for_sci_family() {
-        assert!(
-            check_param_allowed(
-                ChannelProtocol::SCI_A_ENGINE,
-                ComParamId(j2534_0404::T1_MAX),
-                None,
-            )
-            .is_ok()
-        );
-        assert!(
-            check_param_allowed(
-                ChannelProtocol::SCI_B_TRANS,
-                ComParamId(j2534_0404::T1_MAX),
-                None,
-            )
-            .is_ok()
-        );
+        check_param_allowed(
+            ChannelProtocol::SCI_A_ENGINE,
+            ComParamId(j2534_0404::T1_MAX),
+            None,
+        )
+        .unwrap();
+        check_param_allowed(
+            ChannelProtocol::SCI_B_TRANS,
+            ComParamId(j2534_0404::T1_MAX),
+            None,
+        )
+        .unwrap();
         assert!(
             check_param_allowed(ChannelProtocol::CAN, ComParamId(j2534_0404::T1_MAX), None,)
                 .is_err()
@@ -2421,22 +2386,18 @@ mod tests {
 
     #[test]
     fn iso15765_flow_control_for_can_family_only() {
-        assert!(
-            check_param_allowed(
-                ChannelProtocol::ISO15765,
-                ComParamId(j2534_0404::ISO15765_BS),
-                None,
-            )
-            .is_ok()
-        );
-        assert!(
-            check_param_allowed(
-                ChannelProtocol::CAN,
-                ComParamId(j2534_0404::ISO15765_BS),
-                None,
-            )
-            .is_ok()
-        );
+        check_param_allowed(
+            ChannelProtocol::ISO15765,
+            ComParamId(j2534_0404::ISO15765_BS),
+            None,
+        )
+        .unwrap();
+        check_param_allowed(
+            ChannelProtocol::CAN,
+            ComParamId(j2534_0404::ISO15765_BS),
+            None,
+        )
+        .unwrap();
         assert!(
             check_param_allowed(
                 ChannelProtocol::ISO9141,
@@ -2451,7 +2412,7 @@ mod tests {
     fn can_service_params_only_for_can_family() {
         // CP_CanFuncReqId is a shared functional address (not PDU_PC_UNIQUE_ID
         // class), so it goes through Get/SetComParam like any other CAN param.
-        assert!(check_param_allowed(ChannelProtocol::CAN, PARAM_CAN_FUNC_REQ_ID, None,).is_ok());
+        check_param_allowed(ChannelProtocol::CAN, PARAM_CAN_FUNC_REQ_ID, None).unwrap();
         assert!(
             check_param_allowed(ChannelProtocol::ISO9141, PARAM_CAN_FUNC_REQ_ID, None,).is_err()
         );
@@ -2487,9 +2448,7 @@ mod tests {
             check_param_allowed(ChannelProtocol::J1939_PS, PARAM_J1939_SOURCE_ADDRESS, None,)
                 .is_err()
         );
-        assert!(
-            check_param_allowed(ChannelProtocol::J1939_PS, PARAM_J1939_SOURCE_NAME, None,).is_ok()
-        );
+        check_param_allowed(ChannelProtocol::J1939_PS, PARAM_J1939_SOURCE_NAME, None).unwrap();
         assert!(
             check_param_allowed(ChannelProtocol::ISO9141, PARAM_ECU_RESP_SOURCE_ADDR, None,)
                 .is_err()
@@ -2512,65 +2471,51 @@ mod tests {
         }
 
         // Request-side / non-unique counterparts are unaffected.
-        assert!(check_param_allowed(ChannelProtocol::CAN, PARAM_CAN_FUNC_REQ_ID, None,).is_ok());
-        assert!(
-            check_param_allowed(ChannelProtocol::CAN, PARAM_J1939_TARGET_ADDRESS, None,).is_ok()
-        );
-        assert!(check_param_allowed(ChannelProtocol::ISO9141, PARAM_MID_REQ_ID, None,).is_ok());
+        check_param_allowed(ChannelProtocol::CAN, PARAM_CAN_FUNC_REQ_ID, None).unwrap();
+        check_param_allowed(ChannelProtocol::CAN, PARAM_J1939_TARGET_ADDRESS, None).unwrap();
+        check_param_allowed(ChannelProtocol::ISO9141, PARAM_MID_REQ_ID, None).unwrap();
     }
 
     #[test]
     fn j1939_params_only_for_can_family() {
-        assert!(check_param_allowed(ChannelProtocol::CAN, PARAM_J1939_NAME, None,).is_ok());
-        assert!(check_param_allowed(ChannelProtocol::ISO15765, PARAM_J1939_NAME, None,).is_ok());
+        check_param_allowed(ChannelProtocol::CAN, PARAM_J1939_NAME, None).unwrap();
+        check_param_allowed(ChannelProtocol::ISO15765, PARAM_J1939_NAME, None).unwrap();
         assert!(check_param_allowed(ChannelProtocol::ISO9141, PARAM_J1939_NAME, None,).is_err());
     }
 
     #[test]
     fn tester_present_for_can_and_kwp_not_sci() {
-        assert!(check_param_allowed(ChannelProtocol::CAN, PARAM_TESTER_PRESENT_MSG, None,).is_ok());
-        assert!(
-            check_param_allowed(ChannelProtocol::ISO14230, PARAM_TESTER_PRESENT_MSG, None,).is_ok()
-        );
-        assert!(
-            check_param_allowed(ChannelProtocol::J1850PWM, PARAM_TESTER_PRESENT_MSG, None,).is_ok()
-        );
-        assert!(
-            check_param_allowed(
-                ChannelProtocol::SCI_A_ENGINE,
-                PARAM_TESTER_PRESENT_MSG,
-                None,
-            )
-            .is_ok()
-        );
+        check_param_allowed(ChannelProtocol::CAN, PARAM_TESTER_PRESENT_MSG, None).unwrap();
+        check_param_allowed(ChannelProtocol::ISO14230, PARAM_TESTER_PRESENT_MSG, None).unwrap();
+        check_param_allowed(ChannelProtocol::J1850PWM, PARAM_TESTER_PRESENT_MSG, None).unwrap();
+        check_param_allowed(
+            ChannelProtocol::SCI_A_ENGINE,
+            PARAM_TESTER_PRESENT_MSG,
+            None,
+        )
+        .unwrap();
     }
 
     #[test]
     fn uart_data_bits_for_kwp_and_sci_not_can() {
-        assert!(
-            check_param_allowed(
-                ChannelProtocol::ISO9141,
-                ComParamId(j2534_0404::DATA_BITS),
-                None,
-            )
-            .is_ok()
-        );
-        assert!(
-            check_param_allowed(
-                ChannelProtocol::ISO14230,
-                ComParamId(j2534_0404::DATA_BITS),
-                None,
-            )
-            .is_ok()
-        );
-        assert!(
-            check_param_allowed(
-                ChannelProtocol::SCI_A_ENGINE,
-                ComParamId(j2534_0404::DATA_BITS),
-                None,
-            )
-            .is_ok()
-        );
+        check_param_allowed(
+            ChannelProtocol::ISO9141,
+            ComParamId(j2534_0404::DATA_BITS),
+            None,
+        )
+        .unwrap();
+        check_param_allowed(
+            ChannelProtocol::ISO14230,
+            ComParamId(j2534_0404::DATA_BITS),
+            None,
+        )
+        .unwrap();
+        check_param_allowed(
+            ChannelProtocol::SCI_A_ENGINE,
+            ComParamId(j2534_0404::DATA_BITS),
+            None,
+        )
+        .unwrap();
         assert!(
             check_param_allowed(
                 ChannelProtocol::CAN,
@@ -2592,22 +2537,18 @@ mod tests {
     #[test]
     fn unknown_protocol_allows_all() {
         // Protocol 0xFFFF is unknown — allow everything for forward-compat.
-        assert!(
-            check_param_allowed(
-                ChannelProtocol::from_raw(0xFFFF),
-                ComParamId(j2534_0404::BIT_SAMPLE_POINT),
-                None,
-            )
-            .is_ok()
-        );
-        assert!(
-            check_param_allowed(
-                ChannelProtocol::from_raw(0xFFFF),
-                PARAM_CAN_PHYS_REQ_ID,
-                None,
-            )
-            .is_ok()
-        );
+        check_param_allowed(
+            ChannelProtocol::from_raw(0xFFFF),
+            ComParamId(j2534_0404::BIT_SAMPLE_POINT),
+            None,
+        )
+        .unwrap();
+        check_param_allowed(
+            ChannelProtocol::from_raw(0xFFFF),
+            PARAM_CAN_PHYS_REQ_ID,
+            None,
+        )
+        .unwrap();
     }
 
     /// Codex review, PR #70 round 3: unlike every other ComParam, an unknown/
@@ -3665,16 +3606,12 @@ mod tests {
     /// A correctly-shaped value for the matching param_id is accepted.
     #[test]
     fn matching_shapes_are_accepted() {
-        assert!(
-            validate_structfield_shape(
-                PARAM_ACCESS_TIMING_ECU,
-                &access_timing_sf(vec![10, 20, 30, 40, 50])
-            )
-            .is_ok()
-        );
-        assert!(
-            validate_structfield_shape(PARAM_SESSION_TIMING_OVERRIDE, &session_timing_sf()).is_ok()
-        );
+        validate_structfield_shape(
+            PARAM_ACCESS_TIMING_ECU,
+            &access_timing_sf(vec![10, 20, 30, 40, 50]),
+        )
+        .unwrap();
+        validate_structfield_shape(PARAM_SESSION_TIMING_OVERRIDE, &session_timing_sf()).unwrap();
     }
 
     /// An explicitly empty Structfield (`data: None`) is valid for every
@@ -3683,7 +3620,7 @@ mod tests {
     fn empty_structfield_is_always_accepted() {
         let empty = vci_service_interface::ParamStructfield { data: None };
         for param in STRUCTFIELD_PARAMS {
-            assert!(validate_structfield_shape(*param, &empty).is_ok());
+            validate_structfield_shape(*param, &empty).unwrap();
         }
     }
 

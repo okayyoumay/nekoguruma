@@ -558,11 +558,11 @@ mod tests {
     fn malformed_public_keys_are_refused() {
         let key = kat_public();
         let der = key.to_spki_der();
-        assert!(PublicKey::from_spki_der(&[]).is_err());
-        assert!(PublicKey::from_spki_der(&der[..der.len() - 1]).is_err());
+        PublicKey::from_spki_der(&[]).unwrap_err();
+        PublicKey::from_spki_der(&der[..der.len() - 1]).unwrap_err();
         let mut long = der.clone();
         long.push(0);
-        assert!(PublicKey::from_spki_der(&long).is_err());
+        PublicKey::from_spki_der(&long).unwrap_err();
         // Last byte of the point changed: the point is no longer on the curve.
         let mut off_curve = der.clone();
         *off_curve.last_mut().unwrap() ^= 1;
@@ -628,10 +628,10 @@ mod tests {
             let pem = good.replace("PUBLIC KEY", label);
             assert!(PublicKey::from_spki_pem(&pem).is_err(), "{label}");
         }
-        assert!(PublicKey::from_spki_pem("").is_err());
-        assert!(PublicKey::from_spki_pem("not pem").is_err());
-        assert!(PublicKey::from_spki_pem(&format!("junk\n{good}")).is_err());
-        assert!(PublicKey::from_spki_pem(&format!("{good}junk\n")).is_err());
+        PublicKey::from_spki_pem("").unwrap_err();
+        PublicKey::from_spki_pem("not pem").unwrap_err();
+        PublicKey::from_spki_pem(&format!("junk\n{good}")).unwrap_err();
+        PublicKey::from_spki_pem(&format!("{good}junk\n")).unwrap_err();
     }
 
     #[test]
@@ -687,7 +687,7 @@ mod tests {
         der.extend(hex(KAT_SECRET));
         der.extend(hex("a144034200"));
         der.extend_from_slice(point);
-        assert!(SigningKey::from_pkcs8_der(&der).is_err());
+        SigningKey::from_pkcs8_der(&der).unwrap_err();
         // The same document with the matching point is accepted.
         let mut matching = der[..der.len() - 65].to_vec();
         matching.push(4);
@@ -707,10 +707,10 @@ mod tests {
         assert_eq!(back.public_key(), key.public_key());
         // Signing is deterministic, so equal keys give equal signatures.
         assert_eq!(back.sign(b"m").unwrap(), key.sign(b"m").unwrap());
-        assert!(SigningKey::from_pkcs8_der(&der[..der.len() - 1]).is_err());
-        assert!(SigningKey::from_pkcs8_der(&[]).is_err());
+        SigningKey::from_pkcs8_der(&der[..der.len() - 1]).unwrap_err();
+        SigningKey::from_pkcs8_der(&[]).unwrap_err();
         // A public key is not a private key.
-        assert!(SigningKey::from_pkcs8_der(&key.public_key().to_spki_der()).is_err());
+        SigningKey::from_pkcs8_der(&key.public_key().to_spki_der()).unwrap_err();
     }
 
     #[test]

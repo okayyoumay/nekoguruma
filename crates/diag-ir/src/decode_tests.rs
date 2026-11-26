@@ -1204,7 +1204,7 @@ fn layouts_nest_at_most_sixteen_deep() {
             })
             .collect::<Vec<_>>()
     };
-    assert!(decode_nested(&[], vec![group(1, 1)], chain(16), &[SID, 1]).is_ok());
+    decode_nested(&[], vec![group(1, 1)], chain(16), &[SID, 1]).unwrap();
     assert_eq!(
         decode_nested(&[], vec![group(1, 1)], chain(17), &[SID, 1]),
         Err(DecodeError::TooDeep { field: 116 })
@@ -1230,7 +1230,7 @@ fn a_message_decodes_to_at_most_65536_values() {
     let layouts = || vec![layout(1, 0, vec![next(10, DataKind::Uint, 8)])];
     let mut message = vec![SID];
     message.resize(1 + MAX_DECODED_VALUES, 0);
-    assert!(decode_nested(&[], fixed(32_767), layouts(), &message).is_ok());
+    decode_nested(&[], fixed(32_767), layouts(), &message).unwrap();
     assert_eq!(
         decode_nested(&[], fixed(32_768), layouts(), &message),
         Err(DecodeError::TooManyValues)
@@ -1315,7 +1315,7 @@ fn table_entries_looked_at_are_bounded() {
         decode_nested(&[], vec![group(1, 1)], doubling(14, innermost), &[SID, 0])
     };
     assert_eq!(MAX_TABLE_ENTRIES, (1 << 13) * 2048);
-    assert!(decode(2048).is_ok());
+    decode(2048).unwrap();
     assert_eq!(decode(2049), Err(DecodeError::TooLarge));
 }
 
@@ -1325,7 +1325,7 @@ fn only_the_entries_looked_at_count_toward_the_table_budget() {
     // entry each, far below the budget.
     let cases = (0..4096).map(|n| (n, n, 0)).collect();
     let innermost = vec![at(5, DataKind::Uint, 0, 8), select(6, 5, cases, None)];
-    assert!(decode_nested(&[], vec![group(1, 1)], doubling(14, innermost), &[SID, 0]).is_ok());
+    decode_nested(&[], vec![group(1, 1)], doubling(14, innermost), &[SID, 0]).unwrap();
     // A text table and a scale-linear conversion matched by their first entry, likewise.
     let entries = (0..4096)
         .map(|n| TextEntryT {
@@ -1356,15 +1356,13 @@ fn only_the_entries_looked_at_count_toward_the_table_budget() {
             scales: Some(scales),
         })),
     );
-    assert!(
-        decode_nested(
-            &[],
-            vec![group(1, 1)],
-            doubling(14, vec![text, scaled]),
-            &[SID, 0]
-        )
-        .is_ok()
-    );
+    decode_nested(
+        &[],
+        vec![group(1, 1)],
+        doubling(14, vec![text, scaled]),
+        &[SID, 0],
+    )
+    .unwrap();
 }
 
 #[test]

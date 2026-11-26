@@ -50,6 +50,7 @@ unused_lifetimes = "warn"
 
 [workspace.lints.clippy]
 allow_attributes_without_reason = "warn"
+assertions_on_result_states = "warn"
 disallowed_script_idents = "warn"
 empty_drop = "warn"
 empty_enum_variants_with_brackets = "warn"

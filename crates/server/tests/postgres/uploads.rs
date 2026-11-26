@@ -3469,11 +3469,11 @@ async fn the_table_refuses_what_the_rules_forbid() {
         .execute(&fx.u.w.pool)
         .await
         .unwrap();
-    assert!(insert("state = 'open'").await.is_ok());
-    assert!(insert("state = 'completing'").await.is_err());
-    assert!(insert("generation = 2").await.is_ok());
-    assert!(insert("state = 'failed'").await.is_ok());
-    assert!(insert("state = 'failed'").await.is_ok());
+    insert("state = 'open'").await.unwrap();
+    insert("state = 'completing'").await.unwrap_err();
+    insert("generation = 2").await.unwrap();
+    insert("state = 'failed'").await.unwrap();
+    insert("state = 'failed'").await.unwrap();
     // The key of an object is one row's.
     sqlx::query("UPDATE job_objects SET storage_key = repeat('a', 36)")
         .execute(&fx.u.w.pool)

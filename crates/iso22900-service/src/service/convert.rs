@@ -1040,7 +1040,7 @@ mod tests {
     #[test]
     fn resolve_param_item_id_rejects_missing_id() {
         let result = resolve_param_item_id(None, |_| panic!("resolver should not be called"));
-        assert!(result.is_err());
+        result.unwrap_err();
     }
 
     // ── ADR-218: STRUCTFIELD ComParam support ──────────────────────────────

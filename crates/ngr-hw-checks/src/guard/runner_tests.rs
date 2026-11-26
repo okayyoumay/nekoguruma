@@ -628,12 +628,12 @@ async fn a_module_request_of_a_job_is_refused_and_traced_as_a_refusal() {
             module_handle: Some(ModuleHandle { module_handle: 1 }),
         })
         .await;
-    assert!(disconnect.is_err());
+    disconnect.unwrap_err();
     assert!(fake.log.lock().unwrap().is_empty());
     let trace = client.trace().lock().unwrap().clone();
     assert_eq!(trace.len(), 1, "{trace:?}");
     assert_eq!(trace[0].0, "ModuleConnect");
-    assert!(trace[0].1.is_err());
+    trace[0].1.as_ref().unwrap_err();
     run.pass();
     assert!(run.run_teardown().is_empty());
 }

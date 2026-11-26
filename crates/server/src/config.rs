@@ -457,23 +457,21 @@ mod tests {
 
     #[test]
     fn the_database_table_and_its_url_are_required() {
-        assert!(Config::parse("").is_err());
-        assert!(Config::parse("[http]\nport = 9001\n").is_err());
-        assert!(Config::parse("[database]\nconnect_timeout_secs = 3\n").is_err());
+        Config::parse("").unwrap_err();
+        Config::parse("[http]\nport = 9001\n").unwrap_err();
+        Config::parse("[database]\nconnect_timeout_secs = 3\n").unwrap_err();
     }
 
     #[test]
     fn the_instruction_key_table_and_its_path_are_required() {
         let db_only = "[database]\nurl = \"postgres://ngr:pw@127.0.0.1:5432/nekoguruma\"\n";
-        assert!(Config::parse(db_only).is_err());
-        assert!(Config::parse(&format!("[instruction_key]\n{db_only}")).is_err());
-        assert!(
-            Config::parse(&format!(
-                "[instruction_key]\npath = \"/k\"\nmode = 1\n{db_only}"
-            ))
-            .is_err()
-        );
-        assert!(Config::parse(&format!("[instruction_key]\npath = \"/k\"\n{db_only}")).is_ok());
+        Config::parse(db_only).unwrap_err();
+        Config::parse(&format!("[instruction_key]\n{db_only}")).unwrap_err();
+        Config::parse(&format!(
+            "[instruction_key]\npath = \"/k\"\nmode = 1\n{db_only}"
+        ))
+        .unwrap_err();
+        Config::parse(&format!("[instruction_key]\npath = \"/k\"\n{db_only}")).unwrap();
     }
 
     #[test]
@@ -488,14 +486,14 @@ mod tests {
             Err(ConfigError::InstructionKeyPath)
         ));
         std::fs::write(&path, DB).unwrap();
-        assert!(Config::load(&path).is_ok());
+        Config::load(&path).unwrap();
     }
 
     // The `[storage]` table is gone (ADR-492): the object store is a bucket of the object server.
     #[test]
     fn a_storage_table_is_refused() {
         let text = format!("[storage]\ndir = \"/srv/objects\"\n{DB}");
-        assert!(Config::parse(&text).is_err());
+        Config::parse(&text).unwrap_err();
     }
 
     // The bucket of the object store.
@@ -543,8 +541,8 @@ mod tests {
                 "{bad}"
             );
         }
-        assert!(load(&with_bucket(&"a".repeat(63))).is_ok());
-        assert!(load(&with_bucket("abc")).is_ok());
+        load(&with_bucket(&"a".repeat(63))).unwrap();
+        load(&with_bucket("abc")).unwrap();
         assert!(is_valid_bucket("health-check"));
     }
 
@@ -643,17 +641,17 @@ mod tests {
         assert_eq!(object.resolved_port(8080).unwrap(), 8081);
         assert_eq!(load(DB).unwrap().object_server.unwrap().port, None);
         // The default overflows at 65535; 0 and the server's own port are refused.
-        assert!(object.resolved_port(65535).is_err());
+        object.resolved_port(65535).unwrap_err();
         let with = |port: u16| ObjectServerConfig {
             port: Some(port),
             ..object.clone()
         };
         assert_eq!(with(9000).resolved_port(8080).unwrap(), 9000);
         assert_eq!(with(9000).resolved_port(65535).unwrap(), 9000);
-        assert!(with(0).resolved_port(8080).is_err());
-        assert!(with(8080).resolved_port(8080).is_err());
+        with(0).resolved_port(8080).unwrap_err();
+        with(8080).resolved_port(8080).unwrap_err();
         // A server port of 0 (code-built) needs an explicit port, and is not compared.
-        assert!(object.resolved_port(0).is_err());
+        object.resolved_port(0).unwrap_err();
         assert_eq!(with(9000).resolved_port(0).unwrap(), 9000);
         // The same rules apply when a file is loaded.
         for (http, port) in [
@@ -708,26 +706,26 @@ mod tests {
 
     #[test]
     fn unknown_keys_are_refused() {
-        assert!(Config::parse(&with_db("colour = 1")).is_err());
-        assert!(Config::parse(&with_db("[http]\nport = 1\nextra = 2")).is_err());
-        assert!(Config::parse(&format!("{DB}extra = 1\n")).is_err());
+        Config::parse(&with_db("colour = 1")).unwrap_err();
+        Config::parse(&with_db("[http]\nport = 1\nextra = 2")).unwrap_err();
+        Config::parse(&format!("{DB}extra = 1\n")).unwrap_err();
     }
 
     #[test]
     fn a_bind_address_key_does_not_exist() {
-        assert!(Config::parse(&with_db("[http]\nbind = \"0.0.0.0\"")).is_err());
-        assert!(Config::parse(&with_db("[http]\nhost = \"localhost\"")).is_err());
+        Config::parse(&with_db("[http]\nbind = \"0.0.0.0\"")).unwrap_err();
+        Config::parse(&with_db("[http]\nhost = \"localhost\"")).unwrap_err();
     }
 
     #[test]
     fn another_profile_is_refused() {
-        assert!(Config::parse(&with_db("profile = \"standard\"")).is_err());
+        Config::parse(&with_db("profile = \"standard\"")).unwrap_err();
     }
 
     #[test]
     fn a_port_out_of_range_or_of_the_wrong_type_is_refused() {
-        assert!(Config::parse(&with_db("[http]\nport = 70000")).is_err());
-        assert!(Config::parse(&with_db("[http]\nport = \"80\"")).is_err());
+        Config::parse(&with_db("[http]\nport = 70000")).unwrap_err();
+        Config::parse(&with_db("[http]\nport = \"80\"")).unwrap_err();
     }
 
     #[test]
@@ -754,7 +752,7 @@ mod tests {
             Err(ConfigError::GraceTooLong)
         ));
         std::fs::write(&long, with_db("[http]\nshutdown_grace_secs = 300\n")).unwrap();
-        assert!(Config::load(&long).is_ok());
+        Config::load(&long).unwrap();
     }
 
     #[test]
@@ -778,7 +776,7 @@ mod tests {
             ));
         }
         std::fs::write(&path, format!("{DB}connect_timeout_secs = 300\n")).unwrap();
-        assert!(Config::load(&path).is_ok());
+        Config::load(&path).unwrap();
 
         for url in [
             "mysql://u:s3cret-value@h/db",

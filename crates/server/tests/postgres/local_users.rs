@@ -1340,11 +1340,9 @@ async fn adding_an_existing_user_writes_nothing_and_one_of_two_adds_at_once_lose
         "other",
     )
     .await;
-    assert!(
-        add_user(&lab.pool, "zed", "Zed", &[], password())
-            .await
-            .is_ok()
-    );
+    add_user(&lab.pool, "zed", "Zed", &[], password())
+        .await
+        .unwrap();
     // Two adds at once, on a database with no local tenant yet.
     let fresh = Lab::new().await;
     let (x, y) = tokio::join!(

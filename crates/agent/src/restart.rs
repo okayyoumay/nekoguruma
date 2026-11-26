@@ -3819,7 +3819,7 @@ mod tests {
             &mut host,
             &AtomicBool::new(false),
         );
-        assert!(failed.is_err());
+        failed.unwrap_err();
         assert_eq!(host.0.session, sim_ecu::Session::Extended);
     }
 

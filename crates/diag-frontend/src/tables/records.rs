@@ -248,7 +248,7 @@ mod tests {
         ] {
             assert_eq!(error(bad).line, 2, "{bad:?}");
         }
-        assert!(parse(b"a\n\"b\rc\r\nd\"\n").is_ok());
+        parse(b"a\n\"b\rc\r\nd\"\n").unwrap();
         assert_eq!(error(b"a\nb\"c\n").line, 2);
         assert_eq!(error(b"\"a\"b\n").line, 1);
         assert_eq!(error(b"a\rb\n").line, 1);
@@ -256,6 +256,6 @@ mod tests {
         // Invalid UTF-8 on line 3.
         assert_eq!(error(b"a\nb\nc\xFF\n").line, 3);
         // A second byte order mark is not skipped; it is just a character.
-        assert!(parse(b"\xEF\xBB\xBF\xEF\xBB\xBFa").is_ok());
+        parse(b"\xEF\xBB\xBF\xEF\xBB\xBFa").unwrap();
     }
 }

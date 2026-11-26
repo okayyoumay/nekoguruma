@@ -97,7 +97,7 @@ fn matching_is_exact_and_case_sensitive() {
             "{name:?}"
         );
     }
-    assert!(resolve_in_root_file(&file, "Vendor").is_ok());
+    resolve_in_root_file(&file, "Vendor").unwrap();
 }
 
 #[test]
@@ -131,7 +131,7 @@ fn an_unusable_entry_of_another_name_does_not_block() {
         entry("GOOD", "g/lib.so"),
     ));
     let (_dir, file) = write_root(&xml);
-    assert!(resolve_in_root_file(&file, "GOOD").is_ok());
+    resolve_in_root_file(&file, "GOOD").unwrap();
 }
 
 #[test]
@@ -397,7 +397,7 @@ fn unix_forms() {
 
 #[test]
 fn file_uri_scheme_is_case_insensitive_and_required() {
-    assert!(uri_to_path(&uri("a/lib.so").replacen("file", "FILE", 1)).is_ok());
+    uri_to_path(&uri("a/lib.so").replacen("file", "FILE", 1)).unwrap();
     assert_eq!(uri_to_path("http://h/opt/x"), Err(UriFault::Invalid));
     assert_eq!(uri_to_path(""), Err(UriFault::Invalid));
 }
@@ -647,7 +647,7 @@ fn the_size_limit_is_exact() {
 
     let (_dir, file) = write_root(&pad(MAX_ROOT_FILE_SIZE));
     assert_eq!(fs::metadata(&file).unwrap().len(), MAX_ROOT_FILE_SIZE);
-    assert!(resolve_in_root_file(&file, "X").is_ok());
+    resolve_in_root_file(&file, "X").unwrap();
 
     let (_dir, file) = write_root(&pad(MAX_ROOT_FILE_SIZE + 1));
     assert_eq!(fs::metadata(&file).unwrap().len(), MAX_ROOT_FILE_SIZE + 1);

@@ -341,7 +341,7 @@ mod tests {
         let result = ioctl_input_to_owned(DataItem {
             data: Some(DataItemData::Unum32Value(42)),
         });
-        assert!(result.is_ok());
+        result.unwrap();
     }
 
     #[test]
@@ -353,6 +353,6 @@ mod tests {
                 },
             )),
         });
-        assert!(result.is_ok());
+        result.unwrap();
     }
 }

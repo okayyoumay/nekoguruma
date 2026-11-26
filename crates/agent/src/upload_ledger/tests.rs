@@ -631,7 +631,7 @@ fn a_second_opener_gets_in_use() {
         Err(LedgerError::InUse)
     ));
     drop(first);
-    assert!(UploadLedger::open_in(dir.path(), ID).is_ok());
+    UploadLedger::open_in(dir.path(), ID).unwrap();
 }
 
 // O21
@@ -1011,7 +1011,7 @@ fn a_bad_source_path_or_job_id_is_refused() {
         ));
     }
     let exactly = PathBuf::from(rooted(&"x".repeat(MAX_PATH_BYTES - ROOT.len())));
-    assert!(ledger.enqueue_comm_log(&jk(1), &exactly, digest).is_ok());
+    ledger.enqueue_comm_log(&jk(1), &exactly, digest).unwrap();
     for id in ["", "../x", "a/b", "a.b", &"x".repeat(65)] {
         let key = JobKey {
             job_id: JobId(id.to_owned()),
@@ -1057,7 +1057,7 @@ fn a_poisoned_ledger_refuses_every_enqueue_even_a_duplicate() {
         UploadLedger::open_with(dir.path(), ID, failing_at(Step::AfterWrite, &armed)).unwrap();
     put_result(&mut ledger, 1);
     armed.store(true, Ordering::SeqCst);
-    assert!(ledger.enqueue_result(&jk(2), b"x").is_err());
+    ledger.enqueue_result(&jk(2), b"x").unwrap_err();
     armed.store(false, Ordering::SeqCst);
     assert!(ledger.is_poisoned());
     assert!(matches!(
@@ -1374,7 +1374,7 @@ fn finishing_on_a_poisoned_ledger_says_poisoned_before_anything_else() {
         UploadLedger::open_with(dir.path(), ID, failing_at(Step::BeforeWrite, &armed)).unwrap();
     put_result(&mut ledger, 1);
     armed.store(true, Ordering::SeqCst);
-    assert!(ledger.enqueue_result(&jk(2), b"x").is_err());
+    ledger.enqueue_result(&jk(2), b"x").unwrap_err();
     assert!(matches!(ledger.finished(1), Err(LedgerError::Poisoned)));
     assert!(matches!(ledger.finished(99), Err(LedgerError::Poisoned)));
     assert_eq!(seqs(&ledger), [1]);
@@ -1441,7 +1441,7 @@ fn abandon_on_a_poisoned_ledger_is_refused() {
     let armed = Arc::new(AtomicBool::new(true));
     let mut ledger =
         UploadLedger::open_with(dir.path(), ID, failing_at(Step::AfterSync, &armed)).unwrap();
-    assert!(ledger.enqueue_result(&jk(1), b"x").is_err());
+    ledger.enqueue_result(&jk(1), b"x").unwrap_err();
     assert!(ledger.is_poisoned());
     assert!(matches!(ledger.abandon(1), Err(LedgerError::Poisoned)));
 }
@@ -1658,7 +1658,7 @@ fn a_poisoned_ledger_still_serves_its_entries_from_memory() {
     put_comm(&mut ledger, dir.path(), 1);
     put_result(&mut ledger, 2);
     armed.store(true, Ordering::SeqCst);
-    assert!(ledger.enqueue_result(&jk(3), b"x").is_err());
+    ledger.enqueue_result(&jk(3), b"x").unwrap_err();
     assert!(ledger.is_poisoned());
     assert_eq!(seqs(&ledger), [2, 1]);
     assert_eq!(ledger.next().unwrap().seq, 2);
@@ -1682,5 +1682,5 @@ fn a_file_is_digested_through_one_handle_to_its_end() {
     let digest = digest_file(&path).unwrap();
     assert_eq!(digest.length(), big.len() as u64);
     assert_eq!(*digest.sha256(), <[u8; 32]>::from(Sha256::digest(&big)));
-    assert!(digest_file(&dir.path().join("missing")).is_err());
+    digest_file(&dir.path().join("missing")).unwrap_err();
 }

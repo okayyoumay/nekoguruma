@@ -521,7 +521,7 @@ mod tests {
                 assert_eq!(doc.unpack(), document(), "length {len}");
             }
         }
-        assert!(load_ecu_document(&buf[..buf.len() / 2]).is_err());
+        load_ecu_document(&buf[..buf.len() / 2]).unwrap_err();
     }
 
     #[test]

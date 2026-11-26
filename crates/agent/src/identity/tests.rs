@@ -81,7 +81,7 @@ fn a_first_run_creates_and_a_rerun_finds_the_same_key() {
     let first = load(&store, temp.path()).unwrap();
     assert!(first.created());
     assert_eq!(store.len(), 1);
-    assert!(WriterLock::at(&temp.path().join(format!("{}.lock", name()))).is_ok());
+    WriterLock::at(&temp.path().join(format!("{}.lock", name()))).unwrap();
 
     let second = load_or_create(&store, &name(), &no_lock_dir, WAIT).unwrap();
     assert!(!second.created());
@@ -160,7 +160,7 @@ fn an_absent_key_in_a_store_that_refuses_to_create_is_not_provisioned() {
     assert_eq!(kind(&error), "NotProvisioned");
     assert!(!error.retryable());
     assert!(store.is_empty());
-    assert!(WriterLock::at(&temp.path().join(format!("{}.lock", name()))).is_ok());
+    WriterLock::at(&temp.path().join(format!("{}.lock", name()))).unwrap();
 }
 
 /// L1: a store that cannot create answers "not provisioned" at the first absent read, without
@@ -753,7 +753,7 @@ fn the_file_store_needs_both_variables() {
         (KEY_STORE_VAR, "file".into()),
         (crate::state::STATE_DIR_VAR, abs_dir()),
     ]);
-    assert!(select_store(OperatingMode::User, &good).is_ok());
+    select_store(OperatingMode::User, &good).unwrap();
 }
 
 /// S6 through the file store: a crash left a temporary file; the create succeeds and removes it.

@@ -3372,11 +3372,11 @@ fn unknown_keys_in_a_program_are_refused() {
             r#"{{"schema_version":2,"code":[],"constants":[],"sections":[],"source_map":[]{extra}}}"#
         )
     };
-    assert!(serde_json::from_str::<Program>(&json("")).is_ok());
-    assert!(serde_json::from_str::<Program>(&json(r#","preconditions":{}"#)).is_ok());
+    serde_json::from_str::<Program>(&json("")).unwrap();
+    serde_json::from_str::<Program>(&json(r#","preconditions":{}"#)).unwrap();
     // A misspelt key must not be read as "nothing declared".
-    assert!(serde_json::from_str::<Program>(&json(r#","precondition":{}"#)).is_err());
-    assert!(serde_json::from_str::<Program>(&json(r#","preconditions":{"engin":null}"#)).is_err());
+    serde_json::from_str::<Program>(&json(r#","precondition":{}"#)).unwrap_err();
+    serde_json::from_str::<Program>(&json(r#","preconditions":{"engin":null}"#)).unwrap_err();
 }
 
 /// The layout of `VmState` in schema 1, which had a checkpoint and a resume count at the end.
@@ -3426,7 +3426,7 @@ fn a_version_one_state_still_decodes_and_is_refused() {
     let bytes = postcard::to_allocvec(&old).unwrap();
     let (state, rest) = postcard::take_from_bytes::<VmState>(&bytes).unwrap();
     assert!(!rest.is_empty());
-    assert!(postcard::from_bytes::<VmState>(&bytes).is_ok());
+    postcard::from_bytes::<VmState>(&bytes).unwrap();
     assert_eq!(state.schema_version, 1);
     let current = prog(vec![i(1), i(2)], Vec::new());
     assert!(matches!(

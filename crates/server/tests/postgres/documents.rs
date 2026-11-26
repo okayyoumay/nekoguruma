@@ -1087,7 +1087,10 @@ async fn two_racing_stores_leave_one_row_and_one_object() {
     assert_ne!(deleted[0], kept);
     assert!(issued.contains(&kept) && issued.contains(&deleted[0]));
     // One object: the row's is there, the loser's is gone.
-    assert!(fx.wrap.get(&ObjectKey::parse(&kept).unwrap()).await.is_ok());
+    fx.wrap
+        .get(&ObjectKey::parse(&kept).unwrap())
+        .await
+        .unwrap();
     assert!(matches!(
         fx.wrap.get(&ObjectKey::parse(&deleted[0]).unwrap()).await,
         Err(StoreError::NotFound)

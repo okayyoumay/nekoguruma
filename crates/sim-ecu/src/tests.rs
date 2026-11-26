@@ -2219,7 +2219,7 @@ fn a_startup_in_progress_survives_a_snapshot() {
     ));
     value.as_object_mut().unwrap().remove("startup_left");
     let old: EcuSnapshot = serde_json::from_value(value).unwrap();
-    assert!(SimEcu::restore(old, ManualClock::default(), ms(0)).is_ok());
+    SimEcu::restore(old, ManualClock::default(), ms(0)).unwrap();
 }
 
 #[test]
@@ -3376,12 +3376,10 @@ fn validate_refuses_bad_configured_dids_and_new_does_not_panic() {
             security_level,
         })
     };
-    assert!(with(did(0x1200, vec![1], None)).validate().is_ok());
-    assert!(
-        with(did(0x1200, vec![1], w(Some(Session::Extended), Some(1))))
-            .validate()
-            .is_ok()
-    );
+    with(did(0x1200, vec![1], None)).validate().unwrap();
+    with(did(0x1200, vec![1], w(Some(Session::Extended), Some(1))))
+        .validate()
+        .unwrap();
     for built_in in [
         DID_ACTIVE_DIAGNOSTIC_SESSION,
         DID_SPARE_PART_NUMBER,
@@ -3407,11 +3405,9 @@ fn validate_refuses_bad_configured_dids_and_new_does_not_panic() {
             .validate()
             .is_err()
     );
-    assert!(
-        with(did(0x1200, vec![0; MAX_RESPONSE_LENGTH - 3], None))
-            .validate()
-            .is_ok()
-    );
+    with(did(0x1200, vec![0; MAX_RESPONSE_LENGTH - 3], None))
+        .validate()
+        .unwrap();
     assert!(
         with(did(0x1200, vec![1], w(None, Some(2))))
             .validate()
@@ -3428,11 +3424,9 @@ fn validate_refuses_bad_configured_dids_and_new_does_not_panic() {
             .validate()
             .is_err()
     );
-    assert!(
-        with(did(0x1200, vec![1], w(Some(Session::Default), None)))
-            .validate()
-            .is_ok()
-    );
+    with(did(0x1200, vec![1], w(Some(Session::Default), None)))
+        .validate()
+        .unwrap();
     // An unvalidated configuration builds: the built-in wins, the first duplicate wins.
     let mut ecu = SimEcu::new(EcuConfig {
         dids: vec![

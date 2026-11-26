@@ -484,8 +484,8 @@ mod tests {
             assert_eq!(RegistrationCode::parse(&text), Err(want), "{text:?}");
         }
         // Non-ASCII text, including one that splits a character at the prefix length.
-        assert!(RegistrationCode::parse("ngr1\u{e9}0000000000000000000000000").is_err());
-        assert!(RegistrationCode::parse("\u{e9}\u{e9}\u{e9}").is_err());
+        RegistrationCode::parse("ngr1\u{e9}0000000000000000000000000").unwrap_err();
+        RegistrationCode::parse("\u{e9}\u{e9}\u{e9}").unwrap_err();
     }
 
     // ------------------------------------------------------------- request
@@ -747,9 +747,9 @@ mod tests {
             Err(TranscriptError::BadField { field: "owner_id" })
         );
         let long = "x".repeat(MAX_FIELD_LEN + 1);
-        assert!(new(&long, "o").is_err());
-        assert!(new("a", &long).is_err());
-        assert!(new(&"x".repeat(MAX_FIELD_LEN), "o").is_ok());
+        new(&long, "o").unwrap_err();
+        new("a", &long).unwrap_err();
+        new(&"x".repeat(MAX_FIELD_LEN), "o").unwrap();
         assert_ne!(
             new("ab", "c").unwrap().encode(),
             new("a", "bc").unwrap().encode()
@@ -813,11 +813,11 @@ mod tests {
         let key = SigningKey::generate().unwrap();
         let t = request(&code(), &key.public_key(), server_key_id());
         let bytes = sign_registration(&key, &t).unwrap().to_bytes();
-        assert!(Signature::from_bytes(&bytes[..63]).is_err());
+        Signature::from_bytes(&bytes[..63]).unwrap_err();
         let mut long = bytes.to_vec();
         long.push(0);
-        assert!(Signature::from_bytes(&long).is_err());
-        assert!(Signature::from_bytes(&[]).is_err());
+        Signature::from_bytes(&long).unwrap_err();
+        Signature::from_bytes(&[]).unwrap_err();
     }
 
     #[test]

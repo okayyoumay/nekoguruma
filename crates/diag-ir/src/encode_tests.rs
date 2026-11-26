@@ -387,17 +387,15 @@ fn a_field_may_not_overlap_another_the_sid_or_the_prefix() {
         &[("a", Bytes(&[1])), ("b", Int(7))]
     )));
     // Bit fields that share bytes without sharing bits are fine.
-    assert!(
-        encode(
-            &[],
-            vec![
-                at("a", DataKind::Uint, 8, 4),
-                at("b", DataKind::Uint, 12, 4)
-            ],
-            &[("a", Int(1)), ("b", Int(2))]
-        )
-        .is_ok()
-    );
+    encode(
+        &[],
+        vec![
+            at("a", DataKind::Uint, 8, 4),
+            at("b", DataKind::Uint, 12, 4),
+        ],
+        &[("a", Int(1)), ("b", Int(2))],
+    )
+    .unwrap();
 }
 
 #[test]
@@ -477,14 +475,12 @@ fn more_positions_and_kinds_round_trip() {
         ]
     );
     // A float field takes an integer it holds exactly, however large.
-    assert!(
-        encode(
-            &[],
-            vec![next("f", DataKind::Float, 64)],
-            &[("f", Int(1 << 60))]
-        )
-        .is_ok()
-    );
+    encode(
+        &[],
+        vec![next("f", DataKind::Float, 64)],
+        &[("f", Int(1 << 60))],
+    )
+    .unwrap();
 }
 
 #[test]

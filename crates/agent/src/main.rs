@@ -1430,8 +1430,8 @@ mod tests {
             all.drain(2 * missing..2 * missing + 2);
             assert!(parse_command(&all).is_err(), "{all:?}");
         }
-        assert!(parse_command(&["debug"]).is_err());
-        assert!(parse_command(&["debug", "other"]).is_err());
+        parse_command(&["debug"]).unwrap_err();
+        parse_command(&["debug", "other"]).unwrap_err();
     }
 
     /// The debug enqueue command takes its five options, each once.
@@ -1797,8 +1797,8 @@ mod tests {
             with(&["--comm-log", "logs"]).expect("valid").comm_log,
             Some(PathBuf::from("logs"))
         );
-        assert!(with(&["--comm-log", "a", "--comm-log", "b"]).is_err());
-        assert!(with(&["--comm-log"]).is_err());
+        with(&["--comm-log", "a", "--comm-log", "b"]).unwrap_err();
+        with(&["--comm-log"]).unwrap_err();
     }
 
     #[test]
@@ -1960,20 +1960,18 @@ mod tests {
             assert!(parse_command(&args).is_err(), "{args:?}");
         }
         // A run takes no plan.
-        assert!(
-            parse_command(&[
-                "run",
-                "--vci",
-                "x",
-                "--mode",
-                "user",
-                "--document",
-                "d",
-                "--plan",
-                "p"
-            ])
-            .is_err()
-        );
+        parse_command(&[
+            "run",
+            "--vci",
+            "x",
+            "--mode",
+            "user",
+            "--document",
+            "d",
+            "--plan",
+            "p",
+        ])
+        .unwrap_err();
     }
 
     /// A job is always a document: the options that gave a bare program and its link are gone.

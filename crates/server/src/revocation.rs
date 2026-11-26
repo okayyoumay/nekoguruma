@@ -287,7 +287,7 @@ mod tests {
             std::future::ready(Ok(vec![]))
         };
         pass(&hub, &sessions, &mut read, &gate).await;
-        assert!(late_reg.as_mut().unwrap().close.try_recv().is_err());
+        late_reg.as_mut().unwrap().close.try_recv().unwrap_err();
         assert!(sessions.authenticate(&late_token).is_some());
         assert!(
             sessions.authenticate(&gone_token).is_none(),

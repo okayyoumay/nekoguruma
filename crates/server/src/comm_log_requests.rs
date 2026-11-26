@@ -509,6 +509,6 @@ mod tests {
         for _ in 0..OUTBOUND_CAPACITY {
             full_registration.outbound.try_recv().unwrap();
         }
-        assert!(full_registration.outbound.try_recv().is_err());
+        full_registration.outbound.try_recv().unwrap_err();
     }
 }

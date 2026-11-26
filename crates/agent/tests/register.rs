@@ -1512,7 +1512,7 @@ mod with_store {
         let output = finish(child);
         stub.finish();
         assert_eq!(output.status.code(), Some(0));
-        assert!(Record::read(&env.record_path()).is_ok());
+        Record::read(&env.record_path()).unwrap();
     }
 
     /// V7: a signature that does not verify is exit 6; a K3 server key that is well-formed but
@@ -1564,7 +1564,7 @@ mod with_store {
         let output = finish(child);
         stub.finish();
         assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
-        assert!(Record::read(&env.record_path()).is_ok());
+        Record::read(&env.record_path()).unwrap();
     }
 
     /// The reader the session library will use takes the record the command wrote, and refuses it
@@ -1584,6 +1584,6 @@ mod with_store {
         json["mode"] = "user".into();
         let copy = env.home.path().join("copy.json");
         std::fs::write(&copy, json.to_string()).unwrap();
-        assert!(Record::read(&copy).is_err());
+        Record::read(&copy).unwrap_err();
     }
 }

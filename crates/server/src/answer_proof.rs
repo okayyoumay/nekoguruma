@@ -348,12 +348,10 @@ mod tests {
         let asked = Asked::with_nonce(&parts("GET", "/x", &[]), fresh()).unwrap();
         let bad = AgentId(String::new());
         for _ in 0..2 {
-            assert!(
-                prover
-                    .header(&asked, &bad, [0; 32], 200, b"")
-                    .await
-                    .is_err()
-            );
+            prover
+                .header(&asked, &bad, [0; 32], 200, b"")
+                .await
+                .unwrap_err();
         }
         let response = Unprovable.into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);

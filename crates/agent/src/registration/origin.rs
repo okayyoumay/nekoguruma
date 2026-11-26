@@ -211,7 +211,10 @@ mod tests {
             "http://2130706433",
         ] {
             assert!(
-                matches!(refused(text), OriginError::Audience(AudienceError::BadHost)),
+                matches!(
+                    refused(text),
+                    OriginError::Audience(AudienceError::BadHost | AudienceError::BadIpAddress(_))
+                ),
                 "{text}"
             );
         }

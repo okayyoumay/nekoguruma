@@ -71,43 +71,74 @@ pub fn mint(key: &[u8; 32], sub: &str, now: SystemTime) -> (String, u64) {
     (format!("{TOKEN_VERSION}.{payload_b64}.{mac_b64}"), exp)
 }
 
-/// Verifies `token` against `key` as of `now`. Returns a short, generic
-/// static reason string on any failure -- callers that might expose this to
-/// an untrusted client (e.g. a gRPC interceptor) should map every variant to
-/// the same generic `UNAUTHENTICATED` message rather than surfacing it,
-/// since these strings are diagnostic detail, not something a caller should
-/// rely on distinguishing.
-pub fn verify(key: &[u8; 32], token: &str, now: SystemTime) -> Result<(), &'static str> {
+/// Why a token was refused. The texts are short and generic; the cause a
+/// library reported is the error's source.
+///
+/// Callers that might expose this to an untrusted client (e.g. a gRPC
+/// interceptor) should map every variant to the same generic
+/// `UNAUTHENTICATED` message rather than surfacing it, since the variants
+/// are diagnostic detail, not something a caller should rely on
+/// distinguishing.
+#[derive(Debug, thiserror::Error)]
+pub enum TokenError {
+    /// The token is not three dot-separated segments starting with the
+    /// version.
+    #[error("malformed token")]
+    Malformed,
+    /// The payload or MAC segment is not base64url; the source is the
+    /// decoder's error.
+    #[error("invalid base64")]
+    InvalidBase64(#[source] base64::DecodeError),
+    /// The key was refused by the MAC; the source is the MAC's error.
+    #[error("invalid key")]
+    InvalidKey(#[source] hmac::digest::InvalidLength),
+    /// The MAC does not match; the source is the MAC's error.
+    #[error("invalid mac")]
+    InvalidMac(#[source] hmac::digest::MacError),
+    /// The payload is not the expected JSON; the source is the parser's
+    /// error.
+    #[error("invalid payload")]
+    InvalidPayload(#[source] serde_json::Error),
+    /// The token's expiry is not after the verification time.
+    #[error("expired")]
+    Expired,
+}
+
+/// Verifies `token` against `key` as of `now`. Fails with the [`TokenError`]
+/// naming the first check that did not hold.
+pub fn verify(key: &[u8; 32], token: &str, now: SystemTime) -> Result<(), TokenError> {
     let mut parts = token.split('.');
-    let version = parts.next().ok_or("malformed token")?;
-    let payload_b64 = parts.next().ok_or("malformed token")?;
-    let mac_b64 = parts.next().ok_or("malformed token")?;
+    let version = parts.next().ok_or(TokenError::Malformed)?;
+    let payload_b64 = parts.next().ok_or(TokenError::Malformed)?;
+    let mac_b64 = parts.next().ok_or(TokenError::Malformed)?;
     if parts.next().is_some() {
-        return Err("malformed token");
+        return Err(TokenError::Malformed);
     }
     if version != TOKEN_VERSION {
-        return Err("malformed token");
+        return Err(TokenError::Malformed);
     }
 
     let payload_bytes = URL_SAFE_NO_PAD
         .decode(payload_b64)
-        .map_err(|_| "invalid base64")?;
+        .map_err(TokenError::InvalidBase64)?;
     let mac_bytes = URL_SAFE_NO_PAD
         .decode(mac_b64)
-        .map_err(|_| "invalid base64")?;
+        .map_err(TokenError::InvalidBase64)?;
 
-    let mut mac = HmacSha256::new_from_slice(key).map_err(|_| "invalid key")?;
+    let mut mac = HmacSha256::new_from_slice(key).map_err(TokenError::InvalidKey)?;
     // Recompute over the raw, undecoded payload segment bytes -- see module
     // doc comment for why.
     mac.update(payload_b64.as_bytes());
     // `verify_slice` is `hmac`'s constant-time comparison; never use `==` on
     // raw MAC bytes.
-    mac.verify_slice(&mac_bytes).map_err(|_| "invalid mac")?;
+    mac.verify_slice(&mac_bytes)
+        .map_err(TokenError::InvalidMac)?;
 
-    let payload: Payload = serde_json::from_slice(&payload_bytes).map_err(|_| "invalid payload")?;
+    let payload: Payload =
+        serde_json::from_slice(&payload_bytes).map_err(TokenError::InvalidPayload)?;
 
     if payload.exp <= unix_secs(now) {
-        return Err("expired");
+        return Err(TokenError::Expired);
     }
 
     Ok(())
@@ -146,7 +177,8 @@ mod tests {
         let tampered = parts.join(".");
 
         let err = verify(&KEY, &tampered, now).expect_err("tampered payload should fail");
-        assert!(!err.is_empty());
+        assert!(matches!(err, TokenError::InvalidMac(_)), "{err:?}");
+        assert!(std::error::Error::source(&err).is_some());
     }
 
     #[test]
@@ -155,7 +187,7 @@ mod tests {
         let long_ago = SystemTime::now() - Duration::from_secs(TOKEN_TTL_SECS * 10);
         let (token, _exp) = mint(&KEY, "test-client", long_ago);
         let err = verify(&KEY, &token, SystemTime::now()).expect_err("expired token should fail");
-        assert_eq!(err, "expired");
+        assert!(matches!(err, TokenError::Expired), "{err:?}");
     }
 
     #[test]

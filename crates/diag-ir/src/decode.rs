@@ -126,6 +126,37 @@ pub enum DecodeError {
         /// What is wrong.
         reason: &'static str,
     },
+    /// A length taken from another field is negative; the source is the integer conversion's
+    /// error.
+    #[error("field {field}: {reason}")]
+    NegativeLength {
+        /// The field.
+        field: u32,
+        /// What is wrong.
+        reason: &'static str,
+        /// The conversion's error.
+        #[source]
+        source: std::num::TryFromIntError,
+    },
+    /// A `Utf8` field's bytes are not UTF-8; the source is the decoder's error.
+    #[error("field {field}: bytes that are not UTF-8")]
+    InvalidUtf8 {
+        /// The field.
+        field: u32,
+        /// The decoder's error.
+        #[source]
+        source: std::string::FromUtf8Error,
+    },
+    /// A field's length does not fit in `usize`, so it reaches past any message; the source is
+    /// the integer conversion's error.
+    #[error("field {field} reaches past the end of the response or of its layout")]
+    LengthOverflow {
+        /// The field.
+        field: u32,
+        /// The conversion's error.
+        #[source]
+        source: std::num::TryFromIntError,
+    },
     /// The conversion has no result for the value: no scale or text entry matches, the value
     /// is outside an interpolation table, a denominator is zero, or the result is not finite.
     #[error("field {field}: conversion failed: {reason}")]
@@ -686,7 +717,11 @@ impl<'a, 'm> Decoder<'a, 'm> {
                             // Too few bytes left for a marker, or bytes that are no value of the
                             // marker's type: no marker, so an item follows.
                             Err(
-                                DecodeError::Truncated { .. } | DecodeError::InvalidValue { .. },
+                                DecodeError::Truncated { .. }
+                                | DecodeError::LengthOverflow { .. }
+                                | DecodeError::InvalidValue { .. }
+                                | DecodeError::NegativeLength { .. }
+                                | DecodeError::InvalidUtf8 { .. },
                             ) => {}
                             Err(error) => return Err(error),
                         }
@@ -804,7 +839,11 @@ impl<'a, 'm> Decoder<'a, 'm> {
 fn whole(field: &Field<'_>, seen: Seen, reason: &'static str) -> Result<u64, DecodeError> {
     match seen.number {
         Some(Number::Unsigned(n)) => Ok(n),
-        Some(Number::Signed(n)) => u64::try_from(n).map_err(|_| invalid(field, reason)),
+        Some(Number::Signed(n)) => u64::try_from(n).map_err(|source| DecodeError::NegativeLength {
+            field: field.id(),
+            reason,
+            source,
+        }),
         Some(Number::Float(f)) if f >= 0.0 && f.fract() == 0.0 && f < u64::MAX as f64 => {
             Ok(f as u64)
         }
@@ -1114,7 +1153,10 @@ fn string_value(field: &Field<'_>, bytes: &[u8]) -> Result<PhysicalValue, Decode
         )),
         DataKind::Utf8 => String::from_utf8(bytes.to_vec())
             .map(PhysicalValue::Text)
-            .map_err(|_| invalid(field, "bytes that are not UTF-8")),
+            .map_err(|source| DecodeError::InvalidUtf8 {
+                field: field.id(),
+                source,
+            }),
         DataKind::Unicode2 => {
             if !bytes.len().is_multiple_of(2) {
                 return Err(invalid(field, "a Unicode2 value of an odd number of bytes"));
@@ -1389,7 +1431,10 @@ fn as_usize(n: u32) -> usize {
 }
 
 fn as_usize_u64(field: &Field<'_>, n: u64) -> Result<usize, DecodeError> {
-    usize::try_from(n).map_err(|_| truncated(field))
+    usize::try_from(n).map_err(|source| DecodeError::LengthOverflow {
+        field: field.id(),
+        source,
+    })
 }
 
 /// `a + b`; an overflow means the field reaches past any message.

@@ -65,8 +65,10 @@ pub enum HmiParam {
 pub enum HmiError {
     #[error("the encoding is {0} bytes, more than {MAX_HMI_FORM_LEN}")]
     TooLong(usize),
+    /// The bytes are not one encoded form. The source is the codec's error, or `None` when the
+    /// bytes decode but are followed by more.
     #[error("the bytes are not one encoded form")]
-    Malformed,
+    Malformed(#[source] Option<postcard::Error>),
     #[error("the id is not 1 to {MAX_HMI_ID_LEN} bytes")]
     BadId,
     #[error("more than {MAX_HMI_PARAMS} parameters")]
@@ -110,7 +112,7 @@ fn is_identifier(key: &str) -> bool {
 
 /// Encodes `value` after `check`, refusing an encoding past [`MAX_HMI_FORM_LEN`].
 fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, HmiError> {
-    let bytes = postcard::to_allocvec(value).map_err(|_| HmiError::Malformed)?;
+    let bytes = postcard::to_allocvec(value).map_err(|e| HmiError::Malformed(Some(e)))?;
     if bytes.len() > MAX_HMI_FORM_LEN {
         return Err(HmiError::TooLong(bytes.len()));
     }
@@ -124,7 +126,8 @@ fn decode<'d, T: Deserialize<'d>>(bytes: &'d [u8]) -> Result<T, HmiError> {
     }
     match postcard::take_from_bytes(bytes) {
         Ok((value, [])) => Ok(value),
-        _ => Err(HmiError::Malformed),
+        Ok(_) => Err(HmiError::Malformed(None)),
+        Err(error) => Err(HmiError::Malformed(Some(error))),
     }
 }
 

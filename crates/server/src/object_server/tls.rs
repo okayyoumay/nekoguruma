@@ -310,7 +310,7 @@ mod tests {
         );
         let key = std::fs::read_to_string(key_path(dir.path())).unwrap();
         let cert = std::fs::read_to_string(cert_path(dir.path())).unwrap();
-        assert_eq!(identity::pin_of_pair(&cert, &key).as_ref(), Ok(first.pin()));
+        assert_eq!(&identity::pin_of_pair(&cert, &key).unwrap(), first.pin());
         #[cfg(unix)]
         for path in [key_path(dir.path()), cert_path(dir.path())] {
             use std::os::unix::fs::PermissionsExt;
@@ -348,10 +348,7 @@ mod tests {
         assert_eq!(loaded.created(), Some(Created::CertificateOnly));
         assert_eq!(std::fs::read_to_string(key_path(dir.path())).unwrap(), key);
         let cert = std::fs::read_to_string(cert_path(dir.path())).unwrap();
-        assert_eq!(
-            identity::pin_of_pair(&cert, &key).as_ref(),
-            Ok(loaded.pin())
-        );
+        assert_eq!(&identity::pin_of_pair(&cert, &key).unwrap(), loaded.pin());
     }
 
     #[test]

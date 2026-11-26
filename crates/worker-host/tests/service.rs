@@ -130,7 +130,7 @@ async fn reports_startup_error() {
 #[tokio::test]
 async fn times_out_when_never_running() {
     let result = launch("never-running", Duration::from_millis(500)).await;
-    assert!(matches!(result, Err(ServiceError::Timeout(_))));
+    assert!(matches!(result, Err(ServiceError::Timeout(..))));
 }
 
 /// A worker answers its first control request only after its own startup (loading its
@@ -172,7 +172,7 @@ async fn a_startup_longer_than_the_startup_bound_times_out() {
     )
     .await;
     assert!(
-        matches!(result, Err(ServiceError::Timeout(_))),
+        matches!(result, Err(ServiceError::Timeout(..))),
         "{:?}",
         result.err()
     );

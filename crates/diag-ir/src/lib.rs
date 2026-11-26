@@ -791,6 +791,12 @@ impl Vm {
         }
     }
 
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "VmError is journaled in an append-only encoding (ADR-288) and carries only plain \
+            values; the standard library error behind this conversion is not serializable, so it \
+            cannot be a field"
+    )]
     fn execute<H: DiagHost>(
         &mut self,
         op: &Op,
@@ -1114,6 +1120,12 @@ impl Vm {
     /// The checks a diagnostic primitive needs before the host is called, and what it sends.
     /// Shared by [`Vm::current_op`] and `execute`, so the two cannot drift; exhaustive, so a new
     /// instruction must declare its checks here.
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "VmError is journaled in an append-only encoding (ADR-288) and carries only plain \
+            values; the standard library error behind this conversion is not serializable, so it \
+            cannot be a field"
+    )]
     fn check_primitive<'a>(
         &'a self,
         op: &Op,
@@ -1209,6 +1221,12 @@ impl Vm {
 
     /// The form an `HmiRequest`, `RecordInput` or `HmiRequestFromStack` sends, and how many
     /// operands it takes from the stack (ADR-340 item 2).
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "VmError is journaled in an append-only encoding (ADR-288) and carries only plain \
+            values; the standard library error behind this conversion is not serializable, so it \
+            cannot be a field"
+    )]
     fn hmi_form(&self, op: &Op, program: &Program) -> Result<(Vec<u8>, usize), VmError> {
         let index = match op {
             Op::HmiRequest { form } | Op::HmiRequestFromStack { form } => *form,
@@ -1500,6 +1518,12 @@ fn declared_segment(
 }
 
 /// The artifact offset and length of block `index` of the segment ([`Op::FlashBlock`]).
+#[expect(
+    clippy::map_err_ignore,
+    reason = "VmError is journaled in an append-only encoding (ADR-288) and carries only plain \
+        values; the standard library error behind this conversion is not serializable, so it \
+        cannot be a field"
+)]
 fn flash_block_range(
     variant: &EcuVariant<'_>,
     session: u32,
@@ -1551,6 +1575,12 @@ fn declared_positive<'a>(
     Ok(positive)
 }
 
+#[expect(
+    clippy::map_err_ignore,
+    reason = "VmError is journaled in an append-only encoding (ADR-288) and carries only plain \
+        values; the standard library error behind this conversion is not serializable, so it \
+        cannot be a field"
+)]
 fn decode_field(
     variant: &EcuVariant<'_>,
     service: u32,

@@ -622,7 +622,9 @@ mod tests {
             api_status(j2534_0404::ERR_FAILED),
             api_status(j2534_0404::ERR_TIMEOUT),
             api_status(0xDEAD_BEEF),
-            j2534_0404::Error::InvalidVersionString,
+            j2534_0404::Error::InvalidVersionString(
+                String::from_utf8(vec![0xFF]).unwrap_err().utf8_error(),
+            ),
         ] {
             let status = map_connect_filter_failure(&error, None, 9);
             assert_eq!(status.code(), Code::Unknown, "{error}");

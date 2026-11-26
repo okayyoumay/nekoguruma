@@ -26,8 +26,9 @@ pub enum IdentifyError {
     Incomplete(u32, &'static str),
     #[error("identification service {service}: {error}")]
     Encode { service: u32, error: EncodeError },
+    /// The identification program does not serialize; the source is the codec's error.
     #[error("the program does not serialize")]
-    Serialize,
+    Serialize(#[source] postcard::Error),
     /// A run's final stack does not hold one byte answer per identification service.
     #[error("the run of document {0} left {1} values for {2} identification services")]
     Answers(usize, usize, usize),
@@ -110,8 +111,7 @@ pub fn identification_document(document: &[u8]) -> Result<(Vec<u8>, Vec<u32>), I
         services.push(id);
     }
     let mut unpacked = loaded.unpack();
-    unpacked.procedure =
-        Some(postcard::to_allocvec(&program).map_err(|_| IdentifyError::Serialize)?);
+    unpacked.procedure = Some(postcard::to_allocvec(&program).map_err(IdentifyError::Serialize)?);
     Ok((encode_ecu_document(&unpacked), services))
 }
 

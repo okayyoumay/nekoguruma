@@ -18,12 +18,20 @@ pub const SIGNATURE_LEN: usize = 64;
 /// A key could not be decoded.
 #[derive(Debug, thiserror::Error)]
 pub enum KeyError {
-    /// The bytes are not a PKCS#8 private key for P-256.
+    /// The bytes are not a PKCS#8 private key for P-256; the source is the decoder's error.
     #[error("not a PKCS#8 P-256 private key")]
-    InvalidPrivateKey,
-    /// The bytes or text are not an SPKI public key for a P-256 point.
+    InvalidPrivateKey(#[source] p256::pkcs8::Error),
+    /// The text is not one `PUBLIC KEY` PEM block, or the bytes or text are not an SPKI public
+    /// key for a P-256 point for a reason the decoders do not report.
     #[error("not an SPKI P-256 public key")]
     InvalidPublicKey,
+    /// The DER does not decode as an SPKI public key for a P-256 point; the source is the
+    /// decoder's error.
+    #[error("not an SPKI P-256 public key")]
+    InvalidPublicKeyDer(#[source] p256::pkcs8::spki::Error),
+    /// The PEM block does not decode; the source is the decoder's error.
+    #[error("not an SPKI P-256 public key")]
+    InvalidPublicKeyPem(#[source] p256::pkcs8::der::Error),
     /// The SPKI is valid but not in canonical form (uncompressed point, minimal DER).
     #[error("SPKI public key is not in canonical form")]
     NonCanonicalPublicKey,
@@ -35,20 +43,25 @@ pub enum SignatureError {
     /// A signature is exactly [`SIGNATURE_LEN`] bytes.
     #[error("signature must be {SIGNATURE_LEN} bytes, got {0}")]
     WrongLength(usize),
-    /// r or s is zero or not below the group order.
+    /// r or s is zero or not below the group order; the source is the parser's error.
     #[error("signature scalar out of range")]
-    OutOfRange,
+    OutOfRange(#[source] ecdsa::signature::Error),
 }
 
 /// A signature did not verify.
-#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum VerifyError {
     /// The signature is in the high-S form, which this crate never produces and never accepts.
     #[error("signature is not in low-S form")]
     HighS,
-    /// The signature does not match the key and message.
+    /// The signature does not match the key and message. The source is the verifier's error
+    /// when the check ran the primitive, and `None` when it failed an earlier check.
     #[error("signature does not match the key and message")]
-    Mismatch,
+    Mismatch {
+        /// The verifier's error.
+        #[source]
+        source: Option<ecdsa::signature::Error>,
+    },
 }
 
 /// Why a signer failed.
@@ -111,15 +124,22 @@ impl std::error::Error for SignError {
     }
 }
 
-/// Operating-system randomness could not be read.
+/// Operating-system randomness could not be read. The source is the generator's error.
 #[derive(Debug, thiserror::Error)]
 #[error("operating-system randomness is unavailable")]
-pub struct RandomError;
+pub struct RandomError(#[source] Box<dyn std::error::Error + Send + Sync>);
+
+impl RandomError {
+    /// An error caused by `source`.
+    pub fn new(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
+        Self(source.into())
+    }
+}
 
 /// Fills 32 bytes from operating-system randomness: a challenge or a nonce.
 pub fn random_32() -> Result<[u8; 32], RandomError> {
     let mut bytes = [0u8; 32];
-    getrandom::fill(&mut bytes).map_err(|_| RandomError)?;
+    getrandom::fill(&mut bytes).map_err(RandomError::new)?;
     Ok(bytes)
 }
 
@@ -131,7 +151,7 @@ impl PublicKey {
     /// Decodes a DER SPKI. Anything but the canonical encoding is refused, so the stored bytes
     /// and the [`fingerprint`](Self::fingerprint) always describe the same key.
     pub fn from_spki_der(der: &[u8]) -> Result<Self, KeyError> {
-        let key = VerifyingKey::from_public_key_der(der).map_err(|_| KeyError::InvalidPublicKey)?;
+        let key = VerifyingKey::from_public_key_der(der).map_err(KeyError::InvalidPublicKeyDer)?;
         let key = Self(key);
         if key.to_spki_der() != der {
             return Err(KeyError::NonCanonicalPublicKey);
@@ -151,7 +171,7 @@ impl PublicKey {
         if !pem.starts_with(BEGIN) || !pem[end + END.len()..].trim().is_empty() {
             return Err(KeyError::InvalidPublicKey);
         }
-        let (label, doc) = Document::from_pem(pem).map_err(|_| KeyError::InvalidPublicKey)?;
+        let (label, doc) = Document::from_pem(pem).map_err(KeyError::InvalidPublicKeyPem)?;
         if label != "PUBLIC KEY" {
             return Err(KeyError::InvalidPublicKey);
         }
@@ -207,7 +227,7 @@ impl Signature {
         }
         ecdsa::Signature::from_slice(bytes)
             .map(Self)
-            .map_err(|_| SignatureError::OutOfRange)
+            .map_err(SignatureError::OutOfRange)
     }
 
     /// The fixed-size encoding.
@@ -244,7 +264,9 @@ pub(crate) fn verify(
     }
     key.0
         .verify(message, &signature.0)
-        .map_err(|_| VerifyError::Mismatch)
+        .map_err(|source| VerifyError::Mismatch {
+            source: Some(source),
+        })
 }
 
 /// The bytes a tagged signature covers: the purpose tag with a 4-byte big-endian length, then
@@ -298,7 +320,7 @@ impl SigningKey {
     /// Generates a key from operating-system randomness.
     pub fn generate() -> Result<Self, RandomError> {
         Ok(Self(
-            ecdsa::SigningKey::try_generate().map_err(|_| RandomError)?,
+            ecdsa::SigningKey::try_generate().map_err(RandomError::new)?,
         ))
     }
 
@@ -306,7 +328,7 @@ impl SigningKey {
     pub fn from_pkcs8_der(der: &[u8]) -> Result<Self, KeyError> {
         ecdsa::SigningKey::from_pkcs8_der(der)
             .map(Self)
-            .map_err(|_| KeyError::InvalidPrivateKey)
+            .map_err(KeyError::InvalidPrivateKey)
     }
 
     /// The PKCS#8 DER private key, in a buffer that is wiped when dropped. For the key stores.
@@ -439,17 +461,20 @@ mod tests {
         let (msg, r, s) = KAT[0];
         let high = sig_of(r, &hex(s));
         assert!(!high.is_low_s());
-        assert_eq!(verify(&key, msg.as_bytes(), &high), Err(VerifyError::HighS));
+        assert!(matches!(
+            verify(&key, msg.as_bytes(), &high),
+            Err(VerifyError::HighS)
+        ));
     }
 
     #[test]
     fn known_answer_wrong_message_is_refused() {
         let (_, r, s) = KAT[1];
         let sig = sig_of(r, &hex(s));
-        assert_eq!(
+        assert!(matches!(
             verify(&kat_public(), b"sample", &sig),
-            Err(VerifyError::Mismatch)
-        );
+            Err(VerifyError::Mismatch { .. })
+        ));
     }
 
     #[test]
@@ -471,18 +496,18 @@ mod tests {
         let other = SigningKey::generate().unwrap();
         let sig = key.sign(b"message").unwrap();
         verify(&key.public_key(), b"message", &sig).unwrap();
-        assert_eq!(
+        assert!(matches!(
             verify(&other.public_key(), b"message", &sig),
-            Err(VerifyError::Mismatch)
-        );
-        assert_eq!(
+            Err(VerifyError::Mismatch { .. })
+        ));
+        assert!(matches!(
             verify(&key.public_key(), b"messagf", &sig),
-            Err(VerifyError::Mismatch)
-        );
-        assert_eq!(
+            Err(VerifyError::Mismatch { .. })
+        ));
+        assert!(matches!(
             verify(&key.public_key(), b"", &sig),
-            Err(VerifyError::Mismatch)
-        );
+            Err(VerifyError::Mismatch { .. })
+        ));
     }
 
     #[test]
@@ -493,10 +518,10 @@ mod tests {
             assert!(sig.is_low_s());
             let twin = with_s(&sig, &negate_s(&sig.to_bytes()[32..]));
             assert!(!twin.is_low_s());
-            assert_eq!(
+            assert!(matches!(
                 verify(&key.public_key(), &[i], &twin),
                 Err(VerifyError::HighS)
-            );
+            ));
         }
     }
 
@@ -521,11 +546,11 @@ mod tests {
         ));
         assert!(matches!(
             Signature::from_bytes(&[0u8; 64]),
-            Err(SignatureError::OutOfRange)
+            Err(SignatureError::OutOfRange(_))
         ));
         assert!(matches!(
             Signature::from_bytes(&[0xff; 64]),
-            Err(SignatureError::OutOfRange)
+            Err(SignatureError::OutOfRange(_))
         ));
     }
 
@@ -568,7 +593,7 @@ mod tests {
         *off_curve.last_mut().unwrap() ^= 1;
         assert!(matches!(
             PublicKey::from_spki_der(&off_curve),
-            Err(KeyError::InvalidPublicKey)
+            Err(KeyError::InvalidPublicKeyDer(_))
         ));
         // The identity point, as an all-zero uncompressed point and as the one-byte form.
         let mut identity = hex("3059301306072a8648ce3d020106082a8648ce3d030107034200");
@@ -576,12 +601,12 @@ mod tests {
         identity.extend([0u8; 64]);
         assert!(matches!(
             PublicKey::from_spki_der(&identity),
-            Err(KeyError::InvalidPublicKey)
+            Err(KeyError::InvalidPublicKeyDer(_))
         ));
         let one_byte = hex("3019301306072a8648ce3d020106082a8648ce3d03010703020000");
         assert!(matches!(
             PublicKey::from_spki_der(&one_byte),
-            Err(KeyError::InvalidPublicKey)
+            Err(KeyError::InvalidPublicKeyDer(_))
         ));
         // A P-384 key's algorithm identifiers (curve OID 1.3.132.0.34) are not accepted.
         let mut p384 = hex("3076301006072a8648ce3d020106052b81040022036200");
@@ -589,7 +614,7 @@ mod tests {
         p384.extend(der[der.len() - 64..].iter().cycle().take(96));
         assert!(matches!(
             PublicKey::from_spki_der(&p384),
-            Err(KeyError::InvalidPublicKey)
+            Err(KeyError::InvalidPublicKeyDer(_))
         ));
     }
 
@@ -643,22 +668,25 @@ mod tests {
             Signature::from_bytes(&b)
         };
         let n = hex(ORDER);
-        assert!(matches!(cat(ORDER, &ok), Err(SignatureError::OutOfRange)));
+        assert!(matches!(
+            cat(ORDER, &ok),
+            Err(SignatureError::OutOfRange(_))
+        ));
         assert!(matches!(
             cat(
                 "0000000000000000000000000000000000000000000000000000000000000001",
                 &n
             ),
-            Err(SignatureError::OutOfRange)
+            Err(SignatureError::OutOfRange(_))
         ));
         let zero = [0u8; 32];
-        assert!(matches!(cat(ORDER, &n), Err(SignatureError::OutOfRange)));
+        assert!(matches!(cat(ORDER, &n), Err(SignatureError::OutOfRange(_))));
         assert!(matches!(
             cat(
                 "0000000000000000000000000000000000000000000000000000000000000001",
                 &zero
             ),
-            Err(SignatureError::OutOfRange)
+            Err(SignatureError::OutOfRange(_))
         ));
     }
 
@@ -672,8 +700,11 @@ mod tests {
         assert!(low.is_low_s());
         assert!(!high.is_low_s());
         let key = kat_public();
-        assert_eq!(verify(&key, b"m", &low), Err(VerifyError::Mismatch));
-        assert_eq!(verify(&key, b"m", &high), Err(VerifyError::HighS));
+        assert!(matches!(
+            verify(&key, b"m", &low),
+            Err(VerifyError::Mismatch { .. })
+        ));
+        assert!(matches!(verify(&key, b"m", &high), Err(VerifyError::HighS)));
     }
 
     #[test]

@@ -55,12 +55,19 @@ pub enum AudienceError {
     /// The host is empty or not a host name, an IPv4 address or a bracketed IPv6 address.
     #[error("the audience's host is not valid, or an IP address not in its own canonical form")]
     BadHost,
+    /// The host looks like an IP address but does not parse as one in its canonical form; the
+    /// source is the parser's error.
+    #[error("the audience's host is not valid, or an IP address not in its own canonical form")]
+    BadIpAddress(#[source] std::net::AddrParseError),
     /// `localhost` is not an audience: the local profile pins an IP address (ADR-456).
     #[error("the audience must not name localhost")]
     Localhost,
     /// The port is not a number from 1 to 65535 written without leading zeros.
     #[error("the audience's port is not valid")]
     BadPort,
+    /// The port is made of digits but does not fit in 16 bits; the source is the parser's error.
+    #[error("the audience's port is not valid")]
+    PortOutOfRange(#[source] std::num::ParseIntError),
     /// The text is not in canonical form (strict parsing only).
     #[error("the audience is not in canonical form")]
     NotCanonical,
@@ -173,7 +180,7 @@ fn split_host_port(authority: &str) -> Result<(&str, Option<&str>), AudienceErro
 fn canonical_host(host: &str) -> Result<String, AudienceError> {
     let host = host.to_ascii_lowercase();
     if let Some(inner) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
-        let addr: std::net::Ipv6Addr = inner.parse().map_err(|_| AudienceError::BadHost)?;
+        let addr: std::net::Ipv6Addr = inner.parse().map_err(AudienceError::BadIpAddress)?;
         return Ok(format!("[{addr}]"));
     }
     if host.starts_with('[') {
@@ -199,7 +206,7 @@ fn canonical_host(host: &str) -> Result<String, AudienceError> {
     }
     let last = host.rsplit('.').next().unwrap_or("");
     if last.bytes().all(|b| b.is_ascii_digit()) {
-        let addr: std::net::Ipv4Addr = host.parse().map_err(|_| AudienceError::BadHost)?;
+        let addr: std::net::Ipv4Addr = host.parse().map_err(AudienceError::BadIpAddress)?;
         return Ok(addr.to_string());
     }
     // A last label of `0x` and hexadecimal digits makes the whole host an IPv4 address to a URL
@@ -221,7 +228,7 @@ fn parse_port(text: &str) -> Result<u16, AudienceError> {
     {
         return Err(AudienceError::BadPort);
     }
-    text.parse::<u16>().map_err(|_| AudienceError::BadPort)
+    text.parse::<u16>().map_err(AudienceError::PortOutOfRange)
 }
 
 /// A transcript could not be built.
@@ -392,9 +399,11 @@ mod tests {
             transcript(n, c),
         ];
         for t in cases {
-            assert_eq!(
-                verify_proof(&pk, &t, &sig),
-                Err(VerifyError::Mismatch),
+            assert!(
+                matches!(
+                    verify_proof(&pk, &t, &sig),
+                    Err(VerifyError::Mismatch { .. })
+                ),
                 "{t:?}"
             );
         }
@@ -426,10 +435,10 @@ mod tests {
         let key = SigningKey::generate().unwrap();
         let sig = sign_proof(&key, &transcript(c, n)).unwrap();
         let other = SigningKey::generate().unwrap().public_key();
-        assert_eq!(
+        assert!(matches!(
             verify_proof(&other, &transcript(c, n), &sig),
-            Err(VerifyError::Mismatch)
-        );
+            Err(VerifyError::Mismatch { .. })
+        ));
         let bytes = sig.to_bytes();
         Signature::from_bytes(&bytes[..63]).unwrap_err();
         let mut long = bytes.to_vec();
@@ -548,6 +557,14 @@ mod tests {
         }
     }
 
+    fn ip_error() -> std::net::AddrParseError {
+        "x".parse::<std::net::Ipv4Addr>().unwrap_err()
+    }
+
+    fn port_error() -> std::num::ParseIntError {
+        "x".parse::<u16>().unwrap_err()
+    }
+
     #[test]
     fn audience_refusals() {
         use AudienceError::*;
@@ -576,29 +593,39 @@ mod tests {
             ("http://a..example", BadHost),
             ("https://ngr.example.com.", BadHost),
             ("http://a_b.example", BadHost),
-            ("http://127.000.0.1", BadHost),
-            ("http://0x7f.0.0.1", BadHost),
+            ("http://127.000.0.1", BadIpAddress(ip_error())),
+            ("http://0x7f.0.0.1", BadIpAddress(ip_error())),
             ("http://0x7f000001", BadHost),
             ("http://127.0.0.0x1", BadHost),
             ("http://127.0.0.0x", BadHost),
             ("http://0X7F000001", BadHost),
-            ("http://127.1", BadHost),
-            ("http://1.2.3.256", BadHost),
-            ("http://1.2.3.4.5", BadHost),
-            ("http://a.1", BadHost),
-            ("http://[fe80::1%25eth0]", BadHost),
-            ("http://[]", BadHost),
-            ("http://[zz]", BadHost),
+            ("http://127.1", BadIpAddress(ip_error())),
+            ("http://1.2.3.256", BadIpAddress(ip_error())),
+            ("http://1.2.3.4.5", BadIpAddress(ip_error())),
+            ("http://a.1", BadIpAddress(ip_error())),
+            ("http://[fe80::1%25eth0]", BadIpAddress(ip_error())),
+            ("http://[]", BadIpAddress(ip_error())),
+            ("http://[zz]", BadIpAddress(ip_error())),
             ("http://[::1", BadHost),
             ("http://[::1]x", BadHost),
             ("http://127.0.0.1:", BadPort),
             ("http://127.0.0.1:0", BadPort),
             ("http://127.0.0.1:080", BadPort),
-            ("http://127.0.0.1:65536", BadPort),
+            ("http://127.0.0.1:65536", PortOutOfRange(port_error())),
             ("http://127.0.0.1:80x", BadPort),
             ("http://127.0.0.1:+80", BadPort),
         ] {
-            assert_eq!(canon(input), Err(want), "{input:?}");
+            // The two variants that hold a parser's error are compared by variant: the
+            // error inside is the standard library's, not this crate's to pin.
+            let got = canon(input).expect_err(input);
+            assert_eq!(
+                std::mem::discriminant(&got),
+                std::mem::discriminant(&want),
+                "{input:?}"
+            );
+            if matches!(got, BadIpAddress(_) | PortOutOfRange(_)) {
+                assert!(std::error::Error::source(&got).is_some(), "{input:?}");
+            }
         }
         let long = format!("https://{}.example", "a".repeat(MAX_FIELD_LEN));
         assert_eq!(canon(&long), Err(BadCharacter));

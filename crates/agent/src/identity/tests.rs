@@ -498,7 +498,7 @@ fn only_unavailable_and_a_busy_lock_are_retryable() {
         IdentityError::NoStore("x"),
         IdentityError::KeyUnusable("x"),
         IdentityError::NotProvisioned,
-        IdentityError::Random(RandomError),
+        IdentityError::Random(RandomError::new("test: no randomness")),
     ] {
         assert!(!error.retryable(), "{error}");
     }

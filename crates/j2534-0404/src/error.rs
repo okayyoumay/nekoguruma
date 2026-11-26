@@ -92,8 +92,8 @@ pub enum Error {
         name: &'static str,
         reason: &'static str,
     },
-    /// C API returned invalid UTF-8 or malformed text.
-    InvalidVersionString,
+    /// C API returned invalid UTF-8 or malformed text; the source is the UTF-8 error.
+    InvalidVersionString(std::str::Utf8Error),
     /// Operation is unavailable for this binding mode.
     OperationNotAvailable { operation: &'static str },
 }
@@ -121,7 +121,7 @@ impl fmt::Display for Error {
             Self::InvalidArgument { name, reason } => {
                 write!(f, "invalid argument {name}: {reason}")
             }
-            Self::InvalidVersionString => write!(f, "invalid version string returned by API"),
+            Self::InvalidVersionString(_) => write!(f, "invalid version string returned by API"),
             Self::OperationNotAvailable { operation } => {
                 write!(f, "operation requires open handle: {operation}")
             }
@@ -129,7 +129,14 @@ impl fmt::Display for Error {
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidVersionString(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 /// Firmware/DLL/API version triplet reported by the device API.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,7 +166,7 @@ pub(crate) fn c_buf_to_string(buffer: &[c_char]) -> Result<String, Error> {
     let cstr = unsafe { CStr::from_ptr(buffer.as_ptr()) };
     cstr.to_str()
         .map(|s| s.to_string())
-        .map_err(|_| Error::InvalidVersionString)
+        .map_err(Error::InvalidVersionString)
 }
 
 #[cfg(test)]
@@ -188,5 +195,14 @@ mod tests {
             err.to_string(),
             "J2534 call failed: ERR_FAILED (0x00000007)"
         );
+    }
+
+    #[test]
+    fn a_version_string_that_is_not_utf8_keeps_the_utf8_error() {
+        let buffer: [c_char; 3] = [0xC3u8 as c_char, 0, 0];
+        let err = c_buf_to_string(&buffer).unwrap_err();
+        assert!(matches!(err, Error::InvalidVersionString(_)), "{err:?}");
+        assert!(std::error::Error::source(&err).is_some());
+        assert_eq!(err.to_string(), "invalid version string returned by API");
     }
 }

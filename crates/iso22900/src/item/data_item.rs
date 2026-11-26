@@ -388,7 +388,7 @@ impl OwnedDataItem {
         data: crate::IoVehicleIdRequestData,
     ) -> Result<Self, DPduApiError> {
         let preselection = match data.preselection_value {
-            Some(value) => Some(CString::new(value).map_err(|_| DPduApiError::InvalidShortName)?),
+            Some(value) => Some(CString::new(value).map_err(DPduApiError::InvalidShortName)?),
             None => None,
         };
 
@@ -805,7 +805,7 @@ mod tests {
             destination_addresses: vec![],
         });
 
-        assert!(matches!(result, Err(DPduApiError::InvalidShortName)));
+        assert!(matches!(result, Err(DPduApiError::InvalidShortName(_))));
     }
 
     #[test]

@@ -295,7 +295,7 @@ pub fn verify_registration(
     signature: &Signature,
 ) -> Result<(), VerifyError> {
     if transcript.agent_key_fingerprint != key.fingerprint() {
-        return Err(VerifyError::Mismatch);
+        return Err(VerifyError::Mismatch { source: None });
     }
     verify_tagged(key, DOMAIN_TAG, &transcript.encode(), signature)
 }
@@ -536,18 +536,20 @@ mod tests {
             request(&c, &pk, server_key_id()),
         ];
         for changed in cases {
-            assert_eq!(
-                verify_registration(&pk, &changed, &sig),
-                Err(VerifyError::Mismatch),
+            assert!(
+                matches!(
+                    verify_registration(&pk, &changed, &sig),
+                    Err(VerifyError::Mismatch { .. })
+                ),
                 "{changed:?}"
             );
         }
         // Another key's signature over the same transcript fails too.
         let foreign = sign_registration(&SigningKey::generate().unwrap(), &t).unwrap();
-        assert_eq!(
+        assert!(matches!(
             verify_registration(&pk, &t, &foreign),
-            Err(VerifyError::Mismatch)
-        );
+            Err(VerifyError::Mismatch { .. })
+        ));
     }
 
     #[test]
@@ -557,10 +559,10 @@ mod tests {
         // The transcript names `claimed`, but `signer` made the signature and is the key given.
         let t = request(&code(), &claimed, server_key_id());
         let sig = sign_registration(&signer, &t).unwrap();
-        assert_eq!(
+        assert!(matches!(
             verify_registration(&signer.public_key(), &t, &sig),
-            Err(VerifyError::Mismatch)
-        );
+            Err(VerifyError::Mismatch { .. })
+        ));
     }
 
     #[test]
@@ -627,10 +629,10 @@ mod tests {
         verify_response(&server.public_key(), &response(&f), &sig).unwrap();
         // Another server key does not verify it.
         let other = SigningKey::generate().unwrap().public_key();
-        assert_eq!(
+        assert!(matches!(
             verify_response(&other, &response(&f), &sig),
-            Err(VerifyError::Mismatch)
-        );
+            Err(VerifyError::Mismatch { .. })
+        ));
     }
 
     #[test]
@@ -724,9 +726,11 @@ mod tests {
             ),
         ];
         for changed in cases {
-            assert_eq!(
-                verify_response(&pk, &changed, &sig),
-                Err(VerifyError::Mismatch),
+            assert!(
+                matches!(
+                    verify_response(&pk, &changed, &sig),
+                    Err(VerifyError::Mismatch { .. })
+                ),
                 "{changed:?}"
             );
         }

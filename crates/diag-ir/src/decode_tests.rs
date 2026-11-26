@@ -545,7 +545,7 @@ fn strings_are_checked_against_their_encoding() {
     );
     assert!(matches!(
         decode(&[], vec![next(1, DataKind::Utf8, 8)], &[SID, 0xC3]),
-        Err(DecodeError::InvalidValue { field: 1, .. })
+        Err(DecodeError::InvalidUtf8 { field: 1, .. })
     ));
     assert!(matches!(
         decode(
@@ -866,7 +866,7 @@ fn a_repeat_count_must_be_a_whole_number_decoded_first() {
             layouts(),
             &[SID, 0xFF, 1]
         ),
-        Err(DecodeError::InvalidValue { field: 2, .. })
+        Err(DecodeError::NegativeLength { field: 2, .. })
     ));
     let text = next(1, DataKind::Ascii, 8);
     assert!(matches!(
@@ -1815,8 +1815,10 @@ fn utf8_cut_by_max_bytes_is_invalid() {
     let fields = vec![terminated(1, DataKind::Utf8, Termination::Zero, 0, 2)];
     assert!(matches!(
         decode(&[], fields, &[SID, b'a', 0xC3, 0xA9]),
-        Err(DecodeError::InvalidValue { field: 1, .. })
+        Err(DecodeError::InvalidUtf8 { field: 1, .. })
     ));
+    let error = decode(&[], vec![next(1, DataKind::Utf8, 8)], &[SID, 0xC3]).unwrap_err();
+    assert!(std::error::Error::source(&error).is_some(), "{error:?}");
 }
 
 #[test]

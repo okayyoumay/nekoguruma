@@ -220,11 +220,11 @@ impl<'a> BorrowedVendorSpecificStructArray<'a> {
                 .ok_or(DPduApiError::Unsupported(
                     "vendor specific structfield byte length overflow",
                 ))?;
-        let len_unum32 = UNUM32::try_from(byte_len).map_err(|_| {
-            DPduApiError::Unsupported(
-                "vendor specific structfield byte length exceeds UNUM32 range",
-            )
-        })?;
+        let len_unum32 =
+            UNUM32::try_from(byte_len).map_err(|source| DPduApiError::UnsupportedSize {
+                what: "vendor specific structfield byte length exceeds UNUM32 range",
+                source,
+            })?;
         unsafe {
             ffi_slice(
                 self.ptr.cast::<u8>(),

@@ -238,7 +238,7 @@ mod number_form {
         fn visit_i64<E: de::Error>(self, v: i64) -> Result<Number, E> {
             u64::try_from(v)
                 .map(Number)
-                .map_err(|_| E::custom("number must not be negative"))
+                .map_err(|error| E::custom(format!("number must not be negative: {error}")))
         }
         fn visit_str<E: de::Error>(self, v: &str) -> Result<Number, E> {
             let digits = v
@@ -249,7 +249,7 @@ mod number_form {
             }
             u64::from_str_radix(digits, 16)
                 .map(Number)
-                .map_err(|_| E::custom(format!("{v:?} is too large")))
+                .map_err(|error| E::custom(format!("{v:?} is too large: {error}")))
         }
     }
 
@@ -259,8 +259,8 @@ mod number_form {
         }
     }
 
-    fn narrow<T: TryFrom<u64>, E: de::Error>(n: u64) -> Result<T, E> {
-        T::try_from(n).map_err(|_| E::custom(format!("{n} is out of range")))
+    fn narrow<T: TryFrom<u64, Error: fmt::Display>, E: de::Error>(n: u64) -> Result<T, E> {
+        T::try_from(n).map_err(|error| E::custom(format!("{n} is out of range: {error}")))
     }
 
     pub fn u16<'de, D: Deserializer<'de>>(d: D) -> Result<u16, D::Error> {

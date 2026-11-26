@@ -317,10 +317,14 @@ fn the_longest_matching_prefix_decides_and_a_tie_is_ambiguous() {
         vec![vec![0xF1, 0x90]],
     );
     let report = run(&buf, &wide, &Script::new());
-    assert_eq!(
-        report.end,
-        DryRunEnd::Host(DryRunError::NotASid { service: 0x122 })
+    let DryRunEnd::Host(error) = report.end else {
+        panic!("the run ended with {:?}", report.end);
+    };
+    assert!(
+        matches!(error, DryRunError::NotASid { service: 0x122, .. }),
+        "{error:?}"
     );
+    assert!(std::error::Error::source(&error).is_some());
 }
 
 #[test]

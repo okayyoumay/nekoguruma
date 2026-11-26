@@ -210,8 +210,8 @@ mod tests {
                 0 => assert!(outcome.is_err(), "byte {i}"),
                 // The fingerprint is not signed: the signature still verifies, which is why a
                 // verifier compares it with its pinned key.
-                1..=32 => assert_eq!(outcome, Ok(Some(Ok(()))), "byte {i}"),
-                _ => assert_ne!(outcome, Ok(Some(Ok(()))), "byte {i}"),
+                1..=32 => assert!(matches!(outcome, Ok(Some(Ok(())))), "byte {i}"),
+                _ => assert!(!matches!(outcome, Ok(Some(Ok(())))), "byte {i}"),
             }
         }
     }
@@ -222,10 +222,10 @@ mod tests {
         let other = SigningKey::generate().unwrap().public_key();
         let blob = seal(&key, &payload(32)).unwrap();
         let env = Envelope::split(&blob).unwrap();
-        assert_eq!(
+        assert!(matches!(
             verify(&other, env.payload(), &env.signature().unwrap()),
-            Err(VerifyError::Mismatch)
-        );
+            Err(VerifyError::Mismatch { .. })
+        ));
     }
 
     #[test]
@@ -294,10 +294,10 @@ mod tests {
             flipped[32 + i] = (d + 256) as u8;
         }
         let high = Signature::from_bytes(&flipped).unwrap();
-        assert_eq!(
+        assert!(matches!(
             verify(&key.public_key(), &body, &high),
             Err(VerifyError::HighS)
-        );
+        ));
         verify(
             &key.public_key(),
             &body,

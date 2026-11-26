@@ -138,7 +138,7 @@ pub enum ServiceError {
     #[error("worker exited")]
     Exited,
     #[error("timed out waiting for {0}")]
-    Timeout(&'static str),
+    Timeout(&'static str, #[source] tokio::time::error::Elapsed),
     #[error("malformed control response: {0}")]
     Protocol(String),
     #[error("worker returned error {code}: {message}")]
@@ -244,7 +244,7 @@ impl WorkerProcess {
         };
         tokio::time::timeout(options.startup_timeout, startup)
             .await
-            .map_err(|_| ServiceError::Timeout("worker startup"))??;
+            .map_err(|elapsed| ServiceError::Timeout("worker startup", elapsed))??;
         Ok(worker)
     }
 
@@ -323,7 +323,7 @@ impl WorkerProcess {
         };
         tokio::time::timeout(timeout, exchange)
             .await
-            .map_err(|_| ServiceError::Timeout("control response"))?
+            .map_err(|elapsed| ServiceError::Timeout("control response", elapsed))?
     }
 
     /// Asks the worker to stop, then waits up to `grace` for it to exit; kills it if it does

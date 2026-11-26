@@ -2,7 +2,7 @@
 
 **Date:** 2026-11-26
 **Status:** Accepted
-**Affects:** `Cargo.toml` (`[workspace.lints.clippy]`), the error types of every crate that mapped an error without its cause, `CLAUDE.md` ("Rust code"), `.github/copilot-instructions.md`, `.github/instructions/rust.instructions.md`
+**Affects:** `Cargo.toml` (`[workspace.lints.clippy]`), the error types of every crate that mapped an error without its cause, `CLAUDE.md` ("Rust code"), `.github/instructions/rust.instructions.md`, `diag-ir` (`VmError`), `agent` (`src/journal.rs`, `src/oplog.rs`), ADR-288
 
 ## Context
 
@@ -62,6 +62,12 @@ cheapest way through.
    transmit failure becomes an error event of the D-PDU API, built from a value made in many
    places. Where the failure is mapped to that value, the worker logs the cause, and the value
    stays as it was.
+
+8. **A journaled error carries its cause as text.** `VmError` is part of the agent's journal
+   format (ADR-288), so its variants hold the cause's text rather than the error itself. The
+   journal's format version is 2; a journal of version 1 is refused, as any other version is.
+   The operation log shows the variants' fixed text without the cause, since a decode error's
+   text holds values read from the vehicle.
 
 ## Consequences
 

@@ -30,7 +30,7 @@ use worker_host::service::OperatingMode;
 use crate::state::StateDirError;
 
 /// The journal format this build writes and reads.
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 /// The longest procedure failure code a journal record holds, in bytes: the longest code
 /// `Program::validate` accepts (ADR-280).
 pub const MAX_FAILURE_CODE_LEN: usize = diag_ir::MAX_FAILURE_CODE_LEN;
@@ -2256,11 +2256,11 @@ mod tests {
         ));
 
         let mut newer = good.clone();
-        newer[MAGIC.len()..PREAMBLE].copy_from_slice(&2u32.to_le_bytes());
+        newer[MAGIC.len()..PREAMBLE].copy_from_slice(&(FORMAT_VERSION + 1).to_le_bytes());
         fs::write(path(&dir), &newer).expect("write");
         assert!(matches!(
             Journal::open(&dir.0, &key()),
-            Err(JournalError::UnsupportedVersion(2))
+            Err(JournalError::UnsupportedVersion(v)) if v == FORMAT_VERSION + 1
         ));
 
         let mut foreign = good.clone();
@@ -3791,10 +3791,16 @@ mod tests {
             VmError::DivisionByZero,
             VmError::ShiftOutOfRange(0),
             VmError::BadConstant(0),
-            VmError::InvalidUtf8(0),
+            VmError::InvalidUtf8 {
+                constant: 0,
+                cause: String::new(),
+            },
             VmError::UndefinedVariable(0),
             VmError::IndexOutOfRange(0),
-            VmError::ByteOutOfRange(0),
+            VmError::ByteOutOfRange {
+                value: 0,
+                cause: String::new(),
+            },
             VmError::BytesTooLong(0),
             VmError::FloatNotConvertible,
             VmError::NoDeclarations,
@@ -3806,9 +3812,15 @@ mod tests {
                 service: 0,
                 field: 0,
             },
-            VmError::Undecodable { service: 0 },
+            VmError::Undecodable {
+                service: 0,
+                cause: String::new(),
+            },
             VmError::UnknownService { service: 0 },
-            VmError::WaitOutOfRange(0),
+            VmError::WaitOutOfRange {
+                millis: 0,
+                cause: String::new(),
+            },
             VmError::UnknownFlashSession { session: 0 },
             VmError::UnknownFlashSegment {
                 session: 0,
@@ -3822,6 +3834,7 @@ mod tests {
                 session: 0,
                 segment: 0,
                 index: 0,
+                cause: None,
             },
             VmError::ArtifactLength {
                 expected: 0,
@@ -3830,6 +3843,9 @@ mod tests {
             VmError::BadHmiForm(0),
             VmError::HmiFormTooLong(0),
             VmError::BadTarget(0),
+            VmError::UnsignedOutOfRange {
+                cause: String::new(),
+            },
         ];
         // The match fails to compile when a variant is added, so the list above stays complete.
         for error in &errors {
@@ -3848,10 +3864,10 @@ mod tests {
                 | VmError::DivisionByZero
                 | VmError::ShiftOutOfRange(_)
                 | VmError::BadConstant(_)
-                | VmError::InvalidUtf8(_)
+                | VmError::InvalidUtf8 { .. }
                 | VmError::UndefinedVariable(_)
                 | VmError::IndexOutOfRange(_)
-                | VmError::ByteOutOfRange(_)
+                | VmError::ByteOutOfRange { .. }
                 | VmError::BytesTooLong(_)
                 | VmError::FloatNotConvertible
                 | VmError::NoDeclarations
@@ -3859,7 +3875,7 @@ mod tests {
                 | VmError::ShapedField { .. }
                 | VmError::Undecodable { .. }
                 | VmError::UnknownService { .. }
-                | VmError::WaitOutOfRange(_)
+                | VmError::WaitOutOfRange { .. }
                 | VmError::UnknownFlashSession { .. }
                 | VmError::UnknownFlashSegment { .. }
                 | VmError::ZeroBlockSize { .. }
@@ -3867,7 +3883,8 @@ mod tests {
                 | VmError::ArtifactLength { .. }
                 | VmError::BadHmiForm(_)
                 | VmError::HmiFormTooLong(_)
-                | VmError::BadTarget(_) => {}
+                | VmError::BadTarget(_)
+                | VmError::UnsignedOutOfRange { .. } => {}
             }
         }
         let encoded = |reason: RunStop| {
@@ -4119,11 +4136,11 @@ mod tests {
         }
     }
 
-    /// The two kinds keep their variant index in the encoding, and the format version is
-    /// unchanged by the record (ADR-485 item 2).
+    /// The two kinds keep their variant index in the encoding, and the record does not change
+    /// the format version (ADR-485 item 2).
     #[test]
     fn the_job_content_keeps_its_encoding_and_the_format_version() {
-        assert_eq!(FORMAT_VERSION, 1);
+        assert_eq!(FORMAT_VERSION, 2);
         let document = postcard::to_allocvec(&JobContent::Document([3; 32])).expect("encode");
         let program = postcard::to_allocvec(&JobContent::Program([3; 32])).expect("encode");
         assert_eq!((document[0], program[0]), (0, 1));

@@ -39,14 +39,21 @@ pub fn external(text: impl std::fmt::Display) -> ExternalField {
 
 /// A [`diag_ir::VmError`]'s text without the run-time values some variants print (an index, a
 /// byte, a shift amount or a wait duration the procedure computed, which may come from the
-/// vehicle).
+/// vehicle) and without the text of the cause some variants carry, which can name values of the
+/// vehicle's response.
 pub fn vm_error_text(error: &diag_ir::VmError) -> String {
     use diag_ir::VmError;
     match error {
         VmError::ShiftOutOfRange(_) => "shift amount out of range".to_owned(),
         VmError::IndexOutOfRange(_) => "index out of range".to_owned(),
-        VmError::ByteOutOfRange(_) => "byte value out of range".to_owned(),
-        VmError::WaitOutOfRange(_) => "wait duration out of range".to_owned(),
+        VmError::ByteOutOfRange { .. } => "byte value out of range".to_owned(),
+        VmError::WaitOutOfRange { .. } => "wait duration out of range".to_owned(),
+        VmError::InvalidUtf8 { cause, .. } | VmError::Undecodable { cause, .. } => {
+            let text = error.to_string();
+            text.strip_suffix(&format!(": {cause}"))
+                .map(str::to_owned)
+                .unwrap_or(text)
+        }
         other => other.to_string(),
     }
 }
@@ -60,12 +67,33 @@ mod tests {
         for error in [
             diag_ir::VmError::ShiftOutOfRange(4711),
             diag_ir::VmError::IndexOutOfRange(4711),
-            diag_ir::VmError::ByteOutOfRange(4711),
-            diag_ir::VmError::WaitOutOfRange(4711),
+            diag_ir::VmError::ByteOutOfRange {
+                value: 4711,
+                cause: "cause".to_owned(),
+            },
+            diag_ir::VmError::WaitOutOfRange {
+                millis: 4711,
+                cause: "cause".to_owned(),
+            },
         ] {
             let text = vm_error_text(&error);
             assert!(!text.contains("4711"), "{text}");
             assert!(error.to_string().starts_with(&text), "{text}");
+        }
+        for error in [
+            diag_ir::VmError::InvalidUtf8 {
+                constant: 1,
+                cause: "found 0x4711".to_owned(),
+            },
+            diag_ir::VmError::Undecodable {
+                service: 1,
+                cause: "found 0x4711".to_owned(),
+            },
+        ] {
+            let text = vm_error_text(&error);
+            assert!(!text.contains("4711"), "{text}");
+            assert!(error.to_string().starts_with(&text), "{text}");
+            assert!(text.len() < error.to_string().len(), "{text}");
         }
         assert_eq!(
             vm_error_text(&diag_ir::VmError::StackUnderflow),

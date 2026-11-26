@@ -228,7 +228,36 @@ fn expect_vm_error(code: Vec<Op>, constants: Vec<Vec<u8>>, steps_before: usize) 
         before,
         "state changed on error"
     );
-    error
+    without_cause(error)
+}
+
+/// `error` with the text of its conversion cause emptied, so a table names the variant and its
+/// operands only. Fails when a variant that carries a cause has none.
+fn without_cause(error: VmError) -> VmError {
+    match error {
+        VmError::InvalidUtf8 { constant, cause } => {
+            assert!(!cause.is_empty(), "InvalidUtf8 {constant} has no cause");
+            VmError::InvalidUtf8 {
+                constant,
+                cause: String::new(),
+            }
+        }
+        VmError::ByteOutOfRange { value, cause } => {
+            assert!(!cause.is_empty(), "ByteOutOfRange {value} has no cause");
+            VmError::ByteOutOfRange {
+                value,
+                cause: String::new(),
+            }
+        }
+        VmError::WaitOutOfRange { millis, cause } => {
+            assert!(!cause.is_empty(), "WaitOutOfRange {millis} has no cause");
+            VmError::WaitOutOfRange {
+                millis,
+                cause: String::new(),
+            }
+        }
+        other => other,
+    }
 }
 
 fn i(v: i64) -> Op {
@@ -772,7 +801,10 @@ fn byte_indexing() {
             constants(),
             3
         ),
-        VmError::ByteOutOfRange(256)
+        VmError::ByteOutOfRange {
+            value: 256,
+            cause: String::new()
+        }
     );
     assert_eq!(
         expect_vm_error(vec![i(0), i(0), Op::IndexGet], vec![], 2),
@@ -985,7 +1017,10 @@ fn vm_checks_run_before_the_host_is_called() {
                 },
             ],
             vec![vec![0xFF]],
-            VmError::InvalidUtf8(0),
+            VmError::InvalidUtf8 {
+                constant: 0,
+                cause: String::new(),
+            },
         ),
         (
             vec![i(0), Op::FlashTransfer { block: 0 }],
@@ -1422,7 +1457,10 @@ fn fail_checks_its_operands_before_it_changes_anything() {
             vec![b"d".to_vec(), vec![0xc3, 0x28]],
             1
         ),
-        VmError::InvalidUtf8(1)
+        VmError::InvalidUtf8 {
+            constant: 1,
+            cause: String::new()
+        }
     );
     // No detail on the stack.
     assert_eq!(
@@ -1828,12 +1866,18 @@ fn current_op_and_step_agree_on_primitives() {
         (
             with(vec![i(-1)], Op::WaitFromStack),
             vec![],
-            VmError::WaitOutOfRange(-1),
+            VmError::WaitOutOfRange {
+                millis: -1,
+                cause: String::new(),
+            },
         ),
         (
             with(vec![i(i64::from(u32::MAX) + 1)], Op::WaitFromStack),
             vec![],
-            VmError::WaitOutOfRange(i64::from(u32::MAX) + 1),
+            VmError::WaitOutOfRange {
+                millis: i64::from(u32::MAX) + 1,
+                cause: String::new(),
+            },
         ),
         (
             with(full(), Op::ReadDtc { mask: 1 }),
@@ -1866,7 +1910,10 @@ fn current_op_and_step_agree_on_primitives() {
                 message: 0,
             }],
             vec![vec![0xFF]],
-            VmError::InvalidUtf8(0),
+            VmError::InvalidUtf8 {
+                constant: 0,
+                cause: String::new(),
+            },
         ),
         (
             vec![Op::Log {
@@ -1897,11 +1944,14 @@ fn current_op_and_step_agree_on_primitives() {
         }
         host.forbidden = true;
         let before = postcard::to_allocvec(&vm.state).unwrap();
-        assert_eq!(vm.current_op(&program), Err(expected.clone()));
-        assert!(
-            matches!(vm.step(&program, &mut host), Err(StepError::Vm(ref e)) if *e == expected),
-            "{expected:?}"
+        assert_eq!(
+            vm.current_op(&program).map_err(without_cause),
+            Err(expected.clone())
         );
+        let Err(StepError::Vm(stepped)) = vm.step(&program, &mut host) else {
+            panic!("{expected:?}: the step did not fail with a VM error");
+        };
+        assert_eq!(without_cause(stepped), expected);
         assert_eq!(
             postcard::to_allocvec(&vm.state).unwrap(),
             before,
@@ -3816,7 +3866,14 @@ mod decode_field {
             })
         );
         // u64::MAX does not fit an I64.
-        assert_eq!(decode(true, 7, 8, &message), Err(VmError::Overflow));
+        assert!(
+            matches!(
+                decode(true, 7, 8, &message),
+                Err(VmError::UnsignedOutOfRange { ref cause }) if !cause.is_empty()
+            ),
+            "{:?}",
+            decode(true, 7, 8, &message)
+        );
         // A field of the nested layout is not a top-level field.
         assert_eq!(
             decode(true, 7, 7, &message),
@@ -3850,10 +3907,13 @@ mod decode_field {
             vec![0x62, 0xF1, 0x91, 0x12, 0x34],
             vec![0x62, 0xF1, 0x90, 0x12],
         ] {
-            assert_eq!(
-                decode(true, 7, 1, &message),
-                Err(VmError::Undecodable { service: 7 }),
-                "{message:02X?}"
+            assert!(
+                matches!(
+                    decode(true, 7, 1, &message),
+                    Err(VmError::Undecodable { service: 7, ref cause }) if !cause.is_empty()
+                ),
+                "{message:02X?}: {:?}",
+                decode(true, 7, 1, &message)
             );
         }
     }
@@ -4069,14 +4129,19 @@ mod flash_block {
             ..Default::default()
         };
         for index in [-1, 3, 4, i64::MAX, i64::MIN] {
-            assert_eq!(
-                block(4, 0, index, &mut host),
-                Err(VmError::BlockOutOfRange {
-                    session: 4,
-                    segment: 0,
-                    index
-                }),
-                "index {index}"
+            let result = block(4, 0, index, &mut host);
+            // A negative index fails to convert and names why; a too-large one converts.
+            assert!(
+                matches!(
+                    result,
+                    Err(VmError::BlockOutOfRange {
+                        session: 4,
+                        segment: 0,
+                        index: got,
+                        ref cause,
+                    }) if got == index && cause.is_some() == (index < 0)
+                ),
+                "index {index}: {result:?}"
             );
         }
     }
@@ -4711,7 +4776,10 @@ fn hmi_form_errors_come_before_the_host() {
         (
             vec![Op::PushBytes(1), Op::HmiRequestFromStack { form: 0 }],
             vec![one_slot(), vec![b'a', 0xFF]],
-            VmError::InvalidUtf8(0),
+            VmError::InvalidUtf8 {
+                constant: 0,
+                cause: String::new(),
+            },
         ),
         (
             vec![Op::PushBytes(1), Op::HmiRequestFromStack { form: 0 }],
@@ -4744,11 +4812,14 @@ fn hmi_form_errors_come_before_the_host() {
         }
         host.forbidden = true;
         let before = postcard::to_allocvec(&vm.state).unwrap();
-        assert_eq!(vm.current_op(&program), Err(expected.clone()));
-        assert!(
-            matches!(vm.step(&program, &mut host), Err(StepError::Vm(ref e)) if *e == expected),
-            "{expected:?}"
+        assert_eq!(
+            vm.current_op(&program).map_err(without_cause),
+            Err(expected.clone())
         );
+        let Err(StepError::Vm(stepped)) = vm.step(&program, &mut host) else {
+            panic!("{expected:?}: the step did not fail with a VM error");
+        };
+        assert_eq!(without_cause(stepped), expected);
         assert_eq!(
             postcard::to_allocvec(&vm.state).unwrap(),
             before,

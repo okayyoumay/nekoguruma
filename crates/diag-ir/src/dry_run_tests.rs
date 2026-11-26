@@ -1042,7 +1042,8 @@ fn a_flash_block_outside_the_declarations_ends_the_run_with_the_vms_error() {
         DryRunEnd::Vm(VmError::BlockOutOfRange {
             session: 2,
             segment: 0,
-            index: 3
+            index: 3,
+            cause: None
         })
     );
 }

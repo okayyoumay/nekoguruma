@@ -499,6 +499,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-507](ADR-507-the-windows-key-is-a-dpapi-blob-file-in-the-accounts-state-directory-created-once-and-tied-to-a-persistent-profile.md) | The Windows Key Is a DPAPI Blob File in the Account's State Directory, Created Once and Tied to a Persistent Profile | Accepted | design 6.4, `crates/agent` (`identity::blob_store`, `identity::dpapi`, store selection), `core-windows`; details ADR-459 item 4 and ADR-460 |
 | [ADR-508](ADR-508-an-operators-request-row-lets-a-communication-log-be-stored-and-the-agent-is-told-by-an-unsigned-control-message.md) | An Operator's Request Row Is What Lets a Communication Log Be Stored, and the Agent Is Told by an Unsigned Control Message | Accepted | design 4.3, 8.11, 13.4, 14.3, `crates/server` (`uploads`, `comm_log_requests`), `crates/agent`, `db/README.md`; details ADR-455; amends ADR-493 item 3's judgement of begin |
 | [ADR-509](ADR-509-dependencies-are-audited-with-cargo-deny-against-a-licence-allow-list-and-the-advisory-database.md) | Dependencies Are Audited With cargo-deny Against a Licence Allow-List and the Advisory Database | Accepted | `deny.toml`, `.github/workflows/ci.yml`, `CLAUDE.md`; `Cargo.toml` `license` keys |
+| [ADR-510](ADR-510-a-mapped-error-keeps-its-cause.md) | A Mapped Error Keeps Its Cause | Accepted | `Cargo.toml` lints; error types across the workspace; `CLAUDE.md` |
 
 ## Status Legend
 
@@ -782,6 +783,7 @@ the predecessor repository these ADRs came from.
 - ADR-354
 - ADR-355
 - ADR-359 (item 3 extended by ADR-437: a collecting request lists its rejected results among its answers, and its end is a rejected result only while no usable answer stands; item 3's "the request stays owed" amended by ADR-443: the primitive the VCI finished on a wrong echo counts as the VCI ending its wait, so its exchange is kept and the ECU's usable answer is its `late_response`; item 1's list item gains `late_response` and item 3's "counts for nothing else" revised by ADR-447: a wrong echo bound to a later primitive is first offered to the kept owed exchanges)
+- ADR-510
 
 ### Configuration & Deployment
 - ADR-024 (default `VCI_CONFIG_PATH` and the non-Windows root superseded by ADR-228)

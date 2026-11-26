@@ -50,9 +50,9 @@ pub enum LogUploadError {
     /// The upload ledger could not take the entry.
     #[error("the upload ledger could not take the entry: {0}")]
     Ledger(#[from] LedgerError),
-    /// The task that does the work ended without a result.
+    /// The task that does the work ended without a result; the source says how it ended.
     #[error("the task for the log ended without a result")]
-    Task,
+    Task(#[source] Option<tokio::task::JoinError>),
     /// The connection the command came on ended while the log was being read.
     #[error("the connection ended while the log was being read")]
     Cancelled,
@@ -162,7 +162,7 @@ impl LogUploader {
             digest_for_upload_traced(&dir, &read_key, max, &cancel, &*trace).map(|read| (read, dir))
         })
         .await
-        .map_err(|_| LogUploadError::Task)??;
+        .map_err(|error| LogUploadError::Task(Some(error)))??;
         let (digest, dir) = match found {
             (UploadRead::Busy, _) => return Ok(LogUploadOutcome::Busy),
             (UploadRead::NoLog, _) => return Ok(LogUploadOutcome::NoLog),

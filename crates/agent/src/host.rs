@@ -72,8 +72,10 @@ pub enum HostError {
     /// for it (for example a transmit error), so the request may not have been sent.
     #[error("the primitive failed: {}", error_event_name(*.0))]
     PrimitiveFailed(i32),
+    /// The value is not a one-byte service ID. The source is the failed narrowing, when there was
+    /// one (an empty request has no service byte to narrow).
     #[error("service {0:#x} is not a UDS service ID")]
-    BadService(u16),
+    BadService(u16, #[source] Option<std::num::TryFromIntError>),
     #[error(
         "service {0:#x} is not allowed: the agent's request policy refuses it (ADR-235 item 8, ADR-247)"
     )]
@@ -212,7 +214,7 @@ impl HostError {
         match self {
             // The agent refused before the start RPC.
             HostError::LinkHeld
-            | HostError::BadService(_)
+            | HostError::BadService(..)
             | HostError::NotAllowed(_)
             | HostError::EmptyRequest
             | HostError::UndeclaredService(_)
@@ -391,9 +393,14 @@ impl Timings {
     }
 }
 
+/// The one-byte service ID of `service`, or [`HostError::BadService`] when it does not fit.
+pub fn service_id(service: u16) -> Result<u8, HostError> {
+    u8::try_from(service).map_err(|source| HostError::BadService(service, Some(source)))
+}
+
 /// The request a `ServiceRequest` sends: the SID, then the payload (ADR-235 item 2).
 pub fn service_request_bytes(service: u16, payload: &[u8]) -> Result<Vec<u8>, HostError> {
-    let sid = u8::try_from(service).map_err(|_| HostError::BadService(service))?;
+    let sid = service_id(service)?;
     let mut request = Vec::with_capacity(1 + payload.len());
     request.push(sid);
     request.extend_from_slice(payload);
@@ -439,7 +446,7 @@ impl TransferCounter {
     ///   the response: FlashTransfer would discard upload data, and the other four end or
     ///   invalidate the server's transfer (ADR-250).
     /// - Other services leave it as it is.
-    fn after_request(&mut self, request: &[u8], outcome: Result<&[u8], ()>) {
+    fn after_request(&mut self, request: &[u8], outcome: Result<&[u8], &HostError>) {
         match request.first() {
             Some(0x34) => {
                 (self.accepted, self.max_block_length) = match outcome {
@@ -2380,9 +2387,7 @@ impl<C: WorkerApi> WorkerHost<C> {
                 progress: None,
             });
         }
-        let result = waited
-            .map_err(|_| HostError::NoResponse)
-            .and_then(|outcome| outcome);
+        let result = deadline_outcome(waited);
         Sent {
             result,
             error_events: std::mem::take(&mut progress.errors),
@@ -2532,6 +2537,22 @@ impl<C: WorkerApi> WorkerHost<C> {
             evidence.caused_by = caused_by;
         });
     }
+}
+
+/// The outcome of a wait that may have run out its deadline: an expired deadline is
+/// [`HostError::NoResponse`].
+#[expect(
+    clippy::map_err_ignore,
+    reason = "NoResponse is a unit variant that over five hundred tests and the restart and \
+              report code construct and match; the Elapsed it would hold says only that the \
+              deadline passed, which NoResponse already says"
+)]
+fn deadline_outcome<T>(
+    waited: Result<Result<T, HostError>, tokio::time::error::Elapsed>,
+) -> Result<T, HostError> {
+    waited
+        .map_err(|_| HostError::NoResponse)
+        .and_then(|outcome| outcome)
 }
 
 /// Polls `future` once, with a waker that wakes nothing: its output if it is ready, `None` if it
@@ -3864,7 +3885,7 @@ fn link_error_kind(code: i32) -> LinkErrorKind {
 fn refusal_cause(request: &[u8], error: &HostError) -> RefusalCause {
     match error {
         // A service number no request can carry: the entry has no bytes for it.
-        HostError::BadService(_) | HostError::UndeclaredService(_) => {
+        HostError::BadService(..) | HostError::UndeclaredService(_) => {
             RefusalCause::UndeclaredService
         }
         _ if request.is_empty() => RefusalCause::EmptyRequest,
@@ -3897,7 +3918,7 @@ fn host_error_name(error: &HostError) -> &'static str {
         HostError::EventsLost => "EventsLost",
         HostError::VciLost { .. } => "VciLost",
         HostError::PrimitiveFailed(_) => "PrimitiveFailed",
-        HostError::BadService(_) => "BadService",
+        HostError::BadService(..) => "BadService",
         HostError::NotAllowed(_) => "NotAllowed",
         HostError::NoTransferActive => "NoTransferActive",
         HostError::TransferRefused { .. } => "TransferRefused",
@@ -4368,7 +4389,7 @@ impl Progress {
     }
 
     fn for_request(request: &[u8]) -> Result<Self, HostError> {
-        let sid = *request.first().ok_or(HostError::BadService(0))?;
+        let sid = *request.first().ok_or(HostError::BadService(0, None))?;
         Ok(Self {
             sid,
             positive_prefix: positive_prefix(request),
@@ -4776,8 +4797,7 @@ impl<C: WorkerApi> DiagHost for WorkerHost<C> {
             return Err(error);
         }
         let response = self.send_recv(request.clone());
-        self.transfer
-            .after_request(&request, response.as_deref().map_err(|_| ()));
+        self.transfer.after_request(&request, response.as_deref());
         response
     }
 
@@ -4801,8 +4821,7 @@ impl<C: WorkerApi> DiagHost for WorkerHost<C> {
             }
         };
         let response = self.send_expecting(request.to_vec(), expected);
-        self.transfer
-            .after_request(request, response.as_deref().map_err(|_| ()));
+        self.transfer.after_request(request, response.as_deref());
         response
     }
 
@@ -5127,7 +5146,7 @@ mod tests {
         let cases: [(&[u8], HostError, RefusalCause); 11] = [
             (
                 &[],
-                HostError::BadService(0x1FF),
+                HostError::BadService(0x1FF, None),
                 RefusalCause::UndeclaredService,
             ),
             (
@@ -5733,7 +5752,7 @@ mod tests {
         assert_eq!(service_request_bytes(0x3E, &[]).unwrap(), [0x3E]);
         assert!(matches!(
             service_request_bytes(0x100, &[]),
-            Err(HostError::BadService(0x100))
+            Err(HostError::BadService(0x100, _))
         ));
         assert_eq!(
             routine_control_bytes(0xFF00, 0x01, &[0xAA]),
@@ -5864,7 +5883,7 @@ mod tests {
         counter.after_request(&download, Ok(&[0x7F, 0x34, 0x22]));
         assert_eq!(counter.accepted, None);
         counter.after_request(&download, Ok(&[0x74, 0x20]));
-        counter.after_request(&download, Err(()));
+        counter.after_request(&download, Err(&HostError::NoResponse));
         assert_eq!(counter.accepted, None);
         // A response of another service does not begin one.
         counter.after_request(&download, Ok(&[0x77]));
@@ -5884,7 +5903,11 @@ mod tests {
             &[0x10, 0x01],
             &[0x11, 0x01],
         ] {
-            for outcome in [Ok(&[0x7F, request[0], 0x22][..]), Ok(&[0x00][..]), Err(())] {
+            for outcome in [
+                Ok(&[0x7F, request[0], 0x22][..]),
+                Ok(&[0x00][..]),
+                Err(&HostError::NoResponse),
+            ] {
                 let mut counter = begun();
                 counter.after_request(request, outcome);
                 assert_eq!(counter.accepted, None, "{request:02X?}");
@@ -5894,7 +5917,7 @@ mod tests {
         // Other services leave it.
         let mut counter = begun();
         counter.after_request(&[0x22, 0xF1, 0x90], Ok(&[0x62, 0xF1, 0x90]));
-        counter.after_request(&[0x31, 0x01, 0xFF, 0x00], Err(()));
+        counter.after_request(&[0x31, 0x01, 0xFF, 0x00], Err(&HostError::NoResponse));
         assert_eq!(counter.accepted, Some(0));
     }
 
@@ -7409,7 +7432,7 @@ mod tests {
     fn agent_refusals() -> Vec<HostError> {
         vec![
             HostError::LinkHeld,
-            HostError::BadService(0x1FF),
+            HostError::BadService(0x1FF, None),
             HostError::NotAllowed(0x2E),
             HostError::EmptyRequest,
             HostError::UndeclaredService(7),

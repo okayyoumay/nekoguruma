@@ -677,12 +677,24 @@ pub enum JournalError {
     UnsupportedVersion(u32),
     #[error("the journal belongs to another job or generation")]
     WrongJob,
+    /// `source` is the decoder's error when a header or record did not decode.
     #[error("the journal is corrupt at byte {offset}: {reason}")]
-    Corrupt { offset: u64, reason: &'static str },
+    Corrupt {
+        offset: u64,
+        reason: &'static str,
+        #[source]
+        source: Option<postcard::Error>,
+    },
     #[error("the record does not fit the journal: {0}")]
     Invariant(&'static str),
     #[error("the record is larger than a journal frame")]
     TooLarge,
+    /// The record could not be encoded.
+    #[error("the record cannot be encoded")]
+    Unencodable(#[source] postcard::Error),
+    /// A block count does not fit the journal's range.
+    #[error("the record does not fit the journal: the block count is beyond the journal's range")]
+    BlockCount(#[source] std::num::TryFromIntError),
     /// Another `Journal` of this job and generation is open for writing, in this process or
     /// another (ADR-255).
     #[error("the journal is open for writing elsewhere")]
@@ -1454,8 +1466,8 @@ fn unix_ms() -> u64 {
         .map_or(0, |elapsed| elapsed.as_millis() as u64)
 }
 
-fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, JournalError> {
-    postcard::to_allocvec(value).map_err(|_| JournalError::TooLarge)
+pub(crate) fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, JournalError> {
+    postcard::to_allocvec(value).map_err(JournalError::Unencodable)
 }
 
 pub(crate) fn push_frame(out: &mut Vec<u8>, payload: &[u8]) -> Result<(), JournalError> {
@@ -1515,6 +1527,7 @@ fn load(bytes: &[u8], key: &JobKey) -> Result<Loaded, JournalError> {
     let corrupt = |offset: usize, reason| JournalError::Corrupt {
         offset: offset as u64,
         reason,
+        source: None,
     };
     if bytes.len() < PREAMBLE || bytes[..MAGIC.len()] != MAGIC {
         return Err(corrupt(0, "not a journal"));
@@ -1527,8 +1540,11 @@ fn load(bytes: &[u8], key: &JobKey) -> Result<Loaded, JournalError> {
     let FrameRead::Ok { payload, next } = read_frame(bytes, PREAMBLE) else {
         return Err(corrupt(PREAMBLE, "the header does not read back"));
     };
-    let header: Header = postcard::from_bytes(payload)
-        .map_err(|_| corrupt(PREAMBLE, "the header does not decode"))?;
+    let header: Header = postcard::from_bytes(payload).map_err(|source| JournalError::Corrupt {
+        offset: PREAMBLE as u64,
+        reason: "the header does not decode",
+        source: Some(source),
+    })?;
     if header.key != *key {
         return Err(JournalError::WrongJob);
     }
@@ -1558,8 +1574,12 @@ fn load(bytes: &[u8], key: &JobKey) -> Result<Loaded, JournalError> {
             FrameRead::Torn => return Err(corrupt(offset, "a record does not read back")),
             FrameRead::Bad => return Err(corrupt(offset, "a record fails its checksum")),
         };
-        let entry: Entry = postcard::from_bytes(payload)
-            .map_err(|_| corrupt(offset, "a record does not decode"))?;
+        let entry: Entry =
+            postcard::from_bytes(payload).map_err(|source| JournalError::Corrupt {
+                offset: offset as u64,
+                reason: "a record does not decode",
+                source: Some(source),
+            })?;
         if entry.seq != state.records {
             return Err(corrupt(offset, "a record is out of sequence"));
         }

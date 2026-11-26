@@ -76,13 +76,12 @@ fn upload_body(id: &str, part_bytes: u64, part_count: u64, state: &str) -> Strin
     )
 }
 
-fn failure(class: Class, why: &'static str, status: Option<u16>) -> Failure {
-    Failure {
-        class,
-        why,
-        status,
-        retry_after_secs: None,
-    }
+/// Whether `failure` is a failure of `class` for `why` at `status`, with no `Retry-After`.
+fn is_failure(failure: &Failure, class: Class, why: &str, status: Option<u16>) -> bool {
+    failure.class == class
+        && failure.why == why
+        && failure.status == status
+        && failure.retry_after_secs.is_none()
 }
 
 /// Every status a route has no result for, and the class the loop gets (the same for all four).
@@ -163,9 +162,13 @@ async fn begin_reads_the_row_of_the_same_declaration_in_any_state_but_failed() {
         (201, "completing"),
     ] {
         let (routes, _) = with_reply(Served::new(status, &upload_body(ID, MIB5, 1, state)));
-        assert_eq!(
-            routes.begin("t", &declared(10)).await.unwrap_err(),
-            failure(Class::PassOver, "answer", Some(status)),
+        assert!(
+            is_failure(
+                &routes.begin("t", &declared(10)).await.unwrap_err(),
+                Class::PassOver,
+                "answer",
+                Some(status)
+            ),
             "{status} {state}"
         );
     }
@@ -194,10 +197,12 @@ async fn begin_judges_the_count_against_its_own_length() {
         let got = routes.begin("t", &declared(length)).await;
         assert_eq!(got.is_ok(), fine, "{length} {part_bytes} {count}: {got:?}");
         if !fine {
-            assert_eq!(
-                got.unwrap_err(),
-                failure(Class::PassOver, "answer", Some(201))
-            );
+            assert!(is_failure(
+                &got.unwrap_err(),
+                Class::PassOver,
+                "answer",
+                Some(201)
+            ));
         }
     }
 }
@@ -235,9 +240,13 @@ async fn begin_refuses_bodies_the_route_does_not_promise() {
         r#"{"uploadId":5,"partBytes":1,"partCount":1,"state":"open"}"#.to_owned(),
     ] {
         let (routes, _) = with_reply(Served::new(201, &body));
-        assert_eq!(
-            routes.begin("t", &declared(1)).await.unwrap_err(),
-            failure(Class::PassOver, "answer", Some(201)),
+        assert!(
+            is_failure(
+                &routes.begin("t", &declared(1)).await.unwrap_err(),
+                Class::PassOver,
+                "answer",
+                Some(201)
+            ),
             "{:?}",
             &body[..body.len().min(60)]
         );
@@ -309,9 +318,13 @@ async fn a_part_url_that_breaks_the_rule_is_a_retry_and_other_bodies_are_unpromi
         "https://evil.example/x",
     ] {
         let (routes, seen) = with_reply(Served::new(200, &part_answer(url)));
-        assert_eq!(
-            routes.part_url("t", &id(), 1).await.unwrap_err(),
-            failure(Class::Retry, "part-url-host", Some(200)),
+        assert!(
+            is_failure(
+                &routes.part_url("t", &id(), 1).await.unwrap_err(),
+                Class::Retry,
+                "part-url-host",
+                Some(200)
+            ),
             "{url}"
         );
         assert_eq!(seen.lock().unwrap().len(), 1, "only the route was asked");
@@ -342,9 +355,13 @@ async fn a_part_url_that_breaks_the_rule_is_a_retry_and_other_bodies_are_unpromi
     ]);
     for body in bodies {
         let (routes, seen) = with_reply(Served::new(200, &body));
-        assert_eq!(
-            routes.part_url("t", &id(), 1).await.unwrap_err(),
-            failure(Class::PassOver, "answer", Some(200)),
+        assert!(
+            is_failure(
+                &routes.part_url("t", &id(), 1).await.unwrap_err(),
+                Class::PassOver,
+                "answer",
+                Some(200)
+            ),
             "{body}"
         );
         assert_eq!(seen.lock().unwrap().len(), 1, "only the route was asked");
@@ -355,10 +372,12 @@ async fn a_part_url_that_breaks_the_rule_is_a_retry_and_other_bodies_are_unpromi
         PIN.to_uppercase()
     );
     let (routes, seen) = with_reply(Served::new(200, &both));
-    assert_eq!(
-        routes.part_url("t", &id(), 1).await.unwrap_err(),
-        failure(Class::PassOver, "answer", Some(200))
-    );
+    assert!(is_failure(
+        &routes.part_url("t", &id(), 1).await.unwrap_err(),
+        Class::PassOver,
+        "answer",
+        Some(200)
+    ));
     assert_eq!(seen.lock().unwrap().len(), 1, "only the route was asked");
     // A 201 is not what the route answers.
     let (routes, _) = with_reply(Served::new(201, &part_answer("https://127.0.0.1:9000/x")));
@@ -455,9 +474,13 @@ async fn status_refuses_what_the_route_does_not_promise() {
     ];
     for (body, length) in table {
         let (routes, _) = with_reply(Served::new(200, &body));
-        assert_eq!(
-            routes.status("t", &id(), length).await.unwrap_err(),
-            failure(Class::PassOver, "answer", Some(200)),
+        assert!(
+            is_failure(
+                &routes.status("t", &id(), length).await.unwrap_err(),
+                Class::PassOver,
+                "answer",
+                Some(200)
+            ),
             "{:?}",
             &body[..body.len().min(80)]
         );
@@ -502,11 +525,11 @@ async fn complete_answers_are_typed() {
     ];
     for (status, body, want) in table {
         let (routes, seen) = with_reply(Served::new(status, &body));
-        assert_eq!(
-            routes.complete("tok", &id()).await,
-            Ok(want),
-            "{status} {body}"
-        );
+        let done = routes
+            .complete("tok", &id())
+            .await
+            .unwrap_or_else(|failure| panic!("{status} {body}: {failure:?}"));
+        assert_eq!(done, want, "{status} {body}");
         let seen = seen.lock().unwrap();
         assert_eq!(
             seen[0].request_line(),
@@ -531,9 +554,13 @@ async fn complete_refuses_what_the_route_does_not_promise() {
         (202, ""),
     ] {
         let (routes, _) = with_reply(Served::new(status, body));
-        assert_eq!(
-            routes.complete("t", &id()).await.unwrap_err(),
-            failure(Class::PassOver, "answer", Some(status)),
+        assert!(
+            is_failure(
+                &routes.complete("t", &id()).await.unwrap_err(),
+                Class::PassOver,
+                "answer",
+                Some(status)
+            ),
             "{status} {body}"
         );
     }
@@ -553,21 +580,27 @@ async fn a_request_with_no_answer_is_a_retry() {
     dial.set(crate::uploader::fake::Mode::Refuse);
     let (_, verifier) = proving(ORIGIN, AGENT);
     let routes = routes_over(dial.clone(), verifier);
-    assert_eq!(
-        routes.complete("t", &id()).await.unwrap_err(),
-        failure(Class::Retry, "not-sent", None)
-    );
+    assert!(is_failure(
+        &routes.complete("t", &id()).await.unwrap_err(),
+        Class::Retry,
+        "not-sent",
+        None
+    ));
     dial.set(crate::uploader::fake::Mode::Hang);
-    assert_eq!(
-        routes.status("t", &id(), 1).await.unwrap_err(),
-        failure(Class::Retry, "connect-timeout", None)
-    );
+    assert!(is_failure(
+        &routes.status("t", &id(), 1).await.unwrap_err(),
+        Class::Retry,
+        "connect-timeout",
+        None
+    ));
     // Garbage on the wire.
     let (routes2, _) = with_raw(b"junk\r\n\r\n".to_vec());
-    assert_eq!(
-        routes2.begin("t", &declared(1)).await.unwrap_err(),
-        failure(Class::Retry, "transport", None)
-    );
+    assert!(is_failure(
+        &routes2.begin("t", &declared(1)).await.unwrap_err(),
+        Class::Retry,
+        "transport",
+        None
+    ));
 }
 
 #[tokio::test(start_paused = true)]
@@ -599,13 +632,15 @@ async fn the_put_carries_no_token_and_any_failure_is_a_retry() {
             target: part_url::check(&origin, "https://127.0.0.1:9000/b/k?sig=1", pin).unwrap(),
             expires_in_secs: 300,
         };
-        assert_eq!(
-            routes
+        assert!(is_failure(
+            &routes
                 .put_part(&url, 1, Box::new(Cursor::new(vec![1])))
                 .await
                 .unwrap_err(),
-            failure(Class::Retry, "put-refused", Some(status))
-        );
+            Class::Retry,
+            "put-refused",
+            Some(status)
+        ));
     }
 }
 
@@ -628,10 +663,12 @@ async fn a_put_to_a_peer_that_is_not_the_object_server_is_a_retry_and_sends_no_b
         .put_part(&url, 4, Box::new(Cursor::new(b"abcd".to_vec())))
         .await
         .unwrap_err();
-    assert_eq!(
-        refused,
-        failure(Class::Retry, "object-tls-certificate", None)
-    );
+    assert!(is_failure(
+        &refused,
+        Class::Retry,
+        "object-tls-certificate",
+        None
+    ));
     assert!(seen.lock().unwrap().is_empty(), "the peer read a request");
 }
 
@@ -736,7 +773,9 @@ async fn a_proved_answer_on_every_route_gives_its_result() {
     for (route, call, answers) in calls() {
         for (status, body) in answers {
             let (routes, _) = with_reply(Served::new(status, &body));
-            assert_eq!(call(&routes).await, Ok(()), "{route} {status} {body}");
+            call(&routes)
+                .await
+                .unwrap_or_else(|failure| panic!("{route} {status} {body}: {failure:?}"));
         }
     }
 }
@@ -749,9 +788,8 @@ async fn a_promised_status_that_is_not_proved_is_unproven_on_every_route() {
         for (status, body) in answers {
             for proof in Proof::UNPROVED {
                 let (routes, _) = with_reply(Served::new(status, &body).with(proof));
-                assert_eq!(
-                    call(&routes).await,
-                    Err(failure(Class::Unproven, "unproven", Some(status))),
+                assert!(
+                    matches!(&call(&routes).await, Err(e) if is_failure(e, Class::Unproven, "unproven", Some(status))),
                     "{route} {status} {proof:?}"
                 );
             }
@@ -764,15 +802,19 @@ async fn a_promised_status_that_is_not_proved_is_unproven_on_every_route() {
 #[tokio::test(start_paused = true)]
 async fn the_proof_is_checked_before_the_shape_of_the_body() {
     let (routes, _) = with_reply(Served::new(201, "not json"));
-    assert_eq!(
-        routes.begin("t", &declared(1)).await.unwrap_err(),
-        failure(Class::PassOver, "answer", Some(201))
-    );
+    assert!(is_failure(
+        &routes.begin("t", &declared(1)).await.unwrap_err(),
+        Class::PassOver,
+        "answer",
+        Some(201)
+    ));
     let (routes, _) = with_reply(Served::new(201, "not json").unproved());
-    assert_eq!(
-        routes.begin("t", &declared(1)).await.unwrap_err(),
-        failure(Class::Unproven, "unproven", Some(201))
-    );
+    assert!(is_failure(
+        &routes.begin("t", &declared(1)).await.unwrap_err(),
+        Class::Unproven,
+        "unproven",
+        Some(201)
+    ));
 }
 
 /// R9, R10: the statuses that are not results are classed by status whatever proof they carry,
@@ -797,9 +839,13 @@ async fn statuses_that_are_not_results_are_classed_by_status_not_checked() {
             );
         }
         let (routes, _) = with_reply(Served::new(409, "{}").with(proof));
-        assert_eq!(
-            routes.part_url("t", &id(), 1).await.unwrap_err(),
-            failure(Class::Retry, "not-open", Some(409)),
+        assert!(
+            is_failure(
+                &routes.part_url("t", &id(), 1).await.unwrap_err(),
+                Class::Retry,
+                "not-open",
+                Some(409)
+            ),
             "{proof:?}"
         );
     }
@@ -850,9 +896,8 @@ async fn a_body_over_the_bound_or_cut_is_unproven_on_every_route() {
         for (status, body) in answers {
             for proof in [Proof::OverLimit, Proof::Cut] {
                 let (routes, _) = with_reply(Served::new(status, &body).with(proof));
-                assert_eq!(
-                    call(&routes).await,
-                    Err(failure(Class::Unproven, "unproven", Some(status))),
+                assert!(
+                    matches!(&call(&routes).await, Err(e) if is_failure(e, Class::Unproven, "unproven", Some(status))),
                     "{route} {status} {proof:?}"
                 );
             }

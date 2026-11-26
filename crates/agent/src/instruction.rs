@@ -84,6 +84,22 @@ pub(crate) struct Refusal {
     pub(crate) reason: InstructionRejectReason,
     /// The fingerprint the envelope offered, kept for an unknown key only.
     pub(crate) offered: Option<[u8; envelope::FINGERPRINT_LEN]>,
+    /// The error that made the envelope malformed or its signature bad, when there was one. It
+    /// goes to the log and never into the reason that is sent back.
+    pub(crate) source: Option<Box<dyn std::error::Error + Send + Sync>>,
+}
+
+impl Refusal {
+    fn caused_by(
+        reason: InstructionRejectReason,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            reason,
+            offered: None,
+            source: Some(Box::new(source)),
+        }
+    }
 }
 
 impl From<InstructionRejectReason> for Refusal {
@@ -91,6 +107,7 @@ impl From<InstructionRejectReason> for Refusal {
         Self {
             reason,
             offered: None,
+            source: None,
         }
     }
 }
@@ -111,10 +128,14 @@ fn check(
         return Err(Refusal {
             reason: Reason::UnknownKey,
             offered: Some(*split.fingerprint()),
+            source: None,
         });
     }
-    let signature = split.signature().map_err(|_| Reason::Malformed)?;
-    envelope::verify(trusted_key, split.payload(), &signature).map_err(|_| Reason::BadSignature)?;
+    let signature = split
+        .signature()
+        .map_err(|error| Refusal::caused_by(Reason::Malformed, error))?;
+    envelope::verify(trusted_key, split.payload(), &signature)
+        .map_err(|error| Refusal::caused_by(Reason::BadSignature, error))?;
     let instruction = JobInstruction::decode(split.payload()).map_err(|error| match error {
         InstructionError::UnsupportedVersion { .. } => Reason::UnsupportedVersion,
         InstructionError::TooLong(_)
@@ -135,21 +156,24 @@ fn check(
 /// otherwise (the control channel's gate bounds its warnings that way; [`open`] always warns).
 pub(crate) fn log_refusal(refusal: &Refusal, envelope_len: usize, first: bool) {
     let reason = format!("{:?}", refusal.reason);
+    let cause = refusal.source.as_deref().map(tracing::field::display);
     match (&refusal.offered, first) {
         (Some(fingerprint), true) => tracing::warn!(
             reason,
             envelope_len,
             offered_key = %hex(fingerprint),
+            cause,
             "job instruction refused"
         ),
         (Some(fingerprint), false) => tracing::debug!(
             reason,
             envelope_len,
             offered_key = %hex(fingerprint),
+            cause,
             "job instruction refused"
         ),
-        (None, true) => tracing::warn!(reason, envelope_len, "job instruction refused"),
-        (None, false) => tracing::debug!(reason, envelope_len, "job instruction refused"),
+        (None, true) => tracing::warn!(reason, envelope_len, cause, "job instruction refused"),
+        (None, false) => tracing::debug!(reason, envelope_len, cause, "job instruction refused"),
     }
 }
 

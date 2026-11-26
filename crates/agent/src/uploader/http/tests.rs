@@ -104,14 +104,14 @@ async fn a_head_over_the_limit_is_refused() {
     let filler = "X-Pad: ".to_owned() + &"a".repeat(1000) + "\r\n";
     let (dial, _) = scripted(answer(200, &filler.repeat(20), "{}"));
     let client = Client::with_dial(dial);
-    assert_eq!(post(&client).await.unwrap_err(), Error::Failed);
+    assert!(matches!(post(&client).await.unwrap_err(), Error::Failed(_)));
     // Too many header lines are refused as well.
     let lines = "X: 1\r\n".repeat(MAX_HEADERS + 1);
     let (dial, _) = scripted(answer(200, &lines, "{}"));
-    assert_eq!(
+    assert!(matches!(
         post(&Client::with_dial(dial)).await.unwrap_err(),
-        Error::Failed
-    );
+        Error::Failed(_)
+    ));
 }
 
 /// The body is read for 200, 201, 202 and 409 only: for any other status the server declares a
@@ -344,10 +344,16 @@ async fn the_connect_is_bounded_at_five_seconds_and_a_refusal_is_not_sent() {
     let client = Client::with_dial(dial.clone());
     dial.set(Mode::Hang);
     let started = Instant::now();
-    assert_eq!(post(&client).await.unwrap_err(), Error::ConnectTimeout);
+    assert!(matches!(
+        post(&client).await.unwrap_err(),
+        Error::ConnectTimeout
+    ));
     assert_eq!(started.elapsed(), CONNECT_TIMEOUT);
     dial.set(Mode::Refuse);
-    assert_eq!(post(&client).await.unwrap_err(), Error::NotSent);
+    assert!(matches!(
+        post(&client).await.unwrap_err(),
+        Error::NotSent(_)
+    ));
     // A PUT is bounded the same way.
     dial.set(Mode::Hang);
     let started = Instant::now();
@@ -361,7 +367,7 @@ async fn the_connect_is_bounded_at_five_seconds_and_a_refusal_is_not_sent() {
             Box::new(Cursor::new(vec![0u8])),
         )
         .await;
-    assert_eq!(put.unwrap_err(), Error::ConnectTimeout);
+    assert!(matches!(put.unwrap_err(), Error::ConnectTimeout));
     assert_eq!(started.elapsed(), CONNECT_TIMEOUT);
 }
 
@@ -389,7 +395,10 @@ fn silent_after_request_tls() -> (Arc<FakeDial>, CertPin) {
 async fn thirty_seconds_of_silence_ends_a_request_and_twenty_nine_do_not() {
     let client = Client::with_dial(silent_after_request());
     let started = Instant::now();
-    assert_eq!(post(&client).await.unwrap_err(), Error::NoProgress);
+    assert!(matches!(
+        post(&client).await.unwrap_err(),
+        Error::NoProgress
+    ));
     assert_eq!(started.elapsed(), NO_PROGRESS);
     // A PUT has no total but the same clock.
     let (dial, pin) = silent_after_request_tls();
@@ -397,7 +406,7 @@ async fn thirty_seconds_of_silence_ends_a_request_and_twenty_nine_do_not() {
     let put = Client::with_dial(dial)
         .put(9000, &pin, "/p", HOST, 1, Box::new(Cursor::new(vec![0u8])))
         .await;
-    assert_eq!(put.unwrap_err(), Error::NoProgress);
+    assert!(matches!(put.unwrap_err(), Error::NoProgress));
     assert_eq!(started.elapsed(), NO_PROGRESS);
 
     // An answer that comes after 29 seconds is taken.
@@ -433,7 +442,7 @@ async fn the_clock_runs_from_the_dial_when_nothing_is_ever_sent_back() {
             Box::new(Cursor::new(vec![0u8; 100_000])),
         )
         .await;
-    assert_eq!(put.unwrap_err(), Error::NoProgress);
+    assert!(matches!(put.unwrap_err(), Error::NoProgress));
     assert_eq!(started.elapsed(), NO_PROGRESS);
 }
 
@@ -471,7 +480,7 @@ async fn the_total_is_for_the_json_routes_and_a_moving_put_has_none() {
     assert!(reply.len() > 40);
     let started = Instant::now();
     let client = Client::with_dial(trickling(secs(10), reply.clone()));
-    assert_eq!(post(&client).await.unwrap_err(), Error::Timeout);
+    assert!(matches!(post(&client).await.unwrap_err(), Error::Timeout));
     assert_eq!(started.elapsed(), JSON_TOTAL);
 
     let started = Instant::now();
@@ -487,7 +496,7 @@ async fn the_total_is_for_the_json_routes_and_a_moving_put_has_none() {
     // A trickle slower than the no-progress limit is still abandoned.
     let (dial, pin) = trickling_tls(secs(31), reply);
     let got = client_put(&Client::with_dial(dial), &pin).await;
-    assert_eq!(got.unwrap_err(), Error::NoProgress);
+    assert!(matches!(got.unwrap_err(), Error::NoProgress));
 }
 
 async fn client_put(client: &Client, pin: &CertPin) -> Result<Answer, Error> {
@@ -522,10 +531,10 @@ async fn a_cut_body_is_reported_as_cut_and_garbage_is_a_failure() {
     let cut = post(&Client::with_dial(dial)).await.unwrap();
     assert_eq!((cut.status, cut.body), (200, AnswerBody::Cut));
     let (dial, _) = scripted(b"not http at all\r\n\r\n".to_vec());
-    assert_eq!(
+    assert!(matches!(
         post(&Client::with_dial(dial)).await.unwrap_err(),
-        Error::Failed
-    );
+        Error::Failed(_)
+    ));
 }
 
 /// The real socket path, once: a loopback listener, the production dial. The PUT's real socket
@@ -597,13 +606,13 @@ async fn the_reader_starts_after_the_connect_and_stops_with_the_put() {
     let (dial, _) = scripted(json(200, "{}"));
     dial.set(Mode::Refuse);
     let client = Client::with_dial(dial.clone());
-    assert_eq!(
+    assert!(matches!(
         client
             .put(9000, &any_pin(), "/p", HOST, 1024 * 1024 * 1024, source)
             .await
             .unwrap_err(),
-        Error::NotSent
-    );
+        Error::NotSent(_)
+    ));
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
         produced.load(Ordering::SeqCst),
@@ -675,7 +684,7 @@ async fn a_put_the_server_reads_slowly_is_kept_alive_by_the_bytes_it_takes() {
     assert!(started.elapsed() > limit * 3, "{:?}", started.elapsed());
     // The same server reading once per limit-and-a-half gives no progress in between.
     let got = put(slow(Duration::from_millis(700))).await;
-    assert_eq!(got.unwrap_err(), Error::NoProgress);
+    assert!(matches!(got.unwrap_err(), Error::NoProgress));
 }
 
 /// A writer that fails after `ok` bytes, as a full disk does.
@@ -770,7 +779,7 @@ async fn a_get_with_a_failing_writer_is_a_write_error() {
         .await
         .map(|_| ())
         .unwrap_err();
-    assert_eq!(error, Error::Write(io::ErrorKind::StorageFull));
+    assert!(matches!(error, Error::Write(io::ErrorKind::StorageFull)));
 }
 
 #[tokio::test(start_paused = true)]
@@ -782,7 +791,7 @@ async fn a_get_refused_at_connect_sends_nothing() {
         .await
         .map(|_| ())
         .unwrap_err();
-    assert_eq!(error, Error::NotSent);
+    assert!(matches!(error, Error::NotSent(_)));
 }
 
 /// The TLS dial (ADR-505): the server's end of each pipe is a TLS server.
@@ -891,14 +900,14 @@ mod tls {
         let other = pin_of(&Identity::generate(Key::P256));
         let server = serving(Acceptor::new(&served), answer(200, "", ""));
         let client = Client::with_dial(server.dial.clone());
-        assert_eq!(
+        assert!(matches!(
             put(&client, &other).await.unwrap_err(),
             Error::Tls(Refused::Certificate)
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             get(&client, &other).await.unwrap_err(),
             Error::Tls(Refused::Certificate)
-        );
+        ));
         server.settle().await;
         server.assert_untouched();
     }
@@ -911,10 +920,10 @@ mod tls {
         let server = serving(impostor, answer(200, "", ""));
         let client = Client::with_dial(server.dial.clone());
         // The pin is right, so the signature is what refuses.
-        assert_eq!(
+        assert!(matches!(
             put(&client, &pin_of(&real)).await.unwrap_err(),
             Error::Tls(Refused::Signature)
-        );
+        ));
         server.settle().await;
         server.assert_untouched();
     }
@@ -938,10 +947,10 @@ mod tls {
         });
         let client = Client::with_dial(dial);
         let pin = pin_of(&Identity::generate(Key::P256));
-        assert_eq!(
+        assert!(matches!(
             put(&client, &pin).await.unwrap_err(),
             Error::Tls(Refused::Handshake(io::ErrorKind::InvalidData))
-        );
+        ));
         tokio::time::sleep(Duration::from_millis(1)).await;
         let received = received.lock().unwrap();
         assert!(!received.is_empty(), "the server read the hello");
@@ -990,7 +999,7 @@ mod tls {
             b"HTTP/1.1 200 X\r\nContent-Length: 10\r\nConnection: close\r\n\r\nabc".to_vec(),
         );
         let error = get(&Client::with_dial(dial), &pin).await.unwrap_err();
-        assert_eq!(error, Error::Failed);
+        assert!(matches!(error, Error::Failed(_)));
         // No length: the body would end with the connection, and a close with no close_notify
         // cannot tell the end from a cut. The GET never reads it as a complete body.
         let (dial, pin) = closing_without_close_notify(
@@ -1020,10 +1029,10 @@ mod tls {
         });
         let client = Client::with_dial(dial);
         let pin = pin_of(&Identity::generate(Key::P256));
-        assert_eq!(
+        assert!(matches!(
             put(&client, &pin).await.unwrap_err(),
             Error::Tls(Refused::Handshake(io::ErrorKind::UnexpectedEof))
-        );
+        ));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1037,10 +1046,16 @@ mod tls {
         let client = Client::with_dial(dial);
         let pin = pin_of(&Identity::generate(Key::P256));
         let started = Instant::now();
-        assert_eq!(put(&client, &pin).await.unwrap_err(), Error::ConnectTimeout);
+        assert!(matches!(
+            put(&client, &pin).await.unwrap_err(),
+            Error::ConnectTimeout
+        ));
         assert_eq!(started.elapsed(), CONNECT_TIMEOUT);
         let started = Instant::now();
-        assert_eq!(get(&client, &pin).await.unwrap_err(), Error::ConnectTimeout);
+        assert!(matches!(
+            get(&client, &pin).await.unwrap_err(),
+            Error::ConnectTimeout
+        ));
         assert_eq!(started.elapsed(), CONNECT_TIMEOUT);
     }
 
@@ -1060,10 +1075,10 @@ mod tls {
         });
         let client = Client::with_dial(dial);
         let started = Instant::now();
-        assert_eq!(
+        assert!(matches!(
             put(&client, &pin_of(&identity)).await.unwrap_err(),
             Error::NoProgress
-        );
+        ));
         assert_eq!(started.elapsed(), NO_PROGRESS);
     }
 

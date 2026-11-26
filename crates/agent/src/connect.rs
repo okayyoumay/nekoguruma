@@ -175,7 +175,7 @@ fn control_error(error: &ControlError) -> ConnectError {
 /// The exit and the text of an error that ends the open of the outbox. The texts are NGR's own.
 fn outbox_error(error: &OutboxError) -> ConnectError {
     match error {
-        OutboxError::Corrupt(_) => fail(
+        OutboxError::Corrupt(..) => fail(
             Exit::CannotConnect,
             "the outbox is corrupt and is not repaired; register again with `ngr-agent register --replace`",
         ),
@@ -198,7 +198,7 @@ fn outbox_error(error: &OutboxError) -> ConnectError {
 /// NGR's own.
 fn mark_error(error: &MarkError) -> ConnectError {
     match error {
-        MarkError::Corrupt(_) => fail(
+        MarkError::Corrupt(..) => fail(
             Exit::CannotConnect,
             "the issue-time mark file is corrupt and is not repaired; register again with `ngr-agent register --replace`",
         ),
@@ -221,7 +221,7 @@ fn mark_error(error: &MarkError) -> ConnectError {
 /// are NGR's own.
 fn ledger_error(error: &LedgerError) -> ConnectError {
     match error {
-        LedgerError::Corrupt(_) => fail(
+        LedgerError::Corrupt(..) => fail(
             Exit::CannotConnect,
             "the received-jobs ledger is corrupt and is not repaired; register again with `ngr-agent register --replace`",
         ),
@@ -246,7 +246,7 @@ fn ledger_error(error: &LedgerError) -> ConnectError {
 /// own.
 fn upload_ledger_error(error: &UploadLedgerError) -> ConnectError {
     match error {
-        UploadLedgerError::Corrupt(_) => fail(
+        UploadLedgerError::Corrupt(..) => fail(
             Exit::CannotConnect,
             "the upload ledger is corrupt and is not repaired; register again with `ngr-agent register --replace`",
         ),
@@ -272,7 +272,7 @@ fn identity_error(error: &IdentityError) -> ConnectError {
         IdentityError::Unavailable(_)
         | IdentityError::CreationLockBusy
         | IdentityError::LocalFault(_) => Exit::Unavailable,
-        IdentityError::KeyUnusable(_) => Exit::KeyUnusable,
+        IdentityError::KeyUnusable(..) => Exit::KeyUnusable,
         IdentityError::NoStore(_) | IdentityError::NotProvisioned | IdentityError::Random(_) => {
             Exit::CannotConnect
         }
@@ -362,10 +362,10 @@ async fn run_opened(
             () = handle.stopped() => {
                 break Err(match handle.ended() {
                     Some(control::Ended::OutboxUnusable) => {
-                        outbox_error(&OutboxError::Corrupt("reopen"))
+                        outbox_error(&OutboxError::Corrupt("reopen", None))
                     }
                     Some(control::Ended::LedgerUnusable) => {
-                        ledger_error(&LedgerError::Corrupt("reopen"))
+                        ledger_error(&LedgerError::Corrupt("reopen", None))
                     }
                     None => fail(
                         Exit::CannotConnect,

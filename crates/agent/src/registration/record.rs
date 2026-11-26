@@ -64,9 +64,16 @@ pub enum RecordError {
     #[error("the registration record is not a regular file or is too large")]
     NotARecord,
     #[error("the registration record is not the expected JSON object")]
-    Json,
+    Json(#[source] serde_json::Error),
     #[error("the registration record's {0} is not valid")]
     Field(&'static str),
+    /// A field that failed to parse; the parser's error is the source.
+    #[error("the registration record's {field} is not valid")]
+    Unparsed {
+        field: &'static str,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 impl Record {
@@ -84,9 +91,17 @@ impl Record {
         if bytes.len() as u64 > MAX_RECORD {
             return Err(RecordError::NotARecord);
         }
-        let record: Record = serde_json::from_slice(&bytes).map_err(|_| RecordError::Json)?;
+        let record: Record = serde_json::from_slice(&bytes).map_err(RecordError::Json)?;
         record.check()?;
         Ok(record)
+    }
+
+    /// The server's origin, parsed from the record's `server_origin`.
+    pub fn origin(&self) -> Result<ServerOrigin, RecordError> {
+        ServerOrigin::parse(&self.server_origin).map_err(|source| RecordError::Unparsed {
+            field: "server_origin",
+            source: Box::new(source),
+        })
     }
 
     /// The rules every field of a record holds to.
@@ -329,19 +344,43 @@ mod tests {
     }
 
     #[test]
+    fn an_origin_that_does_not_parse_keeps_the_parsers_error() {
+        let mut record = sample();
+        record.server_origin = "https://example.org".to_owned();
+        let error = record.origin().unwrap_err();
+        assert!(matches!(
+            error,
+            RecordError::Unparsed {
+                field: "server_origin",
+                ..
+            }
+        ));
+        assert!(std::error::Error::source(&error).is_some());
+        assert_eq!(
+            error.to_string(),
+            RecordError::Field("server_origin").to_string()
+        );
+    }
+
+    #[test]
     fn the_reader_refuses_unknown_missing_and_invalid_fields() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(RECORD_FILE);
         let mut json = serde_json::to_value(sample()).unwrap();
         json["mode"] = "user".into();
         fs::write(&path, json.to_string()).unwrap();
-        assert!(matches!(Record::read(&path), Err(RecordError::Json)));
+        assert!(matches!(Record::read(&path), Err(RecordError::Json(_))));
         let mut json = serde_json::to_value(sample()).unwrap();
         json.as_object_mut().unwrap().remove("allow_remote");
         fs::write(&path, json.to_string()).unwrap();
-        assert!(matches!(Record::read(&path), Err(RecordError::Json)));
+        assert!(matches!(Record::read(&path), Err(RecordError::Json(_))));
         fs::write(&path, b"[]").unwrap();
-        assert!(matches!(Record::read(&path), Err(RecordError::Json)));
+        let error = Record::read(&path).unwrap_err();
+        assert!(matches!(error, RecordError::Json(_)));
+        assert!(
+            std::error::Error::source(&error).is_some(),
+            "the JSON error is kept"
+        );
 
         type Break = (&'static str, fn(&mut Record));
         let breaks: [Break; 7] = [

@@ -58,10 +58,10 @@ pub(crate) fn installed_record(
 ) -> Result<Record, CommandError> {
     let dir = state::private_subdir(mode, record::DIR_NAME)
         .map_err(|error| fail(3, format!("the state directory is unusable: {error}")))?;
-    let record = Record::read(&dir.join(record::RECORD_FILE)).map_err(|_| {
+    let record = Record::read(&dir.join(record::RECORD_FILE)).map_err(|error| {
         fail(
             1,
-            "not registered, or the registration record cannot be used",
+            format!("not registered, or the registration record cannot be used: {error}"),
         )
     })?;
     if record.server_origin != installed.as_str() {
@@ -82,13 +82,18 @@ pub async fn run(args: Args, installed: &ServerOrigin) -> Result<Fetched, Comman
     let mode = args.mode;
     let record = installed_record(mode, installed)?;
     let bytes = read_envelope(&args.instruction)?;
-    let trusted = shared_crypto::PublicKey::from_spki_pem(&record.instruction_key_pem)
-        .map_err(|_| fail(1, "the registration record's instruction key is not valid"))?;
+    let trusted =
+        shared_crypto::PublicKey::from_spki_pem(&record.instruction_key_pem).map_err(|error| {
+            fail(
+                1,
+                format!("the registration record's instruction key is not valid: {error}"),
+            )
+        })?;
     let verified = instruction::open(&bytes, &trusted, &record.agent_id)
         .map_err(|reason| fail(1, format!("the instruction was refused: {reason:?}")))?;
     let key = tokio::task::spawn_blocking(move || agent_key(mode))
         .await
-        .map_err(|_| fail(1, "the key load failed unexpectedly"))?
+        .map_err(|error| fail(1, format!("the key load failed unexpectedly: {error}")))?
         .map_err(|error| {
             let exit = if error.retry_class().is_some() { 3 } else { 1 };
             fail(exit, error.to_string())
@@ -97,13 +102,19 @@ pub async fn run(args: Args, installed: &ServerOrigin) -> Result<Fetched, Comman
         return Err(fail(1, "the agent key was just created; register again"));
     }
     let store = ObjectStore::open(mode).map_err(|error| fail(3, error.to_string()))?;
-    let fetcher = Fetcher::new(&record, &key, store)
-        .map_err(|_| fail(1, "the agent key is not the registered one"))?;
+    let fetcher = Fetcher::new(&record, &key, store).map_err(|error| {
+        fail(
+            1,
+            format!("the agent key is not the registered one: {error}"),
+        )
+    })?;
     fetcher
         .fetch_retrying(&verified, args.kind, &args.sha256, args.attempts)
         .await
         .map_err(|error| {
-            let exit = if error.may_retry() || matches!(error, FetchError::Local { .. }) {
+            let exit = if error.may_retry()
+                || matches!(error, FetchError::Local { .. } | FetchError::Task(_))
+            {
                 3
             } else {
                 1

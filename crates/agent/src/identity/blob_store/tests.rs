@@ -470,6 +470,6 @@ fn a_blob_that_holds_no_key_is_unusable_and_not_replaced() {
     let lock = || Ok(dir.clone());
     let error =
         load_or_create(&store, &name(), &lock, std::time::Duration::from_secs(5)).unwrap_err();
-    assert!(matches!(error, IdentityError::KeyUnusable(_)), "{error}");
+    assert!(matches!(error, IdentityError::KeyUnusable(..)), "{error}");
     assert_eq!(fs::read(file_of(&dir, &name())).unwrap(), before);
 }

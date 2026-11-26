@@ -59,7 +59,7 @@ use crate::host::{HostError, TransferProgress};
 use crate::inputs::{FieldBytes, ServiceSources, read_identity_bytes};
 use crate::journal::{
     FileStore, JobContent, JobKey, Journal, JournalError, JournalState, RunStop, StageId, StepRef,
-    Store, Vin, journal_dir,
+    Store, Vin, encode, journal_dir,
 };
 use crate::restart::{in_section_outside_plans, needs_request_marker};
 use crate::runner::JobError;
@@ -185,8 +185,7 @@ impl<S: Store> JobJournal<S> {
     /// Commits the VM state the run starts from, at the step count it starts at, as the run's
     /// first record (ADR-272). Called before the run's first arrival, so before any request.
     pub(crate) fn run_start(&mut self, state: &VmState) -> Result<(), JobError> {
-        let encoded = postcard::to_allocvec(state)
-            .map_err(|_| JournalError::Invariant("the VM state does not encode"))?;
+        let encoded = encode(state)?;
         self.journal.commit_run_start(
             StepRef {
                 pc: state.pc,
@@ -362,8 +361,7 @@ impl<S: Store> JobJournal<S> {
         });
         let primitive = op.is_some_and(Op::is_diagnostic_primitive);
         if enters {
-            let encoded = postcard::to_allocvec(after)
-                .map_err(|_| JournalError::Invariant("the VM state does not encode"))?;
+            let encoded = encode(after)?;
             self.journal.commit_step(at, Some(&encoded))?;
         } else if inside {
             if primitive {
@@ -372,8 +370,7 @@ impl<S: Store> JobJournal<S> {
         } else if primitive {
             // A plain procedure's resume origin (ADR-335 item 2); the flash-plan facts do not
             // read it.
-            let encoded = postcard::to_allocvec(after)
-                .map_err(|_| JournalError::Invariant("the VM state does not encode"))?;
+            let encoded = encode(after)?;
             // A state too large for a frame is skipped, not the job's end: `commit_checkpoint`
             // refuses it before anything is appended, so the journal is unchanged and the job
             // goes on. A missing checkpoint only makes a restart more conservative (ADR-335):
@@ -486,8 +483,7 @@ fn block_number(index: Option<u64>) -> Result<u32, JournalError> {
         Some(0) | None => Err(JournalError::Invariant(
             "the host has no index for a confirmed block",
         )),
-        Some(index) => u32::try_from(index)
-            .map_err(|_| JournalError::Invariant("the block count is beyond the journal's range")),
+        Some(index) => u32::try_from(index).map_err(JournalError::BlockCount),
     }
 }
 
@@ -502,7 +498,10 @@ mod tests {
         assert_eq!(block_number(Some(u64::from(u32::MAX))).unwrap(), u32::MAX);
         for index in [None, Some(0), Some(u64::from(u32::MAX) + 1)] {
             assert!(
-                matches!(block_number(index), Err(JournalError::Invariant(_))),
+                matches!(
+                    block_number(index),
+                    Err(JournalError::Invariant(_) | JournalError::BlockCount(_))
+                ),
                 "{index:?}"
             );
         }

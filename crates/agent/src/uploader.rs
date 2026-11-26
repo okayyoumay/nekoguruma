@@ -47,8 +47,7 @@ use crate::control::dial::{LoopbackPorts, PortDial};
 use crate::data_token::Holder;
 use crate::identity::AgentKey;
 use crate::journal::JobKey;
-use crate::registration::origin::ServerOrigin;
-use crate::registration::record::{Record, RecordError};
+use crate::registration::record::Record;
 use crate::upload_ledger::{Digest, Entry, LedgerError, UploadLedger};
 use http::Client;
 use routes::Routes;
@@ -392,8 +391,7 @@ impl Worker {
         if key.fingerprint_hex() != record.agent_key_fingerprint {
             return Err(ControlError::KeyMismatch);
         }
-        let origin = ServerOrigin::parse(&record.server_origin)
-            .map_err(|_| RecordError::Field("server_origin"))?;
+        let origin = record.origin()?;
         let verifier = Arc::new(Verifier::from_record(record)?);
         Ok(Worker {
             routes: Routes::new(seams.client, origin.clone(), verifier.clone(), seams.random),
@@ -440,7 +438,7 @@ impl Worker {
                     tracing::info!("the upload ledger was opened again");
                 }
                 Ok(false) => {}
-                Err(error @ (LedgerError::Corrupt(_) | LedgerError::BadAgentId)) => {
+                Err(error @ (LedgerError::Corrupt(..) | LedgerError::BadAgentId)) => {
                     tracing::error!(%error, "the upload ledger cannot be opened again; the uploader ends");
                     let _ = ended.set(Ended::LedgerUnusable);
                     break;

@@ -34,8 +34,8 @@ use shared_proto::MAX_CONTROL_MESSAGE_LEN;
 use worker_host::service::OperatingMode;
 
 use crate::journal::{
-    FRAME_HEADER, FrameRead, LockFailure, WriterLock, open_rw, push_frame, read_frame,
-    record_follows, sync_after_rename, take_writer_lock, valid_id,
+    FRAME_HEADER, FrameRead, JournalError, LockFailure, WriterLock, open_rw, push_frame,
+    read_frame, record_follows, sync_after_rename, take_writer_lock, valid_id,
 };
 use crate::state::{StateDirError, private_subdir};
 
@@ -91,8 +91,9 @@ pub enum OutboxError {
     Io(#[from] io::Error),
     #[error("the outbox directory: {0}")]
     State(#[from] StateDirError),
+    /// The second field is the decoder's error when a record did not decode.
     #[error("the outbox file is corrupt: {0}")]
-    Corrupt(&'static str),
+    Corrupt(&'static str, #[source] Option<postcard::Error>),
     /// Another outbox of this directory is open for writing, in this process or another.
     #[error("the outbox is open for writing elsewhere")]
     InUse,
@@ -102,6 +103,9 @@ pub enum OutboxError {
     Full,
     #[error("the event text is longer than a control message")]
     TooLarge,
+    /// The event does not fit a frame of the file; the source says why.
+    #[error("the event text is longer than a control message")]
+    FrameTooLarge(#[source] JournalError),
     /// A write to the outbox failed (an append, or a rewrite, in this call or an earlier one; the
     /// cause is logged by its kind); open the outbox again.
     #[error("a write to the outbox failed")]
@@ -292,7 +296,7 @@ impl Outbox {
         self.last = u64::try_from(events.len())
             .ok()
             .and_then(|count| floor.checked_add(count))
-            .ok_or(OutboxError::Corrupt("the event counter overflows"))?;
+            .ok_or(OutboxError::Corrupt("the event counter overflows", None))?;
         self.pending = events.into();
         self.file_len = len as u64;
         Ok(())
@@ -322,7 +326,7 @@ impl Outbox {
             .last
             .checked_add(1)
             .filter(|seq| *seq < u64::MAX)
-            .ok_or(OutboxError::Corrupt("the event counter overflows"))?;
+            .ok_or(OutboxError::Corrupt("the event counter overflows", None))?;
         let text = text(seq);
         if text.len() > MAX_EVENT_TEXT {
             return Err(OutboxError::TooLarge);
@@ -331,7 +335,7 @@ impl Outbox {
         payload.extend_from_slice(&seq.to_le_bytes());
         payload.extend_from_slice(text.as_bytes());
         let mut frame = Vec::with_capacity(FRAME_HEADER + payload.len());
-        push_frame(&mut frame, &payload).map_err(|_| OutboxError::TooLarge)?;
+        push_frame(&mut frame, &payload).map_err(OutboxError::FrameTooLarge)?;
         let limit = match kind {
             Kind::Received => ADMISSION_BYTES,
             Kind::Other => MAX_OUTBOX_BYTES,
@@ -555,7 +559,7 @@ fn decode_event(payload: &[u8]) -> Option<(u64, &str)> {
 /// Reads a whole file: the floor, the events, and the length up to the end of the last whole
 /// frame. Anything that is not one unfinished append at the end is corrupt.
 fn parse(bytes: &[u8], agent_id: &str) -> Result<(u64, Vec<Event>, usize), OutboxError> {
-    let corrupt = OutboxError::Corrupt;
+    let corrupt = |reason| OutboxError::Corrupt(reason, None);
     if bytes.len() < PREAMBLE || bytes[..MAGIC.len()] != MAGIC {
         return Err(corrupt("not an outbox"));
     }
@@ -566,8 +570,8 @@ fn parse(bytes: &[u8], agent_id: &str) -> Result<(u64, Vec<Event>, usize), Outbo
     let FrameRead::Ok { payload, next } = read_frame(bytes, PREAMBLE) else {
         return Err(corrupt("the header does not read back"));
     };
-    let header: Header =
-        postcard::from_bytes(payload).map_err(|_| corrupt("the header does not decode"))?;
+    let header: Header = postcard::from_bytes(payload)
+        .map_err(|e| OutboxError::Corrupt("the header does not decode", Some(e)))?;
     if header.agent_id != agent_id {
         return Err(corrupt("the file belongs to another agent ID"));
     }
@@ -898,7 +902,7 @@ mod tests {
         put(&mut outbox, 1);
         outbox.poisoned = true;
         fs::write(file_of(dir.path()), b"not an outbox").unwrap();
-        assert!(matches!(outbox.reopen(), Err(OutboxError::Corrupt(_))));
+        assert!(matches!(outbox.reopen(), Err(OutboxError::Corrupt(..))));
         assert!(matches!(
             outbox.append(Kind::Other, text),
             Err(OutboxError::Poisoned)
@@ -1119,7 +1123,7 @@ mod tests {
         assert_eq!(outbox.append(Kind::Other, text).unwrap(), u64::MAX - 1);
         assert!(matches!(
             outbox.append(Kind::Other, text),
-            Err(OutboxError::Corrupt(_))
+            Err(OutboxError::Corrupt(..))
         ));
         // The file, whole and after a rewrite, still reads back.
         drop(outbox);
@@ -1328,7 +1332,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             fs::write(file_of(dir.path()), &bytes).unwrap();
             let result = Outbox::open_in(dir.path(), ID);
-            assert!(matches!(result, Err(OutboxError::Corrupt(_))), "{name}");
+            assert!(matches!(result, Err(OutboxError::Corrupt(..))), "{name}");
             assert_eq!(fs::read(file_of(dir.path())).unwrap(), bytes, "{name}");
             let names: Vec<_> = fs::read_dir(dir.path())
                 .unwrap()

@@ -55,10 +55,18 @@ impl Verifier {
     /// The verifier of the registered agent `record`: the instruction key and the origin as the
     /// control channel's start checks them.
     pub(crate) fn from_record(record: &Record) -> Result<Self, RecordError> {
-        let audience = Audience::parse_canonical(&record.server_origin)
-            .map_err(|_| RecordError::Field("server_origin"))?;
-        let key = PublicKey::from_spki_pem(&record.instruction_key_pem)
-            .map_err(|_| RecordError::Field("instruction_key_pem"))?;
+        let audience = Audience::parse_canonical(&record.server_origin).map_err(|source| {
+            RecordError::Unparsed {
+                field: "server_origin",
+                source: Box::new(source),
+            }
+        })?;
+        let key = PublicKey::from_spki_pem(&record.instruction_key_pem).map_err(|source| {
+            RecordError::Unparsed {
+                field: "instruction_key_pem",
+                source: Box::new(source),
+            }
+        })?;
         Ok(Self {
             key,
             audience,

@@ -191,7 +191,7 @@ fn identity_error(error: &IdentityError) -> RegisterError {
         IdentityError::Unavailable(_)
         | IdentityError::CreationLockBusy
         | IdentityError::LocalFault(_) => Exit::Unavailable,
-        IdentityError::KeyUnusable(_) => Exit::KeyUnusable,
+        IdentityError::KeyUnusable(..) => Exit::KeyUnusable,
         IdentityError::NoStore(_) | IdentityError::NotProvisioned | IdentityError::Random(_) => {
             Exit::CannotRegister
         }
@@ -238,10 +238,10 @@ pub fn register_in(
         registration_mode(request.mode),
         request.server_key,
     );
-    let proof = sign_registration(&*key.signer(), &transcript).map_err(|_| {
+    let proof = sign_registration(&*key.signer(), &transcript).map_err(|error| {
         fail(
             Exit::Unavailable,
-            "cannot sign the registration proof; nothing was sent",
+            format!("cannot sign the registration proof; nothing was sent: {error}"),
         )
     })?;
     let body = serde_json::json!({
@@ -263,10 +263,10 @@ pub fn register_in(
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|_| {
+        .map_err(|error| {
             fail(
                 Exit::Unavailable,
-                "cannot start the runtime; nothing was sent",
+                format!("cannot start the runtime; nothing was sent: {error}"),
             )
         })?;
     let reply = runtime
@@ -337,7 +337,7 @@ fn transport_error(error: &PostError) -> RegisterError {
             Exit::Unavailable,
             "the connection to the server timed out; nothing was sent",
         ),
-        PostError::Unknown => fail(Exit::Unavailable, UNKNOWN),
+        PostError::Unknown(_) => fail(Exit::Unavailable, UNKNOWN),
     }
 }
 
@@ -363,8 +363,14 @@ fn judge(
                 agent_key,
                 server_key_id,
             };
-            answer::check(reply.json_content_type, body, &expected)
-                .map_err(|error| fail(error.exit_kind(), error.to_string()))
+            answer::check(reply.json_content_type, body, &expected).map_err(|error| {
+                tracing::warn!(
+                    %error,
+                    source = std::error::Error::source(&error).map(tracing::field::display),
+                    "the server's registration answer was refused"
+                );
+                fail(error.exit_kind(), error.to_string())
+            })
         }
         403 => Err(fail(Exit::CannotRegister, REFUSED)),
         429 => {

@@ -147,8 +147,9 @@ pub enum IdentityError {
     LocalFault(String),
     /// A key is present and cannot be used; the store is untouched. Registering again needs an
     /// explicit reset.
+    /// The second field is why the key did not decode, when that is the reason.
     #[error("the stored agent key cannot be used ({0}); it is not replaced")]
-    KeyUnusable(&'static str),
+    KeyUnusable(&'static str, #[source] Option<shared_crypto::KeyError>),
     /// The store holds no key and cannot create one: an administrator provisions it.
     #[error("the store holds no agent key and cannot create one; an administrator provisions it")]
     NotProvisioned,
@@ -172,7 +173,7 @@ impl IdentityError {
             IdentityError::CreationLockBusy => Some("creation lock"),
             IdentityError::NoStore(_)
             | IdentityError::LocalFault(_)
-            | IdentityError::KeyUnusable(_)
+            | IdentityError::KeyUnusable(..)
             | IdentityError::NotProvisioned
             | IdentityError::Random(_) => None,
         }
@@ -355,12 +356,13 @@ fn read(store: &dyn SecretStore, name: &SecretName) -> Result<Option<SigningKey>
     match store.get(name) {
         Ok(bytes) => SigningKey::from_pkcs8_der(&bytes)
             .map(Some)
-            .map_err(|_| IdentityError::KeyUnusable("not a P-256 private key")),
+            .map_err(|error| IdentityError::KeyUnusable("not a P-256 private key", Some(error))),
         Err(error) => match error.kind() {
             StoreErrorKind::Absent => Ok(None),
-            StoreErrorKind::Undecryptable => {
-                Err(IdentityError::KeyUnusable("the store cannot decrypt it"))
-            }
+            StoreErrorKind::Undecryptable => Err(IdentityError::KeyUnusable(
+                "the store cannot decrypt it",
+                None,
+            )),
             _ => Err(unavailable("the key store", &error)),
         },
     }

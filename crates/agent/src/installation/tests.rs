@@ -43,6 +43,18 @@ fn err(text: &str) -> InstallationError {
     parse(text.as_bytes()).expect_err("a file that must be refused was accepted")
 }
 
+/// Whether `error` refuses the value of `key` with `rule`, whether the value failed a rule or a
+/// parser.
+fn is_invalid(error: &InstallationError, key: &str, rule: &str) -> bool {
+    matches!(
+        error,
+        InstallationError::Invalid { key: k, rule: r }
+            | InstallationError::Unparsed { key: k, rule: r, .. }
+            if *k == key && *r == rule
+    )
+}
+
+/// An error that refuses `key`, for tests that need a value of the type.
 fn invalid(key: &'static str, rule: &'static str) -> InstallationError {
     InstallationError::Invalid { key, rule }
 }
@@ -101,7 +113,7 @@ fn a_valid_file_gives_its_keys_and_the_defaults() {
 fn c4_a_file_that_is_not_utf8_is_refused_and_a_byte_order_mark_is_accepted() {
     let mut bytes = device().into_bytes();
     bytes.extend_from_slice(b"# \xff\xfe\n");
-    assert_eq!(parse(&bytes), Err(InstallationError::NotUtf8));
+    assert!(matches!(parse(&bytes), Err(InstallationError::NotUtf8(_))));
     let mut with_mark = b"\xef\xbb\xbf".to_vec();
     with_mark.extend_from_slice(device().as_bytes());
     assert_eq!(parse(&with_mark).unwrap().mode(), OperatingMode::Device);
@@ -122,10 +134,10 @@ fn c5_a_file_over_64_kib_is_refused() {
         text
     };
     parse(pad(MAX_SIZE as usize).as_bytes()).unwrap();
-    assert_eq!(
+    assert!(matches!(
         parse(pad(MAX_SIZE as usize + 1).as_bytes()),
         Err(InstallationError::TooLarge)
-    );
+    ));
     assert_eq!(InstallationError::TooLarge.exit_code(), 1);
 }
 
@@ -137,7 +149,10 @@ fn c5_the_read_stops_at_the_limit() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("big.toml");
     std::fs::write(&path, vec![b'#'; MAX_SIZE as usize + 2]).unwrap();
-    assert_eq!(read_bytes(&path), Err(InstallationError::TooLarge));
+    assert!(matches!(
+        read_bytes(&path),
+        Err(InstallationError::TooLarge)
+    ));
     std::fs::write(&path, vec![b'#'; MAX_SIZE as usize]).unwrap();
     assert_eq!(read_bytes(&path).unwrap().len() as u64, MAX_SIZE);
 }
@@ -145,11 +160,14 @@ fn c5_the_read_stops_at_the_limit() {
 /// C6: an empty file lacks the mode, the first required key.
 #[test]
 fn c6_an_empty_file_lacks_the_mode() {
-    assert_eq!(err(""), InstallationError::Missing { key: "mode" });
-    assert_eq!(
+    assert!(matches!(
+        err(""),
+        InstallationError::Missing { key: "mode" }
+    ));
+    assert!(matches!(
         err("# only a comment\n"),
         InstallationError::Missing { key: "mode" }
-    );
+    ));
 }
 
 /// D1: a syntax error names its line and nothing of the file's text: `toml`'s own message quotes
@@ -158,7 +176,7 @@ fn c6_an_empty_file_lacks_the_mode() {
 fn d1_a_syntax_error_names_the_line_only() {
     let text = format!("mode = \"device\"\nserver_url = {SECRET}\n");
     let error = err(&text);
-    assert_eq!(error, InstallationError::Syntax { line: Some(2) });
+    assert!(matches!(error, InstallationError::Syntax { line: Some(2) }));
     let shown = error.to_string();
     assert!(shown.contains("line 2"), "{shown}");
     assert!(
@@ -172,7 +190,10 @@ fn d1_a_syntax_error_names_the_line_only() {
     ));
     // A line counted from the start, past a byte order mark.
     let mark = format!("\u{feff}# first\n{SECRET}\n");
-    assert_eq!(err(&mark), InstallationError::Syntax { line: Some(2) });
+    assert!(matches!(
+        err(&mark),
+        InstallationError::Syntax { line: Some(2) }
+    ));
 }
 
 /// D9: CRLF line endings, in the file and inside the PEM, are accepted.
@@ -201,11 +222,9 @@ fn d9_crlf_line_endings_are_accepted() {
 #[test]
 fn d2_an_unknown_key_is_refused_and_named_only_when_it_is_a_plain_word() {
     let named = err(&with(&device(), "moed = \"user\""));
-    assert_eq!(
-        named,
-        InstallationError::UnknownKey {
-            name: Some("moed".to_owned())
-        }
+    assert!(
+        matches!(&named, InstallationError::UnknownKey { name: Some(name) } if name == "moed"),
+        "{named}"
     );
     assert!(named.to_string().ends_with(": moed"), "{named}");
     for key in [
@@ -228,14 +247,16 @@ fn d2_an_unknown_key_is_refused_and_named_only_when_it_is_a_plain_word() {
         assert!(!error.to_string().contains(SECRET), "{error}");
     }
     // An unknown key is found even in a file that lacks every required key.
-    assert_eq!(
+    assert!(matches!(
         err("typo = 1\n"),
-        InstallationError::UnknownKey {
-            name: Some("typo".to_owned())
-        }
-    );
+        InstallationError::UnknownKey { name: Some(name) } if name == "typo"
+    ));
     // A table named like a key is a key of the wrong type, not an unknown one.
-    assert_eq!(err("[mode]\nx = 1\n"), invalid("mode", "must be a string"));
+    assert!(is_invalid(
+        &err("[mode]\nx = 1\n"),
+        "mode",
+        "must be a string"
+    ));
 }
 
 /// D3: each required key missing.
@@ -249,15 +270,21 @@ fn d3_each_required_key_is_required() {
         (format!("{mode}{pem}"), "server_url"),
         (format!("{mode}{server}"), "distribution_root_pem"),
     ] {
-        assert_eq!(err(&text), InstallationError::Missing { key }, "{text}");
+        assert!(
+            matches!(err(&text), InstallationError::Missing { key: got } if got == key),
+            "{text}"
+        );
     }
     // The optional keys do not stand in for them.
-    assert_eq!(
+    assert!(matches!(
         err("profile = \"local\"\nstartup = \"auto\"\n"),
         InstallationError::Missing { key: "mode" }
-    );
+    ));
     // The first missing key in the order of the table is the one named.
-    assert_eq!(err(mode), InstallationError::Missing { key: "server_url" });
+    assert!(matches!(
+        err(mode),
+        InstallationError::Missing { key: "server_url" }
+    ));
 }
 
 /// D4: the mode is exactly `device` or `user`, as a string.
@@ -273,11 +300,14 @@ fn d4_the_mode_is_device_or_user() {
         "\"user\\u0000\"",
     ] {
         let text = replacing(&device(), "mode", &format!("mode = {value}"));
-        assert_eq!(err(&text), invalid("mode", rule), "{value}");
+        assert!(is_invalid(&err(&text), "mode", rule), "{value}");
     }
     for value in ["1", "true", "[\"device\"]", "{ a = 1 }"] {
         let text = replacing(&device(), "mode", &format!("mode = {value}"));
-        assert_eq!(err(&text), invalid("mode", "must be a string"), "{value}");
+        assert!(
+            is_invalid(&err(&text), "mode", "must be a string"),
+            "{value}"
+        );
     }
 }
 
@@ -323,12 +353,16 @@ fn d5_d6_the_server_url_is_the_pinned_origin() {
         assert!(
             matches!(
                 error,
-                InstallationError::Invalid {
+                InstallationError::Unparsed {
                     key: "server_url",
                     ..
                 }
             ),
             "{bad}: {error}"
+        );
+        assert!(
+            std::error::Error::source(&error).is_some(),
+            "{bad}: the parser's error is the source"
         );
         let shown = error.to_string();
         assert!(
@@ -337,7 +371,7 @@ fn d5_d6_the_server_url_is_the_pinned_origin() {
         );
     }
     let text = replacing(&device(), "server_url", "server_url = 8080");
-    assert_eq!(err(&text), invalid("server_url", "must be a string"));
+    assert!(is_invalid(&err(&text), "server_url", "must be a string"));
 }
 
 /// D7, D8: the key is one SPKI PEM block of a P-256 key; no refusal repeats a byte of it.
@@ -374,7 +408,7 @@ fn d7_d8_the_distribution_root_is_one_p256_pem_block() {
     );
     for pem in cases {
         let error = err(&with_pem(&pem));
-        assert_eq!(error, invalid("distribution_root_pem", rule), "{pem}");
+        assert!(is_invalid(&error, "distribution_root_pem", rule), "{pem}");
         let shown = error.to_string();
         assert!(
             !shown.contains(SECRET) && !shown.contains(&body[..16]),
@@ -382,10 +416,11 @@ fn d7_d8_the_distribution_root_is_one_p256_pem_block() {
         );
     }
     parse(with_pem(&good).as_bytes()).unwrap();
-    assert_eq!(
-        err("mode = \"user\"\nserver_url = \"http://127.0.0.1:1\"\ndistribution_root_pem = 1\n"),
-        invalid("distribution_root_pem", "must be a string")
-    );
+    assert!(is_invalid(
+        &err("mode = \"user\"\nserver_url = \"http://127.0.0.1:1\"\ndistribution_root_pem = 1\n"),
+        "distribution_root_pem",
+        "must be a string"
+    ));
 }
 
 /// D10: the profile is `local` by default; `standard` is refused until it exists.
@@ -395,10 +430,11 @@ fn d10_the_profile_is_local_and_standard_is_refused() {
         ok(&with(&device(), "profile = \"local\"")).profile(),
         Profile::Local
     );
-    assert_eq!(
-        err(&with(&device(), "profile = \"standard\"")),
-        invalid("profile", "standard is not supported yet")
-    );
+    assert!(is_invalid(
+        &err(&with(&device(), "profile = \"standard\"")),
+        "profile",
+        "standard is not supported yet"
+    ));
     for bad in ["\"Local\"", "\"\"", "\"remote\"", "1"] {
         assert!(
             matches!(
@@ -421,10 +457,11 @@ fn d11_d12_the_startup_defaults_by_mode_and_explicit_is_refused_for_a_device() {
     ] {
         assert_eq!(ok(&text).startup(), expected, "{text}");
     }
-    assert_eq!(
-        err(&with(&device(), "startup = \"explicit\"")),
-        invalid("startup", "must not be \"explicit\" in device mode")
-    );
+    assert!(is_invalid(
+        &err(&with(&device(), "startup = \"explicit\"")),
+        "startup",
+        "must not be \"explicit\" in device mode"
+    ));
     for text in [device(), user()] {
         for bad in ["\"manual\"", "\"\"", "\"Auto\"", "true"] {
             assert!(
@@ -590,7 +627,10 @@ fn the_exit_status_is_3_only_for_another_read_error() {
         (InstallationError::Unreadable(io::ErrorKind::Other), 3),
         (InstallationError::Unreadable(io::ErrorKind::TimedOut), 3),
         (InstallationError::TooLarge, 1),
-        (InstallationError::NotUtf8, 1),
+        (
+            InstallationError::NotUtf8(String::from_utf8(vec![0xff]).unwrap_err().utf8_error()),
+            1,
+        ),
         (InstallationError::Syntax { line: None }, 1),
         (InstallationError::UnknownKey { name: None }, 1),
         (InstallationError::Missing { key: "mode" }, 1),
@@ -674,7 +714,7 @@ fn a2_no_file_is_absent() {
         temp.path().join("missing").join("agent.toml"),
     ] {
         let error = load(&path, &Policy::system()).unwrap_err();
-        assert_eq!(error, InstallationError::Absent);
+        assert!(matches!(error, InstallationError::Absent));
         assert_eq!(error.exit_code(), 1);
     }
 }
@@ -841,7 +881,7 @@ fn c1_a_file_the_account_cannot_open_is_exit_1() {
     let path = file_in(temp.path(), &device());
     set_mode(&path, 0o000);
     let error = load(&path, &trusting()).unwrap_err();
-    assert_eq!(error, InstallationError::AccessDenied);
+    assert!(matches!(error, InstallationError::AccessDenied));
     assert_eq!(error.exit_code(), 1);
 }
 
@@ -860,7 +900,7 @@ fn c2_another_read_error_is_exit_3() {
 fn c3_a_file_removed_after_the_check_is_absent() {
     let temp = tempfile::tempdir().unwrap();
     let error = read_bytes(&temp.path().join("agent.toml")).unwrap_err();
-    assert_eq!(error, InstallationError::Absent);
+    assert!(matches!(error, InstallationError::Absent));
     assert_eq!(error.exit_code(), 1);
 }
 
@@ -873,8 +913,7 @@ fn a_file_with_a_bad_key_is_refused_after_the_check() {
         temp.path(),
         &replacing(&device(), "mode", "mode = \"machine\""),
     );
-    assert_eq!(
-        load(&path, &trusting()),
-        Err(invalid("mode", "must be \"device\" or \"user\""))
+    assert!(
+        matches!(&load(&path, &trusting()), Err(e) if is_invalid(e, "mode", "must be \"device\" or \"user\""))
     );
 }

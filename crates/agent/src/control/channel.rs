@@ -104,6 +104,8 @@ pub(super) struct UpgradeFail {
     pub(super) status: Option<u16>,
     /// The 101 carried no valid proof (ADR-504): the loop backs off to the cap.
     pub(super) unproven: bool,
+    /// The error that ended the attempt before a response, when there is one.
+    pub(super) source: Option<Box<dyn std::error::Error + Send + Sync>>,
 }
 
 fn fail(class: &'static str, status: Option<u16>) -> UpgradeFail {
@@ -111,6 +113,17 @@ fn fail(class: &'static str, status: Option<u16>) -> UpgradeFail {
         class,
         status,
         unproven: false,
+        source: None,
+    }
+}
+
+fn fail_with(
+    class: &'static str,
+    source: impl std::error::Error + Send + Sync + 'static,
+) -> UpgradeFail {
+    UpgradeFail {
+        source: Some(Box::new(source)),
+        ..fail(class, None)
     }
 }
 
@@ -129,8 +142,8 @@ pub(super) async fn upgrade(w: &Wiring, token: &Token) -> Result<Socket, Upgrade
     };
     let uri: http::Uri = format!("ws://{}{CONTROL_PATH}", w.host)
         .parse()
-        .map_err(|_| fail("upgrade-request", None))?;
-    let nonce = (w.random)().map_err(|_| fail("upgrade-random", None))?;
+        .map_err(|e| fail_with("upgrade-request", e))?;
+    let nonce = (w.random)().map_err(|e| fail_with("upgrade-random", e))?;
     let request = ClientRequestBuilder::new(uri)
         .with_header("Authorization", format!("Bearer {}", token.as_str()))
         .with_header(NONCE_HEADER, STANDARD.encode(nonce))
@@ -162,6 +175,7 @@ pub(super) async fn upgrade(w: &Wiring, token: &Token) -> Result<Socket, Upgrade
                     class: "upgrade-unproven",
                     status: Some(response.status().as_u16()),
                     unproven: true,
+                    source: None,
                 })
             }
         }
@@ -622,7 +636,7 @@ async fn connected(
                         continue;
                     }
                     Err(()) => {
-                        state.warnings.log_upload_failure(&LogUploadError::Task);
+                        state.warnings.log_upload_failure(&LogUploadError::Task(None));
                         continue;
                     }
                 };

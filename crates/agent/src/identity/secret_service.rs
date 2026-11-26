@@ -43,8 +43,42 @@ const CONTENT_TYPE: &str = "application/octet-stream";
 /// How long one method call may take before it counts as unanswered.
 const CALL_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Why a call failed, in words fixed in this file.
-type Reason = &'static str;
+/// Why a call failed: words fixed in this file, and the error that led to it when there is one.
+#[derive(Debug)]
+struct Reason {
+    text: &'static str,
+    source: Option<Box<dyn std::error::Error + Send + Sync>>,
+}
+
+impl Reason {
+    fn caused_by(
+        text: &'static str,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            text,
+            source: Some(Box::new(source)),
+        }
+    }
+}
+
+impl From<&'static str> for Reason {
+    fn from(text: &'static str) -> Self {
+        Self { text, source: None }
+    }
+}
+
+impl std::fmt::Display for Reason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.text)
+    }
+}
+
+impl std::error::Error for Reason {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.as_deref().map(|source| source as _)
+    }
+}
 
 /// What a search found: the item paths, split by their collection's lock state.
 #[derive(Debug, Default)]
@@ -97,8 +131,8 @@ trait Transport {
     ) -> Result<Created, Reason>;
 }
 
-fn unavailable(reason: Reason) -> StoreError {
-    StoreError::with_source(StoreErrorKind::Unavailable, reason)
+fn unavailable(reason: impl Into<Reason>) -> StoreError {
+    StoreError::with_source(StoreErrorKind::Unavailable, reason.into())
 }
 
 /// Opens a `plain` session and checks the answer is one.
@@ -237,7 +271,7 @@ impl DbusTransport {
             Builder::session().method_timeout(CALL_TIMEOUT).build(),
         ))
         .ok_or("no answer in time")?
-        .map_err(|_| "no session bus")?;
+        .map_err(|error| Reason::caused_by("no session bus", error))?;
         Ok(Self {
             connection: Some(connection),
         })
@@ -266,7 +300,7 @@ impl DbusTransport {
                 .await?;
             reply.body().deserialize::<R>()
         })
-        .map_err(|error| reason(&error))
+        .map_err(reason)
     }
 }
 
@@ -350,8 +384,13 @@ impl Drop for DbusTransport {
     }
 }
 
-/// The fixed reason for a failed call. The daemon's own text is dropped.
-fn reason(error: &zbus::Error) -> Reason {
+/// The reason for a failed call: fixed words, with the error as their source.
+fn reason(error: zbus::Error) -> Reason {
+    Reason::caused_by(reason_text(&error), error)
+}
+
+/// The fixed words for a failed call. The daemon's own text is not among them.
+fn reason_text(error: &zbus::Error) -> &'static str {
     use zbus::fdo::Error as Fdo;
     match error {
         zbus::Error::FDO(fdo) => match &**fdo {
@@ -411,7 +450,8 @@ impl Transport for DbusTransport {
             "Get",
             &(COLLECTION_IFACE, "Locked"),
         )?;
-        bool::try_from(value).map_err(|_| "Secret Service call failed")
+        bool::try_from(value)
+            .map_err(|error| Reason::caused_by("Secret Service call failed", error))
     }
 
     fn open_session(&self) -> Result<SessionReply, Reason> {
@@ -428,7 +468,8 @@ impl Transport for DbusTransport {
     }
 
     fn get_secret(&self, item: &str, session: &str) -> Result<SecretReply, Reason> {
-        let session = zbus::ObjectPath::try_from(session).map_err(|_| "bad session")?;
+        let session = zbus::ObjectPath::try_from(session)
+            .map_err(|error| Reason::caused_by("bad session", error))?;
         let ((reply_session, parameters, value, _content_type),): ((
             OwnedObjectPath,
             Vec<u8>,
@@ -449,7 +490,8 @@ impl Transport for DbusTransport {
         name: &SecretName,
         secret: &[u8],
     ) -> Result<Created, Reason> {
-        let session = zbus::ObjectPath::try_from(session).map_err(|_| "bad session")?;
+        let session = zbus::ObjectPath::try_from(session)
+            .map_err(|error| Reason::caused_by("bad session", error))?;
         let properties: HashMap<&str, Variant> = HashMap::from([
             ("org.freedesktop.Secret.Item.Label", Variant::from(LABEL)),
             (
@@ -481,14 +523,14 @@ mod tests {
     /// A scripted transport: each field is the answer of its call, and `calls` records the
     /// calls made.
     struct Fake {
-        search: Result<(Vec<&'static str>, Vec<&'static str>), Reason>,
-        default: Result<Option<&'static str>, Reason>,
-        locked: Result<bool, Reason>,
-        session: Result<&'static str, Reason>,
+        search: Result<(Vec<&'static str>, Vec<&'static str>), &'static str>,
+        default: Result<Option<&'static str>, &'static str>,
+        locked: Result<bool, &'static str>,
+        session: Result<&'static str, &'static str>,
         session_output_empty: bool,
         reply_session: &'static str,
-        secret: Result<(Vec<u8>, Vec<u8>), Reason>,
-        create: Result<Created, Reason>,
+        secret: Result<(Vec<u8>, Vec<u8>), &'static str>,
+        create: Result<Created, &'static str>,
         calls: RefCell<Vec<&'static str>>,
     }
 
@@ -523,37 +565,47 @@ mod tests {
     impl Transport for Fake {
         fn search(&self, _: &SecretName) -> Result<Found, Reason> {
             self.calls.borrow_mut().push("search");
-            self.search.clone().map(|(unlocked, locked)| Found {
-                unlocked: unlocked.iter().map(|p| p.to_string()).collect(),
-                locked: locked.iter().map(|p| p.to_string()).collect(),
-            })
+            self.search
+                .clone()
+                .map(|(unlocked, locked)| Found {
+                    unlocked: unlocked.iter().map(|p| p.to_string()).collect(),
+                    locked: locked.iter().map(|p| p.to_string()).collect(),
+                })
+                .map_err(Reason::from)
         }
 
         fn default_collection(&self) -> Result<Option<String>, Reason> {
             self.calls.borrow_mut().push("default");
-            self.default.map(|path| path.map(str::to_owned))
+            self.default
+                .map(|path| path.map(str::to_owned))
+                .map_err(Reason::from)
         }
 
         fn collection_locked(&self, _: &str) -> Result<bool, Reason> {
             self.calls.borrow_mut().push("locked");
-            self.locked
+            self.locked.map_err(Reason::from)
         }
 
         fn open_session(&self) -> Result<SessionReply, Reason> {
             self.calls.borrow_mut().push("session");
-            self.session.map(|path| SessionReply {
-                output_empty: self.session_output_empty,
-                path: path.to_owned(),
-            })
+            self.session
+                .map(|path| SessionReply {
+                    output_empty: self.session_output_empty,
+                    path: path.to_owned(),
+                })
+                .map_err(Reason::from)
         }
 
         fn get_secret(&self, _: &str, _: &str) -> Result<SecretReply, Reason> {
             self.calls.borrow_mut().push("get_secret");
-            self.secret.clone().map(|(parameters, value)| SecretReply {
-                session: self.reply_session.to_owned(),
-                parameters,
-                value: Zeroizing::new(value),
-            })
+            self.secret
+                .clone()
+                .map(|(parameters, value)| SecretReply {
+                    session: self.reply_session.to_owned(),
+                    parameters,
+                    value: Zeroizing::new(value),
+                })
+                .map_err(Reason::from)
         }
 
         fn create_item(
@@ -567,7 +619,7 @@ mod tests {
             match &self.create {
                 Ok(Created::Done) => Ok(Created::Done),
                 Ok(Created::Prompt) => Ok(Created::Prompt),
-                Err(reason) => Err(reason),
+                Err(reason) => Err(Reason::from(*reason)),
             }
         }
     }
@@ -799,10 +851,10 @@ mod tests {
     #[test]
     fn a_failed_call_gives_a_fixed_reason() {
         let error = zbus::Error::Failure("secret text".into());
-        assert_eq!(reason(&error), "Secret Service call failed");
+        assert_eq!(reason_text(&error), "Secret Service call failed");
         let error = zbus::Error::FDO(Box::new(zbus::fdo::Error::ServiceUnknown("x".into())));
-        assert_eq!(reason(&error), "no Secret Service");
+        assert_eq!(reason_text(&error), "no Secret Service");
         let error = zbus::Error::FDO(Box::new(zbus::fdo::Error::NoReply("x".into())));
-        assert_eq!(reason(&error), "no answer in time");
+        assert_eq!(reason_text(&error), "no answer in time");
     }
 }

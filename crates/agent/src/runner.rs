@@ -41,7 +41,9 @@ use crate::host::{
     SendState, Timings, TransferProgress, WorkerHost,
 };
 use crate::inputs::RuntimeInputs;
-use crate::journal::{JobContent, Journal, JournalError, RunStop, StepRef, StoppedRun, Store};
+use crate::journal::{
+    JobContent, Journal, JournalError, RunStop, StepRef, StoppedRun, Store, encode,
+};
 use crate::journaling::{JobJournal, JournalSetup};
 use crate::link::{self, LinkConfig};
 use crate::oplog::LogSafe;
@@ -1425,8 +1427,7 @@ fn job_content(program: &Program, document: Option<&JobDocument>) -> Result<JobC
     match document {
         Some(document) => Ok(JobContent::Document(document.sha256())),
         None => {
-            let encoded = postcard::to_allocvec(program)
-                .map_err(|_| JournalError::Invariant("the program does not encode"))?;
+            let encoded = encode(program)?;
             Ok(JobContent::Program(sha2::Sha256::digest(&encoded).into()))
         }
     }

@@ -68,7 +68,7 @@ pub enum Class {
 }
 
 /// Why a route gave no result: the class and fixed words, never a body, a token or a URL.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Failure {
     pub class: Class,
     /// A fixed word naming the reason, for the loop's log line.
@@ -76,6 +76,9 @@ pub struct Failure {
     pub status: Option<u16>,
     /// The usable `Retry-After` of a 429 or 503 (1 to 60 seconds).
     pub retry_after_secs: Option<u32>,
+    /// The error that led to the failure, when there is one. It is not in the fixed words and
+    /// may quote what the server sent, so a log line does not print it.
+    pub source: Option<Arc<dyn std::error::Error + Send + Sync>>,
 }
 
 impl Failure {
@@ -85,7 +88,17 @@ impl Failure {
             why,
             status,
             retry_after_secs: None,
+            source: None,
         }
+    }
+
+    /// The failure with `source` as its cause.
+    pub(crate) fn caused_by(
+        mut self,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        self.source = Some(Arc::new(source));
+        self
     }
 
     pub(crate) fn unpromised(status: u16) -> Self {
@@ -250,10 +263,10 @@ pub(crate) fn object_target(
     if parsed.expires_in_secs == 0 {
         return Err(Failure::unpromised(status));
     }
-    let pin =
-        CertPin::from_hex(&parsed.certificate_pin).map_err(|_| Failure::unpromised(status))?;
+    let pin = CertPin::from_hex(&parsed.certificate_pin)
+        .map_err(|error| Failure::unpromised(status).caused_by(error))?;
     let target = part_url::check(origin, &parsed.url, pin)
-        .map_err(|_| Failure::new(Class::Retry, host_why, Some(status)))?;
+        .map_err(|error| Failure::new(Class::Retry, host_why, Some(status)).caused_by(error))?;
     Ok((target, parsed.expires_in_secs))
 }
 
@@ -314,7 +327,8 @@ impl Requester {
         body: Option<Vec<u8>>,
         reads: fn(u16) -> bool,
     ) -> Result<Called, Failure> {
-        let nonce = (self.random)().map_err(|_| Failure::new(Class::Retry, "random", None))?;
+        let nonce = (self.random)()
+            .map_err(|error| Failure::new(Class::Retry, "random", None).caused_by(error))?;
         let host = self.origin.host_header();
         let request = JsonRequest {
             method,
@@ -584,18 +598,18 @@ impl Routes {
 
 /// A request that got no answer is always a retry.
 pub(crate) fn transport(error: Error) -> Failure {
-    let why = match error {
-        Error::NotSent => "not-sent",
+    let why = match &error {
+        Error::NotSent(_) => "not-sent",
         Error::ConnectTimeout => "connect-timeout",
         Error::Tls(Refused::Certificate) => "object-tls-certificate",
         Error::Tls(Refused::Signature) => "object-tls-signature",
         Error::Tls(Refused::Handshake(_)) => "object-tls-handshake",
         Error::NoProgress => "no-progress",
         Error::Timeout => "timeout",
-        Error::Failed => "transport",
+        Error::Failed(_) => "transport",
         Error::Write(_) => "write",
     };
-    Failure::new(Class::Retry, why, None)
+    Failure::new(Class::Retry, why, None).caused_by(error)
 }
 
 /// The failure a status is when it is not a result of the route.
@@ -617,7 +631,7 @@ fn by_status(answer: &Answer) -> Failure {
 
 /// A body that is exactly the document's shape, or the answer is not promised.
 pub(crate) fn parse<'a, T: Deserialize<'a>>(status: u16, body: &'a [u8]) -> Result<T, Failure> {
-    serde_json::from_slice(body).map_err(|_| Failure::unpromised(status))
+    serde_json::from_slice(body).map_err(|error| Failure::unpromised(status).caused_by(error))
 }
 
 #[cfg(test)]

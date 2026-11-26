@@ -529,7 +529,7 @@ impl LogUploads for ScriptedLogUploads {
                 self.gate.acquire().await.unwrap().forget();
             }
             let outcome = *self.outcome.lock().unwrap();
-            outcome.ok_or(LogUploadError::Task)
+            outcome.ok_or(LogUploadError::Task(None))
         })
     }
 }

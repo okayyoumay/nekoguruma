@@ -395,7 +395,7 @@ fn identity(mode: OperatingMode) -> ExitCode {
                 IdentityError::Unavailable(_)
                 | IdentityError::CreationLockBusy
                 | IdentityError::LocalFault(_) => 3,
-                IdentityError::KeyUnusable(_) => 4,
+                IdentityError::KeyUnusable(..) => 4,
                 IdentityError::NoStore(_)
                 | IdentityError::NotProvisioned
                 | IdentityError::Random(_) => 1,
@@ -649,7 +649,7 @@ fn parse_debug_enqueue(mut args: impl Iterator<Item = OsString>) -> Result<Comma
                 generation = Some(
                     text()?
                         .parse::<u64>()
-                        .map_err(|_| "--generation is a number".to_owned())?,
+                        .map_err(|error| format!("--generation is a number: {error}"))?,
                 );
             }
             "--kind" => {
@@ -953,6 +953,10 @@ fn flag_name(flag: &str) -> Option<&str> {
 /// The options of `ngr-agent register` (ADR-470, ADR-494): `--mode` and `--server-key`, each
 /// once and in any order, the optional `--server`, `--code-file <file>` and `--replace`. No message repeats a value, and
 /// a stray argument is never echoed.
+#[expect(
+    clippy::map_err_ignore,
+    reason = "the error of OsString::into_string is the argument itself, which this parser never echoes"
+)]
 fn parse_register(args: impl Iterator<Item = OsString>) -> Result<Command, String> {
     use agent::registration::origin::{ServerOrigin, parse_server_key};
     let mut args = args;

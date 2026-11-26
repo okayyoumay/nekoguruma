@@ -148,7 +148,7 @@ impl Installation {
 
 /// Why the installation file cannot be used. The text is NGR's own: it names a key and the rule
 /// it broke, never a value from the file.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum InstallationError {
     /// There is no file.
     #[error("there is no installation file")]
@@ -166,7 +166,7 @@ pub enum InstallationError {
     #[error("the installation file is larger than {MAX_SIZE} bytes")]
     TooLarge,
     #[error("the installation file is not UTF-8")]
-    NotUtf8,
+    NotUtf8(#[source] std::str::Utf8Error),
     /// A TOML syntax error, at a line of the file (none when the parser gave no position).
     #[error("the installation file is not valid TOML{}", line_text(*.line))]
     Syntax { line: Option<usize> },
@@ -180,6 +180,14 @@ pub enum InstallationError {
     Invalid {
         key: &'static str,
         rule: &'static str,
+    },
+    /// A value that failed to parse; the parser's error is the source.
+    #[error("the installation file's {key} {rule}")]
+    Unparsed {
+        key: &'static str,
+        rule: &'static str,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 }
 
@@ -288,7 +296,7 @@ pub fn parse(bytes: &[u8]) -> Result<Installation, InstallationError> {
     if bytes.len() as u64 > MAX_SIZE {
         return Err(InstallationError::TooLarge);
     }
-    let text = std::str::from_utf8(bytes).map_err(|_| InstallationError::NotUtf8)?;
+    let text = std::str::from_utf8(bytes).map_err(InstallationError::NotUtf8)?;
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let table: toml::Table =
         text.parse()
@@ -364,18 +372,22 @@ fn parse_mode(table: &toml::Table) -> Result<OperatingMode, InstallationError> {
 }
 
 fn parse_server(table: &toml::Table) -> Result<ServerOrigin, InstallationError> {
-    ServerOrigin::parse(required(table, "server_url")?).map_err(|_| InstallationError::Invalid {
-        key: "server_url",
-        rule: "must be http://127.0.0.1 with an optional port, and nothing else",
+    ServerOrigin::parse(required(table, "server_url")?).map_err(|source| {
+        InstallationError::Unparsed {
+            key: "server_url",
+            rule: "must be http://127.0.0.1 with an optional port, and nothing else",
+            source: Box::new(source),
+        }
     })
 }
 
 fn parse_root(table: &toml::Table) -> Result<PublicKey, InstallationError> {
     // Line endings may be CRLF (a file saved on Windows); the PEM itself is read as one block.
     let pem = required(table, "distribution_root_pem")?.replace("\r\n", "\n");
-    PublicKey::from_spki_pem(&pem).map_err(|_| InstallationError::Invalid {
+    PublicKey::from_spki_pem(&pem).map_err(|source| InstallationError::Unparsed {
         key: "distribution_root_pem",
         rule: "must be one P-256 public key in SPKI PEM form",
+        source: Box::new(source),
     })
 }
 

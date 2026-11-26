@@ -606,23 +606,23 @@ async fn only_a_named_digest_of_the_right_kind_is_fetched() {
     rig.serve_body(b"doc");
     let f = &rig.fetcher;
     let v = &rig.verified;
-    assert_eq!(
+    assert!(matches!(
         f.fetch(v, Kind::Document, &digest(b"other")).await,
         Err(FetchError::NotNamed)
-    );
-    assert_eq!(
+    ));
+    assert!(matches!(
         f.fetch(v, Kind::Artifact, &digest(b"doc")).await,
         Err(FetchError::NotNamed)
-    );
-    assert_eq!(
+    ));
+    assert!(matches!(
         f.fetch(v, Kind::Document, &digest(b"art")).await,
         Err(FetchError::NotNamed)
-    );
+    ));
     let (none, _) = sign(vec![digest(b"doc")], None);
-    assert_eq!(
+    assert!(matches!(
         f.fetch(&none, Kind::Artifact, &digest(b"art")).await,
         Err(FetchError::NotNamed)
-    );
+    ));
     assert!(
         rig.script.lock().unwrap().log.is_empty(),
         "nothing was sent"
@@ -702,10 +702,10 @@ async fn a_bad_cached_file_is_deleted_and_fetched_again() {
     fs::remove_file(&path).unwrap();
     fs::create_dir(&path).unwrap();
     let before = rig.script.lock().unwrap().log.len();
-    assert_eq!(
+    assert!(matches!(
         rig.doc(0).await,
         Err(FetchError::Local { why: "not-regular" })
-    );
+    ));
     assert!(path.is_dir());
     assert_eq!(rig.script.lock().unwrap().log.len(), before);
 }
@@ -725,23 +725,23 @@ async fn a_failed_exchange_is_a_retry_with_its_wait() {
             .push_back(answer(429, "Retry-After: 9\r\n", "{}"));
         script.session.push_back(Some(json(403, "{}")));
     }
-    assert_eq!(
+    assert!(matches!(
         rig.doc(0).await,
         Err(FetchError::Retry {
             why: "exchange",
             status: None,
             retry_after_secs: None
         })
-    );
-    assert_eq!(
+    ));
+    assert!(matches!(
         rig.doc(0).await,
         Err(FetchError::Retry {
             why: "exchange",
             status: None,
             retry_after_secs: Some(9)
         })
-    );
-    assert_eq!(rig.doc(0).await, Err(FetchError::ExchangeCapped));
+    ));
+    assert!(matches!(rig.doc(0).await, Err(FetchError::ExchangeCapped)));
     assert_eq!((rig.downloads(), rig.gets()), (0, 0));
     // The next one gets through.
     rig.doc(0).await.unwrap();
@@ -816,14 +816,14 @@ async fn a_401_gets_one_new_exchange_and_one_repeat() {
             .downloads
             .push_back(Served::new(401, "{}").unproved());
     }
-    assert_eq!(
+    assert!(matches!(
         rig.doc(0).await,
         Err(FetchError::Retry {
             why: "unauthorized",
             status: Some(401),
             retry_after_secs: None
         })
-    );
+    ));
     assert_eq!((rig.sessions(), rig.downloads(), rig.gets()), (2, 2, 0));
 }
 
@@ -839,7 +839,7 @@ async fn a_401_then_a_refused_exchange_ends_in_a_retry_of_the_exchange() {
         script.session.push_back(None);
         script.session.push_back(Some(json(403, "{}")));
     }
-    assert_eq!(rig.doc(0).await, Err(FetchError::ExchangeCapped));
+    assert!(matches!(rig.doc(0).await, Err(FetchError::ExchangeCapped)));
     assert_eq!(rig.gets(), 0);
 }
 
@@ -855,12 +855,14 @@ async fn a_proved_refusal_ends_the_fetch() {
             .unwrap()
             .downloads
             .push_back(Served::new(status, "{}"));
-        assert_eq!(
-            rig.doc_retrying(0, 5).await,
-            Err(FetchError::Refused {
-                why: "refused",
-                status: Some(status)
-            }),
+        assert!(
+            matches!(
+                rig.doc_retrying(0, 5).await,
+                Err(FetchError::Refused {
+                    why: "refused",
+                    status: Some(got)
+                }) if got == status
+            ),
             "{status}"
         );
         assert_eq!((rig.downloads(), rig.gets()), (1, 0));
@@ -1058,13 +1060,15 @@ async fn a_status_but_200_is_a_retry_and_its_body_is_never_read() {
         ));
         let started = Instant::now();
         let error = rig.doc(0).await.unwrap_err();
-        assert_eq!(
-            error,
-            FetchError::Retry {
-                why,
-                status: Some(status),
-                retry_after_secs: None
-            },
+        assert!(
+            matches!(
+                error,
+                FetchError::Retry {
+                    why: got_why,
+                    status: Some(got),
+                    retry_after_secs: None
+                } if got_why == why && got == status
+            ),
             "{status}"
         );
         assert_eq!(started.elapsed(), Duration::ZERO, "no body was waited for");
@@ -1144,7 +1148,7 @@ async fn a_cut_body_leaves_nothing_and_a_longer_one_is_not_accepted() {
     let mut long = b"HTTP/1.1 200 X\r\nContent-Length: 3\r\nConnection: close\r\n\r\n".to_vec();
     long.extend_from_slice(&rig.docs[0]);
     rig.serve(Obj::Raw(long));
-    assert_eq!(rig.doc(0).await, Err(FetchError::Mismatch));
+    assert!(matches!(rig.doc(0).await, Err(FetchError::Mismatch)));
     assert_eq!(rig.tmp_files(), 0);
     assert!(!rig.cached(Kind::Document, &rig.docs[0]).exists());
 }
@@ -1189,14 +1193,17 @@ async fn a_stalled_body_is_dropped_and_a_slow_one_is_not() {
 async fn a_second_mismatch_in_a_row_fails_the_object_until_restart() {
     let rig = Rig::one(b"the real bytes");
     rig.serve_body(b"not the bytes!");
-    assert_eq!(rig.doc(0).await, Err(FetchError::Mismatch));
+    assert!(matches!(rig.doc(0).await, Err(FetchError::Mismatch)));
     assert_eq!(rig.tmp_files(), 0);
     assert!(!rig.cached(Kind::Document, &rig.docs[0]).exists());
-    assert_eq!(rig.doc(0).await, Err(FetchError::MismatchTwice));
+    assert!(matches!(rig.doc(0).await, Err(FetchError::MismatchTwice)));
     let gets = rig.gets();
     assert_eq!(gets, 2);
-    assert_eq!(rig.doc(0).await, Err(FetchError::MismatchTwice));
-    assert_eq!(rig.doc_retrying(0, 5).await, Err(FetchError::MismatchTwice));
+    assert!(matches!(rig.doc(0).await, Err(FetchError::MismatchTwice)));
+    assert!(matches!(
+        rig.doc_retrying(0, 5).await,
+        Err(FetchError::MismatchTwice)
+    ));
     assert_eq!(rig.gets(), gets, "no request after the second mismatch");
     // A restart (a new fetcher) starts over.
     let again = Rig::one(b"the real bytes");
@@ -1209,7 +1216,10 @@ async fn a_second_mismatch_in_a_row_fails_the_object_until_restart() {
 async fn the_loop_makes_two_attempts_on_a_mismatch_and_a_match_clears_the_count() {
     let rig = Rig::one(b"the real bytes");
     rig.serve_body(b"not the bytes!");
-    assert_eq!(rig.doc_retrying(0, 5).await, Err(FetchError::MismatchTwice));
+    assert!(matches!(
+        rig.doc_retrying(0, 5).await,
+        Err(FetchError::MismatchTwice)
+    ));
     assert_eq!(rig.gets(), 2);
 
     let rig = Rig::one(b"the real bytes");
@@ -1222,7 +1232,7 @@ async fn the_loop_makes_two_attempts_on_a_mismatch_and_a_match_clears_the_count(
     // Cache emptied, one more mismatch: the first of a new run, not a second.
     fs::remove_file(rig.cached(Kind::Document, b"the real bytes")).unwrap();
     rig.serve_body(b"not the bytes!");
-    assert_eq!(rig.doc(0).await, Err(FetchError::Mismatch));
+    assert!(matches!(rig.doc(0).await, Err(FetchError::Mismatch)));
 }
 
 // ---------------------------------------------------------------- A16
@@ -1234,10 +1244,10 @@ async fn a_local_failure_is_not_retried() {
     rig.serve_body(b"d");
     fs::remove_dir_all(rig.tmp_dir()).unwrap();
     fs::write(rig.tmp_dir(), b"in the way").unwrap();
-    assert_eq!(
+    assert!(matches!(
         rig.doc_retrying(0, 5).await,
         Err(FetchError::Local { why: "io" })
-    );
+    ));
     assert_eq!((rig.downloads(), rig.gets()), (1, 0));
     assert!(!rig.cached(Kind::Document, b"d").exists());
 }
@@ -1287,10 +1297,10 @@ async fn a_failing_write_is_a_local_failure() {
     let rig = Rig::one(&bytes(100_000, 6));
     rig.serve_body(&rig.docs[0]);
     rig.fetcher.store.fail_writes_after(10_000);
-    assert_eq!(
+    assert!(matches!(
         rig.doc_retrying(0, 5).await,
         Err(FetchError::Local { why: "write" })
-    );
+    ));
     assert_eq!(rig.gets(), 1);
     assert!(rig.tmp_empty_soon());
     assert!(!rig.cached(Kind::Document, &rig.docs[0]).exists());
@@ -1329,17 +1339,20 @@ async fn the_get_s_retry_after_is_kept_for_429_and_503_only() {
         let rig = Rig::one(b"d");
         rig.serve(Obj::Raw(answer(status, "Retry-After: 7\r\n", "")));
         let error = rig.doc(0).await.unwrap_err();
-        assert_eq!(
-            error,
-            FetchError::Retry {
-                why: if status == 302 {
-                    "get-redirect"
-                } else {
-                    "get-status"
-                },
-                status: Some(status),
-                retry_after_secs: want
-            },
+        let why = if status == 302 {
+            "get-redirect"
+        } else {
+            "get-status"
+        };
+        assert!(
+            matches!(
+                error,
+                FetchError::Retry {
+                    why: got_why,
+                    status: Some(got),
+                    retry_after_secs
+                } if got_why == why && got == status && retry_after_secs == want
+            ),
             "{status}"
         );
     }
@@ -1371,10 +1384,10 @@ async fn read_document_returns_the_bytes_of_one_verified_load() {
     assert_eq!(rig.gets(), 2);
     // A digest the instruction does not name is not read.
     let other = digest(b"other");
-    assert_eq!(
+    assert!(matches!(
         rig.fetcher.read_document(&rig.verified, &other, 1).await,
         Err(FetchError::NotNamed)
-    );
+    ));
 }
 
 // ---------------------------------------------------------------- A21
@@ -1485,9 +1498,11 @@ async fn an_unproven_download_answer_fetches_nothing() {
             .unwrap()
             .downloads
             .push_back(Served::new(200, &download_url()).with(proof));
-        assert_eq!(
-            rig.doc(0).await,
-            Err(FetchError::Unproven { status: Some(200) }),
+        assert!(
+            matches!(
+                rig.doc(0).await,
+                Err(FetchError::Unproven { status: Some(200) })
+            ),
             "{proof:?}"
         );
         assert_eq!((rig.gets(), rig.dialled(OBJ), rig.tmp_files()), (0, 0, 0));
@@ -1527,11 +1542,11 @@ async fn an_impostors_404_does_not_end_the_fetch_as_refused() {
                 .downloads
                 .push_back(Served::new(status, r#"{"title":"x"}"#).with(proof));
             let error = rig.doc(0).await.unwrap_err();
-            assert_eq!(
-                error,
-                FetchError::Unproven {
-                    status: Some(status)
-                },
+            assert!(
+                matches!(
+                    error,
+                    FetchError::Unproven { status: Some(got) } if got == status
+                ),
                 "{status} {proof:?}"
             );
             assert!(error.may_retry());
@@ -1594,7 +1609,7 @@ async fn attempts_that_run_out_are_never_a_refusal() {
         }
         let error = rig.doc_retrying(0, 3).await.unwrap_err();
         assert_eq!((error.class(), error.may_retry()), ("retry", true));
-        assert_eq!(error, FetchError::ExchangeCapped);
+        assert!(matches!(error, FetchError::ExchangeCapped));
         assert_eq!(rig.downloads(), 0);
     }
     // No answer at all.
@@ -1624,12 +1639,12 @@ async fn an_unproven_class_warns_once_per_token() {
             .push_back(Served::new(200, &download_url()).unproved());
     }
     for _ in 0..3 {
-        assert_eq!(rig.doc(0).await, Err(FetchError::ExchangeCapped));
+        assert!(matches!(rig.doc(0).await, Err(FetchError::ExchangeCapped)));
     }
-    assert_eq!(
+    assert!(matches!(
         rig.doc(0).await,
         Err(FetchError::Unproven { status: Some(200) })
-    );
+    ));
     let text = String::from_utf8_lossy(&log.0.lock().unwrap()).into_owned();
     let lines: Vec<&str> = text
         .lines()
@@ -1692,7 +1707,7 @@ async fn an_unproved_404_over_a_real_socket_is_retried_and_not_refused() {
         },
     ));
     let error = rig.doc(0).await.unwrap_err();
-    assert_eq!(error, FetchError::Unproven { status: Some(404) });
+    assert!(matches!(error, FetchError::Unproven { status: Some(404) }));
     assert!(error.may_retry());
     assert_eq!((rig.downloads(), rig.gets(), rig.tmp_files()), (1, 0, 0));
     server.abort();

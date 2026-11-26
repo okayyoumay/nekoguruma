@@ -37,8 +37,8 @@ use shared_crypto::instruction::{HEADER_LEN, MAX_PAYLOAD_LEN};
 use worker_host::service::OperatingMode;
 
 use crate::journal::{
-    FRAME_HEADER, FrameRead, JournalError, WriterLock, push_frame, read_frame, record_follows,
-    sync_after_rename,
+    FRAME_HEADER, FrameRead, JournalError, WriterLock, encode, push_frame, read_frame,
+    record_follows, sync_after_rename,
 };
 use crate::outbox::{Probe, Step};
 use crate::registration::record;
@@ -69,8 +69,9 @@ pub enum LedgerError {
     #[error("the state directory: {0}")]
     State(#[from] StateDirError),
     /// The file is not what the writer makes (never repaired).
+    /// The second field is the decoder's error when a record did not decode.
     #[error("the received-jobs ledger file is corrupt: {0}")]
-    Corrupt(&'static str),
+    Corrupt(&'static str, #[source] Option<postcard::Error>),
     /// Another store of this directory is open, in this process or another.
     #[error("the received-jobs ledger is open for writing elsewhere")]
     InUse,
@@ -83,6 +84,9 @@ pub enum LedgerError {
     /// nothing is written.
     #[error("the record is not one the ledger holds")]
     Refused,
+    /// The record could not be encoded or framed; the source says why.
+    #[error("the record is not one the ledger holds")]
+    Unencodable(#[source] JournalError),
 }
 
 impl From<io::Error> for LedgerError {
@@ -233,9 +237,9 @@ impl ReceivedJobs {
             envelope: envelope.to_vec(),
         };
         let mut frame = Vec::new();
-        let encoded = postcard::to_allocvec(&entry)
-            .map_err(|_| LedgerError::Refused)
-            .and_then(|payload| push_frame(&mut frame, &payload).map_err(|_| LedgerError::Refused));
+        let encoded = encode(&entry)
+            .and_then(|payload| push_frame(&mut frame, &payload))
+            .map_err(LedgerError::Unencodable);
         encoded?;
         if let Err(error) = io.write(&frame) {
             io.poisoned = true;
@@ -308,7 +312,7 @@ impl Io {
             Err(error) => return Err(error.into()),
         };
         if !meta.is_file() {
-            return Err(LedgerError::Corrupt("not a regular file"));
+            return Err(LedgerError::Corrupt("not a regular file", None));
         }
         let bytes = fs::read(&self.path)?;
         let parsed = parse(&bytes, &self.agent_id)?;
@@ -364,7 +368,7 @@ impl Io {
             protection: 0,
         })
         .map_err(io::Error::other)?;
-        push_frame(&mut bytes, &header).map_err(|_| io::Error::other("the header is too large"))?;
+        push_frame(&mut bytes, &header).map_err(io::Error::other)?;
         let preface = bytes.len() as u64;
         bytes.extend_from_slice(frame);
         let prepared = (|| {
@@ -409,7 +413,7 @@ fn seq_of(payload: &[u8]) -> Option<u64> {
 /// Reads a whole file: the index, the number of records and the length up to the end of the last
 /// whole frame. Anything that is not one unfinished append at the end is corrupt.
 fn parse(bytes: &[u8], agent_id: &str) -> Result<Parsed, LedgerError> {
-    let corrupt = LedgerError::Corrupt;
+    let corrupt = |reason| LedgerError::Corrupt(reason, None);
     if bytes.len() < PREAMBLE || bytes[..MAGIC.len()] != MAGIC {
         return Err(corrupt("not a received-jobs ledger"));
     }
@@ -420,8 +424,8 @@ fn parse(bytes: &[u8], agent_id: &str) -> Result<Parsed, LedgerError> {
     let FrameRead::Ok { payload, next } = read_frame(bytes, PREAMBLE) else {
         return Err(corrupt("the header does not read back"));
     };
-    let header: Header =
-        postcard::from_bytes(payload).map_err(|_| corrupt("the header does not decode"))?;
+    let header: Header = postcard::from_bytes(payload)
+        .map_err(|e| LedgerError::Corrupt("the header does not decode", Some(e)))?;
     if header.agent_id != agent_id {
         return Err(corrupt("the file belongs to another agent ID"));
     }
@@ -435,7 +439,7 @@ fn parse(bytes: &[u8], agent_id: &str) -> Result<Parsed, LedgerError> {
         match read_frame(bytes, offset) {
             FrameRead::Ok { payload, next } => {
                 let entry: Entry = postcard::from_bytes(payload)
-                    .map_err(|_| corrupt("a record does not decode"))?;
+                    .map_err(|e| LedgerError::Corrupt("a record does not decode", Some(e)))?;
                 if entry.seq != records {
                     return Err(corrupt("record numbers are not contiguous"));
                 }

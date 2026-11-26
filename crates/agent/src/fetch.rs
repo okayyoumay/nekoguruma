@@ -181,7 +181,7 @@ impl FetchError {
         }
     }
 
-    fn of(failure: Failure) -> Self {
+    fn of(failure: &Failure) -> Self {
         match failure.class {
             Class::PassOver => FetchError::Refused {
                 why: failure.why,
@@ -558,7 +558,7 @@ impl Fetcher {
         let got = match got {
             Ok(got) => got,
             Err(HttpError::Write(_)) => return Err(FetchError::Local { why: "write" }),
-            Err(error) => return Err(FetchError::of(transport(error))),
+            Err(error) => return Err(FetchError::of(&transport(error))),
         };
         let writer = match got.body {
             GetBody::Complete { writer, .. } => writer,
@@ -645,7 +645,7 @@ impl Fetcher {
             if failure.class == Class::Unproven {
                 state.holder.unproven(failure.status);
             }
-            return Err(FetchError::of(failure));
+            return Err(FetchError::of(&failure));
         }
     }
 

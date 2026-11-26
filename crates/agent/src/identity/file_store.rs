@@ -29,7 +29,7 @@ impl DebugFileStore {
     }
 }
 
-fn unavailable(error: io::Error) -> StoreError {
+fn unavailable(error: &io::Error) -> StoreError {
     StoreError::with_source(StoreErrorKind::Unavailable, format!("{:?}", error.kind()))
 }
 
@@ -40,7 +40,7 @@ impl SecretStore for DebugFileStore {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 Err(StoreError::new(StoreErrorKind::Absent))
             }
-            Err(error) => Err(unavailable(error)),
+            Err(error) => Err(unavailable(&error)),
         }
     }
 
@@ -52,7 +52,7 @@ impl SecretStore for DebugFileStore {
             Err(CreateLinkedError::AlreadyExists) => {
                 Err(StoreError::new(StoreErrorKind::AlreadyExists))
             }
-            Err(CreateLinkedError::Io(error)) => Err(unavailable(error)),
+            Err(CreateLinkedError::Io(error)) => Err(unavailable(&error)),
         }
     }
 }

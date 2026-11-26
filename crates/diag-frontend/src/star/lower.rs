@@ -1813,7 +1813,7 @@ impl<'a> Lowerer<'a> {
                 return;
             }
         };
-        self.unroll(id, stmt, &var, items, &for_.body, code);
+        self.unroll(id, stmt, &var, &items, &for_.body, code);
     }
 
     /// Unrolls a loop over constant items: each iteration binds the variable to its item, so
@@ -1824,7 +1824,7 @@ impl<'a> Lowerer<'a> {
         id: usize,
         stmt: &AstStmt,
         var: &Rc<str>,
-        items: Items,
+        items: &Items,
         body: &AstStmt,
         code: &mut Code,
     ) {
@@ -3205,7 +3205,7 @@ impl<'a> Lowerer<'a> {
                 if !self.charge(cost.saturating_add(index.size()), span) {
                     return Val::Const(Const::Int(0));
                 }
-                self.fold_index_checked(object, index, span)
+                self.fold_index_checked(&object, &index, span)
             }
             (_, Val::Const(Const::Int(n))) if n < 0 => {
                 self.not_lowerable(
@@ -3638,8 +3638,8 @@ impl<'a> Lowerer<'a> {
         .to_vec()
     }
 
-    fn fold_index_checked(&mut self, object: Const, index: Const, span: Span) -> Val {
-        match fold_index(&object, &index) {
+    fn fold_index_checked(&mut self, object: &Const, index: &Const, span: Span) -> Val {
+        match fold_index(object, index) {
             Ok(value) => Val::Const(value),
             Err(reason) => {
                 self.not_lowerable(span, reason);

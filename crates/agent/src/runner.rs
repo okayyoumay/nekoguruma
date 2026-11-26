@@ -1212,8 +1212,18 @@ async fn run_checked<C: WorkerApi>(
         comm_log,
         move |comm_log| {
             run_job(
-                handle, client, source, &config, &program, document, artifact, limits, &cancelled,
-                journal, guards, comm_log,
+                &handle,
+                client,
+                source,
+                &config,
+                &program,
+                document.as_ref(),
+                artifact,
+                limits,
+                &cancelled,
+                journal,
+                &guards,
+                comm_log,
             )
         },
         |log, result| log.finish(result),
@@ -1266,24 +1276,24 @@ pub(crate) const WORKER_EXIT_GRACE: Duration = Duration::from_secs(1);
     reason = "the job's whole input, split only by what the caller owns"
 )]
 fn run_job<C: WorkerApi>(
-    handle: Handle,
+    handle: &Handle,
     client: C,
     source: Box<dyn WorkerSource<Client = C>>,
     config: &LinkConfig,
     program: &Program,
-    document: Option<JobDocument>,
+    document: Option<&JobDocument>,
     artifact: Option<Artifact>,
     limits: JobLimits,
     cancelled: &AtomicBool,
     journal: Option<JournalMode>,
-    guards: GuardSlot,
+    guards: &GuardSlot,
     comm_log: &mut JobLog,
 ) -> Result<VmState, JobError> {
     // The job's guards stay held until the end of this function, after the link is closed
     // (`OpenLink`, declared below, closes it on every way out, a panic included): declared
     // first, this handle is dropped last, so even a caller whose future is gone cannot hand the
     // VCI to another job while this one still tears its link down.
-    let _guards = Arc::clone(&guards);
+    let _guards = Arc::clone(guards);
     if cancelled.load(Ordering::Relaxed) {
         return Err(JobError::Cancelled);
     }
@@ -1322,7 +1332,7 @@ fn run_job<C: WorkerApi>(
     // resume. A job without a journal has no use for it. A program that does not encode ends the
     // job before the communication log opens, so it leaves none (ADR-347).
     let content = match &journal {
-        Some(_) => Some(job_content(program, document.as_ref())?),
+        Some(_) => Some(job_content(program, document)?),
         None => None,
     };
     // The communication log opens after the journal, so a job a journal turns away has none, and
@@ -1342,14 +1352,14 @@ fn run_job<C: WorkerApi>(
         path_lost,
         permission,
     } = open_job_link(
-        &handle,
+        handle,
         client,
         source,
         config,
-        document.clone(),
+        document.cloned(),
         artifact,
         comm_log,
-        &guards,
+        guards,
         timings,
     )
     .map_err(|refused| refused.error)?;
@@ -1357,7 +1367,7 @@ fn run_job<C: WorkerApi>(
     // than this link allows is refused with no effect on it.
     let refused = refuse_beyond(
         program,
-        document.as_ref().map(JobDocument::variant).as_ref(),
+        document.map(JobDocument::variant).as_ref(),
         permission,
     );
     if let Err(error) = refused {
@@ -1386,7 +1396,7 @@ fn run_job<C: WorkerApi>(
             setup.intended_software_version.as_deref(),
             artifact_sha256.as_ref(),
             &content.expect("computed above for a journaled job"),
-            &guards,
+            guards,
         ),
         _ => run_on(
             program,
@@ -5592,7 +5602,7 @@ def main():
                 let handle = Handle::current();
                 tokio::task::spawn_blocking(move || {
                     run_job(
-                        handle,
+                        &handle,
                         unreachable_client(),
                         Box::new(unreachable_client()),
                         &LinkConfig::iso15765(0x7E0, 0x7E8),
@@ -5602,7 +5612,7 @@ def main():
                         JobLimits::default(),
                         &AtomicBool::new(false),
                         Some(JournalMode::Create(setup)),
-                        slot,
+                        &slot,
                         &mut JobLog::none(),
                     )
                 })
@@ -5726,7 +5736,7 @@ def main():
                 let handle = Handle::current();
                 tokio::task::spawn_blocking(move || {
                     run_job(
-                        handle,
+                        &handle,
                         unreachable_client(),
                         Box::new(unreachable_client()),
                         &LinkConfig::iso15765(0x7E0, 0x7E8),
@@ -5736,7 +5746,7 @@ def main():
                         JobLimits::default(),
                         &cancelled,
                         Some(JournalMode::Resume(setup)),
-                        job_slot,
+                        &job_slot,
                         &mut JobLog::none(),
                     )
                 })
@@ -6243,7 +6253,7 @@ def main():
                 let handle = Handle::current();
                 tokio::task::spawn_blocking(move || {
                     run_job(
-                        handle,
+                        &handle,
                         unreachable_client(),
                         Box::new(unreachable_client()),
                         &LinkConfig::iso15765(0x7E0, 0x7E8),
@@ -6253,7 +6263,7 @@ def main():
                         JobLimits::default(),
                         &AtomicBool::new(false),
                         Some(JournalMode::Create(setup)),
-                        slot,
+                        &slot,
                         &mut JobLog::none(),
                     )
                 })
@@ -15344,7 +15354,7 @@ def main():
             let program = program(two_requests());
             // Without the check, opening the link fails against the unreachable client.
             run_job(
-                handle,
+                &handle,
                 unreachable_client(),
                 Box::new(unreachable_client()),
                 &config,
@@ -15354,7 +15364,7 @@ def main():
                 JobLimits::default(),
                 &AtomicBool::new(true),
                 None,
-                slot,
+                &slot,
                 &mut JobLog::none(),
             )
         })
@@ -16235,7 +16245,7 @@ def main():
                     Err(vci_service_interface::status_with_error_detail(
                         tonic::Code::NotFound,
                         "PDU_ERR_INVALID_HANDLE",
-                        vci_service_interface::ErrorDetail {
+                        &vci_service_interface::ErrorDetail {
                             pdu_error: vci_service_interface::PduError::PduErrInvalidHandle as i32,
                             ..Default::default()
                         },
@@ -20207,7 +20217,7 @@ def main():
             Some(vci_service_interface::status_with_error_detail(
                 tonic::Code::NotFound,
                 "PDU_ERR_INVALID_HANDLE",
-                vci_service_interface::ErrorDetail {
+                &vci_service_interface::ErrorDetail {
                     pdu_error: vci_service_interface::PduError::PduErrInvalidHandle as i32,
                     ..Default::default()
                 },
@@ -20318,7 +20328,7 @@ def main():
         let invalid_handle = Some(vci_service_interface::status_with_error_detail(
             tonic::Code::NotFound,
             "PDU_ERR_INVALID_HANDLE",
-            vci_service_interface::ErrorDetail {
+            &vci_service_interface::ErrorDetail {
                 pdu_error: vci_service_interface::PduError::PduErrInvalidHandle as i32,
                 ..Default::default()
             },
@@ -21524,7 +21534,7 @@ def main():
             status: Box::new(vci_service_interface::status_with_error_detail(
                 tonic::Code::ResourceExhausted,
                 "queue full",
-                ErrorDetail {
+                &ErrorDetail {
                     pdu_error: PduError::PduErrInvalidParameters as i32,
                     error_event_data: None,
                     detail_text: None,
@@ -24886,7 +24896,7 @@ def main():
                 vci_service_interface::status_with_error_detail(
                     tonic::Code::InvalidArgument,
                     "refused",
-                    vci_service_interface::ErrorDetail {
+                    &vci_service_interface::ErrorDetail {
                         refusal: Some(
                             vci_service_interface::RefusalReason::InvalidParameters as i32,
                         ),

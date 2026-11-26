@@ -106,7 +106,7 @@ impl Iso22900Service {
                 .as_ref()
                 .ok_or_else(|| api_not_initialized_status(API_NOT_INITIALIZED))?;
             api.destroy_com_logical_link(h_mod, h_cll)
-                .map_err(|error| map_runtime_error_for_link(api, h_mod, h_cll, error))?;
+                .map_err(|error| map_runtime_error_for_link(api, h_mod, h_cll, &error))?;
             self.terminate_cop_tags_for_link(h_mod, h_cll).await;
         }
         self.terminate_subscription(h_mod, h_cll).await;
@@ -198,11 +198,11 @@ impl Iso22900Service {
             Param::ParamId(id) => ObjectId(id),
             Param::ParamName(name) => api
                 .get_object_id(ObjectType(E_PDU_OBJT::PDU_OBJT_COMPARAM), &name)
-                .map_err(|e| map_runtime_error_for_link(api, h_mod, h_cll, e))?,
+                .map_err(|e| map_runtime_error_for_link(api, h_mod, h_cll, &e))?,
         };
         let param = api
             .get_com_param(h_mod, h_cll, param_id)
-            .map_err(|e| map_runtime_error_for_link(api, h_mod, h_cll, e))?;
+            .map_err(|e| map_runtime_error_for_link(api, h_mod, h_cll, &e))?;
 
         let borrowed = param.borrowed();
         let mut resolve_vendor_entry_size =
@@ -231,7 +231,7 @@ impl Iso22900Service {
 
         let param_id = resolve_param_item_id(param_item.id.clone(), |name| {
             api.get_object_id(ObjectType(E_PDU_OBJT::PDU_OBJT_COMPARAM), name)
-                .map_err(|e| map_runtime_error_for_link(api, h_mod, h_cll, e))
+                .map_err(|e| map_runtime_error_for_link(api, h_mod, h_cll, &e))
         })?;
 
         // The real D-PDU API expects a concrete class -- `to_iso_param`'s
@@ -245,7 +245,7 @@ impl Iso22900Service {
         if param_item.com_param_class == PduParamClass::PduPcSpecified as i32 {
             let current = api
                 .get_com_param(h_mod, h_cll, param_id)
-                .map_err(|e| map_runtime_error_for_link(api, h_mod, h_cll, e))?;
+                .map_err(|e| map_runtime_error_for_link(api, h_mod, h_cll, &e))?;
             param_item.com_param_class = current.borrowed().class().0 as i32;
         }
 
@@ -258,7 +258,7 @@ impl Iso22900Service {
             |struct_type| self.resolve_vendor_struct_entry_size(struct_type);
         let param = to_iso_param(param_item, param_id, &mut resolve_vendor_entry_size)?;
         api.set_com_param(h_mod, h_cll, param)
-            .map_err(|e| map_runtime_error_for_link(api, h_mod, h_cll, e))?;
+            .map_err(|e| map_runtime_error_for_link(api, h_mod, h_cll, &e))?;
 
         Ok(Self::empty_response())
     }

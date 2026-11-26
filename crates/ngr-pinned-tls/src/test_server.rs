@@ -130,6 +130,7 @@ fn section(text: &str, kind: SectionKind) -> Option<Vec<u8>> {
     None
 }
 
+#[derive(Clone, Copy)]
 enum Validity {
     Current,
     Expired,

@@ -3044,7 +3044,7 @@ impl LinkState {
             let (classification, evidence) = (kept.classification, kept.evidence.clone());
             freed.extend(self.refresh_row_owners(
                 seq,
-                evidence,
+                &evidence,
                 classification,
                 before,
                 (clears, answer_at),
@@ -3095,7 +3095,7 @@ impl LinkState {
             };
             freed.extend(self.refresh_row_owners(
                 seq,
-                evidence,
+                &evidence,
                 classification,
                 before,
                 (clears, answer_at),
@@ -3113,19 +3113,19 @@ impl LinkState {
     fn refresh_row_owners(
         &mut self,
         seq: u64,
-        evidence: Evidence,
+        evidence: &Evidence,
         classification: Classification,
         before: (Sent, bool),
         at: (Clears, AnswerTime),
         place: Place,
     ) -> Option<SettledAnswer> {
         let (clears, answer_at) = at;
-        let entry = self.kept_entry(seq, &evidence, classification);
+        let entry = self.kept_entry(seq, evidence, classification);
         self.free_owner_answer(
             before,
             &entry,
             false,
-            &evidence,
+            evidence,
             answer_at,
             (clears, clears),
             place,

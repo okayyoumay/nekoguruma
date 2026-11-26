@@ -67,7 +67,7 @@ fn state() -> AppState {
     }
 }
 
-fn report(errors: Vec<String>) {
+fn report(errors: &[String]) {
     assert!(
         errors.is_empty(),
         "{} mismatch(es) between the API description and the code:\n  - {}",
@@ -174,7 +174,7 @@ async fn the_served_routes_and_openapi_agree() {
         &spec,
         &channel_addresses,
     ));
-    report(errors);
+    report(&errors);
 }
 
 async fn status_and_allow(
@@ -266,7 +266,7 @@ async fn the_recorded_routes_are_the_routers() {
             ));
         }
     }
-    report(errors);
+    report(&errors);
 }
 
 /// Where the router may be built: every route goes through `Mounts::mount`, which records it, so
@@ -335,7 +335,7 @@ fn routes_are_mounted_only_where_they_are_recorded() {
             ));
         }
     }
-    report(errors);
+    report(&errors);
 }
 
 // ------------------------------------------------------------------------------ messages
@@ -757,7 +757,7 @@ fn the_control_messages_and_asyncapi_agree() {
     let code = code_messages(&mut errors);
     let spec = spec_messages(&yaml("asyncapi.yaml"), &mut errors);
     errors.extend(compare_messages(&code, &spec));
-    report(errors);
+    report(&errors);
 }
 
 // ------------------------------------------------------------------------------ self-tests

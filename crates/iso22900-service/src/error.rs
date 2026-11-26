@@ -40,7 +40,7 @@ pub(crate) fn api_not_initialized_status(message: impl Into<String>) -> Status {
         detail_text: None,
         refusal: None,
     };
-    status_with_error_detail(Code::FailedPrecondition, message, detail)
+    status_with_error_detail(Code::FailedPrecondition, message, &detail)
 }
 
 /// Maps a failed library lookup (design 7.1) to a client-facing [`Status`]. Only a name with no
@@ -91,9 +91,13 @@ fn runtime_error_parts(error: &DPduApiError) -> (Code, String, ErrorDetail) {
     }
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "mostly used as the function handed to `Result::map_err`, which passes the error by value"
+)]
 pub fn map_runtime_error(error: DPduApiError) -> Status {
     let (code, message, detail) = runtime_error_parts(&error);
-    status_with_error_detail(code, message, detail)
+    status_with_error_detail(code, message, &detail)
 }
 
 /// Builds an [`ErrorEventData`] from a `PDUGetLastError` result, unless it
@@ -101,7 +105,7 @@ pub fn map_runtime_error(error: DPduApiError) -> Status {
 /// not a real async error worth surfacing (mirrors
 /// `j2534-0404-service::error::error_event_data_for`'s same filter).
 fn error_event_data_for(
-    last_error: LastErrorInfo,
+    last_error: &LastErrorInfo,
     module: ModuleHandle,
     cll: ComLogicalLinkHandle,
 ) -> Option<ErrorEventData> {
@@ -130,12 +134,12 @@ pub(crate) fn map_runtime_error_for_link(
     api: &DPduApi,
     module: ModuleHandle,
     cll: ComLogicalLinkHandle,
-    error: DPduApiError,
+    error: &DPduApiError,
 ) -> Status {
-    let (code, message, mut detail) = runtime_error_parts(&error);
+    let (code, message, mut detail) = runtime_error_parts(error);
     match api.get_last_error(module, cll) {
         Ok(last_error) => {
-            detail.error_event_data = error_event_data_for(last_error, module, cll);
+            detail.error_event_data = error_event_data_for(&last_error, module, cll);
         }
         Err(fetch_error) => {
             warn!(
@@ -146,7 +150,7 @@ pub(crate) fn map_runtime_error_for_link(
             );
         }
     }
-    status_with_error_detail(code, message, detail)
+    status_with_error_detail(code, message, &detail)
 }
 
 #[cfg(test)]
@@ -164,7 +168,7 @@ mod tests {
             extra_error_info: 0,
         };
         assert_eq!(
-            error_event_data_for(last_error, ModuleHandle(1), ComLogicalLinkHandle(2)),
+            error_event_data_for(&last_error, ModuleHandle(1), ComLogicalLinkHandle(2)),
             None,
             "PDU_ERR_EVT_NOERROR is not a real tracked error and must not be surfaced"
         );
@@ -178,7 +182,7 @@ mod tests {
             timestamp: 42,
             extra_error_info: 7,
         };
-        let data = error_event_data_for(last_error, ModuleHandle(1), ComLogicalLinkHandle(2))
+        let data = error_event_data_for(&last_error, ModuleHandle(1), ComLogicalLinkHandle(2))
             .expect("a real tracked error should be surfaced");
         assert_eq!(
             data.error_event,

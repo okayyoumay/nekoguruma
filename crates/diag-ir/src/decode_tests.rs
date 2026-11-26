@@ -1245,11 +1245,11 @@ fn a_message_decodes_to_at_most_65536_values() {
 
 /// Layout n (from 1) holds two copies of `inner(n)`, both at offset 0, so `depth` layouts
 /// decode the innermost one 2^depth times over the same bytes.
-fn doubling(depth: u32, innermost: Vec<FieldT>) -> Vec<LayoutT> {
+fn doubling(depth: u32, innermost: &[FieldT]) -> Vec<LayoutT> {
     (1..=depth)
         .map(|n| {
             let fields = if n == depth {
-                innermost.clone()
+                innermost.to_vec()
             } else {
                 let copy = |id| FieldT {
                     placement: Placement::Absolute,
@@ -1279,7 +1279,7 @@ fn items_read_over_the_same_bytes_count_toward_the_limit() {
             },
         )
     };
-    let mut layouts = doubling(14, vec![empty_items(1), empty_items(2)]);
+    let mut layouts = doubling(14, &[empty_items(1), empty_items(2)]);
     layouts.push(layout(99, 0, vec![]));
     let mut message = vec![SID];
     message.resize(1001, 0);
@@ -1299,7 +1299,7 @@ fn names_and_values_read_over_the_same_bytes_are_bounded() {
         ..at(1, DataKind::Uint, 0, 8)
     };
     assert_eq!(
-        decode_nested(&[], vec![group(1, 1)], doubling(11, vec![named]), &[SID, 0]),
+        decode_nested(&[], vec![group(1, 1)], doubling(11, &[named]), &[SID, 0]),
         Err(DecodeError::TooLarge)
     );
 }
@@ -1312,7 +1312,7 @@ fn table_entries_looked_at_are_bounded() {
     let decode = |count: i64| {
         let cases = (0..count).map(|n| (n + 10, n + 10, 0)).collect();
         let innermost = vec![at(5, DataKind::Uint, 0, 8), select(6, 5, cases, Some(0))];
-        decode_nested(&[], vec![group(1, 1)], doubling(14, innermost), &[SID, 0])
+        decode_nested(&[], vec![group(1, 1)], doubling(14, &innermost), &[SID, 0])
     };
     assert_eq!(MAX_TABLE_ENTRIES, (1 << 13) * 2048);
     decode(2048).unwrap();
@@ -1325,7 +1325,7 @@ fn only_the_entries_looked_at_count_toward_the_table_budget() {
     // entry each, far below the budget.
     let cases = (0..4096).map(|n| (n, n, 0)).collect();
     let innermost = vec![at(5, DataKind::Uint, 0, 8), select(6, 5, cases, None)];
-    decode_nested(&[], vec![group(1, 1)], doubling(14, innermost), &[SID, 0]).unwrap();
+    decode_nested(&[], vec![group(1, 1)], doubling(14, &innermost), &[SID, 0]).unwrap();
     // A text table and a scale-linear conversion matched by their first entry, likewise.
     let entries = (0..4096)
         .map(|n| TextEntryT {
@@ -1359,7 +1359,7 @@ fn only_the_entries_looked_at_count_toward_the_table_budget() {
     decode_nested(
         &[],
         vec![group(1, 1)],
-        doubling(14, vec![text, scaled]),
+        doubling(14, &[text, scaled]),
         &[SID, 0],
     )
     .unwrap();

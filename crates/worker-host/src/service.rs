@@ -318,7 +318,7 @@ impl WorkerProcess {
                 if response.get("id").and_then(Value::as_u64) != Some(id) {
                     continue;
                 }
-                return parse_response(response);
+                return parse_response(&response);
             }
         };
         tokio::time::timeout(timeout, exchange)
@@ -360,7 +360,7 @@ pub enum Stopped {
     Killed,
 }
 
-fn parse_response(response: Value) -> Result<Value, ServiceError> {
+fn parse_response(response: &Value) -> Result<Value, ServiceError> {
     if let Some(error) = response.get("error") {
         return Err(ServiceError::Rpc {
             code: error.get("code").and_then(Value::as_i64).unwrap_or(0),
@@ -424,11 +424,11 @@ mod tests {
     #[test]
     fn response_parsing() {
         assert_eq!(
-            parse_response(json!({"id": 1, "result": {"a": 1}})).unwrap(),
+            parse_response(&json!({"id": 1, "result": {"a": 1}})).unwrap(),
             json!({"a": 1})
         );
         assert!(matches!(
-            parse_response(json!({"id": 1, "error": {"code": -32601, "message": "nope"}})),
+            parse_response(&json!({"id": 1, "error": {"code": -32601, "message": "nope"}})),
             Err(ServiceError::Rpc { code: -32601, .. })
         ));
         parse_endpoints(&json!({"running": true, "endpoints": null})).unwrap_err();

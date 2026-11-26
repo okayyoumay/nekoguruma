@@ -479,13 +479,13 @@ pub struct Entry {
 /// ECU definition converted to, which carry its identifier (ADR-363). The rules between the
 /// tables are checked first, then the names given to the ECU definitions.
 pub fn convert_vehicle(
-    tables: VehicleTables,
+    tables: &VehicleTables,
     ecu_definitions: &[&[EcuDocumentT]],
 ) -> Result<VehicleDefinition, Rejected> {
     let mut errors = Errors::default();
-    check_tables(&tables, &mut errors);
+    check_tables(tables, &mut errors);
     if errors.0.is_empty() {
-        check_names(&tables, ecu_definitions, &mut errors);
+        check_names(tables, ecu_definitions, &mut errors);
     }
     if !errors.0.is_empty() {
         return Err(Rejected::new(errors.0));

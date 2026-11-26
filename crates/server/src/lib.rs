@@ -136,9 +136,10 @@ pub fn router(state: AppState) -> Router {
 /// the same; tests use the list to check what is served against `api/openapi.yaml`.
 #[doc(hidden)]
 pub fn router_with_routes(state: AppState) -> (Router, Vec<ServedRoute>) {
-    let (routes, served) = routes_unguarded(state.clone());
+    let port = state.port;
+    let (routes, served) = routes_unguarded(state);
     // The standard profile supplies its own ingress layer here (design 13).
-    let guarded = middleware::from_fn_with_state(state.port, local_guard::guard).layer(routes);
+    let guarded = middleware::from_fn_with_state(port, local_guard::guard).layer(routes);
     (Router::new().fallback_service(guarded), served)
 }
 

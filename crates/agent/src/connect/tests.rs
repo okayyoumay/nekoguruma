@@ -126,7 +126,7 @@ fn uploads_in(dir: &std::path::Path) -> uploader::SharedLedger {
 /// The real session over `dir`'s state, which dials the record's closed port.
 fn start_session(
     opened: control::Opened,
-    key: AgentKey,
+    key: &AgentKey,
     dir: &std::path::Path,
 ) -> Result<control::Handle, ControlError> {
     opened.start(

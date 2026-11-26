@@ -539,8 +539,8 @@ fn binary_fault(
     None
 }
 
-fn data_dir_store_error(error: StoreError) -> ObjectServerError {
-    match error {
+fn data_dir_store_error(error: &StoreError) -> ObjectServerError {
+    match *error {
         StoreError::InUse => ObjectServerError::DataDirInUse,
         StoreError::NotADirectory => ObjectServerError::DataDirNotADirectory,
         StoreError::DirectoryNotOwned => ObjectServerError::DataDirNotOwned,
@@ -562,9 +562,9 @@ fn data_dir_store_error(error: StoreError) -> ObjectServerError {
 /// the new entries. Returns the lock, which the object server holds for its life, and the
 /// volume's path.
 fn prepare_data_dir(dir: &Path) -> Result<(ProcessLock, PathBuf), ObjectServerError> {
-    let lock = open_locked_dir(dir).map_err(data_dir_store_error)?;
+    let lock = open_locked_dir(dir).map_err(|error| data_dir_store_error(&error))?;
     let volume = dir.join(VOLUME_DIR);
-    ensure_area(&volume).map_err(data_dir_store_error)?;
+    ensure_area(&volume).map_err(|error| data_dir_store_error(&error))?;
     for synced in [volume.as_path(), dir] {
         sync_directory(synced).map_err(|error| ObjectServerError::DataDirIo {
             op: "sync",

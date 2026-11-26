@@ -54,7 +54,7 @@ impl JsonRpcError {
     }
 }
 
-pub fn success_response(id: Option<&Value>, result: Value) -> Value {
+pub fn success_response(id: Option<&Value>, result: &Value) -> Value {
     json!({
         "jsonrpc": "2.0",
         "id": id,

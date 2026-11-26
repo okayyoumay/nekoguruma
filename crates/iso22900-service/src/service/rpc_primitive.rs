@@ -111,7 +111,7 @@ impl Iso22900Service {
                     control,
                     0,
                 )
-                .map_err(|error| map_runtime_error_for_link(api, h_mod, h_cll, error))?;
+                .map_err(|error| map_runtime_error_for_link(api, h_mod, h_cll, &error))?;
 
             // Reconcile unconditionally, not just insert: this same
             // `(h_mod, h_cll, h_cop)` key may be a reused handle from a prior
@@ -173,7 +173,7 @@ impl Iso22900Service {
             }
         };
 
-        Ok(Response::new(to_status_response(status, mapped_status)))
+        Ok(Response::new(to_status_response(&status, mapped_status)))
     }
 
     pub(super) async fn rpc_get_event_item(

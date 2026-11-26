@@ -83,15 +83,16 @@ pub fn run(args: Args, installed: &ServerOrigin) -> Result<u64, CommandError> {
             Source::Log(path, digest)
         }
     };
-    let mut ledger = UploadLedger::open(args.mode, &record.agent_id).map_err(ledger_failure)?;
+    let mut ledger =
+        UploadLedger::open(args.mode, &record.agent_id).map_err(|error| ledger_failure(&error))?;
     match source {
         Source::Bytes(bytes) => ledger.enqueue_result(&key, &bytes),
         Source::Log(path, digest) => ledger.enqueue_comm_log(&key, &path, digest),
     }
-    .map_err(ledger_failure)
+    .map_err(|error| ledger_failure(&error))
 }
 
-fn ledger_failure(error: LedgerError) -> CommandError {
+fn ledger_failure(error: &LedgerError) -> CommandError {
     let exit = match error {
         LedgerError::InUse | LedgerError::State(_) | LedgerError::Io(_) | LedgerError::Poisoned => {
             3

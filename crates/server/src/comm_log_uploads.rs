@@ -782,7 +782,7 @@ mod tests {
         headers
     }
 
-    fn post(body: Value) -> Result<(Vec<String>, [u8; 32]), ShapeError> {
+    fn post(body: &Value) -> Result<(Vec<String>, [u8; 32]), ShapeError> {
         shape(&json_headers(), body.to_string().as_bytes())
     }
 
@@ -853,14 +853,14 @@ mod tests {
     // G1: the IDs are sorted, so the order a client names them in does not matter.
     #[test]
     fn the_ids_of_a_request_come_back_sorted() {
-        let (got, _) = post(json!({ "jobIds": [B, A], "scopeDigest": DIGEST })).unwrap();
+        let (got, _) = post(&json!({ "jobIds": [B, A], "scopeDigest": DIGEST })).unwrap();
         assert_eq!(got, [A, B]);
     }
 
     // S1, S3, S4, S5, S6, S7
     #[test]
     fn the_body_is_one_object_of_two_properties_judged_in_order() {
-        let ok = |v: Value| post(v).map(|(ids, _)| ids.len());
+        let ok = |v: Value| post(&v).map(|(ids, _)| ids.len());
         assert_eq!(
             ok(json!({ "jobIds": ids(1), "scopeDigest": DIGEST })),
             Ok(1)
@@ -908,7 +908,7 @@ mod tests {
     // S6
     #[test]
     fn the_digest_is_64_lowercase_hex_digits() {
-        let with = |digest: Value| post(json!({ "jobIds": [A], "scopeDigest": digest }));
+        let with = |digest: Value| post(&json!({ "jobIds": [A], "scopeDigest": digest }));
         with(json!(DIGEST)).unwrap();
         for bad in [
             json!(&DIGEST[..63]),
@@ -923,7 +923,7 @@ mod tests {
             assert_eq!(with(bad.clone()), Err(ShapeError::Json), "{bad}");
         }
         assert_eq!(
-            post(json!({ "jobIds": [A] })),
+            post(&json!({ "jobIds": [A] })),
             Err(ShapeError::ScopeDigest),
             "missing"
         );

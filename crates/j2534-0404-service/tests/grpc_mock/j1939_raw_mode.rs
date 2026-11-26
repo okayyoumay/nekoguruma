@@ -448,18 +448,18 @@ async fn io_ctl_cll(
 fn repeat_message_setup(
     time_interval: u32,
     condition: u32,
-    repeat_msg_data: Vec<u8>,
-    mask_data: Vec<u8>,
-    pattern_data: Vec<u8>,
+    repeat_msg_data: &[u8],
+    mask_data: &[u8],
+    pattern_data: &[u8],
 ) -> DataItem {
     DataItem {
         data: Some(data_item::Data::BytearrayData(IoBytearray {
             data: pack_repeat_message_setup(
                 time_interval,
                 condition,
-                &repeat_msg_data,
-                &mask_data,
-                &pattern_data,
+                repeat_msg_data,
+                mask_data,
+                pattern_data,
                 &[],
             ),
         })),
@@ -536,7 +536,7 @@ async fn raw_mode_j1939_repeat_message_mask_pattern_matches_a_native_five_byte_f
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(5000, 1, repeat_msg_data, mask_data, pattern_data),
+        repeat_message_setup(5000, 1, &repeat_msg_data, &mask_data, &pattern_data),
     )
     .await
     .expect("PDU_IOCTL_START_REPEAT_MESSAGE should succeed on a RawMode SAE J1939 ComLogicalLink");

@@ -34,7 +34,7 @@ fn rich_runtime_error(
     error: DPduApiError,
 ) -> Status {
     if module.0 != PDU_HANDLE_UNDEF && cll.0 != PDU_HANDLE_UNDEF {
-        map_runtime_error_for_link(api, module, cll, error)
+        map_runtime_error_for_link(api, module, cll, &error)
     } else {
         map_runtime_error(error)
     }

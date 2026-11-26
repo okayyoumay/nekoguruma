@@ -135,7 +135,7 @@ impl Scan {
                 if self.elifs.len() - 1 > MAX_BLOCK_DEPTH {
                     return Err(exceeded(
                         at,
-                        format!("blocks nest deeper than {MAX_BLOCK_DEPTH} levels"),
+                        &format!("blocks nest deeper than {MAX_BLOCK_DEPTH} levels"),
                     ));
                 }
                 return Ok(());
@@ -160,7 +160,7 @@ impl Scan {
                 if self.elif > MAX_ELIF_CHAIN {
                     return Err(exceeded(
                         at,
-                        format!("more than {MAX_ELIF_CHAIN} `elif` clauses enclose this point"),
+                        &format!("more than {MAX_ELIF_CHAIN} `elif` clauses enclose this point"),
                     ));
                 }
             } else if !matches!(token, Token::Else) {
@@ -180,7 +180,7 @@ impl Scan {
                 if self.levels.len() - 1 > MAX_BRACKET_DEPTH {
                     return Err(exceeded(
                         at,
-                        format!("brackets nest deeper than {MAX_BRACKET_DEPTH} levels"),
+                        &format!("brackets nest deeper than {MAX_BRACKET_DEPTH} levels"),
                     ));
                 }
                 return self.check_depth(at);
@@ -254,14 +254,14 @@ impl Scan {
         if depth > MAX_EXPRESSION_DEPTH {
             return Err(exceeded(
                 at,
-                format!("the expression here nests deeper than {MAX_EXPRESSION_DEPTH} levels"),
+                &format!("the expression here nests deeper than {MAX_EXPRESSION_DEPTH} levels"),
             ));
         }
         Ok(())
     }
 }
 
-fn exceeded(at: usize, hint: String) -> Exceeded {
+fn exceeded(at: usize, hint: &str) -> Exceeded {
     Exceeded {
         at,
         hint: format!("{hint}; split it up (2.8)"),

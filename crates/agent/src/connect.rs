@@ -330,7 +330,7 @@ async fn run_opened(
     opened: control::Opened,
     load_key: impl Fn() -> Result<AgentKey, IdentityError> + Clone + Send + 'static,
     start_uploader: impl FnOnce(&Record, &AgentKey) -> Result<uploader::Handle, ControlError>,
-    start: impl FnOnce(control::Opened, AgentKey) -> Result<control::Handle, ControlError>,
+    start: impl FnOnce(control::Opened, &AgentKey) -> Result<control::Handle, ControlError>,
     uploader_bound: Duration,
     stop: impl Future<Output = ()>,
 ) -> Result<(), ConnectError> {
@@ -347,10 +347,10 @@ async fn run_opened(
     opened
         .check(&key.public_key())
         .map_err(|error| control_error(&error))?;
-    // The uploader first, over the key by reference: the session's start takes the key. A start
+    // The uploader first, over the key by reference, as the session's start does. A start
     // that fails drops the uploader's handle, which stops it.
     let uploader = start_uploader(opened.record(), &key).map_err(|error| control_error(&error))?;
-    let handle = start(opened, key).map_err(|error| control_error(&error))?;
+    let handle = start(opened, &key).map_err(|error| control_error(&error))?;
     tracing::info!("control channel session started");
     // The task also ends without a stop when it panics (release builds unwind): the locks are
     // then free and no session is left, so the process must not stay up.

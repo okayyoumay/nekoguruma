@@ -716,9 +716,9 @@ impl<'v> ScriptedHost<'_, 'v> {
         Ok(answer)
     }
 
-    fn send(&mut self, request: Vec<u8>) -> Result<Vec<u8>, DryRunError> {
-        let service = resolve(self.variant(), &request)?;
-        self.answer(&request, service, false)
+    fn send(&mut self, request: &[u8]) -> Result<Vec<u8>, DryRunError> {
+        let service = resolve(self.variant(), request)?;
+        self.answer(request, service, false)
     }
 }
 
@@ -1003,7 +1003,7 @@ impl DiagHost for ScriptedHost<'_, '_> {
     // The bytes the agent sends for these primitives (`agent::host`): ReadDTCInformation with
     // reportDTCByStatusMask, and RoutineControl with the routine identifier big-endian.
     fn read_dtc(&mut self, mask: u8) -> Result<Vec<u8>, DryRunError> {
-        self.send(vec![0x19, 0x02, mask])
+        self.send(&[0x19, 0x02, mask])
     }
 
     fn routine_control(
@@ -1015,7 +1015,7 @@ impl DiagHost for ScriptedHost<'_, '_> {
         let mut request = vec![0x31, sub];
         request.extend_from_slice(&routine.to_be_bytes());
         request.extend_from_slice(payload);
-        self.send(request)
+        self.send(&request)
     }
 
     fn security_access(

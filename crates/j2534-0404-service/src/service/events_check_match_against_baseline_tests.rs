@@ -1,8 +1,8 @@
 use super::*;
 
-fn matched_count(result: PollMatchResult) -> Option<u32> {
+fn matched_count(result: &PollMatchResult) -> Option<u32> {
     match result {
-        PollMatchResult::Matched(count, _) => Some(count),
+        PollMatchResult::Matched(count, _) => Some(*count),
         _ => None,
     }
 }
@@ -11,7 +11,7 @@ fn matched_count(result: PollMatchResult) -> Option<u32> {
 #[test]
 fn reports_the_delta_above_baseline() {
     let result = check_match_against_baseline(3, None, 1, 0, 0);
-    assert_eq!(matched_count(result), Some(2));
+    assert_eq!(matched_count(&result), Some(2));
 }
 
 /// ADR-148 (Codex round-9 finding): when a completing match and a

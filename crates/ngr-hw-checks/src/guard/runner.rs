@@ -141,7 +141,7 @@ fn status_of(error: HandleError) -> tonic::Status {
         HandleError::VciLost => status_with_error_detail(
             Code::FailedPrecondition,
             message,
-            ErrorDetail {
+            &ErrorDetail {
                 pdu_error: PduError::PduErrCllNotConnected as i32,
                 error_event_data: Some(ErrorEventData {
                     error_event: PduErrorEvent::PduErrEvtLostCommToVci as i32,

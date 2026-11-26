@@ -668,6 +668,7 @@ impl Env {
 }
 
 /// How the first run is interrupted ([`Env::interrupt_run`]).
+#[derive(Clone, Copy)]
 enum Interruption<'a> {
     /// The worker alone is killed with SIGKILL.
     KillWorker,
@@ -1029,14 +1030,14 @@ pub fn child_main(spec: fn(&str) -> JobSpec) {
     };
     let variant = std::env::var(VARIANT_ENV).unwrap_or_default();
     match role.as_str() {
-        "agent" => agent_main(spec(&variant)),
+        "agent" => agent_main(&spec(&variant)),
         "probe" => probe_main(),
         other => panic!("unknown role {other:?}"),
     }
 }
 
 /// The agent's first run, as a process the parent kills.
-fn agent_main(spec: JobSpec) {
+fn agent_main(spec: &JobSpec) {
     let root = PathBuf::from(std::env::var_os("NGR_SIM_ECU_STATE").expect("the state file path"))
         .parent()
         .expect("the state file has a directory")

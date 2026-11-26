@@ -245,7 +245,7 @@ fn main() -> ExitCode {
     };
     // provision-key runs before the operational log starts: it logs to stderr only (ADR-498).
     if let Command::ProvisionKey(args) = command {
-        return provision_key(args);
+        return provision_key(&args);
     }
     // The operational log (design 12.2), kept for the process's lifetime: stderr and the
     // rotated file, with the settings of the configuration file checked for the device's mode
@@ -294,7 +294,7 @@ fn main() -> ExitCode {
         let (Some(source), Some(installation)) = (code_source, installation) else {
             unreachable!("read before the command runs")
         };
-        return register(args, &source, &installation);
+        return register(&args, &source, &installation);
     }
     // The job's VM runs on a blocking thread that blocks on the runtime for every primitive,
     // so the runtime must be multi-threaded (ADR-235).
@@ -406,7 +406,7 @@ fn identity(mode: OperatingMode) -> ExitCode {
 
 /// `ngr-agent provision-key` off Linux: there is no device key store to provision.
 #[cfg(not(target_os = "linux"))]
-fn provision_key(args: ProvisionArgs) -> ExitCode {
+fn provision_key(args: &ProvisionArgs) -> ExitCode {
     let ProvisionArgs { mode, with_key } = args;
     let _ = (mode, with_key);
     eprintln!("ngr-agent: provision-key: only Linux has a device key store to provision");
@@ -417,7 +417,7 @@ fn provision_key(args: ProvisionArgs) -> ExitCode {
 /// [`agent::identity::provision`]. Prints the public key as one JSON line; the exit status is the
 /// error's ([`agent::identity::provision::ProvisionError::exit_code`]).
 #[cfg(target_os = "linux")]
-fn provision_key(args: ProvisionArgs) -> ExitCode {
+fn provision_key(args: &ProvisionArgs) -> ExitCode {
     use agent::identity::provision::{provision, require_root};
     let fail = |text: &dyn std::fmt::Display, code: u8| {
         eprintln!("ngr-agent: provision-key: {text}");
@@ -485,7 +485,7 @@ fn code_source(
 /// installation file's; `--server`, when given, must name it. Nothing it prints or logs holds the
 /// code, an argument or text from the server (`agent::registration`).
 fn register(
-    args: RegisterArgs,
+    args: &RegisterArgs,
     source: &agent::registration::code_input::CodeSource,
     installation: &agent::installation::Installation,
 ) -> ExitCode {
@@ -1169,8 +1169,11 @@ async fn identify_job(args: IdentifyArgs, key: JobKey) -> Result<String, String>
             supplied.push((hash, bytes));
         }
     }
-    let loaded =
-        load_plan(&plan_bytes, supplied, None).map_err(|error| format!("plan refused: {error}"))?;
+    let loaded = load_plan(&plan_bytes, &supplied, None)
+        .map_err(|error| format!("plan refused: {error}"))?;
+    // The loaded plan holds its own copy of each document; the supplied bytes are not needed
+    // for the rest of the run.
+    drop(supplied);
     let named = loaded.document_hashes();
     for (hash, path) in &paths {
         if !named.contains(hash) {

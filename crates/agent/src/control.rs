@@ -543,7 +543,7 @@ impl Opened {
     /// exchange begins at once, connected to `with` (the intake, the outbox, the issue-time marks,
     /// the clock, the ledger and the log requests' handling). Needs a running tokio runtime. On
     /// an error nothing was sent and both locks are released.
-    pub fn start(self, key: AgentKey, with: Collaborators) -> Result<Handle, ControlError> {
+    pub fn start(self, key: &AgentKey, with: Collaborators) -> Result<Handle, ControlError> {
         let port = self.origin()?.port();
         let seams = Seams {
             dial: Arc::new(Loopback { port }),
@@ -564,7 +564,7 @@ impl Opened {
     #[cfg(test)]
     pub(crate) fn start_panicking(
         self,
-        key: AgentKey,
+        key: &AgentKey,
         outbox: SharedOutbox,
         marks: IssueMark,
         ledger: ReceivedJobs,

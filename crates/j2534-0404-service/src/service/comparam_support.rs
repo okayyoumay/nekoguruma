@@ -3428,7 +3428,7 @@ mod tests {
         );
     }
 
-    fn access_timing_sf(entries: Vec<u32>) -> vci_service_interface::ParamStructfield {
+    fn access_timing_sf(entries: &[u32]) -> vci_service_interface::ParamStructfield {
         vci_service_interface::ParamStructfield {
             data: Some(
                 vci_service_interface::param_structfield::Data::AccessTiming(
@@ -3489,7 +3489,7 @@ mod tests {
     /// `AccessTiming`-shaped value.
     #[test]
     fn session_timing_param_rejects_access_timing_shaped_value() {
-        let sf = access_timing_sf(vec![10, 20, 30, 40, 50]);
+        let sf = access_timing_sf(&[10, 20, 30, 40, 50]);
         assert!(validate_structfield_shape(PARAM_SESSION_TIMING_OVERRIDE, &sf).is_err());
         assert!(validate_structfield_shape(PARAM_SESSION_TIMING_ECU, &sf).is_err());
     }
@@ -3608,7 +3608,7 @@ mod tests {
     fn matching_shapes_are_accepted() {
         validate_structfield_shape(
             PARAM_ACCESS_TIMING_ECU,
-            &access_timing_sf(vec![10, 20, 30, 40, 50]),
+            &access_timing_sf(&[10, 20, 30, 40, 50]),
         )
         .unwrap();
         validate_structfield_shape(PARAM_SESSION_TIMING_OVERRIDE, &session_timing_sf()).unwrap();
@@ -3636,7 +3636,7 @@ mod tests {
         assert!(
             validate_structfield_shape(
                 PARAM_ACCESS_TIMING_ECU,
-                &access_timing_sf(vec![256, 20, 30, 40, 50])
+                &access_timing_sf(&[256, 20, 30, 40, 50])
             )
             .is_err(),
             "p2_min = 256 must be rejected"
@@ -3644,7 +3644,7 @@ mod tests {
         assert!(
             validate_structfield_shape(
                 PARAM_ACCESS_TIMING_ECU,
-                &access_timing_sf(vec![10, 20, 30, 40, 50, 256])
+                &access_timing_sf(&[10, 20, 30, 40, 50, 256])
             )
             .is_err(),
             "timing_set = 256 must be rejected too"
@@ -3652,7 +3652,7 @@ mod tests {
         assert!(
             validate_structfield_shape(
                 PARAM_ACCESS_TIMING_ECU,
-                &access_timing_sf(vec![255, 255, 255, 255, 255])
+                &access_timing_sf(&[255, 255, 255, 255, 255])
             )
             .is_ok(),
             "255 (the max valid byte value) must be accepted"

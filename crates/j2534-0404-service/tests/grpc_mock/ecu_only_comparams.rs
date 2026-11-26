@@ -18,9 +18,9 @@ use crate::harness::*;
 const CP_P2_STAR_ECU: u32 = 0x8012;
 const CP_P2_MAX_ECU: u32 = 0x8013;
 
-fn assert_not_supported(status: tonic::Status, what: &str) {
+fn assert_not_supported(status: &tonic::Status, what: &str) {
     assert_eq!(status.code(), Code::InvalidArgument, "{what}");
-    let detail = error_detail_from_status(&status)
+    let detail = error_detail_from_status(status)
         .unwrap_or_else(|| panic!("{what} rejection should carry an ErrorDetail"));
     assert_eq!(
         detail.pdu_error,
@@ -54,7 +54,7 @@ async fn ecu_only_p2_comparams_are_refused_by_id_and_name() {
                     })
                     .await
                     .expect_err(&what);
-                assert_not_supported(status, &what);
+                assert_not_supported(&status, &what);
             }
 
             let what = format!("GetComParam {name} on protocol {protocol:#x}");
@@ -65,7 +65,7 @@ async fn ecu_only_p2_comparams_are_refused_by_id_and_name() {
                 })
                 .await
                 .expect_err(&what);
-            assert_not_supported(status, &what);
+            assert_not_supported(&status, &what);
         }
     }
 

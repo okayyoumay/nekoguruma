@@ -13,6 +13,10 @@ use vci_service_interface::{
     IoVehicleIdRequest, IpAddrInfo, data_item::Data as DataItemData,
 };
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "used as the function handed to `Result::map_err`, which passes the error by value"
+)]
 fn map_runtime_error(error: DPduApiError) -> Status {
     Status::internal(format!("ISO22900 call failed: {error}"))
 }
@@ -21,7 +25,7 @@ pub(super) fn ioctl_input_to_owned(input_data: DataItem) -> Result<OwnedDataItem
     match input_data.data {
         Some(DataItemData::Unum32Value(value)) => Ok(OwnedDataItem::from_unum32(value)),
         Some(DataItemData::ProgVoltage(value)) => Ok(OwnedDataItem::from_prog_voltage(
-            iso22900::IoProgVoltageData {
+            &iso22900::IoProgVoltageData {
                 prog_voltage_mv: value.prog_voltage_mv,
                 pin_on_dlc: value.pin_on_dlc,
             },
@@ -81,7 +85,7 @@ pub(super) fn ioctl_input_to_owned(input_data: DataItem) -> Result<OwnedDataItem
             };
 
             Ok(OwnedDataItem::from_event_queue_property(
-                iso22900::IoEventQueuePropertyData {
+                &iso22900::IoEventQueuePropertyData {
                     queue_size: value.queue_size,
                     queue_mode,
                 },
@@ -105,19 +109,19 @@ pub(super) fn ioctl_input_to_owned(input_data: DataItem) -> Result<OwnedDataItem
             .map_err(map_runtime_error)
         }
         Some(DataItemData::EthSwitchState(value)) => Ok(OwnedDataItem::from_eth_switch_state(
-            iso22900::IoEthSwitchStateData {
+            &iso22900::IoEthSwitchStateData {
                 ethernet_sense_state: value.ethernet_sense_state,
                 ethernet_act_pin_number: value.ethernet_act_pin_number,
             },
         )),
         Some(DataItemData::EntityAddress(value)) => Ok(OwnedDataItem::from_entity_address(
-            iso22900::IoEntityAddressData {
+            &iso22900::IoEntityAddressData {
                 logical_address: value.logical_address,
                 doip_ctrl_timeout: value.doip_ctrl_timeout,
             },
         )),
         Some(DataItemData::EntityStatus(value)) => Ok(OwnedDataItem::from_entity_status(
-            iso22900::IoEntityStatusData {
+            &iso22900::IoEntityStatusData {
                 entity_type: value.entity_type,
                 tcp_clients_max: value.tcp_clients_max,
                 tcp_clients: value.tcp_clients,

@@ -45,7 +45,7 @@ struct GoogleRpcStatus {
 pub fn status_with_error_detail(
     code: Code,
     message: impl Into<String>,
-    detail: ErrorDetail,
+    detail: &ErrorDetail,
 ) -> Status {
     let message = message.into();
     let any = GoogleProtobufAny {
@@ -95,7 +95,7 @@ pub fn start_refusal(status: Status) -> Status {
     status_with_error_detail(
         status.code(),
         status.message(),
-        ErrorDetail {
+        &ErrorDetail {
             refusal: Some(reason as i32),
             ..detail
         },
@@ -109,7 +109,7 @@ pub fn protocol_cannot_carry(message: impl Into<String>) -> Status {
     status_with_error_detail(
         Code::InvalidArgument,
         message,
-        ErrorDetail {
+        &ErrorDetail {
             pdu_error: PduError::PduErrInvalidParameters as i32,
             refusal: Some(RefusalReason::ProtocolCannotCarry as i32),
             ..Default::default()
@@ -136,8 +136,7 @@ mod tests {
             refusal: None,
         };
 
-        let status =
-            status_with_error_detail(Code::FailedPrecondition, "resource locked", detail.clone());
+        let status = status_with_error_detail(Code::FailedPrecondition, "resource locked", &detail);
         let round_tripped =
             error_detail_from_status(&status).expect("error detail should round-trip");
 
@@ -154,7 +153,7 @@ mod tests {
             refusal: None,
         };
 
-        let status = status_with_error_detail(Code::Internal, "unmapped", detail.clone());
+        let status = status_with_error_detail(Code::Internal, "unmapped", &detail);
         let round_tripped =
             error_detail_from_status(&status).expect("error detail should round-trip");
 
@@ -172,7 +171,7 @@ mod tests {
             status_with_error_detail(
                 Code::Internal,
                 "native",
-                ErrorDetail {
+                &ErrorDetail {
                     pdu_error: error as i32,
                     ..Default::default()
                 },

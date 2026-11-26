@@ -286,7 +286,7 @@ impl OwnedDataItem {
     }
 
     /// Builds an IO programming-voltage data item.
-    pub fn from_prog_voltage(data: crate::IoProgVoltageData) -> Self {
+    pub fn from_prog_voltage(data: &crate::IoProgVoltageData) -> Self {
         let mut payload = Box::new(PDU_IO_PROG_VOLTAGE_DATA {
             ProgVoltage_mv: data.prog_voltage_mv,
             PinOnDLC: data.pin_on_dlc,
@@ -366,7 +366,7 @@ impl OwnedDataItem {
     }
 
     /// Builds an IO event-queue-property data item.
-    pub fn from_event_queue_property(data: crate::IoEventQueuePropertyData) -> Self {
+    pub fn from_event_queue_property(data: &crate::IoEventQueuePropertyData) -> Self {
         let mut payload = Box::new(PDU_IO_EVENT_QUEUE_PROPERTY_DATA {
             QueueSize: data.queue_size,
             QueueMode: data.queue_mode,
@@ -435,7 +435,7 @@ impl OwnedDataItem {
     }
 
     /// Builds an IO Ethernet-switch-state data item.
-    pub fn from_eth_switch_state(data: crate::IoEthSwitchStateData) -> Self {
+    pub fn from_eth_switch_state(data: &crate::IoEthSwitchStateData) -> Self {
         let mut payload = Box::new(PDU_IO_ETH_SWITCH_STATE {
             EthernetSenseState: data.ethernet_sense_state,
             EthernetActPinNumber: data.ethernet_act_pin_number,
@@ -451,7 +451,7 @@ impl OwnedDataItem {
     }
 
     /// Builds an IO entity-address data item.
-    pub fn from_entity_address(data: crate::IoEntityAddressData) -> Self {
+    pub fn from_entity_address(data: &crate::IoEntityAddressData) -> Self {
         let mut payload = Box::new(PDU_IO_ENTITY_ADDRESS_DATA {
             LogicalAddress: data.logical_address,
             DoIPCtrlTimeout: data.doip_ctrl_timeout,
@@ -467,7 +467,7 @@ impl OwnedDataItem {
     }
 
     /// Builds an IO entity-status data item.
-    pub fn from_entity_status(data: crate::IoEntityStatusData) -> Self {
+    pub fn from_entity_status(data: &crate::IoEntityStatusData) -> Self {
         let mut payload = Box::new(PDU_IO_ENTITY_STATUS_DATA {
             EntityType: data.entity_type,
             TcpClientsMax: data.tcp_clients_max,
@@ -529,7 +529,7 @@ impl OwnedDataItem {
             E_PDU_IT::PDU_IT_IO_UNUM32 => Ok(Self::from_unum32(*item.data::<UNUM32>()?)),
             E_PDU_IT::PDU_IT_IO_PROG_VOLTAGE => {
                 let data = item.data::<PDU_IO_PROG_VOLTAGE_DATA>()?;
-                Ok(Self::from_prog_voltage(crate::IoProgVoltageData {
+                Ok(Self::from_prog_voltage(&crate::IoProgVoltageData {
                     prog_voltage_mv: data.ProgVoltage_mv,
                     pin_on_dlc: data.PinOnDLC,
                 }))
@@ -562,7 +562,7 @@ impl OwnedDataItem {
             E_PDU_IT::PDU_IT_IO_EVENT_QUEUE_PROPERTY => {
                 let data = item.data::<PDU_IO_EVENT_QUEUE_PROPERTY_DATA>()?;
                 Ok(Self::from_event_queue_property(
-                    crate::IoEventQueuePropertyData {
+                    &crate::IoEventQueuePropertyData {
                         queue_size: data.QueueSize,
                         queue_mode: data.QueueMode,
                     },
@@ -622,21 +622,21 @@ impl OwnedDataItem {
             }
             E_PDU_IT::PDU_IT_IO_ETH_SWITCH_STATE => {
                 let data = item.data::<PDU_IO_ETH_SWITCH_STATE>()?;
-                Ok(Self::from_eth_switch_state(crate::IoEthSwitchStateData {
+                Ok(Self::from_eth_switch_state(&crate::IoEthSwitchStateData {
                     ethernet_sense_state: data.EthernetSenseState,
                     ethernet_act_pin_number: data.EthernetActPinNumber,
                 }))
             }
             E_PDU_IT::PDU_IT_IO_ENTITY_ADDRESS => {
                 let data = item.data::<PDU_IO_ENTITY_ADDRESS_DATA>()?;
-                Ok(Self::from_entity_address(crate::IoEntityAddressData {
+                Ok(Self::from_entity_address(&crate::IoEntityAddressData {
                     logical_address: data.LogicalAddress,
                     doip_ctrl_timeout: data.DoIPCtrlTimeout,
                 }))
             }
             E_PDU_IT::PDU_IT_IO_ENTITY_STATUS => {
                 let data = item.data::<PDU_IO_ENTITY_STATUS_DATA>()?;
-                Ok(Self::from_entity_status(crate::IoEntityStatusData {
+                Ok(Self::from_entity_status(&crate::IoEntityStatusData {
                     entity_type: data.EntityType,
                     tcp_clients_max: data.TcpClientsMax,
                     tcp_clients: data.TcpClients,

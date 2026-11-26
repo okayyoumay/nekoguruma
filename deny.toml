@@ -1,0 +1,54 @@
+# Policy for `cargo deny` (ADR-509): advisories, licences and sources of the main workspace's
+# dependency tree. Run it from the repository root with `cargo deny --locked check`; the CI job
+# `deps-audit` in .github/workflows/ci.yml does the same with the pinned cargo-deny.
+
+[advisories]
+# A vulnerability or an unsound crate fails the check wherever it is in the tree.
+unsound = "all"
+# A yanked version fails the check.
+yanked = "deny"
+# An unmaintained crate fails the check only when a workspace crate depends on it directly; a
+# transitive one is a warning.
+unmaintained = "workspace"
+# Each ignore names its reason and has a backlog item to remove it.
+ignore = [
+    { id = "RUSTSEC-2026-0574", reason = "heapless 0.7 unsoundness; reached only through starlark_syntax -> pagable -> postcard's default heapless-cas feature, and no workspace crate uses a heapless type" },
+    { id = "RUSTSEC-2026-0575", reason = "heapless 0.7 unsoundness; reached only through starlark_syntax -> pagable -> postcard's default heapless-cas feature, and no workspace crate uses a heapless type" },
+    { id = "RUSTSEC-2026-0576", reason = "heapless 0.7 unsoundness; reached only through starlark_syntax -> pagable -> postcard's default heapless-cas feature, and no workspace crate uses a heapless type" },
+    { id = "RUSTSEC-2026-0577", reason = "heapless 0.7 unsoundness; reached only through starlark_syntax -> pagable -> postcard's default heapless-cas feature, and no workspace crate uses a heapless type" },
+    { id = "RUSTSEC-2026-0578", reason = "heapless 0.7 unsoundness; reached only through starlark_syntax -> pagable -> postcard's default heapless-cas feature, and no workspace crate uses a heapless type" },
+    { id = "RUSTSEC-2026-0579", reason = "heapless 0.7 unsoundness; reached only through starlark_syntax -> pagable -> postcard's default heapless-cas feature, and no workspace crate uses a heapless type" },
+    { id = "RUSTSEC-2026-0580", reason = "heapless 0.7 unsoundness; reached only through starlark_syntax -> pagable -> postcard's default heapless-cas feature, and no workspace crate uses a heapless type" },
+    { id = "RUSTSEC-2026-0581", reason = "heapless 0.7 unsoundness; reached only through starlark_syntax -> pagable -> postcard's default heapless-cas feature, and no workspace crate uses a heapless type" },
+    { id = "RUSTSEC-2026-0582", reason = "heapless 0.7 unsoundness; reached only through starlark_syntax -> pagable -> postcard's default heapless-cas feature, and no workspace crate uses a heapless type" },
+]
+
+[licenses]
+# The licences the dependency tree uses today, all permissive. A crate under any other licence
+# fails the check and the maintainer decides. An `OR` expression passes when one side is allowed.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "BSL-1.0",
+    "CC0-1.0",
+    "MIT-0",
+    "Unlicense",
+]
+
+[bans]
+# Two versions of one crate are common in a tree this size and are not this check's concern.
+multiple-versions = "allow"
+wildcards = "allow"
+
+[sources]
+# crates.io only: a git dependency or another registry fails the check.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

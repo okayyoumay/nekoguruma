@@ -299,6 +299,16 @@ requests (`.github/dependabot.yml`); main runs it on every push that is not docu
 check it locally with `cargo +<rust-version> check --workspace --all-targets --locked` when you
 use a recently stabilized language or library feature.
 
+The `deps-audit` job of `ci.yml` checks the dependency tree with cargo-deny (ADR-509, policy in
+`deny.toml`) and builds nothing: it fails on a vulnerability, an unsound or yanked crate, a
+licence that is not on the allow-list and a source other than crates.io, and on an unmaintained
+crate only when a workspace crate depends on it directly. It runs on pull requests that change a
+`Cargo.toml`, `Cargo.lock`, `.cargo/` or `deny.toml`, and on every push to main, which also finds
+an advisory published later. Run it locally with `cargo deny --locked check`, with the version
+the workflow pins (`cargo install cargo-deny --version <version> --locked`, or the release
+binary); it needs network access for the advisory database. A new advisory or licence fails the
+job and the maintainer decides; an `ignore` in `deny.toml` carries a reason and a backlog item.
+
 `dependabot-auto-merge.yml` turns on GitHub auto-merge (squash) for Dependabot's grouped Cargo
 minor/patch pull request only, so it merges once the required checks pass (ADR-248). Dependabot's
 other pull requests (Cargo updates Cargo treats as breaking, such as 0.22 to 0.23, updates of

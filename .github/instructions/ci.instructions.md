@@ -28,6 +28,11 @@ Flag as P1:
   running, or that renames or removes a job the branch ruleset requires (`repo-checks`,
   `core-linux`, `core-windows`, `worker-check`, `abi-roundtrip`, `msrv`). `msrv` is skipped on
   pull requests that change no `Cargo.toml`, `Cargo.lock` or `.cargo/` file; that skip is intended.
+- **Dependency audit**: `deps-audit` (ADR-509) runs `cargo deny --locked check` with a pinned
+  cargo-deny and compiles nothing. Widening its pull request trigger beyond a manifest, the
+  lockfile, `.cargo/` or `deny.toml`, building the workspace in it, adding a licence to
+  `deny.toml` or an `ignore` entry without a reason (and, for an advisory, a backlog item), or
+  allowing a git or other registry source is a finding.
 - **Out-of-scope targets**: Windows workers target `*-pc-windows-gnullvm` only (ADR-227). An MSVC
   worker target or MSVC-only build path is P1.
 - **Tests weakened**: excluding tests, adding `--skip` filters or loosening a nextest profile to

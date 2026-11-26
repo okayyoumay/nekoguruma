@@ -332,7 +332,7 @@ fn the_profiles_resource_is_created_by_data_and_by_learned_id() {
         "iso_11898_2_dwcan",
         &[(14, "low"), (6, "hi")],
     );
-    assert!(create_with(&env, &lower).is_ok());
+    create_with(&env, &lower).unwrap();
 
     env.learned.resources.insert(7, profile_resource());
     assert_eq!(
@@ -390,7 +390,7 @@ fn a_resource_that_is_not_the_profiles_is_refused() {
     // A resource without protocol or bus type is not the profile's either.
     let mut no_protocol = profile_resource();
     no_protocol.protocol = None;
-    assert!(create_with(&env, &no_protocol).is_err());
+    create_with(&env, &no_protocol).unwrap_err();
 }
 
 #[test]
@@ -417,7 +417,7 @@ fn an_unlearned_pin_type_id_is_refused_and_a_learned_one_compares_by_name() {
     env.learned
         .objects
         .insert((ObjectType::ObjtPintype, 2), "LOW".to_owned());
-    assert!(create_with(&env, &by_id).is_ok());
+    create_with(&env, &by_id).unwrap();
 }
 
 #[test]
@@ -444,14 +444,12 @@ fn only_the_raw_mode_create_flag_is_allowed() {
             raw_mode: true
         })
     );
-    assert!(
-        with(
-            &mut request,
-            bits(&[CllCreateFlagBit::CllCreateFlagChecksumMode])
-        )
-        .is_err()
-    );
-    assert!(with(&mut request, bits(&[CllCreateFlagBit::Unspecified])).is_err());
+    with(
+        &mut request,
+        bits(&[CllCreateFlagBit::CllCreateFlagChecksumMode]),
+    )
+    .unwrap_err();
+    with(&mut request, bits(&[CllCreateFlagBit::Unspecified])).unwrap_err();
     assert_eq!(
         with(
             &mut request,
@@ -605,30 +603,26 @@ fn a_socketcan_end_has_no_worker_link() {
         create_channel(&env, "ISO15765_CH1"),
         Err(GuardRefusal::LinkCount)
     );
-    assert!(create_channel(&env, PROTOCOL).is_err());
+    create_channel(&env, PROTOCOL).unwrap_err();
 }
 
 #[test]
 fn comparams_are_compared_with_the_profile() {
     let env = Env::linked(profile("T3"), false);
-    assert!(set(&env, unum("CP_Baudrate", 500_000)).is_ok());
-    assert!(set(&env, unum("cp_baudrate", 500_000)).is_ok());
-    assert!(set(&env, unum("CP_Baudrate", 250_000)).is_err());
+    set(&env, unum("CP_Baudrate", 500_000)).unwrap();
+    set(&env, unum("cp_baudrate", 500_000)).unwrap();
+    set(&env, unum("CP_Baudrate", 250_000)).unwrap_err();
     // A snum with the same value is the same value.
-    assert!(
-        set(
-            &env,
-            param_by_name("CP_Baudrate", param_item::ParamData::Snum32(500_000))
-        )
-        .is_ok()
-    );
-    assert!(
-        set(
-            &env,
-            param_by_name("CP_Baudrate", param_item::ParamData::Bytefield(vec![1]))
-        )
-        .is_err()
-    );
+    set(
+        &env,
+        param_by_name("CP_Baudrate", param_item::ParamData::Snum32(500_000)),
+    )
+    .unwrap();
+    set(
+        &env,
+        param_by_name("CP_Baudrate", param_item::ParamData::Bytefield(vec![1])),
+    )
+    .unwrap_err();
     // Other physical-layer ComParams, whatever the value, in any case.
     for name in ["CP_TerminationType", "cp_canfdbaudrate", "CP_ListenOnly"] {
         assert!(set(&env, unum(name, 0)).is_err(), "{name}");
@@ -636,15 +630,15 @@ fn comparams_are_compared_with_the_profile() {
     // A ComParam of the bus type class that no list names is physical too.
     let mut unknown_bus = unum("CP_VendorWire", 1);
     unknown_bus.com_param_class = PduParamClass::PduPcBustype as i32;
-    assert!(set(&env, unknown_bus).is_err());
+    set(&env, unknown_bus).unwrap_err();
 
-    assert!(set(&env, unum("CP_CanPhysReqId", 0x7E0)).is_ok());
-    assert!(set(&env, unum("CP_CanPhysReqId", 0x7E1)).is_err());
-    assert!(set(&env, unum("CP_CanRespUSDTId", 0x7E8)).is_ok());
-    assert!(set(&env, unum("CP_CanRespUSDTId", 0x7E9)).is_err());
-    assert!(set(&env, unum("CP_CanRespUUDTId", 0x7E8)).is_err());
-    assert!(set(&env, unum("CP_CanFuncReqId", 0x7DF)).is_ok());
-    assert!(set(&env, unum("CP_CanFuncReqId", 0x7DE)).is_err());
+    set(&env, unum("CP_CanPhysReqId", 0x7E0)).unwrap();
+    set(&env, unum("CP_CanPhysReqId", 0x7E1)).unwrap_err();
+    set(&env, unum("CP_CanRespUSDTId", 0x7E8)).unwrap();
+    set(&env, unum("CP_CanRespUSDTId", 0x7E9)).unwrap_err();
+    set(&env, unum("CP_CanRespUUDTId", 0x7E8)).unwrap_err();
+    set(&env, unum("CP_CanFuncReqId", 0x7DF)).unwrap();
+    set(&env, unum("CP_CanFuncReqId", 0x7DE)).unwrap_err();
 }
 
 #[test]
@@ -676,8 +670,8 @@ fn an_alias_of_the_baud_rate_is_compared_like_it() {
         com_param_class: PduParamClass::PduPcCom as i32,
         param_data: Some(param_item::ParamData::Unum32(value)),
     };
-    assert!(set(&env, by_id(500_000)).is_ok());
-    assert!(set(&env, by_id(250_000)).is_err());
+    set(&env, by_id(500_000)).unwrap();
+    set(&env, by_id(250_000)).unwrap_err();
 }
 
 #[test]
@@ -751,9 +745,9 @@ fn unknown_and_vendor_comparams_are_refused_whatever_their_class() {
     // bus type's.
     let mut timing = unum("CP_P2Max", 1);
     timing.com_param_class = PduParamClass::PduPcSpecified as i32;
-    assert!(set(&env, timing.clone()).is_ok());
+    set(&env, timing.clone()).unwrap();
     timing.com_param_class = PduParamClass::PduPcBustype as i32;
-    assert!(set(&env, timing).is_err());
+    set(&env, timing).unwrap_err();
 }
 
 #[test]
@@ -807,9 +801,9 @@ fn each_allow_listed_comparam_passes() {
 fn identifiers_in_the_response_table_are_compared_too() {
     let env = Env::linked(profile("T3"), false);
     let table = |phys: u32, resp: u32| set_table(&env, table_items(phys, resp));
-    assert!(table(0x7E0, 0x7E8).is_ok());
-    assert!(table(0x7E1, 0x7E8).is_err());
-    assert!(table(0x7E0, 0x7E9).is_err());
+    table(0x7E0, 0x7E8).unwrap();
+    table(0x7E1, 0x7E8).unwrap_err();
+    table(0x7E0, 0x7E9).unwrap_err();
 }
 
 #[test]
@@ -824,16 +818,16 @@ fn a_functional_identifier_needs_one_in_the_profile() {
         ),
         false,
     );
-    assert!(set(&env, unum("CP_CanFuncReqId", 0x7DF)).is_err());
-    assert!(set(&env, unum("CP_RequestAddrMode", 1)).is_ok());
-    assert!(set(&env, unum("CP_RequestAddrMode", 2)).is_err());
-    assert!(set(&env, unum("CP_TesterPresentAddrMode", 0)).is_ok());
-    assert!(set(&env, unum("CP_TesterPresentAddrMode", 1)).is_err());
+    set(&env, unum("CP_CanFuncReqId", 0x7DF)).unwrap_err();
+    set(&env, unum("CP_RequestAddrMode", 1)).unwrap();
+    set(&env, unum("CP_RequestAddrMode", 2)).unwrap_err();
+    set(&env, unum("CP_TesterPresentAddrMode", 0)).unwrap();
+    set(&env, unum("CP_TesterPresentAddrMode", 1)).unwrap_err();
     let with = Env::linked(profile("T3"), false);
-    assert!(set(&with, unum("CP_RequestAddrMode", 2)).is_ok());
-    assert!(set(&with, unum("CP_TesterPresentAddrMode", 1)).is_ok());
-    assert!(set(&with, unum("CP_RequestAddrMode", 9)).is_err());
-    assert!(set(&with, unum("CP_TesterPresentAddrMode", 2)).is_err());
+    set(&with, unum("CP_RequestAddrMode", 2)).unwrap();
+    set(&with, unum("CP_TesterPresentAddrMode", 1)).unwrap();
+    set(&with, unum("CP_RequestAddrMode", 9)).unwrap_err();
+    set(&with, unum("CP_TesterPresentAddrMode", 2)).unwrap_err();
 }
 
 #[test]
@@ -848,8 +842,8 @@ fn a_comparam_the_profile_fixes_keeps_its_value() {
         ),
         false,
     );
-    assert!(set(&env, unum("CP_BlockSize", 8)).is_ok());
-    assert!(set(&env, unum("cp_blocksize", 0)).is_err());
+    set(&env, unum("CP_BlockSize", 8)).unwrap();
+    set(&env, unum("cp_blocksize", 0)).unwrap_err();
 }
 
 /// The agent's link turns the busy-answer repeats off and the indications on: the guard passes
@@ -871,8 +865,8 @@ fn the_links_busy_answer_and_indication_comparams_pass_at_the_agents_values() {
 #[test]
 fn timing_comparams_pass_and_ids_resolve_through_what_was_learned() {
     let mut env = Env::linked(profile("T3"), false);
-    assert!(set(&env, unum("CP_P2Max", 1_000_000)).is_ok());
-    assert!(set(&env, unum("CP_RC78Handling", 1)).is_ok());
+    set(&env, unum("CP_P2Max", 1_000_000)).unwrap();
+    set(&env, unum("CP_RC78Handling", 1)).unwrap();
 
     let by_id = |id: u32, value: u32| ParamItem {
         id: Some(param_item::Id::ParamId(id)),
@@ -892,12 +886,12 @@ fn timing_comparams_pass_and_ids_resolve_through_what_was_learned() {
     env.learned
         .objects
         .insert((ObjectType::ObjtComparam, 0x80A2), "CP_Baudrate".to_owned());
-    assert!(set(&env, by_id(0x80A1, 1)).is_ok());
+    set(&env, by_id(0x80A1, 1)).unwrap();
     // The learned name is what is compared.
-    assert!(set(&env, by_id(0x80A2, 500_000)).is_ok());
-    assert!(set(&env, by_id(0x80A2, 125_000)).is_err());
+    set(&env, by_id(0x80A2, 500_000)).unwrap();
+    set(&env, by_id(0x80A2, 125_000)).unwrap_err();
     // An id in a response table resolves the same way.
-    assert!(set_table(&env, vec![by_id(0x80A2, 125_000)]).is_err());
+    set_table(&env, vec![by_id(0x80A2, 125_000)]).unwrap_err();
     // A ComParam with neither id nor name cannot be classified.
     let mut nameless = unum("CP_P2Max", 1);
     nameless.id = None;
@@ -916,8 +910,8 @@ fn a_tester_present_message_is_judged_as_a_request() {
         )
     };
     let t3 = Env::linked(profile("T3"), false);
-    assert!(set(&t3, message(&[0x3E, 0x80])).is_ok());
-    assert!(set(&t3, message(&[0x3E, 0x00])).is_ok());
+    set(&t3, message(&[0x3E, 0x80])).unwrap();
+    set(&t3, message(&[0x3E, 0x00])).unwrap();
     // The worker sends it cyclically: nothing but TesterPresent, session control included.
     for other in [
         &[0x10, 0x03][..],
@@ -928,18 +922,18 @@ fn a_tester_present_message_is_judged_as_a_request() {
     ] {
         assert!(set(&t3, message(other)).is_err(), "{other:02x?}");
     }
-    assert!(set(&t3, message(&[0x2E, 0xF1, 0x90, 0x01])).is_err());
+    set(&t3, message(&[0x2E, 0xF1, 0x90, 0x01])).unwrap_err();
     let alias = param_by_name(
         "CP_TesterPresentMsg",
         param_item::ParamData::Bytefield(vec![0x2E, 0xF1, 0x90, 0x01]),
     );
-    assert!(set(&t3, alias).is_err());
-    assert!(set(&t3, unum("CP_TesterPresentMessage", 0x3E)).is_err());
+    set(&t3, alias).unwrap_err();
+    set(&t3, unum("CP_TesterPresentMessage", 0x3E)).unwrap_err();
     // The same on T1 (a cyclic session change would need teardown state); T0 has no ECU to
     // address.
     let t1 = Env::linked(profile("T1"), false);
-    assert!(set(&t1, message(&[0x3E, 0x00])).is_ok());
-    assert!(set(&t1, message(&[0x3E, 0x80])).is_ok());
+    set(&t1, message(&[0x3E, 0x00])).unwrap();
+    set(&t1, message(&[0x3E, 0x80])).unwrap();
     for other in [
         &[0x10, 0x02][..],
         &[0x2E, 0xF1, 0x90, 0x01],
@@ -948,7 +942,7 @@ fn a_tester_present_message_is_judged_as_a_request() {
     ] {
         assert!(set(&t1, message(other)).is_err(), "{other:02x?}");
     }
-    assert!(set(&Env::linked(loopback(), false), message(&[0x3E, 0x80])).is_err());
+    set(&Env::linked(loopback(), false), message(&[0x3E, 0x80])).unwrap_err();
 }
 
 #[test]
@@ -971,8 +965,8 @@ fn the_can_id_format_must_describe_the_profiles_link() {
             );
         }
     }
-    assert!(set(&normal, unum("CP_CanRespUUDTFormat", 0x00)).is_ok());
-    assert!(set(&normal, unum("CP_CanRespUUDTFormat", 0x02)).is_err());
+    set(&normal, unum("CP_CanRespUUDTFormat", 0x00)).unwrap();
+    set(&normal, unum("CP_CanRespUUDTFormat", 0x02)).unwrap_err();
 
     let wide = Env::linked(
         profile_with(
@@ -990,28 +984,28 @@ fn the_can_id_format_must_describe_the_profiles_link() {
         ),
         false,
     );
-    assert!(set(&wide, unum("CP_CanPhysReqFormat", 0x4E | 0x01)).is_ok());
+    set(&wide, unum("CP_CanPhysReqFormat", 0x4E | 0x01)).unwrap();
     // Padding overwrite: 11 enables it, which the profile's padding allows; 10 disables it.
-    assert!(set(&wide, unum("CP_CanPhysReqFormat", 0x4E | 0x30)).is_ok());
-    assert!(set(&wide, unum("CP_CanPhysReqFormat", 0x4E | 0x20)).is_err());
-    assert!(set(&wide, unum("CP_CanPhysReqFormat", 0x4E | 0x10)).is_err());
+    set(&wide, unum("CP_CanPhysReqFormat", 0x4E | 0x30)).unwrap();
+    set(&wide, unum("CP_CanPhysReqFormat", 0x4E | 0x20)).unwrap_err();
+    set(&wide, unum("CP_CanPhysReqFormat", 0x4E | 0x10)).unwrap_err();
     // Extended instead of mixed, 11-bit.
-    assert!(set(&wide, unum("CP_CanPhysReqFormat", 0x0E)).is_err());
-    assert!(set(&wide, unum("CP_CanPhysReqFormat", 0x45)).is_err());
+    set(&wide, unum("CP_CanPhysReqFormat", 0x0E)).unwrap_err();
+    set(&wide, unum("CP_CanPhysReqFormat", 0x45)).unwrap_err();
     // The address bytes and the filler.
     for name in ["CP_CanPhysReqExtAddr", "CP_CanRespUSDTExtAddr"] {
-        assert!(set(&wide, unum(name, 0x55)).is_ok());
-        assert!(set(&wide, unum(name, 0x56)).is_err());
-        assert!(set(&normal, unum(name, 0)).is_ok());
-        assert!(set(&normal, unum(name, 0x55)).is_err());
+        set(&wide, unum(name, 0x55)).unwrap();
+        set(&wide, unum(name, 0x56)).unwrap_err();
+        set(&normal, unum(name, 0)).unwrap();
+        set(&normal, unum(name, 0x55)).unwrap_err();
     }
-    assert!(set(&wide, unum("CP_CanFillerByte", 0xCC)).is_ok());
-    assert!(set(&wide, unum("CP_CanFillerByte", 0x55)).is_err());
-    assert!(set(&wide, unum("CP_CanFillerByteHandling", 1)).is_ok());
-    assert!(set(&wide, unum("CP_CanFillerByteHandling", 0)).is_err());
-    assert!(set(&normal, unum("CP_CanFillerByteHandling", 0)).is_ok());
-    assert!(set(&normal, unum("CP_CanFillerByteHandling", 1)).is_err());
-    assert!(set(&normal, unum("CP_CanFillerByte", 0x1FF)).is_err());
+    set(&wide, unum("CP_CanFillerByte", 0xCC)).unwrap();
+    set(&wide, unum("CP_CanFillerByte", 0x55)).unwrap_err();
+    set(&wide, unum("CP_CanFillerByteHandling", 1)).unwrap();
+    set(&wide, unum("CP_CanFillerByteHandling", 0)).unwrap_err();
+    set(&normal, unum("CP_CanFillerByteHandling", 0)).unwrap();
+    set(&normal, unum("CP_CanFillerByteHandling", 1)).unwrap_err();
+    set(&normal, unum("CP_CanFillerByte", 0x1FF)).unwrap_err();
 }
 
 fn connect(env: &Env) -> Result<Grant, GuardRefusal> {
@@ -1084,7 +1078,7 @@ fn a_link_connects_only_once_the_profiles_comparams_are_set() {
     let grant = set(&env, unum("CP_CanFuncReqId", 0x7DF));
     apply(&mut env, grant);
     // A 29-bit format on an 11-bit profile is refused; the functional format is still missing.
-    assert!(set(&env, unum("CP_CanFuncReqFormat", 0x07)).is_err());
+    set(&env, unum("CP_CanFuncReqFormat", 0x07)).unwrap_err();
     let grant = set(&env, unum("CP_CanFuncReqFormat", 0x05));
     apply(&mut env, grant);
     // The worker's preset sends tester present functionally: both modes are pinned.
@@ -1102,7 +1096,7 @@ fn a_link_connects_only_once_the_profiles_comparams_are_set() {
         panic!("connect should be refused");
     };
     assert!(why.contains("cp_canfillerbytehandling"), "{why}");
-    assert!(set(&env, unum("CP_CanFillerByteHandling", 1)).is_err());
+    set(&env, unum("CP_CanFillerByteHandling", 1)).unwrap_err();
     let grant = set(&env, unum("CP_CanFillerByteHandling", 0));
     apply(&mut env, grant);
     // The tester-present message is the last one: the preset arms a cyclic one, and a D-PDU
@@ -1117,8 +1111,8 @@ fn a_link_connects_only_once_the_profiles_comparams_are_set() {
             param_item::ParamData::Bytefield(bytes.to_vec()),
         )
     };
-    assert!(set(&env, message(&[0x10, 0x03])).is_err());
-    assert!(connect(&env).is_err());
+    set(&env, message(&[0x10, 0x03])).unwrap_err();
+    connect(&env).unwrap_err();
     let grant = set(&env, message(&[0x3E, 0x80]));
     assert_eq!(
         grant,
@@ -1132,8 +1126,8 @@ fn a_link_connects_only_once_the_profiles_comparams_are_set() {
 
     // A value changed to another than the profile's is refused at SetComParam anyway, and a
     // set that is refused records nothing.
-    assert!(set(&env, unum("CP_Baudrate", 250_000)).is_err());
-    assert!(set(&env, unum("DATA_RATE", 250_000)).is_err());
+    set(&env, unum("CP_Baudrate", 250_000)).unwrap_err();
+    set(&env, unum("DATA_RATE", 250_000)).unwrap_err();
 }
 
 #[test]
@@ -1229,7 +1223,7 @@ fn a_response_table_replaces_the_old_one_and_must_be_complete() {
         panic!("a table without the response id is refused");
     };
     assert!(why.contains("cp_canrespusdtid"), "{why}");
-    assert!(set_table(&env, vec![unum("CP_CanRespUSDTId", 0x7E8)]).is_err());
+    set_table(&env, vec![unum("CP_CanRespUSDTId", 0x7E8)]).unwrap_err();
     // The pairing must sit in one entry: split across two, or repeated in a second entry, it
     // is refused, since the worker addresses from the first entry and pairs within one.
     let two = |first: Vec<ParamItem>, second: Vec<ParamItem>| {
@@ -1272,7 +1266,7 @@ fn a_response_table_replaces_the_old_one_and_must_be_complete() {
     ));
     assert!(matches!(none, Err(GuardRefusal::LinkSetup(_))));
     // A wrong value is refused as before.
-    assert!(set_table(&env, complete(0x7E1, 0x7E8)).is_err());
+    set_table(&env, complete(0x7E1, 0x7E8)).unwrap_err();
 }
 
 #[test]
@@ -1296,7 +1290,7 @@ fn a_table_must_carry_the_formats_and_address_the_link_needs() {
         unum("CP_CanPhysReqId", 0x18DA_10F1),
         unum("CP_CanRespUSDTId", 0x18DA_F110),
     ];
-    assert!(set_table(&env, ids.clone()).is_err());
+    set_table(&env, ids.clone()).unwrap_err();
     let mut full = ids;
     full.extend([
         unum("CP_CanPhysReqFormat", 0x0F),
@@ -1305,7 +1299,7 @@ fn a_table_must_carry_the_formats_and_address_the_link_needs() {
         unum("CP_CanRespUSDTExtAddr", 0x42),
     ]);
     // The functional identifier is a COM-class ComParam, not held by the table.
-    assert!(set_table(&env, full).is_ok());
+    set_table(&env, full).unwrap();
 }
 
 /// A T0 loopback of two VCIs (two J2534 modules), no channels.
@@ -1364,7 +1358,7 @@ fn each_worker_of_a_two_vci_loopback_binds_only_its_own_end() {
     other.label = Some("elsewhere".to_owned());
     other.pname = Some("Another VCI".to_owned());
     let stranger = Env::for_vci(a.profile.clone(), other);
-    assert!(create_with(&stranger, &profile_resource()).is_err());
+    create_with(&stranger, &profile_resource()).unwrap_err();
 }
 
 #[test]
@@ -1402,17 +1396,15 @@ fn t0_has_raw_links_only_and_nothing_to_start() {
         }
     }
     // A raw frame to its own request identifier still passes.
-    assert!(raw_send(&raw, &frame(0x123, &[0x01, 0x00])).is_ok());
+    raw_send(&raw, &frame(0x123, &[0x01, 0x00])).unwrap();
     // T1 still starts communication.
     let t1 = Env::linked(profile("T1"), false);
-    assert!(
-        t1.decide(Request::StartComPrimitive(&start(
-            ComOperationType::CoptStartcomm,
-            &[],
-            0
-        )))
-        .is_ok()
-    );
+    t1.decide(Request::StartComPrimitive(&start(
+        ComOperationType::CoptStartcomm,
+        &[],
+        0,
+    )))
+    .unwrap();
 }
 
 #[test]
@@ -1453,13 +1445,11 @@ fn raw_frame_flags_must_equal_the_profile_in_both_directions() {
             flag_bits(bits),
         )))
     };
-    assert!(send_with(&all).is_ok());
+    send_with(&all).unwrap();
     // The same as raw bytes: byte 2 bit 0, byte 3 bits 7 and 6.
     let raw = com_primitive_ctrl_data::TxFlag::TxFlagRaw(vec![0, 0, 0x01, 0xC0]);
-    assert!(
-        env.decide(Request::StartComPrimitive(&start_flags(&data, raw)))
-            .is_ok()
-    );
+    env.decide(Request::StartComPrimitive(&start_flags(&data, raw)))
+        .unwrap();
     // Omitting any one of the three is refused (the frame would go out in another format).
     for omitted in 0..3 {
         let bits: Vec<TxFlagBit> = all
@@ -1473,7 +1463,7 @@ fn raw_frame_flags_must_equal_the_profile_in_both_directions() {
             "omitted {omitted}"
         );
     }
-    assert!(send_with(&[]).is_err());
+    send_with(&[]).unwrap_err();
 
     // The whole header on T0: the id, then the address byte, then something to send.
     let go = |data: &[u8]| {
@@ -1482,11 +1472,11 @@ fn raw_frame_flags_must_equal_the_profile_in_both_directions() {
             flag_bits(&all),
         )))
     };
-    assert!(go(&frame(0x18DA_10F1, &[0x42, 0x01])).is_ok());
-    assert!(go(&frame(0x18DA_10F1, &[0x43, 0x01])).is_err());
-    assert!(go(&frame(0x18DA_10F1, &[])).is_err());
-    assert!(go(&[0x18, 0xDA, 0x10]).is_err());
-    assert!(go(&frame(0x18DA_F110, &[0x42, 0x01])).is_err());
+    go(&frame(0x18DA_10F1, &[0x42, 0x01])).unwrap();
+    go(&frame(0x18DA_10F1, &[0x43, 0x01])).unwrap_err();
+    go(&frame(0x18DA_10F1, &[])).unwrap_err();
+    go(&[0x18, 0xDA, 0x10]).unwrap_err();
+    go(&frame(0x18DA_F110, &[0x42, 0x01])).unwrap_err();
 
     // A padded 11-bit T0 profile refuses an omitted padding bit and takes it when present.
     let padded = parse(&format!(
@@ -1503,8 +1493,8 @@ fn raw_frame_flags_must_equal_the_profile_in_both_directions() {
             flag_bits(bits),
         )))
     };
-    assert!(t0_send(&[TxFlagBit::TxFlagIso15765FramePad]).is_ok());
-    assert!(t0_send(&[]).is_err());
+    t0_send(&[TxFlagBit::TxFlagIso15765FramePad]).unwrap();
+    t0_send(&[]).unwrap_err();
 }
 
 #[test]
@@ -1534,11 +1524,11 @@ fn the_formats_are_set_before_connect_on_an_11_bit_normal_link() {
         "{why}"
     );
     // A 29-bit format is not the profile's.
-    assert!(set(&env, unum("CP_CanPhysReqFormat", 0x07)).is_err());
-    assert!(set(&env, unum("CP_CanRespUSDTFormat", 0x06)).is_err());
+    set(&env, unum("CP_CanPhysReqFormat", 0x07)).unwrap_err();
+    set(&env, unum("CP_CanRespUSDTFormat", 0x06)).unwrap_err();
     let grant = set(&env, unum("CP_CanPhysReqFormat", 0x05));
     apply(&mut env, grant);
-    assert!(connect(&env).is_err());
+    connect(&env).unwrap_err();
     let grant = set(&env, unum("CP_CanRespUSDTFormat", 0x05));
     apply(&mut env, grant);
     assert_eq!(connect(&env), Ok(Grant::Pass));
@@ -1579,8 +1569,8 @@ fn the_address_modes_are_set_before_connect() {
         "{why}"
     );
     // Functional is refused, so the preset's cannot be kept by setting it again.
-    assert!(set(&env, unum("CP_TesterPresentAddrMode", 1)).is_err());
-    assert!(set(&env, unum("CP_RequestAddrMode", 2)).is_err());
+    set(&env, unum("CP_TesterPresentAddrMode", 1)).unwrap_err();
+    set(&env, unum("CP_RequestAddrMode", 2)).unwrap_err();
     let grant = set(&env, unum("CP_RequestAddrMode", 1));
     apply(&mut env, grant);
     assert!(
@@ -1600,7 +1590,7 @@ fn the_address_modes_are_set_before_connect() {
         .filter(|n| !n.ends_with("addrmode"))
         .collect();
     env.links.get_mut(&CLL).unwrap().set.extend(others);
-    assert!(connect(&env).is_err());
+    connect(&env).unwrap_err();
     for (name, value) in [("CP_RequestAddrMode", 2), ("CP_TesterPresentAddrMode", 1)] {
         let grant = set(&env, unum(name, value));
         assert!(grant.is_ok(), "{name}");
@@ -1633,7 +1623,7 @@ fn frame_padding_flags_follow_the_profiles_padding() {
         env.decide(Request::StartComPrimitive(&request))
     };
     // Without the flag a read passes; with it, on a profile that does not pad, it is refused.
-    assert!(send_with(&unpadded, None).is_ok());
+    send_with(&unpadded, None).unwrap();
     assert!(matches!(
         send_with(&unpadded, Some(named())),
         Err(GuardRefusal::Frame(_))
@@ -1643,13 +1633,13 @@ fn frame_padding_flags_follow_the_profiles_padding() {
         Err(GuardRefusal::Frame(_))
     ));
     // On a padded profile it passes.
-    assert!(send_with(&padded, Some(named())).is_ok());
-    assert!(send_with(&padded, Some(raw())).is_ok());
+    send_with(&padded, Some(named())).unwrap();
+    send_with(&padded, Some(raw())).unwrap();
     // The other flags that would override the profile, on a link that is not RawMode.
     let wide = flag_bits(&[TxFlagBit::TxFlagCan29bitId]);
     let addressed = flag_bits(&[TxFlagBit::TxFlagIso15765AddrType]);
-    assert!(send_with(&unpadded, Some(wide)).is_err());
-    assert!(send_with(&unpadded, Some(addressed)).is_err());
+    send_with(&unpadded, Some(wide)).unwrap_err();
+    send_with(&unpadded, Some(addressed)).unwrap_err();
     // Every class with a profile link, a receive-only primitive too.
     for class in ["T1", "T2"] {
         let env = Env::linked(profile(class), false);
@@ -1657,11 +1647,9 @@ fn frame_padding_flags_follow_the_profiles_padding() {
     }
     let mut receive = start_flags(&[], named());
     receive.cop_ctrl_data.as_mut().unwrap().num_send_cycles = 0;
-    assert!(
-        unpadded
-            .decide(Request::StartComPrimitive(&receive))
-            .is_err()
-    );
+    unpadded
+        .decide(Request::StartComPrimitive(&receive))
+        .unwrap_err();
 }
 
 #[test]
@@ -1876,8 +1864,8 @@ fn t1_passes_every_request_undecoded() {
     // A raw-bound handle on T1 (never created by the guard) is refused, not passed: its id
     // and its UDS payload would go unseen.
     let env = Env::linked(profile("T1"), true);
-    assert!(send(&env, &[0, 0, 0x07, 0xE0, 0x10, 0x03], 1).is_err());
-    assert!(send(&env, &[0, 0, 0x01, 0x23, 0x02, 0x2E, 0xF1], 1).is_err());
+    send(&env, &[0, 0, 0x07, 0xE0, 0x10, 0x03], 1).unwrap_err();
+    send(&env, &[0, 0, 0x01, 0x23, 0x02, 0x2E, 0xF1], 1).unwrap_err();
 }
 
 #[test]
@@ -1891,15 +1879,15 @@ fn a_periodic_message_is_judged_like_a_single_request() {
         );
     }
     // A primitive that only receives carries nothing, or a request that is judged anyway.
-    assert!(send(&env, &[], 0).is_ok());
-    assert!(send(&env, &[0x2E, 0xF1, 0x90, 0x01], 0).is_err());
-    assert!(send(&env, &[0x3E, 0x80], 0).is_ok());
-    assert!(send(&env, &[0x3E, 0x80], -2).is_err());
-    assert!(send(&env, &[], 1).is_err());
+    send(&env, &[], 0).unwrap();
+    send(&env, &[0x2E, 0xF1, 0x90, 0x01], 0).unwrap_err();
+    send(&env, &[0x3E, 0x80], 0).unwrap();
+    send(&env, &[0x3E, 0x80], -2).unwrap_err();
+    send(&env, &[], 1).unwrap_err();
     // No control data at all means no sending.
     let mut bare = start(ComOperationType::CoptSendrecv, &[0x2E, 0xF1, 0x90, 0x01], 1);
     bare.cop_ctrl_data = None;
-    assert!(env.decide(Request::StartComPrimitive(&bare)).is_err());
+    env.decide(Request::StartComPrimitive(&bare)).unwrap_err();
 }
 
 #[test]
@@ -1907,14 +1895,14 @@ fn communication_primitives_other_than_a_send() {
     let env = Env::linked(profile("T3"), false);
     let run =
         |cop_type, data: &[u8]| env.decide(Request::StartComPrimitive(&start(cop_type, data, 0)));
-    assert!(run(ComOperationType::CoptStartcomm, &[]).is_ok());
-    assert!(run(ComOperationType::CoptStopcomm, &[]).is_ok());
-    assert!(run(ComOperationType::CoptUpdateparam, &[]).is_ok());
-    assert!(run(ComOperationType::CoptDelay, &[]).is_ok());
+    run(ComOperationType::CoptStartcomm, &[]).unwrap();
+    run(ComOperationType::CoptStopcomm, &[]).unwrap();
+    run(ComOperationType::CoptUpdateparam, &[]).unwrap();
+    run(ComOperationType::CoptDelay, &[]).unwrap();
     // A start message is a request like any other.
-    assert!(run(ComOperationType::CoptStartcomm, &[0x10, 0x03]).is_ok());
-    assert!(run(ComOperationType::CoptStartcomm, &[0x11, 0x01]).is_err());
-    assert!(run(ComOperationType::CoptStopcomm, &[0x2E, 0xF1, 0x90, 0x01]).is_err());
+    run(ComOperationType::CoptStartcomm, &[0x10, 0x03]).unwrap();
+    run(ComOperationType::CoptStartcomm, &[0x11, 0x01]).unwrap_err();
+    run(ComOperationType::CoptStopcomm, &[0x2E, 0xF1, 0x90, 0x01]).unwrap_err();
     // Restoring ComParams would undo the comparison with the profile, on every class.
     for class in ["T0", "T1", "T2", "T3"] {
         let profile = if class == "T0" {
@@ -1942,7 +1930,7 @@ fn communication_primitives_other_than_a_send() {
     }
     let mut other = start(ComOperationType::CoptDelay, &[], 0);
     other.cop_type = 0x1234;
-    assert!(env.decide(Request::StartComPrimitive(&other)).is_err());
+    env.decide(Request::StartComPrimitive(&other)).unwrap_err();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1979,17 +1967,15 @@ fn a_raw_mode_link_is_refused_outside_t0() {
             );
         }
         // The same link without RawMode is fine, and a T1 link starts communication.
-        assert!(create_with(&env, &profile_resource()).is_ok());
+        create_with(&env, &profile_resource()).unwrap();
     }
     let t1 = Env::linked(profile("T1"), false);
-    assert!(
-        t1.decide(Request::StartComPrimitive(&start(
-            ComOperationType::CoptStartcomm,
-            &[],
-            0
-        )))
-        .is_ok()
-    );
+    t1.decide(Request::StartComPrimitive(&start(
+        ComOperationType::CoptStartcomm,
+        &[],
+        0,
+    )))
+    .unwrap();
     // T0 keeps RawMode.
     let env = Env::new(loopback());
     let mut request = create_request(create::Resource::RscData(channel_resource("ISO15765_CH1")));
@@ -2018,7 +2004,7 @@ fn a_raw_bound_handle_outside_t0_is_refused_not_decoded() {
             );
         }
         // Receive-only primitives and the ones without a message still pass.
-        assert!(send(&env, &[], 0).is_ok());
+        send(&env, &[], 0).unwrap();
     }
 }
 
@@ -2026,30 +2012,31 @@ fn a_raw_bound_handle_outside_t0_is_refused_not_decoded() {
 fn t0_passes_only_frames_between_its_endpoints() {
     let env = Env::linked(loopback(), true);
     // Endpoint 0 sends to its own request identifier (the other end's response identifier).
-    assert!(raw_send(&env, &frame(0x123, &[0x03, 0x2E, 0xF1, 0x90])).is_ok());
+    raw_send(&env, &frame(0x123, &[0x03, 0x2E, 0xF1, 0x90])).unwrap();
     // Content is not read on T0.
-    assert!(raw_send(&env, &frame(0x123, &[0xAA])).is_ok());
-    assert!(raw_send(&env, &frame(0x124, &[0x03, 0x22, 0xF1, 0x90])).is_err());
-    assert!(raw_send(&env, &frame(0x7DF, &[0x03, 0x22, 0xF1, 0x90])).is_err());
-    assert!(raw_send(&env, &[0x00, 0x01]).is_err());
+    raw_send(&env, &frame(0x123, &[0xAA])).unwrap();
+    raw_send(&env, &frame(0x124, &[0x03, 0x22, 0xF1, 0x90])).unwrap_err();
+    raw_send(&env, &frame(0x7DF, &[0x03, 0x22, 0xF1, 0x90])).unwrap_err();
+    raw_send(&env, &[0x00, 0x01]).unwrap_err();
     // The other endpoint's link sends to its own.
     let mut other = Env::new(loopback());
     other.links.insert(CLL, BoundLink::new(1, true));
-    assert!(raw_send(&other, &frame(0x124, &[0x01, 0x00])).is_ok());
-    assert!(raw_send(&other, &frame(0x123, &[0x01, 0x00])).is_err());
+    raw_send(&other, &frame(0x124, &[0x01, 0x00])).unwrap();
+    raw_send(&other, &frame(0x123, &[0x01, 0x00])).unwrap_err();
     // A frame whose flags disagree with the link.
     let wide_flag = start_flags(
         &frame(0x123, &[0x01]),
         flag_bits(&[TxFlagBit::TxFlagCan29bitId]),
     );
-    assert!(env.decide(Request::StartComPrimitive(&wide_flag)).is_err());
+    env.decide(Request::StartComPrimitive(&wide_flag))
+        .unwrap_err();
     // A request through a link that is not raw is an ECU-addressed request.
     let plain = Env::linked(loopback(), false);
     assert!(matches!(
         send(&plain, &[0x22, 0xF1, 0x90], 1),
         Err(GuardRefusal::Frame(_))
     ));
-    assert!(send(&plain, &[], 0).is_ok());
+    send(&plain, &[], 0).unwrap();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2170,7 +2157,7 @@ fn an_io_control_needs_a_command_and_a_known_scope() {
         input_data: None,
         has_output: true,
     };
-    assert!(env.decide(Request::IoCtl(&named(None))).is_err());
+    env.decide(Request::IoCtl(&named(None))).unwrap_err();
     let system = Some(io_ctl_request::Handle::SystemHandle(
         vci_service_interface::SystemHandle {},
     ));

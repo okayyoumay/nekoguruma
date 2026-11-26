@@ -440,7 +440,7 @@ pub(crate) mod tests {
                 .positive,
             [0x59, 0x02]
         );
-        assert!(prepared(READ_DTC, &[0x19, 0x02, 0x08], true).is_ok());
+        prepared(READ_DTC, &[0x19, 0x02, 0x08], true).unwrap();
         assert!(matches!(
             prepared(READ_DTC, &[], false),
             Err(HostError::EmptyRequest)
@@ -463,7 +463,7 @@ pub(crate) mod tests {
             Err(HostError::UndeclaredService(READ_DTC))
         ));
         // A session change or a reset during a transfer, and any download.
-        assert!(prepared(SESSION, &[0x10, 0x02], false).is_ok());
+        prepared(SESSION, &[0x10, 0x02], false).unwrap();
         assert!(matches!(
             prepared(SESSION, &[0x10, 0x02], true),
             Err(HostError::TransferInterrupted(0x10))

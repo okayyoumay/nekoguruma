@@ -431,10 +431,10 @@ mod tests {
             Err(VerifyError::Mismatch)
         );
         let bytes = sig.to_bytes();
-        assert!(Signature::from_bytes(&bytes[..63]).is_err());
+        Signature::from_bytes(&bytes[..63]).unwrap_err();
         let mut long = bytes.to_vec();
         long.push(0);
-        assert!(Signature::from_bytes(&long).is_err());
+        Signature::from_bytes(&long).unwrap_err();
     }
 
     #[test]
@@ -484,8 +484,8 @@ mod tests {
             Err(TranscriptError::BadField { field: "agent_id" })
         );
         let long = "x".repeat(MAX_FIELD_LEN + 1);
-        assert!(bad(&long).is_err());
-        assert!(bad(&"x".repeat(MAX_FIELD_LEN)).is_ok());
+        bad(&long).unwrap_err();
+        bad(&"x".repeat(MAX_FIELD_LEN)).unwrap();
     }
 
     #[test]

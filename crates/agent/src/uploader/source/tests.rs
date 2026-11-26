@@ -133,11 +133,9 @@ fn the_reader_gives_its_part_only_and_flags_a_shortfall() {
     // A file that is gone is an error, and flagged too.
     unsound.store(false, Ordering::Relaxed);
     fs::remove_file(&path).unwrap();
-    assert!(
-        PartReader::new(path, 0, 3, unsound.clone())
-            .read(&mut [0u8; 3])
-            .is_err()
-    );
+    PartReader::new(path, 0, 3, unsound.clone())
+        .read(&mut [0u8; 3])
+        .unwrap_err();
     assert!(unsound.load(Ordering::Relaxed));
 }
 

@@ -475,10 +475,10 @@ mod tests {
                 config: "a.toml".into()
             })
         );
-        assert!(parse(&[]).is_err());
-        assert!(parse(&["--config"]).is_err());
-        assert!(parse(&["--config", "a", "--config", "b"]).is_err());
-        assert!(parse(&["--config", "a", "--owner", "x"]).is_err());
+        parse(&[]).unwrap_err();
+        parse(&["--config"]).unwrap_err();
+        parse(&["--config", "a", "--config", "b"]).unwrap_err();
+        parse(&["--config", "a", "--owner", "x"]).unwrap_err();
     }
 
     #[test]
@@ -489,8 +489,8 @@ mod tests {
                 config: "registration-code".into()
             })
         );
-        assert!(parse(&["--config", "a.toml", "registration-code"]).is_err());
-        assert!(parse(&["registration-code"]).is_err());
+        parse(&["--config", "a.toml", "registration-code"]).unwrap_err();
+        parse(&["registration-code"]).unwrap_err();
     }
 
     #[test]
@@ -558,7 +558,7 @@ mod tests {
         let mut args = issue_args(&[]);
         let at = args.iter().position(|a| *a == "--name").unwrap();
         args[at + 1] = &long;
-        assert!(parse(&args).is_err());
+        parse(&args).unwrap_err();
     }
 
     #[cfg(unix)]
@@ -568,7 +568,7 @@ mod tests {
         let mut args: Vec<OsString> = issue_args(&[]).into_iter().map(OsString::from).collect();
         let at = args.iter().position(|a| a == "--owner").unwrap();
         args[at + 1] = OsString::from_vec(vec![0xff, 0xfe]);
-        assert!(parse_args(args).is_err());
+        parse_args(args).unwrap_err();
     }
 
     // ----- `user`
@@ -630,7 +630,7 @@ mod tests {
                 config: "user".into()
             })
         );
-        assert!(parse(&["--config", "a.toml", "user"]).is_err());
+        parse(&["--config", "a.toml", "user"]).unwrap_err();
     }
 
     #[test]
@@ -708,21 +708,19 @@ mod tests {
             assert!(parse(&args).is_err(), "{args:?}");
         }
         let long = "x".repeat(129);
-        assert!(
-            parse(&[
-                "user",
-                "add",
-                "--config",
-                "c",
-                "--username",
-                "a",
-                "--name",
-                &long
-            ])
-            .is_err()
-        );
+        parse(&[
+            "user",
+            "add",
+            "--config",
+            "c",
+            "--username",
+            "a",
+            "--name",
+            &long,
+        ])
+        .unwrap_err();
         let long = "x".repeat(65);
-        assert!(parse(&["user", "disable", "--config", "c", "--username", &long]).is_err());
+        parse(&["user", "disable", "--config", "c", "--username", &long]).unwrap_err();
     }
 
     #[cfg(unix)]

@@ -587,7 +587,7 @@ mod tests {
         let c = Hasher::new();
         let (x, y) = tokio::join!(c.dummy_hash(), c.dummy_hash());
         assert_eq!(x.unwrap(), y.unwrap());
-        assert!(c.verify_dummy(secret()).await.is_ok());
+        c.verify_dummy(secret()).await.unwrap();
     }
 
     #[test]
@@ -661,7 +661,7 @@ mod tests {
 
     #[test]
     fn a_new_user_is_validated() {
-        assert!(NewUser::new("alice", "Alice", &[]).is_ok());
+        NewUser::new("alice", "Alice", &[]).unwrap();
         let all = roles(&ROLES);
         assert_eq!(
             NewUser::new("alice", "A", &all).unwrap().roles(),
@@ -676,7 +676,7 @@ mod tests {
         ] {
             assert_eq!(NewUser::new("alice", &bad, &[]), Err(RequestError::Name));
         }
-        assert!(NewUser::new("alice", &"\u{732b}".repeat(128), &[]).is_ok());
+        NewUser::new("alice", &"\u{732b}".repeat(128), &[]).unwrap();
         assert_eq!(
             NewUser::new("alice", "A", &roles(&["root"])),
             Err(RequestError::Role)
@@ -722,15 +722,15 @@ mod tests {
             Err(PasswordError::TooShort)
         );
         // Twelve characters of three bytes each: 36 bytes pass; eleven do not.
-        assert!(pw(wide(MIN_PASSWORD_CHARS).as_bytes()).is_ok());
+        pw(wide(MIN_PASSWORD_CHARS).as_bytes()).unwrap();
         assert_eq!(
             pw(wide(MIN_PASSWORD_CHARS - 1).as_bytes()),
             Err(PasswordError::TooShort)
         );
         let at = filler(MAX_PASSWORD_BYTES);
-        assert!(pw(at.as_bytes()).is_ok());
-        assert!(pw(format!("{at}\n").as_bytes()).is_ok());
-        assert!(pw(format!("{at}\r\n").as_bytes()).is_ok());
+        pw(at.as_bytes()).unwrap();
+        pw(format!("{at}\n").as_bytes()).unwrap();
+        pw(format!("{at}\r\n").as_bytes()).unwrap();
         let over = filler(MAX_PASSWORD_BYTES + 1);
         assert_eq!(pw(over.as_bytes()), Err(PasswordError::TooLong));
         assert_eq!(

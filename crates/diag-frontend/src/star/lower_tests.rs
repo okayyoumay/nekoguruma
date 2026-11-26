@@ -208,7 +208,7 @@ fn a_remainder_by_minus_one_is_zero_even_for_the_smallest_integer() {
         fold(BinOp::Percent, &Const::Int(i64::MIN), &Const::Int(-1)),
         Ok(Const::Int(0))
     );
-    assert!(fold(BinOp::FloorDivide, &Const::Int(i64::MIN), &Const::Int(-1)).is_err());
+    fold(BinOp::FloorDivide, &Const::Int(i64::MIN), &Const::Int(-1)).unwrap_err();
 }
 
 #[test]
@@ -1185,7 +1185,7 @@ fn many_parameters_and_locals_are_numbered_in_linear_time() {
     source.push_str("    p0 = 1\n\ndef main():\n    pass\n");
     let checked = check("t.star", &source).unwrap_or_else(|errors| panic!("{errors:#?}"));
     let started = std::time::Instant::now();
-    assert!(lower_for_a_variant(&checked).is_ok());
+    lower_for_a_variant(&checked).unwrap();
     assert!(started.elapsed() < std::time::Duration::from_secs(30));
 }
 

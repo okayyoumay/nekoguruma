@@ -603,7 +603,7 @@ mod tests {
         assert_eq!(value["failureCode"], "procedure");
         assert_eq!(value["procedureCode"], "flash.verify");
         assert_eq!(value["detail"], "why");
-        assert!(AgentMessage::decode(&text).is_ok());
+        AgentMessage::decode(&text).unwrap();
         // A refusal carries its detail, and no procedure code.
         let kind = JobState::PreconditionFailed {
             code: FailureCode::JobRefused,
@@ -692,10 +692,8 @@ mod tests {
             assert!(ServerMessage::decode(text).is_err(), "{text}");
         }
         // A command is not an agent message, nor an answer a server message.
-        assert!(
-            AgentMessage::decode(r#"{"type":"logUploadCommand","jobId":"j","generation":1}"#)
-                .is_err()
-        );
+        AgentMessage::decode(r#"{"type":"logUploadCommand","jobId":"j","generation":1}"#)
+            .unwrap_err();
     }
 
     #[test]
@@ -728,10 +726,10 @@ mod tests {
             assert!(ServerMessage::decode(text).is_err(), "{text}");
         }
         // A server message is not an agent message, and the reverse.
-        assert!(AgentMessage::decode(r#"{"type":"hello","heartbeatSecs":20}"#).is_err());
-        assert!(ServerMessage::decode(r#"{"type":"commandAck","commandId":"c"}"#).is_err());
+        AgentMessage::decode(r#"{"type":"hello","heartbeatSecs":20}"#).unwrap_err();
+        ServerMessage::decode(r#"{"type":"commandAck","commandId":"c"}"#).unwrap_err();
         // An agent event of an unknown kind.
-        assert!(AgentMessage::decode(r#"{"type":"agentEvent","seq":1,"kind":"capture"}"#).is_err());
+        AgentMessage::decode(r#"{"type":"agentEvent","seq":1,"kind":"capture"}"#).unwrap_err();
     }
 
     #[test]
@@ -789,9 +787,9 @@ mod tests {
                 r#"{{"type":"agentEvent"{seq},"kind":"progress","jobId":"j","progressPermille":5,"phase":"x"}}"#
             )
         };
-        assert!(AgentMessage::decode(&state(r#","seq":1"#)).is_ok());
-        assert!(AgentMessage::decode(hmi).is_ok());
-        assert!(AgentMessage::decode(&progress("")).is_ok());
+        AgentMessage::decode(&state(r#","seq":1"#)).unwrap();
+        AgentMessage::decode(hmi).unwrap();
+        AgentMessage::decode(&progress("")).unwrap();
         // A guaranteed event without a number, or with 0, and a progress event with one.
         assert!(matches!(
             AgentMessage::decode(&state("")),
@@ -805,7 +803,7 @@ mod tests {
             AgentMessage::decode(&progress(r#","seq":1"#)),
             Err(ControlError::Refused(_))
         ));
-        assert!(AgentMessage::decode(&state(r#","seq":-1"#)).is_err());
+        AgentMessage::decode(&state(r#","seq":-1"#)).unwrap_err();
         // A null number is refused on both kinds: the key is absent or it is a number.
         assert!(matches!(
             AgentMessage::decode(&progress(r#","seq":null"#)),
@@ -827,7 +825,7 @@ mod tests {
             panic!("not an event");
         };
         event.seq = None;
-        assert!(AgentMessage::AgentEvent(event).encode().is_err());
+        AgentMessage::AgentEvent(event).encode().unwrap_err();
     }
 
     #[test]
@@ -869,7 +867,7 @@ mod tests {
             );
         }
         // An unknown property still closes, even with a missing envelope.
-        assert!(ServerMessage::decode(r#"{"type":"jobCommand","commandId":"c","x":1}"#).is_err());
+        ServerMessage::decode(r#"{"type":"jobCommand","commandId":"c","x":1}"#).unwrap_err();
     }
 
     #[test]
@@ -881,7 +879,9 @@ mod tests {
             MAX_HEARTBEAT_SECS,
         ] {
             assert!(ServerMessage::decode(&hello(ok)).is_ok(), "{ok}");
-            assert!(ServerMessage::Hello { heartbeat_secs: ok }.encode().is_ok());
+            ServerMessage::Hello { heartbeat_secs: ok }
+                .encode()
+                .unwrap();
         }
         for bad in [0, MAX_HEARTBEAT_SECS + 1, u32::MAX] {
             assert!(
@@ -891,15 +891,13 @@ mod tests {
                 ),
                 "{bad}"
             );
-            assert!(
-                ServerMessage::Hello {
-                    heartbeat_secs: bad
-                }
-                .encode()
-                .is_err()
-            );
+            ServerMessage::Hello {
+                heartbeat_secs: bad,
+            }
+            .encode()
+            .unwrap_err();
         }
-        assert!(ServerMessage::decode(r#"{"type":"hello","heartbeatSecs":-1}"#).is_err());
+        ServerMessage::decode(r#"{"type":"hello","heartbeatSecs":-1}"#).unwrap_err();
     }
 
     #[test]
@@ -911,7 +909,7 @@ mod tests {
         };
         for ok in [0, 1, 1000] {
             let m = AgentMessage::decode(&progress(ok)).unwrap();
-            assert!(m.encode().is_ok());
+            m.encode().unwrap();
         }
         for bad in [1001, 65_535] {
             assert!(
@@ -922,8 +920,8 @@ mod tests {
                 "{bad}"
             );
         }
-        assert!(AgentMessage::decode(&progress(65_536)).is_err());
-        assert!(AgentMessage::decode(&progress(0).replace(":0,", ":-1,")).is_err());
+        AgentMessage::decode(&progress(65_536)).unwrap_err();
+        AgentMessage::decode(&progress(0).replace(":0,", ":-1,")).unwrap_err();
     }
 
     #[test]
@@ -945,7 +943,7 @@ mod tests {
             command_id: "c".into(),
             signed_job: Some("A".repeat(87_512)),
         };
-        assert!(full.encode().is_ok());
+        full.encode().unwrap();
     }
 
     #[test]

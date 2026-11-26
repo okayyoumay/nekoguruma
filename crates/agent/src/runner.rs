@@ -3087,7 +3087,7 @@ mod tests {
                 diag_ir::ProgramError::BoundaryOutOfOrder { flash_session: 1 }
             ))
         ));
-        assert!(check_program(&program(Vec::new()), Permission::ReadOnly).is_ok());
+        check_program(&program(Vec::new()), Permission::ReadOnly).unwrap();
     }
 
     /// ADR-409: the agent opens one link per job, so a program that lists several targets is
@@ -4379,9 +4379,7 @@ def main():
         use diag_ir::RuntimeInput::{IgnitionOn, SupplyVoltageMillivolts, VehicleSpeedKmh};
         let read = |input| Op::ReadInput { input };
         let reads = program(vec![read(SupplyVoltageMillivolts), read(IgnitionOn)]);
-        assert!(
-            crate::policy::check_program(&reads, None, crate::policy::Permission::ReadOnly).is_ok()
-        );
+        crate::policy::check_program(&reads, None, crate::policy::Permission::ReadOnly).unwrap();
         assert!(!crate::policy::writes(&reads, None));
 
         let mut host = FlashHost::new(Rc::new(Cell::new(0)));
@@ -11494,7 +11492,7 @@ def main():
             vci: None,
             vci_margins: VciMargins::default(),
         };
-        assert!(check_job(&job, Permission::ReadOnly).is_ok());
+        check_job(&job, Permission::ReadOnly).unwrap();
         // A field the document does not declare is refused before anything is sent, also
         // when the decode comes after a write.
         let mut undeclared = program.clone();
@@ -15327,16 +15325,14 @@ def main():
                 source: HostError::NotAllowed(0x31)
             })
         ));
-        assert!(
-            refuse_beyond(
-                &program(two_requests()[..2].to_vec()),
-                None,
-                Permission::ReadOnly
-            )
-            .is_ok()
-        );
+        refuse_beyond(
+            &program(two_requests()[..2].to_vec()),
+            None,
+            Permission::ReadOnly,
+        )
+        .unwrap();
         #[cfg(debug_assertions)]
-        assert!(refuse_beyond(&write, None, Permission::Simulator).is_ok());
+        refuse_beyond(&write, None, Permission::Simulator).unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -17990,10 +17986,10 @@ def main():
             host.set_link_ids(0x7E0, 0x7E8);
             host.own_reads(Some(OwnRead::Identification));
             host.set_job_end_wait(JOB_END_WAIT);
-            assert!(host.service_request(0x22, &[0xF1, 0x90]).is_err());
+            host.service_request(0x22, &[0xF1, 0x90]).unwrap_err();
             // The first primitive's receive timeout comes now; the second request's wait reads it.
             released.add_permits(1);
-            assert!(host.service_request(0x22, &[0xF1, 0x90]).is_err());
+            host.service_request(0x22, &[0xF1, 0x90]).unwrap_err();
             released.add_permits(1);
             host.settle_at_end();
         })
@@ -25443,7 +25439,7 @@ def main():
                         inject(events, None, TESTER_PRESENT_ERROR, 5_000);
                         // Requests go on past the moment the host sees the event.
                         for _ in 0..30 {
-                            assert!(host.service_request(0x22, &[0xF1, 0x90]).is_ok());
+                            host.service_request(0x22, &[0xF1, 0x90]).unwrap();
                             std::thread::sleep(Duration::from_millis(10));
                         }
                         host.wait(1, 60_000)

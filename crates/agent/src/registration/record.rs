@@ -300,7 +300,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir(dir.path().join(TEMP_FILE)).unwrap();
         fs::write(dir.path().join(TEMP_FILE).join("x"), b"x").unwrap();
-        assert!(PendingRecord::prepare(dir.path()).is_err());
+        PendingRecord::prepare(dir.path()).unwrap_err();
     }
 
     /// W3: a rename that fails leaves the old record and no temp.
@@ -310,7 +310,7 @@ mod tests {
         // A directory where the record belongs: the rename of a file over it fails.
         fs::create_dir(dir.path().join(RECORD_FILE)).unwrap();
         let pending = PendingRecord::prepare(dir.path()).unwrap();
-        assert!(pending.commit(&sample()).is_err());
+        pending.commit(&sample()).unwrap_err();
         assert!(!dir.path().join(TEMP_FILE).exists());
         assert!(dir.path().join(RECORD_FILE).is_dir());
     }

@@ -872,7 +872,7 @@ mod tests {
             vbatt_lookup(rpc(tonic::Code::InvalidArgument)).unwrap(),
             VbattId::Unsupported
         );
-        assert!(vbatt_lookup(rpc(tonic::Code::Unavailable)).is_err());
+        vbatt_lookup(rpc(tonic::Code::Unavailable)).unwrap_err();
         assert_eq!(VbattId::default(), VbattId::Unknown);
     }
 
@@ -1086,7 +1086,7 @@ mod tests {
             responses: vec![Err(HostError::NoResponse)],
             ..Fake::answering(&[])
         };
-        assert!(read_identity_bytes(HardwarePartNumber, ecu(1, 1), &table(), &mut failed).is_err());
+        read_identity_bytes(HardwarePartNumber, ecu(1, 1), &table(), &mut failed).unwrap_err();
         assert_eq!(
             [
                 host.noted,
@@ -1192,7 +1192,7 @@ mod tests {
         assert!(host.sent.is_empty());
         assert!(host.noted.is_empty());
         // The same field on the primary is sent.
-        assert!(resolve_source(ecu(1, 1), &table(), &mut host).is_ok());
+        resolve_source(ecu(1, 1), &table(), &mut host).unwrap();
         assert_eq!(host.sent.len(), 1);
     }
 
@@ -1322,7 +1322,7 @@ mod tests {
             }
         );
         let json = serde_json::to_string(&vec![vin_field(), vin_field()]).unwrap();
-        assert!(serde_json::from_str::<ServiceSources>(&json).is_err());
+        serde_json::from_str::<ServiceSources>(&json).unwrap_err();
     }
 
     #[test]
@@ -1347,7 +1347,7 @@ mod tests {
                 Err(TableError::Unsupported { .. })
             ));
         }
-        assert!(ServiceSources::new(vec![vin_field()]).is_ok());
+        ServiceSources::new(vec![vin_field()]).unwrap();
     }
 
     #[test]
@@ -1377,7 +1377,7 @@ mod tests {
                 Err(TableError::BadField { .. })
             ));
         }
-        assert!(ServiceSources::new(vec![integer(8)]).is_ok());
+        ServiceSources::new(vec![integer(8)]).unwrap();
     }
 
     #[test]
@@ -1469,8 +1469,8 @@ mod tests {
             let table = ServiceSources::from_document(&document, &named()).unwrap();
             assert_eq!(table.get(1, 1), Some(&field));
             // The hardware part number (8 bytes) is a table entry but not a VIN source.
-            assert!(vin_source_field(&variant, 2, 1).is_err());
-            assert!(vin_source_field(&variant, 3, 1).is_err());
+            vin_source_field(&variant, 2, 1).unwrap_err();
+            vin_source_field(&variant, 3, 1).unwrap_err();
             assert!(vin_source_field(&variant, 9, 1).is_err(), "no such service");
             assert!(vin_source_field(&variant, 1, 9).is_err(), "no such field");
         }
@@ -1671,7 +1671,7 @@ mod tests {
             let mut program = named();
             program.identity.hardware_part_number = Some(ecu(3));
             program.identity.software_version = Some(ecu(2));
-            assert!(build(services(), &program).is_ok());
+            build(services(), &program).unwrap();
             // Shared between a precondition and a version: the version is ASCII, so the
             // precondition refuses it.
             let mut shared = named();
@@ -1686,11 +1686,11 @@ mod tests {
             // Shared and unsigned on both sides is fine.
             let mut both = named();
             both.identity.software_version = Some(ecu(3));
-            assert!(build(services(), &both).is_ok());
+            build(services(), &both).unwrap();
             // The VIN may also be a version, but not a precondition.
             let mut vin_version = named();
             vin_version.identity.hardware_part_number = Some(ecu(1));
-            assert!(build(services(), &vin_version).is_ok());
+            build(services(), &vin_version).unwrap();
             let mut vin_precondition = named();
             vin_precondition
                 .preconditions

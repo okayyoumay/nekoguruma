@@ -1009,7 +1009,7 @@ async fn a_regenerated_certificate_is_refused_once_and_the_next_answer_works() {
     );
     assert_eq!(rig.gets(), 0);
     // The next answer is the script's own, with the pin of the new certificate.
-    assert!(rig.doc(0).await.is_ok());
+    rig.doc(0).await.unwrap();
     assert_eq!(rig.gets(), 1);
 }
 

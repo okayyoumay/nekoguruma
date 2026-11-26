@@ -717,8 +717,8 @@ mod tests {
     // Store case E20
     #[test]
     fn what_is_not_a_numbered_event_with_its_text_is_not_an_event() {
-        assert!(Event::of(inbound(job_state(None, JOB, None), Some("f"))).is_err());
-        assert!(Event::of(inbound(job_state(Some(1), JOB, None), None)).is_err());
+        Event::of(inbound(job_state(None, JOB, None), Some("f"))).unwrap_err();
+        Event::of(inbound(job_state(Some(1), JOB, None), None)).unwrap_err();
         let progress = AgentMessage::AgentEvent(AgentEventMessage {
             seq: Some(1),
             occurred_at_agent: None,
@@ -728,8 +728,8 @@ mod tests {
                 phase: "p".to_owned(),
             },
         });
-        assert!(Event::of(inbound(progress, Some("f"))).is_err());
+        Event::of(inbound(progress, Some("f"))).unwrap_err();
         let reconcile = AgentMessage::Reconcile { open_jobs: vec![] };
-        assert!(Event::of(inbound(reconcile, Some("f"))).is_err());
+        Event::of(inbound(reconcile, Some("f"))).unwrap_err();
     }
 }

@@ -1569,7 +1569,7 @@ fn a_hundred_thousand_levels_are_refused() {
 fn a_source_past_the_size_bound_is_refused() {
     let at = |n: usize| format!("def main():\n    pass\n#{}", "a".repeat(n - 22));
     assert_eq!(at(MAX_SOURCE_BYTES).len(), MAX_SOURCE_BYTES);
-    assert!(check("test.star", &at(MAX_SOURCE_BYTES)).is_ok());
+    check("test.star", &at(MAX_SOURCE_BYTES)).unwrap();
     let errors = check("test.star", &at(MAX_SOURCE_BYTES + 1)).unwrap_err();
     assert_eq!(errors.len(), 1);
     assert_eq!(errors[0].code, StarCode::SourceTooLarge);
@@ -1583,9 +1583,9 @@ fn long_runs_of_one_character_lex_without_overflow() {
         "def main():\n    x = 1{}\n",
         " ".repeat(MAX_SOURCE_BYTES - 30)
     );
-    assert!(check("test.star", &spaces).is_ok());
+    check("test.star", &spaces).unwrap();
     let continuations = format!("def main():\n    x = 1{}\n", " \\\n".repeat(300_000));
-    assert!(check("test.star", &continuations).is_ok());
+    check("test.star", &continuations).unwrap();
 }
 
 // ---------------------------------------------------------------- Flash plans (4.9, ADR-336)

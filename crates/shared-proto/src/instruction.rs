@@ -351,7 +351,7 @@ mod tests {
         );
         let mut v = base();
         v.version = 2;
-        assert!(v.encode().is_err());
+        v.encode().unwrap_err();
     }
 
     #[test]
@@ -392,11 +392,11 @@ mod tests {
                 ),
                 "{err:?}"
             );
-            assert!(i.encode().is_err());
+            i.encode().unwrap_err();
         }
         let mut none = base();
         none.document_hashes.clear();
-        assert!(none.encode().is_ok());
+        none.encode().unwrap();
     }
 
     #[test]

@@ -4086,7 +4086,7 @@ mod tests {
     #[test]
     fn a_plan_without_an_instruction_is_loaded_unsigned() {
         let doc = named(document(0x90, 0x7E0, 0x7E8, |_| {}));
-        assert!(load(&plan(&[doc.0]), &[doc]).is_ok());
+        load(&plan(&[doc.0]), &[doc]).unwrap();
     }
 
     /// Loads and checks a plan over `documents`, without the ECU reads (see [`checked_vin`]).
@@ -4244,7 +4244,7 @@ mod tests {
         ));
         // Names are compared ignoring case, as the workers resolve them (ADR-324 item 3).
         let lower = named(document(0x93, 0x7E3, 0x7EB, grouped("cp_blocksize", 8)));
-        assert!(checked(&[first.clone(), lower]).is_ok());
+        checked(&[first.clone(), lower]).unwrap();
         let lower = named(document(0x93, 0x7E3, 0x7EB, grouped("cp_blocksize", 9)));
         assert!(matches!(
             checked(&[first.clone(), lower]),
@@ -4256,7 +4256,7 @@ mod tests {
             with_param("CP_BlockSize", 16)(p);
         }));
         let no_group = named(document(0x95, 0x7E5, 0x7ED, with_param("CP_BlockSize", 32)));
-        assert!(checked(&[first, other_group, no_group]).is_ok());
+        checked(&[first, other_group, no_group]).unwrap();
     }
 
     #[test]
@@ -4552,7 +4552,7 @@ mod tests {
         // The same field as a field rule's source is not a VIN source, and is accepted.
         let mut as_field_rule = plan(&[short.0]);
         as_field_rule.candidates[0].vin_rules.clear();
-        assert!(check_plan(&load(&as_field_rule, &[short]).unwrap()).is_ok());
+        check_plan(&load(&as_field_rule, &[short]).unwrap()).unwrap();
     }
 
     /// The ADR-345 table reads a field that ends the response; a VIN field with another field
@@ -5930,14 +5930,12 @@ mod tests {
             }
         };
         let text = sw_doc("v1", (0x7E0, 0x7E8));
-        assert!(
-            rule_plan(
-                std::slice::from_ref(&text),
-                &["c1"],
-                &[("c1", 0, 1, 1, YEAR, "y", b"SW")]
-            )
-            .is_ok()
-        );
+        rule_plan(
+            std::slice::from_ref(&text),
+            &["c1"],
+            &[("c1", 0, 1, 1, YEAR, "y", b"SW")],
+        )
+        .unwrap();
         // A float, and a number under a linear conversion, which decodes to one.
         let float = with_field(&text, |f| f.kind = DataKind::Float);
         let why = refused(std::slice::from_ref(&float), b"SW");
@@ -5958,14 +5956,12 @@ mod tests {
         });
         assert!(refused(std::slice::from_ref(&number), &[0; 9]).contains("eight bytes"));
         // The same nine bytes are a fine prefix of text.
-        assert!(
-            rule_plan(
-                std::slice::from_ref(&text),
-                &["c1"],
-                &[("c1", 0, 1, 1, YEAR, "y", b"SW1234567")]
-            )
-            .is_ok()
-        );
+        rule_plan(
+            std::slice::from_ref(&text),
+            &["c1"],
+            &[("c1", 0, 1, 1, YEAR, "y", b"SW1234567")],
+        )
+        .unwrap();
         // A request that needs a value, on a service only the rule names.
         let rule_only = with_service(&sw_doc("v1", (0x7E0, 0x7E8)), {
             let mut service = read_service(2, "readX", [0xF1, 0x90], DataKind::Ascii, 5);
@@ -6004,7 +6000,7 @@ mod tests {
             ("c1", 0, 1, 1, YEAR, "a", b"S"),
             ("c1", 0, 2, 1, VMODEL, "b", &[1]),
         ];
-        assert!(rule_plan(std::slice::from_ref(&both), &["c1"], &rules).is_ok());
+        rule_plan(std::slice::from_ref(&both), &["c1"], &rules).unwrap();
     }
 
     /// ADR-403 item 1: a rule on a pattern service adds no declaration; a rule on another service
@@ -6422,28 +6418,28 @@ mod tests {
             other => panic!("not refused as a field source: {other:?}"),
         };
         // Numbers: one byte holds 255 but not 256; -128 but not 128; BCD two digits hold 99.
-        assert!(outcome(&integer(DataKind::Uint, 8), &[0xFF]).is_ok());
-        assert!(outcome(&integer(DataKind::Uint, 8), &[0, 0xFF]).is_ok());
+        outcome(&integer(DataKind::Uint, 8), &[0xFF]).unwrap();
+        outcome(&integer(DataKind::Uint, 8), &[0, 0xFF]).unwrap();
         let why = refused(outcome(&integer(DataKind::Uint, 8), &[1, 0]));
         assert!(why.contains("width"), "{why}");
-        assert!(outcome(&integer(DataKind::Int, 8), &[0x80]).is_ok());
+        outcome(&integer(DataKind::Int, 8), &[0x80]).unwrap();
         refused(outcome(&integer(DataKind::Int, 8), &[0, 0x80]));
-        assert!(outcome(&integer(DataKind::Bcd, 8), &[99]).is_ok());
+        outcome(&integer(DataKind::Bcd, 8), &[99]).unwrap();
         refused(outcome(&integer(DataKind::Bcd, 8), &[100]));
         // Fixed-length bytes and text: the expected value must fit the field.
-        assert!(outcome(&bytes(2), &[1, 2]).is_ok());
+        outcome(&bytes(2), &[1, 2]).unwrap();
         let why = refused(outcome(&bytes(2), &[1, 2, 3]));
         assert!(why.contains("longer"), "{why}");
-        assert!(outcome(&text(DataKind::Utf8, 2), b"ab").is_ok());
+        outcome(&text(DataKind::Utf8, 2), b"ab").unwrap();
         refused(outcome(&text(DataKind::Utf8, 2), b"abc"));
         // An ASCII byte of 0x80 or more is two bytes of UTF-8, so n bytes can reach 2n.
-        assert!(outcome(&text(DataKind::Ascii, 2), b"abcd").is_ok());
+        outcome(&text(DataKind::Ascii, 2), b"abcd").unwrap();
         refused(outcome(&text(DataKind::Ascii, 2), b"abcde"));
         // Text compares in UTF-8.
         let why = refused(outcome(&text(DataKind::Ascii, 5), &[0xFF]));
         assert!(why.contains("UTF-8"), "{why}");
         // Bytes may hold any byte.
-        assert!(outcome(&bytes(5), &[0xFF]).is_ok());
+        outcome(&bytes(5), &[0xFF]).unwrap();
     }
 
     /// ADR-403: sources of one component on one request that cannot decode to one value (a text
@@ -6474,9 +6470,9 @@ mod tests {
             why(rule_pair(named_with("v2", |f| f.bit_length = 48)))
                 .contains("cannot decode to one value")
         );
-        assert!(rule_pair(named_with("v2", |f| f.kind = DataKind::Utf8)).is_ok());
-        assert!(rule_pair(named_with("v2", |f| f.length_kind = LengthKind::Terminated)).is_ok());
-        assert!(rule_pair(named_with("v2", |_| {})).is_ok());
+        rule_pair(named_with("v2", |f| f.kind = DataKind::Utf8)).unwrap();
+        rule_pair(named_with("v2", |f| f.length_kind = LengthKind::Terminated)).unwrap();
+        rule_pair(named_with("v2", |_| {})).unwrap();
     }
 
     /// ADR-403: two link groups of one definition at one endpoint that read one request for one

@@ -204,7 +204,7 @@ fn the_lock_is_released_after_the_command_and_its_file_stays() {
     let stub = Stub::start(403);
     let _ = run(&stub.request(false), &existing_key(), &code(), dir.path());
     assert!(dir.path().join(LOCK_FILE).is_file());
-    assert!(WriterLock::at(&dir.path().join(LOCK_FILE)).is_ok());
+    WriterLock::at(&dir.path().join(LOCK_FILE)).unwrap();
     let _ = stub.seen.join();
 }
 

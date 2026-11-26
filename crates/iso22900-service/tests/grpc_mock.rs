@@ -569,7 +569,7 @@ async fn grpc_server_responds_through_mock_library() {
             }),
         })
         .await;
-    assert!(unresolved_name_result.is_err());
+    unresolved_name_result.unwrap_err();
 
     let unique_resp_table = client
         .get_unique_resp_id_table(GetUniqueRespIdTableRequest {

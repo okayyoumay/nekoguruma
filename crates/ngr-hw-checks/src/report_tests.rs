@@ -374,7 +374,7 @@ fn a_path_that_leads_into_the_repository_is_refused() {
         .join("no-such-dir")
         .join("..")
         .join("report-guard-dotdot");
-    assert!(report.write_to(&missing).is_err());
+    report.write_to(&missing).unwrap_err();
     // A symlink outside the repository that points into it.
     let root = tempfile::tempdir().unwrap();
     let link = root.path().join("link");

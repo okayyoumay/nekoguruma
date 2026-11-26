@@ -4508,13 +4508,11 @@ mod tests {
                 .unwrap(),
             j2534_0404::ISO15765
         );
-        assert!(
-            J2534Service::resolve_object_id(
-                vci_service_interface::ObjectType::ObjtProtocol,
-                "unknown_protocol"
-            )
-            .is_err()
-        );
+        J2534Service::resolve_object_id(
+            vci_service_interface::ObjectType::ObjtProtocol,
+            "unknown_protocol",
+        )
+        .unwrap_err();
     }
 
     #[test]
@@ -5302,7 +5300,7 @@ mod tests {
             bus_type: None,
             protocol: None,
         };
-        assert!(J2534Service::resolve_resource_ids_from_data(&resource_data).is_err());
+        J2534Service::resolve_resource_ids_from_data(&resource_data).unwrap_err();
     }
 
     #[test]

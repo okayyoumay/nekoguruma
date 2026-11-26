@@ -264,12 +264,12 @@ mod tests {
         assert_eq!(i("-9223372036854775808"), Ok(i64::MIN.into()));
         assert_eq!(i("-0"), Ok(0));
         // Hexadecimal is a magnitude: all ones is out of a signed range, not -1.
-        assert!(i("0xFFFFFFFFFFFFFFFF").is_err());
-        assert!(i("-0x1").is_err());
+        i("0xFFFFFFFFFFFFFFFF").unwrap_err();
+        i("-0x1").unwrap_err();
         let wide = |c: &str| integer(c, false, 0, u64::MAX.into());
         assert_eq!(wide("0xFFFFFFFFFFFFFFFF"), Ok(u64::MAX.into()));
-        assert!(wide(&format!("0x{}", "F".repeat(40))).is_err());
-        assert!(wide(&"9".repeat(60)).is_err());
+        wide(&format!("0x{}", "F".repeat(40))).unwrap_err();
+        wide(&"9".repeat(60)).unwrap_err();
     }
 
     #[test]
@@ -297,12 +297,12 @@ mod tests {
 
     #[test]
     fn names_keys_and_service_names() {
-        assert!(name("softwareVersion").is_ok());
-        assert!(name("_a1").is_ok());
+        name("softwareVersion").unwrap();
+        name("_a1").unwrap();
         for bad in ["", "1a", "a.b", "a-b", "a b"] {
             assert!(name(bad).is_err(), "{bad:?}");
         }
-        assert!(key("session.default").is_ok());
+        key("session.default").unwrap();
         for bad in ["", "a.", ".a", "a..b", "a.1"] {
             assert!(key(bad).is_err(), "{bad:?}");
         }
@@ -328,7 +328,7 @@ mod tests {
         for bad in [";a", "a;", "a;;b", ""] {
             assert!(list(bad, false, text).is_err(), "{bad:?}");
         }
-        assert!(list("a;a", true, text).is_err());
+        list("a;a", true, text).unwrap_err();
         for bad in ["1.0.0; 1.0.1", "1.0.0 ;1.0.1", " a"] {
             assert!(list(bad, false, text).is_err(), "{bad:?}");
         }
@@ -338,6 +338,6 @@ mod tests {
             Ok(vec!["NGR EX".into(), "b".into()])
         );
         assert_eq!(list("1;1", false, float), Ok(vec![1.0, 1.0]));
-        assert!(boolean("Yes").is_err());
+        boolean("Yes").unwrap_err();
     }
 }

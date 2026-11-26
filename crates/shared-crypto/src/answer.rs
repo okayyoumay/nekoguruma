@@ -341,7 +341,7 @@ mod tests {
             mk(&"x".repeat(MAX_FIELD_LEN + 1), "GET", "/"),
             field("agent_id")
         );
-        assert!(mk(&"x".repeat(MAX_FIELD_LEN), "GET", "/").is_ok());
+        mk(&"x".repeat(MAX_FIELD_LEN), "GET", "/").unwrap();
         assert_eq!(mk(AGENT, "", "/"), field("method"));
         assert_eq!(mk(AGENT, "GE T", "/"), field("method"));
         assert_eq!(mk(AGENT, "G\u{e9}T", "/"), field("method"));
@@ -349,14 +349,14 @@ mod tests {
             mk(AGENT, &"G".repeat(MAX_METHOD_LEN + 1), "/"),
             field("method")
         );
-        assert!(mk(AGENT, &"G".repeat(MAX_METHOD_LEN), "/").is_ok());
+        mk(AGENT, &"G".repeat(MAX_METHOD_LEN), "/").unwrap();
         assert_eq!(mk(AGENT, "GET", ""), field("target"));
         assert_eq!(mk(AGENT, "GET", "/a b"), field("target"));
         assert_eq!(mk(AGENT, "GET", "/a\r\nb"), field("target"));
         assert_eq!(mk(AGENT, "GET", "/\u{e9}"), field("target"));
         let long = format!("/{}", "a".repeat(MAX_TARGET_LEN));
         assert_eq!(mk(AGENT, "GET", &long), field("target"));
-        assert!(mk(AGENT, "GET", &long[..MAX_TARGET_LEN]).is_ok());
+        mk(AGENT, "GET", &long[..MAX_TARGET_LEN]).unwrap();
     }
 
     #[test]
@@ -397,8 +397,8 @@ mod tests {
 
     #[test]
     fn check_target_takes_visible_ascii_within_the_bound_only() {
-        assert!(check_target("/api/v1/agent/uploads/0f/parts/3").is_ok());
-        assert!(check_target(&format!("/{}", "a".repeat(MAX_TARGET_LEN - 1))).is_ok());
+        check_target("/api/v1/agent/uploads/0f/parts/3").unwrap();
+        check_target(&format!("/{}", "a".repeat(MAX_TARGET_LEN - 1))).unwrap();
         for bad in [
             String::new(),
             "api/v1/x".to_owned(),

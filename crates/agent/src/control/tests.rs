@@ -1571,7 +1571,7 @@ fn a2_lock_io_failure_is_lock() {
     std::fs::remove_dir_all(fx.registration_dir()).unwrap();
     assert!(matches!(fx.open(), Err(ControlError::Lock(_))));
     // The connection lock taken before it is released.
-    assert!(WriterLock::at(&fx.connection_lock()).is_ok());
+    WriterLock::at(&fx.connection_lock()).unwrap();
 }
 
 #[test]
@@ -1699,11 +1699,9 @@ fn h3_a_record_for_another_server_is_a_server_mismatch() {
     let fx = Fixture::new();
     let installed = |text: &str| ServerOrigin::parse(text).unwrap();
     // The record names ORIGIN (port 8080).
-    assert!(fx.open_installed(&installed(ORIGIN)).is_ok());
-    assert!(
-        fx.open_installed(&installed("HTTP://127.0.0.1:8080/"))
-            .is_ok()
-    );
+    fx.open_installed(&installed(ORIGIN)).unwrap();
+    fx.open_installed(&installed("HTTP://127.0.0.1:8080/"))
+        .unwrap();
     for other in [
         "http://127.0.0.1:8081",
         "http://127.0.0.1",
@@ -1718,7 +1716,8 @@ fn h3_a_record_for_another_server_is_a_server_mismatch() {
     }
     // The default port in either spelling is the same origin.
     fx.write(&record_for(&fx.key.public_key(), "http://127.0.0.1"));
-    assert!(fx.open_installed(&installed("http://127.0.0.1:80")).is_ok());
+    fx.open_installed(&installed("http://127.0.0.1:80"))
+        .unwrap();
     // A missing or an invalid record is reported as such, not as a mismatch.
     fx.write(&record_for(&fx.key.public_key(), "http://localhost:1"));
     assert!(matches!(
@@ -3473,7 +3472,7 @@ async fn f17_stop_closes_with_1001_and_the_task_ends() {
     close_of(&mut ws, 1001, true).await;
     env.handle.stopped().await;
     assert_eq!(env.status().phase, Phase::Stopped);
-    assert!(env.conns.try_recv().is_err());
+    env.conns.try_recv().unwrap_err();
 }
 
 // ---------------------------------------------------------------------------------------------

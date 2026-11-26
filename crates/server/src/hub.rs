@@ -452,7 +452,7 @@ mod tests {
         let a = agent("a");
         let first = hub.register(&a).unwrap();
         let mut first_close = first.close;
-        assert!(first_close.try_recv().is_err());
+        first_close.try_recv().unwrap_err();
         let second = hub.register(&a).unwrap();
         assert_ne!(first.id, second.id);
         assert_eq!(first_close.try_recv(), Ok(CLOSE_CODE_REPLACED));
@@ -477,7 +477,7 @@ mod tests {
         let hub = Hub::new();
         let mut one = hub.register(&agent("a")).unwrap().close;
         let two = hub.register(&agent("b")).unwrap();
-        assert!(one.try_recv().is_err());
+        one.try_recv().unwrap_err();
         assert_eq!(hub.connected().len(), 2);
         assert!(hub.leave(&agent("b"), two.id));
     }
@@ -515,7 +515,7 @@ mod tests {
         let mut tasks = hub.begin_stop();
         assert_eq!(tasks.len(), 1);
         let _ = release.send(());
-        assert!(tasks.join_next().await.unwrap().is_ok());
+        tasks.join_next().await.unwrap().unwrap();
     }
 
     // ----- the queues (ADR-468 item 12)
@@ -577,7 +577,7 @@ mod tests {
             reg.outbound.try_recv().is_err(),
             "the connection is untouched"
         );
-        assert!(hub.send_job_command(&a, fits).is_ok());
+        hub.send_job_command(&a, fits).unwrap();
         assert_eq!(
             reg.outbound.try_recv().unwrap().len(),
             MAX_CONTROL_MESSAGE_LEN - (widest.len() - "c-4".len())
@@ -632,7 +632,7 @@ mod tests {
             Err(SendError::Busy)
         );
         reg.outbound.try_recv().unwrap();
-        assert!(hub.send_job_command(&a, "j".to_owned()).is_ok());
+        hub.send_job_command(&a, "j".to_owned()).unwrap();
     }
 
     #[test]
@@ -786,10 +786,10 @@ mod tests {
         );
         let delivery = hub.send_job_command(&a, "k".to_owned()).unwrap();
         assert_eq!(delivery.connection, new.id);
-        assert!(new.outbound.try_recv().is_ok());
+        new.outbound.try_recv().unwrap();
         // The old task never writes what it still holds (its close instruction comes first), and
         // its queue has no sender left once the entry is replaced.
-        assert!(old.outbound.try_recv().is_ok());
+        old.outbound.try_recv().unwrap();
         assert!(matches!(
             old.outbound.try_recv(),
             Err(mpsc::error::TryRecvError::Disconnected)
@@ -809,7 +809,7 @@ mod tests {
         assert_eq!(hub.connected(), vec![(a.clone(), reg.id)]);
         // A later connection is not told by the earlier instruction.
         let mut next = hub.register(&a).unwrap();
-        assert!(next.close.try_recv().is_err());
+        next.close.try_recv().unwrap_err();
     }
 
     #[test]
@@ -928,7 +928,7 @@ mod tests {
         for code in [1000, 1005, 1006, 1015, 4000, 0] {
             assert!(!hub.close_connection(&a, reg.id, code), "code {code}");
         }
-        assert!(reg.close.try_recv().is_err());
+        reg.close.try_recv().unwrap_err();
         let _tasks = hub.begin_stop();
         assert!(!hub.ack_events(&a, reg.id, 1), "the stop has begun");
     }

@@ -203,8 +203,8 @@ fn required_tables_must_exist_and_variants_needs_a_row() {
         vec![at(MissingColumn, "variants.csv", None, None)]
     );
     // An optional table may be left out.
-    assert!(read_files(without("nrcs.csv")).is_ok());
-    assert!(read_files(with("nrcs.csv", "")).is_ok());
+    read_files(without("nrcs.csv")).unwrap();
+    read_files(with("nrcs.csv", "")).unwrap();
 }
 
 // ---------------------------------------------------------------- Section 2: dialect
@@ -317,7 +317,7 @@ fn ranges_follow_each_column() {
     let service = |sid: &str| table_errors("services.csv", "name,sid", &[&format!("s,{sid}")]);
     assert_eq!(service("0x3F"), vec![cell(BadValue, 2, "sid")]);
     assert_eq!(service("0xC0"), vec![cell(BadValue, 2, "sid")]);
-    assert!(read_files(with("services.csv", "name,sid,p2_ms\ns,0xBF,1\n")).is_ok());
+    read_files(with("services.csv", "name,sid,p2_ms\ns,0xBF,1\n")).unwrap();
     let comparam = |value: &str| {
         table_errors(
             "comparams.csv",

@@ -136,7 +136,7 @@ mod unix {
         // The library is world-writable, but only the naming file is checked.
         chmod(&t.lib, 0o666);
         let files = std::slice::from_ref(&t.naming);
-        assert!(check_files_with(files, &policy()).is_ok());
+        check_files_with(files, &policy()).unwrap();
         chmod(&t.naming, 0o664);
         let e = check_files_with(files, &policy()).unwrap_err();
         assert_eq!(e.findings.len(), 1);
@@ -210,7 +210,7 @@ mod unix {
         let link = t.base.join("link");
         symlink(&t.dir, &link).unwrap();
         let via = link.join("lib.so");
-        assert!(check_writability_with(&via, &[], &policy()).is_ok());
+        check_writability_with(&via, &[], &policy()).unwrap();
         // The directory the link points to is still checked, as the library directory.
         chmod(&t.dir, 0o777);
         let e = check_writability_with(&via, &[], &policy()).unwrap_err();
@@ -222,7 +222,7 @@ mod unix {
         let t = tree();
         let link = t.base.join("lib-link.so");
         symlink(&t.lib, &link).unwrap();
-        assert!(check_writability_with(&link, &[], &policy()).is_ok());
+        check_writability_with(&link, &[], &policy()).unwrap();
         chmod(&t.lib, 0o666);
         let e = check_writability_with(&link, &[], &policy()).unwrap_err();
         assert_eq!(e.findings.len(), 1);
@@ -234,7 +234,7 @@ mod unix {
         let t = tree();
         let link = t.dir.join("rel.so");
         symlink("../dir/lib.so", &link).unwrap();
-        assert!(check_writability_with(&link, &[], &policy()).is_ok());
+        check_writability_with(&link, &[], &policy()).unwrap();
         chmod(&t.lib, 0o666);
         let e = check_writability_with(&link, &[], &policy()).unwrap_err();
         assert!(strictly_find(&e, &t.lib, Role::Library));
@@ -250,7 +250,7 @@ mod unix {
         chmod(&sub, 0o755);
         let link = sub.join("l.so");
         symlink("../lib.so", &link).unwrap();
-        assert!(check_writability_with(&link, &[], &policy()).is_ok());
+        check_writability_with(&link, &[], &policy()).unwrap();
         chmod(&t.dir, 0o1777);
         let e = check_writability_with(&link, &[], &policy()).unwrap_err();
         assert!(strictly_find(&e, &t.dir, Role::LibraryDirectory), "{e}");

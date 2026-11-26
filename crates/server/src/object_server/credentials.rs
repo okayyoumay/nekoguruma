@@ -362,7 +362,7 @@ mod tests {
         }
         std::fs::set_permissions(secret(dir.path()), std::fs::Permissions::from_mode(0o400))
             .unwrap();
-        assert!(Credentials::load_or_create(dir.path()).is_ok());
+        Credentials::load_or_create(dir.path()).unwrap();
     }
 
     // K5
@@ -434,7 +434,7 @@ mod tests {
             Err(CredentialsError::FileNotOwned)
         ));
         std::os::unix::fs::chown(secret(dir.path()), Some(0), None).unwrap();
-        assert!(Credentials::load_or_create(dir.path()).is_ok());
+        Credentials::load_or_create(dir.path()).unwrap();
         std::os::unix::fs::chown(dir.path(), Some(other), None).unwrap();
         assert!(matches!(
             Credentials::load_or_create(dir.path()),

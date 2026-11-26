@@ -125,7 +125,7 @@ mod tests {
     fn mint_then_verify_round_trips() {
         let now = SystemTime::now();
         let (token, _exp) = mint(&KEY, "test-client", now);
-        assert!(verify(&KEY, &token, now).is_ok());
+        verify(&KEY, &token, now).unwrap();
     }
 
     #[test]

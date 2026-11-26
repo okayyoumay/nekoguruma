@@ -593,7 +593,7 @@ mod tests {
                 assert_eq!(files(dir.path()), before);
             }
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
-            assert!(TlsFiles::load_or_create(dir.path()).is_ok());
+            TlsFiles::load_or_create(dir.path()).unwrap();
         }
     }
 
@@ -615,7 +615,7 @@ mod tests {
             ));
             std::os::unix::fs::chown(&path, Some(0), None).unwrap();
         }
-        assert!(TlsFiles::load_or_create(dir.path()).is_ok());
+        TlsFiles::load_or_create(dir.path()).unwrap();
         std::os::unix::fs::chown(dir.path(), Some(other), None).unwrap();
         assert!(matches!(
             TlsFiles::load_or_create(dir.path()),

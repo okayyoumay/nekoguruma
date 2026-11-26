@@ -1292,10 +1292,7 @@ mod validate_vendor_ioctl_buffers_tests {
             input_bytes: 0,
             output_bytes: 0,
         };
-        assert!(
-            validate_vendor_ioctl_buffers(Some(contract), 0x10000, &request(false, None, 0))
-                .is_ok()
-        );
+        validate_vendor_ioctl_buffers(Some(contract), 0x10000, &request(false, None, 0)).unwrap();
     }
 
     #[test]
@@ -1343,14 +1340,8 @@ mod validate_vendor_ioctl_buffers_tests {
             input_required: true,
             output_required: false,
         };
-        assert!(
-            validate_vendor_ioctl_buffers(
-                Some(contract),
-                0x10000,
-                &request(true, Some(Vec::new()), 0)
-            )
-            .is_ok()
-        );
+        validate_vendor_ioctl_buffers(Some(contract), 0x10000, &request(true, Some(Vec::new()), 0))
+            .unwrap();
     }
 
     #[test]
@@ -1371,9 +1362,7 @@ mod validate_vendor_ioctl_buffers_tests {
             input_required: false,
             output_required: false,
         };
-        assert!(
-            validate_vendor_ioctl_buffers(Some(contract), 0x10000, &request(true, None, 0)).is_ok()
-        );
+        validate_vendor_ioctl_buffers(Some(contract), 0x10000, &request(true, None, 0)).unwrap();
     }
 
     #[test]
@@ -1473,10 +1462,7 @@ mod validate_vendor_ioctl_buffers_tests {
             input_bytes: 0,
             output_bytes: 4,
         };
-        assert!(
-            validate_vendor_ioctl_buffers(Some(contract), 0x10000, &request(false, None, 4))
-                .is_ok()
-        );
+        validate_vendor_ioctl_buffers(Some(contract), 0x10000, &request(false, None, 4)).unwrap();
     }
 
     #[test]
@@ -1485,14 +1471,12 @@ mod validate_vendor_ioctl_buffers_tests {
             input_bytes: 4,
             output_bytes: 4,
         };
-        assert!(
-            validate_vendor_ioctl_buffers(
-                Some(contract),
-                0x10000,
-                &request(false, Some(vec![0; 4]), 4)
-            )
-            .is_ok()
-        );
+        validate_vendor_ioctl_buffers(
+            Some(contract),
+            0x10000,
+            &request(false, Some(vec![0; 4]), 4),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1516,14 +1500,12 @@ mod validate_vendor_ioctl_buffers_tests {
             input_required: false,
             output_required: false,
         };
-        assert!(
-            validate_vendor_ioctl_buffers(
-                Some(contract),
-                0x10000,
-                &request(true, None, VENDOR_IOCTL_MAX_WRAPPED_CAPACITY)
-            )
-            .is_ok()
-        );
+        validate_vendor_ioctl_buffers(
+            Some(contract),
+            0x10000,
+            &request(true, None, VENDOR_IOCTL_MAX_WRAPPED_CAPACITY),
+        )
+        .unwrap();
     }
 }
 

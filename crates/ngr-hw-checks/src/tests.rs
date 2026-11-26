@@ -257,8 +257,8 @@ payload = [1]
         assert!(parse(&text).is_err(), "{control}");
     }
     let twice = "[[hardware-control]]\nkind = \"pin-switch\"\nname = \"x\"\npins = [7]\n";
-    assert!(parse(&t1(&format!("{twice}{twice}"))).is_err());
-    assert!(parse(&t1("[power]\noff = []\non = [\"relay\"]")).is_err());
+    parse(&t1(&format!("{twice}{twice}"))).unwrap_err();
+    parse(&t1("[power]\noff = []\non = [\"relay\"]")).unwrap_err();
 }
 
 #[test]
@@ -299,11 +299,11 @@ fn an_incomplete_or_inconsistent_profile_is_refused() {
     .unwrap();
     // T0 needs two endpoints, and the other classes one link.
     let one_endpoint = T0_PROFILE.rsplit_once("[[endpoint]]").unwrap().0;
-    assert!(parse(one_endpoint).is_err());
-    assert!(parse(&T0_PROFILE.replace("class = \"T0\"", "class = \"T1\"")).is_err());
-    assert!(parse(&t1("").replace("class = \"T1\"", "class = \"T0\"")).is_err());
+    parse(one_endpoint).unwrap_err();
+    parse(&T0_PROFILE.replace("class = \"T0\"", "class = \"T1\"")).unwrap_err();
+    parse(&t1("").replace("class = \"T1\"", "class = \"T0\"")).unwrap_err();
     // An endpoint names a VCI or a SocketCAN interface, not both.
-    assert!(parse(&T0_PROFILE.replace("socketcan = \"can0\"", "")).is_err());
+    parse(&T0_PROFILE.replace("socketcan = \"can0\"", "")).unwrap_err();
 }
 
 #[test]
@@ -330,7 +330,7 @@ fn more_fields_are_checked_against_the_setup() {
         assert_ne!(text, t1(""), "{from}");
         assert!(parse(&text).is_err(), "{to}");
     }
-    assert!(parse(&t1("").replace("addressing = \"normal\"", "addressing = \"mixed\"")).is_err());
+    parse(&t1("").replace("addressing = \"normal\"", "addressing = \"mixed\"")).unwrap_err();
     for control in [
         "kind = \"pin-switch\"\nname = \"x\"\npins = [7, 7]",
         "kind = \"pin-switch\"\nname = \"x\"\npins = [17]",
@@ -339,14 +339,14 @@ fn more_fields_are_checked_against_the_setup() {
         let text = t1(&format!("[[hardware-control]]\n{control}"));
         assert!(parse(&text).is_err(), "{control}");
     }
-    assert!(parse(&t1("[power]\noff = [\"\"]\non = [\"relay\"]")).is_err());
+    parse(&t1("[power]\noff = [\"\"]\non = [\"relay\"]")).unwrap_err();
     // The worker's default entry label cannot name the profile's entry, also with spaces round it.
     for label in ["j2534-0404", " j2534-0404 "] {
         let text = t1("").replacen("label = \"bench\"", &format!("label = \"{label}\""), 1);
         assert!(parse(&text).is_err(), "{label}");
     }
     // A blank value is an empty one.
-    assert!(parse(&t1("").replacen("label = \"bench\"", "label = \" \"", 1)).is_err());
+    parse(&t1("").replacen("label = \"bench\"", "label = \" \"", 1)).unwrap_err();
     // A D-PDU API module reports coded versions, so its profile writes them as such; a J2534
     // device reports strings, which are taken as written.
     parse(T0_PROFILE).unwrap();
@@ -459,7 +459,7 @@ fn a_loopback_runs_between_two_ends_of_one_bus() {
         &loopback(jvci, &partner(&ch1)),
         "must be different channels",
     );
-    assert!(parse(&loopback(&with_channel(jvci, " "), &partner(&ch1))).is_err());
+    parse(&loopback(&with_channel(jvci, " "), &partner(&ch1))).unwrap_err();
     // A channel has no surrounding whitespace: the worker does not trim it.
     for padded in [" CAN_CH2", "CAN_CH2 "] {
         refused_for(
@@ -663,7 +663,7 @@ fn a_loopback_runs_between_two_ends_of_one_bus() {
         j2534("bench-a", "Vendor VCI B", "VCI-2"),
         j2534("bench-b", "Vendor VCI A", "VCI-2"),
     ] {
-        assert!(parse(&loopback(&first, &partner(&other))).is_err());
+        parse(&loopback(&first, &partner(&other))).unwrap_err();
     }
     // A loopback across the two APIs is two modules (design 13.5).
     parse(&loopback(

@@ -1401,7 +1401,7 @@ mod tests {
         let bucket = vehicle_bucket(&vin(VIN_A));
         std::os::unix::fs::symlink(&target, vehicle_path(&dir, bucket)).unwrap();
         std::os::unix::fs::symlink(&target, vci_path(&dir, "VCI-1")).unwrap();
-        assert!(JobGuards::take_vci_only(&setup(&dir, "VCI-1"), POLL, &never).is_err());
+        JobGuards::take_vci_only(&setup(&dir, "VCI-1"), POLL, &never).unwrap_err();
         let mut guards = JobGuards::take_vci_only(&setup(&dir, "VCI-2"), POLL, &never).unwrap();
         // The sweep leaves the symlink alone and creates the rest; only this bucket fails.
         assert!(guards.take_vehicle(&vin(VIN_A), POLL, &never).is_err());

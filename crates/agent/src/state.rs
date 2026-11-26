@@ -245,7 +245,7 @@ mod tests {
                 user_base_dir(env(&[("LOCALAPPDATA", r"C:\Users\a\AppData\Local")])).unwrap(),
                 PathBuf::from(r"C:\Users\a\AppData\Local")
             );
-            assert!(user_base_dir(env(&[])).is_err());
+            user_base_dir(env(&[])).unwrap_err();
         } else {
             assert_eq!(
                 user_base_dir(env(&[("XDG_STATE_HOME", "/x/state"), ("HOME", "/home/a")])).unwrap(),
@@ -255,7 +255,7 @@ mod tests {
                 user_base_dir(env(&[("XDG_STATE_HOME", "relative"), ("HOME", "/home/a")])).unwrap(),
                 PathBuf::from("/home/a/.local/state")
             );
-            assert!(user_base_dir(env(&[])).is_err());
+            user_base_dir(env(&[])).unwrap_err();
         }
     }
 
@@ -298,7 +298,7 @@ mod tests {
             assert_eq!(root_from(mode, &var).unwrap(), PathBuf::from(abs));
         }
         let relative = |name: &str| (name == STATE_DIR_VAR).then(|| OsString::from("rel"));
-        assert!(root_from(OperatingMode::User, &relative).is_err());
+        root_from(OperatingMode::User, &relative).unwrap_err();
     }
 
     #[cfg(not(debug_assertions))]
@@ -340,17 +340,17 @@ mod tests {
     fn a_missing_installation_root_is_an_error_and_is_not_created() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("absent");
-        assert!(prepare_subdir(&root, false, "identity").is_err());
+        prepare_subdir(&root, false, "identity").unwrap_err();
         assert!(!root.exists());
         std::fs::create_dir(&root).unwrap();
-        assert!(prepare_subdir(&root, false, "identity").is_ok());
+        prepare_subdir(&root, false, "identity").unwrap();
     }
 
     #[test]
     fn a_sub_directory_that_is_a_file_is_refused() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("identity"), b"x").unwrap();
-        assert!(prepare_subdir(temp.path(), true, "identity").is_err());
+        prepare_subdir(temp.path(), true, "identity").unwrap_err();
     }
 
     #[cfg(unix)]
@@ -368,6 +368,6 @@ mod tests {
             );
         }
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(prepare_subdir(temp.path(), true, "identity").is_ok());
+        prepare_subdir(temp.path(), true, "identity").unwrap();
     }
 }

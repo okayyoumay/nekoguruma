@@ -98,7 +98,7 @@ async fn an_issued_code_is_stored_by_its_hash_with_the_database_clocks_expiry() 
         .unwrap();
 
     assert_eq!(issued.server_key_id, f.key_id);
-    assert!(RegistrationCode::parse(issued.code.as_str()).is_ok());
+    RegistrationCode::parse(issued.code.as_str()).unwrap();
     let row = |column: &str| {
         let sql = format!(
             "SELECT {column} FROM agent_registration_codes WHERE code_sha256 = decode('{}', 'hex')",

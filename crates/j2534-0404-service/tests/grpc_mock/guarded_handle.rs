@@ -1305,12 +1305,10 @@ async fn the_raw_api_is_refused_outside_t0() {
         handle.raw_listen(cll).await,
         Err(HandleError::Refused { .. })
     ));
-    assert!(
-        handle
-            .raw_receive(cll, &[1], std::time::Duration::from_millis(10))
-            .await
-            .is_err()
-    );
+    handle
+        .raw_receive(cll, &[1], std::time::Duration::from_millis(10))
+        .await
+        .unwrap_err();
     assert_eq!(server.backdoor.write_msgs_count(), written);
     drop(handle);
     run.pass();

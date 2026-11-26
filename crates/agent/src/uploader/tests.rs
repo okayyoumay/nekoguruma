@@ -472,12 +472,10 @@ async fn a_poisoned_ledger_is_reopened_and_an_entry_whose_append_landed_is_uploa
     let mut rig = Rig::with_probe(failing(&[(Step::AfterSync, &armed)]));
     rig.start();
     // The append lands, its sync reports a failure, and the ledger is poisoned.
-    assert!(
-        rig.ledger()
-            .enqueue_result(jk(1), DATA.to_vec())
-            .await
-            .is_err()
-    );
+    rig.ledger()
+        .enqueue_result(jk(1), DATA.to_vec())
+        .await
+        .unwrap_err();
     armed.store(false, Ordering::SeqCst);
     // The failed enqueue woke the loop, which reopened the ledger and found the entry.
     rig.until(|s| s.delivered == 1).await;
@@ -497,12 +495,10 @@ async fn a_reopen_that_fails_keeps_uploading_from_memory_and_the_removal_is_retr
     rig.result(1, DATA).await;
     // A second entry lands on disk and poisons the ledger, which then cannot be reopened.
     append.store(true, Ordering::SeqCst);
-    assert!(
-        rig.ledger()
-            .enqueue_result(jk(2), DATA.to_vec())
-            .await
-            .is_err()
-    );
+    rig.ledger()
+        .enqueue_result(jk(2), DATA.to_vec())
+        .await
+        .unwrap_err();
     append.store(false, Ordering::SeqCst);
     reopen.store(true, Ordering::SeqCst);
     rig.start();
@@ -546,12 +542,10 @@ async fn an_idle_loop_keeps_reopening_a_poisoned_ledger_and_finds_the_entry_that
     append.store(true, Ordering::SeqCst);
     reopen.store(true, Ordering::SeqCst);
     // The append lands, its sync fails: poisoned, the entry on disk only.
-    assert!(
-        rig.ledger()
-            .enqueue_result(jk(1), DATA.to_vec())
-            .await
-            .is_err()
-    );
+    rig.ledger()
+        .enqueue_result(jk(1), DATA.to_vec())
+        .await
+        .unwrap_err();
     append.store(false, Ordering::SeqCst);
     // Storage stays bad for 30 seconds with no further enqueue: the reopens go on, paced by
     // the back-off (waits of 1, 2, 4, 8, 16 seconds), not in a spin.
@@ -569,12 +563,10 @@ async fn an_idle_loop_keeps_reopening_a_poisoned_ledger_and_finds_the_entry_that
 async fn a_ledger_file_that_does_not_read_back_ends_the_task() {
     let armed = flag(true);
     let mut rig = Rig::with_probe(failing(&[(Step::AfterSync, &armed)]));
-    assert!(
-        rig.ledger()
-            .enqueue_result(jk(1), DATA.to_vec())
-            .await
-            .is_err()
-    );
+    rig.ledger()
+        .enqueue_result(jk(1), DATA.to_vec())
+        .await
+        .unwrap_err();
     fs::write(rig.dir.path().join(AGENT_ID), b"not a ledger").unwrap();
     rig.start();
     tokio::time::timeout(secs(5), rig.handle().stopped())
@@ -1367,12 +1359,10 @@ async fn a_status_answering_finished_completing_or_failed_is_acted_on() {
 async fn a_corrupt_reopen_that_races_a_stop_does_not_end_the_task_as_unusable() {
     let armed = flag(true);
     let mut rig = Rig::with_probe(failing(&[(Step::AfterSync, &armed)]));
-    assert!(
-        rig.ledger()
-            .enqueue_result(jk(1), DATA.to_vec())
-            .await
-            .is_err()
-    );
+    rig.ledger()
+        .enqueue_result(jk(1), DATA.to_vec())
+        .await
+        .unwrap_err();
     fs::write(rig.dir.path().join(AGENT_ID), b"not a ledger").unwrap();
     // Hold the ledger so that the loop's reopen waits, then stop before it can answer.
     let shared = rig.ledger().clone();

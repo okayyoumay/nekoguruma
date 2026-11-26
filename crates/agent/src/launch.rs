@@ -779,8 +779,8 @@ mod tests {
         // An override of the caller wins over the definition.
         assert_eq!(width(Abi::LinuxX86_64, Some(8), Some(4)), 8);
         // A width the ABI cannot have is refused, from either source.
-        assert!(worker_long_size("v", Abi::LinuxX86, None, &library(Some(8))).is_err());
-        assert!(worker_long_size("v", Abi::LinuxX86, Some(8), &library(None)).is_err());
+        worker_long_size("v", Abi::LinuxX86, None, &library(Some(8))).unwrap_err();
+        worker_long_size("v", Abi::LinuxX86, Some(8), &library(None)).unwrap_err();
     }
 
     #[test]

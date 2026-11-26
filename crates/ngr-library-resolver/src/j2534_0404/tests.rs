@@ -263,7 +263,7 @@ fn a_linked_definition_directory_is_refused() {
         Err(ResolveError::LinkedDirectory { .. })
     ));
     // The directory it points to is read as usual.
-    assert!(resolve_in_dir(&real, "Linked").is_ok());
+    resolve_in_dir(&real, "Linked").unwrap();
 }
 
 #[test]

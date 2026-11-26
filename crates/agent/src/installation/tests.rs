@@ -121,7 +121,7 @@ fn c5_a_file_over_64_kib_is_refused() {
         assert_eq!(text.len(), size);
         text
     };
-    assert!(parse(pad(MAX_SIZE as usize).as_bytes()).is_ok());
+    parse(pad(MAX_SIZE as usize).as_bytes()).unwrap();
     assert_eq!(
         parse(pad(MAX_SIZE as usize + 1).as_bytes()),
         Err(InstallationError::TooLarge)
@@ -381,7 +381,7 @@ fn d7_d8_the_distribution_root_is_one_p256_pem_block() {
             "{shown}"
         );
     }
-    assert!(parse(with_pem(&good).as_bytes()).is_ok());
+    parse(with_pem(&good).as_bytes()).unwrap();
     assert_eq!(
         err("mode = \"user\"\nserver_url = \"http://127.0.0.1:1\"\ndistribution_root_pem = 1\n"),
         invalid("distribution_root_pem", "must be a string")
@@ -759,10 +759,10 @@ fn b3_b4_a_writable_ancestor_is_refused_unless_it_is_sticky() {
     ));
     // B4: sticky, as /tmp is: others may add entries but not replace the file.
     set_mode(&dir, 0o1777);
-    assert!(load(&path, &trusting()).is_ok());
+    load(&path, &trusting()).unwrap();
     // A directory that only its owner can write is accepted.
     set_mode(&dir, 0o755);
-    assert!(load(&path, &trusting()).is_ok());
+    load(&path, &trusting()).unwrap();
 }
 
 /// B5, B6: a link is followed when every entry on the way passes (a trusted owner's link is
@@ -776,7 +776,7 @@ fn b5_b6_a_link_is_judged_with_its_target() {
     let target = file_in(&real, &device());
     let link = temp.path().join("link.toml");
     std::os::unix::fs::symlink(&target, &link).unwrap();
-    assert!(load(&link, &trusting()).is_ok());
+    load(&link, &trusting()).unwrap();
     // A target in a directory others can write is refused through the link.
     set_mode(&real, 0o777);
     assert!(matches!(
@@ -787,7 +787,7 @@ fn b5_b6_a_link_is_judged_with_its_target() {
     // refused or unreadable, never accepted.
     set_mode(&real, 0o755);
     std::fs::remove_file(&target).unwrap();
-    assert!(load(&link, &trusting()).is_err());
+    load(&link, &trusting()).unwrap_err();
 }
 
 /// B7: the path is not a regular file (a directory) and is refused.

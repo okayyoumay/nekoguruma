@@ -909,7 +909,7 @@ mod tests {
     #[test]
     fn the_digest_is_64_lowercase_hex_digits() {
         let with = |digest: Value| post(json!({ "jobIds": [A], "scopeDigest": digest }));
-        assert!(with(json!(DIGEST)).is_ok());
+        with(json!(DIGEST)).unwrap();
         for bad in [
             json!(&DIGEST[..63]),
             json!(format!("{DIGEST}a")),
@@ -933,7 +933,7 @@ mod tests {
     #[test]
     fn an_unknown_or_repeated_property_trailing_bytes_and_a_wrong_type_are_refused() {
         let good = format!(r#"{{"jobIds":["{A}"],"scopeDigest":"{DIGEST}"}}"#);
-        assert!(post_raw(&good).is_ok());
+        post_raw(&good).unwrap();
         for bad in [
             format!(r#"{{"jobIds":["{A}"],"scopeDigest":"{DIGEST}","extra":1}}"#),
             format!(r#"{{"jobIds":["{A}"],"jobIds":["{B}"],"scopeDigest":"{DIGEST}"}}"#),

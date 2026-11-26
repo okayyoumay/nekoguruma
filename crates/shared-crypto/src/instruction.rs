@@ -262,7 +262,7 @@ mod tests {
         );
         // The bound is on the payload: the largest is accepted, one more is not.
         let at_limit = seal(&key, &payload(MAX_PAYLOAD_LEN)).unwrap();
-        assert!(Envelope::split(&at_limit).is_ok());
+        Envelope::split(&at_limit).unwrap();
         let mut over = at_limit;
         over.push(0);
         assert_eq!(
@@ -313,6 +313,6 @@ mod tests {
         // r = 0 is out of range.
         blob[33..65].fill(0);
         let env = Envelope::split(&blob).unwrap();
-        assert!(env.signature().is_err());
+        env.signature().unwrap_err();
     }
 }

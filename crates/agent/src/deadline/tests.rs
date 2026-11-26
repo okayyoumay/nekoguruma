@@ -401,7 +401,7 @@ fn f16_a_second_store_is_in_use_until_the_first_and_every_clone_of_it_are_gone()
         Err(MarkError::InUse)
     ));
     drop(held);
-    assert!(IssueMark::open_in(dir.path(), AGENT).is_ok());
+    IssueMark::open_in(dir.path(), AGENT).unwrap();
 }
 
 // Codex review: a file read at open counts as synced only once its directory entry is durable.

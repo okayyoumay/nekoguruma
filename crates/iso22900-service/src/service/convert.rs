@@ -102,11 +102,12 @@ fn format_vendor_type_url(struct_type: u32) -> String {
 /// Parses a `ParamVendorSpecificStruct.type_url` per ADR-218 Decision item 3's
 /// grammar: `"pdu-cpst:0x<8 lowercase hex digits>"`.
 fn parse_vendor_type_url(type_url: &str) -> Result<u32, Status> {
-    let invalid = || {
-        Status::invalid_argument(format!(
+    let message = || {
+        format!(
             "vendor_specific.type_url must match \"pdu-cpst:0x<8 lowercase hex digits>\", got {type_url:?}"
-        ))
+        )
     };
+    let invalid = || Status::invalid_argument(message());
     let hex = type_url
         .strip_prefix(VENDOR_TYPE_URL_PREFIX)
         .ok_or_else(invalid)?;
@@ -117,7 +118,8 @@ fn parse_vendor_type_url(type_url: &str) -> Result<u32, Status> {
     {
         return Err(invalid());
     }
-    u32::from_str_radix(hex, 16).map_err(|_| invalid())
+    u32::from_str_radix(hex, 16)
+        .map_err(|e| Status::invalid_argument(format!("{}: {e}", message())))
 }
 
 fn map_proto_param_class(class: PduParamClass) -> Result<ParamClass, Status> {
@@ -136,8 +138,11 @@ fn map_proto_param_class(class: PduParamClass) -> Result<ParamClass, Status> {
 }
 
 fn map_raw_param_class(class: T_PDU_PC) -> Result<ParamClass, Status> {
-    let proto = PduParamClass::try_from(class.0 as i32)
-        .map_err(|_| Status::internal("received unknown com parameter class from API"))?;
+    let proto = PduParamClass::try_from(class.0 as i32).map_err(|e| {
+        Status::internal(format!(
+            "received unknown com parameter class from API: {e}"
+        ))
+    })?;
     map_proto_param_class(proto)
 }
 
@@ -365,10 +370,10 @@ pub(super) fn to_iso_param(
     id: ObjectId,
     resolve_vendor_entry_size: &mut dyn FnMut(E_PDU_CPST) -> Result<u32, Status>,
 ) -> Result<ComParam, Status> {
-    let class = map_proto_param_class(
-        PduParamClass::try_from(item.com_param_class)
-            .map_err(|_| Status::invalid_argument("param_item.com_param_class is invalid"))?,
-    )?;
+    let class =
+        map_proto_param_class(PduParamClass::try_from(item.com_param_class).map_err(|e| {
+            Status::invalid_argument(format!("param_item.com_param_class is invalid: {e}"))
+        })?)?;
 
     let (data_type, value) = match item.param_data {
         Some(param_item::ParamData::Unum32(v)) => (ParamDataType::U32, ComParamValue::U32(v)),
@@ -439,12 +444,13 @@ pub(super) fn from_iso_param(param: ComParam) -> Result<ParamItem, Status> {
 }
 
 fn u8_field(value: u32, name: &str) -> Result<u8, Status> {
-    u8::try_from(value).map_err(|_| Status::invalid_argument(format!("{name} must fit in 8 bits")))
+    u8::try_from(value)
+        .map_err(|e| Status::invalid_argument(format!("{name} must fit in 8 bits: {e}")))
 }
 
 fn u16_field(value: u32, name: &str) -> Result<u16, Status> {
     u16::try_from(value)
-        .map_err(|_| Status::invalid_argument(format!("{name} must fit in 16 bits")))
+        .map_err(|e| Status::invalid_argument(format!("{name} must fit in 16 bits: {e}")))
 }
 
 /// Converts a [`ParamStructfield`] (write direction) into the native

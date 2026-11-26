@@ -7510,9 +7510,9 @@ impl J2534Service {
             // all instead.
             for filter in &filters {
                 let filter_type = vci_service_interface::PduFilter::try_from(filter.filter_type)
-                    .map_err(|_| {
+                    .map_err(|e| {
                         Status::invalid_argument(format!(
-                            "unrecognized PDU_FLT filter_type {}",
+                            "unrecognized PDU_FLT filter_type {}: {e}",
                             filter.filter_type
                         ))
                     })?;
@@ -8126,7 +8126,7 @@ impl J2534Service {
     ) -> Result<Response<vci_service_interface::ObjectIdResponse>, Status> {
         let request = request.into_inner();
         let object_type = vci_service_interface::ObjectType::try_from(request.object_type)
-            .map_err(|_| Status::invalid_argument("object_type is invalid"))?;
+            .map_err(|e| Status::invalid_argument(format!("object_type is invalid: {e}")))?;
         let object_id = Self::resolve_object_id(object_type, &request.shortname)?;
 
         Ok(Response::new(vci_service_interface::ObjectIdResponse {

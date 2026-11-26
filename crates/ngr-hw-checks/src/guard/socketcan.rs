@@ -280,8 +280,11 @@ mod raw {
         /// A raw socket bound to `interface`. It receives every frame other nodes send, and none
         /// of its own (the socket default).
         pub fn open(interface: &str) -> std::io::Result<Self> {
-            let name = CString::new(interface).map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, "a NUL in the name")
+            let name = CString::new(interface).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("a NUL in the name: {e}"),
+                )
             })?;
             // SAFETY: `name` is a NUL-terminated string that lives across the call.
             let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
@@ -304,10 +307,10 @@ mod raw {
             // SAFETY: an all-zero `sockaddr_can` is valid; the fields set below are plain data.
             let mut address: libc::sockaddr_can = unsafe { std::mem::zeroed() };
             address.can_family = libc::AF_CAN as libc::sa_family_t;
-            address.can_ifindex = i32::try_from(index).map_err(|_| {
+            address.can_ifindex = i32::try_from(index).map_err(|e| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    "interface index too large",
+                    format!("interface index too large: {e}"),
                 )
             })?;
             // SAFETY: `address` is a `sockaddr_can` of the size passed, alive across the call.

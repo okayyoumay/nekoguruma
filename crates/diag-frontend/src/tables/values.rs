@@ -21,9 +21,9 @@ pub(crate) fn integer(cell: &str, signed: bool, min: i128, max: i128) -> Parsed<
             0
         } else {
             let magnitude = u128::from_str_radix(digits, 16)
-                .map_err(|_| format!("{cell:?} is not a hexadecimal integer"))?;
+                .map_err(|e| format!("{cell:?} is not a hexadecimal integer: {e}"))?;
             i128::try_from(magnitude)
-                .map_err(|_| format!("{cell} is out of range ({min} to {max})"))?
+                .map_err(|e| format!("{cell} is out of range ({min} to {max}): {e}"))?
         }
     } else {
         let (negative, digits) = match cell.strip_prefix('-') {
@@ -43,7 +43,7 @@ pub(crate) fn integer(cell: &str, signed: bool, min: i128, max: i128) -> Parsed<
         } else {
             digits
                 .parse()
-                .map_err(|_| format!("{cell:?} is not an integer"))?
+                .map_err(|e| format!("{cell:?} is not an integer: {e}"))?
         };
         if negative { -magnitude } else { magnitude }
     };
@@ -77,7 +77,7 @@ pub(crate) fn float(cell: &str) -> Parsed<f64> {
             return Err(bad());
         }
     }
-    let value: f64 = cell.parse().map_err(|_| bad())?;
+    let value: f64 = cell.parse().map_err(|e| format!("{}: {e}", bad()))?;
     if value.is_finite() {
         Ok(value)
     } else {
@@ -199,7 +199,7 @@ pub(crate) fn service_name(cell: &str) -> Parsed<ServiceName> {
     let bad = || format!("{cell:?} is not a service name");
     match cell.split_once('.') {
         None => Ok(ServiceName {
-            name: name(cell).map_err(|_| bad())?,
+            name: name(cell).map_err(|e| format!("{}: {e}", bad()))?,
             generated: None,
         }),
         Some((base, suffix)) => {
@@ -212,7 +212,7 @@ pub(crate) fn service_name(cell: &str) -> Parsed<ServiceName> {
                 _ => return Err(bad()),
             };
             Ok(ServiceName {
-                name: name(base).map_err(|_| bad())?,
+                name: name(base).map_err(|e| format!("{}: {e}", bad()))?,
                 generated: Some(generated),
             })
         }

@@ -108,9 +108,14 @@ pub async fn dispatch<C: JsonRpcHandler>(
                 .ok_or_else(|| JsonRpcError::invalid_params("missing 'key' parameter"))?;
             let decoded = base64::engine::general_purpose::STANDARD
                 .decode(key_b64)
-                .map_err(|_| JsonRpcError::invalid_params("'key' must be valid base64"))?;
-            let key: [u8; 32] = decoded.try_into().map_err(|_| {
-                JsonRpcError::invalid_params("'key' must decode to exactly 32 bytes")
+                .map_err(|e| {
+                    JsonRpcError::invalid_params(format!("'key' must be valid base64: {e}"))
+                })?;
+            let key: [u8; 32] = decoded.try_into().map_err(|rejected: Vec<u8>| {
+                JsonRpcError::invalid_params(format!(
+                    "'key' must decode to exactly 32 bytes: got {} bytes",
+                    rejected.len()
+                ))
             })?;
 
             match ctx {

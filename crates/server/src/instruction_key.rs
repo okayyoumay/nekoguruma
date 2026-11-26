@@ -18,8 +18,9 @@
 //! | unreadable, not a P-256 PKCS#8 key, or too open | any | refused, the file is never touched |
 //! | valid | another key | refused |
 //!
-//! Errors are fixed text and, for a failed file operation, the [`std::io::ErrorKind`]: never key
-//! bytes and never the file's contents.
+//! Errors are fixed text and, for a failed file operation, the [`std::io::ErrorKind`]. A key that
+//! does not parse and a failed random source keep the library's error as their source. None of
+//! them holds key bytes or the file's contents.
 
 use std::io::{self, Read};
 use std::path::Path;

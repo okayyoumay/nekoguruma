@@ -194,28 +194,28 @@ pub(super) fn resolve_tp20_connection_params(
         .unum32
         .get(&PARAM_TP20_APPLICATION_TYPE)
         .ok_or("CP_TP20ApplicationType must be staged before CoptStartcomm")?;
-    let destination_address = u8::try_from(destination_address).map_err(|_| {
+    let destination_address = u8::try_from(destination_address).map_err(|e| {
         format!(
             "CP_TP20DestinationAddress value {destination_address} exceeds the 1-byte range \
-             Table 78 packs it into"
+             Table 78 packs it into: {e}"
         )
     })?;
-    let tx_id_proposal = u16::try_from(tx_id_proposal).map_err(|_| {
+    let tx_id_proposal = u16::try_from(tx_id_proposal).map_err(|e| {
         format!(
             "CP_TP20TxIdProposal value {tx_id_proposal} exceeds the 2-byte range Table 78 packs \
-             it into"
+             it into: {e}"
         )
     })?;
-    let rx_id_proposal = u16::try_from(rx_id_proposal).map_err(|_| {
+    let rx_id_proposal = u16::try_from(rx_id_proposal).map_err(|e| {
         format!(
             "CP_TP20RxIdProposal value {rx_id_proposal} exceeds the 2-byte range Table 78 packs \
-             it into"
+             it into: {e}"
         )
     })?;
-    let application_type = u8::try_from(application_type).map_err(|_| {
+    let application_type = u8::try_from(application_type).map_err(|e| {
         format!(
             "CP_TP20ApplicationType value {application_type} exceeds the 1-byte range Table 78 \
-             packs it into"
+             packs it into: {e}"
         )
     })?;
     Ok(Tp20ConnectionParams {
@@ -283,16 +283,16 @@ pub(super) fn resolve_tp20_passive_params(
         );
     }
 
-    let identifier = u16::try_from(identifier).map_err(|_| {
+    let identifier = u16::try_from(identifier).map_err(|e| {
         format!(
             "CP_TP20PassiveIdentifier value {identifier} exceeds the 2-byte range Table 77 \
-             packs it into"
+             packs it into: {e}"
         )
     })?;
-    let rx_id_passive = u16::try_from(rx_id_passive).map_err(|_| {
+    let rx_id_passive = u16::try_from(rx_id_passive).map_err(|e| {
         format!(
             "CP_TP20PassiveRxId value {rx_id_passive} exceeds the 2-byte range Table 77 packs \
-             it into"
+             it into: {e}"
         )
     })?;
     if !(0x200..=0x2EF).contains(&identifier) {

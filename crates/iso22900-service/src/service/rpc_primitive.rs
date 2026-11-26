@@ -38,7 +38,7 @@ impl Iso22900Service {
         let control = control_for_start(request.cop_ctrl_data);
 
         let cop_type = match ComOperationType::try_from(request.cop_type)
-            .map_err(|_| Status::invalid_argument("cop_type is invalid"))?
+            .map_err(|e| Status::invalid_argument(format!("cop_type is invalid: {e}")))?
         {
             ComOperationType::CoptStartcomm => E_PDU_COPT::PDU_COPT_STARTCOMM,
             ComOperationType::CoptStopcomm => E_PDU_COPT::PDU_COPT_STOPCOMM,

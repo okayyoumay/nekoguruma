@@ -3571,7 +3571,7 @@ impl J2534Service {
                 } else {
                     shortname
                         .parse::<u32>()
-                        .map_err(|_| Status::not_found("unknown protocol shortname"))?
+                        .map_err(|e| Status::not_found(format!("unknown protocol shortname: {e}")))?
                 }
             }
             // ADR-069: resolves through the resources table's bus_type_name

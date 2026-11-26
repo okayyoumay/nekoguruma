@@ -331,8 +331,9 @@ async fn the_certificate_pin_survives_a_restart_and_changes_with_new_files() {
     third.stop(std::future::pending()).await;
 }
 
-/// R5: a server that is killed takes the real child with it (Linux).
-#[cfg(target_os = "linux")]
+/// R5: a server that is killed takes the real child with it (Linux: the parent-death signal;
+/// Windows: the kill-on-close job object, after a termination).
+#[cfg(any(target_os = "linux", windows))]
 #[test]
 fn a_killed_server_takes_the_real_child_with_it() {
     let pg = crate::support::TestPostgres::start();
@@ -352,7 +353,7 @@ fn a_killed_server_takes_the_real_child_with_it() {
     child.kill().unwrap();
     let _ = child.wait();
     let deadline = Instant::now() + Duration::from_secs(10);
-    while std::path::Path::new(&format!("/proc/{child_pid}")).exists() && !is_zombie(child_pid) {
+    while alive(child_pid) {
         assert!(
             Instant::now() < deadline,
             "the object server outlived the server"
@@ -386,6 +387,49 @@ fn rustfs_pid_of(parent: u32) -> u32 {
         assert!(Instant::now() < deadline, "the server has no child");
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// Whether `pid` still runs (Linux): it exists and is not a zombie.
+#[cfg(target_os = "linux")]
+fn alive(pid: u32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists() && !is_zombie(pid)
+}
+
+/// The ID of the child process of `parent` (Windows), as the process table reports it.
+#[cfg(windows)]
+fn rustfs_pid_of(parent: u32) -> u32 {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let out = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!(
+                    "(Get-CimInstance Win32_Process -Filter 'ParentProcessId={parent}').ProcessId"
+                ),
+            ])
+            .output()
+            .expect("run powershell");
+        if let Some(pid) = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find_map(|line| line.trim().parse::<u32>().ok())
+        {
+            return pid;
+        }
+        assert!(Instant::now() < deadline, "the server has no child");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Whether `pid` still runs (Windows): `tasklist` lists it.
+#[cfg(windows)]
+fn alive(pid: u32) -> bool {
+    let out = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .output()
+        .expect("run tasklist");
+    String::from_utf8_lossy(&out.stdout).contains(&pid.to_string())
 }
 
 #[cfg(target_os = "linux")]

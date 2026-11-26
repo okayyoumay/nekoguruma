@@ -53,7 +53,8 @@ such checks to run automatically.
 8. **Bans.** Two versions of one crate and wildcard requirements are allowed; this check does
    not govern them.
 9. **Targets.** `deny.toml` sets no `graph.targets`, so a dependency that only one platform's
-   build pulls in is checked too.
+   build pulls in is checked too, and `graph.all-features = true`, so a dependency that only an
+   optional feature enables is checked as well.
 10. **Run it locally** from the repository root with `cargo deny --locked check`, with the
     version the workflow pins.
 

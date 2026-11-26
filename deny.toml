@@ -2,6 +2,11 @@
 # dependency tree. Run it from the repository root with `cargo deny --locked check`; the CI job
 # `deps-audit` in .github/workflows/ci.yml does the same with the pinned cargo-deny.
 
+[graph]
+# Every feature of every workspace crate, so a dependency that only an optional feature enables
+# is checked too.
+all-features = true
+
 [advisories]
 # A vulnerability or an unsound crate fails the check wherever it is in the tree.
 unsound = "all"

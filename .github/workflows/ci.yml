@@ -41,6 +41,7 @@ jobs:
     outputs:
       code: ${{ steps.filter.outputs.code }}
       deps: ${{ steps.filter.outputs.deps }}
+      audit: ${{ steps.filter.outputs.audit }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -55,6 +56,7 @@ jobs:
           if [ "$EVENT" != pull_request ]; then
             echo code=true >> "$GITHUB_OUTPUT"
             echo deps=true >> "$GITHUB_OUTPUT"
+            echo audit=true >> "$GITHUB_OUTPUT"
             exit 0
           fi
           files="$(git diff --name-only "$BASE" HEAD)"
@@ -67,6 +69,11 @@ jobs:
             echo deps=true >> "$GITHUB_OUTPUT"
           else
             echo deps=false >> "$GITHUB_OUTPUT"
+          fi
+          if grep -qE '(^|/)Cargo\.(toml|lock)$|^\.cargo/|^deny\.toml$' <<< "$files"; then
+            echo audit=true >> "$GITHUB_OUTPUT"
+          else
+            echo audit=false >> "$GITHUB_OUTPUT"
           fi
 
   # Server and agent are 64-bit only.
@@ -246,6 +253,22 @@ jobs:
           key: msrv
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo check --workspace --all-targets --locked
+
+  # Advisories, licences and sources of the dependency tree (ADR-509, policy in deny.toml). It
+  # reads Cargo.lock and the manifests and compiles nothing, so it needs no toolchain cache. On
+  # pull requests it runs when a manifest, the lockfile, `.cargo/` or deny.toml changes; main runs
+  # it on every push that starts this workflow, which also catches an advisory published after the
+  # lockfile last changed. The advisory database is fetched from GitHub at run time.
+  deps-audit:
+    needs: changes
+    if: ${{ always() && (needs.changes.result != 'success' || needs.changes.outputs.audit == 'true') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.20.2
+      - run: cargo deny --locked check
 
   # The agent in release: ADR-247's guarantee (a release agent stays read-only and has no
   # simulator permission) rests on `cfg(not(debug_assertions))` code that the debug test jobs

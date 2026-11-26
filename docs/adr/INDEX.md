@@ -498,6 +498,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-506](ADR-506-release-artifacts-are-product-local-bundle-and-sdk-with-the-simulators-in-the-sdk.md) | Release Artifacts Are the Product, the Local-Profile Bundle and the SDK, With the Simulators in the SDK | Accepted | `docs/release-scope.md`, design 9.8 / 13, `sim-vci`, `sim-ecu`, the two mocks |
 | [ADR-507](ADR-507-the-windows-key-is-a-dpapi-blob-file-in-the-accounts-state-directory-created-once-and-tied-to-a-persistent-profile.md) | The Windows Key Is a DPAPI Blob File in the Account's State Directory, Created Once and Tied to a Persistent Profile | Accepted | design 6.4, `crates/agent` (`identity::blob_store`, `identity::dpapi`, store selection), `core-windows`; details ADR-459 item 4 and ADR-460 |
 | [ADR-508](ADR-508-an-operators-request-row-lets-a-communication-log-be-stored-and-the-agent-is-told-by-an-unsigned-control-message.md) | An Operator's Request Row Is What Lets a Communication Log Be Stored, and the Agent Is Told by an Unsigned Control Message | Accepted | design 4.3, 8.11, 13.4, 14.3, `crates/server` (`uploads`, `comm_log_requests`), `crates/agent`, `db/README.md`; details ADR-455; amends ADR-493 item 3's judgement of begin |
+| [ADR-509](ADR-509-dependencies-are-audited-with-cargo-deny-against-a-licence-allow-list-and-the-advisory-database.md) | Dependencies Are Audited With cargo-deny Against a Licence Allow-List and the Advisory Database | Accepted | `deny.toml`, `.github/workflows/ci.yml`, `CLAUDE.md`; `Cargo.toml` `license` keys |
 
 ## Status Legend
 
@@ -895,6 +896,7 @@ the predecessor repository these ADRs came from.
 - ADR-490
 - ADR-502
 - ADR-503
+- ADR-509
 
 ### Timestamps / Clock
 - ADR-057 (amended by ADR-102)

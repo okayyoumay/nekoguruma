@@ -474,11 +474,11 @@ mod tests {
         crate::document::tests::empty_program()
     }
 
-    fn run(error: JobError, first_run: bool, standing: JournalStanding) -> JobOutcome {
-        outcome(&Err(error), first_run, &standing)
+    fn run(error: JobError, first_run: bool, standing: &JournalStanding) -> JobOutcome {
+        outcome(&Err(error), first_run, standing)
     }
 
-    fn state(error: JobError, first_run: bool, standing: JournalStanding) -> JobState {
+    fn state(error: JobError, first_run: bool, standing: &JournalStanding) -> JobState {
         match run(error, first_run, standing) {
             JobOutcome::Terminal(state) => state,
             other => panic!("not terminal: {other:?}"),
@@ -628,7 +628,7 @@ mod tests {
                     detail: "the check failed".to_owned(),
                 };
                 assert_eq!(
-                    state(error, false, standing),
+                    state(error, false, &standing),
                     JobState::Failed {
                         code: FailureCode::Procedure,
                         detail: "the check failed".to_owned(),
@@ -646,7 +646,7 @@ mod tests {
                 detail: long,
             },
             true,
-            Clean,
+            &Clean,
         ) else {
             panic!("not failed");
         };
@@ -660,7 +660,7 @@ mod tests {
                 identity: IdentityKind::Vin,
             },
             false,
-            Resumable,
+            &Resumable,
         );
         assert_eq!(code_of(&vin), &FailureCode::VinMismatch);
         assert!(detail_of(&vin).contains("Vin"));
@@ -669,7 +669,7 @@ mod tests {
                 identity: IdentityKind::HardwarePartNumber,
             },
             false,
-            Clean,
+            &Clean,
         );
         assert_eq!(code_of(&hardware), &FailureCode::VariantMismatch);
         let software = state(
@@ -677,7 +677,7 @@ mod tests {
                 identity: IdentityKind::SoftwareVersion,
             },
             false,
-            Clean,
+            &Clean,
         );
         assert_eq!(code_of(&software), &FailureCode::Other);
     }
@@ -685,7 +685,7 @@ mod tests {
     #[test]
     fn a_stop_the_vm_made_is_a_procedure_error_whatever_the_journal() {
         for standing in [Clean, Resumable, on_site_standing()] {
-            let s = state(JobError::StepLimit(9), true, standing);
+            let s = state(JobError::StepLimit(9), true, &standing);
             assert_eq!(code_of(&s), &FailureCode::ProcedureError);
         }
         // A VM error is the run's own stop while the journal holds nothing; once it holds the
@@ -696,7 +696,7 @@ mod tests {
                 source: VmError::StackUnderflow,
             },
             true,
-            Clean,
+            &Clean,
         );
         assert_eq!(code_of(&s), &FailureCode::ProcedureError);
         assert!(matches!(s, JobState::Failed { .. }));
@@ -708,7 +708,7 @@ mod tests {
             pc: 2,
             source: VmError::StackUnderflow,
         };
-        let s = state(error(), false, Resumable);
+        let s = state(error(), false, &Resumable);
         assert!(matches!(s, JobState::NeedsOnSiteRecovery { .. }), "{s:?}");
         assert!(!detail_of(&s).is_empty());
     }
@@ -722,7 +722,7 @@ mod tests {
                 max: 3,
             }),
             false,
-            Resumable,
+            &Resumable,
         );
         assert_eq!(
             s,
@@ -739,7 +739,7 @@ mod tests {
                 millivolts: Some(12_345_678),
             },
         ] {
-            let s = state(JobError::OnSiteInterventionRequired(reason), true, Clean);
+            let s = state(JobError::OnSiteInterventionRequired(reason), true, &Clean);
             assert!(!detail_of(&s).contains(MARKER));
             assert!(!detail_of(&s).contains("12345678"));
         }
@@ -747,7 +747,7 @@ mod tests {
         let s = state(
             JobError::OnSiteInterventionRequired(OnSiteReason::UnconfirmedRequest { at }),
             false,
-            Clean,
+            &Clean,
         );
         assert_eq!(detail_of(&s), "UnconfirmedRequest: pc 4 step 9");
     }
@@ -761,7 +761,7 @@ mod tests {
             let s = state(
                 JobError::OnSiteInterventionRequired(OnSiteReason::JobContentDiffers),
                 false,
-                resumable,
+                &resumable,
             );
             assert_eq!(
                 s,
@@ -788,7 +788,7 @@ mod tests {
                     let error = nth(list, index);
                     let name = format!("{error:?}");
                     assert_eq!(
-                        run(error, first_run, on_site_standing()),
+                        run(error, first_run, &on_site_standing()),
                         JobOutcome::Terminal(expected.clone()),
                         "{name}"
                     );
@@ -801,11 +801,11 @@ mod tests {
     fn a_cancel_is_cancelled_while_the_journal_is_clean_and_open_after() {
         for first_run in [true, false] {
             assert_eq!(
-                state(JobError::Cancelled, first_run, Clean),
+                state(JobError::Cancelled, first_run, &Clean),
                 JobState::Cancelled
             );
             assert_eq!(
-                run(JobError::Cancelled, first_run, Resumable),
+                run(JobError::Cancelled, first_run, &Resumable),
                 JobOutcome::Open
             );
         }
@@ -830,14 +830,14 @@ mod tests {
                 })
         };
         for error in errors() {
-            let s = state(error, true, Clean);
+            let s = state(error, true, &Clean);
             assert!(matches!(s, JobState::PreconditionFailed { .. }), "{s:?}");
             assert_eq!(code_of(&s), &FailureCode::JobRefused);
             assert!(!detail_of(&s).is_empty());
         }
         // On a resume the same refusal is a failure.
         for error in errors() {
-            let s = state(error, false, Clean);
+            let s = state(error, false, &Clean);
             assert!(matches!(s, JobState::Failed { .. }), "{s:?}");
             assert_eq!(code_of(&s), &FailureCode::JobRefused);
         }
@@ -849,29 +849,29 @@ mod tests {
             for first_run in [true, false] {
                 let error = nth(deterministic_errors, index);
                 let name = format!("{error:?}");
-                let JobOutcome::Terminal(s) = run(error, first_run, Resumable) else {
+                let JobOutcome::Terminal(s) = run(error, first_run, &Resumable) else {
                     panic!("{name}: not terminal");
                 };
                 assert!(matches!(s, JobState::NeedsOnSiteRecovery { .. }), "{name}");
                 assert!(!detail_of(&s).is_empty(), "{name}");
             }
         }
-        let s = state(JobError::ArtifactDiffersFromJournal, false, Resumable);
+        let s = state(JobError::ArtifactDiffersFromJournal, false, &Resumable);
         assert!(matches!(s, JobState::NeedsOnSiteRecovery { .. }));
-        let s = state(JobError::ArtifactDiffersFromJournal, false, Clean);
+        let s = state(JobError::ArtifactDiffersFromJournal, false, &Clean);
         assert_eq!(code_of(&s), &FailureCode::JobRefused);
     }
 
     #[test]
     fn a_link_that_did_not_open_is_not_an_exchange_failure() {
-        let s = state(JobError::Link(HostError::NoResponse), true, Clean);
+        let s = state(JobError::Link(HostError::NoResponse), true, &Clean);
         assert!(matches!(s, JobState::PreconditionFailed { .. }));
         assert_eq!(code_of(&s), &FailureCode::LinkNotOpened);
         // On a resume the link is one more exchange.
-        let s = state(JobError::Link(HostError::NoResponse), false, Clean);
+        let s = state(JobError::Link(HostError::NoResponse), false, &Clean);
         assert!(matches!(s, JobState::Failed { .. }));
         assert_eq!(code_of(&s), &FailureCode::ExchangeFailed);
-        let s = state(JobError::LinkUnconfirmed, true, Clean);
+        let s = state(JobError::LinkUnconfirmed, true, &Clean);
         assert!(matches!(s, JobState::PreconditionFailed { .. }));
         assert_eq!(code_of(&s), &FailureCode::DeviceLocked);
     }
@@ -885,11 +885,11 @@ mod tests {
             JobError::NoCommLogDir,
             JobError::GuardsMissing,
         ] {
-            let s = state(error, true, Clean);
+            let s = state(error, true, &Clean);
             assert!(matches!(s, JobState::PreconditionFailed { .. }), "{s:?}");
             assert_eq!(code_of(&s), &FailureCode::Internal);
         }
-        let s = state(JobError::NoCommLogDir, false, Clean);
+        let s = state(JobError::NoCommLogDir, false, &Clean);
         assert!(matches!(s, JobState::Failed { .. }));
         // A panic and a journal fault can happen mid-run, so they are failures on a first run too.
         for first_run in [true, false] {
@@ -898,7 +898,7 @@ mod tests {
                 JobError::Journal(JournalError::Poisoned),
                 JobError::Journal(JournalError::Io(std::io::Error::other(MARKER))),
             ] {
-                let s = state(error, first_run, Clean);
+                let s = state(error, first_run, &Clean);
                 assert!(matches!(s, JobState::Failed { .. }), "{s:?}");
                 assert_eq!(code_of(&s), &FailureCode::Internal);
             }
@@ -906,7 +906,7 @@ mod tests {
         let s = state(
             JobError::Journal(JournalError::Io(std::io::Error::other(MARKER))),
             true,
-            Clean,
+            &Clean,
         );
         assert!(matches!(s, JobState::Failed { .. }), "{s:?}");
         assert_eq!(code_of(&s), &FailureCode::Internal);
@@ -928,11 +928,11 @@ mod tests {
             },
             JobError::VehicleLock(GuardError::OtherVehicleHeld),
         ] {
-            let s = state(error, true, Clean);
+            let s = state(error, true, &Clean);
             assert!(matches!(s, JobState::Failed { .. }), "{s:?}");
             assert_eq!(code_of(&s), &FailureCode::ExchangeFailed);
         }
-        let s = state(JobError::Unanswerable(WaitingOn::Hmi), false, Clean);
+        let s = state(JobError::Unanswerable(WaitingOn::Hmi), false, &Clean);
         assert_eq!(code_of(&s), &FailureCode::Other);
     }
 
@@ -942,7 +942,11 @@ mod tests {
             for index in 0..transient_errors().len() {
                 let error = nth(transient_errors, index);
                 let name = format!("{error:?}");
-                assert_eq!(run(error, first_run, Resumable), JobOutcome::Open, "{name}");
+                assert_eq!(
+                    run(error, first_run, &Resumable),
+                    JobOutcome::Open,
+                    "{name}"
+                );
             }
         }
     }
@@ -952,18 +956,14 @@ mod tests {
         for standing in [Clean, Resumable, decided(), on_site_standing()] {
             for first_run in [true, false] {
                 assert_eq!(
-                    run(
-                        JobError::Journal(JournalError::InUse),
-                        first_run,
-                        standing.clone()
-                    ),
+                    run(JobError::Journal(JournalError::InUse), first_run, &standing),
                     JobOutcome::None
                 );
                 assert_eq!(
                     run(
                         JobError::Journal(JournalError::AlreadyExists),
                         first_run,
-                        standing.clone()
+                        &standing
                     ),
                     JobOutcome::None
                 );
@@ -1042,7 +1042,7 @@ mod tests {
                     let error = marker_errors().swap_remove(index);
                     let text = error.log_text();
                     assert!(!text.contains(MARKER), "log_text: {text}");
-                    if let JobOutcome::Terminal(s) = run(error, first_run, standing) {
+                    if let JobOutcome::Terminal(s) = run(error, first_run, &standing) {
                         assert!(!detail_of(&s).contains(MARKER), "{text}: {s:?}");
                     }
                 }
@@ -1059,7 +1059,7 @@ mod tests {
                 actual: long,
             },
             true,
-            Clean,
+            &Clean,
         );
         assert!(detail_of(&s).len() <= MAX_FAILURE_DETAIL_LEN);
     }
@@ -1156,7 +1156,7 @@ mod tests {
             "{standing:?}"
         );
         // Whatever the run's error, the job ends in on-site recovery.
-        let s = state(JobError::Cancelled, true, standing);
+        let s = state(JobError::Cancelled, true, &standing);
         assert!(matches!(s, JobState::NeedsOnSiteRecovery { .. }), "{s:?}");
         assert!(detail_of(&s).starts_with("RecoveryRequiredSection: section 0"));
     }
@@ -1239,7 +1239,7 @@ mod tests {
                 let error = error();
                 let name = format!("{error:?}");
                 assert_eq!(
-                    run(error, first_run, standing.clone()),
+                    run(error, first_run, standing),
                     JobOutcome::Terminal(expected.clone()),
                     "{name}"
                 );
@@ -1266,7 +1266,7 @@ mod tests {
             code: String::new(),
             detail: "x".to_owned(),
         });
-        let s = state(JobError::Cancelled, false, standing);
+        let s = state(JobError::Cancelled, false, &standing);
         assert!(
             matches!(
                 &s,
@@ -1295,7 +1295,7 @@ mod tests {
                 matches!(standing, JournalStanding::Decided(_)),
                 "{standing:?}"
             );
-            let expected = state(JobError::IdentityMismatch { identity }, false, Clean);
+            let expected = state(JobError::IdentityMismatch { identity }, false, &Clean);
             assert_eq!(code_of(&expected), &code);
             assert_verdict(&standing, &expected);
             assert!(detail_of(&expected).contains(&format!("{identity:?}")));
@@ -1304,7 +1304,7 @@ mod tests {
         let standing = JournalStanding::Decided(JournalVerdict::Aborted {
             identity: IdentityKind::SoftwareVersion,
         });
-        let s = state(JobError::Cancelled, false, standing);
+        let s = state(JobError::Cancelled, false, &standing);
         assert_eq!(code_of(&s), &FailureCode::Other);
     }
 
@@ -1317,7 +1317,7 @@ mod tests {
                 .commit_run_stopped(stop, RunStop::StepLimit)
                 .unwrap();
         });
-        let expected = state(JobError::StepLimit(9), false, Clean);
+        let expected = state(JobError::StepLimit(9), false, &Clean);
         assert_eq!(code_of(&expected), &FailureCode::ProcedureError);
         assert_verdict(&standing, &expected);
         let standing = standing_after(&program(), |journal| {
@@ -1331,7 +1331,7 @@ mod tests {
                 source: VmError::StackUnderflow,
             },
             false,
-            Clean,
+            &Clean,
         );
         assert_eq!(code_of(&expected), &FailureCode::ProcedureError);
         assert_verdict(&standing, &expected);
@@ -1344,7 +1344,7 @@ mod tests {
             code: "c".to_owned(),
             detail: "é".repeat(MAX_FAILURE_DETAIL_LEN),
         });
-        let s = state(JobError::Cancelled, false, standing);
+        let s = state(JobError::Cancelled, false, &standing);
         assert_eq!(detail_of(&s).len(), MAX_FAILURE_DETAIL_LEN);
     }
 
@@ -1397,11 +1397,8 @@ mod tests {
         assert_eq!(standing, Resumable);
         // The same journal standing decides the run's end: a transient error leaves the job
         // open, a refusal every resume repeats ends it.
-        assert_eq!(
-            run(JobError::Cancelled, false, standing.clone()),
-            JobOutcome::Open
-        );
-        let s = state(JobError::NoDeclarations, false, standing);
+        assert_eq!(run(JobError::Cancelled, false, &standing), JobOutcome::Open);
+        let s = state(JobError::NoDeclarations, false, &standing);
         assert!(matches!(s, JobState::NeedsOnSiteRecovery { .. }), "{s:?}");
     }
 
@@ -1410,7 +1407,7 @@ mod tests {
         let s = state(
             JobError::Link(HostError::DeclaredLink("x".to_owned())),
             false,
-            Resumable,
+            &Resumable,
         );
         assert!(matches!(s, JobState::NeedsOnSiteRecovery { .. }), "{s:?}");
         assert!(!detail_of(&s).is_empty());
@@ -1421,7 +1418,7 @@ mod tests {
             HostError::Setup("the worker reports no module"),
         ] {
             assert_eq!(
-                run(JobError::Link(source), false, Resumable),
+                run(JobError::Link(source), false, &Resumable),
                 JobOutcome::Open
             );
         }
@@ -1435,7 +1432,7 @@ mod tests {
             JobError::Journal(JournalError::Io(std::io::Error::other("x"))),
             JobError::Journal(JournalError::Poisoned),
         ] {
-            assert_eq!(run(error, true, decided()), JobOutcome::Open);
+            assert_eq!(run(error, true, &decided()), JobOutcome::Open);
         }
     }
 }

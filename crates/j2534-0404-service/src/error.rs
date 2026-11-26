@@ -193,7 +193,7 @@ pub(crate) fn map_native_error_as(
     } else {
         Code::Internal
     };
-    status_with_error_detail(code, format!("{context} failed: {error}"), detail)
+    status_with_error_detail(code, format!("{context} failed: {error}"), &detail)
 }
 
 /// Maps the native failure of a `PassThruStartMsgFilter` that installs one
@@ -251,7 +251,7 @@ pub(crate) fn map_connect_filter_failure(
                 detail_text: Some(format!("{CONTEXT}: {error}")),
                 refusal: None,
             };
-            status_with_error_detail(Code::Unknown, format!("{CONTEXT} failed: {error}"), detail)
+            status_with_error_detail(Code::Unknown, format!("{CONTEXT} failed: {error}"), &detail)
         }
     }
 }
@@ -268,7 +268,7 @@ pub(crate) fn unknown_handle_status(message: impl Into<String>) -> Status {
         detail_text: None,
         refusal: None,
     };
-    status_with_error_detail(Code::NotFound, message, detail)
+    status_with_error_detail(Code::NotFound, message, &detail)
 }
 
 /// Builds a [`Status`] for an emulated D-PDU-level state-guard rejection
@@ -295,7 +295,7 @@ pub(crate) fn state_guard_status(
         detail_text: None,
         refusal: None,
     };
-    status_with_error_detail(code, message, detail)
+    status_with_error_detail(code, message, &detail)
 }
 
 /// Shared `PDU_ERR_RSC_LOCKED_BY_OTHER_CLL`/`ResourceExhausted` rejection

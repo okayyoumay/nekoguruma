@@ -206,14 +206,14 @@ impl<'a> Gate<'a> {
         signed_job: Option<&str>,
     ) -> Result<Admitted, InstructionRejectReason> {
         let Some(text) = signed_job else {
-            return Err(self.refuse(Refusal::from(InstructionRejectReason::Malformed), 0));
+            return Err(self.refuse(&Refusal::from(InstructionRejectReason::Malformed), 0));
         };
         let Ok(bytes) = STANDARD.decode(text) else {
             let refusal = Refusal::from(InstructionRejectReason::Malformed);
-            return Err(self.refuse(refusal, text.len()));
+            return Err(self.refuse(&refusal, text.len()));
         };
         let verified = instruction::open_unlogged(&bytes, self.key, self.agent_id)
-            .map_err(|refusal| self.refuse(refusal, bytes.len()))?;
+            .map_err(|refusal| self.refuse(&refusal, bytes.len()))?;
         Ok(self.accept(verified))
     }
 
@@ -281,9 +281,9 @@ impl<'a> Gate<'a> {
 
     /// Counts the refusal, writes its entry (a warning the first time per reason) and returns
     /// the reason.
-    fn refuse(&mut self, refusal: Refusal, envelope_len: usize) -> InstructionRejectReason {
+    fn refuse(&mut self, refusal: &Refusal, envelope_len: usize) -> InstructionRejectReason {
         let count = self.refused.bump(refusal.reason);
-        instruction::log_refusal(&refusal, envelope_len, count == 1);
+        instruction::log_refusal(refusal, envelope_len, count == 1);
         refusal.reason
     }
 

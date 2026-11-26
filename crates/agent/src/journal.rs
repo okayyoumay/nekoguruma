@@ -4057,7 +4057,7 @@ mod tests {
         records
     }
 
-    fn is_corrupt<T>(result: Result<T, JournalError>) -> bool {
+    fn is_corrupt<T>(result: &Result<T, JournalError>) -> bool {
         matches!(result, Err(JournalError::Corrupt { .. }))
     }
 
@@ -4273,8 +4273,8 @@ mod tests {
         for (name, records) in cases {
             let dir = TempDir::new();
             legacy_journal(&dir, records);
-            assert!(is_corrupt(Journal::read(&dir.0, &key())), "{name}");
-            assert!(is_corrupt(Journal::open(&dir.0, &key())), "{name}");
+            assert!(is_corrupt(&Journal::read(&dir.0, &key())), "{name}");
+            assert!(is_corrupt(&Journal::open(&dir.0, &key())), "{name}");
         }
         // The whole prefix in its order reads back.
         let dir = TempDir::new();
@@ -4357,8 +4357,8 @@ mod tests {
             };
             bytes[from..content_end].fill(0);
             fs::write(path(&dir), &bytes).expect("damage");
-            assert!(is_corrupt(Journal::read(&dir.0, &key())), "{whole}");
-            assert!(is_corrupt(Journal::open(&dir.0, &key())), "{whole}");
+            assert!(is_corrupt(&Journal::read(&dir.0, &key())), "{whole}");
+            assert!(is_corrupt(&Journal::open(&dir.0, &key())), "{whole}");
 
             // A damaged record before the content, with the content after it: damage.
             let dir = TempDir::new();
@@ -4375,7 +4375,7 @@ mod tests {
             };
             let from = if whole { vin_at } else { vin_at + FRAME_HEADER };
             bytes[from..vin_end].fill(0);
-            assert!(is_corrupt(load(&bytes, &key())), "{whole}");
+            assert!(is_corrupt(&load(&bytes, &key())), "{whole}");
         }
     }
 
@@ -4412,7 +4412,7 @@ mod tests {
                 .expect("open");
             file.write_all(&frame).expect("append");
             drop(file);
-            assert!(is_corrupt(Journal::read(&dir.0, &key())), "{name}");
+            assert!(is_corrupt(&Journal::read(&dir.0, &key())), "{name}");
         }
     }
 }

@@ -450,8 +450,8 @@ impl Exchange {
 }
 
 /// A 200 document: uncacheable, since the token is a credential.
-fn ok(body: serde_json::Value) -> Response {
-    ok_bytes(serialize(&body))
+fn ok(body: &serde_json::Value) -> Response {
+    ok_bytes(serialize(body))
 }
 
 /// The bytes of a 200 document, which the proof is signed over as they are sent.
@@ -506,7 +506,7 @@ pub async fn challenge(State(exchange): State<Exchange>, request: Request) -> Re
             .into_response();
     };
     inner.challenges.issue(value, now);
-    ok(serde_json::json!({ "challenge": STANDARD.encode(value) }))
+    ok(&serde_json::json!({ "challenge": STANDARD.encode(value) }))
 }
 
 /// `POST /api/v1/agent/session`: 200 `{"token", "expiresInSecs"}` for a valid proof.

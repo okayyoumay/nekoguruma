@@ -68,7 +68,7 @@ fn read_errors(files: Vec<(String, Vec<u8>)>) -> Vec<Located> {
 fn errors(files: Vec<(String, Vec<u8>)>) -> Vec<Located> {
     let tables = read_vehicle_files(files).expect("reads");
     let ecu = example_ecu();
-    convert_vehicle(tables, &[&ecu])
+    convert_vehicle(&tables, &[&ecu])
         .err()
         .map_or_else(Vec::new, located)
 }
@@ -77,7 +77,7 @@ fn errors(files: Vec<(String, Vec<u8>)>) -> Vec<Located> {
 fn the_example_converts() {
     let tables = read_vehicle_directory(&example_dir("example-vehicle")).expect("reads");
     let ecu = example_ecu();
-    let vehicle = convert_vehicle(tables, &[&ecu]).expect("converts");
+    let vehicle = convert_vehicle(&tables, &[&ecu]).expect("converts");
     assert_eq!(vehicle.id, "exampleVehicle");
     assert_eq!(
         vehicle.identification,
@@ -391,7 +391,7 @@ fn the_ecu_definitions_named_are_checked() {
     // Two ECU definitions with one identifier cannot be named (ADR-363 item 3).
     let tables = read_vehicle_files(example()).expect("reads");
     let ecu = example_ecu();
-    let twice = convert_vehicle(tables, &[&ecu, &ecu]).expect_err("refused");
+    let twice = convert_vehicle(&tables, &[&ecu, &ecu]).expect_err("refused");
     let twice = located(twice);
     assert!(
         twice.contains(&at(
@@ -431,7 +431,7 @@ fn a_source_is_a_parameterless_scalar_read_of_one_of_the_vehicle_s_ecus() {
     let tables = read_vehicle_files(example()).expect("reads");
     let mut mixed = example_ecu();
     mixed.last_mut().expect("a document").definition_id = None;
-    let refused = located(convert_vehicle(tables, &[&mixed]).expect_err("refused"));
+    let refused = located(convert_vehicle(&tables, &[&mixed]).expect_err("refused"));
     assert!(
         refused.contains(&at(
             UnknownReference,
@@ -452,7 +452,7 @@ fn a_source_is_a_parameterless_scalar_read_of_one_of_the_vehicle_s_ecus() {
     .expect("reads");
     let ecu = example_ecu();
     assert_eq!(
-        located(convert_vehicle(tables, &[&ecu, &body]).expect_err("refused")),
+        located(convert_vehicle(&tables, &[&ecu, &body]).expect_err("refused")),
         vec![at(
             UnknownReference,
             "field_rules.csv",
@@ -491,7 +491,7 @@ fn reading_reports_what_the_ecu_tables_report() {
     ))
     .expect("reads");
     let ecu = example_ecu();
-    let rejected = convert_vehicle(tables, &[&ecu]).expect_err("refused");
+    let rejected = convert_vehicle(&tables, &[&ecu]).expect_err("refused");
     assert!(
         rejected
             .errors

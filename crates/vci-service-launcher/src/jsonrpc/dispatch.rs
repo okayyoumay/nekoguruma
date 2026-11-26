@@ -196,7 +196,7 @@ pub async fn handle_message<C: JsonRpcHandler>(
     let (response, exit_after_response) =
         match dispatch(ctx, envelope.method, envelope.params, library_name).await {
             Ok(outcome) => (
-                success_response(envelope.id, outcome.response),
+                success_response(envelope.id, &outcome.response),
                 outcome.exit_after_response,
             ),
             Err(err) => (err.to_response(envelope.id), false),

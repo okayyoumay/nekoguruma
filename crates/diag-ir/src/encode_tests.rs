@@ -351,24 +351,24 @@ fn a_field_placed_too_far_out_is_refused() {
     );
 }
 
-fn plan_error(result: Result<Vec<u8>, EncodeError>) -> bool {
+fn plan_error(result: &Result<Vec<u8>, EncodeError>) -> bool {
     matches!(result, Err(EncodeError::InvalidPlan { .. }))
 }
 
 #[test]
 fn a_field_may_not_overlap_another_the_sid_or_the_prefix() {
     // Over the SID, over the prefix, over another field, and over a terminator.
-    assert!(plan_error(encode(
+    assert!(plan_error(&encode(
         &[],
         vec![at("a", DataKind::Uint, 0, 8)],
         &[("a", Int(0x22))]
     )));
-    assert!(plan_error(encode(
+    assert!(plan_error(&encode(
         &[0xF1, 0x90],
         vec![at("a", DataKind::Uint, 8, 8)],
         &[("a", Int(0x22))]
     )));
-    assert!(plan_error(encode(
+    assert!(plan_error(&encode(
         &[],
         vec![
             at("a", DataKind::Uint, 8, 16),
@@ -381,7 +381,7 @@ fn a_field_may_not_overlap_another_the_sid_or_the_prefix() {
         termination: Termination::Zero,
         ..at("a", DataKind::Bytes, 8, 0)
     };
-    assert!(plan_error(encode(
+    assert!(plan_error(&encode(
         &[],
         vec![zero, at("b", DataKind::Uint, 16, 8)],
         &[("a", Bytes(&[1])), ("b", Int(7))]
@@ -405,7 +405,7 @@ fn every_value_that_runs_to_the_end_must_be_last() {
         termination: Termination::EndOfPdu,
         ..at(name, DataKind::Bytes, bit_offset, 0)
     };
-    assert!(plan_error(encode(
+    assert!(plan_error(&encode(
         &[],
         vec![rest("a", 8), rest("b", 16)],
         &[("a", Bytes(&[1])), ("b", Bytes(&[5, 6]))]
@@ -418,8 +418,8 @@ fn fields_need_names_of_their_own() {
         short_name: None,
         ..next("a", DataKind::Uint, 8)
     };
-    assert!(plan_error(encode(&[], vec![unnamed], &[])));
-    assert!(plan_error(encode(
+    assert!(plan_error(&encode(&[], vec![unnamed], &[])));
+    assert!(plan_error(&encode(
         &[],
         vec![next("a", DataKind::Uint, 8), next("a", DataKind::Uint, 8)],
         &[("a", Int(1))]
@@ -446,7 +446,7 @@ fn an_odd_unicode2_terminated_bound_is_refused() {
         min_bytes: 1,
         ..next("w", DataKind::Unicode2, 0)
     };
-    assert!(plan_error(encode(&[], vec![field], &[("w", Text("A"))])));
+    assert!(plan_error(&encode(&[], vec![field], &[("w", Text("A"))])));
 }
 
 #[test]

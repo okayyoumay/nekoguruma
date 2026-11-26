@@ -352,12 +352,12 @@ struct Rig {
 }
 
 impl Rig {
-    fn new(docs: Vec<Vec<u8>>, artifact: Option<Vec<u8>>) -> Rig {
+    fn new(docs: Vec<Vec<u8>>, artifact: Option<&[u8]>) -> Rig {
         Rig::build(docs, artifact, None)
     }
 
     /// A rig whose bounds are `bound` bytes when given.
-    fn build(docs: Vec<Vec<u8>>, artifact: Option<Vec<u8>>, bound: Option<u64>) -> Rig {
+    fn build(docs: Vec<Vec<u8>>, artifact: Option<&[u8]>, bound: Option<u64>) -> Rig {
         Rig::assemble(docs, artifact, bound, None)
     }
 
@@ -369,7 +369,7 @@ impl Rig {
 
     fn assemble(
         docs: Vec<Vec<u8>>,
-        artifact: Option<Vec<u8>>,
+        artifact: Option<&[u8]>,
         bound: Option<u64>,
         real_port: Option<u16>,
     ) -> Rig {
@@ -427,7 +427,7 @@ impl Rig {
         }
         let (verified, _) = sign(
             docs.iter().map(|d| digest(d)).collect(),
-            artifact.as_deref().map(digest),
+            artifact.map(digest),
         );
         Rig {
             temp,
@@ -602,7 +602,7 @@ async fn a_cached_object_needs_no_request() {
 /// Only what the instruction names is fetched, under the kind it names.
 #[tokio::test(start_paused = true)]
 async fn only_a_named_digest_of_the_right_kind_is_fetched() {
-    let rig = Rig::new(vec![b"doc".to_vec()], Some(b"art".to_vec()));
+    let rig = Rig::new(vec![b"doc".to_vec()], Some(b"art".as_slice()));
     rig.serve_body(b"doc");
     let f = &rig.fetcher;
     let v = &rig.verified;
@@ -634,7 +634,7 @@ async fn only_a_named_digest_of_the_right_kind_is_fetched() {
 async fn fetch_all_takes_the_documents_then_the_artifact_on_one_token() {
     let rig = Rig::new(
         vec![b"doc a".to_vec(), b"doc b".to_vec()],
-        Some(b"the artifact".to_vec()),
+        Some(b"the artifact".as_slice()),
     );
     {
         let mut script = rig.script.lock().unwrap();

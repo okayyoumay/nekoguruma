@@ -104,7 +104,7 @@ fn read_vin(dir: &Path) -> PathBuf {
 }
 
 /// Asserts a failure with exit status 1, nothing on stdout and `message` on stderr.
-fn assert_fails_with(output: Output, message: &str) {
+fn assert_fails_with(output: &Output, message: &str) {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(1), "{stderr}");
     assert!(stderr.contains(message), "{stderr}");
@@ -163,7 +163,7 @@ fn refused_program_exits_with_1_before_resolving_the_vci() {
         .arg(program)
         .output()
         .expect("ngr-agent should run");
-    assert_fails_with(output, "refused");
+    assert_fails_with(&output, "refused");
 }
 
 /// A variant's document with no services, carrying `procedure`. Its protocol is UDS over
@@ -223,7 +223,7 @@ fn a_document_that_cannot_run_exits_with_1_before_resolving_the_vci() {
             .arg(&path)
             .output()
             .expect("ngr-agent should run");
-        assert_fails_with(output, message);
+        assert_fails_with(&output, message);
     }
     let without_procedure = TempDir::new("no-procedure");
     let output = ngr_agent()
@@ -231,7 +231,7 @@ fn a_document_that_cannot_run_exits_with_1_before_resolving_the_vci() {
         .arg(write_document(&without_procedure.0, None))
         .output()
         .expect("ngr-agent should run");
-    assert_fails_with(output, "carries no procedure");
+    assert_fails_with(&output, "carries no procedure");
 }
 
 /// The flash artifact is read and compared with the hash the command line names before a worker
@@ -255,8 +255,8 @@ fn a_bad_artifact_exits_before_resolving_the_vci() {
     };
     // The SHA-256 of "abc" with its first digit changed.
     let wrong = "aa7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
-    assert_fails_with(run(&artifact, wrong), "the job names");
-    assert_fails_with(run(&temp.0.join("missing.bin"), wrong), "cannot read");
+    assert_fails_with(&run(&artifact, wrong), "the job names");
+    assert_fails_with(&run(&temp.0.join("missing.bin"), wrong), "cannot read");
     // Only one of the two options is a usage error.
     let output = ngr_agent()
         .args(["run", "--vci", "none", "--mode", "user", "--document"])
@@ -293,7 +293,7 @@ fn run_and_identify_refuse_a_mode_other_than_the_installed_one() {
             .output()
             .expect("ngr-agent should run");
         assert_fails_with(
-            output,
+            &output,
             &format!(
                 "ngr-agent: {}: --mode device is not the installed mode (user)",
                 args[0]
@@ -366,12 +366,12 @@ fn identify_refuses_a_bad_plan_before_the_vci() {
     };
 
     // A plan that is not there.
-    assert_fails_with(identify(&temp.0.join("missing.bin"), &[]), "cannot read");
+    assert_fails_with(&identify(&temp.0.join("missing.bin"), &[]), "cannot read");
 
     // A file that is not a plan.
     let garbage = temp.0.join("garbage.bin");
     std::fs::write(&garbage, b"not a plan").expect("file should be writable");
-    assert_fails_with(identify(&garbage, &[]), "plan refused");
+    assert_fails_with(&identify(&garbage, &[]), "plan refused");
 
     // A plan that names a document nobody supplied.
     let plan = IdentificationPlan {
@@ -385,11 +385,11 @@ fn identify_refuses_a_bad_plan_before_the_vci() {
     };
     let named = temp.0.join("plan.bin");
     std::fs::write(&named, plan.encode().expect("the plan encodes")).expect("plan file");
-    assert_fails_with(identify(&named, &[]), "was not supplied");
+    assert_fails_with(&identify(&named, &[]), "was not supplied");
 
     // A document that is not there.
     assert_fails_with(
-        identify(&named, &[&temp.0.join("missing.dir")]),
+        &identify(&named, &[&temp.0.join("missing.dir")]),
         "cannot read",
     );
 
@@ -433,7 +433,7 @@ fn unknown_vci_exits_with_1() {
         .env("NGR_J2534_DEFINITION_DIR", &definitions)
         .output()
         .expect("ngr-agent should run");
-    assert_fails_with(output, "cannot resolve the library of VCI \"test-vci\"");
+    assert_fails_with(&output, "cannot resolve the library of VCI \"test-vci\"");
 }
 
 #[cfg(debug_assertions)]
@@ -452,7 +452,7 @@ fn missing_worker_build_exits_with_1() {
         .env("NGR_J2534_DEFINITION_DIR", &definitions)
         .output()
         .expect("ngr-agent should run");
-    assert_fails_with(output, "no worker bundled for ABI");
+    assert_fails_with(&output, "no worker bundled for ABI");
 }
 
 /// Installs, for the agent's own ABI, a stand-in worker that records the `NGR_J2534_LONG_SIZE`
@@ -559,7 +559,7 @@ fn a_run_waits_for_the_vci_lock() {
     drop(held);
     // With the lock free, the run goes on and fails at the VCI, which no definition names.
     let output = child.wait_with_output().expect("ngr-agent should end");
-    assert_fails_with(output, "cannot resolve the library of VCI \"test-vci\"");
+    assert_fails_with(&output, "cannot resolve the library of VCI \"test-vci\"");
 }
 
 /// A writing `ngr-agent run` also takes the device's reprogramming slot before it resolves the
@@ -609,5 +609,5 @@ fn a_writing_run_waits_for_the_reprogramming_slot() {
     drop(held);
     // With the slot free, the run goes on and fails at the VCI, which no definition names.
     let output = child.wait_with_output().expect("ngr-agent should end");
-    assert_fails_with(output, "cannot resolve the library of VCI \"test-vci\"");
+    assert_fails_with(&output, "cannot resolve the library of VCI \"test-vci\"");
 }

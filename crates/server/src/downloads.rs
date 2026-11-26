@@ -340,7 +340,7 @@ async fn url_answer(d: &Downloads, caller: &Caller, wanted: &Wanted, hash: [u8; 
     match store.presign_get(&key) {
         Ok(url) => json_answer(
             StatusCode::OK,
-            json!({
+            &json!({
                 "url": url.expose(),
                 "certificatePin": url.pin().to_string(),
                 "expiresInSecs": GET_URL_EXPIRY.as_secs(),

@@ -1223,7 +1223,7 @@ async fn a_vci_lost_while_the_link_opens_opens_it_again() {
         state.table_script = VecDeque::from([vci_service_interface::status_with_error_detail(
             tonic::Code::FailedPrecondition,
             "the VCI is lost",
-            ErrorDetail {
+            &ErrorDetail {
                 pdu_error: PduError::PduErrCllNotConnected as i32,
                 error_event_data: Some(ErrorEventData {
                     error_event: PduErrorEvent::PduErrEvtLostCommToVci as i32,
@@ -1258,7 +1258,7 @@ async fn a_vci_lost_while_the_connect_installs_the_table_is_not_halved() {
             VecDeque::from([vci_service_interface::status_with_error_detail(
                 tonic::Code::FailedPrecondition,
                 "PassThruStartMsgFilter failed: the device is not connected",
-                ErrorDetail {
+                &ErrorDetail {
                     pdu_error: PduError::PduErrCommPcToVciFailed as i32,
                     error_event_data: Some(ErrorEventData {
                         error_event: PduErrorEvent::PduErrEvtLostCommToVci as i32,
@@ -1291,7 +1291,7 @@ async fn another_error_while_the_connect_installs_the_table_is_not_halved() {
         VecDeque::from([vci_service_interface::status_with_error_detail(
             tonic::Code::Unknown,
             "PassThruStartMsgFilter failed: ERR_FAILED",
-            ErrorDetail {
+            &ErrorDetail {
                 pdu_error: PduError::PduErrFctFailed as i32,
                 error_event_data: None,
                 detail_text: None,

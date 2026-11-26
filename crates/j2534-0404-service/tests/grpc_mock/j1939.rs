@@ -312,18 +312,18 @@ async fn io_ctl_cll(
 fn repeat_message_setup(
     time_interval: u32,
     condition: u32,
-    repeat_msg_data: Vec<u8>,
-    mask_data: Vec<u8>,
-    pattern_data: Vec<u8>,
+    repeat_msg_data: &[u8],
+    mask_data: &[u8],
+    pattern_data: &[u8],
 ) -> DataItem {
     DataItem {
         data: Some(data_item::Data::BytearrayData(IoBytearray {
             data: pack_repeat_message_setup(
                 time_interval,
                 condition,
-                &repeat_msg_data,
-                &mask_data,
-                &pattern_data,
+                repeat_msg_data,
+                mask_data,
+                pattern_data,
                 &[],
             ),
         })),
@@ -2905,7 +2905,7 @@ async fn repeat_slot_stop_condition_wildcards_pgn_and_destination_exact_matches_
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(50, 0, vec![0x01], vec![0xFF], vec![0x99]),
+        repeat_message_setup(50, 0, &[0x01], &[0xFF], &[0x99]),
     )
     .await
     .expect("PDU_IOCTL_START_REPEAT_MESSAGE should succeed on a claimed J1939 CLL");
@@ -2997,7 +2997,7 @@ async fn spontaneous_loss_stops_the_clls_own_live_repeat_slots() {
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(50, 1, vec![0x01], vec![0xFF], vec![0x99]),
+        repeat_message_setup(50, 1, &[0x01], &[0xFF], &[0x99]),
     )
     .await
     .expect("PDU_IOCTL_START_REPEAT_MESSAGE should succeed on a claimed J1939 CLL");
@@ -3111,7 +3111,7 @@ async fn repeat_message_accepts_datasize_12_and_rejects_datasize_13_on_j1939() {
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(50, 0, vec![0u8; 7], vec![], vec![]),
+        repeat_message_setup(50, 0, &[0u8; 7], &[], &[]),
     )
     .await
     .expect(
@@ -3125,7 +3125,7 @@ async fn repeat_message_accepts_datasize_12_and_rejects_datasize_13_on_j1939() {
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(50, 0, vec![0u8; 8], vec![], vec![]),
+        repeat_message_setup(50, 0, &[0u8; 8], &[], &[]),
     )
     .await
     .expect_err(
@@ -3190,7 +3190,7 @@ async fn restarting_after_stopcomm_stops_the_previously_claimed_addresss_own_rep
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(50, 1, vec![0x01], vec![0xFF], vec![0x99]),
+        repeat_message_setup(50, 1, &[0x01], &[0xFF], &[0x99]),
     )
     .await
     .expect("PDU_IOCTL_START_REPEAT_MESSAGE should succeed on a claimed J1939 CLL");
@@ -3358,7 +3358,7 @@ async fn cancelling_the_optional_startcomm_message_after_a_successful_claim_stop
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(50, 1, vec![0x01], vec![0xFF], vec![0x99]),
+        repeat_message_setup(50, 1, &[0x01], &[0xFF], &[0x99]),
     )
     .await
     .expect("PDU_IOCTL_START_REPEAT_MESSAGE should succeed while the claim is in flight");
@@ -4064,7 +4064,7 @@ async fn repeat_message_setup_rejects_out_of_range_target_address() {
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(50, 0, vec![0x01], vec![0xFF], vec![0x99]),
+        repeat_message_setup(50, 0, &[0x01], &[0xFF], &[0x99]),
     )
     .await
     .expect_err(
@@ -4115,7 +4115,7 @@ async fn repeat_message_start_rejects_before_any_claim_on_a_negotiation_enabled_
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(50, 0, vec![0x01], vec![0xFF], vec![0x99]),
+        repeat_message_setup(50, 0, &[0x01], &[0xFF], &[0x99]),
     )
     .await
     .expect_err(
@@ -4188,7 +4188,7 @@ async fn repeat_message_start_rejects_after_claim_exhaustion() {
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(50, 0, vec![0x01], vec![0xFF], vec![0x99]),
+        repeat_message_setup(50, 0, &[0x01], &[0xFF], &[0x99]),
     )
     .await
     .expect_err(
@@ -4239,7 +4239,7 @@ async fn repeat_message_start_succeeds_on_non_negotiated_cll_with_no_claim() {
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(50, 0, vec![0x01], vec![0xFF], vec![0x99]),
+        repeat_message_setup(50, 0, &[0x01], &[0xFF], &[0x99]),
     )
     .await
     .expect(
@@ -4300,7 +4300,7 @@ async fn repeat_message_start_succeeds_after_a_successful_claim() {
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(50, 0, vec![0x01], vec![0xFF], vec![0x99]),
+        repeat_message_setup(50, 0, &[0x01], &[0xFF], &[0x99]),
     )
     .await
     .expect(
@@ -4366,7 +4366,7 @@ async fn repeat_message_transmitted_frame_sets_tx_extended_id() {
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(20, 0, vec![0x01], vec![0xFF], vec![0x99]),
+        repeat_message_setup(20, 0, &[0x01], &[0xFF], &[0x99]),
     )
     .await
     .expect("PDU_IOCTL_START_REPEAT_MESSAGE should succeed on a claimed J1939 CLL");
@@ -5196,7 +5196,7 @@ async fn reconnecting_the_same_cll_handle_clears_the_stale_claimed_address() {
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(50, 0, vec![0x01], vec![0xFF], vec![0x99]),
+        repeat_message_setup(50, 0, &[0x01], &[0xFF], &[0x99]),
     )
     .await
     .expect_err(
@@ -5627,7 +5627,7 @@ async fn temp_bound_negotiation_opt_out_does_not_wrongly_block_later_ordinary_se
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(50, 0, vec![0x01], vec![0xFF], vec![0x99]),
+        repeat_message_setup(50, 0, &[0x01], &[0xFF], &[0x99]),
     )
     .await
     .expect(
@@ -5882,7 +5882,7 @@ async fn spontaneous_loss_leaked_repeat_stop_is_drained_by_a_later_sibling_ioctl
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(50, 0, vec![0x01], vec![0xFF], vec![0x99]),
+        repeat_message_setup(50, 0, &[0x01], &[0xFF], &[0x99]),
     )
     .await
     .expect("PDU_IOCTL_START_REPEAT_MESSAGE should succeed on a claimed J1939 CLL");
@@ -5936,7 +5936,7 @@ async fn spontaneous_loss_leaked_repeat_stop_is_drained_by_a_later_sibling_ioctl
         &mut client,
         sibling_cll,
         start_id,
-        repeat_message_setup(50, 1, vec![0x02], vec![0xFF], vec![0x77]),
+        repeat_message_setup(50, 1, &[0x02], &[0xFF], &[0x77]),
     )
     .await
     .expect(
@@ -7713,7 +7713,7 @@ async fn leaked_claim_blocks_repeat_message_start_on_an_opted_out_sibling_cll() 
         &mut client,
         cll_b,
         start_id,
-        repeat_message_setup(50, 0, vec![0x01], vec![0xFF], vec![0x99]),
+        repeat_message_setup(50, 0, &[0x01], &[0xFF], &[0x99]),
     )
     .await
     .expect_err(
@@ -7739,7 +7739,7 @@ async fn leaked_claim_blocks_repeat_message_start_on_an_opted_out_sibling_cll() 
         &mut client,
         cll_b,
         start_id,
-        repeat_message_setup(50, 0, vec![0x01], vec![0xFF], vec![0x99]),
+        repeat_message_setup(50, 0, &[0x01], &[0xFF], &[0x99]),
     )
     .await
     .expect(

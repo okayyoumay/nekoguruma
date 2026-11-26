@@ -179,7 +179,7 @@ impl Iso22900Service {
         let key: SubscriptionKey = (h_mod.0, h_cll.0);
         let mut subscriptions = self.subscriptions.lock().await;
         if let Some(sender_tx) = subscriptions.remove(&key) {
-            terminate_stream_sender(sender_tx);
+            terminate_stream_sender(&sender_tx);
         }
     }
 
@@ -258,7 +258,7 @@ impl Iso22900Service {
         let api = api
             .as_ref()
             .ok_or_else(|| api_not_initialized_status(API_NOT_INITIALIZED))?;
-        f(api).map_err(|error| map_runtime_error_for_link(api, module, cll, error))
+        f(api).map_err(|error| map_runtime_error_for_link(api, module, cll, &error))
     }
 
     pub(super) fn empty_response() -> Response<VciServiceResponse> {
@@ -312,7 +312,7 @@ impl Iso22900Service {
     }
 }
 
-fn terminate_stream_sender(sender_tx: SubscriptionSender) {
+fn terminate_stream_sender(sender_tx: &SubscriptionSender) {
     if !sender_tx.is_closed() {
         let _ = sender_tx.send(Err(Status::cancelled("Subscription terminated")));
     }
@@ -324,7 +324,7 @@ fn remove_subscriptions(
 ) {
     for key in keys {
         if let Some(sender_tx) = subscriptions.remove(&key) {
-            terminate_stream_sender(sender_tx);
+            terminate_stream_sender(&sender_tx);
         }
     }
 }

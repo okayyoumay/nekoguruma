@@ -5224,7 +5224,7 @@ async fn r1_over_real_loopback_an_exchange_an_upgrade_a_heartbeat_and_a_stop() {
         .open()
         .unwrap()
         .start(
-            agent,
+            &agent,
             Collaborators {
                 intake: Arc::new(LogIntake),
                 outbox: open_outbox(&fx, None),
@@ -5285,7 +5285,7 @@ async fn r1_over_real_loopback_a_refused_connection_and_then_the_server_appears(
         .open()
         .unwrap()
         .start(
-            agent,
+            &agent,
             Collaborators {
                 intake: Arc::new(LogIntake),
                 outbox: open_outbox(&fx, None),
@@ -7027,7 +7027,7 @@ async fn i1_an_impostor_on_a_real_port_gets_no_upgrade_and_no_frame_is_read() {
         .open()
         .unwrap()
         .start(
-            agent,
+            &agent,
             Collaborators {
                 intake: Arc::new(LogIntake),
                 outbox: outbox.clone(),
@@ -7074,7 +7074,7 @@ async fn i1_an_impostor_on_a_real_port_gets_no_upgrade_and_no_frame_is_read() {
         .open()
         .unwrap()
         .start(
-            agent2,
+            &agent2,
             Collaborators {
                 intake: Arc::new(LogIntake),
                 outbox: outbox2.clone(),

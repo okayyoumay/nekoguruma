@@ -250,7 +250,7 @@ impl VciService for FakeWorker {
             return Err(vci::status_with_error_detail(
                 tonic::Code::NotFound,
                 "PDU_ERR_INVALID_HANDLE",
-                vci::ErrorDetail {
+                &vci::ErrorDetail {
                     pdu_error: vci::PduError::PduErrInvalidHandle as i32,
                     ..Default::default()
                 },

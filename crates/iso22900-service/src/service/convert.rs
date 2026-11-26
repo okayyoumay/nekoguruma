@@ -464,15 +464,15 @@ fn structfield_from_proto(
         }
         param_structfield::Data::SessionTiming(list) => Ok((
             E_PDU_CPST::PDU_CPST_SESSION_TIMING,
-            encode_session_timing(list.entries)?,
+            encode_session_timing(&list.entries)?,
         )),
         param_structfield::Data::AccessTiming(list) => Ok((
             E_PDU_CPST::PDU_CPST_ACCESS_TIMING,
-            encode_access_timing(list.entries)?,
+            encode_access_timing(&list.entries)?,
         )),
         param_structfield::Data::TlsVersionAndCipher(list) => Ok((
             E_PDU_CPST::PDU_CPST_TLS_VERSION_AND_CIPHER,
-            encode_tls_version_and_cipher(list.entries)?,
+            encode_tls_version_and_cipher(&list.entries)?,
         )),
     }
 }
@@ -549,7 +549,7 @@ fn vendor_struct_from_proto(
     ))
 }
 
-fn encode_session_timing(entries: Vec<ParamSessionTiming>) -> Result<StructFieldEncoding, Status> {
+fn encode_session_timing(entries: &[ParamSessionTiming]) -> Result<StructFieldEncoding, Status> {
     const ENTRY_SIZE: usize = size_of::<PDU_PARAM_STRUCT_SESS_TIMING>();
     const SESSION_OFFSET: usize = offset_of!(PDU_PARAM_STRUCT_SESS_TIMING, session);
     const P2MAX_HIGH_OFFSET: usize = offset_of!(PDU_PARAM_STRUCT_SESS_TIMING, P2Max_high);
@@ -586,7 +586,7 @@ fn encode_session_timing(entries: Vec<ParamSessionTiming>) -> Result<StructField
     })
 }
 
-fn encode_access_timing(entries: Vec<ParamAccessTiming>) -> Result<StructFieldEncoding, Status> {
+fn encode_access_timing(entries: &[ParamAccessTiming]) -> Result<StructFieldEncoding, Status> {
     const ENTRY_SIZE: usize = size_of::<PDU_PARAM_STRUCT_ACCESS_TIMING>();
     const P2MIN_OFFSET: usize = offset_of!(PDU_PARAM_STRUCT_ACCESS_TIMING, P2Min);
     const P2MAX_OFFSET: usize = offset_of!(PDU_PARAM_STRUCT_ACCESS_TIMING, P2Max);
@@ -617,7 +617,7 @@ fn encode_access_timing(entries: Vec<ParamAccessTiming>) -> Result<StructFieldEn
 const MAX_TLS_CIPHERS: usize = 5;
 
 fn encode_tls_version_and_cipher(
-    entries: Vec<ParamTlsVersionAndCipher>,
+    entries: &[ParamTlsVersionAndCipher],
 ) -> Result<StructFieldEncoding, Status> {
     const ENTRY_SIZE: usize = size_of::<PDU_PARAM_STRUCT_TLS_VERSION_AND_CIPHER>();
     const MAJOR_OFFSET: usize =
@@ -886,7 +886,7 @@ pub(super) fn to_iso_control(control: ComPrimitiveCtrlData) -> ComPrimitiveContr
 }
 
 pub(super) fn to_status_response(
-    data: StatusInfo,
+    data: &StatusInfo,
     target: status_response::Status,
 ) -> StatusResponse {
     StatusResponse {

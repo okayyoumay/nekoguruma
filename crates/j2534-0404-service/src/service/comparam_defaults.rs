@@ -970,7 +970,7 @@ struct Kwp9141Params {
     phys_resp_format: u32,
 }
 
-fn kwp_on_9141_common(p: &mut ComParamSet, params: Kwp9141Params) {
+fn kwp_on_9141_common(p: &mut ComParamSet, params: &Kwp9141Params) {
     let Kwp9141Params {
         req_addr_mode,
         func_format,
@@ -979,7 +979,7 @@ fn kwp_on_9141_common(p: &mut ComParamSet, params: Kwp9141Params) {
         func_resp_target,
         phys_format,
         phys_resp_format,
-    } = params;
+    } = *params;
     p.unum32.insert(PARAM_CYCLIC_RESP_TIMEOUT, 0);
     p.unum32.insert(ComParamId(j2534_0404::LOOPBACK), 0);
     p.unum32.insert(ComParamId(j2534_0404::P2_MIN), 25_000);
@@ -1058,7 +1058,7 @@ fn iso_15031_5_on_iso_9141_2() -> ComParamSet {
     p.unum32.insert(PARAM_ENABLE_INIT_SEQ_REPETITION, 0);
     kwp_on_9141_common(
         &mut p,
-        Kwp9141Params {
+        &Kwp9141Params {
             req_addr_mode: 0x02,
             func_format: 0x68,
             func_target: 0x6A,
@@ -1087,7 +1087,7 @@ fn sae_j2190_on_iso_9141_2() -> ComParamSet {
     p.unum32.insert(PARAM_IGNORE_CHECKSUM, 1);
     kwp_on_9141_common(
         &mut p,
-        Kwp9141Params {
+        &Kwp9141Params {
             req_addr_mode: 0x02,
             func_format: 0x68,
             func_target: 0x6A,
@@ -1547,7 +1547,7 @@ struct J1850Params {
     req_addr_mode: u32,
 }
 
-fn j1850_common(p: &mut ComParamSet, params: J1850Params) {
+fn j1850_common(p: &mut ComParamSet, params: &J1850Params) {
     let J1850Params {
         func_format,
         func_target,
@@ -1557,7 +1557,7 @@ fn j1850_common(p: &mut ComParamSet, params: J1850Params) {
         phys_resp_format,
         header_format,
         req_addr_mode,
-    } = params;
+    } = *params;
     p.unum32.insert(PARAM_CHANGE_SPEED_CTRL, 0);
     p.unum32.insert(PARAM_CHANGE_SPEED_RATE, 0);
     p.unum32.insert(PARAM_CHANGE_SPEED_RES_CTRL, 0);
@@ -1606,7 +1606,7 @@ fn iso_15031_5_on_sae_j1850_pwm() -> ComParamSet {
     let mut p = ComParamSet::default();
     j1850_common(
         &mut p,
-        J1850Params {
+        &J1850Params {
             // PWM header/priority bytes (spec correction: this function
             // previously carried the VPW byte values verbatim, a copy-paste
             // bug from `iso_15031_5_on_sae_j1850_vpw` -- func_format must be
@@ -1636,7 +1636,7 @@ fn iso_15031_5_on_sae_j1850_vpw() -> ComParamSet {
     let mut p = ComParamSet::default();
     j1850_common(
         &mut p,
-        J1850Params {
+        &J1850Params {
             func_format: 0x68,
             func_target: 0x6A,
             func_resp_format: 0x48,
@@ -1657,7 +1657,7 @@ fn iso_obd_on_sae_j1850() -> ComParamSet {
     let mut p = ComParamSet::default();
     j1850_common(
         &mut p,
-        J1850Params {
+        &J1850Params {
             func_format: 0x68,
             func_target: 0x6A,
             func_resp_format: 0x48,
@@ -1684,7 +1684,7 @@ fn sae_j2190_on_sae_j1850_pwm() -> ComParamSet {
     let mut p = ComParamSet::default();
     j1850_common(
         &mut p,
-        J1850Params {
+        &J1850Params {
             func_format: 0x61,
             func_target: 0x6A,
             func_resp_format: 0x41,
@@ -1711,7 +1711,7 @@ fn sae_j2190_on_sae_j1850_vpw() -> ComParamSet {
     let mut p = ComParamSet::default();
     j1850_common(
         &mut p,
-        J1850Params {
+        &J1850Params {
             func_format: 0x68,
             func_target: 0x6A,
             func_resp_format: 0x48,

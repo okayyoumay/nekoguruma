@@ -607,9 +607,9 @@ impl OpenFailure {
     }
 
     /// [`OpenFailure::unclean`] after the module's disconnect, whose result is `closed`.
-    fn after_disconnect(error: HostError, closed: Result<(), HostError>) -> Self {
+    fn after_disconnect(error: HostError, closed: &Result<(), HostError>) -> Self {
         let mut evidence = CloseEvidence::default();
-        if let Err(cleanup) = &closed {
+        if let Err(cleanup) = closed {
             evidence.note_error(cleanup);
         }
         Self::unclean(error, closed.is_ok(), evidence)
@@ -661,7 +661,7 @@ pub(crate) async fn open_tracked<C: WorkerApi>(
                     ));
                 }
                 let closed = disconnect_module(client, module_handle, deadline).await;
-                return Err(OpenFailure::after_disconnect(error, closed));
+                return Err(OpenFailure::after_disconnect(error, &closed));
             }
         };
     match set_up_link(client, config, deadline, cll_handle).await {
@@ -734,7 +734,7 @@ async fn open_module<C: WorkerApi>(
         // module that is not connected changes nothing; when that disconnect fails too, the
         // module is not known to be disconnected.
         let closed = disconnect_module(client, module_handle, deadline).await;
-        return Err(OpenFailure::after_disconnect(error, closed));
+        return Err(OpenFailure::after_disconnect(error, &closed));
     }
     Ok(module_handle)
 }
@@ -1792,7 +1792,7 @@ mod tests {
         let lost = vci_service_interface::status_with_error_detail(
             tonic::Code::FailedPrecondition,
             "the VCI is lost",
-            ErrorDetail {
+            &ErrorDetail {
                 pdu_error: PduError::PduErrCllNotConnected as i32,
                 error_event_data: Some(ErrorEventData {
                     error_event: PduErrorEvent::PduErrEvtLostCommToVci as i32,

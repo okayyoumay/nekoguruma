@@ -289,7 +289,7 @@ impl Outcome {
 
     fn answer(self) -> Response {
         match self {
-            Outcome::Finished => json_answer(StatusCode::OK, json!({"state": "finished"})),
+            Outcome::Finished => json_answer(StatusCode::OK, &json!({"state": "finished"})),
             Outcome::Open => Problem::with_state(
                 StatusCode::CONFLICT,
                 "The upload's parts do not make the object; send them again",
@@ -792,7 +792,7 @@ struct CompletionJob {
 // ---------------------------------------------------------------------------------------------
 // Answers
 
-pub(crate) fn json_answer(status: StatusCode, value: Value) -> Response {
+pub(crate) fn json_answer(status: StatusCode, value: &Value) -> Response {
     let mut response = (status, value.to_string()).into_response();
     let headers = response.headers_mut();
     headers.insert(
@@ -919,7 +919,7 @@ impl Row {
     fn answer(&self, status: StatusCode) -> Response {
         json_answer(
             status,
-            json!({
+            &json!({
                 "uploadId": self.id,
                 "partBytes": self.part_bytes,
                 "partCount": self.count(),
@@ -1513,7 +1513,7 @@ async fn begin_answer(u: &Uploads, caller: &Caller, declared: &Declared) -> Resp
     {
         Ok(Some(id)) => json_answer(
             StatusCode::CREATED,
-            json!({
+            &json!({
                 "uploadId": id,
                 "partBytes": part_bytes,
                 "partCount": part_count(declared.size, part_bytes),
@@ -1547,7 +1547,7 @@ async fn begin_answer(u: &Uploads, caller: &Caller, declared: &Declared) -> Resp
             match row_of_key(&u.pool, &caller.tenant, upload.key.as_str()).await {
                 Ok(Some(id)) => json_answer(
                     StatusCode::CREATED,
-                    json!({
+                    &json!({
                         "uploadId": id,
                         "partBytes": part_bytes,
                         "partCount": part_count(declared.size, part_bytes),
@@ -1664,7 +1664,7 @@ async fn part_url_answer(u: &Uploads, caller: &Caller, id: &str, part: u16) -> R
     match store.presign_part(&upload, part) {
         Ok(url) => json_answer(
             StatusCode::OK,
-            json!({
+            &json!({
                 "url": url.expose(),
                 "certificatePin": url.pin().to_string(),
                 "expiresInSecs": PART_URL_EXPIRY.as_secs(),
@@ -1747,7 +1747,7 @@ async fn status_answer(
             Err(error @ (StoreError::NotFound | StoreError::AlreadyFinished)) => {
                 match upload_row(&u.pool, &caller.tenant, &caller.agent.0, &id).await {
                     Ok(Some(now)) if now.state != "open" => {
-                        return json_answer(StatusCode::OK, status_body(&now, &now.state));
+                        return json_answer(StatusCode::OK, &status_body(&now, &now.state));
                     }
                     Ok(Some(now)) => return hand_over(u, caller, &now, store).await,
                     Ok(None) => return store_failure(u, &error),
@@ -1757,7 +1757,7 @@ async fn status_answer(
             Err(error) => return store_failure(u, &error),
         }
     }
-    json_answer(StatusCode::OK, answer)
+    json_answer(StatusCode::OK, &answer)
 }
 
 /// The status answer's members without `partsHeld`.
@@ -1797,14 +1797,14 @@ async fn hand_over(
     match wait_outcome(u.backend.complete_wait, &mut outcome).await {
         Waited::Done(done @ (Outcome::Finished | Outcome::Failed)) => {
             let state = done.written_state().unwrap_or("completing");
-            json_answer(StatusCode::OK, status_body(row, state))
+            json_answer(StatusCode::OK, &status_body(row, state))
         }
         Waited::Done(Outcome::Open) => {
             open_after_part_problem(u, row, store.as_ref(), &upload).await
         }
         Waited::Done(other) => other.answer(),
         Waited::Ended => Outcome::StoreUnavailable.answer(),
-        Waited::Running => json_answer(StatusCode::OK, status_body(row, "completing")),
+        Waited::Running => json_answer(StatusCode::OK, &status_body(row, "completing")),
     }
 }
 
@@ -1820,7 +1820,7 @@ async fn open_after_part_problem(
         Ok(listed) => {
             let mut answer = status_body(row, "open");
             answer["partsHeld"] = parts_held(&listed, row).into();
-            json_answer(StatusCode::OK, answer)
+            json_answer(StatusCode::OK, &answer)
         }
         Err(error) => store_failure(u, &error),
     }
@@ -1919,7 +1919,7 @@ async fn complete_answer(
         // The task ended without an outcome (it panicked or the stop ended it): the row is as it
         // was and a repeat resumes.
         Waited::Ended => Outcome::StoreUnavailable.answer(),
-        Waited::Running => json_answer(StatusCode::ACCEPTED, json!({"state": "completing"})),
+        Waited::Running => json_answer(StatusCode::ACCEPTED, &json!({"state": "completing"})),
     }
 }
 

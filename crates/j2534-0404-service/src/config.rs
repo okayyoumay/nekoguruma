@@ -182,7 +182,7 @@ pub(crate) enum VendorIoctlContract {
 /// silent `FAILED_PRECONDITION` the first time a client uses that command.
 fn parse_vendor_ioctl_entry(
     key: &str,
-    entry: vci_service_launcher::config::VendorIoctlConfigEntry,
+    entry: &vci_service_launcher::config::VendorIoctlConfigEntry,
 ) -> Result<(u32, VendorIoctlContract), io::Error> {
     // Grammar is deliberately canonical (exactly 8 lowercase hex digits),
     // not merely "valid hex" -- without this, distinct TOML keys like
@@ -354,7 +354,7 @@ pub(crate) fn resolve_vendor_ioctls(
     };
     configured
         .into_iter()
-        .map(|(key, entry)| parse_vendor_ioctl_entry(&key, entry))
+        .map(|(key, entry)| parse_vendor_ioctl_entry(&key, &entry))
         .collect()
 }
 
@@ -586,7 +586,7 @@ mod tests {
     fn parse_vendor_ioctl_entry_raw_shape_carries_input_output_bytes() {
         let (cmd_id, contract) = parse_vendor_ioctl_entry(
             "0x00010001",
-            VendorIoctlConfigEntry {
+            &VendorIoctlConfigEntry {
                 shape: "raw".to_string(),
                 input_bytes: 4,
                 output_bytes: 8,
@@ -612,7 +612,7 @@ mod tests {
         // old, removed 64 KiB cap) is still honored exactly as configured.
         let (_, contract) = parse_vendor_ioctl_entry(
             "0x00010001",
-            VendorIoctlConfigEntry {
+            &VendorIoctlConfigEntry {
                 shape: "raw".to_string(),
                 input_bytes: 0,
                 output_bytes: VENDOR_IOCTL_MAX_RAW_CONTRACT_BYTES,
@@ -636,7 +636,7 @@ mod tests {
         // symmetrically to both directions, not just output_bytes.
         let (_, contract) = parse_vendor_ioctl_entry(
             "0x00010001",
-            VendorIoctlConfigEntry {
+            &VendorIoctlConfigEntry {
                 shape: "raw".to_string(),
                 input_bytes: VENDOR_IOCTL_MAX_RAW_CONTRACT_BYTES,
                 output_bytes: 0,
@@ -658,7 +658,7 @@ mod tests {
     fn parse_vendor_ioctl_entry_raw_shape_still_accepts_a_realistic_large_buffer() {
         let (_, contract) = parse_vendor_ioctl_entry(
             "0x00010001",
-            VendorIoctlConfigEntry {
+            &VendorIoctlConfigEntry {
                 shape: "raw".to_string(),
                 input_bytes: 0,
                 output_bytes: 100_000,
@@ -680,7 +680,7 @@ mod tests {
     fn parse_vendor_ioctl_entry_raw_shape_rejects_output_bytes_above_the_sanity_ceiling() {
         let err = parse_vendor_ioctl_entry(
             "0x00010001",
-            VendorIoctlConfigEntry {
+            &VendorIoctlConfigEntry {
                 shape: "raw".to_string(),
                 input_bytes: 0,
                 output_bytes: VENDOR_IOCTL_MAX_RAW_CONTRACT_BYTES + 1,
@@ -696,7 +696,7 @@ mod tests {
     fn parse_vendor_ioctl_entry_raw_shape_rejects_input_bytes_above_the_sanity_ceiling() {
         let err = parse_vendor_ioctl_entry(
             "0x00010001",
-            VendorIoctlConfigEntry {
+            &VendorIoctlConfigEntry {
                 shape: "raw".to_string(),
                 input_bytes: VENDOR_IOCTL_MAX_RAW_CONTRACT_BYTES + 1,
                 output_bytes: 0,
@@ -715,7 +715,7 @@ mod tests {
         // unbounded allocation at dispatch time.
         let err = parse_vendor_ioctl_entry(
             "0x00010001",
-            VendorIoctlConfigEntry {
+            &VendorIoctlConfigEntry {
                 shape: "raw".to_string(),
                 input_bytes: 0,
                 output_bytes: u32::MAX,
@@ -731,7 +731,7 @@ mod tests {
     fn parse_vendor_ioctl_entry_sbyte_array_shape_parses_required_flags() {
         let (cmd_id, contract) = parse_vendor_ioctl_entry(
             "0x00010002",
-            VendorIoctlConfigEntry {
+            &VendorIoctlConfigEntry {
                 shape: "sbyte_array".to_string(),
                 input_bytes: 0,
                 output_bytes: 0,
@@ -754,7 +754,7 @@ mod tests {
     fn parse_vendor_ioctl_entry_sbyte_array_shape_rejects_nonzero_input_bytes() {
         let err = parse_vendor_ioctl_entry(
             "0x00010002",
-            VendorIoctlConfigEntry {
+            &VendorIoctlConfigEntry {
                 shape: "sbyte_array".to_string(),
                 input_bytes: 4,
                 output_bytes: 0,
@@ -770,7 +770,7 @@ mod tests {
     fn parse_vendor_ioctl_entry_sbyte_array_shape_rejects_nonzero_output_bytes() {
         let err = parse_vendor_ioctl_entry(
             "0x00010002",
-            VendorIoctlConfigEntry {
+            &VendorIoctlConfigEntry {
                 shape: "sbyte_array".to_string(),
                 input_bytes: 0,
                 output_bytes: 8,
@@ -786,7 +786,7 @@ mod tests {
     fn parse_vendor_ioctl_entry_raw_shape_rejects_input_required() {
         let err = parse_vendor_ioctl_entry(
             "0x00010001",
-            VendorIoctlConfigEntry {
+            &VendorIoctlConfigEntry {
                 shape: "raw".to_string(),
                 input_bytes: 0,
                 output_bytes: 0,
@@ -802,7 +802,7 @@ mod tests {
     fn parse_vendor_ioctl_entry_raw_shape_rejects_output_required() {
         let err = parse_vendor_ioctl_entry(
             "0x00010001",
-            VendorIoctlConfigEntry {
+            &VendorIoctlConfigEntry {
                 shape: "raw".to_string(),
                 input_bytes: 0,
                 output_bytes: 0,
@@ -818,7 +818,7 @@ mod tests {
     fn parse_vendor_ioctl_entry_rejects_invalid_shape() {
         let err = parse_vendor_ioctl_entry(
             "0x00010001",
-            VendorIoctlConfigEntry {
+            &VendorIoctlConfigEntry {
                 shape: "weird".to_string(),
                 input_bytes: 0,
                 output_bytes: 0,
@@ -834,7 +834,7 @@ mod tests {
     fn parse_vendor_ioctl_entry_rejects_key_without_0x_prefix() {
         let err = parse_vendor_ioctl_entry(
             "00010001",
-            VendorIoctlConfigEntry {
+            &VendorIoctlConfigEntry {
                 shape: "raw".to_string(),
                 input_bytes: 0,
                 output_bytes: 0,
@@ -850,7 +850,7 @@ mod tests {
     fn parse_vendor_ioctl_entry_rejects_non_hex_key() {
         let err = parse_vendor_ioctl_entry(
             "0xZZZZZZZZ",
-            VendorIoctlConfigEntry {
+            &VendorIoctlConfigEntry {
                 shape: "raw".to_string(),
                 input_bytes: 0,
                 output_bytes: 0,
@@ -872,7 +872,7 @@ mod tests {
         // the whole vendor_ioctls table exists for.
         let err = parse_vendor_ioctl_entry(
             "0x10001",
-            VendorIoctlConfigEntry {
+            &VendorIoctlConfigEntry {
                 shape: "raw".to_string(),
                 input_bytes: 4,
                 output_bytes: 4,
@@ -888,7 +888,7 @@ mod tests {
     fn parse_vendor_ioctl_entry_rejects_an_uppercase_hex_key() {
         let err = parse_vendor_ioctl_entry(
             "0x000100AB",
-            VendorIoctlConfigEntry {
+            &VendorIoctlConfigEntry {
                 shape: "raw".to_string(),
                 input_bytes: 4,
                 output_bytes: 4,
@@ -908,7 +908,7 @@ mod tests {
         // while appearing configured.
         let err = parse_vendor_ioctl_entry(
             "0x00000001",
-            VendorIoctlConfigEntry {
+            &VendorIoctlConfigEntry {
                 shape: "raw".to_string(),
                 input_bytes: 4,
                 output_bytes: 4,
@@ -929,7 +929,7 @@ mod tests {
         // reached the vendor dispatch path (Codex review, PR #133 tenth round).
         let err = parse_vendor_ioctl_entry(
             "0x29000001",
-            VendorIoctlConfigEntry {
+            &VendorIoctlConfigEntry {
                 shape: "raw".to_string(),
                 input_bytes: 0,
                 output_bytes: 0,
@@ -945,7 +945,7 @@ mod tests {
     fn parse_vendor_ioctl_entry_accepts_the_vendor_range_floor() {
         let (cmd_id, _) = parse_vendor_ioctl_entry(
             "0x00010000",
-            VendorIoctlConfigEntry {
+            &VendorIoctlConfigEntry {
                 shape: "raw".to_string(),
                 input_bytes: 4,
                 output_bytes: 4,
@@ -961,7 +961,7 @@ mod tests {
     fn parse_vendor_ioctl_entry_accepts_the_canonical_eight_digit_lowercase_key() {
         let (cmd_id, _) = parse_vendor_ioctl_entry(
             "0x00010001",
-            VendorIoctlConfigEntry {
+            &VendorIoctlConfigEntry {
                 shape: "raw".to_string(),
                 input_bytes: 4,
                 output_bytes: 4,

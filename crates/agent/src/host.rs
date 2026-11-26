@@ -3186,6 +3186,7 @@ fn shared_end(data: &Option<event_notification::EventData>) -> bool {
 }
 
 /// How a stray primitive ended, for its `primitive_ended` entry.
+#[derive(Clone, Copy)]
 enum StrayEnd<'a> {
     /// It ended, as its exchange's wait would have read it.
     Ended(&'a Result<Vec<u8>, HostError>),
@@ -4902,7 +4903,7 @@ impl<C: WorkerApi> DiagHost for WorkerHost<C> {
         use crate::inputs::RuntimeInputs;
         self.drain_link_items();
         self.check_session()?;
-        integer_reading(input, self.read(input)?)
+        integer_reading(input, &self.read(input)?)
     }
 
     // The message goes to the communication log only, since it may hold vehicle data; the
@@ -4928,7 +4929,7 @@ impl<C: WorkerApi> DiagHost for WorkerHost<C> {
 /// undecodable answer, text) is [`HostError::InputNotEstablished`] (ADR-338).
 fn integer_reading(
     input: diag_ir::RuntimeInput,
-    reading: crate::inputs::Reading,
+    reading: &crate::inputs::Reading,
 ) -> Result<i64, HostError> {
     reading.value().ok_or(HostError::InputNotEstablished(input))
 }
@@ -4956,8 +4957,8 @@ mod tests {
 
     // ---- exchange entries (design 8.11 "Exchange entry") ----
 
-    fn end_of(request: &[u8], result: Result<Vec<u8>, HostError>) -> (End, Detail) {
-        sent_end(request, &result, &NegativeShape::uds(), request[0])
+    fn end_of(request: &[u8], result: &Result<Vec<u8>, HostError>) -> (End, Detail) {
+        sent_end(request, result, &NegativeShape::uds(), request[0])
     }
 
     fn rpc(code: tonic::Code) -> HostError {
@@ -4983,7 +4984,7 @@ mod tests {
                 status: Box::new(vci_service_interface::status_with_error_detail(
                     tonic::Code::InvalidArgument,
                     "refused",
-                    ErrorDetail {
+                    &ErrorDetail {
                         pdu_error: PduError::PduErrInvalidParameters as i32,
                         error_event_data: None,
                         detail_text: None,
@@ -4999,7 +5000,7 @@ mod tests {
             RefusalReason::QueueFull,
             RefusalReason::ProtocolCannotCarry,
         ] {
-            let (end, detail) = end_of(&read, refused(Some(reason)));
+            let (end, detail) = end_of(&read, &refused(Some(reason)));
             assert!(
                 matches!(end, End::NotSent(RefusalCause::SystemOwnReasons)),
                 "{reason:?}: {end:?}"
@@ -5008,7 +5009,7 @@ mod tests {
             assert_eq!(detail.grpc_status, Some("InvalidArgument"));
         }
         for result in [refused(None), refused(Some(RefusalReason::Unspecified))] {
-            let end = end_of(&read, result).0;
+            let end = end_of(&read, &result).0;
             assert!(
                 matches!(end, End::Unknown(UnknownCause::PrimitiveFailedToStart)),
                 "{end:?}"
@@ -5016,7 +5017,7 @@ mod tests {
         }
         let end = end_of(
             &read,
-            refused_on("SubscribeEvent", Some(RefusalReason::QueueFull)),
+            &refused_on("SubscribeEvent", Some(RefusalReason::QueueFull)),
         )
         .0;
         assert!(
@@ -5029,18 +5030,18 @@ mod tests {
     fn a_sent_request_ends_as_the_host_saw_it() {
         let read = [0x22, 0xF1, 0x90];
         assert!(matches!(
-            end_of(&read, Ok(vec![0x62, 0xF1, 0x90])).0,
+            end_of(&read, &Ok(vec![0x62, 0xF1, 0x90])).0,
             End::Positive(_)
         ));
         assert!(matches!(
-            end_of(&read, Ok(vec![0x7F, 0x22, 0x31])).0,
+            end_of(&read, &Ok(vec![0x7F, 0x22, 0x31])).0,
             End::Negative(_)
         ));
-        let (end, detail) = end_of(&read, Err(HostError::NoResponse));
+        let (end, detail) = end_of(&read, &Err(HostError::NoResponse));
         assert!(matches!(end, End::NoResponse));
         assert_eq!(detail.host_error, Some("NoResponse"));
         for refused_after_loss in [true, false] {
-            let (end, detail) = end_of(&read, Err(HostError::VciLost { refused_after_loss }));
+            let (end, detail) = end_of(&read, &Err(HostError::VciLost { refused_after_loss }));
             assert!(
                 matches!(end, End::VciLost { refused_after_loss: r } if r == refused_after_loss),
                 "{end:?}"
@@ -5050,20 +5051,20 @@ mod tests {
                 Some("PDU_ERR_EVT_LOST_COMM_TO_VCI")
             );
         }
-        let (end, detail) = end_of(&read, Err(rpc(tonic::Code::Unavailable)));
+        let (end, detail) = end_of(&read, &Err(rpc(tonic::Code::Unavailable)));
         assert!(
             matches!(end, End::Unknown(UnknownCause::PrimitiveFailedToStart)),
             "{end:?}"
         );
         assert_eq!(detail.grpc_status, Some("Unavailable"));
-        let end = end_of(&read, Err(rpc_of("SubscribeEvent", tonic::Code::Internal))).0;
+        let end = end_of(&read, &Err(rpc_of("SubscribeEvent", tonic::Code::Internal))).0;
         assert!(
             matches!(end, End::Unknown(UnknownCause::RpcFailure)),
             "{end:?}"
         );
         let (end, detail) = end_of(
             &read,
-            Err(HostError::PrimitiveFailed(
+            &Err(HostError::PrimitiveFailed(
                 PduErrorEvent::PduErrEvtTxError as i32,
             )),
         );
@@ -5073,23 +5074,23 @@ mod tests {
         );
         assert_eq!(detail.error_event.as_deref(), Some("PDU_ERR_EVT_TX_ERROR"));
         assert!(matches!(
-            end_of(&read, Err(HostError::EventsLost)).0,
+            end_of(&read, &Err(HostError::EventsLost)).0,
             End::Unknown(UnknownCause::EventsLost)
         ));
         assert!(matches!(
-            end_of(&read, Err(HostError::EventStreamEnded)).0,
+            end_of(&read, &Err(HostError::EventStreamEnded)).0,
             End::Unknown(UnknownCause::EventsEnded)
         ));
         assert!(matches!(
             end_of(
                 &read,
-                Err(HostError::WorkerUnresponsive("StartComPrimitive"))
+                &Err(HostError::WorkerUnresponsive("StartComPrimitive"))
             )
             .0,
             End::Unknown(UnknownCause::WorkerNotAnswering)
         ));
         assert!(matches!(
-            end_of(&read, Err(HostError::Setup("no handle"))).0,
+            end_of(&read, &Err(HostError::Setup("no handle"))).0,
             End::Unknown(UnknownCause::PrimitiveFailedToStart)
         ));
     }
@@ -5098,13 +5099,13 @@ mod tests {
     fn a_positive_response_the_agent_cannot_use_is_unusable() {
         let block = [0x36, 0x01, 0xAA];
         assert!(matches!(
-            end_of(&block, Ok(vec![0x76, 0x01])).0,
+            end_of(&block, &Ok(vec![0x76, 0x01])).0,
             End::Positive(_)
         ));
         for wrong in [vec![0x76, 0x02], vec![0x76]] {
             assert!(
                 matches!(
-                    end_of(&block, Ok(wrong.clone())).0,
+                    end_of(&block, &Ok(wrong.clone())).0,
                     End::PositiveUnusable(_)
                 ),
                 "{wrong:02X?}"
@@ -5112,11 +5113,11 @@ mod tests {
         }
         let download = [0x34, 0x00, 0x44, 0, 0, 0, 0, 0, 0, 1, 0];
         assert!(matches!(
-            end_of(&download, Ok(vec![0x74, 0x20, 0x01, 0x02])).0,
+            end_of(&download, &Ok(vec![0x74, 0x20, 0x01, 0x02])).0,
             End::Positive(_)
         ));
         assert!(matches!(
-            end_of(&download, Ok(vec![0x74, 0x20, 0x01])).0,
+            end_of(&download, &Ok(vec![0x74, 0x20, 0x01])).0,
             End::PositiveUnusable(_)
         ));
     }
@@ -5683,7 +5684,10 @@ mod tests {
     fn only_an_integer_reading_reads_as_an_input() {
         use crate::inputs::Reading;
         let input = diag_ir::RuntimeInput::VehicleSpeedKmh;
-        assert!(matches!(integer_reading(input, Reading::Value(87)), Ok(87)));
+        assert!(matches!(
+            integer_reading(input, &Reading::Value(87)),
+            Ok(87)
+        ));
         for reading in [
             Reading::CannotBeEstablished,
             Reading::CannotBeDecoded,
@@ -5691,7 +5695,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    integer_reading(input, reading.clone()),
+                    integer_reading(input, &reading),
                     Err(HostError::InputNotEstablished(i)) if i == input
                 ),
                 "{reading:?}"
@@ -7340,7 +7344,7 @@ mod tests {
             status: Box::new(vci_service_interface::status_with_error_detail(
                 code,
                 "logical link must be connected before starting a primitive",
-                ErrorDetail {
+                &ErrorDetail {
                     pdu_error: PduError::PduErrCllNotConnected as i32,
                     error_event_data: event.map(|event| ErrorEventData {
                         error_event: event as i32,
@@ -7391,7 +7395,7 @@ mod tests {
             status: Box::new(vci_service_interface::status_with_error_detail(
                 tonic::Code::InvalidArgument,
                 "refused",
-                ErrorDetail {
+                &ErrorDetail {
                     pdu_error: PduError::PduErrInvalidParameters as i32,
                     error_event_data: None,
                     detail_text: None,
@@ -7511,7 +7515,7 @@ mod tests {
     fn a_timed_out_start_may_have_reached_the_ecu() {
         let error = HostError::WorkerUnresponsive("StartComPrimitive");
         assert_eq!(error.send_state(), SendState::MayHaveReached);
-        let (end, _) = end_of(&[0x22, 0xF1, 0x90], Err(error));
+        let (end, _) = end_of(&[0x22, 0xF1, 0x90], &Err(error));
         assert!(matches!(
             end,
             End::Unknown(UnknownCause::WorkerNotAnswering)
@@ -7596,7 +7600,7 @@ mod tests {
             status: Box::new(vci_service_interface::status_with_error_detail(
                 tonic::Code::Unavailable,
                 "refused",
-                vci_service_interface::ErrorDetail {
+                &vci_service_interface::ErrorDetail {
                     pdu_error: vci_service_interface::PduError::PduErrInvalidParameters as i32,
                     error_event_data: None,
                     detail_text: None,

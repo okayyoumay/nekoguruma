@@ -720,7 +720,7 @@ fn expanded(text: &str) -> Result<String, ResolveError> {
     expand_root_file_value(text, folders)
 }
 
-fn assert_refused(result: Result<impl std::fmt::Debug, ResolveError>, what: &str) {
+fn assert_refused(result: &Result<impl std::fmt::Debug, ResolveError>, what: &str) {
     assert!(
         matches!(result, Err(ResolveError::RootFileValue { .. })),
         "{what}: {result:?}"
@@ -799,7 +799,7 @@ fn other_names_and_stray_percents_are_refused() {
         "%",
         r"%ProgramFiles%\%",
     ] {
-        assert_refused(expanded(text), text);
+        assert_refused(&expanded(text), text);
     }
 }
 
@@ -807,12 +807,12 @@ fn other_names_and_stray_percents_are_refused() {
 fn a_known_name_without_a_registry_value_is_refused() {
     let none = |_: KnownFolder| None;
     assert_refused(
-        expand_root_file_value(r"%ProgramFiles%\r.xml", none),
+        &expand_root_file_value(r"%ProgramFiles%\r.xml", none),
         "missing",
     );
     let only_system_root = |f: KnownFolder| (f == KnownFolder::SystemRoot).then(|| "C:".to_owned());
     assert_refused(
-        expand_root_file_value(r"%windir%\%ProgramFiles%", only_system_root),
+        &expand_root_file_value(r"%windir%\%ProgramFiles%", only_system_root),
         "one missing",
     );
 }
@@ -820,8 +820,8 @@ fn a_known_name_without_a_registry_value_is_refused() {
 #[test]
 fn the_process_environment_is_not_consulted() {
     // PATH exists on every platform; it is still not a known name.
-    assert_refused(expanded("%PATH%"), "PATH");
-    assert_refused(expanded("%Path%"), "Path");
+    assert_refused(&expanded("%PATH%"), "PATH");
+    assert_refused(&expanded("%Path%"), "Path");
 }
 
 #[test]
@@ -866,7 +866,7 @@ fn registry_string(text: &str) -> Vec<u8> {
 fn a_registry_value_expands_only_when_asked() {
     let raw = registry_string(r"  %ProgramFiles%\Vendor\root.xml  ");
     // Literal, so the percent sign makes it a relative path, which is refused.
-    assert_refused(root_file_from_value(&raw, false, &folders), "literal");
+    assert_refused(&root_file_from_value(&raw, false, &folders), "literal");
     let expanded = root_file_from_value(&raw, true, &folders).unwrap();
     assert_eq!(
         expanded,
@@ -877,7 +877,7 @@ fn a_registry_value_expands_only_when_asked() {
         root_file_from_value(&literal, false, &folders).unwrap(),
         Some(PathBuf::from(r"C:\100%\root.xml"))
     );
-    assert_refused(root_file_from_value(&literal, true, &folders), "expanded");
+    assert_refused(&root_file_from_value(&literal, true, &folders), "expanded");
 }
 
 #[test]
@@ -891,7 +891,7 @@ fn the_expanded_root_file_must_be_an_absolute_drive_letter_path() {
     ] {
         for expand in [false, true] {
             assert_refused(
-                root_file_from_value(&registry_string(bad), expand, &folders),
+                &root_file_from_value(&registry_string(bad), expand, &folders),
                 bad,
             );
         }
@@ -903,7 +903,7 @@ fn the_expanded_root_file_must_be_an_absolute_drive_letter_path() {
     // A folder value that is itself relative gives a relative result.
     let relative = |_: KnownFolder| Some("Program Files".to_owned());
     assert_refused(
-        root_file_from_value(&registry_string(r"%ProgramFiles%\r.xml"), true, &relative),
+        &root_file_from_value(&registry_string(r"%ProgramFiles%\r.xml"), true, &relative),
         "relative folder",
     );
 }
@@ -922,9 +922,12 @@ fn a_registry_value_is_decoded_and_checked() {
         root_file_from_value(&registry_string("   "), false, &folders).unwrap(),
         None
     );
-    assert_refused(root_file_from_value(&[0x41], false, &folders), "odd length");
     assert_refused(
-        root_file_from_value(&registry_string("C:\\a\0b"), false, &folders),
+        &root_file_from_value(&[0x41], false, &folders),
+        "odd length",
+    );
+    assert_refused(
+        &root_file_from_value(&registry_string("C:\\a\0b"), false, &folders),
         "NUL",
     );
     // An expansion that comes out blank is no path either.
@@ -945,7 +948,7 @@ fn only_ascii_whitespace_is_trimmed_from_a_registry_value() {
     );
     // A value of only U+3000 is not blank; it is not a drive-letter path, so it is refused.
     assert_refused(
-        root_file_from_value(&registry_string("\u{3000}"), false, &folders),
+        &root_file_from_value(&registry_string("\u{3000}"), false, &folders),
         "ideographic space",
     );
     // ASCII whitespace of every kind is trimmed.
@@ -959,7 +962,7 @@ fn only_ascii_whitespace_is_trimmed_from_a_registry_value() {
 fn a_nul_brought_in_by_a_folder_is_refused() {
     let nul = |_: KnownFolder| Some("C:\\a\0b".to_owned());
     assert_refused(
-        root_file_from_value(&registry_string(r"%ProgramFiles%\r.xml"), true, &nul),
+        &root_file_from_value(&registry_string(r"%ProgramFiles%\r.xml"), true, &nul),
         "NUL from a folder",
     );
 }
@@ -976,7 +979,7 @@ fn parent_like_components_of_the_root_file_are_refused() {
     ] {
         for expand in [false, true] {
             assert_refused(
-                root_file_from_value(&registry_string(bad), expand, &folders),
+                &root_file_from_value(&registry_string(bad), expand, &folders),
                 bad,
             );
         }
@@ -984,7 +987,7 @@ fn parent_like_components_of_the_root_file_are_refused() {
     // A folder value can bring the component in.
     let parent = |_: KnownFolder| Some(r"C:\a\..".to_owned());
     assert_refused(
-        root_file_from_value(&registry_string(r"%ProgramFiles%\r.xml"), true, &parent),
+        &root_file_from_value(&registry_string(r"%ProgramFiles%\r.xml"), true, &parent),
         "parent from a folder",
     );
     // A dotted name and `.` are fine.
@@ -999,7 +1002,7 @@ fn a_unc_known_folder_is_refused() {
     let unc = |_: KnownFolder| Some(r"\\srv\share".to_owned());
     for text in [r"%ProgramFiles%\root.xml", "%windir%"] {
         assert_refused(
-            root_file_from_value(&registry_string(text), true, &unc),
+            &root_file_from_value(&registry_string(text), true, &unc),
             text,
         );
     }
@@ -1271,7 +1274,7 @@ mod registry {
             Some(PathBuf::from(r"C:\100%\pdu_api_root.xml"))
         );
         temp.set_raw(r"%SystemRoot%\pdu_api_root.xml", false);
-        assert_refused(root_file_from_key(&temp.0, &folders), "unexpanded");
+        assert_refused(&root_file_from_key(&temp.0, &folders), "unexpanded");
     }
 
     #[test]
@@ -1296,7 +1299,7 @@ mod registry {
         );
         // A known name whose registry value is absent is refused, whatever the environment holds.
         temp.set_raw(r"%ProgramFiles%\Vendor\root.xml", true);
-        assert_refused(root_file_from_key(&temp.0, &lookup), "missing value");
+        assert_refused(&root_file_from_key(&temp.0, &lookup), "missing value");
     }
 
     #[test]

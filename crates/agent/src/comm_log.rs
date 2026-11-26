@@ -4446,7 +4446,7 @@ impl CommLog {
         // out of the run, so a later run does not settle it again. The run's own loss is
         // the newer of the two; an earlier run's was settled at the run's first connection.
         if let Some(loss) = inner.loss.take().or_else(|| inner.unsettled.take()) {
-            inner.settle_loss(loss, reading)?;
+            inner.settle_loss(&loss, reading)?;
         }
         Some(connected)
     }
@@ -6459,7 +6459,7 @@ impl Inner {
     /// Writes the `vci_loss_settled` of the loss an earlier run recorded, against `reading`,
     /// the first reading of the VCI's clock after it connected (design 8.11 "Settlement",
     /// ADR-373). `None` once the log has failed.
-    fn settle_loss(&mut self, loss: VciLoss, reading: Option<ConnectReading>) -> Option<u64> {
+    fn settle_loss(&mut self, loss: &VciLoss, reading: Option<ConnectReading>) -> Option<u64> {
         let round_trip_us = reading.and_then(|reading| reading.round_trip_us);
         // One sample for every boot time looked up below, so that all see the same offsets.
         self.sample_boot();
@@ -25022,13 +25022,13 @@ pub(crate) mod tests {
     /// the agent's deadline ended (`vci_did_not_end`); its transmit indication at 10.5 ms on the
     /// device clock is its earliest placed start. Returns the log's directory, setup and
     /// `seq` of the exchange.
-    fn stray_log(facts: RunFacts) -> (PathBuf, CommLogSetup, CommLog, u64) {
+    fn stray_log(facts: &RunFacts) -> (PathBuf, CommLogSetup, CommLog, u64) {
         stray_log_with(facts, None)
     }
 
     /// [`stray_log`], whose exchange's entry also has a response start at `start_us`.
     fn stray_log_with(
-        facts: RunFacts,
+        facts: &RunFacts,
         start_us: Option<u64>,
     ) -> (PathBuf, CommLogSetup, CommLog, u64) {
         stray_log_ending(facts, start_us, exchange::End::VciDidNotEnd)
@@ -25036,14 +25036,14 @@ pub(crate) mod tests {
 
     /// [`stray_log_with`], whose exchange ended as `end` instead.
     fn stray_log_ending(
-        facts: RunFacts,
+        facts: &RunFacts,
         start_us: Option<u64>,
         end: exchange::End,
     ) -> (PathBuf, CommLogSetup, CommLog, u64) {
         let dir = dir();
         let setup = setup(&dir);
         let log = CommLog::open(&setup).unwrap();
-        log.begin(&facts, RunKind::First);
+        log.begin(facts, RunKind::First);
         log.link_opened(
             1,
             &crate::link::LinkConfig::iso15765(0x7E0, 0x7E8),
@@ -25111,7 +25111,7 @@ pub(crate) mod tests {
     /// pending and the response are the end's, and no clock epoch opens twice.
     #[test]
     fn a_job_end_places_what_it_read_once_and_keeps_the_exchange_s_starts() {
-        let (dir, setup, log, seq) = stray_log(facts());
+        let (dir, setup, log, seq) = stray_log(&facts());
         log.primitive_ended(
             seq,
             ended_with(
@@ -25156,7 +25156,7 @@ pub(crate) mod tests {
             Some(exchange::End::LinkError(exchange::LinkErrorKind::Receive)),
         ] {
             let (dir, setup, log, seq) = stray_log_ending(
-                facts(),
+                &facts(),
                 None,
                 exchange::End::Unknown(exchange::UnknownCause::PrimitiveFailedToStart),
             );
@@ -25183,7 +25183,7 @@ pub(crate) mod tests {
     #[test]
     fn a_released_unresolved_start_is_no_longer_kept() {
         let (dir, setup, log, seq) = stray_log_ending(
-            facts(),
+            &facts(),
             None,
             exchange::End::Unknown(exchange::UnknownCause::PrimitiveFailedToStart),
         );
@@ -25199,7 +25199,7 @@ pub(crate) mod tests {
     /// tolerances allow, opens an epoch of its own, written before the entry that uses it.
     #[test]
     fn a_step_back_read_at_job_end_opens_its_epoch_before_the_entry() {
-        let (dir, setup, log, seq) = stray_log(facts());
+        let (dir, setup, log, seq) = stray_log(&facts());
         log.primitive_ended(
             seq,
             ended_with(
@@ -25245,7 +25245,7 @@ pub(crate) mod tests {
         ] {
             let mut run_facts = facts();
             run_facts.margins.clock_margin_us = Some(clock_margin_us);
-            let (dir, setup, log, seq) = stray_log(run_facts);
+            let (dir, setup, log, seq) = stray_log(&run_facts);
             let second_read = if together { 400_000 } else { 400_001 };
             log.primitive_ended(
                 seq,
@@ -25286,7 +25286,7 @@ pub(crate) mod tests {
             (long.clone(), Some(400_000), false),
             (long, Some(200_000), true),
         ] {
-            let (dir, setup, log, seq) = stray_log_with(facts(), Some(300_000));
+            let (dir, setup, log, seq) = stray_log_with(&facts(), Some(300_000));
             let mut reads = Vec::new();
             if let Some(us) = pending {
                 reads.push(pending_read(400_000, us));
@@ -25371,7 +25371,7 @@ pub(crate) mod tests {
     /// gives the entry no response time and no judged timing.
     #[test]
     fn a_response_is_not_the_end_s_times_when_the_end_is_not_a_response() {
-        let (dir, setup, log, seq) = stray_log(facts());
+        let (dir, setup, log, seq) = stray_log(&facts());
         log.primitive_ended(
             seq,
             ended_with(
@@ -25852,7 +25852,7 @@ pub(crate) mod tests {
     #[test]
     fn a_bound_error_is_before_the_answer_by_its_read_ordinal() {
         for (errors_first, before) in [(true, true), (false, false)] {
-            let (dir, setup, log, seq) = stray_log(facts());
+            let (dir, setup, log, seq) = stray_log(&facts());
             let error = bound_error(0, Some(exchange::LinkErrorKind::Receive), 20_000, true);
             let reads = if errors_first {
                 vec![
@@ -25893,7 +25893,7 @@ pub(crate) mod tests {
     /// exchange's own, written after the cancel entry.
     #[test]
     fn a_bound_error_with_no_end_is_a_late_item_of_the_cancelled_exchange() {
-        let (dir, setup, log, seq) = stray_log(facts());
+        let (dir, setup, log, seq) = stray_log(&facts());
         log.primitive_ended(
             seq,
             ended_with(
@@ -25952,7 +25952,7 @@ pub(crate) mod tests {
             (20_000, None, true, true),
             (20_000, Some(exchange::Clock::Worker), true, true),
         ] {
-            let (dir, setup, log, seq) = stray_log(facts());
+            let (dir, setup, log, seq) = stray_log(&facts());
             let error = unattached_error(400_000, vci_us, clock, false);
             let reads = if before_answer {
                 vec![error, response_read(500_000, 510_500)]
@@ -26063,7 +26063,7 @@ pub(crate) mod tests {
     fn a_link_error_of_an_earlier_primitive_read_at_job_end_is_placed_by_its_time() {
         let device = Some(exchange::Clock::Device);
         for (clock, expected) in [(device, "late_item"), (None, "unattached")] {
-            let (dir, setup, log, seq) = stray_log(facts());
+            let (dir, setup, log, seq) = stray_log(&facts());
             log.primitive_ended(
                 seq,
                 ended_with(
@@ -26098,7 +26098,7 @@ pub(crate) mod tests {
     #[test]
     fn link_errors_read_at_job_end_with_no_entry_are_placed_by_their_time() {
         let device = Some(exchange::Clock::Device);
-        let (dir, setup, log, _seq) = stray_log(facts());
+        let (dir, setup, log, _seq) = stray_log(&facts());
         let items = [
             unattached_error(400_000, 20_000, device, false),
             unattached_error(400_001, 21_000, None, false),
@@ -26211,7 +26211,7 @@ pub(crate) mod tests {
     /// classification (design 8.11 "Settlement").
     #[test]
     fn a_loss_record_stays_current_with_the_late_items_after_it() {
-        let (dir, setup, log, seq) = stray_log(facts());
+        let (dir, setup, log, seq) = stray_log(&facts());
         log.primitive_ended(
             seq,
             ended_with(
@@ -26249,7 +26249,7 @@ pub(crate) mod tests {
     /// An item settled after the loss record was written rewrites it.
     #[test]
     fn a_late_link_error_rewrites_the_loss_record_of_an_exchange_it_changes() {
-        let (dir, setup, log, seq) = stray_log(facts());
+        let (dir, setup, log, seq) = stray_log(&facts());
         log.primitive_ended(
             seq,
             ended_with(
@@ -26497,7 +26497,7 @@ pub(crate) mod tests {
     /// keeps its classification.
     #[test]
     fn an_unbound_response_no_exchange_could_own_is_written_unattached() {
-        let (dir, setup, log, seq) = stray_log(facts());
+        let (dir, setup, log, seq) = stray_log(&facts());
         log.primitive_ended(
             seq,
             ended_with(
@@ -26522,7 +26522,7 @@ pub(crate) mod tests {
     /// `unattached` before the entry and floors nothing, as for an exchange in flight (ADR-368).
     #[test]
     fn an_unbound_response_only_the_stray_awaits_is_written_unattached_with_no_floor() {
-        let (dir, setup, log, seq) = stray_log(facts());
+        let (dir, setup, log, seq) = stray_log(&facts());
         log.primitive_ended(
             seq,
             ended_with(
@@ -26547,7 +26547,7 @@ pub(crate) mod tests {
     /// response of the stray, whose wait the VCI had ended; it follows the entry.
     #[test]
     fn an_unbound_response_read_after_the_receive_timeout_is_the_stray_s_late_response() {
-        let (dir, setup, log, seq) = stray_log(facts());
+        let (dir, setup, log, seq) = stray_log(&facts());
         let mut ended = ended_with(
             Some(exchange::End::NoResponse),
             vec![
@@ -26572,7 +26572,7 @@ pub(crate) mod tests {
     /// and so is not counted as an owner.
     #[test]
     fn an_unbound_pending_read_at_job_end_is_written_unattached() {
-        let (dir, setup, log, seq) = stray_log(facts());
+        let (dir, setup, log, seq) = stray_log(&facts());
         log.primitive_ended(
             seq,
             ended_with(
@@ -26597,7 +26597,7 @@ pub(crate) mod tests {
     /// its classification and reason.
     #[test]
     fn an_unbound_response_read_for_a_cancelled_primitive_is_written_before_its_entry() {
-        let (dir, setup, log, seq) = stray_log(facts());
+        let (dir, setup, log, seq) = stray_log(&facts());
         log.primitive_ended(
             seq,
             ended_with(
@@ -26637,7 +26637,7 @@ pub(crate) mod tests {
     /// is not written beside the entry as well.
     #[test]
     fn a_start_indication_the_entry_takes_is_not_written_unattached() {
-        let (dir, setup, log, seq) = stray_log(facts());
+        let (dir, setup, log, seq) = stray_log(&facts());
         let EndItem::Unattached(mut start) = unbound_result(300_000, 310_500, 0x7E8, &[]).item
         else {
             unreachable!()
@@ -26767,7 +26767,7 @@ pub(crate) mod tests {
         // Only the stray could own it, and not as the exchange in flight (its time comes
         // before the stray's own transmit done): it is not counted among the owners, so the
         // item is `unattached`, not the stray's `late_item` before its own entry.
-        let (dir, setup, log, seq) = stray_log(facts());
+        let (dir, setup, log, seq) = stray_log(&facts());
         log.primitive_ended(
             seq,
             ended_with(
@@ -26791,7 +26791,7 @@ pub(crate) mod tests {
     /// could own it takes it as its `late_item`.
     #[test]
     fn a_pending_the_job_end_drain_reads_is_the_lone_owner_s_late_item() {
-        let (dir, setup, log, seq) = stray_log(facts());
+        let (dir, setup, log, seq) = stray_log(&facts());
         let mut ended = ended_with(
             Some(exchange::End::NoResponse),
             vec![end_read(500_000, EndItem::RxTimeout(dev(1_010_500)))],
@@ -26818,7 +26818,7 @@ pub(crate) mod tests {
     /// in flight, is the lone owner's `late_item` too, written after the entry.
     #[test]
     fn a_pending_read_after_the_end_is_the_lone_owner_s_late_item() {
-        let (dir, setup, log, seq) = stray_log(facts());
+        let (dir, setup, log, seq) = stray_log(&facts());
         let mut ended = ended_with(
             Some(exchange::End::NoResponse),
             vec![
@@ -26887,7 +26887,7 @@ pub(crate) mod tests {
     /// 8.11 `late_item`).
     #[test]
     fn the_drain_does_not_make_a_stray_in_flight_an_ended_owner() {
-        let (dir, setup, log, seq) = stray_log(facts());
+        let (dir, setup, log, seq) = stray_log(&facts());
         let before = log.lock().links[0].1.standing(seq);
         log.late_link_errors(
             vec![unbound_item(700_000, 1_020_000, 0x7E8, &[0x7F, 0x22, 0x78])],

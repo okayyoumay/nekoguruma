@@ -274,6 +274,10 @@ enum Failed {
 }
 
 impl Failed {
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "used as the function handed to `Result::map_err`, which passes the error by value"
+    )]
     fn run(error: impl ToString) -> Failed {
         Failed::Run(error.to_string())
     }

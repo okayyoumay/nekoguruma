@@ -329,7 +329,7 @@ impl Lab {
 
     /// The request body of an acquire job for the agent, with `extra` merged over it; a null
     /// value removes the property.
-    fn body(&self, extra: Value) -> String {
+    fn body(&self, extra: &Value) -> String {
         let mut body = json!({
             "kind": "acquire",
             "agentId": self.agent_id,
@@ -520,7 +520,7 @@ fn spawn_post(
 async fn the_layer_answers_before_the_body_and_a_wrong_method_needs_no_session() {
     let lab = Lab::new().await;
     let addr = lab.addr();
-    let body = lab.body(json!({}));
+    let body = lab.body(&json!({}));
     let cookie = lab.login("alice").await;
     let post = |headers: Vec<String>, body: &str| {
         let raw = raw(addr, "POST", "/api/v1/jobs", &headers, body);
@@ -645,7 +645,7 @@ async fn the_body_is_bounded_in_size_and_time_and_each_refusal_closes_the_connec
     let lab = Lab::new().await;
     let addr = lab.addr();
     let cookie = lab.login("alice").await;
-    let body = lab.body(json!({}));
+    let body = lab.body(&json!({}));
     let closes = |r: &Reply, what: &str| {
         assert_problem(r, r.status, what);
         assert_eq!(r.header("connection"), Some("close"), "{what}");
@@ -716,7 +716,7 @@ async fn an_acquire_job_is_stored_signed_and_answered_with_its_state() {
     // C1
     let lab = Lab::new().await;
     let cookie = lab.login("alice").await;
-    let body = lab.body(json!({}));
+    let body = lab.body(&json!({}));
     let r = lab.post(&cookie, "key-c1", &body).await;
     assert_eq!(r.status, 202, "{} {}", r.head, r.body);
     assert_eq!(r.header("cache-control"), Some("no-store"));
@@ -803,7 +803,7 @@ async fn a_write_settings_job_has_the_grace_period_level() {
         .post(
             &cookie,
             "key-c2",
-            &lab.body(json!({ "kind": "writeSettings" })),
+            &lab.body(&json!({ "kind": "writeSettings" })),
         )
         .await;
     let id = job_id(&r);
@@ -832,16 +832,20 @@ async fn a_write_settings_job_has_the_grace_period_level() {
 async fn a_job_takes_its_level_from_the_defaults_table_as_it_stands_at_its_creation() {
     let lab = Lab::new().await;
     let cookie = lab.login("alice").await;
-    let acquire = lab.post(&cookie, "d1", &lab.body(json!({}))).await;
+    let acquire = lab.post(&cookie, "d1", &lab.body(&json!({}))).await;
     let write = lab
-        .post(&cookie, "d2", &lab.body(json!({ "kind": "writeSettings" })))
+        .post(
+            &cookie,
+            "d2",
+            &lab.body(&json!({ "kind": "writeSettings" })),
+        )
         .await;
     assert_eq!(json(&acquire)["confirmation"]["level"], "notifyOnly");
     assert_eq!(json(&write)["confirmation"]["level"], "gracePeriod");
     // A changed row reaches the next job and leaves the earlier one alone.
     lab.exec("UPDATE confirmation_defaults SET level = 'onSiteApproval' WHERE kind = 'acquire'")
         .await;
-    let next = lab.post(&cookie, "d3", &lab.body(json!({}))).await;
+    let next = lab.post(&cookie, "d3", &lab.body(&json!({}))).await;
     assert_eq!(json(&next)["confirmation"]["level"], "onSiteApproval");
     assert_eq!(
         lab.field(&job_id(&next), "confirmation_level").await,
@@ -860,7 +864,7 @@ async fn a_kind_without_a_default_row_is_a_500_and_leaves_nothing_behind() {
     let cookie = lab.login("alice").await;
     lab.exec("DELETE FROM confirmation_defaults WHERE kind = 'acquire'")
         .await;
-    let body = lab.body(json!({ "vin": "WVWZZZ1JZXW000001" }));
+    let body = lab.body(&json!({ "vin": "WVWZZZ1JZXW000001" }));
     let r = lab.post(&cookie, "d4", &body).await;
     assert_problem(&r, 500, "no default row");
     lab.assert_jobs(0, "no job").await;
@@ -884,7 +888,7 @@ async fn the_vin_the_artifact_and_the_sorted_unique_digests_reach_the_instructio
     let lab = Lab::new().await;
     let cookie = lab.login("alice").await;
     let operator = lab.w.sql("SELECT id FROM operators").await;
-    let body = lab.body(json!({
+    let body = lab.body(&json!({
         "vin": VIN,
         "artifactDigest": DIGEST_B,
         "irDigests": [DIGEST_B, DIGEST_A, DIGEST_B],
@@ -951,7 +955,7 @@ async fn the_same_operator_and_request_replay_the_stored_job_and_a_different_one
     // K1, K2, K3, K4, K5
     let lab = Lab::new().await;
     let cookie = lab.login("alice").await;
-    let body = lab.body(json!({}));
+    let body = lab.body(&json!({}));
     let first = lab.post(&cookie, "k", &body).await;
     let id = job_id(&first);
     let signed = lab.field(&id, "encode(signed_job, 'hex')").await;
@@ -966,7 +970,7 @@ async fn the_same_operator_and_request_replay_the_stored_job_and_a_different_one
 
     // K2: another body under the key is a 422 with no data of the job.
     let other = lab
-        .post(&cookie, "k", &lab.body(json!({"vciId": "vci-2"})))
+        .post(&cookie, "k", &lab.body(&json!({"vciId": "vci-2"})))
         .await;
     assert_problem(&other, 422, "K2");
     assert!(!other.body.contains(&id));
@@ -1004,7 +1008,7 @@ async fn a_replay_shows_the_current_state_and_writes_nothing() {
     // K6
     let lab = Lab::new().await;
     let cookie = lab.login("alice").await;
-    let body = lab.body(json!({}));
+    let body = lab.body(&json!({}));
     let id = job_id(&lab.post(&cookie, "k", &body).await);
     let snapshot = || {
         lab.w.sql(
@@ -1044,7 +1048,7 @@ async fn a_replay_does_not_need_the_permission_the_creation_did() {
     // K7
     let lab = Lab::new().await;
     let cookie = lab.login("alice").await;
-    let body = lab.body(json!({}));
+    let body = lab.body(&json!({}));
     let id = job_id(&lab.post(&cookie, "k", &body).await);
     let replay = |what: &'static str| {
         let (lab, cookie, body, id) = (&lab, &cookie, &body, &id);
@@ -1070,7 +1074,7 @@ async fn the_key_is_judged_before_the_permission() {
     // K8
     let lab = Lab::new().await;
     let cookie = lab.login("alice").await;
-    let body = lab.body(json!({}));
+    let body = lab.body(&json!({}));
     let id = job_id(&lab.post(&cookie, "k", &body).await);
     lab.user("viewer", &["viewer"]).await;
     let viewer = lab.login("viewer").await;
@@ -1093,7 +1097,7 @@ async fn two_identical_requests_at_once_make_one_job_and_both_are_202() {
     // K9
     let lab = Lab::new().await;
     let cookie = lab.login("alice").await;
-    let body = lab.body(json!({}));
+    let body = lab.body(&json!({}));
     let (a, b) = tokio::join!(lab.post(&cookie, "k", &body), lab.post(&cookie, "k", &body));
     assert_eq!(job_id(&a), job_id(&b));
     lab.assert_jobs(1, "K9").await;
@@ -1107,8 +1111,8 @@ async fn two_bodies_for_one_key_at_once_make_one_job_for_the_first_and_a_conflic
     let lab = Lab::new().await;
     let cookie = lab.login("alice").await;
     let (one, two) = (
-        lab.body(json!({"vciId": "vci-1"})),
-        lab.body(json!({"vciId": "vci-2"})),
+        lab.body(&json!({"vciId": "vci-1"})),
+        lab.body(&json!({"vciId": "vci-2"})),
     );
     let (a, b) = tokio::join!(lab.post(&cookie, "k", &one), lab.post(&cookie, "k", &two));
     let (winner_body, winner, loser) = match (a.status, b.status) {
@@ -1135,7 +1139,7 @@ async fn two_servers_on_one_database_make_one_job_for_one_key() {
     let mut lab = Lab::new().await;
     let second = lab.another_server().await;
     let (first_cookie, second_cookie) = (lab.login("alice").await, login(second, "alice").await);
-    let body = lab.body(json!({}));
+    let body = lab.body(&json!({}));
     let (a, b) = tokio::join!(
         lab.post(&first_cookie, "k", &body),
         post_to(second, &second_cookie, "k", &body)
@@ -1151,7 +1155,7 @@ async fn a_key_held_by_an_uncommitted_insert_is_decided_when_the_holder_ends() {
     // K12
     let lab = Lab::new().await;
     let cookie = lab.login("alice").await;
-    let body = lab.body(json!({}));
+    let body = lab.body(&json!({}));
     let hash = body_hash(body.as_bytes()).unwrap();
     let pool = lab.w.pg.pool();
 
@@ -1204,7 +1208,7 @@ async fn the_replay_after_a_lost_insert_works_whatever_the_database_default_isol
     // Pools are lazy: a server and a holder made now open sessions with the new default.
     let addr = lab.another_server().await;
     let cookie = login(addr, "alice").await;
-    let body = lab.body(json!({}));
+    let body = lab.body(&json!({}));
     let hash = body_hash(body.as_bytes()).unwrap();
     let pool = lab.w.pg.pool();
     let (tx, held) = hold_key(&pool, &lab.agent_id, "same", Some(hash)).await;
@@ -1223,7 +1227,7 @@ async fn a_creation_waiting_on_a_held_key_does_not_block_the_agent_stamp() {
     // The agent's row is locked only after the insert, so the wait on the key holds nothing.
     let lab = Lab::new().await;
     let cookie = lab.login("alice").await;
-    let body = lab.body(json!({}));
+    let body = lab.body(&json!({}));
     let pool = lab.w.pg.pool();
     let (tx, _held) = hold_key(&pool, &lab.agent_id, "k", None).await;
     let waiting = spawn_post(lab.addr(), &cookie, "k", &body);
@@ -1246,7 +1250,7 @@ async fn a_revocation_held_uncommitted_is_seen_by_the_agent_lock_and_the_job_is_
     // Also V13: the lock taken before the agent's row is read goes with the rolled-back job.
     let lab = Lab::new().await;
     let cookie = lab.login("alice").await;
-    let body = lab.body(json!({ "vin": VIN }));
+    let body = lab.body(&json!({ "vin": VIN }));
     let pool = lab.w.pg.pool();
     let mut revoke = pool.begin().await.unwrap();
     sqlx::query("UPDATE agents SET revoked_at = now() WHERE id = $1::uuid")
@@ -1272,7 +1276,7 @@ async fn a_key_held_for_more_than_five_seconds_is_a_503() {
     // K13
     let lab = Lab::new().await;
     let cookie = lab.login("alice").await;
-    let body = lab.body(json!({}));
+    let body = lab.body(&json!({}));
     let pool = lab.w.pg.pool();
     let (tx, held) = hold_key(&pool, &lab.agent_id, "k", None).await;
     let started = Instant::now();
@@ -1298,7 +1302,7 @@ async fn a_key_held_for_more_than_five_seconds_is_a_503() {
 async fn permission_needs_the_role_the_agent_and_its_allow_list_and_each_refusal_is_one_403() {
     let (logs, _guard) = capture();
     let lab = Lab::new().await;
-    let body = lab.body(json!({}));
+    let body = lab.body(&json!({}));
     let mut refusals: Vec<(&str, Reply)> = Vec::new();
 
     // A1: a viewer and an administrator are no workers.
@@ -1320,7 +1324,7 @@ async fn permission_needs_the_role_the_agent_and_its_allow_list_and_each_refusal
 
     let cookie = lab.login("alice").await;
     // A3: an agent nobody knows, and one of another tenant.
-    let unknown = lab.body(json!({"agentId": "0a1b2c3d-4e5f-4a6b-8c7d-0123456789ab"}));
+    let unknown = lab.body(&json!({"agentId": "0a1b2c3d-4e5f-4a6b-8c7d-0123456789ab"}));
     refusals.push(("unknown", lab.post(&cookie, "k-unknown", &unknown).await));
     lab.exec(
         "WITH t AS (INSERT INTO tenants (id, name) VALUES (gen_random_uuid(), 'other') \
@@ -1330,7 +1334,7 @@ async fn permission_needs_the_role_the_agent_and_its_allow_list_and_each_refusal
              FROM t",
     )
     .await;
-    let foreign = lab.body(json!({"agentId": "1a1b2c3d-4e5f-4a6b-8c7d-0123456789ab"}));
+    let foreign = lab.body(&json!({"agentId": "1a1b2c3d-4e5f-4a6b-8c7d-0123456789ab"}));
     refusals.push(("foreign", lab.post(&cookie, "k-foreign", &foreign).await));
     // A5: the agent does not list the operator.
     lab.exec("DELETE FROM agent_allowed_operators").await;
@@ -1371,7 +1375,7 @@ async fn a_key_that_is_not_the_active_one_is_a_503_and_is_logged() {
     let (logs, _guard) = capture();
     let lab = Lab::new().await;
     let cookie = lab.login("alice").await;
-    let body = lab.body(json!({}));
+    let body = lab.body(&json!({}));
     for (what, sql) in [
         ("retired", "UPDATE instruction_keys SET retired_at = now()"),
         (
@@ -1405,7 +1409,7 @@ async fn a_signer_that_fails_is_a_500_and_leaves_no_row() {
     })));
     let lab = Lab::build(key, None).await;
     let cookie = lab.login("alice").await;
-    let body = lab.body(json!({}));
+    let body = lab.body(&json!({}));
     // The registration needed the signer, so it fails only from here on.
     fail.store(true, Ordering::SeqCst);
     let r = lab.post(&cookie, "k", &body).await;
@@ -1423,7 +1427,7 @@ async fn a_statement_that_waits_for_a_lock_on_jobs_for_five_seconds_is_a_503() {
     // S3
     let lab = Lab::new().await;
     let cookie = lab.login("alice").await;
-    let body = lab.body(json!({}));
+    let body = lab.body(&json!({}));
     let pool = lab.w.pg.pool();
     let mut lock = pool.begin().await.unwrap();
     sqlx::query("LOCK TABLE jobs IN ACCESS EXCLUSIVE MODE")
@@ -1453,7 +1457,7 @@ async fn a_created_job_is_delivered_once_with_its_stored_bytes_and_a_replay_send
     // E1
     let lab = Lab::build(instruction_key(), Some(settings(LONG))).await;
     let cookie = lab.login("alice").await;
-    let body = lab.body(json!({}));
+    let body = lab.body(&json!({}));
     let first = job_id(&lab.post(&cookie, "k1", &body).await);
 
     let mut client = open(lab.addr(), &lab.agent_token().await).await;
@@ -1470,7 +1474,7 @@ async fn a_created_job_is_delivered_once_with_its_stored_bytes_and_a_replay_send
     // The replay is the stored job again, and the next frame is the next job's, not this one's.
     let replay = lab.post(&cookie, "k1", &body).await;
     assert_eq!(job_id(&replay), first);
-    let second_body = lab.body(json!({"vciId": "vci-2"}));
+    let second_body = lab.body(&json!({"vciId": "vci-2"}));
     let second = job_id(&lab.post(&cookie, "k2", &second_body).await);
     let (next_id, next_bytes) = command(&mut client).await;
     assert_eq!(next_bytes, lab.instruction_bytes(&second).await);
@@ -1533,7 +1537,7 @@ async fn a_job_with_a_vin_takes_the_lock_and_each_kind_holds_it_until_its_defaul
     let lab = Lab::new().await;
     let cookie = lab.login("alice").await;
     for (kind, vin, allowance) in [("acquire", VIN, 600), ("writeSettings", VIN_2, 1800)] {
-        let body = lab.body(json!({ "kind": kind, "vin": vin }));
+        let body = lab.body(&json!({ "kind": kind, "vin": vin }));
         let id = job_id(&lab.post(&cookie, &format!("{kind}-1"), &body).await);
         // V2: the row names the job and its agent, and ends the allowance after the deadline.
         let row = lab
@@ -1578,7 +1582,7 @@ async fn a_second_job_for_a_locked_vehicle_is_a_409_that_names_no_holder_and_lea
     // V3, V4, V8, V9
     let lab = Lab::new().await;
     let cookie = lab.login("alice").await;
-    let held = lab.body(json!({ "vin": VIN }));
+    let held = lab.body(&json!({ "vin": VIN }));
     let holder = job_id(&lab.post(&cookie, "k-holder", &held).await);
     let before = lab.w.sql("SELECT count(*) FROM instruction_keys").await;
 
@@ -1605,9 +1609,9 @@ async fn a_second_job_for_a_locked_vehicle_is_a_409_that_names_no_holder_and_lea
 
     // V8 and V9: a job with no VIN, one with another VIN, and one for the same VIN in another
     // tenant are not refused, and only the ones with a VIN take a lock.
-    let none = job_id(&lab.post(&cookie, "k-none", &lab.body(json!({}))).await);
+    let none = job_id(&lab.post(&cookie, "k-none", &lab.body(&json!({}))).await);
     assert_eq!(lab.field(&none, "vin IS NULL").await, "true");
-    let other_vin = lab.body(json!({ "vin": VIN_2 }));
+    let other_vin = lab.body(&json!({ "vin": VIN_2 }));
     let other = job_id(&lab.post(&cookie, "k-other", &other_vin).await);
     assert_eq!(lab.locks().await, format!("{VIN}>{holder},{VIN_2}>{other}"));
     lab.exec(&format!(
@@ -1659,7 +1663,7 @@ async fn an_expired_lock_is_replaced_by_the_next_job_and_an_unexpired_one_is_kep
     // V6
     let lab = Lab::new().await;
     let cookie = lab.login("alice").await;
-    let body = lab.body(json!({ "vin": VIN }));
+    let body = lab.body(&json!({ "vin": VIN }));
     let first = job_id(&lab.post(&cookie, "k1", &body).await);
     // One hour left: held.
     lab.exec("UPDATE vehicle_locks SET expires_at = now() + interval '1 hour'")
@@ -1689,7 +1693,7 @@ async fn a_replay_of_the_holders_key_is_a_202_before_any_lock_is_read() {
     // V7 and V14: after the lock expired and another job took it, and while it is held.
     let lab = Lab::new().await;
     let cookie = lab.login("alice").await;
-    let body = lab.body(json!({ "vin": VIN }));
+    let body = lab.body(&json!({ "vin": VIN }));
     let first = lab.post(&cookie, "k1", &body).await;
     let holder = job_id(&first);
     assert_eq!(
@@ -1704,7 +1708,7 @@ async fn a_replay_of_the_holders_key_is_a_202_before_any_lock_is_read() {
     lab.assert_jobs(2, "V7").await;
     // V14: the key's answers come before the lock's: another request under a used key is a
     // 422, and a user with no permission is a 403, whatever holds the vehicle.
-    let other = lab.body(json!({ "vin": VIN, "vciId": "vci-9" }));
+    let other = lab.body(&json!({ "vin": VIN, "vciId": "vci-9" }));
     assert_problem(&lab.post(&cookie, "k2", &other).await, 422, "V14 key");
     lab.user("viewer", &["viewer"]).await;
     let viewer = lab.login("viewer").await;
@@ -1724,7 +1728,7 @@ async fn creations_at_once_for_one_vehicle_make_one_job_on_one_server_or_two() {
     let mut lab = Lab::new().await;
     let second = lab.another_server().await;
     let (c1, c2) = (lab.login("alice").await, login(second, "alice").await);
-    let body = lab.body(json!({ "vin": VIN }));
+    let body = lab.body(&json!({ "vin": VIN }));
     let (a, b) = tokio::join!(
         lab.post(&c1, "k-a", &body),
         post_to(second, &c2, "k-b", &body)
@@ -1734,7 +1738,7 @@ async fn creations_at_once_for_one_vehicle_make_one_job_on_one_server_or_two() {
     assert_eq!(statuses, [202, 409], "{} {}", a.body, b.body);
     lab.assert_jobs(1, "V10 two servers").await;
     lab.assert_one_audit_per_job("A8 V10 two servers").await;
-    let other = lab.body(json!({ "vin": VIN_2 }));
+    let other = lab.body(&json!({ "vin": VIN_2 }));
     let (a, b) = tokio::join!(lab.post(&c1, "k-c", &other), lab.post(&c1, "k-d", &other));
     let mut statuses = [a.status, b.status];
     statuses.sort();
@@ -1749,7 +1753,7 @@ async fn two_takers_of_an_expired_lock_get_one_job_and_one_refusal() {
     // V12
     let lab = Lab::new().await;
     let cookie = lab.login("alice").await;
-    let body = lab.body(json!({ "vin": VIN }));
+    let body = lab.body(&json!({ "vin": VIN }));
     job_id(&lab.post(&cookie, "k0", &body).await);
     lab.age_lock(VIN, "interval '1 day'").await;
     let (a, b) = tokio::join!(
@@ -1788,7 +1792,7 @@ async fn a_lock_held_by_an_uncommitted_take_is_decided_when_it_ends_and_blocks_n
     // V11: a commit makes it a 409, a rollback a 202; the wait holds no agent row.
     let lab = Lab::new().await;
     let cookie = lab.login("alice").await;
-    let body = lab.body(json!({ "vin": VIN }));
+    let body = lab.body(&json!({ "vin": VIN }));
 
     let tx = lab.hold_lock_uncommitted(VIN).await;
     let waiting = spawn_post(lab.addr(), &cookie, "k-commit", &body);
@@ -1825,7 +1829,7 @@ async fn a_lock_held_uncommitted_for_more_than_five_seconds_is_a_503() {
     let tx = lab.hold_lock_uncommitted(VIN).await;
     let started = Instant::now();
     let r = lab
-        .post(&cookie, "k", &lab.body(json!({ "vin": VIN })))
+        .post(&cookie, "k", &lab.body(&json!({ "vin": VIN })))
         .await;
     assert_problem(&r, 503, "V11");
     assert!(
@@ -1847,14 +1851,14 @@ async fn the_same_vin_in_two_tenants_has_a_row_in_each_with_the_jobs_tenant() {
     let cookie = lab.login("alice").await;
     let (cookie_2, agent_2, tenant_2) = lab.second_tenant().await;
     let first = job_id(
-        &lab.post(&cookie, "k-1", &lab.body(json!({ "vin": VIN })))
+        &lab.post(&cookie, "k-1", &lab.body(&json!({ "vin": VIN })))
             .await,
     );
     let second = job_id(
         &lab.post(
             &cookie_2,
             "k-2",
-            &lab.body(json!({ "vin": VIN, "agentId": agent_2 })),
+            &lab.body(&json!({ "vin": VIN, "agentId": agent_2 })),
         )
         .await,
     );
@@ -1891,7 +1895,7 @@ async fn an_audit_log_locked_for_five_seconds_is_a_503_that_creates_no_job_and_b
     // the agent's row is locked, so the wait times out into a rollback that holds nothing.
     let lab = Lab::new().await;
     let cookie = lab.login("alice").await;
-    let body = lab.body(json!({ "vin": VIN }));
+    let body = lab.body(&json!({ "vin": VIN }));
     let pool = lab.w.pg.pool();
     let mut lock = pool.begin().await.unwrap();
     sqlx::query("LOCK TABLE audit_log IN ACCESS EXCLUSIVE MODE")
@@ -1935,7 +1939,7 @@ async fn a_creation_waiting_on_the_audit_log_holds_no_vehicle_lock() {
     // creation's uncommitted row).
     let lab = Lab::new().await;
     let cookie = lab.login("alice").await;
-    let body = lab.body(json!({ "vin": VIN }));
+    let body = lab.body(&json!({ "vin": VIN }));
     let mut lock = lab.w.pg.pool().begin().await.unwrap();
     sqlx::query("LOCK TABLE audit_log IN ACCESS EXCLUSIVE MODE")
         .execute(&mut *lock)
@@ -1967,7 +1971,7 @@ async fn the_refusal_for_a_locked_vehicle_is_logged_once_without_the_vehicle() {
     let (logs, _guard) = capture();
     let lab = Lab::new().await;
     let cookie = lab.login("alice").await;
-    let body = lab.body(json!({ "vin": VIN }));
+    let body = lab.body(&json!({ "vin": VIN }));
     let holder = job_id(&lab.post(&cookie, "k-holder", &body).await);
     for key in ["k-1", "k-2"] {
         assert_problem(&lab.post(&cookie, key, &body).await, 409, key);
@@ -2014,7 +2018,7 @@ async fn a_creation_waiting_on_an_uncommitted_replacement_of_an_expired_lock_is_
     // 202.
     let lab = Lab::new().await;
     let cookie = lab.login("alice").await;
-    let body = lab.body(json!({ "vin": VIN }));
+    let body = lab.body(&json!({ "vin": VIN }));
     job_id(&lab.post(&cookie, "k0", &body).await);
     lab.age_lock(VIN, "interval '1 day'").await;
 
@@ -2044,7 +2048,7 @@ async fn an_end_of_the_old_job_waits_for_an_uncommitted_take_and_then_deletes_no
     // V16: the queue ends J_old by a rejection while a take of its expired lock is uncommitted.
     let lab = Lab::build(instruction_key(), Some(settings(LONG))).await;
     let cookie = lab.login("alice").await;
-    let body = lab.body(json!({ "vin": VIN }));
+    let body = lab.body(&json!({ "vin": VIN }));
     let old = job_id(&lab.post(&cookie, "k-old", &body).await);
     lab.age_lock(VIN, "interval '1 day'").await;
     let mut client = open(lab.addr(), &lab.agent_token().await).await;
@@ -2089,7 +2093,7 @@ impl Lab {
         vin: &str,
     ) -> String {
         let r = self
-            .post(cookie, key, &self.body(json!({ "vin": vin })))
+            .post(cookie, key, &self.body(&json!({ "vin": vin })))
             .await;
         assert_eq!(r.status, 202, "{}", r.head);
         let id = job_id(&r);
@@ -2104,7 +2108,7 @@ async fn the_lock_is_held_until_the_agent_reports_an_end_and_a_recovery_is_an_en
     let (lab, mut client, cookie) = Lab::with_agent().await;
     let held = lab.job_for(&mut client, &cookie, "k-1", VIN).await;
     let other = lab.job_for(&mut client, &cookie, "k-2", VIN_2).await;
-    let refused = lab.body(json!({ "vin": VIN }));
+    let refused = lab.body(&json!({ "vin": VIN }));
     assert_eq!(lab.post(&cookie, "k-3", &refused).await.status, 409);
     let audit_of_the_two = format!(
         "SELECT string_agg(row_to_json(a)::text, ',' ORDER BY id) FROM audit_log a \
@@ -2133,7 +2137,7 @@ async fn the_lock_is_held_until_the_agent_reports_an_end_and_a_recovery_is_an_en
     .await;
     assert_eq!(lab.locks().await, format!("{VIN}>{}", job_id(&r)));
     let r = lab
-        .post(&cookie, "k-4", &lab.body(json!({ "vin": VIN_2 })))
+        .post(&cookie, "k-4", &lab.body(&json!({ "vin": VIN_2 })))
         .await;
     assert_eq!(r.status, 202, "{}", r.head);
     // A10: the two ends added no row, and deleting the jobs leaves the rows as they were.
@@ -2163,7 +2167,7 @@ async fn the_end_of_a_job_whose_lock_expired_and_was_taken_leaves_the_new_holder
 #[tokio::test]
 async fn a_replay_of_a_failed_job_shows_its_failure_code_and_procedure_code_and_no_detail() {
     let (lab, mut client, cookie) = Lab::with_agent().await;
-    let body = lab.body(json!({ "vin": VIN }));
+    let body = lab.body(&json!({ "vin": VIN }));
     let r = lab.post(&cookie, "k-failed", &body).await;
     let job = job_id(&r);
     command(&mut client).await;
@@ -2225,7 +2229,7 @@ async fn a_start_deadline_in_the_bounds_is_signed_stored_and_normalized_to_utc_s
     let now = db_seconds(&lab).await;
     let deadline = now + 3600;
     let zoned = rfc3339(&lab, deadline, 9 * 3600, ".789+09:00").await;
-    let body = lab.body(json!({ "vin": VIN, "startDeadline": zoned }));
+    let body = lab.body(&json!({ "vin": VIN, "startDeadline": zoned }));
     let first = lab.post(&cookie, "k", &body).await;
     let id = job_id(&first);
     let instruction = lab.instruction(&id).await;
@@ -2258,7 +2262,7 @@ async fn a_start_deadline_in_the_bounds_is_signed_stored_and_normalized_to_utc_s
         rfc3339(&lab, deadline, 0, "-00:00").await,
         rfc3339(&lab, deadline, -5 * 3600, ".999999999-05:00").await,
     ] {
-        let same = lab.body(json!({ "vin": VIN, "startDeadline": form }));
+        let same = lab.body(&json!({ "vin": VIN, "startDeadline": form }));
         let again = lab.post(&cookie, "k", &same).await;
         assert_eq!(job_id(&again), id, "{form}");
         assert_eq!(hex_of(body_hash(same.as_bytes()).unwrap()), hash, "{form}");
@@ -2290,11 +2294,11 @@ async fn a_start_deadline_outside_the_bounds_is_a_422_with_its_own_code_and_leav
     // F14: no permission is a 403 whatever the deadline.
     let viewer = lab.login("viewer").await;
     for text in &outside {
-        let body = lab.body(json!({ "vin": VIN, "startDeadline": text }));
+        let body = lab.body(&json!({ "vin": VIN, "startDeadline": text }));
         assert_problem(&lab.post(&viewer, "k", &body).await, 403, text);
     }
     for text in &outside {
-        let body = lab.body(json!({ "vin": VIN, "startDeadline": text }));
+        let body = lab.body(&json!({ "vin": VIN, "startDeadline": text }));
         let r = lab.post(&cookie, "k", &body).await;
         assert_problem(&r, 422, text);
         assert_eq!(json(&r)["code"], "START_DEADLINE_OUT_OF_BOUNDS", "{text}");
@@ -2304,16 +2308,16 @@ async fn a_start_deadline_outside_the_bounds_is_a_422_with_its_own_code_and_leav
     lab.assert_audits(0, "no audit row").await;
     assert_eq!(lab.w.sql("SELECT count(*) FROM vehicle_locks").await, "0");
     // The key is unbound: the same key creates the job with a good deadline.
-    let good = lab.body(json!({ "vin": VIN, "startDeadline": utc(&lab, now + 3600).await }));
+    let good = lab.body(&json!({ "vin": VIN, "startDeadline": utc(&lab, now + 3600).await }));
     job_id(&lab.post(&cookie, "k", &good).await);
     // F14: with the instruction key not active, the bounds are judged before the key.
     lab.exec("UPDATE instruction_keys SET retired_at = now()")
         .await;
-    let bad = lab.body(json!({ "startDeadline": outside[0] }));
+    let bad = lab.body(&json!({ "startDeadline": outside[0] }));
     let r = lab.post(&cookie, "k2", &bad).await;
     assert_problem(&r, 422, "bounds before the key");
     assert_eq!(json(&r)["code"], "START_DEADLINE_OUT_OF_BOUNDS");
-    let ok = lab.body(json!({ "startDeadline": utc(&lab, now + 3600).await }));
+    let ok = lab.body(&json!({ "startDeadline": utc(&lab, now + 3600).await }));
     assert_problem(&lab.post(&cookie, "k2", &ok).await, 503, "the key");
     lab.finish().await;
 }
@@ -2334,7 +2338,7 @@ async fn a_malformed_start_deadline_is_a_400_and_creates_nothing() {
         json!("2030-01-01T00:00:60Z"),
     ] {
         let r = lab
-            .post(&cookie, "k", &lab.body(json!({ "startDeadline": bad })))
+            .post(&cookie, "k", &lab.body(&json!({ "startDeadline": bad })))
             .await;
         assert_problem(&r, 400, &bad.to_string());
     }
@@ -2354,18 +2358,18 @@ async fn a_replay_with_another_deadline_or_the_field_added_or_dropped_is_a_key_c
     let lab = Lab::new().await;
     let cookie = lab.login("alice").await;
     let now = db_seconds(&lab).await;
-    let named = lab.body(json!({ "startDeadline": utc(&lab, now + 3600).await }));
+    let named = lab.body(&json!({ "startDeadline": utc(&lab, now + 3600).await }));
     let id = job_id(&lab.post(&cookie, "k", &named).await);
-    let later = lab.body(json!({ "startDeadline": utc(&lab, now + 3601).await }));
+    let later = lab.body(&json!({ "startDeadline": utc(&lab, now + 3601).await }));
     let r = lab.post(&cookie, "k", &later).await;
     assert_problem(&r, 422, "F9");
     assert!(json(&r).get("code").is_none(), "{}", r.body);
     assert!(!r.body.contains(&id));
     // F10: absent, then the default's own second named.
-    let absent = lab.body(json!({}));
+    let absent = lab.body(&json!({}));
     let id2 = job_id(&lab.post(&cookie, "k2", &absent).await);
     let default = lab.instruction(&id2).await.issued_at + 900;
-    let explicit = lab.body(json!({ "startDeadline": utc(&lab, default as i64).await }));
+    let explicit = lab.body(&json!({ "startDeadline": utc(&lab, default as i64).await }));
     assert_problem(&lab.post(&cookie, "k2", &explicit).await, 422, "F10");
     // And the reverse: named, then absent.
     assert_problem(&lab.post(&cookie, "k", &absent).await, 422, "F10 reverse");
@@ -2380,7 +2384,7 @@ async fn a_replay_with_the_same_deadline_is_not_judged_against_the_bounds_again(
     let lab = Lab::new().await;
     let cookie = lab.login("alice").await;
     let now = db_seconds(&lab).await;
-    let body = lab.body(json!({ "startDeadline": utc(&lab, now + 62).await }));
+    let body = lab.body(&json!({ "startDeadline": utc(&lab, now + 62).await }));
     let id = job_id(&lab.post(&cookie, "k", &body).await);
     // Past this the deadline is under a minute from the replay's time.
     let wait = Instant::now() + Duration::from_secs(15);
@@ -2402,8 +2406,8 @@ async fn two_requests_at_once_for_one_key_replay_on_the_same_deadline_and_confli
     let lab = Lab::new().await;
     let cookie = lab.login("alice").await;
     let now = db_seconds(&lab).await;
-    let one = lab.body(json!({ "startDeadline": utc(&lab, now + 3600).await }));
-    let two = lab.body(json!({ "startDeadline": utc(&lab, now + 7200).await }));
+    let one = lab.body(&json!({ "startDeadline": utc(&lab, now + 3600).await }));
+    let two = lab.body(&json!({ "startDeadline": utc(&lab, now + 7200).await }));
     let (a, b) = tokio::join!(
         lab.post(&cookie, "same", &one),
         lab.post(&cookie, "same", &one)
@@ -2428,9 +2432,9 @@ async fn an_expired_job_frees_its_vehicle_and_its_replay_shows_expired_with_no_f
     let lab = Lab::new().await;
     let cookie = lab.login("alice").await;
     let now = db_seconds(&lab).await;
-    let body = lab.body(json!({ "vin": VIN, "startDeadline": utc(&lab, now + 3600).await }));
+    let body = lab.body(&json!({ "vin": VIN, "startDeadline": utc(&lab, now + 3600).await }));
     let id = job_id(&lab.post(&cookie, "k1", &body).await);
-    let next = lab.body(json!({ "vin": VIN }));
+    let next = lab.body(&json!({ "vin": VIN }));
     // F15: the vehicle is locked for the job's whole window.
     let held = lab.post(&cookie, "k2", &next).await;
     assert_problem(&held, 409, "F15");
@@ -2510,11 +2514,11 @@ async fn a_job_naming_a_document_or_an_artifact_its_tenant_does_not_hold_is_a_42
             "DOCUMENT_NOT_STORED",
         ),
     ] {
-        let r = lab.post(&cookie, "k", &lab.body(extra)).await;
+        let r = lab.post(&cookie, "k", &lab.body(&extra)).await;
         assert_not_stored(&lab, &r, code, what).await;
     }
     // The key is unbound: the same key creates the job once what it names is stored.
-    let good = lab.body(json!({
+    let good = lab.body(&json!({
         "vin": VIN,
         "irDigests": [DIGEST_B, DIGEST_A],
         "artifactDigest": DIGEST_B,
@@ -2533,23 +2537,23 @@ async fn the_store_check_answers_after_the_permission_and_the_deadline_and_befor
     let unstored = json!({ "irDigests": [DIGEST_C] });
     // No permission is a 403 whatever the job names.
     assert_problem(
-        &lab.post(&viewer, "k", &lab.body(unstored.clone())).await,
+        &lab.post(&viewer, "k", &lab.body(&unstored)).await,
         403,
         "permission",
     );
     // A deadline out of its bounds is answered before the store.
     let now = db_seconds(&lab).await;
     let late = json!({ "irDigests": [DIGEST_C], "startDeadline": utc(&lab, now + 10).await });
-    let r = lab.post(&cookie, "k", &lab.body(late)).await;
+    let r = lab.post(&cookie, "k", &lab.body(&late)).await;
     assert_problem(&r, 422, "deadline");
     assert_eq!(json(&r)["code"], "START_DEADLINE_OUT_OF_BOUNDS");
     // An instruction key that is not the active one is judged after the store.
     lab.exec("UPDATE instruction_keys SET retired_at = now()")
         .await;
-    let r = lab.post(&cookie, "k", &lab.body(unstored)).await;
+    let r = lab.post(&cookie, "k", &lab.body(&unstored)).await;
     assert_not_stored(&lab, &r, "DOCUMENT_NOT_STORED", "before the key").await;
     assert_problem(
-        &lab.post(&cookie, "k", &lab.body(json!({}))).await,
+        &lab.post(&cookie, "k", &lab.body(&json!({}))).await,
         503,
         "the key",
     );
@@ -2562,7 +2566,7 @@ async fn a_replay_is_answered_before_the_store_check() {
     // ADR-477 item 5: a replay is of a job created once; what it named is not judged again.
     let lab = Lab::new().await;
     let cookie = lab.login("alice").await;
-    let body = lab.body(json!({ "artifactDigest": DIGEST_B }));
+    let body = lab.body(&json!({ "artifactDigest": DIGEST_B }));
     let first = lab.post(&cookie, "k", &body).await;
     job_id(&first);
     // Nothing deletes these rows; a test may, as the superuser, to show the order.
@@ -2584,7 +2588,7 @@ async fn a_document_stored_through_the_route_can_be_named_by_a_job() {
     let cookie = lab.login("alice").await;
     let bytes = crate::documents::doc("job");
     let digest = crate::documents::name_of(&bytes);
-    let body = lab.body(json!({ "irDigests": [digest] }));
+    let body = lab.body(&json!({ "irDigests": [digest] }));
     let r = lab.post(&cookie, "k", &body).await;
     assert_problem(&r, 422, "before the store");
     assert_eq!(json(&r)["code"], "DOCUMENT_NOT_STORED");

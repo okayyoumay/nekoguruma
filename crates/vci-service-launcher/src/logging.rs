@@ -9,7 +9,7 @@ pub fn init_logging(cfg: LoggingConfig) {
     match cfg.output.unwrap_or_default() {
         LogOutput::Named(LogOutputKind::Stderr) => init_stderr(filter),
         LogOutput::Named(LogOutputKind::Null) => init_null(filter),
-        LogOutput::File(file_cfg) => init_file(filter, file_cfg),
+        LogOutput::File(file_cfg) => init_file(filter, &file_cfg),
         #[cfg(feature = "eventlog")]
         LogOutput::Named(LogOutputKind::Eventlog) => eventlog::init(filter),
         #[cfg(feature = "journald")]
@@ -41,7 +41,7 @@ fn init_null(filter: EnvFilter) {
         .init();
 }
 
-fn init_file(filter: EnvFilter, file_cfg: FileOutput) {
+fn init_file(filter: EnvFilter, file_cfg: &FileOutput) {
     match std::fs::OpenOptions::new()
         .create(true)
         .append(true)

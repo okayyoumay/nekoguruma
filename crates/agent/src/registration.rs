@@ -170,7 +170,7 @@ fn registration_mode(mode: OperatingMode) -> Mode {
 /// Registers this agent: the whole flow of the module's documentation, with the key, the state
 /// directory and the code taken from where the build and the environment say.
 pub fn register(request: &Request, source: &CodeSource) -> Result<Registered, RegisterError> {
-    let key = agent_key(request.mode).map_err(identity_error)?;
+    let key = agent_key(request.mode).map_err(|error| identity_error(&error))?;
     if key.created() {
         return Err(fail(
             Exit::CannotRegister,
@@ -186,7 +186,7 @@ pub fn register(request: &Request, source: &CodeSource) -> Result<Registered, Re
     register_in(request, &key, &code, &dir, Timeouts::default())
 }
 
-fn identity_error(error: IdentityError) -> RegisterError {
+fn identity_error(error: &IdentityError) -> RegisterError {
     let exit = match error {
         IdentityError::Unavailable(_)
         | IdentityError::CreationLockBusy
@@ -271,7 +271,7 @@ pub fn register_in(
         })?;
     let reply = runtime
         .block_on(server_http::post(&post, &[201], timeouts))
-        .map_err(transport_error)?;
+        .map_err(|error| transport_error(&error))?;
 
     let verified = judge(&reply, code, &agent_public, request.server_key)?;
     let record = Record {
@@ -327,7 +327,7 @@ fn existing_record(dir: &Path, replace: bool) -> Result<bool, RegisterError> {
     }
 }
 
-fn transport_error(error: PostError) -> RegisterError {
+fn transport_error(error: &PostError) -> RegisterError {
     match error {
         PostError::NotSent(kind) => fail(
             Exit::Unavailable,

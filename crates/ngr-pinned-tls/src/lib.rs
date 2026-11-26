@@ -133,7 +133,7 @@ where
         .connect(name, stream)
         .await
         .map(Stream)
-        .map_err(refusal)
+        .map_err(|error| refusal(&error))
 }
 
 fn client_config(pin: &CertPin) -> ClientConfig {
@@ -153,7 +153,7 @@ fn client_config(pin: &CertPin) -> ClientConfig {
 /// other certificate error can arise in this client. A peer that signs with a scheme the client
 /// did not offer, or with an algorithm other than the one its key exchange named, failed the
 /// signature too, and rustls reports that as the peer's misbehaviour.
-fn refusal(error: io::Error) -> Refused {
+fn refusal(error: &io::Error) -> Refused {
     match error
         .get_ref()
         .and_then(|inner| inner.downcast_ref::<TlsError>())

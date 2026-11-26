@@ -172,9 +172,10 @@ pub(crate) struct Row<'a> {
     ok: bool,
 }
 
-impl Row<'_> {
-    /// The cell of `column`, or `None` when it is empty or the header leaves it out.
-    pub(crate) fn cell(&self, column: &str) -> Option<&str> {
+impl<'a> Row<'a> {
+    /// The cell of `column`, or `None` when it is empty or the header leaves it out. The cell
+    /// borrows the table, not the row, so the row can report an error about it.
+    pub(crate) fn cell(&self, column: &str) -> Option<&'a str> {
         self.header
             .get(column)
             .map(|&i| self.cells[i].as_str())
@@ -204,7 +205,7 @@ impl Row<'_> {
         parse: impl FnOnce(&str) -> Parsed<T>,
     ) -> Option<T> {
         match self.cell(column) {
-            Some(cell) => self.parse(errors, column, cell.to_owned(), parse),
+            Some(cell) => self.parse(errors, column, cell, parse),
             None => {
                 let reported = !self.header.contains_key(column)
                     && self.header_required.contains(&(column, true));
@@ -232,10 +233,7 @@ impl Row<'_> {
     ) -> Result<Option<T>, ()> {
         match self.cell(column) {
             None => Ok(None),
-            Some(cell) => self
-                .parse(errors, column, cell.to_owned(), parse)
-                .map(Some)
-                .ok_or(()),
+            Some(cell) => self.parse(errors, column, cell, parse).map(Some).ok_or(()),
         }
     }
 
@@ -268,10 +266,10 @@ impl Row<'_> {
         &mut self,
         errors: &mut Errors,
         column: &str,
-        cell: String,
+        cell: &str,
         parse: impl FnOnce(&str) -> Parsed<T>,
     ) -> Option<T> {
-        match parse(&cell) {
+        match parse(cell) {
             Ok(value) => Some(value),
             Err(hint) => {
                 self.error(errors, ErrorCode::BadValue, column, hint);

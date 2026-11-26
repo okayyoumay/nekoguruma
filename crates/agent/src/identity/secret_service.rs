@@ -379,7 +379,7 @@ fn attributes(name: &SecretName) -> HashMap<&'static str, &str> {
     HashMap::from([(NAME_ATTRIBUTE, name.as_str())])
 }
 
-fn paths(list: Vec<OwnedObjectPath>) -> Vec<String> {
+fn paths(list: &[OwnedObjectPath]) -> Vec<String> {
     list.iter().map(|path| path.as_str().to_owned()).collect()
 }
 
@@ -392,8 +392,8 @@ impl Transport for DbusTransport {
             &(attributes(name),),
         )?;
         Ok(Found {
-            unlocked: paths(unlocked),
-            locked: paths(locked),
+            unlocked: paths(&unlocked),
+            locked: paths(&locked),
         })
     }
 

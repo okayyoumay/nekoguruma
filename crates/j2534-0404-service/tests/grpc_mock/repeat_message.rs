@@ -85,9 +85,9 @@ async fn io_ctl_cll(
 fn repeat_message_setup(
     time_interval: u32,
     condition: u32,
-    repeat_msg_data: Vec<u8>,
-    mask_data: Vec<u8>,
-    pattern_data: Vec<u8>,
+    repeat_msg_data: &[u8],
+    mask_data: &[u8],
+    pattern_data: &[u8],
 ) -> DataItem {
     repeat_message_setup_with_tx_flags(
         time_interval,
@@ -95,7 +95,7 @@ fn repeat_message_setup(
         repeat_msg_data,
         mask_data,
         pattern_data,
-        vec![],
+        &[],
     )
 }
 
@@ -108,20 +108,20 @@ fn repeat_message_setup(
 fn repeat_message_setup_with_tx_flags(
     time_interval: u32,
     condition: u32,
-    repeat_msg_data: Vec<u8>,
-    mask_data: Vec<u8>,
-    pattern_data: Vec<u8>,
-    tx_flag_bits: Vec<i32>,
+    repeat_msg_data: &[u8],
+    mask_data: &[u8],
+    pattern_data: &[u8],
+    tx_flag_bits: &[i32],
 ) -> DataItem {
     DataItem {
         data: Some(data_item::Data::BytearrayData(IoBytearray {
             data: pack_repeat_message_setup(
                 time_interval,
                 condition,
-                &repeat_msg_data,
-                &mask_data,
-                &pattern_data,
-                &tx_flag_bits,
+                repeat_msg_data,
+                mask_data,
+                pattern_data,
+                tx_flag_bits,
             ),
         })),
     }
@@ -135,22 +135,22 @@ fn repeat_message_setup_with_tx_flags(
 fn repeat_message_setup_with_response_tx_flag_bits(
     time_interval: u32,
     condition: u32,
-    repeat_msg_data: Vec<u8>,
-    mask_data: Vec<u8>,
-    pattern_data: Vec<u8>,
-    tx_flag_bits: Vec<i32>,
-    response_tx_flag_bits: Option<Vec<i32>>,
+    repeat_msg_data: &[u8],
+    mask_data: &[u8],
+    pattern_data: &[u8],
+    tx_flag_bits: &[i32],
+    response_tx_flag_bits: Option<&[i32]>,
 ) -> DataItem {
     DataItem {
         data: Some(data_item::Data::BytearrayData(IoBytearray {
             data: pack_repeat_message_setup_with_response_tx_flag_bits(
                 time_interval,
                 condition,
-                &repeat_msg_data,
-                &mask_data,
-                &pattern_data,
-                &tx_flag_bits,
-                response_tx_flag_bits.as_deref(),
+                repeat_msg_data,
+                mask_data,
+                pattern_data,
+                tx_flag_bits,
+                response_tx_flag_bits,
             ),
         })),
     }
@@ -274,7 +274,7 @@ async fn start_then_query_succeeds_on_a_connected_opted_in_can_link() {
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(1000, 0, vec![0x01, 0x02], vec![], vec![]),
+        repeat_message_setup(1000, 0, &[0x01, 0x02], &[], &[]),
     )
     .await
     .expect(
@@ -317,7 +317,7 @@ async fn start_is_rejected_on_a_module_not_opted_into_j2534_2() {
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(1000, 0, vec![0x01, 0x02], vec![], vec![]),
+        repeat_message_setup(1000, 0, &[0x01, 0x02], &[], &[]),
     )
     .await
     .expect_err(
@@ -372,7 +372,7 @@ async fn query_and_stop_reject_a_msg_id_owned_by_a_sibling_cll_on_the_shared_cha
         &mut client,
         cll_a,
         start_id,
-        repeat_message_setup(1000, 0, vec![0x01, 0x02], vec![], vec![]),
+        repeat_message_setup(1000, 0, &[0x01, 0x02], &[], &[]),
     )
     .await
     .expect("PDU_IOCTL_START_REPEAT_MESSAGE should succeed on cll_a");
@@ -431,7 +431,7 @@ async fn stop_succeeds_and_a_subsequent_query_on_the_same_msg_id_fails() {
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(1000, 0, vec![0x01, 0x02], vec![], vec![]),
+        repeat_message_setup(1000, 0, &[0x01, 0x02], &[], &[]),
     )
     .await
     .expect("PDU_IOCTL_START_REPEAT_MESSAGE should succeed");
@@ -480,7 +480,7 @@ async fn query_repeat_message_reports_the_live_to_terminated_status_transition_a
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(20, 1, vec![0x01, 0x02], vec![0xFF], vec![0x99]),
+        repeat_message_setup(20, 1, &[0x01, 0x02], &[0xFF], &[0x99]),
     )
     .await
     .expect("PDU_IOCTL_START_REPEAT_MESSAGE should succeed");
@@ -552,7 +552,7 @@ async fn destroy_com_logical_link_cleans_up_a_live_repeat_slot() {
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(5000, 0, vec![0x01, 0x02], vec![], vec![]),
+        repeat_message_setup(5000, 0, &[0x01, 0x02], &[], &[]),
     )
     .await
     .expect("PDU_IOCTL_START_REPEAT_MESSAGE should succeed");
@@ -602,7 +602,7 @@ async fn disconnect_com_logical_link_cleans_up_a_live_repeat_slot() {
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(5000, 0, vec![0x01, 0x02], vec![], vec![]),
+        repeat_message_setup(5000, 0, &[0x01, 0x02], &[], &[]),
     )
     .await
     .expect("PDU_IOCTL_START_REPEAT_MESSAGE should succeed");
@@ -660,7 +660,7 @@ async fn query_after_disconnect_reports_not_connected_not_invalid_msg_id() {
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(5000, 0, vec![0x01, 0x02], vec![], vec![]),
+        repeat_message_setup(5000, 0, &[0x01, 0x02], &[], &[]),
     )
     .await
     .expect("PDU_IOCTL_START_REPEAT_MESSAGE should succeed");
@@ -731,7 +731,7 @@ async fn query_after_destroy_reports_unknown_handle_not_not_connected() {
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(5000, 0, vec![0x01, 0x02], vec![], vec![]),
+        repeat_message_setup(5000, 0, &[0x01, 0x02], &[], &[]),
     )
     .await
     .expect("PDU_IOCTL_START_REPEAT_MESSAGE should succeed");
@@ -823,7 +823,7 @@ async fn wrong_shaped_input_data_is_rejected_for_all_three_commands() {
         &mut client,
         cll_handle,
         query_id,
-        Some(repeat_message_setup(1000, 0, vec![0x01], vec![], vec![])),
+        Some(repeat_message_setup(1000, 0, &[0x01], &[], &[])),
         true,
     )
     .await
@@ -844,7 +844,7 @@ async fn wrong_shaped_input_data_is_rejected_for_all_three_commands() {
         &mut client,
         cll_handle,
         stop_id,
-        Some(repeat_message_setup(1000, 0, vec![0x01], vec![], vec![])),
+        Some(repeat_message_setup(1000, 0, &[0x01], &[], &[])),
         false,
     )
     .await
@@ -896,7 +896,7 @@ async fn start_repeat_message_on_an_fd_connected_link_carries_tx_fd_can_format()
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(1000, 0, vec![0x01, 0x02], vec![], vec![]),
+        repeat_message_setup(1000, 0, &[0x01, 0x02], &[], &[]),
     )
     .await
     .expect("PDU_IOCTL_START_REPEAT_MESSAGE should succeed on an FD-connected link");
@@ -1010,7 +1010,7 @@ async fn condition_one_slot_on_an_fd_connected_link_does_not_terminate_on_a_matc
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(5000, 1, vec![0x01, 0x02], vec![], vec![]),
+        repeat_message_setup(5000, 1, &[0x01, 0x02], &[], &[]),
     )
     .await
     .expect("PDU_IOCTL_START_REPEAT_MESSAGE should succeed on an FD-connected link");
@@ -1132,7 +1132,7 @@ async fn condition_one_slot_on_kwp_embedded_length_format_does_not_terminate_des
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(5000, 1, vec![0x01, 0x02], vec![], vec![]),
+        repeat_message_setup(5000, 1, &[0x01, 0x02], &[], &[]),
     )
     .await
     .expect("PDU_IOCTL_START_REPEAT_MESSAGE should succeed on a KWP embedded-length-format link");
@@ -1259,7 +1259,7 @@ async fn condition_one_slot_on_kwp_embedded_length_format_accepted_residual_shif
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(5000, 1, vec![0x01, 0x02], vec![0xFF], vec![0x62]),
+        repeat_message_setup(5000, 1, &[0x01, 0x02], &[0xFF], &[0x62]),
     )
     .await
     .expect("PDU_IOCTL_START_REPEAT_MESSAGE should succeed on a KWP embedded-length-format link");
@@ -1340,7 +1340,7 @@ async fn condition_one_slot_on_an_fd_connected_link_does_not_terminate_with_clas
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(5000, 1, vec![0x01, 0x02], vec![], vec![]),
+        repeat_message_setup(5000, 1, &[0x01, 0x02], &[], &[]),
     )
     .await
     .expect("PDU_IOCTL_START_REPEAT_MESSAGE should succeed on an FD-connected link");
@@ -1411,7 +1411,7 @@ async fn start_repeat_message_reports_exceeded_limit_through_the_full_grpc_stack
             &mut client,
             cll_handle,
             start_id,
-            repeat_message_setup(5000, 0, vec![0x01, 0x02], vec![], vec![]),
+            repeat_message_setup(5000, 0, &[0x01, 0x02], &[], &[]),
         )
         .await
         .expect("PDU_IOCTL_START_REPEAT_MESSAGE should succeed up to the device's 10-slot minimum");
@@ -1422,7 +1422,7 @@ async fn start_repeat_message_reports_exceeded_limit_through_the_full_grpc_stack
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(5000, 0, vec![0x01, 0x02], vec![], vec![]),
+        repeat_message_setup(5000, 0, &[0x01, 0x02], &[], &[]),
     )
     .await
     .expect_err(
@@ -1501,7 +1501,7 @@ async fn a_running_repeat_slot_does_not_disrupt_ordinary_cop_response_delivery()
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(5000, 0, vec![0x01, 0x02], vec![0xFF], vec![0x62]),
+        repeat_message_setup(5000, 0, &[0x01, 0x02], &[0xFF], &[0x62]),
     )
     .await
     .expect("PDU_IOCTL_START_REPEAT_MESSAGE should succeed");
@@ -1569,7 +1569,7 @@ async fn start_succeeds_on_a_plain_can_link_with_only_uudt_response_addressing()
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(1000, 0, vec![0x01, 0x02], vec![], vec![]),
+        repeat_message_setup(1000, 0, &[0x01, 0x02], &[], &[]),
     )
     .await
     .expect(
@@ -1622,7 +1622,7 @@ async fn start_with_condition_zero_now_rejects_without_a_resolvable_response_hea
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(1000, 0, vec![0x01, 0x02], vec![], vec![]),
+        repeat_message_setup(1000, 0, &[0x01, 0x02], &[], &[]),
     )
     .await
     .expect_err(
@@ -1665,7 +1665,7 @@ async fn start_with_condition_one_still_rejects_without_a_resolvable_response_he
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(1000, 1, vec![0x01, 0x02], vec![0xFF], vec![0x01]),
+        repeat_message_setup(1000, 1, &[0x01, 0x02], &[0xFF], &[0x01]),
     )
     .await
     .expect_err(
@@ -1723,10 +1723,10 @@ async fn start_repeat_message_with_tx_flag_bits_carries_iso15765_frame_pad() {
         repeat_message_setup_with_tx_flags(
             1000,
             0,
-            vec![0x01, 0x02],
-            vec![],
-            vec![],
-            vec![vci_service_interface::TxFlagBit::TxFlagIso15765FramePad as i32],
+            &[0x01, 0x02],
+            &[],
+            &[],
+            &[vci_service_interface::TxFlagBit::TxFlagIso15765FramePad as i32],
         ),
     )
     .await
@@ -1775,7 +1775,7 @@ async fn start_rejects_mismatched_length_mask_and_pattern_data_under_condition_o
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(1000, 1, vec![0x01, 0x02], vec![0xFF, 0xFF], vec![0x55]),
+        repeat_message_setup(1000, 1, &[0x01, 0x02], &[0xFF, 0xFF], &[0x55]),
     )
     .await
     .expect_err(
@@ -1815,7 +1815,7 @@ async fn start_with_condition_zero_now_rejects_mismatched_length_mask_and_patter
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(1000, 0, vec![0x01, 0x02], vec![], vec![0x01]),
+        repeat_message_setup(1000, 0, &[0x01, 0x02], &[], &[0x01]),
     )
     .await
     .expect_err(
@@ -1880,7 +1880,7 @@ async fn a_device_forgotten_condition_one_slot_is_pruned_on_the_first_query_that
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(1000, 1, vec![0x01, 0x02], vec![0xFF], vec![0x99]),
+        repeat_message_setup(1000, 1, &[0x01, 0x02], &[0xFF], &[0x99]),
     )
     .await
     .expect("PDU_IOCTL_START_REPEAT_MESSAGE should succeed");
@@ -1968,7 +1968,7 @@ async fn a_device_forgotten_condition_one_slot_is_pruned_on_the_first_stop_that_
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(1000, 1, vec![0x01, 0x02], vec![0xFF], vec![0x99]),
+        repeat_message_setup(1000, 1, &[0x01, 0x02], &[0xFF], &[0x99]),
     )
     .await
     .expect("PDU_IOCTL_START_REPEAT_MESSAGE should succeed");
@@ -2058,7 +2058,7 @@ async fn start_is_rejected_on_a_software_isotp_link() {
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(1000, 0, vec![0x01, 0x02], vec![], vec![]),
+        repeat_message_setup(1000, 0, &[0x01, 0x02], &[], &[]),
     )
     .await
     .expect_err(
@@ -2128,7 +2128,7 @@ async fn start_repeat_message_on_an_fd_connected_link_rejects_a_payload_over_the
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(1000, 0, payload, vec![], vec![]),
+        repeat_message_setup(1000, 0, &payload, &[], &[]),
     )
     .await
     .expect_err(
@@ -2187,7 +2187,7 @@ async fn start_repeat_message_on_an_fd_connected_link_accepts_a_payload_at_the_p
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(1000, 0, payload.clone(), vec![], vec![]),
+        repeat_message_setup(1000, 0, &payload, &[], &[]),
     )
     .await
     .expect("an 8-byte repeat_msg_data (DataSize 12) must be accepted at the periodic cap");
@@ -2268,7 +2268,7 @@ async fn start_repeat_message_rejects_an_oversized_raw_can_fd_payload_instead_of
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(1000, 0, oversized_payload, vec![], vec![]),
+        repeat_message_setup(1000, 0, &oversized_payload, &[], &[]),
     )
     .await
     .expect_err(
@@ -2284,7 +2284,7 @@ async fn start_repeat_message_rejects_an_oversized_raw_can_fd_payload_instead_of
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(1000, 0, vec![0x01, 0x02], vec![], vec![]),
+        repeat_message_setup(1000, 0, &[0x01, 0x02], &[], &[]),
     )
     .await
     .expect(
@@ -2350,7 +2350,7 @@ async fn start_repeat_message_on_a_raw_can_link_never_sets_iso15765_addr_type() 
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(1000, 0, vec![0x01, 0x02], vec![], vec![]),
+        repeat_message_setup(1000, 0, &[0x01, 0x02], &[], &[]),
     )
     .await
     .expect("PDU_IOCTL_START_REPEAT_MESSAGE should succeed on an extended-addressing raw-CAN link");
@@ -2426,7 +2426,7 @@ async fn start_repeat_message_is_rejected_while_a_sibling_holds_the_physical_tx_
         &mut client,
         cll_b,
         start_id,
-        repeat_message_setup(1000, 0, vec![0x01, 0x02], vec![], vec![]),
+        repeat_message_setup(1000, 0, &[0x01, 0x02], &[], &[]),
     )
     .await
     .expect_err(
@@ -2483,7 +2483,7 @@ async fn lock_resource_is_rejected_while_a_sibling_has_a_live_repeat_message_slo
         &mut client,
         cll_a,
         start_id,
-        repeat_message_setup(1000, 0, vec![0x01, 0x02], vec![], vec![]),
+        repeat_message_setup(1000, 0, &[0x01, 0x02], &[], &[]),
     )
     .await
     .expect("PDU_IOCTL_START_REPEAT_MESSAGE should succeed on cll_a");
@@ -2556,7 +2556,7 @@ async fn start_repeat_message_rejects_an_oversized_classic_can_payload() {
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(1000, 0, oversized_payload, vec![], vec![]),
+        repeat_message_setup(1000, 0, &oversized_payload, &[], &[]),
     )
     .await
     .expect_err(
@@ -2572,7 +2572,7 @@ async fn start_repeat_message_rejects_an_oversized_classic_can_payload() {
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(1000, 0, vec![0x01, 0x02], vec![], vec![]),
+        repeat_message_setup(1000, 0, &[0x01, 0x02], &[], &[]),
     )
     .await
     .expect(
@@ -2619,7 +2619,7 @@ async fn start_repeat_message_accepts_a_classic_can_payload_at_the_exact_size_bo
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(1000, 0, boundary_payload.clone(), vec![], vec![]),
+        repeat_message_setup(1000, 0, &boundary_payload, &[], &[]),
     )
     .await
     .expect(
@@ -2701,7 +2701,7 @@ async fn lock_resource_is_granted_once_a_siblings_repeat_message_slot_has_self_t
         &mut client,
         cll_a,
         start_id,
-        repeat_message_setup(20, 1, vec![0x01, 0x02], vec![0xFF], vec![0x99]),
+        repeat_message_setup(20, 1, &[0x01, 0x02], &[0xFF], &[0x99]),
     )
     .await
     .expect("PDU_IOCTL_START_REPEAT_MESSAGE should succeed on cll_a");
@@ -2802,7 +2802,7 @@ async fn lock_resource_is_still_rejected_while_a_sibling_has_a_genuinely_live_re
         &mut client,
         cll_a,
         start_id,
-        repeat_message_setup(1000, 0, vec![0x01, 0x02], vec![], vec![]),
+        repeat_message_setup(1000, 0, &[0x01, 0x02], &[], &[]),
     )
     .await
     .expect("PDU_IOCTL_START_REPEAT_MESSAGE should succeed on cll_a");
@@ -2860,7 +2860,7 @@ async fn lock_resource_is_rejected_by_the_requesters_own_live_repeat_message_slo
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(1000, 0, vec![0x01, 0x02], vec![], vec![]),
+        repeat_message_setup(1000, 0, &[0x01, 0x02], &[], &[]),
     )
     .await
     .expect("PDU_IOCTL_START_REPEAT_MESSAGE should succeed");
@@ -2949,7 +2949,7 @@ async fn condition_one_slot_terminates_immediately_on_a_frame_with_the_wrong_res
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(5000, 1, vec![0x01, 0x02], vec![], vec![]),
+        repeat_message_setup(5000, 1, &[0x01, 0x02], &[], &[]),
     )
     .await
     .expect("PDU_IOCTL_START_REPEAT_MESSAGE should succeed");
@@ -3021,7 +3021,7 @@ async fn condition_one_slot_does_not_terminate_on_a_frame_with_the_correct_respo
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(5000, 1, vec![0x01, 0x02], vec![], vec![]),
+        repeat_message_setup(5000, 1, &[0x01, 0x02], &[], &[]),
     )
     .await
     .expect("PDU_IOCTL_START_REPEAT_MESSAGE should succeed");
@@ -3105,7 +3105,7 @@ async fn condition_one_slot_does_not_terminate_on_its_own_loopback_echo() {
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(5000, 1, vec![0x01, 0x02], vec![0xFF], vec![0x99]),
+        repeat_message_setup(5000, 1, &[0x01, 0x02], &[0xFF], &[0x99]),
     )
     .await
     .expect("PDU_IOCTL_START_REPEAT_MESSAGE should succeed");
@@ -3195,7 +3195,7 @@ async fn repeat_worker_autonomous_transmit_emits_a_loopback_echo() {
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(100, 0, vec![0x01, 0x02], vec![], vec![]),
+        repeat_message_setup(100, 0, &[0x01, 0x02], &[], &[]),
     )
     .await
     .expect("PDU_IOCTL_START_REPEAT_MESSAGE should succeed");
@@ -3278,7 +3278,7 @@ async fn condition_one_iso15765_slot_terminates_immediately_on_a_raw_can_frame_w
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(5000, 1, vec![0x01, 0x02], vec![], vec![]),
+        repeat_message_setup(5000, 1, &[0x01, 0x02], &[], &[]),
     )
     .await
     .expect("PDU_IOCTL_START_REPEAT_MESSAGE should succeed");
@@ -3344,7 +3344,7 @@ async fn start_repeat_message_rejects_an_out_of_range_condition_through_the_full
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(5000, 2, vec![0x01, 0x02], vec![], vec![]),
+        repeat_message_setup(5000, 2, &[0x01, 0x02], &[], &[]),
     )
     .await
     .expect_err(
@@ -3412,7 +3412,7 @@ async fn lock_resource_is_granted_once_a_leaked_repeat_message_slot_is_pruned() 
         &mut client,
         cll_a,
         start_id,
-        repeat_message_setup(1000, 1, vec![0x01, 0x02], vec![0xFF], vec![0x99]),
+        repeat_message_setup(1000, 1, &[0x01, 0x02], &[0xFF], &[0x99]),
     )
     .await
     .expect("PDU_IOCTL_START_REPEAT_MESSAGE should succeed on cll_a");
@@ -3500,7 +3500,7 @@ async fn start_repeat_message_rejects_an_oversized_mask_and_pattern_template_und
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(1000, 1, vec![0x01, 0x02], oversized.clone(), oversized),
+        repeat_message_setup(1000, 1, &[0x01, 0x02], &oversized, &oversized),
     )
     .await
     .expect_err(
@@ -3516,7 +3516,7 @@ async fn start_repeat_message_rejects_an_oversized_mask_and_pattern_template_und
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(1000, 0, vec![0x01, 0x02], vec![], vec![]),
+        repeat_message_setup(1000, 0, &[0x01, 0x02], &[], &[]),
     )
     .await
     .expect(
@@ -3565,7 +3565,7 @@ async fn start_with_condition_zero_now_rejects_an_oversized_mask_and_pattern_tem
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(1000, 0, vec![0x01, 0x02], oversized.clone(), oversized),
+        repeat_message_setup(1000, 0, &[0x01, 0x02], &oversized, &oversized),
     )
     .await
     .expect_err(
@@ -3582,7 +3582,7 @@ async fn start_with_condition_zero_now_rejects_an_oversized_mask_and_pattern_tem
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(1000, 0, vec![0x01, 0x02], vec![], vec![]),
+        repeat_message_setup(1000, 0, &[0x01, 0x02], &[], &[]),
     )
     .await
     .expect(
@@ -3628,7 +3628,7 @@ async fn start_repeat_message_accepts_a_mask_and_pattern_template_at_the_exact_s
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(1000, 1, vec![0x01, 0x02], boundary.clone(), boundary),
+        repeat_message_setup(1000, 1, &[0x01, 0x02], &boundary, &boundary),
     )
     .await
     .expect(
@@ -3702,9 +3702,9 @@ async fn start_repeat_message_accepts_an_oversized_by_tx_dl_mask_and_pattern_tem
         repeat_message_setup(
             1000,
             1,
-            vec![0x01, 0x02],
-            oversized_by_tx_dl.clone(),
-            oversized_by_tx_dl,
+            &[0x01, 0x02],
+            &oversized_by_tx_dl,
+            &oversized_by_tx_dl,
         ),
     )
     .await
@@ -3760,7 +3760,7 @@ async fn start_repeat_message_rejects_an_oversized_functional_iso15765_single_fr
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(1000, 0, too_long_payload, vec![], vec![]),
+        repeat_message_setup(1000, 0, &too_long_payload, &[], &[]),
     )
     .await
     .expect_err(
@@ -3838,7 +3838,7 @@ async fn start_repeat_message_functional_addressing_on_fd_link_periodic_cap_prec
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(1000, 0, at_periodic_cap_payload, vec![], vec![]),
+        repeat_message_setup(1000, 0, &at_periodic_cap_payload, &[], &[]),
     )
     .await
     .expect_err(
@@ -3863,7 +3863,7 @@ async fn start_repeat_message_functional_addressing_on_fd_link_periodic_cap_prec
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(1000, 0, over_periodic_cap_payload, vec![], vec![]),
+        repeat_message_setup(1000, 0, &over_periodic_cap_payload, &[], &[]),
     )
     .await
     .expect_err("an 8-byte repeat_msg_data must exceed ADR-186's periodic-message cap");
@@ -3916,7 +3916,7 @@ async fn start_repeat_message_rejects_an_oversized_classic_iso15765_payload_even
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(1000, 0, too_long_payload, vec![], vec![]),
+        repeat_message_setup(1000, 0, &too_long_payload, &[], &[]),
     )
     .await
     .expect_err(
@@ -3937,7 +3937,7 @@ async fn start_repeat_message_rejects_an_oversized_classic_iso15765_payload_even
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(1000, 0, at_cap_payload, vec![], vec![]),
+        repeat_message_setup(1000, 0, &at_cap_payload, &[], &[]),
     )
     .await
     .expect("a 7-byte repeat_msg_data (DataSize 11) must be accepted at the periodic cap");
@@ -3990,7 +3990,7 @@ async fn start_repeat_message_on_fd_iso15765_enforces_the_eleven_byte_periodic_c
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(1000, 0, too_long_payload, vec![], vec![]),
+        repeat_message_setup(1000, 0, &too_long_payload, &[], &[]),
     )
     .await
     .expect_err(
@@ -4011,7 +4011,7 @@ async fn start_repeat_message_on_fd_iso15765_enforces_the_eleven_byte_periodic_c
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(1000, 0, at_cap_payload, vec![], vec![]),
+        repeat_message_setup(1000, 0, &at_cap_payload, &[], &[]),
     )
     .await
     .expect("a 7-byte repeat_msg_data (DataSize 11) must be accepted at the periodic cap");
@@ -4320,7 +4320,7 @@ async fn start_repeat_message_succeeds_on_a_raw_mode_can_cll_with_header_inclusi
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(5000, 1, repeat_msg_data, mask_data, pattern_data),
+        repeat_message_setup(5000, 1, &repeat_msg_data, &mask_data, &pattern_data),
     )
     .await
     .expect("PDU_IOCTL_START_REPEAT_MESSAGE should succeed on a RawMode CAN ComLogicalLink");
@@ -4394,9 +4394,9 @@ async fn start_repeat_message_succeeds_on_a_raw_mode_kline_cll() {
         repeat_message_setup(
             1000,
             0,
-            vec![0x80, 0x10, 0xF1, 0x01, 0x02],
-            vec![0xFF, 0xFF, 0xFF],
-            vec![0x80, 0x10, 0xF1],
+            &[0x80, 0x10, 0xF1, 0x01, 0x02],
+            &[0xFF, 0xFF, 0xFF],
+            &[0x80, 0x10, 0xF1],
         ),
     )
     .await
@@ -4441,10 +4441,10 @@ async fn start_repeat_message_raw_mode_iso15765_extended_addressing_enforces_fiv
         repeat_message_setup_with_tx_flags(
             1000,
             0,
-            too_short,
-            vec![0xFF, 0xFF, 0xFF, 0xFF],
-            0x7E8_u32.to_be_bytes().to_vec(),
-            vec![TxFlagBit::TxFlagIso15765AddrType as i32],
+            &too_short,
+            &[0xFF, 0xFF, 0xFF, 0xFF],
+            &0x7E8_u32.to_be_bytes(),
+            &[TxFlagBit::TxFlagIso15765AddrType as i32],
         ),
     )
     .await
@@ -4467,10 +4467,10 @@ async fn start_repeat_message_raw_mode_iso15765_extended_addressing_enforces_fiv
         repeat_message_setup_with_tx_flags(
             1000,
             0,
-            at_floor,
-            vec![0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
-            mask_at_floor,
-            vec![TxFlagBit::TxFlagIso15765AddrType as i32],
+            &at_floor,
+            &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+            &mask_at_floor,
+            &[TxFlagBit::TxFlagIso15765AddrType as i32],
         ),
     )
     .await
@@ -4510,13 +4510,7 @@ async fn start_repeat_message_raw_mode_kline_checksum_mode_off_widens_template_r
         &mut client,
         cll_handle_off,
         start_id,
-        repeat_message_setup(
-            1000,
-            0,
-            repeat_msg_data.clone(),
-            vec![0xFFu8; 260],
-            vec![0x00u8; 260],
-        ),
+        repeat_message_setup(1000, 0, &repeat_msg_data, &[0xFFu8; 260], &[0x00u8; 260]),
     )
     .await
     .expect(
@@ -4551,13 +4545,7 @@ async fn start_repeat_message_raw_mode_kline_checksum_mode_off_widens_template_r
         &mut client,
         cll_handle_on,
         start_id,
-        repeat_message_setup(
-            1000,
-            0,
-            repeat_msg_data,
-            vec![0xFFu8; 260],
-            vec![0x00u8; 260],
-        ),
+        repeat_message_setup(1000, 0, &repeat_msg_data, &[0xFFu8; 260], &[0x00u8; 260]),
     )
     .await
     .expect_err(
@@ -4609,10 +4597,10 @@ async fn start_repeat_message_raw_mode_tx_flag_bits_are_honored() {
         repeat_message_setup_with_tx_flags(
             5000,
             0,
-            repeat_msg_data,
-            mask_data,
-            pattern_data,
-            vec![TxFlagBit::TxFlagCan29bitId as i32],
+            &repeat_msg_data,
+            &mask_data,
+            &pattern_data,
+            &[TxFlagBit::TxFlagCan29bitId as i32],
         ),
     )
     .await
@@ -4676,11 +4664,11 @@ async fn start_repeat_message_raw_mode_response_tx_flag_bits_override_the_reques
         repeat_message_setup_with_response_tx_flag_bits(
             5000,
             0,
-            repeat_msg_data,
-            mask_data,
-            pattern_data,
-            vec![TxFlagBit::TxFlagCan29bitId as i32],
-            Some(vec![]),
+            &repeat_msg_data,
+            &mask_data,
+            &pattern_data,
+            &[TxFlagBit::TxFlagCan29bitId as i32],
+            Some(&[]),
         ),
     )
     .await
@@ -4741,11 +4729,11 @@ async fn start_repeat_message_raw_mode_response_tx_flag_bits_add_addressing_the_
         repeat_message_setup_with_response_tx_flag_bits(
             5000,
             0,
-            repeat_msg_data,
-            mask_data,
-            pattern_data,
-            vec![],
-            Some(vec![TxFlagBit::TxFlagCan29bitId as i32]),
+            &repeat_msg_data,
+            &mask_data,
+            &pattern_data,
+            &[],
+            Some(&[TxFlagBit::TxFlagCan29bitId as i32]),
         ),
     )
     .await
@@ -4826,11 +4814,11 @@ async fn start_repeat_message_raw_mode_response_tx_flag_bits_apply_on_an_fd_conn
         repeat_message_setup_with_response_tx_flag_bits(
             5000,
             0,
-            repeat_msg_data,
-            mask_data,
-            pattern_data,
-            vec![TxFlagBit::TxFlagCan29bitId as i32],
-            Some(vec![]),
+            &repeat_msg_data,
+            &mask_data,
+            &pattern_data,
+            &[TxFlagBit::TxFlagCan29bitId as i32],
+            Some(&[]),
         ),
     )
     .await
@@ -4902,11 +4890,11 @@ async fn start_repeat_message_raw_mode_asymmetric_addressing_matches_on_the_resp
         repeat_message_setup_with_response_tx_flag_bits(
             5000,
             1,
-            repeat_msg_data,
-            mask_data,
-            pattern_data,
-            vec![TxFlagBit::TxFlagCan29bitId as i32],
-            Some(vec![]),
+            &repeat_msg_data,
+            &mask_data,
+            &pattern_data,
+            &[TxFlagBit::TxFlagCan29bitId as i32],
+            Some(&[]),
         ),
     )
     .await
@@ -4980,7 +4968,7 @@ async fn start_repeat_message_succeeds_on_a_raw_mode_sci_cll() {
         &mut client,
         cll_handle,
         start_id,
-        repeat_message_setup(1000, 0, vec![0x01, 0x02], vec![0xFF], vec![0x99]),
+        repeat_message_setup(1000, 0, &[0x01, 0x02], &[0xFF], &[0x99]),
     )
     .await
     .expect("PDU_IOCTL_START_REPEAT_MESSAGE should succeed on a RawMode SCI ComLogicalLink");

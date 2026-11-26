@@ -251,7 +251,7 @@ fn internal() -> Response {
 }
 
 fn stored(status: StatusCode, name: &str) -> Response {
-    json_answer(status, json!({ "sha256": name }))
+    json_answer(status, &json!({ "sha256": name }))
 }
 
 fn db_failure(inner: &Inner, operator: &str, error: &sqlx::Error) -> Response {

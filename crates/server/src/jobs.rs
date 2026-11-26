@@ -1068,7 +1068,7 @@ mod tests {
         headers(&["application/json"], &["key-1"])
     }
 
-    fn body(extra: Value) -> Vec<u8> {
+    fn body(extra: &Value) -> Vec<u8> {
         let mut object = serde_json::json!({
             "kind": "acquire",
             "agentId": AGENT,
@@ -1085,7 +1085,7 @@ mod tests {
         object.to_string().into_bytes()
     }
 
-    fn shaped(extra: Value) -> Result<Spec, ShapeError> {
+    fn shaped(extra: &Value) -> Result<Spec, ShapeError> {
         shape(&good_headers(), &body(extra)).map(|(_, spec)| spec)
     }
 
@@ -1096,7 +1096,7 @@ mod tests {
     // R2
     #[test]
     fn the_content_type_must_be_exactly_one_json_media_type() {
-        let ok = |h: &HeaderMap| shape(h, &body(serde_json::json!({}))).map(|_| ());
+        let ok = |h: &HeaderMap| shape(h, &body(&serde_json::json!({}))).map(|_| ());
         assert_eq!(ok(&headers(&["application/json"], &["k"])), Ok(()));
         assert_eq!(
             ok(&headers(&["application/json; charset=utf-8"], &["k"])),
@@ -1121,7 +1121,7 @@ mod tests {
         let key_of = |keys: &[&str]| {
             shape(
                 &headers(&["application/json"], keys),
-                &body(serde_json::json!({})),
+                &body(&serde_json::json!({})),
             )
             .map(|(key, _)| key)
         };
@@ -1152,7 +1152,7 @@ mod tests {
             HeaderValue::from_bytes(b"caf\xe9").unwrap(),
         );
         assert_eq!(
-            shape(&high, &body(serde_json::json!({}))),
+            shape(&high, &body(&serde_json::json!({}))),
             Err(ShapeError::Key)
         );
         // The key is judged before the body.
@@ -1165,14 +1165,14 @@ mod tests {
     // R4
     #[test]
     fn the_body_is_one_object_of_the_known_properties_typed_right() {
-        shaped(serde_json::json!({})).unwrap();
+        shaped(&serde_json::json!({})).unwrap();
         let bad = [
             "".to_owned(),
             "[]".to_owned(),
             "null".to_owned(),
             "\"x\"".to_owned(),
             "{}".to_owned() + " x",
-            String::from_utf8(body(serde_json::json!({}))).unwrap() + "{}",
+            String::from_utf8(body(&serde_json::json!({}))).unwrap() + "{}",
             format!(
                 r#"{{"kind":"acquire","kind":"acquire","agentId":"{AGENT}","vciId":"v","irDigests":["{DIGEST_A}"]}}"#
             ),
@@ -1208,7 +1208,7 @@ mod tests {
         );
         assert_eq!(
             shaped_raw(reordered.as_bytes()),
-            shaped(serde_json::json!({}))
+            shaped(&serde_json::json!({}))
         );
     }
 
@@ -1216,11 +1216,13 @@ mod tests {
     #[test]
     fn only_acquire_and_write_settings_are_created_and_the_others_are_not_supported() {
         assert_eq!(
-            shaped(serde_json::json!({"kind": "acquire"})).unwrap().kind,
+            shaped(&serde_json::json!({"kind": "acquire"}))
+                .unwrap()
+                .kind,
             Kind::Acquire
         );
         assert_eq!(
-            shaped(serde_json::json!({"kind": "writeSettings"}))
+            shaped(&serde_json::json!({"kind": "writeSettings"}))
                 .unwrap()
                 .kind,
             Kind::WriteSettings
@@ -1233,20 +1235,20 @@ mod tests {
             "identify",
         ] {
             assert_eq!(
-                shaped(serde_json::json!({ "kind": kind })),
+                shaped(&serde_json::json!({ "kind": kind })),
                 Err(ShapeError::KindUnsupported),
                 "{kind}"
             );
         }
         for kind in ["", "Acquire", "unknown", "write_settings"] {
             assert_eq!(
-                shaped(serde_json::json!({ "kind": kind })),
+                shaped(&serde_json::json!({ "kind": kind })),
                 Err(ShapeError::Kind),
                 "{kind}"
             );
         }
         assert_eq!(
-            shaped(serde_json::json!({"kind": null})),
+            shaped(&serde_json::json!({"kind": null})),
             Err(ShapeError::Kind)
         );
         assert_ne!(
@@ -1262,13 +1264,13 @@ mod tests {
         let bare = AGENT.replace('-', "");
         for id in [upper.as_str(), bare.as_str(), &AGENT[..35], ""] {
             assert_eq!(
-                shaped(serde_json::json!({ "agentId": id })),
+                shaped(&serde_json::json!({ "agentId": id })),
                 Err(ShapeError::AgentId),
                 "{id}"
             );
         }
         assert_eq!(
-            shaped(serde_json::json!({"agentId": null})),
+            shaped(&serde_json::json!({"agentId": null})),
             Err(ShapeError::AgentId)
         );
     }
@@ -1278,7 +1280,7 @@ mod tests {
     fn the_vci_id_is_one_to_1024_bytes_without_a_control_character() {
         let longest = "v".repeat(1024);
         assert_eq!(
-            shaped(serde_json::json!({ "vciId": longest }))
+            shaped(&serde_json::json!({ "vciId": longest }))
                 .unwrap()
                 .vci_id,
             longest
@@ -1286,13 +1288,13 @@ mod tests {
         let too_long = "v".repeat(1025);
         for id in ["", too_long.as_str(), "a\nb", "a\u{0}b", "a\u{7f}b"] {
             assert_eq!(
-                shaped(serde_json::json!({ "vciId": id })),
+                shaped(&serde_json::json!({ "vciId": id })),
                 Err(ShapeError::VciId),
                 "{id:?}"
             );
         }
         assert_eq!(
-            shaped(serde_json::json!({"vciId": null})),
+            shaped(&serde_json::json!({"vciId": null})),
             Err(ShapeError::VciId)
         );
     }
@@ -1301,13 +1303,13 @@ mod tests {
     #[test]
     fn a_vin_is_well_formed_when_present_and_may_be_absent() {
         assert_eq!(
-            shaped(serde_json::json!({ "vin": VIN }))
+            shaped(&serde_json::json!({ "vin": VIN }))
                 .unwrap()
                 .vin
                 .as_deref(),
             Some(VIN)
         );
-        assert_eq!(shaped(serde_json::json!({})).unwrap().vin, None);
+        assert_eq!(shaped(&serde_json::json!({})).unwrap().vin, None);
         for vin in [
             "1HGCM82633A00435",
             "1HGCM82633A0043521",
@@ -1318,7 +1320,7 @@ mod tests {
             "",
         ] {
             assert_eq!(
-                shaped(serde_json::json!({ "vin": vin })),
+                shaped(&serde_json::json!({ "vin": vin })),
                 Err(ShapeError::Vin),
                 "{vin}"
             );
@@ -1329,14 +1331,14 @@ mod tests {
     #[test]
     fn the_digest_list_is_one_to_128_lowercase_hex_digests_in_any_order_with_duplicates() {
         assert_eq!(
-            shaped(serde_json::json!({ "irDigests": [DIGEST_B, DIGEST_A, DIGEST_B] }))
+            shaped(&serde_json::json!({ "irDigests": [DIGEST_B, DIGEST_A, DIGEST_B] }))
                 .unwrap()
                 .hashes,
             vec![[0xaa; 32], [0xbb; 32]]
         );
         let many: Vec<String> = (0..128).map(|n| format!("{n:064x}")).collect();
         assert_eq!(
-            shaped(serde_json::json!({ "irDigests": many }))
+            shaped(&serde_json::json!({ "irDigests": many }))
                 .unwrap()
                 .hashes
                 .len(),
@@ -1355,7 +1357,7 @@ mod tests {
             serde_json::json!([DIGEST_A, "x"]),
         ] {
             assert_eq!(
-                shaped(serde_json::json!({ "irDigests": list })),
+                shaped(&serde_json::json!({ "irDigests": list })),
                 Err(ShapeError::IrDigests),
                 "{list}"
             );
@@ -1366,7 +1368,7 @@ mod tests {
     #[test]
     fn the_artifact_digest_is_one_lowercase_hex_digest_when_present() {
         assert_eq!(
-            shaped(serde_json::json!({ "artifactDigest": DIGEST_B }))
+            shaped(&serde_json::json!({ "artifactDigest": DIGEST_B }))
                 .unwrap()
                 .artifact,
             Some([0xbb; 32])
@@ -1374,7 +1376,7 @@ mod tests {
         let upper = DIGEST_A.to_uppercase();
         for digest in ["", &DIGEST_A[..63], upper.as_str(), "sha256:abc"] {
             assert_eq!(
-                shaped(serde_json::json!({ "artifactDigest": digest })),
+                shaped(&serde_json::json!({ "artifactDigest": digest })),
                 Err(ShapeError::ArtifactDigest),
                 "{digest}"
             );
@@ -1391,24 +1393,20 @@ mod tests {
             serde_json::json!({"executionWindow": {"from": "2030-01-01T00:00:00Z"}}),
             serde_json::json!({"onSiteContact": "x"}),
         ] {
-            assert_eq!(
-                shaped(extra.clone()),
-                Err(ShapeError::Unsupported),
-                "{extra}"
-            );
+            assert_eq!(shaped(&extra), Err(ShapeError::Unsupported), "{extra}");
         }
-        let plain = shaped(serde_json::json!({})).unwrap();
+        let plain = shaped(&serde_json::json!({})).unwrap();
         assert_eq!(
-            shaped(serde_json::json!({"remote": false})),
+            shaped(&serde_json::json!({"remote": false})),
             Ok(plain.clone())
         );
-        assert_eq!(shaped(serde_json::json!({"parameters": {}})), Ok(plain));
+        assert_eq!(shaped(&serde_json::json!({"parameters": {}})), Ok(plain));
     }
 
     // R12
     #[test]
     fn the_hash_is_the_same_for_the_same_request_and_differs_in_each_part() {
-        let spec = |extra: Value| shaped(extra).unwrap().request_hash();
+        let spec = |extra: Value| shaped(&extra).unwrap().request_hash();
         let base = spec(serde_json::json!({ "vin": VIN, "artifactDigest": DIGEST_B }));
         let same = [
             serde_json::json!({ "vin": VIN, "artifactDigest": DIGEST_B, "remote": false, "parameters": {} }),
@@ -1449,7 +1447,7 @@ mod tests {
     // this code.
     #[test]
     fn a_request_without_a_deadline_hashes_as_before_the_field_existed() {
-        let hash = shaped(serde_json::json!({})).unwrap().request_hash();
+        let hash = shaped(&serde_json::json!({})).unwrap().request_hash();
         assert_eq!(
             hex(&hash),
             "45777d016bfcb067d6d6ef46833d13e372f29c8bc79562b15fda50dc1ea57d8a"
@@ -1461,7 +1459,7 @@ mod tests {
     #[test]
     fn the_deadline_enters_the_hash_as_its_normalized_second_and_its_presence_counts() {
         let spec = |at: &str| {
-            shaped(serde_json::json!({ "startDeadline": at }))
+            shaped(&serde_json::json!({ "startDeadline": at }))
                 .unwrap()
                 .request_hash()
         };
@@ -1470,14 +1468,14 @@ mod tests {
         assert_eq!(spec("2030-01-01T10:00:00-00:00"), base);
         assert_eq!(spec("2030-01-01T10:00:00.999Z"), base);
         assert_ne!(spec("2030-01-01T10:00:01Z"), base);
-        let absent = shaped(serde_json::json!({})).unwrap().request_hash();
+        let absent = shaped(&serde_json::json!({})).unwrap().request_hash();
         assert_ne!(base, absent);
         // The default's own second is another request than none at all.
-        let mut named = shaped(serde_json::json!({})).unwrap();
+        let mut named = shaped(&serde_json::json!({})).unwrap();
         named.start_deadline = Some(1_900_000_000);
         assert_ne!(named.request_hash(), absent);
         assert_eq!(
-            shaped(serde_json::json!({ "startDeadline": "2030-03-17T17:46:40Z" }))
+            shaped(&serde_json::json!({ "startDeadline": "2030-03-17T17:46:40Z" }))
                 .unwrap()
                 .start_deadline,
             Some(1_900_000_000)
@@ -1504,7 +1502,7 @@ mod tests {
         ] {
             let result = shape(
                 &good_headers(),
-                &body(serde_json::json!({ "startDeadline": bad })),
+                &body(&serde_json::json!({ "startDeadline": bad })),
             );
             assert_eq!(
                 result.map(|_| ()),
@@ -1525,7 +1523,7 @@ mod tests {
             r#"{{"kind":"acquire","agentId":"{AGENT}","vciId":"v","irDigests":["{DIGEST_A}"],"startDeadline":"2030-01-01T00:00:00Z","startDeadline":"2030-01-01T00:00:00Z"}}"#
         );
         assert_eq!(shaped_raw(twice.as_bytes()), Err(ShapeError::Json));
-        let ok = shaped(serde_json::json!({ "startDeadline": "2030-01-01T00:00:00Z" })).unwrap();
+        let ok = shaped(&serde_json::json!({ "startDeadline": "2030-01-01T00:00:00Z" })).unwrap();
         assert_eq!(ok.start_deadline, Some(1_893_456_000));
     }
 
@@ -1545,7 +1543,7 @@ mod tests {
     // F1, F2: the instruction carries the request's second, else the default window.
     #[test]
     fn the_instruction_carries_the_requests_deadline_else_the_default_window() {
-        let mut spec = shaped(serde_json::json!({})).unwrap();
+        let mut spec = shaped(&serde_json::json!({})).unwrap();
         let operator = "4e475200-0000-4000-8000-000000000001";
         let id = job_id(1, [0; 10]);
         let issued = 1_800_000_000;
@@ -1563,7 +1561,7 @@ mod tests {
     #[tokio::test]
     async fn the_largest_accepted_request_fits_the_instruction_and_the_command_frame() {
         let digests: Vec<String> = (0..128).map(|n| format!("{n:064x}")).collect();
-        let request = body(serde_json::json!({
+        let request = body(&serde_json::json!({
             "vciId": "v".repeat(1024),
             "vin": VIN,
             "irDigests": digests,

@@ -314,7 +314,7 @@ pub struct LoadedPlan {
 /// accepted as a development path.
 pub fn load_plan(
     plan_bytes: &[u8],
-    supplied: Vec<(Sha256, Vec<u8>)>,
+    supplied: &[(Sha256, Vec<u8>)],
     instruction: Option<&VerifiedInstruction>,
 ) -> Result<LoadedPlan, PlanRefused> {
     let plan_sha256: Sha256 = sha2::Sha256::digest(plan_bytes).into();
@@ -1928,7 +1928,7 @@ pub async fn run_identification<W: WorkerSource>(
         move |log| {
             identify(
                 &handle,
-                Arc::new(Mutex::new(source)),
+                &Arc::new(Mutex::new(source)),
                 &plan,
                 &limits,
                 &cancel,
@@ -2022,7 +2022,7 @@ enum PartEnd {
 /// The run on the job's blocking thread.
 fn identify<W: WorkerSource>(
     handle: &Handle,
-    source: Arc<Mutex<W>>,
+    source: &Arc<Mutex<W>>,
     plan: &CheckedPlan,
     limits: &JobLimits,
     cancelled: &AtomicBool,
@@ -2045,9 +2045,9 @@ fn identify<W: WorkerSource>(
             let config = base.functional(group.functional_id, table.clone());
             let part = presence_part(
                 handle,
-                &source,
+                source,
                 &config,
-                comm_log.clone(),
+                &comm_log,
                 limits,
                 cancelled,
                 guards,
@@ -2097,7 +2097,7 @@ fn identify<W: WorkerSource>(
     }
     vin_phase(
         handle,
-        &source,
+        source,
         plan,
         limits,
         cancelled,
@@ -2120,7 +2120,7 @@ fn identify<W: WorkerSource>(
         // open does: a worker that exited during the last close is found, and its mark cleared.
         // Guards still marked take no lock (ADR-258); an ECU read that remains then ends the run
         // in `LinkUnconfirmed` as its link opens (ADR-401), and a run with none reports so.
-        match settle_before_open(&source, &comm_log, cancelled, guards, &worker_ended) {
+        match settle_before_open(source, &comm_log, cancelled, guards, &worker_ended) {
             Ok(_) => {
                 promote_to_vehicle(
                     guards,
@@ -2136,7 +2136,7 @@ fn identify<W: WorkerSource>(
     }
     ecu_phase(
         handle,
-        &source,
+        source,
         plan,
         limits,
         cancelled,
@@ -2220,7 +2220,7 @@ fn open_part<W: WorkerSource>(
     handle: &Handle,
     source: &Arc<Mutex<W>>,
     config: &LinkConfig,
-    comm_log: Option<crate::comm_log::CommLog>,
+    comm_log: &Option<crate::comm_log::CommLog>,
     limits: &JobLimits,
     cancelled: &AtomicBool,
     guards: &GuardSlot,
@@ -2236,7 +2236,7 @@ fn open_part<W: WorkerSource>(
             evidence: CloseEvidence::default(),
         };
         let mut shared =
-            settle_before_open(source, &comm_log, cancelled, guards, worker_ended).map_err(stop)?;
+            settle_before_open(source, comm_log, cancelled, guards, worker_ended).map_err(stop)?;
         let client = shared
             .client()
             .map_err(|error| stop(JobError::Link(error)))?;
@@ -2266,7 +2266,7 @@ fn open_part<W: WorkerSource>(
                 refused.cleaned_up = settle(
                     &mut shared,
                     refused.evidence,
-                    &comm_log,
+                    comm_log,
                     guards,
                     worker_ended,
                 );
@@ -2398,7 +2398,7 @@ fn presence_part<W: WorkerSource>(
     handle: &Handle,
     source: &Arc<Mutex<W>>,
     config: &LinkConfig,
-    comm_log: Option<crate::comm_log::CommLog>,
+    comm_log: &Option<crate::comm_log::CommLog>,
     limits: &JobLimits,
     cancelled: &AtomicBool,
     guards: &GuardSlot,
@@ -2471,7 +2471,7 @@ fn open_read_link<W: WorkerSource>(
     handle: &Handle,
     source: &Arc<Mutex<W>>,
     link: &LinkConfig,
-    comm_log: Option<crate::comm_log::CommLog>,
+    comm_log: &Option<crate::comm_log::CommLog>,
     limits: &JobLimits,
     cancelled: &AtomicBool,
     guards: &GuardSlot,
@@ -2568,7 +2568,7 @@ fn vin_read<W: WorkerSource>(
     source: &Arc<Mutex<W>>,
     read: &VinReadPlan,
     link: &LinkConfig,
-    comm_log: Option<crate::comm_log::CommLog>,
+    comm_log: &Option<crate::comm_log::CommLog>,
     limits: &JobLimits,
     cancelled: &AtomicBool,
     guards: &GuardSlot,
@@ -2692,7 +2692,7 @@ fn vin_phase<W: WorkerSource>(
             source,
             read,
             link,
-            comm_log.clone(),
+            comm_log,
             limits,
             cancelled,
             guards,
@@ -2790,7 +2790,7 @@ fn ecu_read_group<W: WorkerSource>(
     group: &LinkGroup,
     link: &LinkConfig,
     documents: &[(Sha256, JobDocument)],
-    comm_log: Option<crate::comm_log::CommLog>,
+    comm_log: &Option<crate::comm_log::CommLog>,
     limits: &JobLimits,
     cancelled: &AtomicBool,
     guards: &GuardSlot,
@@ -3414,7 +3414,7 @@ fn read_definition_at<W: WorkerSource>(
             group,
             link,
             &plan.documents,
-            comm_log.clone(),
+            comm_log,
             limits,
             cancelled,
             guards,
@@ -3909,7 +3909,7 @@ mod tests {
         plan: &IdentificationPlan,
         supplied: &[(Sha256, Vec<u8>)],
     ) -> Result<LoadedPlan, PlanRefused> {
-        load_plan(&plan.encode().unwrap(), supplied.to_vec(), None)
+        load_plan(&plan.encode().unwrap(), supplied, None)
     }
 
     /// A plan over `documents` with one candidate whose VIN rules are `rules`: the index of the
@@ -4005,7 +4005,7 @@ mod tests {
         let bytes = plan(&hashes).encode().unwrap();
         let plan_hash: Sha256 = sha2::Sha256::digest(&bytes).into();
         let instruction = verified(Some(plan_hash));
-        let mut checked = check_plan(&load_plan(&bytes, documents.to_vec(), Some(&instruction))?)?;
+        let mut checked = check_plan(&load_plan(&bytes, documents, Some(&instruction))?)?;
         checked.ecu_reads.clear();
         checked.rule_fields.clear();
         Ok((checked, plan_hash))
@@ -4016,7 +4016,7 @@ mod tests {
         let doc = named(document(0x90, 0x7E0, 0x7E8, |_| {}));
         let bytes = plan(&[doc.0]).encode().unwrap();
         let instruction = verified(Some(sha2::Sha256::digest(&bytes).into()));
-        let loaded = load_plan(&bytes, vec![doc.clone()], Some(&instruction)).unwrap();
+        let loaded = load_plan(&bytes, std::slice::from_ref(&doc), Some(&instruction)).unwrap();
         assert_eq!(loaded.document_hashes(), [doc.0]);
         assert_eq!(
             loaded.plan_sha256,
@@ -4032,7 +4032,7 @@ mod tests {
         other.candidates[0].id = "another".into();
         let instruction = verified(Some(sha2::Sha256::digest(other.encode().unwrap()).into()));
         assert!(matches!(
-            load_plan(&bytes, vec![doc], Some(&instruction)),
+            load_plan(&bytes, &[doc], Some(&instruction)),
             Err(PlanRefused::PlanHashMismatch)
         ));
     }
@@ -4042,7 +4042,7 @@ mod tests {
         let doc = named(document(0x90, 0x7E0, 0x7E8, |_| {}));
         let bytes = plan(&[doc.0]).encode().unwrap();
         assert!(matches!(
-            load_plan(&bytes, vec![doc], Some(&verified(None))),
+            load_plan(&bytes, &[doc], Some(&verified(None))),
             Err(PlanRefused::InstructionNamesNoPlan)
         ));
     }
@@ -4057,7 +4057,7 @@ mod tests {
         ] {
             let instruction = verified_of_kind(kind, Some(sha2::Sha256::digest(&bytes).into()));
             assert!(matches!(
-                load_plan(&bytes, vec![doc.clone()], Some(&instruction)),
+                load_plan(&bytes, std::slice::from_ref(&doc), Some(&instruction)),
                 Err(PlanRefused::InstructionNotIdentify)
             ));
         }
@@ -4067,7 +4067,7 @@ mod tests {
     fn the_hash_check_comes_before_the_plan_is_decoded() {
         let instruction = verified(Some([7; 32]));
         assert!(matches!(
-            load_plan(b"not a plan", Vec::new(), Some(&instruction)),
+            load_plan(b"not a plan", &[], Some(&instruction)),
             Err(PlanRefused::PlanHashMismatch)
         ));
     }
@@ -4078,7 +4078,7 @@ mod tests {
         let bytes = plan(&[doc.0]).encode().unwrap();
         let instruction = verified(Some(sha2::Sha256::digest(&bytes).into()));
         assert!(matches!(
-            load_plan(&bytes, Vec::new(), Some(&instruction)),
+            load_plan(&bytes, &[], Some(&instruction)),
             Err(PlanRefused::MissingDocument(_))
         ));
     }

@@ -120,6 +120,7 @@ fn io_error(op: &'static str) -> impl FnOnce(io::Error) -> StoreError {
     move |error| StoreError::Io {
         op,
         kind: error.kind(),
+        source: Some(Box::new(error)),
     }
 }
 
@@ -128,6 +129,7 @@ fn directory_error(fault: DirectoryFault) -> StoreError {
         DirectoryFault::Io(kind) => StoreError::Io {
             op: "inspect the directory",
             kind,
+            source: None,
         },
         DirectoryFault::NotADirectory => StoreError::NotADirectory,
         DirectoryFault::NotOwned => StoreError::DirectoryNotOwned,
@@ -184,6 +186,7 @@ pub(crate) fn take_process_lock(path: &Path) -> Result<ProcessLock, StoreError> 
         return Err(StoreError::Io {
             op: "trust the lock file",
             kind: io::ErrorKind::PermissionDenied,
+            source: None,
         });
     }
     match file.try_lock() {
@@ -271,9 +274,10 @@ impl LocalStore {
             work(&inner, &key)
         })
         .await
-        .map_err(|_| StoreError::Io {
+        .map_err(|error| StoreError::Io {
             op: "run a task",
             kind: io::ErrorKind::Other,
+            source: Some(Box::new(error)),
         })?
     }
 
@@ -281,9 +285,10 @@ impl LocalStore {
         let inner = Arc::clone(&self.inner);
         let keys = tokio::task::spawn_blocking(move || inner.staged_keys())
             .await
-            .map_err(|_| StoreError::Io {
+            .map_err(|error| StoreError::Io {
                 op: "run a task",
                 kind: io::ErrorKind::Other,
+                source: Some(Box::new(error)),
             })??;
         let mut listed = Vec::new();
         for key in keys {
@@ -363,6 +368,7 @@ impl Inner {
             return Err(StoreError::Io {
                 op: "trust an object file",
                 kind: io::ErrorKind::PermissionDenied,
+                source: None,
             });
         }
         Ok(())
@@ -411,6 +417,7 @@ impl Inner {
             return Err(StoreError::Io {
                 op: "use an object after a failed sync",
                 kind: io::ErrorKind::Other,
+                source: None,
             });
         }
         Ok(())
@@ -537,6 +544,7 @@ impl Inner {
             return Err(StoreError::Io {
                 op: "read an object",
                 kind: io::ErrorKind::UnexpectedEof,
+                source: None,
             });
         }
         if hasher.finalize().as_slice() != sha256.as_slice() {
@@ -750,6 +758,7 @@ impl ObjectStore for LocalStore {
             Err(StoreError::Io {
                 op: "create an object",
                 kind: io::ErrorKind::AlreadyExists,
+                source: None,
             })
         })
     }

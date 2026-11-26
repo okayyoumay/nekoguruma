@@ -106,7 +106,7 @@ fn parse_registration_code(mut args: impl Iterator<Item = OsString>) -> Result<C
         value
             .map(|v| {
                 v.into_string()
-                    .map_err(|_| format!("{flag} must be valid UTF-8"))
+                    .map_err(|e| format!("{flag} must be valid UTF-8: {e:?}"))
             })
             .transpose()
     };
@@ -148,7 +148,7 @@ fn parse_user(mut args: impl Iterator<Item = OsString>) -> Result<UserCommand, S
             value
                 .clone()
                 .into_string()
-                .map_err(|_| format!("{flag} must be valid UTF-8"))
+                .map_err(|e| format!("{flag} must be valid UTF-8: {e:?}"))
         };
         let slot = match flag {
             "--config" => &mut config,
@@ -167,13 +167,13 @@ fn parse_user(mut args: impl Iterator<Item = OsString>) -> Result<UserCommand, S
     let username = username
         .ok_or("--username is required")?
         .into_string()
-        .map_err(|_| "--username must be valid UTF-8".to_owned())?;
+        .map_err(|e| format!("--username must be valid UTF-8: {e:?}"))?;
     match sub.as_str() {
         "add" => {
             let name = name
                 .ok_or("--name is required")?
                 .into_string()
-                .map_err(|_| "--name must be valid UTF-8".to_owned())?;
+                .map_err(|e| format!("--name must be valid UTF-8: {e:?}"))?;
             let user = NewUser::new(&username, &name, &roles).map_err(|e| e.to_string())?;
             Ok(UserCommand::Add { config, user })
         }

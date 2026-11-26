@@ -1013,7 +1013,10 @@ async fn a_listing_that_goes_backwards_repeats_or_overflows_is_parts_changed() {
     for (name, xml) in cases {
         let fake = Fake::start(move |_, _| reply(200, xml.clone())).await;
         let error = store(&fake).list_parts(&upload()).await.unwrap_err();
-        assert!(matches!(error, StoreError::PartsChanged), "{name}: {error}");
+        assert!(
+            matches!(error, StoreError::PartsChanged { .. }),
+            "{name}: {error}"
+        );
     }
 }
 
@@ -1340,7 +1343,7 @@ async fn the_object_servers_own_complaints_about_the_parts_are_parts_changed() {
             .await
             .unwrap_err();
         assert!(
-            matches!(error, StoreError::PartsChanged),
+            matches!(error, StoreError::PartsChanged { .. }),
             "{status}: {error}"
         );
     }
@@ -1424,7 +1427,7 @@ async fn a_completion_over_ten_thousand_parts_is_never_built() {
         .complete(&upload(), [0; 32], 1)
         .await
         .unwrap_err();
-    assert!(matches!(error, StoreError::PartsChanged), "{error}");
+    assert!(matches!(error, StoreError::PartsChanged { .. }), "{error}");
 }
 
 // ---------------------------------------------------------------------------------------------

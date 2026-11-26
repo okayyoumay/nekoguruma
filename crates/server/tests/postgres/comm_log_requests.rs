@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::SinkExt;
 use server::comm_log_requests::Settings;
+use server::hub::OUTBOUND_CAPACITY;
 use shared_proto::ServerMessage;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -432,6 +433,8 @@ async fn an_agent_with_a_backlog_does_not_keep_another_agents_row_from_the_first
     r.requests(&busy_job, 250).await;
     let other_job = r.job(&other_id).await;
     r.request(&other_job, "requested", 0).await;
+    // No pass that finished before this count can have sent the busy agent anything.
+    let before = r.passes.load(Ordering::Relaxed);
     let mut busy = r.connect().await;
     let mut other = open(r.u.s.addr, &other_token).await;
     // Two passes: one has started after both connected. At 100 rows a pass, an agent served in
@@ -439,7 +442,10 @@ async fn an_agent_with_a_backlog_does_not_keep_another_agents_row_from_the_first
     r.passes(2).await;
     assert_eq!(command(&mut other).await.0, other_job);
     r.until_row(&other_job, "requested|-|true|false").await;
-    // The busy agent's rows go out a queue's worth at a time, never more than a pass sent.
+    // The busy agent's rows go out a queue's worth at a time, never more than a pass sent. The
+    // connection's writer drains its queue into the socket although the test reads nothing, so
+    // every pass may send another queue's worth: the bound counts the passes that ran, plus the
+    // one that may have stamped its rows and not yet been counted.
     let sent: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM comm_log_requests WHERE job_id = $1::uuid AND sent_at IS NOT NULL",
     )
@@ -447,7 +453,13 @@ async fn an_agent_with_a_backlog_does_not_keep_another_agents_row_from_the_first
     .fetch_one(&r.u.w.pool)
     .await
     .unwrap();
-    assert!(sent > 0 && sent <= 16 * 4, "{sent} rows stamped");
+    let ran = r.passes.load(Ordering::Relaxed) - before + 1;
+    let queue = i64::try_from(OUTBOUND_CAPACITY).unwrap();
+    let bound = queue * i64::try_from(ran).unwrap();
+    assert!(
+        sent > 0 && sent <= bound,
+        "{sent} rows stamped in at most {ran} passes"
+    );
     let _ = command(&mut busy).await;
     r.finish().await;
 }

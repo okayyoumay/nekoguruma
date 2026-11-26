@@ -74,6 +74,7 @@ impl Client {
         let io_error = |error: io::Error| StoreError::Io {
             op,
             kind: error.kind(),
+            source: Some(Box::new(error)),
         };
         let mut target = url.path().to_owned();
         if let Some(query) = url.query() {
@@ -94,13 +95,13 @@ impl Client {
         if has_body {
             request = request.header(CONTENT_LENGTH, body.len());
         }
-        let request =
-            request
-                .body(http_body_util::Full::new(body))
-                .map_err(|_| StoreError::Io {
-                    op,
-                    kind: io::ErrorKind::InvalidInput,
-                })?;
+        let request = request
+            .body(http_body_util::Full::new(body))
+            .map_err(|error| StoreError::Io {
+                op,
+                kind: io::ErrorKind::InvalidInput,
+                source: Some(Box::new(error)),
+            })?;
         let stream = TcpStream::connect(self.addr).await.map_err(io_error)?;
         let _ = stream.set_nodelay(true);
         let stream = ngr_pinned_tls::connect(&self.pin, stream)
@@ -112,6 +113,7 @@ impl Client {
                 .map_err(|error| StoreError::Io {
                     op,
                     kind: hyper_kind(&error),
+                    source: Some(Box::new(error)),
                 })?;
         let driver = EndOnDrop(tokio::spawn(async move {
             let _ = connection.await;
@@ -122,6 +124,7 @@ impl Client {
             .map_err(|error| StoreError::Io {
                 op,
                 kind: hyper_kind(&error),
+                source: Some(Box::new(error)),
             })?;
         let (head, body) = response.into_parts();
         Ok(Response {
@@ -181,6 +184,7 @@ impl Response {
             let frame = frame.map_err(|error| StoreError::Io {
                 op: self.op,
                 kind: hyper_kind(&error),
+                source: Some(Box::new(error)),
             })?;
             if let Ok(chunk) = frame.into_data() {
                 if data.len() + chunk.len() > limit {

@@ -27,8 +27,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use shared_proto::{
-    AgentId, AgentMessage, CLOSE_CODE_REPLACED, CLOSE_CODES, JobId, MAX_CONTROL_MESSAGE_LEN,
-    ServerMessage,
+    AgentId, AgentMessage, CLOSE_CODE_REPLACED, CLOSE_CODES, ControlError, JobId,
+    MAX_CONTROL_MESSAGE_LEN, ServerMessage,
 };
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -141,14 +141,22 @@ pub struct Delivery {
 }
 
 /// Why [`Hub::send_job_command`] or [`Hub::send_log_upload_command`] queued nothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error)]
 pub enum SendError {
     /// The agent has no current connection, or it is closing.
+    #[error("the agent has no current connection")]
     NotConnected,
     /// [`OUTBOUND_CAPACITY`] frames already wait on the connection.
+    #[error("the connection's outbound queue is full")]
     Busy,
     /// The frame is over the control message limit (128 KiB); the connection is untouched.
-    TooLarge,
+    /// `source` is the encoder's error when the encoder refused the message, and `None` when the
+    /// hub judged the frame's length.
+    #[error("the frame is over the control message limit")]
+    TooLarge {
+        #[source]
+        source: Option<ControlError>,
+    },
 }
 
 /// A message an agent sent that is not a heartbeat, as the inbox gives it.
@@ -298,11 +306,11 @@ impl Hub {
         }
         .encode()
         // Serializing two strings fails only by the size limit; any other error is refused alike.
-        .map_err(|_| SendError::TooLarge)?;
+        .map_err(|e| SendError::TooLarge { source: Some(e) })?;
         if frame.len() + WIDEST_COMMAND_ID_LEN.saturating_sub(command_id.len())
             > MAX_CONTROL_MESSAGE_LEN
         {
-            return Err(SendError::TooLarge);
+            return Err(SendError::TooLarge { source: None });
         }
         let connection = self.queue_frame(agent, frame)?;
         Ok(Delivery {
@@ -328,7 +336,7 @@ impl Hub {
             generation,
         }
         .encode()
-        .map_err(|_| SendError::TooLarge)?;
+        .map_err(|e| SendError::TooLarge { source: Some(e) })?;
         self.queue_frame(agent, frame)
     }
 
@@ -560,19 +568,19 @@ mod tests {
         // Nobody is connected: the size is judged first. The first call has the ID `c-1`, and
         // one byte more is too large although that frame would fit with this ID.
         assert!(frame_len(&format!("{fits}xxxxx")) <= MAX_CONTROL_MESSAGE_LEN);
-        assert_eq!(
+        assert!(matches!(
             hub.send_job_command(&a, format!("{fits}x")),
-            Err(SendError::TooLarge)
-        );
-        assert_eq!(
+            Err(SendError::TooLarge { .. })
+        ));
+        assert!(matches!(
             hub.send_job_command(&a, fits.clone()),
             Err(SendError::NotConnected)
-        );
+        ));
         let mut reg = hub.register(&a).unwrap();
-        assert_eq!(
+        assert!(matches!(
             hub.send_job_command(&a, format!("{fits}x")),
-            Err(SendError::TooLarge)
-        );
+            Err(SendError::TooLarge { .. })
+        ));
         assert!(
             reg.outbound.try_recv().is_err(),
             "the connection is untouched"
@@ -589,33 +597,33 @@ mod tests {
     fn nothing_is_queued_for_an_absent_or_closing_connection() {
         let hub = Hub::new();
         let a = agent("a");
-        assert_eq!(
+        assert!(matches!(
             hub.send_job_command(&a, "j".to_owned()),
             Err(SendError::NotConnected)
-        );
+        ));
         // The close instruction has been taken.
         let reg = hub.register(&a).unwrap();
         assert!(hub.close_agent(&a, 4002));
-        assert_eq!(
+        assert!(matches!(
             hub.send_job_command(&a, "j".to_owned()),
             Err(SendError::NotConnected)
-        );
+        ));
         drop(reg);
         // The task's receiver is gone.
         let reg = hub.register(&a).unwrap();
         let Registration { outbound, .. } = reg;
         drop(outbound);
-        assert_eq!(
+        assert!(matches!(
             hub.send_job_command(&a, "j".to_owned()),
             Err(SendError::NotConnected)
-        );
+        ));
         // The stop has begun.
         let _reg = hub.register(&agent("b")).unwrap();
         let _tasks = hub.begin_stop();
-        assert_eq!(
+        assert!(matches!(
             hub.send_job_command(&agent("b"), "j".to_owned()),
             Err(SendError::NotConnected)
-        );
+        ));
     }
 
     // D4
@@ -627,10 +635,10 @@ mod tests {
         for _ in 0..OUTBOUND_CAPACITY {
             hub.send_job_command(&a, "j".to_owned()).unwrap();
         }
-        assert_eq!(
+        assert!(matches!(
             hub.send_job_command(&a, "j".to_owned()),
             Err(SendError::Busy)
-        );
+        ));
         reg.outbound.try_recv().unwrap();
         hub.send_job_command(&a, "j".to_owned()).unwrap();
     }
@@ -640,13 +648,13 @@ mod tests {
         let hub = Hub::new();
         let a = agent("a");
         let job = JobId("0194f0a2-7c3e-7d11-8a52-3f6f9b1c2d4f".to_owned());
-        assert_eq!(
+        assert!(matches!(
             hub.send_log_upload_command(&a, &job, 3),
             Err(SendError::NotConnected)
-        );
+        ));
         let mut reg = hub.register(&a).unwrap();
         hub.send_job_command(&a, "j".to_owned()).unwrap();
-        assert_eq!(hub.send_log_upload_command(&a, &job, 3), Ok(reg.id));
+        assert_eq!(hub.send_log_upload_command(&a, &job, 3).unwrap(), reg.id);
         let first = reg.outbound.try_recv().unwrap();
         assert!(matches!(
             ServerMessage::decode(&first),
@@ -664,17 +672,17 @@ mod tests {
         for _ in 0..OUTBOUND_CAPACITY {
             hub.send_log_upload_command(&a, &job, 3).unwrap();
         }
-        assert_eq!(
+        assert!(matches!(
             hub.send_log_upload_command(&a, &job, 3),
             Err(SendError::Busy)
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             hub.send_job_command(&a, "j".to_owned()),
             Err(SendError::Busy)
-        );
+        ));
         // A newer connection is the one that is named.
         let newer = hub.register(&a).unwrap();
-        assert_eq!(hub.send_log_upload_command(&a, &job, 3), Ok(newer.id));
+        assert_eq!(hub.send_log_upload_command(&a, &job, 3).unwrap(), newer.id);
     }
 
     #[test]
@@ -697,7 +705,7 @@ mod tests {
                 calls.push((item.0.0.clone(), item.1));
                 match (item.0.0.as_str(), item.1) {
                     ("a", 1) => Err(SendError::Busy),
-                    ("b", 2) => Err(SendError::TooLarge),
+                    ("b", 2) => Err(SendError::TooLarge { source: None }),
                     ("c", 1) => Err(SendError::NotConnected),
                     _ => Ok(item.1),
                 }
@@ -710,12 +718,15 @@ mod tests {
             .into_iter()
             .map(|(item, result)| (item.0.0, item.1, result))
             .collect();
-        assert_eq!(
-            kinds,
-            [
-                ("b".to_owned(), 1, Ok(1)),
-                ("b".to_owned(), 2, Err(SendError::TooLarge)),
-            ]
+        assert!(
+            matches!(
+                kinds.as_slice(),
+                [
+                    (b1, 1, Ok(1)),
+                    (b2, 2, Err(SendError::TooLarge { .. })),
+                ] if b1 == "b" && b2 == "b"
+            ),
+            "{kinds:?}"
         );
         let none = Hub::send_in_order(
             vec![item("a", 1)],
@@ -737,10 +748,10 @@ mod tests {
         assert_eq!(first.command_id, "c-1");
         assert_eq!(first.connection, reg_a.id);
         // A failed call consumes its number.
-        assert_eq!(
+        assert!(matches!(
             hub.send_job_command(&agent("nobody"), "x".to_owned()),
             Err(SendError::NotConnected)
-        );
+        ));
         let second = hub.send_job_command(&b, "two".to_owned()).unwrap();
         assert_eq!(second.command_id, "c-3", "the number is hub-wide");
         assert_eq!(second.connection, reg_b.id);

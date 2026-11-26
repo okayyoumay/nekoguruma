@@ -335,13 +335,13 @@ fn settle(result: &Result<(), StoreError>) -> Outcome {
             | StoreError::MissingPart { .. }
             | StoreError::PartTooSmall { .. }
             | StoreError::PartsLengthMismatch { .. }
-            | StoreError::PartsChanged
+            | StoreError::PartsChanged { .. }
             | StoreError::ObjectTooLarge,
         ) => Outcome::Open,
         Err(
             StoreError::HashMismatch | StoreError::LengthMismatch { .. } | StoreError::NotFound,
         ) => Outcome::Failed,
-        Err(StoreError::Random) => Outcome::Internal,
+        Err(StoreError::Random(_)) => Outcome::Internal,
         Err(_) => Outcome::StoreUnavailable,
     }
 }
@@ -845,7 +845,7 @@ fn store_failure(u: &Uploads, error: &StoreError) -> Response {
 /// the data channel and the document store.
 pub(crate) fn store_error_response(error: &StoreError) -> Response {
     match error {
-        StoreError::Random => problem(StatusCode::INTERNAL_SERVER_ERROR, "The request failed"),
+        StoreError::Random(_) => problem(StatusCode::INTERNAL_SERVER_ERROR, "The request failed"),
         _ => problem(
             StatusCode::SERVICE_UNAVAILABLE,
             "The object store is unavailable",
@@ -1977,6 +1977,7 @@ mod tests {
         let io = || StoreError::Io {
             op: "t",
             kind: ErrorKind::Other,
+            source: None,
         };
         assert_eq!(settle(&Ok(())), Outcome::Finished);
         for open in [
@@ -1984,7 +1985,7 @@ mod tests {
             StoreError::MissingPart { part: 1 },
             StoreError::PartTooSmall { part: 1 },
             StoreError::PartsLengthMismatch { stored: 1 },
-            StoreError::PartsChanged,
+            StoreError::PartsChanged { source: None },
             StoreError::ObjectTooLarge,
         ] {
             assert_eq!(settle(&Err(open)), Outcome::Open);
@@ -1996,10 +1997,18 @@ mod tests {
         ] {
             assert_eq!(settle(&Err(failed)), Outcome::Failed);
         }
-        assert_eq!(settle(&Err(StoreError::Random)), Outcome::Internal);
+        assert_eq!(
+            settle(&Err(StoreError::Random(shared_crypto::RandomError::new(
+                "t"
+            )))),
+            Outcome::Internal
+        );
         for none in [
             io(),
-            StoreError::Refused { op: "t" },
+            StoreError::Refused {
+                op: "t",
+                source: None,
+            },
             StoreError::Untrusted {
                 op: "t",
                 refused: ngr_pinned_tls::Refused::Certificate,
@@ -2007,6 +2016,7 @@ mod tests {
             StoreError::Server {
                 op: "t",
                 status: 500,
+                source: None,
             },
             StoreError::AlreadyFinished,
         ] {

@@ -11,13 +11,14 @@ use shared_crypto::Zeroizing;
 use crate::fs_guard::{self, FileFault, LinkFault};
 
 /// Why a file could not be read or created.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub(super) enum Fault {
     /// The file is unsafe or an operation on it failed ([`fs_guard::open_private`], a read, the
     /// link).
     File(FileFault),
-    /// The operating system has no randomness for the temporary file's name or the value.
-    Random,
+    /// The operating system has no randomness for the temporary file's name or the value; the
+    /// source is the generator's error.
+    Random(Box<dyn std::error::Error + Send + Sync>),
     /// The file is longer than the bound the caller gave.
     TooLong,
 }
@@ -57,7 +58,7 @@ pub(super) fn read_or_create<E: From<Fault>>(
             let value = make()?;
             created = match fs_guard::create_by_link(dir, path, tmp_prefix, &value) {
                 Ok(created) => created,
-                Err(LinkFault::Random) => return Err(Fault::Random.into()),
+                Err(LinkFault::Random(source)) => return Err(Fault::Random(source.into()).into()),
                 Err(LinkFault::Io { op, error }) => {
                     return Err(Fault::File(FileFault::Io {
                         op,

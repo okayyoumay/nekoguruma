@@ -142,8 +142,9 @@ pub enum PasswordError {
     TooShort,
     #[error("the password is longer than 1024 bytes")]
     TooLong,
+    /// The source is the UTF-8 decoder's error.
     #[error("the password is not valid UTF-8")]
-    NotUtf8,
+    NotUtf8(#[source] std::str::Utf8Error),
     #[error("the password starts with a byte order mark")]
     ByteOrderMark,
     #[error("the input has more than one line")]
@@ -177,7 +178,7 @@ pub fn check_password(raw: &[u8]) -> Result<String, PasswordError> {
     if raw.len() > MAX_PASSWORD_BYTES + 2 {
         return Err(PasswordError::TooLong);
     }
-    let text = std::str::from_utf8(raw).map_err(|_| PasswordError::NotUtf8)?;
+    let text = std::str::from_utf8(raw).map_err(PasswordError::NotUtf8)?;
     if text.starts_with('\u{feff}') {
         return Err(PasswordError::ByteOrderMark);
     }
@@ -220,10 +221,12 @@ pub enum Verdict {
 pub enum HashError {
     #[error("operating-system randomness is unavailable")]
     Random(#[from] RandomError),
+    /// The source is the hasher's error.
     #[error("the password could not be hashed")]
-    Hash,
+    Hash(#[source] argon2::password_hash::Error),
+    /// The source is the error of the permit wait or of the blocking task.
     #[error("the hashing task failed")]
-    Task,
+    Task(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
 /// Hashes `password` with Argon2id at the policy's parameters and a new random salt; the result
@@ -231,10 +234,10 @@ pub enum HashError {
 /// blocking thread ([`Hasher`]).
 pub fn hash_password(password: &str) -> Result<String, HashError> {
     let seed = random_32()?;
-    let salt = SaltString::encode_b64(&seed[..16]).map_err(|_| HashError::Hash)?;
+    let salt = SaltString::encode_b64(&seed[..16]).map_err(HashError::Hash)?;
     let hash = argon2()
         .hash_password(password.as_bytes(), &salt)
-        .map_err(|_| HashError::Hash)?;
+        .map_err(HashError::Hash)?;
     Ok(hash.to_string())
 }
 
@@ -324,13 +327,13 @@ impl Hasher {
             let _counted = Waiting::enter(&self.waiting);
             self.permit.clone().acquire_owned().await
         }
-        .map_err(|_| HashError::Task)?;
+        .map_err(|error| HashError::Task(Box::new(error)))?;
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             work()
         })
         .await
-        .map_err(|_| HashError::Task)
+        .map_err(|error| HashError::Task(Box::new(error)))
     }
 
     /// [`hash_password`], waiting for the permit.
@@ -751,7 +754,7 @@ mod tests {
         let mut broken = a.clone().into_bytes();
         broken.extend_from_slice(&[0xff, 0xfe]);
         broken.extend_from_slice(b.as_bytes());
-        assert_eq!(pw(&broken), Err(PasswordError::NotUtf8));
+        assert!(matches!(pw(&broken), Err(PasswordError::NotUtf8(_))));
         assert_eq!(
             pw(format!("\u{feff}{a}{b}").as_bytes()),
             Err(PasswordError::ByteOrderMark)

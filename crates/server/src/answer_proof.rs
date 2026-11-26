@@ -39,19 +39,25 @@ const LOG_EVERY: Duration = Duration::from_secs(60);
 const NONCE_TEXT: usize = 44;
 
 /// Why a request's proof cannot be asked for: each is a 400 that consumes nothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error)]
 pub(crate) enum AskError {
     /// More than one `Ngr-Nonce` header, or one that is not the canonical padded base64 of 32
     /// bytes.
+    #[error("invalid Ngr-Nonce header")]
     Nonce,
+    /// An `Ngr-Nonce` header whose value is not visible ASCII; the source is the header
+    /// parser's error.
+    #[error("invalid Ngr-Nonce header")]
+    NonceText(#[source] axum::http::header::ToStrError),
     /// A request target the transcript cannot take (`answer::check_target`).
+    #[error("request target the answer proof cannot take")]
     Target,
 }
 
 impl AskError {
-    fn title(self) -> &'static str {
+    fn title(&self) -> &'static str {
         match self {
-            AskError::Nonce => "Invalid Ngr-Nonce header",
+            AskError::Nonce | AskError::NonceText(_) => "Invalid Ngr-Nonce header",
             AskError::Target => BAD_TARGET,
         }
     }
@@ -59,6 +65,10 @@ impl AskError {
 
 impl IntoResponse for AskError {
     fn into_response(self) -> Response {
+        // The answer names no cause; the refusing side records it.
+        if let AskError::NonceText(source) = &self {
+            tracing::debug!(error = %source, "the Ngr-Nonce header was refused");
+        }
         Problem::new(StatusCode::BAD_REQUEST, self.title()).into_response()
     }
 }
@@ -83,7 +93,7 @@ impl Asked {
         if values.next().is_some() {
             return Err(AskError::Nonce);
         }
-        let text = value.to_str().map_err(|_| AskError::Nonce)?;
+        let text = value.to_str().map_err(AskError::NonceText)?;
         let nonce = decode_fixed(text, NONCE_TEXT).ok_or(AskError::Nonce)?;
         Asked::with_nonce(parts, nonce).map(Some)
     }
@@ -164,12 +174,12 @@ impl Prover {
             status,
             body_digest(answer_bytes),
         )
-        .map_err(|_| self.failed("the transcript could not be built"))?;
+        .map_err(|e| self.failed("the transcript could not be built", &e))?;
         let signature = self
             .key
             .prove_answer(&transcript)
             .await
-            .map_err(|_| self.failed("the signature could not be made"))?;
+            .map_err(|e| self.failed("the signature could not be made", &e))?;
         Ok(
             HeaderValue::from_str(&STANDARD.encode(signature.to_bytes()))
                 .expect("base64 is a header value"),
@@ -191,8 +201,13 @@ impl Prover {
             return response;
         };
         let (mut parts, body) = response.into_parts();
-        let Ok(bytes) = axum::body::to_bytes(body, MAX_ANSWER_LEN).await else {
-            return self.failed("the answer could not be read").into_response();
+        let bytes = match axum::body::to_bytes(body, MAX_ANSWER_LEN).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                return self
+                    .failed("the answer could not be read", &e)
+                    .into_response();
+            }
         };
         let sent: &[u8] = if asked.method == "HEAD" { &[] } else { &bytes };
         match self
@@ -213,9 +228,9 @@ impl Prover {
     }
 
     /// Logs a failed proof through the one gate and says it as a value.
-    fn failed(&self, what: &'static str) -> Unprovable {
+    fn failed(&self, what: &'static str, cause: &dyn std::error::Error) -> Unprovable {
         if may_log(&self.gate, now(), LOG_EVERY) {
-            tracing::error!(what, "an answer could not be proved");
+            tracing::error!(what, error = %cause, "an answer could not be proved");
         }
         Unprovable
     }
@@ -285,27 +300,42 @@ mod tests {
             ("non-zero padding bits", vec![loose.as_str()]),
             ("two values", vec![good.as_str(), good.as_str()]),
         ] {
-            assert_eq!(
-                Asked::from_header(&parts("GET", "/x", &nonces)),
-                Err(AskError::Nonce),
+            assert!(
+                matches!(
+                    Asked::from_header(&parts("GET", "/x", &nonces)),
+                    Err(AskError::Nonce)
+                ),
                 "{name}"
             );
         }
     }
 
     #[test]
+    fn a_nonce_that_is_not_ascii_keeps_the_parser_error_as_its_source() {
+        let mut p = parts("GET", "/x", &[]);
+        p.headers.insert(
+            NONCE_HEADER,
+            HeaderValue::from_bytes(&[0xe9]).expect("a byte above 0x7f is a header value"),
+        );
+        let error = Asked::from_header(&p).unwrap_err();
+        assert!(matches!(error, AskError::NonceText(_)));
+        assert!(std::error::Error::source(&error).is_some());
+        assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
     fn a_target_the_transcript_cannot_take_is_an_error_after_the_nonce() {
         let good = nonce_text(fresh());
         let long = format!("/{}", "a".repeat(answer::MAX_TARGET_LEN));
-        assert_eq!(
+        assert!(matches!(
             Asked::from_header(&parts("GET", &long, &[&good])),
             Err(AskError::Target)
-        );
+        ));
         // A malformed nonce is the nonce's error even when the target is bad too.
-        assert_eq!(
+        assert!(matches!(
             Asked::from_header(&parts("GET", &long, &["x"])),
             Err(AskError::Nonce)
-        );
+        ));
     }
 
     #[tokio::test]

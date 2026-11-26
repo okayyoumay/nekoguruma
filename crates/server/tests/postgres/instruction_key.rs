@@ -160,7 +160,7 @@ async fn a_file_that_is_not_a_key_refuses_the_start_and_is_not_overwritten() {
     }
     assert!(matches!(
         refused(start(&pg, &path).await),
-        KeyError::NotAKey
+        KeyError::NotAKey { .. }
     ));
     assert_eq!(std::fs::read(&path).unwrap(), b"not a key");
     assert_eq!(

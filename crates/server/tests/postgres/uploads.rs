@@ -115,19 +115,23 @@ impl Fail {
             Fail::Io => StoreError::Io {
                 op: "test",
                 kind: io::ErrorKind::Other,
+                source: None,
             },
-            Fail::Random => StoreError::Random,
+            Fail::Random => StoreError::Random(shared_crypto::RandomError::new("test")),
             Fail::NotFound => StoreError::NotFound,
             Fail::AlreadyFinished => StoreError::AlreadyFinished,
             Fail::NoParts => StoreError::NoParts,
             Fail::MissingPart => StoreError::MissingPart { part: 2 },
             Fail::PartTooSmall => StoreError::PartTooSmall { part: 1 },
             Fail::PartsLengthMismatch => StoreError::PartsLengthMismatch { stored: 1 },
-            Fail::PartsChanged => StoreError::PartsChanged,
+            Fail::PartsChanged => StoreError::PartsChanged { source: None },
             Fail::ObjectTooLarge => StoreError::ObjectTooLarge,
             Fail::HashMismatch => StoreError::HashMismatch,
             Fail::LengthMismatch => StoreError::LengthMismatch { stored: 1 },
-            Fail::Refused => StoreError::Refused { op: "test" },
+            Fail::Refused => StoreError::Refused {
+                op: "test",
+                source: None,
+            },
         }
     }
 }

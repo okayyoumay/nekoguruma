@@ -74,7 +74,7 @@ impl ObjectKey {
 
     /// A new random key (the generator is the operating system's).
     pub(crate) fn generate() -> Result<ObjectKey, StoreError> {
-        let random = shared_crypto::random_32().map_err(|_| StoreError::Random)?;
+        let random = shared_crypto::random_32().map_err(StoreError::Random)?;
         let mut b = [0u8; 16];
         b.copy_from_slice(&random[..16]);
         b[6] = b[6] & 0x0f | 0x40;
@@ -174,18 +174,33 @@ pub enum StoreError {
     MissingPart { part: u16 },
     #[error("part {part} is smaller than the minimum and is not the last")]
     PartTooSmall { part: u16 },
+    /// `source` is the conversion error when a part's position did not fit a part number.
     #[error("the parts changed while the upload was being completed")]
-    PartsChanged,
+    PartsChanged {
+        #[source]
+        source: Option<std::num::TryFromIntError>,
+    },
     #[error("the object would be larger than the size limit")]
     ObjectTooLarge,
     /// The object server turned the request down: the credentials are not accepted, or the
-    /// request is not allowed.
+    /// request is not allowed. `source` is the error behind a refusal made before the request
+    /// was sent (a URL that cannot be built), and `None` for a refusal the server answered.
     #[error("the object server refused to {op}")]
-    Refused { op: &'static str },
+    Refused {
+        op: &'static str,
+        #[source]
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    },
     /// The object server answered with a status the operation does not expect, or with an answer
-    /// that could not be read.
+    /// that could not be read. `source` is the error that made the answer unreadable, and `None`
+    /// when the status alone is the failure.
     #[error("the object server answered {status} to {op}")]
-    Server { op: &'static str, status: u16 },
+    Server {
+        op: &'static str,
+        status: u16,
+        #[source]
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    },
     /// The peer at the object server's port did not present the object server's certificate (or
     /// not its handshake), so nothing was sent to it: the request, with its signed URL, is written
     /// only after the handshake accepted the peer (ADR-505).
@@ -196,10 +211,14 @@ pub enum StoreError {
     Unavailable,
     #[error("another process uses the object store's directory")]
     InUse,
+    /// `source` is the error behind `kind` when there is one (an I/O error, a timeout, a failed
+    /// task).
     #[error("cannot {op} in the object store: {kind}")]
     Io {
         op: &'static str,
         kind: io::ErrorKind,
+        #[source]
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
     },
     #[error("the object store's directory must be an absolute path")]
     DirectoryNotAbsolute,
@@ -216,8 +235,9 @@ pub enum StoreError {
     DirectoryWritable,
     #[error("an object store file is not a regular file (a symbolic link is refused)")]
     NotRegularFile,
+    /// The source is the generator's error.
     #[error("operating-system randomness is unavailable")]
-    Random,
+    Random(#[source] shared_crypto::RandomError),
 }
 
 /// The ID the object server gave a multipart upload. It is a bearer of access to the upload, so

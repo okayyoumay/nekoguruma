@@ -68,9 +68,15 @@ pub enum CredentialsError {
         "the object server's {which} file is not what the server writes; it is never rewritten: \
          fix or delete it (the object server's data may then refuse new keys)"
     )]
-    Corrupt { which: &'static str },
+    Corrupt {
+        which: &'static str,
+        /// The UTF-8 decoder's error when the file's bytes are not text.
+        #[source]
+        source: Option<std::str::Utf8Error>,
+    },
+    /// The source is the generator's error.
     #[error("operating-system randomness is unavailable")]
-    Random,
+    Random(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
 /// The access key and the secret key. `Debug` shows neither; the secret is zeroed when dropped.
@@ -172,7 +178,7 @@ fn file_error(fault: FileFault) -> CredentialsError {
 
 /// `bytes` random bytes as hexadecimal text, upper case when `upper`.
 fn generate(bytes: usize, upper: bool) -> Result<Zeroizing<Vec<u8>>, Fault> {
-    let random = Zeroizing::new(random_32().map_err(|_| Fault::Random)?);
+    let random = Zeroizing::new(random_32().map_err(|e| Fault::Random(e.into()))?);
     let mut text = Zeroizing::new(Vec::with_capacity(bytes * 2));
     for b in random.iter().take(bytes) {
         text.extend_from_slice(
@@ -205,16 +211,26 @@ fn load_or_create_one(
     )
     .map_err(|fault| match fault {
         Fault::File(fault) => file_error(fault),
-        Fault::Random => CredentialsError::Random,
-        Fault::TooLong => CredentialsError::Corrupt { which },
+        Fault::Random(source) => CredentialsError::Random(source),
+        Fault::TooLong => CredentialsError::Corrupt {
+            which,
+            source: None,
+        },
     })?;
     let Loaded { mut bytes, created } = loaded;
     let valid = bytes.len() == len && bytes.iter().all(|&c| allowed(c));
     if !valid {
-        return Err(CredentialsError::Corrupt { which });
+        return Err(CredentialsError::Corrupt {
+            which,
+            source: None,
+        });
     }
-    let text = String::from_utf8(std::mem::take(&mut *bytes))
-        .map_err(|_| CredentialsError::Corrupt { which })?;
+    let text = String::from_utf8(std::mem::take(&mut *bytes)).map_err(|source| {
+        CredentialsError::Corrupt {
+            which,
+            source: Some(source.utf8_error()),
+        }
+    })?;
     Ok((Zeroizing::new(text), created))
 }
 
@@ -314,7 +330,8 @@ mod tests {
                 matches!(
                     error,
                     CredentialsError::Corrupt {
-                        which: "secret key"
+                        which: "secret key",
+                        ..
                     }
                 ),
                 "{name}: {error}"
@@ -332,7 +349,8 @@ mod tests {
                 matches!(
                     error,
                     CredentialsError::Corrupt {
-                        which: "access key"
+                        which: "access key",
+                        ..
                     }
                 ),
                 "{name}: {error}"

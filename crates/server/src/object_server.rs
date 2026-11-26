@@ -549,7 +549,7 @@ fn data_dir_store_error(error: &StoreError) -> ObjectServerError {
             ObjectServerError::Config(ConfigError::ObjectServerPath)
         }
         StoreError::NotRegularFile => ObjectServerError::DataDirFileNotRegular,
-        StoreError::Io { op, kind } => ObjectServerError::DataDirIo { op, kind },
+        StoreError::Io { op, kind, .. } => ObjectServerError::DataDirIo { op, kind },
         _ => ObjectServerError::DataDirIo {
             op: "use",
             kind: io::ErrorKind::Other,
@@ -799,12 +799,12 @@ async fn probe(port: u16, pin: &CertPin) -> Result<(), String> {
 /// The status code of an HTTP/1 status line, or why there is none.
 fn parse_status(head: &[u8]) -> Result<u16, String> {
     let line = head.split(|&b| b == b'\n').next().unwrap_or_default();
-    let text = std::str::from_utf8(line).map_err(|_| "unparseable answer".to_owned())?;
+    let text = std::str::from_utf8(line).map_err(|e| format!("unparseable answer: {e}"))?;
     let mut parts = text.trim_end().splitn(3, ' ');
     match (parts.next(), parts.next()) {
         (Some("HTTP/1.1" | "HTTP/1.0"), Some(code)) if code.len() == 3 => code
             .parse::<u16>()
-            .map_err(|_| "unparseable answer".to_owned()),
+            .map_err(|e| format!("unparseable answer: {e}")),
         _ => Err("unparseable answer".to_owned()),
     }
 }

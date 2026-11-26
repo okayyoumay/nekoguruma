@@ -52,8 +52,16 @@ cheapest way through.
    - a C-ABI function of a mock or the simulator, which returns a status code or `()` across
      the C boundary and has no other place to record the cause;
    - a lock's poison error, which borrows its guard and cannot be stored, where the error type
-     holds no text.
+     holds no text;
+   - an error whose text or value may hold a secret: a refused database URL, whose parse error
+     may repeat the password, or a command-line argument that is not UTF-8, whose error is the
+     argument itself;
+   - a library error with no content, such as a unit `()` error.
    A closure parameter named only to silence the lint (`|_e|`) is not used.
+7. **A value that only selects an outcome may log the cause instead of holding it.** A worker's
+   transmit failure becomes an error event of the D-PDU API, built from a value made in many
+   places. Where the failure is mapped to that value, the worker logs the cause, and the value
+   stays as it was.
 
 ## Consequences
 

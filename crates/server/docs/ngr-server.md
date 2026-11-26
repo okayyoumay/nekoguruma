@@ -235,6 +235,16 @@ readiness probe.
   can leave an orphan, and the next start fails at the port check, naming `object_server.port`.
   A service manager should signal the server alone first: with systemd, `KillMode=mixed` (SIGTERM
   to the server, SIGKILL to what remains in the control group after the stop timeout).
+  `a_killed_server_takes_the_child_with_it` (with the fake object server) and
+  `a_killed_server_takes_the_real_child_with_it` (with RustFS) kill the server and check that the
+  child ends, on Linux and on Windows.
+- **A termination and the data.** On Windows every stop of RustFS is a termination, so RustFS gets
+  no chance to finish anything on its way out. A part it acknowledged before the termination is
+  there after the next start, and the upload completes from it
+  (`storage::an_upload_survives_a_restart_of_the_object_server`, which runs on Windows too). A
+  request in flight at the termination gets no answer; the server treats it as any failed store
+  call, and the agent's uploader sends that part or completion again (5.2, ADR-493), since every
+  store call is safe to repeat.
 - **The stop's tail.** After the child is reaped the server kills its process group (Unix), so a
   grandchild that holds the child's pipes or port does not outlive the stop, and then joins the
   two log forwarders together for at most 1 second, aborting what is left.

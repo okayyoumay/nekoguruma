@@ -1460,7 +1460,7 @@ fn listening(port: u16) -> bool {
     .is_ok()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 fn read_pid(data: &Path, limit: Duration) -> u32 {
     let deadline = Instant::now() + limit;
     loop {
@@ -1475,7 +1475,7 @@ fn read_pid(data: &Path, limit: Duration) -> u32 {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 fn ended_within(pid: u32, limit: Duration) -> bool {
     let deadline = Instant::now() + limit;
     while Instant::now() < deadline {
@@ -1678,8 +1678,9 @@ fn a_stop_signal_during_the_start_ends_the_child_with_the_server() {
     );
 }
 
-/// R5: a server that is killed (SIGKILL) takes the child with it (Linux: parent-death signal).
-#[cfg(target_os = "linux")]
+/// R5: a server that is killed (SIGKILL on Linux, a termination on Windows) takes the child with
+/// it: the parent-death signal on Linux, the kill-on-close job object on Windows.
+#[cfg(any(target_os = "linux", windows))]
 #[test]
 fn a_killed_server_takes_the_child_with_it() {
     let pg = TestPostgres::start();

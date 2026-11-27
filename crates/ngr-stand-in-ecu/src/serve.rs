@@ -19,8 +19,8 @@ pub trait Transport {
     /// The next request and the addressing it arrived with, or `None` when none arrives within
     /// `timeout` (a wait cut short by a signal also gives `None`).
     fn recv(&mut self, timeout: Duration) -> io::Result<Option<(Addressing, Vec<u8>)>>;
-    /// Sends `message` as the answer to a request that arrived with `addressing`.
-    fn send(&mut self, addressing: Addressing, message: &[u8]) -> io::Result<()>;
+    /// Sends `message` as a response, whatever the addressing of the request.
+    fn send(&mut self, message: &[u8]) -> io::Result<()>;
 }
 
 /// Why the ECU could not be created.
@@ -144,9 +144,7 @@ impl Station {
             if !wait_until(received + Duration::from_millis(delay_ms.into()), stop) {
                 return Ok(());
             }
-            transport
-                .send(addressing, &message)
-                .map_err(ServeError::Send)?;
+            transport.send(&message).map_err(ServeError::Send)?;
         }
         Ok(())
     }

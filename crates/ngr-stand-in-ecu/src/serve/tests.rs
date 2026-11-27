@@ -10,7 +10,7 @@ use super::*;
 /// when each message went out.
 struct Fake<'a> {
     requests: VecDeque<(Addressing, Vec<u8>)>,
-    sent: Vec<(Addressing, Vec<u8>)>,
+    sent: Vec<Vec<u8>>,
     saved_at_send: Vec<Option<Session>>,
     state: Option<PathBuf>,
     stop: &'a AtomicBool,
@@ -37,8 +37,8 @@ impl Transport for Fake<'_> {
         Ok(next)
     }
 
-    fn send(&mut self, addressing: Addressing, message: &[u8]) -> io::Result<()> {
-        self.sent.push((addressing, message.to_vec()));
+    fn send(&mut self, message: &[u8]) -> io::Result<()> {
+        self.sent.push(message.to_vec());
         let session = self
             .state
             .as_deref()
@@ -53,7 +53,7 @@ fn serve(
     config: Option<&Path>,
     state: Option<&Path>,
     requests: &[(Addressing, &[u8])],
-) -> Vec<(Addressing, Vec<u8>)> {
+) -> Vec<Vec<u8>> {
     let stop = AtomicBool::new(false);
     let mut station = Station::start(config, state).expect("the station should start");
     let mut fake = Fake::new(&stop, state, requests);
@@ -84,20 +84,20 @@ fn a_physical_read_is_answered_with_the_configured_vin() {
     let sent = serve(Some(&config), None, &[(PHYSICAL, &READ_VIN)]);
     let mut expected = vec![0x62, 0xF1, 0x90];
     expected.extend_from_slice(b"WVWZZZ1KZAW000001");
-    assert_eq!(sent, [(PHYSICAL, expected)]);
+    assert_eq!(sent, [expected]);
 }
 
 #[test]
-fn a_response_goes_out_on_the_addressing_of_its_request() {
+fn a_functional_request_is_answered_like_a_physical_one_but_refusals_are_not_sent() {
     let sent = serve(
         None,
         None,
         &[(FUNCTIONAL, &READ_VIN), (PHYSICAL, &[0x22, 0x00, 0x01])],
     );
-    let addressings: Vec<_> = sent.iter().map(|(a, _)| *a).collect();
-    assert_eq!(addressings, [FUNCTIONAL, PHYSICAL]);
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[0][..3], [0x62, 0xF1, 0x90]);
     // A functional request the ECU has no answer to gets none; the same physical one is refused.
-    assert_eq!(sent[1].1, [0x7F, 0x22, 0x31]);
+    assert_eq!(sent[1], [0x7F, 0x22, 0x31]);
     let sent = serve(None, None, &[(FUNCTIONAL, &[0x22, 0x00, 0x01])]);
     assert!(sent.is_empty(), "{sent:?}");
 }
@@ -189,7 +189,7 @@ fn an_interrupted_flash_write_is_kept_across_a_restart_and_resumes() {
         ],
     );
     assert_eq!(sent.len(), 4);
-    assert_eq!(sent[3].1, [0x76, 0x01]);
+    assert_eq!(sent[3], [0x76, 0x01]);
 
     // The next process takes the ECU from the file (the configuration, which would drop block 2
     // again, is not read), powers it up and finds the transfer where it stopped; the rest of the
@@ -205,7 +205,7 @@ fn an_interrupted_flash_write_is_kept_across_a_restart_and_resumes() {
             (PHYSICAL, &[0x37]),
         ],
     );
-    let responses: Vec<_> = sent.iter().map(|(_, m)| m.as_slice()).collect();
+    let responses: Vec<_> = sent.iter().map(Vec::as_slice).collect();
     // The flash-state record: phase 5 (interrupted), last block 1, 8 bytes received.
     assert_eq!(
         responses[0],
@@ -229,7 +229,7 @@ fn the_state_file_wins_over_the_configuration_named_with_it() {
     serve(None, Some(&state), &[]);
     // The state file wins over the configuration named with it.
     let sent = serve(Some(&other), Some(&state), &[(PHYSICAL, &READ_VIN)]);
-    assert!(sent[0].1.ends_with(b"NGRSIMECU00000001"), "{sent:?}");
+    assert!(sent[0].ends_with(b"NGRSIMECU00000001"), "{sent:?}");
 }
 
 #[test]

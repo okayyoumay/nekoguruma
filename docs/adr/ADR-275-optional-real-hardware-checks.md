@@ -67,9 +67,14 @@ also need a limit that does not depend on each check's author being careful.
    VCI and library without risking an ECU. The front end is the `ngr-stand-in-ecu` binary
    (`crates/ngr-stand-in-ecu`, a library and a binary); `sim-ecu` stays a pure simulator. It uses
    the kernel's ISO-TP sockets (`CAN_ISOTP`), one per address pair (physical: receive on the
-   request ID, send on the response ID; functional: receive on the functional ID, send on the
-   response ID), so the kernel does the segmentation and flow control and the process handles
-   whole UDS messages. The CAN identifiers and their width come from command-line flags, the
+   request ID, send on the response ID; functional: receive on the functional ID only), so the
+   kernel does the segmentation and flow control and the process handles whole UDS messages.
+   Every response goes out on the physical socket: functional addressing is single-frame only
+   (ISO 15765-2 (2024) 8.3.2.4), so a segmented response to a functional request is a physical
+   transfer and the tester sends its flow control to the physical request ID. The kernel cannot
+   restrict the functional socket to single frames, so a segmented functional request is
+   accepted. A transfer the kernel reports as failed does not end the process: it is logged and
+   dropped. The CAN identifiers and their width come from command-line flags, the
    faults only from the `EcuConfig` JSON read at start, and the persistent state from the state
    file `sim-vci` uses (shared code in `sim-ecu`'s `persist` module); it has no runtime control
    channel. A start that loads a state file is the ECU's power-up: the session and security

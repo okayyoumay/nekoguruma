@@ -30,8 +30,8 @@ fn serve(args: &args::Args) -> Result<(), String> {
     use ngr_stand_in_ecu::isotp::{IsoTpTransport, stop_on_signals};
     use ngr_stand_in_ecu::serve::Station;
 
-    let mut station =
-        Station::start(args.config.as_deref(), args.state.as_deref()).map_err(|e| e.to_string())?;
+    // The transport and the signals come first: a start that fails there must leave the state
+    // file as it was, with no new file and no extra power cycle.
     let mut transport = IsoTpTransport::open(&args.interface, &args.ids).map_err(|e| {
         format!(
             "cannot open the ISO-TP sockets on {} (is the can-isotp module loaded and the \
@@ -40,6 +40,8 @@ fn serve(args: &args::Args) -> Result<(), String> {
         )
     })?;
     let stop = stop_on_signals().map_err(|e| format!("cannot install the stop signals: {e}"))?;
+    let mut station =
+        Station::start(args.config.as_deref(), args.state.as_deref()).map_err(|e| e.to_string())?;
     // A script (or a test) that starts the process waits for this line before it sends.
     println!("ngr-stand-in-ecu: serving on {}", args.interface);
     station.run(&mut transport, stop).map_err(|e| e.to_string())

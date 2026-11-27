@@ -299,11 +299,16 @@ the stand-in ECU of the T1 hardware checks (design 13.5, ADR-275). It uses the k
 sockets (`CAN_ISOTP`, the `can-isotp` module), so the kernel segments messages and runs the flow
 control of ISO 15765-2 (2024) clauses 9 and 10 on classical CAN, and the process reads and writes
 whole UDS messages. It opens two sockets on the interface: physical requests (receive on the
-request ID, send on the response ID) and functional requests (receive on the functional ID, send
-on the response ID). A request goes to `SimEcu::exchange` with its addressing; the messages the
-exchange returns (response pending messages, the response, repeated responses) go out on the
-socket the request arrived on, each after its delay, and a response that is `NoResponse` is not
-sent. The sockets use normal addressing and no padding. It builds on every platform, but off
+request ID, send on the response ID) and functional requests (receive on the functional ID only).
+A request goes to `SimEcu::exchange` with its addressing; the messages the exchange returns
+(response pending messages, the response, repeated responses) all go out on the physical socket,
+each after its delay, and a response that is `NoResponse` is not sent. Responses use the physical
+socket for both addressings because functional addressing is single-frame only (ISO 15765-2
+(2024) 8.3.2.4): a segmented response is a physical transfer, and the tester sends its flow
+control to the request ID. The kernel cannot restrict the functional socket to single frames, so
+a segmented functional request is accepted. A transfer the kernel reports as failed (the tester
+stops mid-request or sends bad flow control, or none for a response) is logged to stderr and
+dropped; the server goes on. A request longer than the read buffer is logged and dropped. The sockets use normal addressing and no padding. It builds on every platform, but off
 Linux the binary exits with an error saying it is Linux only.
 
 ```text

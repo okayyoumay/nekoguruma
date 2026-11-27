@@ -1060,14 +1060,21 @@ fn watch_of(rig: &Rig, in_secs: u64) -> (Watched, Arc<AtomicBool>, Arc<AtomicBoo
     );
     let (first_step, started) = mpsc::unbounded_channel();
     let gate = Arc::new(StartGate::new());
-    let hook = first_step_hook(Arc::clone(&gate), first_step);
+    let deadline = rig.clock.now_unix() + in_secs;
+    let hook = first_step_hook(
+        Arc::clone(&gate),
+        first_step,
+        rig.marks.clone(),
+        Arc::clone(&rig.clock),
+        deadline,
+    );
     (
         Watched {
             gate,
             lock_cancel: lock_cancel.clone(),
             job_cancel: job_cancel.clone(),
             started,
-            deadline: rig.clock.now_unix() + in_secs,
+            deadline,
         },
         lock_cancel,
         job_cancel,
@@ -1275,6 +1282,44 @@ fn the_gate_lets_the_first_step_or_the_deadline_win_never_both() {
     assert_eq!(begun_first.begin(), Begin::Go);
     assert!(!begun_first.cut(), "the deadline ignores a job that began");
     assert_eq!(begun_first.begin(), Begin::Expired);
+}
+
+/// The first step judges the deadline itself: a deadline that passed after the supervisor's last
+/// poll and before the first step expires the job, with no first step reported, and the
+/// supervisor's later cut finds nothing left to cut. A first step before the deadline begins.
+#[tokio::test(start_paused = true)]
+async fn the_first_step_after_the_deadline_expires_the_job_before_the_supervisor_polls() {
+    let rig = Rig::new();
+    let deadline = rig.clock.now_unix() + 3;
+    let hook_at = |deadline| {
+        let gate = Arc::new(StartGate::new());
+        let (first_step, started) = mpsc::unbounded_channel();
+        let hook = first_step_hook(
+            Arc::clone(&gate),
+            first_step,
+            rig.marks.clone(),
+            Arc::clone(&rig.clock),
+            deadline,
+        );
+        (gate, started, hook)
+    };
+
+    let (early_gate, mut early_started, early) = hook_at(deadline);
+    let (late_gate, mut late_started, late) = hook_at(deadline);
+    // Under a second before the deadline: the supervisor's poll has nothing to see yet.
+    tokio::time::sleep(Duration::from_millis(2900)).await;
+    assert_eq!(early(), Begin::Go);
+    assert_eq!(early_started.try_recv(), Ok(()));
+    assert!(!early_gate.cut());
+
+    // The deadline passes and the first step comes before the next poll.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(late(), Begin::Expired);
+    assert!(
+        late_started.try_recv().is_err(),
+        "no first step is reported"
+    );
+    assert!(!late_gate.cut(), "the first step already cut the job");
 }
 
 /// A deadline that passes after the shell launched the worker and before the job's first step

@@ -443,11 +443,27 @@ impl StartGate {
     }
 }
 
-/// The hook a run calls at its first step: it asks `gate` whether the job may begin, and reports
-/// the beginning on `first_step`.
-fn first_step_hook(gate: Arc<StartGate>, first_step: mpsc::UnboundedSender<()>) -> FirstStep {
+/// The hook a run calls at its first step: it judges the start `deadline` itself, as the channel
+/// does (the mark and the clock, both in memory, so the job thread does no I/O), and cuts the job
+/// at `gate` when it has passed; otherwise it asks `gate` whether the job may begin. It reports the
+/// beginning on `first_step`. The supervisor's poll of the deadline is only what cancels a wait
+/// that has no first step to judge it.
+fn first_step_hook(
+    gate: Arc<StartGate>,
+    first_step: mpsc::UnboundedSender<()>,
+    marks: IssueMark,
+    clock: Arc<dyn Clock>,
+    deadline: u64,
+) -> FirstStep {
     Box::new(move || {
-        let begin = gate.begin();
+        let begin = if matches!(marks.judge(&*clock, deadline), Verdict::Expired { .. }) {
+            // The result does not matter: a job that was already cut stays cut, and one that
+            // began cannot reach here, since the hook runs once.
+            gate.cut();
+            Begin::Expired
+        } else {
+            gate.begin()
+        };
         if begin == Begin::Go {
             // The job thread does not wait: a send on an unbounded channel does not block.
             let _ = first_step.send(());
@@ -890,7 +906,13 @@ impl Worker {
         let job_cancel = Arc::new(AtomicBool::new(false));
         let (first_step, started) = mpsc::unbounded_channel::<()>();
         let gate = Arc::new(StartGate::new());
-        let first = first_step_hook(Arc::clone(&gate), first_step);
+        let first = first_step_hook(
+            Arc::clone(&gate),
+            first_step,
+            self.parts.marks.clone(),
+            Arc::clone(&self.parts.clock),
+            deadline,
+        );
         let watched = Watched {
             gate,
             lock_cancel: Arc::clone(&lock_cancel),

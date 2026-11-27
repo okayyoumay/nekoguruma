@@ -29,6 +29,7 @@ members = [
     "crates/sim-vci",
     "crates/sim-ecu",
     "crates/ngr-hw-checks",
+    "crates/ngr-stand-in-ecu",
 ]
 
 [workspace.package]

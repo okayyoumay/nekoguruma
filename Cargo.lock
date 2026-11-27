@@ -2114,6 +2114,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ngr-stand-in-ecu"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde_json",
+ "sim-ecu",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "nix"
 version = "0.32.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3240,8 +3251,10 @@ dependencies = [
 name = "sim-ecu"
 version = "0.1.0"
 dependencies = [
+ "postcard",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -3249,7 +3262,6 @@ name = "sim-vci"
 version = "0.1.0"
 dependencies = [
  "j2534-defs",
- "postcard",
  "serde",
  "serde_json",
  "sim-ecu",

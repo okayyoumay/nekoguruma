@@ -26,7 +26,8 @@ Cargo workspace corresponding to the design document `docs/system-architecture.m
 | `ngr-oplog` | The operational log's outputs: `tracing` layers writing JSON Lines to a private file rotated by size, one per process (ADR-348 item 5), and text for stderr, for the agent and the workers | 12.2 |
 | `ngr-pinned-tls` | The client side of TLS to the bundled object server: a handshake that accepts only a leaf certificate with a given SHA-256 pin and checks the handshake signature with its key; (feature `identity`) the object server's key and self-signed certificate, the check that a pair belongs together, and its pin; and (feature `test-server`, which implies `identity`) a TLS server for tests (ADR-505); the one crate whose non-test code depends on rustls | 13.3 |
 | `sim-vci` | cdylib exposing J2534 (mock) | 13.4 |
-| `sim-ecu` | Simulation of UDS responses and flash state transitions | 13.4 |
+| `sim-ecu` | Simulation of UDS responses and flash state transitions, and the configuration and state files of a simulated ECU | 13.4 |
+| `ngr-stand-in-ecu` | The `ngr-stand-in-ecu` binary: serves `sim-ecu` over a Linux SocketCAN interface through the kernel's ISO-TP sockets, the stand-in ECU of the T1 hardware checks | 13.5 |
 | `ngr-hw-checks` | Harness of the optional real-hardware checks: the hardware profile, check declarations and their listing, opening the profile's device through a worker with the module match (ADR-275), the guarded handle for checks and the agent's runner (ADR-333, ADR-334), and the check bodies (the T0 loopback) | 13.5 |
 
 ## License

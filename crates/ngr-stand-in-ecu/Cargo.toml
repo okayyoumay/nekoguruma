@@ -1,0 +1,29 @@
+[package]
+name = "ngr-stand-in-ecu"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "ngr_stand_in_ecu"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ngr-stand-in-ecu"
+path = "src/main.rs"
+
+[dependencies]
+sim-ecu = { workspace = true }
+thiserror = { workspace = true }
+
+# The ISO-TP sockets (`isotp`) and the stop signals are Linux's.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tempfile = "3"
+
+[lints]
+workspace = true

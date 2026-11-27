@@ -137,6 +137,25 @@ jobs:
           # control socket there.
           export XDG_RUNTIME_DIR=$(mktemp -d)
           dbus-run-session -- bash -c 'printf pw | HOME=$KEYRING_HOME XDG_DATA_HOME=$KEYRING_HOME gnome-keyring-daemon --unlock --components=secrets > /dev/null && NGR_TEST_SECRET_SERVICE=1 cargo nextest run -p agent --locked --profile ci --no-tests=fail -E "binary(secret_service)"'
+      # The stand-in ECU of the T1 hardware checks (design 13.5, ADR-275 item 5) on a virtual CAN
+      # interface: the run above skips its tests, which need `NGR_TEST_VCAN=1`, the `vcan` and
+      # `can-isotp` kernel modules and an interface `vcan0`. The modules come with the runner
+      # kernel's extra modules package, installed when it is missing. `--no-tests=fail` makes a
+      # filter that matches nothing an error.
+      - name: Stand-in ECU tests on vcan
+        run: |
+          if ! dpkg -s "linux-modules-extra-$(uname -r)" > /dev/null 2>&1; then
+            # The runner image lists Microsoft's package source, which nothing here installs from
+            # and which sometimes answers 403; a failed source fails the whole update.
+            { sudo grep -lr packages.microsoft.com /etc/apt/sources.list.d || true; } | xargs -r sudo rm -f
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends "linux-modules-extra-$(uname -r)"
+          fi
+          sudo modprobe vcan
+          sudo modprobe can-isotp
+          sudo ip link add dev vcan0 type vcan
+          sudo ip link set up vcan0
+          NGR_TEST_VCAN=1 cargo nextest run -p ngr-stand-in-ecu --locked --profile ci --no-tests=fail -E "binary(vcan)"
       # sim-vci is a cdylib only, which cargo runs no doc tests for.
       - run: cargo test --workspace --locked --exclude sim-vci --doc
 

@@ -72,7 +72,8 @@ also need a limit that does not depend on each check's author being careful.
    whole UDS messages. The CAN identifiers and their width come from command-line flags, the
    faults only from the `EcuConfig` JSON read at start, and the persistent state from the state
    file `sim-vci` uses (shared code in `sim-ecu`'s `persist` module); it has no runtime control
-   channel. The `vcan` test of the front end runs in CI in a step that loads the `vcan` and
+   channel. A start that loads a state file is the ECU's power-up: the session and security
+   state start from their defaults and the power-cycle count rises by one. The `vcan` test of the front end runs in CI in a step that loads the `vcan` and
    `can-isotp` modules (decided 2026-11-27).
 6. **Cleanup on every exit.** The harness registers a teardown step as it acquires each
    resource (power, device, link) and runs the registered steps in reverse order, each at most

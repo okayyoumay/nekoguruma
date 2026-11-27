@@ -280,6 +280,9 @@ A generic mechanism in both D-PDU API and J2534 for hardware-specific commands (
 **IS-MULTIPLE**  
 `ComPrimitiveCtrlData.NumReceiveCycles == -2`: the COP's receive phase collects every matching response from one or more ECUs until the `CP_P2Max` window (restarted after each accepted response) closes — the normal shape for a functionally-addressed request answered by several ECUs (ADR-053). Valid on both `COPT_SENDRECV` and `COPT_STOPCOMM`'s optional final-message receive phase; on `COPT_STOPCOMM` specifically, an additional absolute ceiling (`max(16 × CP_P2Max, 2000ms)`) bounds the total wait against a chatty ECU, since that receive phase is non-cancellable (ADR-087). See **IS-CYCLIC**, **NumReceiveCycles**.
 
+**Job intake** (agent, design 5.3, 5.6, 8.2.6, ADR-511)  
+What a verified job instruction becomes on the agent after the control channel's gate has recorded it: a queue served one job at a time in the order the jobs were taken. For each job it judges the start deadline, checks the instruction's shape, fetches what the instruction names into the **Object cache**, checks the documents it holds against the ones named, the kind against the document and the plan against the plan hash, and then runs the job on its VCI, reporting `running` once the first step begins and the end through the run's outcome. Its own refusals are `failed` with `instructionRejected`; a server that cannot be reached is waited for until the start deadline, which ends the job `expired`. See **Outcome record**, **Received-jobs ledger**.
+
 **Job instruction** (design 11.1, ADR-461)  
 What the server sends an agent to start one job: a postcard body (`shared_proto::JobInstruction`: job ID, ownership generation, agent ID, operator ID, job kind, VCI, VIN, the hashes of the documents, artifact and plan, issue time, start deadline) signed as exact bytes with the **instruction key** and delivered in an envelope (format byte, key fingerprint, signature, payload). The agent verifies the bytes before it parses them and answers a command that fails with a command-level rejection. See **Identification plan**.
 
@@ -365,6 +368,9 @@ The browser session of a **Local user**: the cookie `ngr_session` that `POST /ap
 
 **Outbox** (agent, design 5.3, ADR-478, ADR-479)  
 The agent's durable queue of events for the server, one file per agent ID. Each guaranteed event (`jobState`, `hmiRequest`) gets a `seq` of at least 1, contiguous under the agent ID, inside the synced append, and stays until the server's cumulative `eventAck` covers it; `progress` events are not in it. The server stores events in order by `seq` in `agent_events` (the exact frame text, one row per event) and deduplicates by agent ID and `seq` against a per-agent cursor, sends the `eventAck` after the commit on the connection the event came on, and closes a connection whose event skips a number or repeats a stored number with a different text with 1002 (ADR-479).
+
+**Outcome record** (agent, design 5.3, 5.6, ADR-511)  
+The agent's append-only file of the terminal states the **Job intake** decided, in an owner-only file named after the agent ID in the registration directory beside the **Received-jobs ledger** (`<agent-id>.outcomes.v1`, with its own lock). It holds `ended` (job, ownership generation and terminal state), synced before the state's event is appended to the **Outbox**, and `reported`, written after that append; at its start the intake appends the ends that have no `reported`, so a crash between the two loses no end. See **Job intake**.
 
 ---
 

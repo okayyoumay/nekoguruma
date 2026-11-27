@@ -32,8 +32,9 @@
 //! loop with the control channel's back-off ([`Backoff`]). A stop is dropping the future: the
 //! temporary file is deleted best effort and nothing is reported (the sweep at the next open
 //! takes what this cannot). One fetch runs at a time per [`Fetcher`]; a second request for the
-//! same digest then finds the cache. The job-start wiring (fetch before the run's first step)
-//! belongs to the intake item; nothing in `connect` calls this yet.
+//! same digest then finds the cache. The job intake ([`crate::intake`], ADR-511) calls
+//! [`Fetcher::fetch_all`] before a job's run and [`Fetcher::read_document`] for each document it
+//! runs; `connect` gives it the one `Fetcher` over the open cache.
 //!
 //! No interface here returns bytes that were not hashed against the instruction's hash:
 //! [`Fetcher::read_document`] returns only bytes that matched, and [`Fetched`] names a file that

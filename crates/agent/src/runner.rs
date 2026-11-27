@@ -124,6 +124,8 @@ pub struct Job {
     vci: Option<VciFacts>,
     /// The VCI's margins a hardware profile gives, for the log (ADR-357).
     vci_margins: VciMargins,
+    /// Set from outside to cancel the run, as dropping its future does ([`Job::with_cancel`]).
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 impl Job {
@@ -137,6 +139,7 @@ impl Job {
             comm_log_dir: None,
             vci: None,
             vci_margins: VciMargins::default(),
+            cancel: None,
         })
     }
 
@@ -173,6 +176,15 @@ impl Job {
     /// records which.
     pub fn with_vci_margins(mut self, margins: VciMargins) -> Self {
         self.vci_margins = margins;
+        self
+    }
+
+    /// Gives the job a flag that cancels the run when it is set, as dropping the run's future
+    /// does, but with the future still awaited, so the caller gets the run's result: a run that
+    /// has ended `Ok` before the flag is seen stays `Ok`. The run takes the flag at its next
+    /// interruptible point (ADR-330).
+    pub fn with_cancel(mut self, cancel: Arc<AtomicBool>) -> Self {
+        self.cancel = Some(cancel);
         self
     }
 
@@ -230,6 +242,7 @@ impl From<Program> for Job {
             comm_log_dir: None,
             vci: None,
             vci_margins: VciMargins::default(),
+            cancel: None,
         }
     }
 }
@@ -277,6 +290,9 @@ pub enum JobError {
     },
     #[error("the job was cancelled")]
     Cancelled,
+    /// The job's start deadline passed before its first step (design 5.3): nothing was sent.
+    #[error("the job's start deadline passed before it began")]
+    StartDeadlinePassed,
     /// The program lists more than one target, and this agent opens one link per job
     /// (ADR-325 item 8, ADR-409).
     #[error("the program lists {count} targets; this agent opens one link per job")]
@@ -547,10 +563,20 @@ pub(crate) fn truncated(mut text: String, max: usize) -> String {
 }
 
 /// What a run calls once, on its job thread, after its pre-run checks and before the first
-/// instruction is executed (the point where the job counts as running). It must not wait for
-/// anything: a send on a channel is the intended use. A run refused before that point drops it
-/// without calling it.
-pub type FirstStep = Box<dyn FnOnce() + Send>;
+/// instruction is executed (the point where the job counts as running). It decides whether the
+/// job may begin. It must not wait for anything: a send on a channel is the intended use. A run
+/// refused before that point drops it without calling it.
+pub type FirstStep = Box<dyn FnOnce() -> Begin + Send>;
+
+/// What a [`FirstStep`] decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Begin {
+    /// The job begins.
+    Go,
+    /// The job's start deadline has passed: nothing is sent, and the run ends in
+    /// [`JobError::StartDeadlinePassed`].
+    Expired,
+}
 
 /// What a job does with its journal.
 enum JournalMode {
@@ -1223,11 +1249,12 @@ async fn run_checked<C: WorkerApi>(
         comm_log_dir: _,
         vci: _,
         vci_margins: _,
+        cancel,
     } = job;
     let artifact = artifact.map(|(_, artifact)| artifact);
     let config = config.clone();
 
-    let cancel = CancelOnDrop(Arc::new(AtomicBool::new(false)));
+    let cancel = CancelOnDrop(cancel.unwrap_or_default());
     let cancelled = Arc::clone(&cancel.0);
     let run = on_job_thread(
         comm_log,
@@ -1407,8 +1434,10 @@ fn run_job<C: WorkerApi>(
             let content = content.expect("computed above for a journaled job");
             let mut journal = JobJournal::create(setup, artifact_sha256.as_ref(), &content)?;
             // Everything that can refuse the job is behind us: the next thing is the program.
-            if let Some(first_step) = first_step {
-                first_step();
+            if let Some(first_step) = first_step
+                && first_step() == Begin::Expired
+            {
+                return Err(JobError::StartDeadlinePassed);
             }
             run_on(program, &mut host, limits, cancelled, Some(&mut journal))
         }
@@ -6220,6 +6249,7 @@ def main():
             Box::new(move || {
                 count.fetch_add(1, Ordering::SeqCst);
                 calls.lock().unwrap().push("first_step");
+                Begin::Go
             })
         };
         (hook, count)
@@ -6252,6 +6282,40 @@ def main():
             .position(|call| *call == "StartComPrimitive")
             .expect("the program sent a request");
         assert!(hook_at < start_at, "{calls:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A hook that refuses the start ends the run in `StartDeadlinePassed` with nothing sent to
+    /// the worker, and the journal it left holds no step, so the job stands clean.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hook_that_expires_the_job_stops_it_before_anything_is_sent() {
+        let dir = journal_dir("first-step-expired");
+        let (client, calls) = fake_worker_losing(Vec::new(), Vec::new(), Vec::new()).await;
+        let program = program(request_step(0x22).to_vec());
+        let run = run_program_journaled(
+            client,
+            &LinkConfig::iso15765(0x7E0, 0x7E8),
+            program.clone(),
+            JobLimits::default(),
+            file_setup_for(&dir, None),
+            vci_only_guards("first-step-expired"),
+            Some(Box::new(|| Begin::Expired)),
+        )
+        .await;
+        assert!(
+            matches!(run.result, Err(JobError::StartDeadlinePassed)),
+            "{:?}",
+            run.result
+        );
+        let calls = calls.lock().unwrap().clone();
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.starts_with("StartComPrimitive")),
+            "{calls:?}"
+        );
+        let standing = crate::job_report::JournalStanding::read(&dir, &job_key(), &program, true);
+        assert_eq!(standing, crate::job_report::JournalStanding::Clean);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -11499,6 +11563,7 @@ def main():
             comm_log_dir: None,
             vci: None,
             vci_margins: VciMargins::default(),
+            cancel: None,
         };
         check_job(&job(READ_DTC, document()), Permission::ReadOnly).unwrap();
         assert!(!job(READ_DTC, document()).writes());
@@ -11590,6 +11655,7 @@ def main():
                 comm_log_dir: None,
                 vci: None,
                 vci_margins: VciMargins::default(),
+                cancel: None,
             }
         };
         for (service, sid) in [(SESSION, 0x10), (RESET, 0x11)] {
@@ -11641,6 +11707,7 @@ def main():
             comm_log_dir: None,
             vci: None,
             vci_margins: VciMargins::default(),
+            cancel: None,
         };
         check_job(&job, Permission::ReadOnly).unwrap();
         // A field the document does not declare is refused before anything is sent, also
@@ -11658,6 +11725,7 @@ def main():
             comm_log_dir: None,
             vci: None,
             vci_margins: VciMargins::default(),
+            cancel: None,
         };
         assert!(
             matches!(
@@ -11718,6 +11786,7 @@ def main():
             comm_log_dir: None,
             vci: None,
             vci_margins: VciMargins::default(),
+            cancel: None,
         };
         let refused = check_job(&job, Permission::ReadOnly);
         assert!(
@@ -11749,6 +11818,7 @@ def main():
             comm_log_dir: None,
             vci: None,
             vci_margins: VciMargins::default(),
+            cancel: None,
         };
         let refused = check_job(&job, Permission::ReadOnly);
         assert!(

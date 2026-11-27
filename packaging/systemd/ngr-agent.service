@@ -21,10 +21,13 @@ StateDirectoryMode=0700
 LoadCredentialEncrypted=nekoguruma-agent-key.device.v1:/etc/credstore.encrypted/nekoguruma-agent-key.device.v1
 ExecStart=/usr/bin/ngr-agent connect --mode device
 # Exit 3 (the installation file, a lock, the state directory, the registration record or the key
-# store, such as an unreadable credential, cannot be read or used for now) is worth a retry,
-# and so is a crash. Exit 1 (no installation file at /etc/nekoguruma/agent.toml or one that is
+# store, such as an unreadable credential, cannot be read or used for now, or the job intake task
+# ended by a panic) is worth a retry, and so is a crash. Exit 1 (no installation file at /etc/nekoguruma/agent.toml or one that is
 # refused, not valid or for user mode, not registered, no key store), 2 (invalid command line)
 # and 4 (the key is present and unusable) repeat until an administrator acts; exit 0 is a stop.
+# A stop waits for the session, then for the intake (up to 30 s) and the uploader (up to 30 s) in
+# turn, so the stop timeout stays above their sum.
+TimeoutStopSec=120
 Restart=on-failure
 RestartSec=10
 RestartPreventExitStatus=1 2 4

@@ -60,9 +60,19 @@ pub type Taken<'a> = Pin<Box<dyn Future<Output = Result<(), IntakeError>> + Send
 /// agent's stop) and tolerates being dropped before it finishes, which a stop does. An error
 /// leaves the job recorded and ends the connection with 1011; the same command is not handed
 /// over again, as its redelivery is a duplicate.
+///
+/// The job's events go to the outbox in the order they happen, so an intake that reports the job
+/// itself must report nothing before the channel's `received` event is appended:
+/// [`Intake::received`] says it is.
 pub trait Intake: Send + Sync {
     /// Takes the instruction.
     fn take(&self, instruction: VerifiedInstruction) -> Taken<'_>;
+
+    /// The channel appended the `received` event of the job `take` was given, under the same
+    /// ownership generation: the intake may now report the job's later states. Not called when the
+    /// append failed or the stop came first, and the job then stays taken and unreported. The
+    /// default does nothing.
+    fn received(&self, _job_id: &str, _generation: u64) {}
 }
 
 /// The default intake, connected to no job runner: it logs the job ID at `debug` and drops the

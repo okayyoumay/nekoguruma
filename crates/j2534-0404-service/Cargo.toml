@@ -43,6 +43,8 @@ postcard = { workspace = true }
 serde_json = "1"
 serial_test = "4"
 shared-proto = { workspace = true }
+# tests/agent_intake_end_to_end.rs signs the job instruction the intake takes.
+shared-crypto = { workspace = true }
 tempfile = "3"
 worker-host = { workspace = true }
 # Built for tests/sim_vci_end_to_end.rs and tests/sim_vci_control.rs, which load the cdylib;

@@ -44,24 +44,32 @@ const JOB: &str = "0194f0a2-7c3e-7d11-8a52-3f6f9b1c2d4f";
 /// whole body. A call site that is first reached on a thread without a subscriber while the log
 /// test's scoped subscriber is being set up can stay disabled, and the "no secret in the log"
 /// checks would then pass on an empty log. A test thread that holds the gate does not take it
-/// again.
+/// again. The gate is a flag and not a lock guard, so that a fetcher's future, which holds it, is
+/// `Send` (the intake's object source needs that, ADR-511).
 pub(super) fn gate() -> Gate {
-    static GATE: Mutex<()> = Mutex::new(());
-    thread_local!(static HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) });
     if HELD.get() {
-        return Gate(None);
+        return Gate(false);
     }
-    let guard = GATE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut taken = GATE.0.lock().unwrap_or_else(|e| e.into_inner());
+    while *taken {
+        taken = GATE.1.wait(taken).unwrap_or_else(|e| e.into_inner());
+    }
+    *taken = true;
     HELD.set(true);
-    Gate(Some((guard, || HELD.set(false))))
+    Gate(true)
 }
 
-pub(super) struct Gate(Option<(std::sync::MutexGuard<'static, ()>, fn())>);
+static GATE: (Mutex<bool>, std::sync::Condvar) = (Mutex::new(false), std::sync::Condvar::new());
+thread_local!(static HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) });
+
+pub(super) struct Gate(bool);
 
 impl Drop for Gate {
     fn drop(&mut self) {
-        if let Some((_, release)) = &self.0 {
-            release();
+        if self.0 {
+            HELD.set(false);
+            *GATE.0.lock().unwrap_or_else(|e| e.into_inner()) = false;
+            GATE.1.notify_one();
         }
     }
 }

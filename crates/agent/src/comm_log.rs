@@ -1520,6 +1520,7 @@ pub(crate) fn error_outcome_name(error: &JobError) -> &'static str {
         JobError::StepLimit(_) => "StepLimit",
         JobError::Refused { .. } => "Refused",
         JobError::Cancelled => "Cancelled",
+        JobError::StartDeadlinePassed => "StartDeadlinePassed",
         JobError::SeveralTargets { .. } => "SeveralTargets",
         JobError::Journal(_) => "Journal",
         JobError::IdentityUnreadable { .. } => "IdentityUnreadable",

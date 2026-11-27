@@ -1316,6 +1316,15 @@ pub fn journal_dir(mode: OperatingMode) -> Result<PathBuf, StateDirError> {
     Ok(dir)
 }
 
+/// Where the journals and communication logs are, resolved at each use so that a failure to
+/// resolve is that use's (the intake's job, a log request).
+pub type DirSource = std::sync::Arc<dyn Fn() -> io::Result<PathBuf> + Send + Sync>;
+
+/// The [`DirSource`] of `mode`: [`journal_dir`] at each call.
+pub fn dir_source(mode: OperatingMode) -> DirSource {
+    std::sync::Arc::new(move || journal_dir(mode).map_err(io::Error::other))
+}
+
 /// Probes `dir` unless `probed` already lists it, and lists it once a probe succeeds. The lock
 /// is held across the probe, so one process probes each directory once; a failed probe is not
 /// listed, so the next call probes again.

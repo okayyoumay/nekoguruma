@@ -293,6 +293,98 @@ impl Fixture {
         }
     }
 
+    /// Waits until the job is delivered (the delivery time is set), whatever state it is in: the
+    /// agent's intake ends a job of these tests (it names no document) as soon as it has taken it.
+    async fn until_delivered(&self, id: &str) {
+        let deadline = Instant::now() + LIMIT;
+        loop {
+            let delivered: bool =
+                sqlx::query_scalar("SELECT delivered_at IS NOT NULL FROM jobs WHERE id = $1::uuid")
+                    .bind(id)
+                    .fetch_one(&self.world.pool)
+                    .await
+                    .unwrap();
+            if delivered {
+                return;
+            }
+            assert!(Instant::now() < deadline, "the job was not delivered");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Waits until the agent's report of the job has been applied: the job carries its time.
+    async fn until_stamped(&self, id: &str) {
+        let deadline = Instant::now() + LIMIT;
+        loop {
+            let stamped: bool = sqlx::query_scalar(
+                "SELECT last_reported_at IS NOT NULL FROM jobs WHERE id = $1::uuid",
+            )
+            .bind(id)
+            .fetch_one(&self.world.pool)
+            .await
+            .unwrap();
+            if stamped {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no report of the job was applied"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Waits until the job is delivered and ended as failed: the agent's intake refuses the job
+    /// of these tests, which names no document, after its `received` event (ADR-511 item 3).
+    async fn until_refused_by_the_intake(&self, id: &str) {
+        let deadline = Instant::now() + LIMIT;
+        loop {
+            let ended: bool = sqlx::query_scalar(
+                "SELECT state = 'failed' AND delivered_at IS NOT NULL FROM jobs \
+                 WHERE id = $1::uuid",
+            )
+            .bind(id)
+            .fetch_one(&self.world.pool)
+            .await
+            .unwrap();
+            if ended {
+                return;
+            }
+            assert!(Instant::now() < deadline, "the intake did not end the job");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The next message must be the agent's `failed` event with the failure code
+    /// `instructionRejected` of `job` with number `seq`: the intake's refusal of a job that names
+    /// no document.
+    async fn expect_rejected_of(&mut self, seq: u64, job: &str) {
+        match self.next().await.message {
+            AgentMessage::AgentEvent(AgentEventMessage {
+                seq: Some(got),
+                event:
+                    AgentEventKind::JobState {
+                        job_id,
+                        state,
+                        failure_code,
+                        ..
+                    },
+                ..
+            }) => {
+                assert_eq!(
+                    (
+                        got,
+                        job_id.0.as_str(),
+                        state.as_str(),
+                        failure_code.as_deref()
+                    ),
+                    (seq, job, "failed", Some("instructionRejected"))
+                );
+            }
+            other => panic!("the refusal {seq} expected, got {other:?}"),
+        }
+    }
+
     /// The next message must be the agent's `received` event of `JOB_ID` with number `seq`.
     async fn expect_received(&mut self, seq: u64) {
         self.expect_received_of(seq, JOB_ID).await;
@@ -312,6 +404,48 @@ impl Fixture {
                 );
             }
             other => panic!("the received event {seq} expected, got {other:?}"),
+        }
+    }
+
+    /// How many records the agent's outcome record holds: an `ended` and a `reported` for each job
+    /// it has ended and appended. The file is the header's frame and one frame per record after
+    /// the magic and the version; `0` while there is no file.
+    fn outcome_records(&self) -> usize {
+        let path = self
+            .env
+            .state
+            .path()
+            .join("registration")
+            .join(format!("{}.outcomes.v1", self.agent_id));
+        let Ok(bytes) = std::fs::read(path) else {
+            return 0;
+        };
+        let mut offset = 12;
+        let mut frames: usize = 0;
+        while let Some(head) = bytes.get(offset..offset + 8) {
+            let len = u32::from_le_bytes(head[..4].try_into().unwrap()) as usize;
+            if bytes.len() < offset + 8 + len {
+                break;
+            }
+            offset += 8 + len;
+            frames += 1;
+        }
+        frames.saturating_sub(1)
+    }
+
+    /// Waits until the agent's outcome record holds the `ended` and the `reported` of `jobs`
+    /// jobs: their end is in the outbox and recorded as such, so a kill now leaves nothing owed
+    /// for the restart to append again.
+    async fn until_reported(&self, jobs: usize) {
+        let deadline = Instant::now() + LIMIT;
+        while self.outcome_records() != 2 * jobs {
+            assert!(
+                Instant::now() < deadline,
+                "the outcome record holds {} records, not {}",
+                self.outcome_records(),
+                2 * jobs
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 
@@ -471,8 +605,10 @@ async fn a_registered_agent_connects_answers_commands_and_stops_on_a_signal() {
         AgentMessage::CommandAck { command_id } => assert_eq!(command_id, sent.command_id),
         other => panic!("commandAck expected, got {other:?}"),
     }
-    // The agent recorded the command before it acknowledged it, and now sends the event.
+    // The agent recorded the command before it acknowledged it, and now sends the event, then
+    // its intake's refusal of the job, which names no document (ADR-511).
     f.expect_received(1).await;
+    f.expect_rejected_of(2, JOB_ID).await;
 
     let forged = f.signed_job(true).await;
     let sent = f
@@ -501,7 +637,9 @@ async fn a_registered_agent_connects_answers_commands_and_stops_on_a_signal() {
 /// The agent's `received` event follows `commandAck` with its outbox number, and the server, which
 /// acknowledges no event yet, gets it again after a reconnection, before the next command's
 /// answer and event (design 5.3, ADR-478). A redelivery of the first job is acknowledged by the
-/// agent's ledger and adds no event, so the next job's event is number 2 (ADR-489).
+/// agent's ledger and adds no event, so the next job's events are numbers 3 and 4 (ADR-489). Each
+/// job's `received` is followed by the intake's refusal of it, as the job names no document
+/// (ADR-511).
 #[tokio::test(flavor = "multi_thread")]
 async fn the_received_event_follows_the_ack_and_is_sent_again_after_a_reconnect() {
     let mut f = Fixture::new().await;
@@ -517,12 +655,16 @@ async fn the_received_event_follows_the_ack_and_is_sent_again_after_a_reconnect(
         other => panic!("commandAck expected, got {other:?}"),
     }
     f.expect_received(1).await;
+    // The agent's intake refuses the job, which names no document, right after its `received`.
+    f.expect_rejected_of(2, JOB_ID).await;
 
-    // The connection ends; the agent connects again and sends the event that was not acknowledged.
+    // The connection ends; the agent connects again and sends the events that were not
+    // acknowledged.
     assert!(f.hub.close_agent(&id, shared_proto::CLOSE_CODE_GOING_AWAY));
     f.wait_connected(Some(&mut agent), false).await;
     f.wait_connected(Some(&mut agent), true).await;
     f.expect_received(1).await;
+    f.expect_rejected_of(2, JOB_ID).await;
     // The redelivery of the first job: acknowledged, with no event and no intake call.
     let sent = f
         .hub
@@ -540,7 +682,8 @@ async fn the_received_event_follows_the_ack_and_is_sent_again_after_a_reconnect(
         AgentMessage::CommandAck { command_id } => assert_eq!(command_id, sent.command_id),
         other => panic!("commandAck expected, got {other:?}"),
     }
-    f.expect_received_of(2, OTHER_JOB_ID).await;
+    f.expect_received_of(3, OTHER_JOB_ID).await;
+    f.expect_rejected_of(4, OTHER_JOB_ID).await;
 
     agent.stop().await;
     f.server.take().unwrap().finish().await;
@@ -596,7 +739,7 @@ async fn a_forged_stored_command_is_rejected_by_the_agent_and_ends_the_job_and_t
     f.add_job(NEXT_ID, 2, &good).await;
     let mut agent = f.start_agent();
     f.wait_connected(Some(&mut agent), true).await;
-    f.until_job(NEXT_ID, "received|||true").await;
+    f.until_delivered(NEXT_ID).await;
     f.until_job(JOB_ID, "failed|instructionRejected|badSignature|false")
         .await;
     agent.stop().await;
@@ -633,7 +776,7 @@ async fn a_job_sealed_for_another_operator_is_refused_by_the_agent_and_the_owner
     f.add_job(NEXT_ID, 2, &good).await;
     let mut agent = f.start_agent();
     f.wait_connected(Some(&mut agent), true).await;
-    f.until_job(NEXT_ID, "received|||true").await;
+    f.until_delivered(NEXT_ID).await;
     f.until_job(JOB_ID, "preconditionFailed|operatorNotAllowed||true")
         .await;
     assert_eq!(f.world.sql("SELECT count(*) FROM vehicle_locks").await, "0");
@@ -667,7 +810,10 @@ async fn a_job_created_through_the_route_is_accepted_and_acknowledged_by_the_age
         .as_str()
         .unwrap()
         .to_owned();
-    f.until_job(&id, "received|||true").await;
+    f.until_delivered(&id).await;
+    // The agent's `received` report has been applied (it stamps the job) before the audit rows
+    // are counted, so a report that arrives late cannot be missed.
+    f.until_stamped(&id).await;
     assert!(f.is_connected(), "{}", agent.log_text());
     // A12: the creation wrote one audit row, and the agent's `received` report added none.
     assert_eq!(
@@ -698,14 +844,15 @@ async fn until_count(counter: &AtomicU64, expected: u64, what: &str, agent: &Age
     }
 }
 
-/// The server stores the `received` events of three accepted jobs, which the real agent sends,
-/// once each, and acknowledges them (design 5.3, ADR-478 item 6, ADR-479; E24). The cursor row is
-/// held locked while the events arrive, so that all three are seen and none is stored; the agent
-/// is killed, the lock is released, and the events are stored without an acknowledgement, since
-/// their connection is gone. The restarted agent sends the three again from its outbox: each is a
-/// repeat, answered with the cursor, and nothing is doubled. A fourth job's event is stored and
-/// acknowledged (the agent's outbox file shrinks to its header again), and a further restart sends
-/// nothing, repeats nothing and is closed for nothing.
+/// The server stores the events of three accepted jobs, which the real agent sends, once each, and
+/// acknowledges them (design 5.3, ADR-478 item 6, ADR-479; E24). Each job gives two events: its
+/// `received` and the agent's intake's refusal of it, as the job names no document (ADR-511). The
+/// cursor row is held locked while the events arrive, so that all six are seen and none is stored;
+/// the agent is killed, the lock is released, and the events are stored without an
+/// acknowledgement, since their connection is gone. The restarted agent sends the six again from
+/// its outbox: each is a repeat, answered with the cursor, and nothing is doubled. A fourth job's
+/// two events are stored and acknowledged (the agent's outbox file shrinks to its header again),
+/// and a further restart sends nothing, repeats nothing and is closed for nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn events_seen_while_the_cursor_is_held_are_stored_once_across_a_kill_and_a_restart_and_acknowledged()
  {
@@ -751,37 +898,55 @@ async fn events_seen_while_the_cursor_is_held_are_stored_once_across_a_kill_and_
     }
     // The queue reads all three events, though each of its attempts to store waits on the lock
     // and gives up; nothing is stored.
-    until_count(&f.counts.seen, 3, "the events seen", &agent).await;
+    until_count(&f.counts.seen, 6, "the events seen", &agent).await;
     assert_eq!(f.counts.stored.load(Ordering::Relaxed), 0);
     assert_eq!(f.stored_events().await, (vec![], 0));
-    // The agent dies with its three events unacknowledged, and the lock is released.
+    // The agent dies with its events unacknowledged, and the lock is released. Its intake has
+    // recorded every end as reported by then, so the restart appends nothing it has not.
+    f.until_reported(3).await;
     agent.kill();
     f.wait_connected(None, false).await;
     held.commit().await.unwrap();
-    until_count(&f.counts.stored, 3, "the events stored", &agent).await;
-    let received = |ids: &[&str]| -> Vec<String> {
-        ids.iter()
-            .enumerate()
-            .map(|(n, job)| format!("{}:{job}:received", n + 1))
-            .collect()
+    until_count(&f.counts.stored, 6, "the events stored", &agent).await;
+    // The numbers are the agent's: its channel appends a job's `received` and its intake the
+    // refusal, so the refusal of one job may come before or after the `received` of the next.
+    let events_of = |stored: Vec<String>, ids: &[&str]| -> Vec<String> {
+        for (n, event) in stored.iter().enumerate() {
+            assert!(event.starts_with(&format!("{}:", n + 1)), "{stored:?}");
+        }
+        let at = |job: &str, state: &str| {
+            stored
+                .iter()
+                .position(|event| event.ends_with(&format!("{job}:{state}")))
+                .unwrap_or_else(|| panic!("no {state} event of {job} in {stored:?}"))
+        };
+        for job in ids {
+            assert!(at(job, "received") < at(job, "failed"), "{stored:?}");
+        }
+        assert_eq!(stored.len(), 2 * ids.len(), "{stored:?}");
+        stored
     };
-    assert_eq!(f.stored_events().await, (received(&JOBS[..3]), 3));
+    let (stored, cursor) = f.stored_events().await;
+    assert_eq!(cursor, 6);
+    let first_six = events_of(stored, &JOBS[..3]);
     assert_eq!(f.counts.duplicates.load(Ordering::Relaxed), 0);
     for job in &JOBS[..3] {
-        f.until_job(job, "received|||true").await;
+        f.until_refused_by_the_intake(job).await;
     }
     // The restart sends the three again: each is a repeat, and the answer empties the outbox.
     let mut agent = f.start_agent();
     f.wait_connected(Some(&mut agent), true).await;
-    until_count(&f.counts.duplicates, 3, "the repeats", &agent).await;
+    until_count(&f.counts.duplicates, 6, "the repeats", &agent).await;
     f.until_outbox_len(header).await;
-    assert_eq!(f.stored_events().await, (received(&JOBS[..3]), 3));
-    // A fourth job: its event is stored as number 4 and acknowledged.
+    assert_eq!(f.stored_events().await, (first_six, 6));
+    // A fourth job: its two events are stored as numbers 7 and 8 and acknowledged.
     let envelope = f.envelope(JOBS[3], false).await;
     f.add_job(JOBS[3], 4, &envelope).await;
-    f.until_job(JOBS[3], "received|||true").await;
-    until_count(&f.counts.stored, 4, "the events stored", &agent).await;
-    assert_eq!(f.stored_events().await, (received(&JOBS), 4));
+    f.until_refused_by_the_intake(JOBS[3]).await;
+    until_count(&f.counts.stored, 8, "the events stored", &agent).await;
+    let (stored, cursor) = f.stored_events().await;
+    assert_eq!(cursor, 8);
+    events_of(stored, &JOBS);
     f.until_outbox_len(header).await;
     // After a stop and a restart the agent has nothing pending: no repeat, no new event, and the
     // connection is not closed for an acknowledgement.
@@ -802,18 +967,18 @@ async fn events_seen_while_the_cursor_is_held_are_stored_once_across_a_kill_and_
         "{}",
         agent.log_text()
     );
-    assert_eq!(f.counts.duplicates.load(Ordering::Relaxed), 3);
-    assert_eq!(f.counts.stored.load(Ordering::Relaxed), 4);
-    assert_eq!(f.counts.seen.load(Ordering::Relaxed), 7);
+    assert_eq!(f.counts.duplicates.load(Ordering::Relaxed), 6);
+    assert_eq!(f.counts.stored.load(Ordering::Relaxed), 8);
+    assert_eq!(f.counts.seen.load(Ordering::Relaxed), 14);
     agent.stop().await;
     f.server.take().unwrap().finish().await;
     f.world.finish().await;
 }
 
 /// The real agent's `received` event is applied to its job once (design 5.3, 5.6, ADR-481; J21):
-/// the job stays `received` and carries the time of the report. The event is stored while the
-/// agent is gone, so the agent sends it again after a restart; the repeat is answered with the
-/// cursor and changes nothing.
+/// the job carries the time of the report, and the intake's refusal that follows ends it (ADR-511).
+/// The events are stored while the agent is gone, so the agent sends them again after a restart;
+/// the repeats are answered with the cursor and change nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_agents_received_event_stamps_its_job_once_and_a_resend_changes_nothing() {
     let mut f = Fixture::with_queue(true).await;
@@ -835,31 +1000,42 @@ async fn the_agents_received_event_stamps_its_job_once_and_a_resend_changes_noth
     f.wait_connected(Some(&mut agent), true).await;
     let envelope = f.envelope(JOB_ID, false).await;
     f.add_job(JOB_ID, 1, &envelope).await;
-    // The delivery is acknowledged by the agent (the commandAck), and its event waits on the lock.
-    f.until_job(JOB_ID, "received|||true").await;
-    until_count(&f.counts.seen, 1, "the events seen", &agent).await;
+    // The delivery is acknowledged by the agent (the commandAck), and its two events, `received`
+    // and the intake's refusal, wait on the lock.
+    f.until_delivered(JOB_ID).await;
+    until_count(&f.counts.seen, 2, "the events seen", &agent).await;
     assert_eq!(f.counts.applied.load(Ordering::Relaxed), 0);
+    f.until_reported(1).await;
     agent.kill();
     f.wait_connected(None, false).await;
     held.commit().await.unwrap();
-    until_count(&f.counts.applied, 1, "the reports applied", &agent).await;
+    until_count(&f.counts.applied, 2, "the reports applied", &agent).await;
     let reported = f
         .world
         .sql("SELECT coalesce(last_reported_at::text, '-') FROM jobs")
         .await;
     assert_ne!(reported, "-");
-    f.until_job(JOB_ID, "received|||true").await;
+    f.until_refused_by_the_intake(JOB_ID).await;
+    let ended = f
+        .world
+        .sql("SELECT state || '|' || coalesce(finished_at::text, '-') FROM jobs")
+        .await;
     let mut agent = f.start_agent();
     f.wait_connected(Some(&mut agent), true).await;
-    until_count(&f.counts.duplicates, 1, "the repeats", &agent).await;
-    assert_eq!(f.counts.applied.load(Ordering::Relaxed), 1);
+    until_count(&f.counts.duplicates, 2, "the repeats", &agent).await;
+    assert_eq!(f.counts.applied.load(Ordering::Relaxed), 2);
     assert_eq!(
         f.world
             .sql("SELECT coalesce(last_reported_at::text, '-') FROM jobs")
             .await,
         reported
     );
-    f.until_job(JOB_ID, "received|||true").await;
+    assert_eq!(
+        f.world
+            .sql("SELECT state || '|' || coalesce(finished_at::text, '-') FROM jobs")
+            .await,
+        ended
+    );
     agent.stop().await;
     f.server.take().unwrap().finish().await;
     f.world.finish().await;

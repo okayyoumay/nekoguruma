@@ -56,7 +56,7 @@ use crate::journal::Vin;
 use crate::link::{BUS_TYPE_DWCAN, CloseEvidence, LinkConfig};
 use crate::policy::{ApplicationLayer, PRESENCE_REQUEST};
 use crate::runner::{
-    CancelOnDrop, FirstStep, GuardSlot, JobError, JobLimits, JobLink, LinkRefused,
+    Begin, CancelOnDrop, FirstStep, GuardSlot, JobError, JobLimits, JobLink, LinkRefused,
     WORKER_EXIT_GRACE, base_facts, close_job_link, on_job_thread, open_job_link,
     promote_to_vehicle, reopen_attempts,
 };
@@ -2253,10 +2253,10 @@ impl RunState {
     }
 
     /// Calls the run's first-step hook, once: the first link has opened.
-    fn link_opened(&self) {
-        if let Some(first_step) = self.first_step.take() {
-            first_step();
-        }
+    fn link_opened(&self) -> Begin {
+        self.first_step
+            .take()
+            .map_or(Begin::Go, |first_step| first_step())
     }
 }
 
@@ -2367,7 +2367,16 @@ fn open_part<W: WorkerSource>(
         Ok(link) => {
             // Every check that can refuse the run, the first link's open included, is behind
             // us: the next thing is the first request.
-            state.link_opened();
+            if state.link_opened() == Begin::Expired {
+                let JobLink {
+                    host,
+                    open_link,
+                    path_lost,
+                    ..
+                } = link;
+                close_job_link(host, open_link, &path_lost);
+                return Err(JobError::StartDeadlinePassed);
+            }
             Ok(Opened::Link(Box::new(link)))
         }
         // A refusal whose teardown failed left the guards marked: nothing more opens (ADR-258).

@@ -1,5 +1,6 @@
 //! The flow of `ngr-agent connect` (design 5.3, 6.4; ADR-471; `crates/agent/docs/ngr-agent.md`):
-//! it runs the control channel session ([`crate::control`]) until a stop signal.
+//! it runs the control channel session ([`crate::control`]) until a stop signal. The end of the
+//! session task or of the job intake task without a stop ends the command too.
 //!
 //! The order, where the first step that fails decides:
 //!
@@ -40,7 +41,14 @@
 //!    (its ledger did not read back after a reopen) is logged once at error level and the session
 //!    goes on: `connect`'s exit status is the session's. Then both tasks are stopped (the
 //!    session closes with 1001), the session is awaited, and the uploader is awaited for
-//!    [`UPLOADER_STOP_BOUND`] at most.
+//!    [`STOP_BOUND`] at most. The job intake ([`crate::intake`], ADR-511) is started with the
+//!    session, over the object cache ([`crate::fetch::store::ObjectStore`], opened with the other
+//!    state: one that another process holds is exit 3) and the outcome record
+//!    ([`crate::outcome_record::OutcomeRecord`], beside the received-jobs ledger, opened as it is).
+//!    It runs the instructions the session takes, across the session's connections, and is
+//!    stopped after the session and awaited for [`STOP_BOUND`] at most, as the uploader is. An
+//!    intake that ends alone (a panic) ends the command with exit 3, which the unit restarts: the
+//!    session would acknowledge jobs nothing runs.
 //!
 //! The command prints and logs nothing the server sent and no token; its messages are fixed
 //! wording.
@@ -51,26 +59,39 @@ use std::time::Duration;
 
 use worker_host::service::OperatingMode;
 
-use crate::control::{self, Collaborators, ControlError, LogIntake, SharedOutbox};
+use crate::control::{self, Collaborators, ControlError, SharedOutbox};
 use crate::deadline::{IssueMark, MarkError, SystemClock};
+use crate::fetch::Fetcher;
+use crate::fetch::store::{ObjectStore, StoreError};
+use crate::identification::NoPlans;
 use crate::identity::{AgentKey, IdentityError, agent_key};
+use crate::intake;
+use crate::journal::dir_source;
 use crate::log_upload::LogUploader;
 use crate::outbox::{Outbox, OutboxError};
+use crate::outcome_record::{OutcomeRecord, RecordError as OutcomeError};
 use crate::received_jobs::{LedgerError, ReceivedJobs};
 use crate::registration::origin::ServerOrigin;
 use crate::registration::record::{Record, RecordError};
 use crate::upload_ledger::{LedgerError as UploadLedgerError, UploadLedger};
 use crate::uploader::{self, SharedLedger};
+use crate::vci_shell::RegisteredVcis;
 
 /// The first wait before the key store is tried again, as the session's own delay starts.
 const RETRY_INITIAL: Duration = Duration::from_secs(1);
 /// The longest wait between two tries of the key store.
 const RETRY_CAP: Duration = Duration::from_secs(60);
 
-/// How long a stop waits for the uploader to end. The uploader drops the request in flight at
-/// once and awaits only a ledger write that is running, so the wait is short; the bound keeps a
-/// stuck write from holding the process.
-const UPLOADER_STOP_BOUND: Duration = Duration::from_secs(10);
+/// How long a stop waits for the uploader and the intake to end. The uploader drops the request in
+/// flight at once and awaits only a file write that is running. The intake awaits a cancelled run
+/// for [`intake::RUN_STOP_BOUND`] and then syncs the end's records; the bound is that plus 10
+/// seconds for them, and keeps a stuck write from holding the process.
+const STOP_BOUND: Duration = Duration::from_secs(intake::RUN_STOP_BOUND.as_secs() + 10);
+
+const _: () = assert!(
+    STOP_BOUND.as_secs() >= intake::RUN_STOP_BOUND.as_secs() + 10,
+    "a stop must wait for the intake's run bound and the end's record syncs"
+);
 
 /// The exit status of a command that did not end by a stop signal (the usage text lists them; a
 /// stop is 0 and a usage error 2, which the caller decides).
@@ -265,6 +286,44 @@ fn upload_ledger_error(error: &UploadLedgerError) -> ConnectError {
     }
 }
 
+/// The exit and the text of an error that ends the open of the outcome record. The texts are
+/// NGR's own.
+fn outcome_record_error(error: &OutcomeError) -> ConnectError {
+    match error {
+        OutcomeError::Corrupt(..) => fail(
+            Exit::CannotConnect,
+            "the outcome record is corrupt and is not repaired; register again with `ngr-agent register --replace`",
+        ),
+        OutcomeError::BadAgentId => fail(
+            Exit::CannotConnect,
+            "the registration record cannot be used; register again with `ngr-agent register --replace`",
+        ),
+        OutcomeError::InUse => fail(
+            Exit::Unavailable,
+            "the outcome record is open in another process; nothing changed, try again",
+        ),
+        other => fail(
+            Exit::Unavailable,
+            format!("the outcome record cannot be opened: {other}; nothing changed, try again"),
+        ),
+    }
+}
+
+/// The exit and the text of an error that ends the open of the object cache. The texts are NGR's
+/// own.
+fn object_store_error(error: &StoreError) -> ConnectError {
+    match error {
+        StoreError::InUse => fail(
+            Exit::Unavailable,
+            "the object cache is open in another process (a `debug fetch` that has not ended, or a second agent); nothing changed, try again",
+        ),
+        other => fail(
+            Exit::Unavailable,
+            format!("the object cache cannot be opened: {other}; nothing changed, try again"),
+        ),
+    }
+}
+
 /// The exit and the text of a key error that ends the load, as `register` reports it. The retried
 /// errors ([`IdentityError::retry_class`]) never get here.
 fn identity_error(error: &IdentityError) -> ConnectError {
@@ -301,28 +360,72 @@ pub async fn run(
     let uploads = UploadLedger::open(mode, &opened.record().agent_id)
         .map_err(|error| upload_ledger_error(&error))?;
     let uploads = SharedLedger::new(uploads);
+    let outcomes = OutcomeRecord::open(mode, &opened.record().agent_id)
+        .map_err(|error| outcome_record_error(&error))?;
+    let objects = ObjectStore::open(mode).map_err(|error| object_store_error(&error))?;
+    let vcis = RegisteredVcis::for_mode(mode).map_err(|error| {
+        fail(
+            Exit::Unavailable,
+            format!("cannot locate the worker and lock directories: {error}"),
+        )
+    })?;
     let log_uploads = LogUploader::new(mode, ledger.clone(), uploads.clone());
+    let intake_uploads = uploads.clone();
+    let (intake_outbox, intake_marks) = (outbox.clone(), marks.clone());
     run_opened(
         opened,
         move || agent_key(mode),
         move |record, key| uploader::start(record, key, uploads),
         |opened, key| {
-            opened.start(
+            let fetcher = Fetcher::new(opened.record(), key, objects)?;
+            let (job_intake, intake_handle) = intake::start(intake::Parts {
+                objects: Arc::new(fetcher),
+                plans: Arc::new(NoPlans),
+                vcis: Arc::new(vcis),
+                mode,
+                journal_dir: dir_source(mode),
+                outbox: intake_outbox,
+                uploads: intake_uploads,
+                marks: intake_marks,
+                clock: Arc::new(SystemClock),
+                outcomes,
+            });
+            let session = opened.start(
                 key,
                 Collaborators {
-                    intake: Arc::new(LogIntake),
+                    intake: job_intake,
                     outbox,
                     marks,
                     clock: Arc::new(SystemClock),
                     ledger,
                     log_uploads: Arc::new(log_uploads),
                 },
-            )
+            )?;
+            Ok(Started {
+                session,
+                intake: Some(intake_handle),
+            })
         },
-        UPLOADER_STOP_BOUND,
+        STOP_BOUND,
         stop,
     )
     .await
+}
+
+/// What the session's start gives back: the session, and the job intake that serves what the
+/// session takes, which is stopped after it.
+struct Started {
+    session: control::Handle,
+    intake: Option<intake::Handle>,
+}
+
+impl From<control::Handle> for Started {
+    fn from(session: control::Handle) -> Self {
+        Started {
+            session,
+            intake: None,
+        }
+    }
 }
 
 /// The steps after `open`, with the key's source and the session's start as seams for tests.
@@ -330,8 +433,8 @@ async fn run_opened(
     opened: control::Opened,
     load_key: impl Fn() -> Result<AgentKey, IdentityError> + Clone + Send + 'static,
     start_uploader: impl FnOnce(&Record, &AgentKey) -> Result<uploader::Handle, ControlError>,
-    start: impl FnOnce(control::Opened, &AgentKey) -> Result<control::Handle, ControlError>,
-    uploader_bound: Duration,
+    start: impl FnOnce(control::Opened, &AgentKey) -> Result<Started, ControlError>,
+    stop_bound: Duration,
     stop: impl Future<Output = ()>,
 ) -> Result<(), ConnectError> {
     tokio::pin!(stop);
@@ -350,16 +453,22 @@ async fn run_opened(
     // The uploader first, over the key by reference, as the session's start does. A start
     // that fails drops the uploader's handle, which stops it.
     let uploader = start_uploader(opened.record(), &key).map_err(|error| control_error(&error))?;
-    let handle = start(opened, &key).map_err(|error| control_error(&error))?;
+    let Started {
+        session: handle,
+        intake,
+    } = start(opened, &key).map_err(|error| control_error(&error))?;
     tracing::info!("control channel session started");
     // The task also ends without a stop when it panics (release builds unwind): the locks are
     // then free and no session is left, so the process must not stay up.
     let mut uploader_ended = false;
+    let mut session_ended = false;
+    let mut intake_ended = false;
     let outcome = loop {
         tokio::select! {
             biased;
             () = stop.as_mut() => break Ok(()),
             () = handle.stopped() => {
+                session_ended = true;
                 break Err(match handle.ended() {
                     Some(control::Ended::OutboxUnusable) => {
                         outbox_error(&OutboxError::Corrupt("reopen", None))
@@ -373,6 +482,22 @@ async fn run_opened(
                     ),
                 });
             }
+            // The intake ended on its own: the session would acknowledge jobs nothing runs, and
+            // their redeliveries would be duplicates, so the command ends. The task ends alone
+            // only by a panic, which a restart can repair: exit 3, which the unit restarts.
+            () = async {
+                match &intake {
+                    Some(intake) => intake.stopped().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                intake_ended = true;
+                tracing::error!("the job intake ended; the agent ends with it");
+                break Err(fail(
+                    Exit::Unavailable,
+                    "the job intake ended unexpectedly",
+                ));
+            }
             // Neither channel ends the other: the session goes on without uploads.
             () = uploader.stopped(), if !uploader_ended => {
                 uploader_ended = true;
@@ -383,16 +508,32 @@ async fn run_opened(
             }
         }
     };
-    if outcome.is_ok() {
+    // The session is stopped on every path but its own end: a stop, or the intake's end.
+    if !session_ended {
         handle.stop();
         handle.stopped().await;
         tracing::info!("control channel session stopped");
+    }
+    // The intake is stopped after the session, on the error path too: it leaves a job it was
+    // running open, and the process then ends within a short timeout.
+    if let Some(intake) = &intake
+        && !intake_ended
+    {
+        intake.stop();
+        if tokio::time::timeout(stop_bound, intake.stopped())
+            .await
+            .is_err()
+        {
+            tracing::warn!("the job intake did not stop in time; the agent exits without it");
+        } else {
+            tracing::info!("job intake stopped");
+        }
     }
     // The uploader is awaited on the error path too: the process then ends within a short
     // timeout, which must not cut a ledger rewrite that is running.
     uploader.stop();
     if !uploader_ended {
-        if tokio::time::timeout(uploader_bound, uploader.stopped())
+        if tokio::time::timeout(stop_bound, uploader.stopped())
             .await
             .is_err()
         {

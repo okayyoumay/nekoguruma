@@ -26,7 +26,6 @@ use agent::{
     check_job, run_key, run_program,
 };
 use diag_ir::plan::Sha256;
-use diag_ir::{Value, VmState};
 use sha2::Digest;
 use tracing::Instrument;
 use worker_host::service::OperatingMode;
@@ -133,7 +132,7 @@ options:
   --workers <dir>      worker binaries, laid out as <dir>/<ABI name>/<binary>
                        (default: the 'workers' directory next to ngr-agent)
   --locks <dir>        the device's lock directory for the VCI lock and the reprogramming
-                       slot (default: the 'locks' directory next to ngr-agent)
+                       slot (default: 'locks' in the state directory of --mode)
   --comm-log <dir>     writes the run's communication log (design 8.11) to this directory,
                        created if missing, and prints the log's path on stderr; without it
                        the run writes none, unless its procedure logs messages (diag.log):
@@ -1028,9 +1027,10 @@ fn default_workers() -> Result<PathBuf, String> {
     next_to_exe("workers", "--workers")
 }
 
-/// The `locks` directory next to the running executable.
-fn default_locks() -> Result<PathBuf, String> {
-    next_to_exe("locks", "--locks")
+/// The lock directory of `mode`: `locks` in its state root.
+fn default_locks(mode: OperatingMode) -> Result<PathBuf, String> {
+    agent::vci_shell::lock_dir(mode)
+        .map_err(|error| format!("cannot make the lock directory: {error}; pass --locks"))
 }
 
 fn default_comm_logs() -> Result<PathBuf, String> {
@@ -1038,12 +1038,8 @@ fn default_comm_logs() -> Result<PathBuf, String> {
 }
 
 fn next_to_exe(name: &str, flag: &str) -> Result<PathBuf, String> {
-    let exe = std::env::current_exe()
-        .map_err(|error| format!("cannot locate ngr-agent: {error}; pass {flag}"))?;
-    let dir = exe
-        .parent()
-        .ok_or_else(|| format!("cannot locate the directory of ngr-agent; pass {flag}"))?;
-    Ok(dir.join(name))
+    agent::vci_shell::beside_executable(name)
+        .map_err(|error| format!("cannot locate {name} next to ngr-agent: {error}; pass {flag}"))
 }
 
 /// Reads the job a run's document gives.
@@ -1124,13 +1120,7 @@ async fn run_job(args: RunArgs, key: JobKey) -> Result<String, String> {
         },
     )
     .await?;
-    // serde_json would print such a value as `null`, which no longer reads back as the state.
-    if holds_non_finite_float(&state) {
-        return Err(
-            "the final state holds a non-finite float, which JSON cannot represent".to_owned(),
-        );
-    }
-    serde_json::to_string(&state).map_err(|error| format!("cannot print the result: {error}"))
+    agent::result_json::vm_state_json(&state).map_err(|error| error.to_string())
 }
 
 /// Runs an identification plan on the VCI, in its span of the operational log, and returns the
@@ -1206,7 +1196,7 @@ async fn identify_job(args: IdentifyArgs, key: JobKey) -> Result<String, String>
 }
 
 /// The shell's VCI for a command, from the command line: its API and name, the worker builds
-/// and the lock directory it names or the ones next to the executable.
+/// and the lock directory it names, or the workers next to the executable and the mode's locks.
 fn vci_shell(
     api: Api,
     vci: String,
@@ -1220,7 +1210,7 @@ fn vci_shell(
     };
     let locks = match locks {
         Some(dir) => dir,
-        None => default_locks()?,
+        None => default_locks(mode)?,
     };
     Ok(VciShell {
         vci,
@@ -1293,23 +1283,6 @@ where
         }
     }
     run.result.map_err(|error| format!("job failed: {error}"))
-}
-
-/// Whether any value in `state` is an infinite or NaN `F64`.
-fn holds_non_finite_float(state: &VmState) -> bool {
-    let frames = state.call_stack.iter().flat_map(|frame| &frame.locals);
-    state
-        .stack
-        .iter()
-        .chain(
-            state
-                .locals
-                .iter()
-                .chain(&state.globals)
-                .chain(frames)
-                .flatten(),
-        )
-        .any(|value| matches!(value, Value::F64(number) if !number.is_finite()))
 }
 
 #[cfg(test)]
@@ -1945,35 +1918,5 @@ mod tests {
         let error = parse(&["run", "--vci", "x", "--mode", "user", "--program", "p.json"])
             .expect_err("a retired option");
         assert!(error.starts_with("unknown option"), "{error}");
-    }
-
-    #[test]
-    fn finds_non_finite_floats_anywhere_in_the_state() {
-        let finite = VmState {
-            schema_version: 0,
-            pc: 0,
-            stack: vec![Value::F64(1.5), Value::Bytes(vec![1])],
-            locals: vec![None, Some(Value::F64(-0.0))],
-            globals: vec![Some(Value::I64(1))],
-            call_stack: vec![diag_ir::Frame {
-                return_pc: 0,
-                locals: vec![Some(Value::F64(f64::MAX))],
-            }],
-            steps: 0,
-            target: 0,
-        };
-        assert!(!holds_non_finite_float(&finite));
-
-        let mut stack = finite.clone();
-        stack.stack.push(Value::F64(f64::INFINITY));
-        let mut global = finite.clone();
-        global.globals.push(Some(Value::F64(f64::NAN)));
-        let mut frame = finite;
-        frame.call_stack[0]
-            .locals
-            .push(Some(Value::F64(f64::NEG_INFINITY)));
-        for state in [stack, global, frame] {
-            assert!(holds_non_finite_float(&state), "{state:?}");
-        }
     }
 }

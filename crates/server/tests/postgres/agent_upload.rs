@@ -880,14 +880,14 @@ async fn a_requested_log_is_stored_up_to_its_last_line_and_an_unrequested_one_is
     let mut agent = fx.start_agent("connect.log");
     let agent_log = fx.env.home.path().join("connect.log");
     // The queue delivers both jobs and the agent acknowledges them, which puts them in its
-    // received-jobs ledger at generation 1.
+    // received-jobs ledger at generation 1. The jobs name no document, so the agent's intake
+    // refuses each right after its `received` event (ADR-511): the state is not looked at.
     fx.until("both jobs to be received", &mut agent, || async {
-        let delivered: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM jobs WHERE state = 'received' AND delivered_at IS NOT NULL",
-        )
-        .fetch_one(&fx.world.pool)
-        .await
-        .unwrap();
+        let delivered: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM jobs WHERE delivered_at IS NOT NULL")
+                .fetch_one(&fx.world.pool)
+                .await
+                .unwrap();
         delivered == 2
     })
     .await;

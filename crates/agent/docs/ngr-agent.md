@@ -5,9 +5,9 @@ an identification plan's functional presence requests, VIN reads and ECU reads; 
 end-to-end runs and tests (below). `identity` creates the agent's key and prints its public key
 ("`ngr-agent identity`" below), and `register` registers that key with the server and stores the
 registration record ("`ngr-agent register`" below), and `connect` runs the control channel session
-with that server until it is stopped ("`ngr-agent connect`" below). Its session's intake is
-`LogIntake`, connected to no job runner: a command that passes the instruction gate is
-acknowledged and dropped, so the agent runs no job the server sends. A procedure job is always a document: a bare program has no
+with that server until it is stopped ("`ngr-agent connect`" below). Its session's intake is the
+job intake ("The job intake" below): a command that passes the instruction gate is queued, fetched,
+checked and run, and its states are reported to the server. A procedure job is always a document: a bare program has no
 declarations to decode with and no declared link, so `run` takes none.
 
 ## `ngr-agent run`
@@ -24,8 +24,8 @@ ngr-agent run --vci <name> --mode <device|user> --document <file> [--artifact <f
 | `--document` | A variant's document (design 8.2.6, `.dir`): its procedure is the program, and the job decodes response fields through its variant's declarations (`agent::JobDocument`). The document is checked as `diag_ir::declaration::load_ecu_document` checks it (ADR-296), and one without a procedure, or whose procedure is not exactly one program, is refused (ADR-318). Required, given once. The options `--program`, `--tx-id` and `--rx-id` of earlier versions are gone: they are refused as unknown options (exit status 2) |
 | `--artifact`, `--artifact-sha256` | The flash artifact a procedure reads its blocks from (`Op::FlashBlock`, design 8.2.5, 11.3, ADR-336 items 1 and 12), and the SHA-256 the job names for it, 64 hexadecimal digits in either case. Both or neither, each at most once. The file is read once, before any worker starts, and its bytes stay in memory for the job (`agent::Artifact`), so a file changed on disk after the check cannot change a block. See step 1 for the check |
 | `--workers` | Directory of worker builds, laid out as `<dir>/<ABI name>/j2534-0404-service[.exe]` and `<dir>/<ABI name>/iso22900-service[.exe]` (design 7.3). Default: `workers` next to the `ngr-agent` executable |
-| `--locks` | The device's lock directory for the job's guards ("Job guards" below), as an absolute path. Default: `locks` next to the `ngr-agent` executable. Lock files are opened read-only, so a file another user created still locks. The agent creates a missing directory writable by its owner only, so a device whose agents run as several users needs it prepared beforehand: writable by all of them, and with the sticky bit (or an equivalent ACL) so that no user can delete another's lock files (ADR-257). It must also be readable by every agent user, since the per-vehicle lock lists it, and on Unix support hard links, with which it creates its files (ADR-262). On Unix a directory that group or others may write without the sticky bit, or without being readable by them, is refused |
-| `--comm-log` | The directory of the run's communication log (design 8.11, ADR-347), created if missing (on Unix writable and readable by its owner only; an existing directory keeps its permissions, which are not checked); at most once. The run gets a job ID of its own (`run-{unix ms}-{process ID}-{count}`, generation 0), so two runs never share a log, and the log's path is printed on stderr after the run, when the log was opened. A log that ends incomplete is reported on stderr and does not change the exit status. Without it the run writes no log, unless its procedure logs with `diag.log`: then it gets a log of its own in `commlog/` beside `ngr-agent`, as `--locks` defaults to `locks/`, with its path and an incomplete end reported the same way ("Communication log" below) |
+| `--locks` | The device's lock directory for the job's guards ("Job guards" below), as an absolute path. Default: `locks` in the state directory of `--mode`, the directory that holds the mode's journal (ADR-511 item 12), made private to the account if missing. Agents of one mode share their locks with no flag; a device-mode service and a user-mode run have different state directories and so do not, unless both pass the same `--locks`. Lock files are opened read-only, so a file another user created still locks. The agent creates a missing directory writable by its owner only, so a device whose agents run as several users needs it prepared beforehand and named by `--locks`: writable by all of them, and with the sticky bit (or an equivalent ACL) so that no user can delete another's lock files (ADR-257). It must also be readable by every agent user, since the per-vehicle lock lists it, and on Unix support hard links, with which it creates its files (ADR-262). On Unix a directory that group or others may write without the sticky bit, or without being readable by them, is refused |
+| `--comm-log` | The directory of the run's communication log (design 8.11, ADR-347), created if missing (on Unix writable and readable by its owner only; an existing directory keeps its permissions, which are not checked); at most once. The run gets a job ID of its own (`run-{unix ms}-{process ID}-{count}`, generation 0), so two runs never share a log, and the log's path is printed on stderr after the run, when the log was opened. A log that ends incomplete is reported on stderr and does not change the exit status. Without it the run writes no log, unless its procedure logs with `diag.log`: then it gets a log of its own in `commlog/` beside `ngr-agent`, as `--workers` defaults to `workers/`, with its path and an incomplete end reported the same way ("Communication log" below) |
 
 The job opens the link its variant declares (`agent::Job::declared_link`, ADR-324):
 
@@ -487,11 +487,20 @@ printed, as `register` prints no argument value.
      ledger open in another process (a `debug enqueue` that has not ended, or a second agent), a
      file that cannot be read or a directory that cannot be used is exit 3. A ledger found corrupt
      later, by a reopen, ends only the uploader ("The uploader" below);
-  8. the agent key through `agent::identity::agent_key` (create once). A key this run had to
+  8. the outcome record of the record's agent ID (`OutcomeRecord::open`, "The job intake" below),
+     beside the received-jobs ledger and opened as it is: read when present and never created by
+     the open, a torn last frame cut off. A file that does not read back ends the command with
+     exit 1 and the advice to register again, before the key store is touched; a file that cannot
+     be read, a record open in another process or a directory that cannot be used is exit 3;
+  9. the object cache (`ObjectStore::open`, "Fetching a job's objects" below), created when
+     missing. A cache open in another process (a `debug fetch` that has not ended, or a second
+     agent), or a directory that cannot be used, is exit 3;
+  10. the agent key through `agent::identity::agent_key` (create once). A key this run had to
      create cannot be the registered one, so it is "register again" (the key stays, and a code can
      be issued for its fingerprint); a key whose fingerprint differs from the record's
      (`KeyMismatch`, from `Opened::check`, which runs before the uploader or the session is spawned) is the same;
-  9. `uploader::start`, then `Opened::start` (with a `LogUploader` built from the same received-jobs ledger and `SharedLedger` as the uploader's, "Log requests" below), then the wait for a stop signal.
+  11. `uploader::start`, then the job intake (`intake::start`, over the `Fetcher` of the record and
+     the key), then `Opened::start` (with the intake and a `LogUploader` built from the same received-jobs ledger and `SharedLedger` as the uploader's, "Log requests" below), then the wait for a stop signal.
 - **The key's retry** covers two classes, each logged as one `warn` per try with a fixed class
   name (`key store` or `creation lock`) and the next delay: a key store that is unavailable, and
   the creation lock held by another process past its 10-second wait. The delays are the session's
@@ -509,23 +518,26 @@ printed, as `register` prints no argument value.
   did not read back; a panic ends it with no reason) is logged once at `error`, and the control session goes on (ADR-499):
   neither channel ends the other, nothing is uploaded until the agent restarts, and `connect`'s
   exit status stays the session's. A stop stops both: the uploader drops the request in flight
-  and awaits a ledger write that is running, and `connect` waits for it at most 10 seconds
-  (`UPLOADER_STOP_BOUND`) before it exits, with a warning when it did not end; a session that
+  and awaits a ledger write that is running, and `connect` waits for it at most `STOP_BOUND`
+  (30 seconds: the intake's `RUN_STOP_BOUND` and 10 for the end's record syncs) before it exits, with a warning when it did not end; a session that
   ends on its own error is followed by the same stop and wait for the uploader, so that the
   process's short shutdown does not cut a ledger rewrite. An uploader that had already ended is
   not waited for or logged again. `Opened::check` (the key is the record's; the origin, audience
   and instruction key parse) runs before either task is spawned.
 - **A stop** is SIGINT or SIGTERM on Unix, and Ctrl-C or the console closing on Windows. The
-  command then calls `Handle::stop` on the session and on the uploader; the session sends Close
-  1001 on a live connection and its task, which releases both locks, is awaited, then the uploader
-  for its bound, and the command exits 0. There is no Windows service
+  command then calls `Handle::stop` on the session, the intake and the uploader; the session sends
+  Close 1001 on a live connection and its task, which releases both locks, is awaited, then the
+  intake and the uploader, each for `STOP_BOUND`, and the command exits 0. The intake leaves a job
+  it was serving open ("The job intake" below). There is no Windows service
   integration. The handlers are installed before the record is read, so a signal during start is a
   stop too; if they cannot be installed the command exits 1. A stop during a key load does not
   wait for the load: the runtime is shut down with a short timeout (2 seconds), so the process
   ends promptly, though a load already running on a blocking thread may still finish in the
   background (or be cut off by the exit) before the process ends. A session task that ends
   without a stop (a panic) is exit 1 with "the control channel session ended unexpectedly"; both
-  locks are free by then.
+  locks are free by then. A job intake that ends without a stop (a panic, which a restart can repair) is
+  exit 3 with "the job intake ended unexpectedly", after the session is stopped, and is not waited
+  for again.
 - **The locks** make a second `connect` exit 3 ("a control channel session is already running")
   and `register` exit 3 while a session lives.
 - **A release build** on a machine without an installation file at the fixed location exits 1
@@ -535,9 +547,9 @@ printed, as `register` prints no argument value.
 | Exit status | Meaning |
 |---|---|
 | 0 | Stopped by a signal |
-| 1 | The installation file is absent, refused, not readable by the agent's account, not valid or for the other mode; not registered; register again (a record for another server than the installation file's, a key just created, a key that is not the record's, a record that reads but is not valid, an outbox file, an issue-time mark file, a received-jobs ledger or an upload ledger that is corrupt at start, or an outbox or received-jobs ledger that is corrupt when a poisoned one is opened again); no key store (a release build, a build or mode without one, wrong debug variables); the stop handlers cannot be installed; the session ended without a stop |
+| 1 | The installation file is absent, refused, not readable by the agent's account, not valid or for the other mode; not registered; register again (a record for another server than the installation file's, a key just created, a key that is not the record's, a record that reads but is not valid, an outbox file, an issue-time mark file, a received-jobs ledger, an upload ledger or an outcome record that is corrupt at start, or an outbox or received-jobs ledger that is corrupt when a poisoned one is opened again); no key store (a release build, a build or mode without one, wrong debug variables); the stop handlers cannot be installed; the session ended without a stop |
 | 2 | Invalid command line |
-| 3 | The installation file cannot be read for a reason other than a refusal of access, the key store is unavailable (Linux device mode: a credential that is a symlink, a FIFO or unreadable, or a missing credential directory; the unit then restarts every 10 seconds), another session or a registration is running, a lock cannot be taken, the state directory or the identity directory is unusable, the creation lock cannot be opened, the registration record cannot be read for an I/O reason, the outbox is open elsewhere or cannot be opened, the issue-time mark is open elsewhere or cannot be read, the received-jobs ledger is open elsewhere or cannot be read, or the upload ledger is open elsewhere or cannot be opened |
+| 3 | The installation file cannot be read for a reason other than a refusal of access, the key store is unavailable (Linux device mode: a credential that is a symlink, a FIFO or unreadable, or a missing credential directory; the unit then restarts every 10 seconds), another session or a registration is running, a lock cannot be taken, the state directory or the identity directory is unusable, the creation lock cannot be opened, the registration record cannot be read for an I/O reason, the outbox is open elsewhere or cannot be opened, the issue-time mark is open elsewhere or cannot be read, the received-jobs ledger is open elsewhere or cannot be read, the upload ledger is open elsewhere or cannot be opened, the outcome record is open elsewhere or cannot be read, or the object cache is open elsewhere or cannot be opened |
 | 4 | The agent key is present and cannot be used (it is not replaced) |
 
 ## Control channel session
@@ -561,7 +573,7 @@ connect`, above) loads the agent key and passes it in.
   `commandAck` and `commandRejected` over all connections (a command is counted once its answer
   is written; a job refused for its operator was answered `commandAck` and counts under
   `commands_acknowledged`, and so is a job past its start deadline). `intake` is the `Intake` trait object that takes every new verified instruction whose operator
-  the gate allows (ADR-483, ADR-489); `take` returns a future with a result, is called at most once per job ID and generation, returns promptly and tolerates being dropped; the default, `LogIntake`, is connected to no job runner: it logs the job ID at `debug` and drops the
+  the gate allows (ADR-483, ADR-489); `take` returns a future with a result, is called at most once per job ID and generation, returns promptly and tolerates being dropped. `received(job_id, generation)` has a default that does nothing: the channel calls it once the job's `received` event is appended to the outbox (not when the append failed or the stop came first), so that an intake that reports the job's later states does so after it. `connect` passes the job intake ("The job intake" below); the library's default, `LogIntake`, is connected to no job runner: it logs the job ID at `debug` and drops the
   instruction. `outbox` is the `SharedOutbox` around the open `Outbox` of the record's agent ID
   (below); the caller opens it, and the connections send its events. `marks` is the open
   `IssueMark` of the same agent ID and `clock` the device `Clock` (`agent::deadline`, "Start
@@ -685,7 +697,7 @@ connect`, above) loads the agent key and passes it in.
 - **The order on a command**: the gate verifies; the channel raises the mark to the instruction's issue time (a maximum, the one place the mark changes); the operator check; the duplicate check (ledger, below); the deadline (the device clock is read once, here, and not for a rejected, an operator-refused or a duplicate command); the synced write when the file is behind, for every verified command, a duplicate included; the ledger record; the intake; the first event; `commandAck`.
 - **A write that fails** (the write, a sync, the rename or the directory sync) withholds the intake, the event and the acknowledgement, warns once per `hello` under the class `mark-write` and closes with 1011. The mark in memory stays raised and the file's known value unchanged, so the next verified command writes again. A stop during the write ends as a stop.
 - **Status**: an expired job adds one to `commands_acknowledged`; `commands_rejected` is for the gate's refusals only.
-- **Not covered**: a deadline that passes between the acknowledgement and the real start of a job, and the resume of a recorded job (nothing starts a job from the control channel yet; those call the same raise and judgement when they land).
+- **After the acknowledgement**: the job intake judges the deadline again, with the same mark, when the job leaves its queue and while it waits for the server or the locks ("The job intake"); the deadline is decided once more at the job's first step, which refuses to begin a job whose deadline has passed (it ends `expired`, with nothing sent to the ECU); once the job has begun the deadline no longer applies. A job recorded before a restart is not resumed, so no deadline is judged for it.
 
 ## Received-jobs ledger
 
@@ -695,7 +707,7 @@ connect`, above) loads the agent key and passes it in.
 - **The rule**: a verified instruction for job `J` at generation `g` is a duplicate when `J` is recorded at `g` or higher; otherwise it is new, and a higher generation adds a second record. A duplicate is answered `commandAck` and counted in `commands_acknowledged`; no event, no intake call, no ledger write, no clock read, and a job past its deadline is still a duplicate. The record is made after the deadline check and the mark's write and before the intake.
 - **A record that fails** (write, sync, rename, directory sync; a blocking task that panics fails the command the same way but does not poison the ledger) withholds the intake, the event and the acknowledgement, warns once per `hello` under `ledger-write` and closes with 1011; the index is unchanged and the ledger then refuses records (`ledger-poisoned`, 1011) until `ReceivedJobs::reopen_if_poisoned` succeeds, which the session calls before each connection: a frame that reached the file counts, a torn one is cut, a corrupt file ends the session (`Ended::LedgerUnusable`, exit 1), another failure warns once per `hello` as `ledger-reopen` and is tried again. A duplicate is acknowledged while the ledger is poisoned. An `Intake` that fails after the record was made leaves the record, writes no event and no acknowledgement and closes with 1011 under `intake`.
 - **A stop during the write** ends as a stop; the write goes on holding the store and its lock, so a session started at once finds it in use (exit 3) until it ends.
-- **Not covered**: starting or resuming a recorded job, verifying its envelope again, and judging acceptance and the deadline again then (nothing starts a job from the control channel yet). A recorded job whose hand-over failed stays unrun until that exists.
+- **After a restart**: a recorded job is not resumed, and its envelope, acceptance and deadline are not judged again; a recorded job whose hand-over failed stays unrun. The job intake ("The job intake") runs only the jobs handed to it in the running session.
 
 ## Job instruction gate
 
@@ -929,7 +941,7 @@ The client:
 
 ## Fetching a job's objects
 
-The `agent` library's `fetch` module is the download leg of the data channel (design 4.1, 8.2.6, 14.3, ADR-497 items 6 to 8): it fetches the documents and the artifact that a verified instruction names from the object store, through `POST /api/v1/agent/downloads`. `connect` does not run it and no job starts it yet: the wiring "fetch before the run's first step" belongs to the item that starts jobs from the control channel, which calls `Fetcher::fetch_all` with the verified instruction.
+The `agent` library's `fetch` module is the download leg of the data channel (design 4.1, 8.2.6, 14.3, ADR-497 items 6 to 8): it fetches the documents and the artifact that a verified instruction names from the object store, through `POST /api/v1/agent/downloads`. `connect` opens the cache once and gives the `Fetcher` to the job intake ("The job intake" below), which calls `Fetcher::fetch_all` with the verified instruction before the run's first step, and `Fetcher::read_document` for the bytes of each document it runs; no other code reads the cache's files.
 
 - **API.** `Fetcher::new(record, key, ObjectStore::open(mode)?)`. `fetch(instruction, kind, digest)` makes one attempt and returns the cached file's path and length (`Fetched`); `fetch_retrying` is the bounded loop (the control channel's back-off, 1 second doubling to 60, a longer `Retry-After` honoured, at most the given number of attempts); `fetch_all(instruction, attempts)` takes every document hash and then the artifact hash; `read_document` returns a document's bytes from one load that reads and hashes them under the fetcher's lock, so no other task's commit or delete interleaves. Only a digest the instruction names, under the kind it names, is fetched (`NotNamed` otherwise, with nothing sent). One fetch runs at a time, so a second request for the same digest finds the cache. A stop is dropping the future: the temporary file is deleted, nothing is reported.
 - **One attempt.** The cache first (a hit sends nothing and exchanges no token); then the token, exchanged only now, by the fetcher's own exchange through `control::exchange` (the token holder and its log, `crate::data_token`, are shared with the uploader) (a 401 from the route drops it, exchanges once more and repeats once; a second 401 is a retry) and dropped when the call ends; then the route's answer, verified first (below), and read strictly (`{url, certificatePin, expiresInSecs}`, at most 64 KiB, no unknown member) and the object URL's rule, as the part-URL answer is (`uploader::routes`); then `uploader::http::Client::get`; then the digest check and the rename.
@@ -947,6 +959,24 @@ A debug build has two commands more, `ngr-agent debug enqueue` and `ngr-agent de
 
 `ngr-agent debug fetch --mode <device|user> --instruction <file> --kind <document|artifact> --sha256 <hex> [--attempts <n>]`, for the end-to-end tests (design 13.4); a release build does not compile it, and its parser reports `unknown command`. `--instruction` is a file holding one signed instruction envelope as the server delivered it. The command reads the installation file as every command does, reads the registration record without the control channel's locks (the cache has its own lock), verifies the envelope against the record's instruction key and the agent's ID, loads the key, opens the cache and runs `fetch_retrying` (`--attempts` defaults to 4). It prints `{"path": ..., "length": ...}` of the cached file on stdout. Exit status: 0 fetched; 1 it cannot as asked (not registered, an envelope that does not verify, a digest the instruction does not name, a refusal, a digest that did not match twice, a key just created); 2 a usage error; 3 it may work later (retries ran out, an exchange refused for a revoked agent, an answer the server did not prove, the disk, the cache locked, the key store).
 
+## The job intake
+
+`agent::intake` is what a verified instruction becomes (design 5.3, 5.6, 8.2.6; ADR-511). `JobIntake` is the `control::Intake` the `connect` command gives the session, and `intake::start(Parts)` returns it with a `Handle` (`stop()`, `stopped()`; dropping the handle stops the task). `Parts` holds the seams: `Objects` (the `Fetcher` in production), a `PlanSource` (`NoPlans`), a `VciLookup` (`RegisteredVcis`, which gives the `workers` directory next to the executable and the mode's lock directory, `locks` in its state directory, "Job guards"), the journal directory's source (`journal::dir_source(mode)`), the shared outbox and upload ledger, the issue-time mark and clock, and the outcome record.
+
+- **The queue.** `take` only stores the instruction and returns; it is an error only once the task has ended. When the channel has appended the job's `received` event it calls `received`, which moves the job to the end of the ready queue. One task serves the ready queue one job at a time, in that order, across the session's connections: a connection that ends neither ends nor repeats a job, and a job is served only after its `received` event, so no state of a job precedes it in the outbox. The queue has no bound.
+- **The order of a job's checks** (ADR-511 item 2); the first that fails decides.
+  1. The start deadline, judged by `IssueMark::judge` as the channel judges it, when the job leaves the queue: a job past it ends `expired` and the next is served.
+  2. The shape: a kind other than identification names exactly one document; an identification instruction has a plan hash and the plan source has the plan. A failure is `failed` with `instructionRejected`, before any fetch.
+  3. The fetch: `Objects::fetch_all` with three attempts. A refusal the server proved (`FetchError::Refused`) is `instructionRejected` at once; `Local`, `Task` and `NotNamed` are `preconditionFailed` with `internal`; every other class (`Retry`, `ExchangeCapped`, `Unproven`, `Mismatch` and `MismatchTwice`) is the server unavailable: the intake waits 60 seconds (`UNAVAILABLE_WAIT`) and fetches again, until the start deadline passes, which ends the job `expired`. The deadline is looked at every second, so it also cuts a fetch in flight and the wait.
+  4. The documents: each named hash is read with `Objects::read_document` and nowhere else, so a cached document the instruction does not name is never used, built into a `JobDocument`, and the set of their `JobDocument::sha256` values must equal the named set (otherwise `preconditionFailed` with `internal`). A document that does not load is `preconditionFailed` with `jobRefused`. The artifact the instruction names is read from the fetched object of its kind.
+  5. The kind against the document: an `acquire`, `monitorSession` or `monitorCapture` job whose program `writes` is `instructionRejected`, before `check_job`. An identification plan is loaded with the verified instruction (`load_plan`), so a plan whose SHA-256 is not the plan hash is `instructionRejected` before any link; another refusal of the plan or of `check_plan` is `jobRefused`. Then `check_job` with the build's ceiling: its refusal is mapped as the run's own would be (`job_report::outcome` on a first run, ADR-475).
+  6. The VCI: `VciLookup::find` (a VCI no definition names, one both APIs name, a lookup that fails: `preconditionFailed` with `linkNotOpened`), then `run_on_vci` ("The VCI shell" below) with a cancel flag. A worker that does not launch is `linkNotOpened` too; a lock that cannot be taken is `internal`.
+- **The refusals.** An `instructionRejected` has no detail: which check refused is written to the operational log only. Every other failure before the run has a fixed detail, and its cause is in the log (as `external`, escaped).
+- **The run.** A program job is `run_program_journaled` with the journal under `journal_dir(mode)`, the job's key and its VIN, and no intended software version; its communication log is the journal's, beside it. An identification job is `run_identification` with `CommLogSetup::for_run_key` in the same directory. The run is a task of its own, watched by the intake. `running` is appended once, when the run's first-step hook lets the job begin (a send on a channel). The hook (`runner::FirstStep`) returns `Begin::Go` or `Begin::Expired`, and it decides in two steps. It judges the start deadline itself, with the issue-time mark and the clock the intake already holds in memory (no I/O on the job thread), and cuts the `StartGate` when the deadline has passed, so a deadline that passes between two of the watching task's one-second polls still expires the job. Otherwise it moves the gate out of its waiting state by a compare-and-swap. The watching task's deadline poll cuts the same gate, and each of them moves the gate out of its waiting state by a compare-and-swap, so exactly one of them wins. Until the job begins the start deadline cuts the gate and sets the shell's cancel flag, which ends the wait for the locks, or the launch, as `expired`; a job whose deadline has passed, or whose gate was cut, after the launch is refused at its first step with `JobError::StartDeadlinePassed`, sends nothing (an identification run closes its first link), and `job_report` maps it to `expired` with no failure code and no detail. The journaled run creates its journal before the hook, and a journal with no step counts as a plain start, so the job stands clean. Once the job has begun the deadline no longer concerns it. A run's end is `job_report::outcome` with the journal's standing read after it (an identification run has none and is `Clean`); `Open` and `None` report nothing terminal and the queue goes on.
+- **The stop.** `Handle::stop` sets the shell's cancel flag and the job's own (`Job::with_cancel`, the `cancel` of `run_identification`), and keeps awaiting the run for `RUN_STOP_BOUND` (20 seconds: the wait for a job's end on the link, 10, the worker's stop, 5, and 5 of margin), so the job ends at its next interruptible point, its worker is stopped and its locks are released; a run that does not end in time is dropped, with a warning, and its job stays open. `connect` waits for the task at most `STOP_BOUND` (30 seconds). While it stops, nothing terminal is reported and nothing is recorded, so the job stays open for the resume, except a run that ended `Ok` (also one that ended while the stop was being carried out): its `completed` is reported and recorded and its result enqueued. The start deadline cuts the gate and sets only the shell's flag, so it ends a job that has not yet begun (waiting for its locks, launching its worker, or opening its link or journal before the first step) and no job past its first step. A job taken after the task ended is an `IntakeError`.
+- **The result.** Only a run that ended `Ok` enqueues a result in the upload ledger: the final VM state as JSON (`result_json::vm_state_json`, which `ngr-agent run` prints too) or the identification report. A run that ended another way enqueues none. The communication log is not enqueued by the intake: it is uploaded on an operator's request ("Log requests" above).
+- **The outcome record** (`agent::outcome_record`, `<state>/registration/<agent-id>.outcomes.v1`, beside the received-jobs ledger in the frame layout of `agent::frame_file`, which both share) holds two records, in the order written: `ended` (job, generation and the terminal state) and `reported`. The order of an end is the result's enqueue, the `ended` record synced, the append to the outbox, then `reported`. At its start, and every minute while idle with one owed, the intake appends the ends that have no `reported`, so an end is appended at least once and, after a crash between the two records, one more time at most. A failed enqueue, record or append is logged and does not stop the others: the state is reported all the same. An end appended in this start is not appended again whatever becomes of its `reported` record; an end that is neither recorded nor appended is kept in memory and tried again, and is lost only if the agent ends first (logged at `error`). A file that does not read back is corrupt and never repaired, and a poisoned record is opened again before its next write.
+
 ## Reporting a run's end
 
 `agent::job_report::outcome` maps a run's `Result<VmState, JobError>`, whether it was the job's first run and the journal's standing to a `JobOutcome` (design 5.6, ADR-475): `Terminal(JobState)`, `Open` (report no terminal state; the job is resumed as after a crash) or `None` (`JobError::Journal(InUse)` or `AlreadyExists`: another run owns the job, ADR-255). The match on `JobError` has no wildcard arm, so a new variant must be placed, and it reads no worker kind, API or vendor code.
@@ -959,7 +989,7 @@ The standing is what the next resume would decide: `JournalStanding::of` calls `
 - `Resumable`: a refusal that every resume repeats (`Program`, `Vm`, `SeveralTargets`, `Undeclared`, `NoDeclarations`, `Sources`, `Refused`, `NoArtifact`, `ArtifactMismatch`, `SegmentOutsideArtifact`, `ArtifactDiffersFromJournal`, `CommLogMismatch`, `NoCommLogDir`, `CurrentThreadRuntime`, `GuardsMissing`, and `Link` with a declared link the document does not give; a refused link setup is not, as it also carries the worker's answer at the open) is `NeedsOnSiteRecovery` with the error's `log_text`; any other error (`Link` otherwise, `Host`, `IdentityRead`, `IdentityUnreadable`, `NoReprogrammingSlot`, `VehicleLock`, `LinkUnconfirmed`, `Journal`, `Panicked`, `Cancelled`, `Unanswerable`) is `Open`.
 - `Clean`: a first run's refusal (`Program`, `SeveralTargets`, `Undeclared`, `NoDeclarations`, `Sources`, `Refused`, `NoArtifact`, `ArtifactMismatch`, `SegmentOutsideArtifact`, `ArtifactDiffersFromJournal`), `Link` and `LinkUnconfirmed`, and the agent's own configuration faults (`NoReprogrammingSlot`, `CurrentThreadRuntime`, `CommLogMismatch`, `NoCommLogDir`, `GuardsMissing`) are `PreconditionFailed` with `jobRefused`, `linkNotOpened`, `deviceLocked` and `internal`; on a resume they are `Failed` with the same codes, except `Link`, which is `exchangeFailed`. `Panicked` and a journal fault can happen mid-run, so they are `Failed` with `internal` on a first run too. `Host`, `IdentityRead`, `IdentityUnreadable` and `VehicleLock` are `Failed` with `exchangeFailed` and `Unanswerable` with `other`.
 
-A detail is `LogSafe::log_text` cut to 1024 bytes and left out of the event when empty; `log_text` carries no operating-system text (the I/O error of a journal or a guard lock shows its kind only), no document text (`Sources`, a declared link), no job ID and no reason string of an unreadable journal or an invalid entry state; that text is in `log_external`. An on-site reason is written as its name and plain numeric fields by hand (strings, the supply voltage and the nested teardown outcomes stay out). `on_job_thread` ends a job as `Cancelled` when the runtime shuts down before its thread starts, so whatever sends the outcome must send nothing terminal while the agent shuts down.
+A detail is `LogSafe::log_text` cut to 1024 bytes and left out of the event when empty; `log_text` carries no operating-system text (the I/O error of a journal or a guard lock shows its kind only), no document text (`Sources`, a declared link), no job ID and no reason string of an unreadable journal or an invalid entry state; that text is in `log_external`. An on-site reason is written as its name and plain numeric fields by hand (strings, the supply voltage and the nested teardown outcomes stay out). `on_job_thread` ends a job as `Cancelled` when the runtime shuts down before its thread starts, so the intake sends nothing terminal while the agent shuts down, except a run that ended `Ok` ("The job intake" below).
 
 ## Log requests
 
@@ -967,7 +997,7 @@ The `agent` library's `log_upload` module answers the control channel's `logUplo
 
 `LogUploader` answers in this order. (1) `unknownJob` unless the job ID is a canonical UUID and the received-jobs ledger's highest generation for it is the one asked for, so an earlier generation is as unknown as a job never taken. (2) `queued` when the upload ledger has an entry for the job, generation and a communication log, whatever bytes it covers, without reading the file or trying the lock. (3) On a blocking task, `comm_log::digest_for_upload` first answers `noLog` for a log file that does not exist (before the lock is touched, so no lock file is made), takes the log's writer lock once (`busy` when a run holds it), finds the last line end by reading back from the end of the file (a torn last line is not part of the entry), answers `noLog` when there is none, `tooLarge` when it is over the ledger's 4 GiB bound (a `LogUploader` built in a test may lower it), and otherwise hashes the file up to that offset with the lock held. (4) The entry is enqueued with the log's path, which `comm_log::comm_log_path` builds in the journal directory of the agent's mode (`journal_dir(mode)`, resolved at each command) and which the log's writer uses too, and `queued` is the answer once the entry is durable. A run that reopens the log cuts it only after its last line end and appends, so the bytes an entry covers do not change. A ledger that refuses the entry as `Conflict` (another command queued the log first) is `queued`.
 
-Nothing in the agent writes a server job's log at that path yet: the runner's intake that starts server jobs is not built, so a job taken from the server answers `noLog` until it is.
+The job intake writes every server job's log at that path: a program job's log goes beside its journal under the same key, and an identification job's log is made with `CommLogSetup::for_run_key` in the same directory. A job that never reached its run (a refusal, a fetch that never came) has no log and answers `noLog`.
 
 ## Communication log
 
@@ -2090,7 +2120,7 @@ a job that `writes`), launches the worker of the VCI's API (`launch_worker`), ru
 the worker's `RelaunchingWorker`, the VCI's facts and the guards, stops the worker and releases
 the guards. It returns the job's result, how its communication log ended and how the worker
 ended (`WorkerEnd`); it prints nothing, so `ngr-agent run` and `ngr-agent identify` report the
-log's path and the worker's end on stderr, and the intake reports them its own way.
+log's path and the worker's end on stderr, and the intake logs them in the operational log.
 
 - The wait for the locks takes a cancel flag (`Arc<AtomicBool>`). A flag set while it waits ends
   it with `VciShellError::Cancelled`, with no worker launched. The commands pass a flag that is
@@ -2102,14 +2132,20 @@ log's path and the worker's end on stderr, and the intake reports them its own w
   API is the one whose definitions name the VCI. A name no definition holds is
   `VciShellError::UnknownVci`, and one that both APIs' definitions name is
   `VciShellError::AmbiguousVci`; the library file is not checked until the worker launches, which
-  fails as `VciShellError::Launch`.
+  fails as `VciShellError::Launch`. `RegisteredVcis::for_mode(mode)` gives it the `workers`
+  directory next to the executable, which is only read, and `vci_shell::lock_dir(mode)`: `locks`
+  in the mode's state root, beside the journal directory, made private to the account when
+  missing. That is where `connect` and, without `--locks`, `ngr-agent run` and `identify` take
+  their locks, so a device-mode service, which runs as an unprivileged account that cannot write
+  next to the executable, can create it.
 - A run's first step: `run_program_journaled` and `run_identification` take an optional
   `runner::FirstStep`, a `FnOnce` the job thread calls once, after the run's checks and before
   its first instruction or request. A run refused before that point never calls it, and the
   hook must not wait (a channel send).
 - `identification::PlanSource` gives the bytes of the plan an identification instruction's
-  plan hash names. The agent's `NoPlans` has none, since the server serves no plan yet;
-  `load_plan` checks whatever a source gives against the instruction's hash.
+  plan hash names. The agent's `NoPlans` has none, since the server serves no plan yet, so the
+  intake refuses an identification instruction before any fetch; `load_plan` checks whatever a
+  source gives against the instruction's hash.
 
 ## Job guards
 
@@ -2165,10 +2201,11 @@ a restart's replay keep the rule above (ADR-337). The
 job thread, with its guards and link, may therefore run on for as long as the section takes,
 waits included, and the worker must not be handed to another job meanwhile. A job that survives a worker crash, a VCI disconnect or a loss
 of the vehicle's supply alone gets them back, still held, and passes them to its next run. A
-VCI name has 1 to `MAX_VCI_NAME` (100) bytes. The lock directory is one per device,
-shared by every agent process on it whichever user it runs as: each of them must be able to
-create files in it, list it (the per-vehicle lock counts its bucket files, ADR-262) and read the
-lock files there (lock files are opened read-only).
+VCI name has 1 to `MAX_VCI_NAME` (100) bytes. The default lock directory is `locks` in the state directory of the mode (ADR-511 item 12),
+the account's own, so agents of one mode on a device share it and a device-mode service and a
+user-mode run do not. A directory shared by several accounts is named with `--locks`: each of
+them must be able to create files in it, list it (the per-vehicle lock counts its bucket files,
+ADR-262) and read the lock files there (lock files are opened read-only).
 
 A run whose link close fails or panics, or whose open fails partway and cannot close what it had
 opened, gives its guards back marked (`JobGuards::link_unconfirmed`), whatever the job's own

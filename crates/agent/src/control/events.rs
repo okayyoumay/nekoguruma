@@ -16,6 +16,7 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
+use shared_proto::{AgentEventMessage, AgentMessage, ControlError, JobId, JobState};
 use tokio::sync::{Mutex, Notify};
 use tokio::time::Instant;
 
@@ -75,10 +76,28 @@ impl SharedOutbox {
         appended.unwrap_or_else(|_| Err(task_failed()))
     }
 
+    /// Appends the `jobState` event of `job_id` in `state` (see [`SharedOutbox::append`]): the
+    /// text is checked to encode at the longest number the counter gives before anything is
+    /// appended, so the text appended encodes as well. No device time is given: the property is
+    /// optional and the server stamps its own receive time (16.3).
+    pub async fn append_job_state(
+        &self,
+        kind: Kind,
+        job_id: String,
+        state: JobState,
+    ) -> Result<u64, JobStateError> {
+        job_state_text(&job_id, u64::MAX - 1, &state).map_err(JobStateError::Text)?;
+        Ok(self
+            .append(kind, move |seq| {
+                job_state_text(&job_id, seq, &state).unwrap_or_default()
+            })
+            .await?)
+    }
+
     /// Reopens the outbox on a blocking task when it is poisoned (see [`Outbox::reopen`]);
     /// `Ok(true)` when it did, `Ok(false)` when it was not poisoned. The session calls it before
     /// each connection attempt, so the reconnect delay paces the retries.
-    pub(super) async fn reopen_if_poisoned(&self) -> Result<bool, OutboxError> {
+    pub(crate) async fn reopen_if_poisoned(&self) -> Result<bool, OutboxError> {
         let inner = self.inner.clone();
         let reopened = tokio::task::spawn_blocking(move || {
             let mut outbox = inner.outbox.blocking_lock();
@@ -103,6 +122,19 @@ impl SharedOutbox {
             .collect()
     }
 
+    /// The texts of the events still pending, in order, for a test that reads what the server
+    /// would be sent.
+    #[cfg(test)]
+    pub(crate) async fn texts_for_test(&self) -> Vec<String> {
+        self.inner
+            .outbox
+            .lock()
+            .await
+            .pending()
+            .map(|(_, text)| text.to_owned())
+            .collect()
+    }
+
     #[cfg(test)]
     pub(super) async fn is_poisoned_for_test(&self) -> bool {
         self.inner.outbox.lock().await.is_poisoned()
@@ -124,6 +156,26 @@ impl SharedOutbox {
             notified.await;
         }
     }
+}
+
+/// The text of the `jobState` event of `job_id` in `state` with number `seq`.
+fn job_state_text(job_id: &str, seq: u64, state: &JobState) -> Result<String, ControlError> {
+    AgentMessage::AgentEvent(AgentEventMessage {
+        seq: Some(seq),
+        occurred_at_agent: None,
+        event: state.to_event_kind(JobId(job_id.to_owned())),
+    })
+    .encode()
+}
+
+/// Why a job state's event was not appended.
+#[derive(Debug, thiserror::Error)]
+pub enum JobStateError {
+    /// The event's text cannot be built: nothing was appended.
+    #[error("the job state's event cannot be built")]
+    Text(#[source] ControlError),
+    #[error(transparent)]
+    Outbox(#[from] OutboxError),
 }
 
 fn task_failed() -> OutboxError {

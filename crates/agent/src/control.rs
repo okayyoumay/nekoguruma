@@ -65,7 +65,7 @@ use crate::registration::origin::ServerOrigin;
 use crate::registration::record::{self, Record, RecordError};
 use backoff::Backoff;
 use dial::{Dial, Loopback};
-pub use events::SharedOutbox;
+pub use events::{JobStateError, SharedOutbox};
 use exchange::Fail;
 pub use gate::{Intake, IntakeError, LogIntake, Taken};
 

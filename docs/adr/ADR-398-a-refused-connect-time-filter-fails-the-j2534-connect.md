@@ -1,7 +1,7 @@
 # ADR-398: A Refused Connect-Time Filter Fails the J2534 Connect; the Log Header Names the Job Kind; `ngr-agent identify`
 
 **Date:** 2026-10-31
-**Status:** Accepted
+**Status:** Accepted (item 6's shell, `run_on_vci`, moved into the library by ADR-511 item 9, with the log's setup and the report of its path left to each caller)
 **Affects:** `j2534-0404-service` (`rpc_link`: the connect's install of the UniqueRespIdTable
 filters and the teardown shared with `DisconnectComLogicalLink`; `error`; `events`: the hard
 error clears the counts), `j2534-0404-mock`, `agent` (`comm_log` `RunFacts` and header, `runner`, `identification`, `main.rs`),

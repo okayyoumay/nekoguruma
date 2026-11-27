@@ -1,7 +1,7 @@
 # ADR-481: A Stored Job-State Report Is Applied to the Sender's Own Job, and an End Frees Its Vehicle Lock
 
 **Date:** 2026-11-16
-**Status:** Accepted
+**Status:** Accepted (item 5's treatment of an agent-sent `instructionRejected` as a server-only code superseded by ADR-511 item 3)
 **Affects:** design 4.3, 5.1, 5.3, 5.6, 8.8; `db/migrations/0010_job_procedure_code.sql`, `db/README.md`; `api/openapi.yaml` (`Job`, `POST /v1/jobs`), `api/asyncapi.yaml` (`agentEvent`); `crates/server` (`agent_events`, `job_state`, `job_queue`, `jobs`), `crates/server/docs/ngr-server.md`; `crates/shared-proto` (`JobState`, `FailureCode`); `docs/glossary.md`; details ADR-479 item 7, replaces ADR-480's first consequence and ADR-476's consequence that a delivered job stays `received`
 
 ## Context

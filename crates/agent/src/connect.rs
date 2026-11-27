@@ -363,10 +363,10 @@ pub async fn run(
     let outcomes = OutcomeRecord::open(mode, &opened.record().agent_id)
         .map_err(|error| outcome_record_error(&error))?;
     let objects = ObjectStore::open(mode).map_err(|error| object_store_error(&error))?;
-    let vcis = RegisteredVcis::beside_executable().map_err(|error| {
+    let vcis = RegisteredVcis::for_mode(mode).map_err(|error| {
         fail(
             Exit::Unavailable,
-            format!("cannot locate the directories next to ngr-agent: {error}"),
+            format!("cannot locate the worker and lock directories: {error}"),
         )
     })?;
     let log_uploads = LogUploader::new(mode, ledger.clone(), uploads.clone());

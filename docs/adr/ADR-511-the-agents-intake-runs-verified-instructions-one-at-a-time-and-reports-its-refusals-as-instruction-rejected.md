@@ -59,7 +59,7 @@ launches its worker in the binary, out of reach of a second caller.
      - during the wait for the locks;
      - between the shell's launch of the worker and the job's first step.
    - A job whose deadline passes ends as `expired`, and the next job starts.
-   - The last judgement is made at the first step, by the hook that item 6 describes, which either lets the job begin or refuses it: the deadline and the hook each take one shared state out of "waiting" by a compare-and-swap, so exactly one of them wins and the deadline cannot cut a job that has begun. A job refused there sends nothing to the ECU and ends `expired`, with no failure code and no detail. (Amendment by the maintainer, 2026-11-27: before it, the deadline stopped a job only until the shell launched the worker.)
+   - The last judgement is made at the first step, by the hook that item 6 describes, which judges the start deadline itself, with the issue-time mark and the clock in memory (a poll of the watching task, once a second, would let a first step just after the deadline begin), and refuses the job when it has passed, and otherwise lets it begin: the deadline and the hook each take one shared state out of "waiting" by a compare-and-swap, so exactly one of them wins and the deadline cannot cut a job that has begun. A job refused there sends nothing to the ECU and ends `expired`, with no failure code and no detail. (Amendment by the maintainer, 2026-11-27: before it, the deadline stopped a job only until the shell launched the worker.)
 6. **What is reported, and when.**
    - `running` is sent once, from a hook that the journaled run and the identification run call after their pre-run checks, before the first instruction. The hook decides whether the job begins (item 5) and sends `running` only when it does.
    - A run's end is mapped by `job_report::outcome` (ADR-475).
@@ -82,6 +82,16 @@ launches its worker in the binary, out of reach of a second caller.
     channel calls once that append has returned (not when it failed or the stop came first), and
     the intake moves the job from the jobs it has taken to the queue it serves only then. A job
     whose `received` is never appended stays taken and unserved until the resume item starts it.
+12. **The lock directory is in the mode's state directory.** (Decision by the maintainer,
+    2026-11-27.) The default lock directory of `connect`, `ngr-agent run` and `ngr-agent
+    identify` is `locks` in the state directory of the agent's mode, the directory that holds
+    its journal; `--locks` still overrides it. It replaces the `locks` directory next to the
+    executable (ADR-257 item 4), which an agent that runs as an unprivileged account, as under
+    the packaged service, cannot create, so that every job would end `preconditionFailed`. The
+    agent makes the directory as it makes the journal's, private to its account. Agents of one
+    mode therefore share their locks with no flag; a device-mode service and a user-mode run
+    have different state directories and do not share them, unless both name one directory with
+    `--locks`. The worker builds stay next to the executable, since the agent only reads them.
 
 ## Rejected
 

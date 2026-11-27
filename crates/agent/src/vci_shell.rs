@@ -89,14 +89,34 @@ pub struct RegisteredVcis {
 }
 
 impl RegisteredVcis {
-    /// The lookup with the worker builds and the lock directory the agent's own installation has:
-    /// the `workers` and `locks` directories next to the running executable.
-    pub fn beside_executable() -> std::io::Result<Self> {
+    /// The lookup of the agent of `mode`: the worker builds are the `workers` directory next to
+    /// the running executable (only read), and the lock directory is that of [`lock_dir`].
+    pub fn for_mode(mode: OperatingMode) -> std::io::Result<Self> {
         Ok(Self {
             workers: beside_executable("workers")?,
-            locks: beside_executable("locks")?,
+            locks: lock_dir(mode).map_err(std::io::Error::other)?,
         })
     }
+}
+
+/// The name of the lock directory in the state root of a mode.
+const LOCK_DIR_NAME: &str = "locks";
+
+/// The default lock directory of `mode`: `locks` in the mode's state root, which also holds its
+/// journal directory (ADR-511), made when missing and private to the agent's account like the
+/// directories of the journal. Agents of one mode therefore share their locks; an agent of
+/// another mode, or another account, has its own. Where the installation runs the agent as an
+/// unprivileged account, the directory is that account's, not a directory beside the executable.
+pub fn lock_dir(mode: OperatingMode) -> Result<PathBuf, crate::state::StateDirError> {
+    lock_dir_from(mode, &|name| std::env::var_os(name))
+}
+
+/// [`lock_dir`] for the environment `var` reads.
+fn lock_dir_from(
+    mode: OperatingMode,
+    var: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<PathBuf, crate::state::StateDirError> {
+    crate::state::private_subdir_from(mode, var, LOCK_DIR_NAME)
 }
 
 /// The directory `name` next to the running executable.
@@ -313,6 +333,39 @@ mod tests {
             workers: PathBuf::from("no-workers"),
             locks,
         }
+    }
+
+    /// The default lock directory is `locks` in the state root of the mode, made when missing and
+    /// shared by every call for that mode; a mode with another root has another directory.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_default_lock_directory_is_in_the_state_root_of_the_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        let var_of = |root: PathBuf| {
+            let value = root.into_os_string();
+            move |name: &str| (name == crate::state::STATE_DIR_VAR).then(|| value.clone())
+        };
+        let (device_root, user_root) = (temp.path().join("device"), temp.path().join("user"));
+        let device = lock_dir_from(OperatingMode::Device, &var_of(device_root.clone())).unwrap();
+        let user = lock_dir_from(OperatingMode::User, &var_of(user_root.clone())).unwrap();
+        assert_eq!(device, device_root.join("locks"));
+        assert_eq!(user, user_root.join("locks"));
+        assert!(device.is_dir() && user.is_dir());
+        assert_eq!(
+            lock_dir_from(OperatingMode::Device, &var_of(device_root)).unwrap(),
+            device,
+            "a second call finds the directory the first made"
+        );
+        // The guards accept the directory it made.
+        let guards = crate::guards::JobGuards::take_vci_only(
+            &crate::guards::GuardSetup {
+                dir: device,
+                vci: "ngr-test-lock-dir".to_owned(),
+            },
+            Duration::from_millis(10),
+            &AtomicBool::new(false),
+        );
+        assert!(guards.is_ok(), "{:?}", guards.err());
     }
 
     /// A VCI that no definition on a test machine names is unknown, not a launch failure.

@@ -1056,7 +1056,7 @@ The targets form 3 tiers: VCI (communication interface) -> vehicle bus -> ECU.
 
 | Layer | Means | Limitation |
 |---|---|---|
-| Same PC | OS-level exclusive lock (a file lock in a device lock directory, ADR-256) | Same PC only |
+| Same PC | OS-level exclusive lock (a file lock in a lock directory, by default `locks` in the agent's state directory, ADR-256, ADR-511 item 12) | Same PC only |
 | Server | Per-VIN lock taken when a job is created (a second job for the vehicle is refused while the lock is held; it expires on its own) | Does not work offline; a refusal, not a warning, and there is no override |
 | Vehicle | Check session state and bus conditions on connection | Detection, not prevention |
 

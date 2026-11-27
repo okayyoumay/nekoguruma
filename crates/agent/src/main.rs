@@ -132,7 +132,7 @@ options:
   --workers <dir>      worker binaries, laid out as <dir>/<ABI name>/<binary>
                        (default: the 'workers' directory next to ngr-agent)
   --locks <dir>        the device's lock directory for the VCI lock and the reprogramming
-                       slot (default: the 'locks' directory next to ngr-agent)
+                       slot (default: 'locks' in the state directory of --mode)
   --comm-log <dir>     writes the run's communication log (design 8.11) to this directory,
                        created if missing, and prints the log's path on stderr; without it
                        the run writes none, unless its procedure logs messages (diag.log):
@@ -1027,9 +1027,10 @@ fn default_workers() -> Result<PathBuf, String> {
     next_to_exe("workers", "--workers")
 }
 
-/// The `locks` directory next to the running executable.
-fn default_locks() -> Result<PathBuf, String> {
-    next_to_exe("locks", "--locks")
+/// The lock directory of `mode`: `locks` in its state root.
+fn default_locks(mode: OperatingMode) -> Result<PathBuf, String> {
+    agent::vci_shell::lock_dir(mode)
+        .map_err(|error| format!("cannot make the lock directory: {error}; pass --locks"))
 }
 
 fn default_comm_logs() -> Result<PathBuf, String> {
@@ -1195,7 +1196,7 @@ async fn identify_job(args: IdentifyArgs, key: JobKey) -> Result<String, String>
 }
 
 /// The shell's VCI for a command, from the command line: its API and name, the worker builds
-/// and the lock directory it names or the ones next to the executable.
+/// and the lock directory it names, or the workers next to the executable and the mode's locks.
 fn vci_shell(
     api: Api,
     vci: String,
@@ -1209,7 +1210,7 @@ fn vci_shell(
     };
     let locks = match locks {
         Some(dir) => dir,
-        None => default_locks()?,
+        None => default_locks(mode)?,
     };
     Ok(VciShell {
         vci,

@@ -1,7 +1,7 @@
 # ADR-257: Every Job Runs on Guards It Holds
 
 **Date:** 2026-10-09
-**Status:** Accepted (lock files must be regular files since ADR-262 item 6; ADR-325 item 10 adds an access class that does not need the reprogramming slot; items 2 and 4's writing test applies to every combination a job holds, ADR-325 item 7)
+**Status:** Accepted (lock files must be regular files since ADR-262 item 6; ADR-325 item 10 adds an access class that does not need the reprogramming slot; items 2 and 4's writing test applies to every combination a job holds, ADR-325 item 7; item 4's default lock directory is the mode's state directory, ADR-511 item 12)
 **Affects:** `agent` (`src/guards.rs`, `src/runner.rs`, `src/policy.rs`, `src/main.rs`), `j2534-0404-service` (tests), ADR-256
 
 ## Context
@@ -63,7 +63,7 @@ runner also needs a way to know which kind of job it runs.
   ACL that grants create but not delete on others' files. The agent does not set these
   permissions: it cannot safely change a directory another user owns, so on a device whose
   agents run as several users the installation prepares the directory and names it with
-  `--locks` or places it next to the executable. The agent checks what it can instead. On
+  `--locks`. The agent checks what it can instead. On
   Unix it creates a missing directory writable by its owner only (mode 0755 before the
   umask), and refuses a directory that group or others may write without the sticky bit
   (`GuardError::UnsafeDir`), before it takes any lock. On Windows it does not check the ACL.

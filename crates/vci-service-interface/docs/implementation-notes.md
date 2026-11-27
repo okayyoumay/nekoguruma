@@ -8,7 +8,7 @@ Defines gRPC/protobuf contract and generated Rust bindings consumed by service a
 
 - service.proto is the source of truth for wire contract.
 - Generated bindings are checked into source and included directly by lib.rs.
-- Regeneration remains feature-gated through protoc options.
+- Regeneration needs a protoc feature and `NGR_REGENERATE_PROTO=1`; the feature alone writes nothing.
 - proto-rules.md is a normative naming and field-policy reference.
 - `src/rich_error.rs` is hand-written, non-generated Rust and is not touched
   by the regeneration workflow below; it only depends on message types the

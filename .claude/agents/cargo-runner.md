@@ -61,7 +61,7 @@ Hard rules (these override anything else in your brief):
   stable` and `rustup target add x86_64-pc-windows-gnullvm` once per
   session, with the pinned llvm-mingw from `scripts/fetch-llvm-mingw.sh` on
   `PATH`), which you run when the brief's change touches `cfg(unix)`,
-  `cfg(windows)` or other platform-specific code. A bindgen build rewrites committed files in
+  `cfg(windows)` or other platform-specific code. A bindgen build with `NGR_REGENERATE_FFI=1` rewrites committed files in
   `crates/*-sys/src/bindings/`, which conflicts with the first rule; report
   back instead.
 

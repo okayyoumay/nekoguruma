@@ -445,10 +445,12 @@ components:
                   libraryLoadFailed, unsupportedAbi, runtime32BitMissing, cpuOrKernelNo32Bit,
                   gatewayAuthExpired, ticketExpired, procedure, procedureError, jobRefused, linkNotOpened,
                   exchangeFailed, internal, instructionRejected, instructionKeyRetired, operatorNotAllowed and other.
-                  instructionRejected and instructionKeyRetired are the server's own, for a job it ends before
+                  instructionRejected and instructionKeyRetired are the server's, for a job it ends before
                   the agent runs it: the first when the agent refused the delivered command (the detail is the
                   agent's coarse reason), the second when the job's instruction was signed by a key that is
-                  no longer the active one (5.3, ADR-476); an agent does not send them. operatorNotAllowed is the agent's: it
+                  no longer the active one (5.3, ADR-476). An agent also sends instructionRejected, when its
+                  intake refuses an instruction it has acknowledged (ADR-511 item 3); it does not send
+                  instructionKeyRetired. operatorNotAllowed is the agent's: it
                   refused a verified job because its operator is not one the agent allows, with no detail
                   (5.3, 6.6, ADR-483). Only internal asserts a fault of the diagnostic system
                   (the agent's, or the server's when it ends a job whose instruction is too large to send);

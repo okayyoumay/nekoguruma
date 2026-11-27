@@ -71,14 +71,13 @@ impl Report {
     }
 }
 
-/// The name of the failure code the agent reported, kept when it is one an agent may report; the
-/// server's own two (an agent's refusal of a command and a retired instruction key, ADR-476), an
-/// unknown name and no name are `other`.
+/// The name of the failure code the agent reported, kept when it is one an agent may report.
+/// `instructionRejected` is one: the agent's intake refuses an instruction it has acknowledged
+/// with it (ADR-511 item 3), as the server ends a job whose command the agent refused (ADR-476).
+/// The server's own `instructionKeyRetired`, an unknown name and no name are `other`.
 fn agent_failure_code(name: Option<&str>) -> &'static str {
     match name.and_then(FailureCode::from_wire_name) {
-        Some(FailureCode::InstructionRejected | FailureCode::InstructionKeyRetired) | None => {
-            FailureCode::Other.wire_name()
-        }
+        Some(FailureCode::InstructionKeyRetired) | None => FailureCode::Other.wire_name(),
         Some(code) => code.wire_name(),
     }
 }
@@ -220,14 +219,13 @@ mod tests {
             None
         );
         assert_eq!(code("failed", "procedure"), Some("procedure"));
-        // Unknown, wrongly cased and the server's own two are `other`.
-        for odd in [
-            "nope",
-            "VinMismatch",
-            "",
-            "instructionRejected",
-            "instructionKeyRetired",
-        ] {
+        // The intake's refusal of an acknowledged instruction keeps its code (ADR-511 item 3).
+        assert_eq!(
+            code("failed", "instructionRejected"),
+            Some("instructionRejected")
+        );
+        // Unknown, wrongly cased and the server's own retired key are `other`.
+        for odd in ["nope", "VinMismatch", "", "instructionKeyRetired"] {
             assert_eq!(code("failed", odd), Some("other"), "{odd:?}");
         }
         assert_eq!(report("failed").failure_code, Some("other"));

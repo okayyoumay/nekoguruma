@@ -571,6 +571,15 @@ fn answer(
     gate: &Mutex<Option<std::time::Instant>>,
     unapplied_gate: &Mutex<Option<std::time::Instant>>,
 ) {
+    // Counted before the agents are told, so that a test that sees an acknowledgement also sees
+    // the counts of the store behind it.
+    if let Some(counts) = counts {
+        counts.stored.fetch_add(stored.stored, Ordering::Relaxed);
+        counts
+            .duplicates
+            .fetch_add(stored.repeats, Ordering::Relaxed);
+        counts.applied.fetch_add(stored.applied, Ordering::Relaxed);
+    }
     for (connection, seq) in &stored.acks {
         hub.ack_events(agent, *connection, *seq);
     }
@@ -591,13 +600,6 @@ fn answer(
                 }
             }
         }
-    }
-    if let Some(counts) = counts {
-        counts.stored.fetch_add(stored.stored, Ordering::Relaxed);
-        counts
-            .duplicates
-            .fetch_add(stored.repeats, Ordering::Relaxed);
-        counts.applied.fetch_add(stored.applied, Ordering::Relaxed);
     }
     if stored.ignored > 0 {
         tracing::debug!(agent_id = %agent.0, count = stored.ignored, "reports changed no job");

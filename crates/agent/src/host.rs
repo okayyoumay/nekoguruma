@@ -49,11 +49,17 @@ pub enum HostError {
     LinkHeld,
     #[error("the worker's event stream ended")]
     EventStreamEnded,
-    /// The ECU did not answer. Not the silence of a request whose positive response is
-    /// suppressed, which the VCI ended by its receive timeout with no pending seen: that is an
-    /// empty response (ADR-408).
+    /// The ECU did not answer, as the VCI's receive timeout or the link reports it; it carries
+    /// no `Elapsed`. [`HostError::DeadlinePassed`] is the agent's own deadline. Not the silence
+    /// of a request whose positive response is suppressed, which the VCI ended by its receive
+    /// timeout with no pending seen: that is an empty response (ADR-408).
     #[error("no response from the ECU")]
     NoResponse,
+    /// The ECU gave no response before the agent's own deadline ran out. The cause is the
+    /// timer's `Elapsed`. Everywhere the host judges an unanswered request it counts as
+    /// [`HostError::NoResponse`] (see [`HostError::is_no_response`]).
+    #[error("no response from the ECU before the agent's deadline")]
+    DeadlinePassed(#[source] tokio::time::error::Elapsed),
     /// The worker dropped events of the link, so the primitive's outcome is unknown: the
     /// request may have been answered.
     #[error("the worker lost events of the link")]
@@ -254,6 +260,7 @@ impl HostError {
                 refused_after_loss: false,
             }
             | HostError::NoResponse
+            | HostError::DeadlinePassed(_)
             | HostError::EventsLost
             | HostError::EventStreamEnded
             | HostError::PrimitiveFailed(_)
@@ -283,13 +290,21 @@ pub enum ResendClass {
 }
 
 impl HostError {
+    /// Whether the ECU gave no response: [`HostError::NoResponse`] from the VCI, or
+    /// [`HostError::DeadlinePassed`] from the agent's deadline. The host's judgement of an
+    /// unanswered request reads this and not the variant.
+    pub fn is_no_response(&self) -> bool {
+        matches!(self, HostError::NoResponse | HostError::DeadlinePassed(_))
+    }
+
     /// The class of this error for a resend (ADR-392).
     pub fn resend_class(&self) -> ResendClass {
         match self {
             HostError::StreamFailedBeforeSend(inner) => inner.resend_class(),
-            HostError::NoResponse | HostError::PrimitiveFailed(_) | HostError::EventsLost => {
-                ResendClass::EcuLevel
-            }
+            HostError::NoResponse
+            | HostError::DeadlinePassed(_)
+            | HostError::PrimitiveFailed(_)
+            | HostError::EventsLost => ResendClass::EcuLevel,
             HostError::LinkHeld => ResendClass::Transient,
             HostError::Rpc { rpc, status }
                 if *rpc == "StartComPrimitive"
@@ -1548,7 +1563,11 @@ impl<C: WorkerApi> WorkerHost<C> {
             // The same rule says whether that end is a rejected result, which is no answer of the
             // request (ADR-437).
             let (end, mut detail, collected_rejected) = match &sent.result {
-                Ok(_) | Err(HostError::NoResponse) if collecting && !sent.agent_deadline => {
+                result
+                    if collecting
+                        && !sent.agent_deadline
+                        && result.as_ref().err().is_none_or(HostError::is_no_response) =>
+                {
                     let (end, rejected) =
                         crate::comm_log::exchange::collecting_end(&answers, &expected);
                     (end, Detail::default(), Some(rejected))
@@ -2024,7 +2043,7 @@ impl<C: WorkerApi> WorkerHost<C> {
         // agent's deadline ended is, since the VCI did not end it.
         let end = match sent.result {
             Ok(_) => Ok(()),
-            Err(HostError::NoResponse) if !sent.agent_deadline => Ok(()),
+            Err(error) if error.is_no_response() && !sent.agent_deadline => Ok(()),
             Err(error) => Err(error),
         };
         // Only an identifier of the table marks presence (ADR-396); the log lists every result.
@@ -2540,18 +2559,12 @@ impl<C: WorkerApi> WorkerHost<C> {
 }
 
 /// The outcome of a wait that may have run out its deadline: an expired deadline is
-/// [`HostError::NoResponse`].
-#[expect(
-    clippy::map_err_ignore,
-    reason = "NoResponse is a unit variant that over five hundred tests and the restart and \
-              report code construct and match; the Elapsed it would hold says only that the \
-              deadline passed, which NoResponse already says"
-)]
+/// [`HostError::DeadlinePassed`].
 fn deadline_outcome<T>(
     waited: Result<Result<T, HostError>, tokio::time::error::Elapsed>,
 ) -> Result<T, HostError> {
     waited
-        .map_err(|_| HostError::NoResponse)
+        .map_err(HostError::DeadlinePassed)
         .and_then(|outcome| outcome)
 }
 
@@ -2663,7 +2676,7 @@ fn entry_response_times(
 ) -> VciTimes {
     match result {
         Ok(_) => times,
-        Err(HostError::NoResponse) if collecting && !agent_deadline => VciTimes {
+        Err(error) if error.is_no_response() && collecting && !agent_deadline => VciTimes {
             finished: times.finished,
             ..VciTimes::default()
         },
@@ -3465,7 +3478,7 @@ impl Sent {
             && self.rx_timeout.is_some()
             && self.pendings.is_empty()
             && self.error_events.is_empty()
-            && matches!(self.result, Err(HostError::NoResponse))
+            && matches!(&self.result, Err(error) if error.is_no_response())
         {
             self.result = Ok(Vec::new());
         }
@@ -3816,7 +3829,7 @@ fn sent_end(
         ..Detail::default()
     };
     let end = match error {
-        HostError::NoResponse => End::NoResponse,
+        HostError::NoResponse | HostError::DeadlinePassed(_) => End::NoResponse,
         // The agent did not start it: an earlier primitive still holds the link.
         HostError::LinkHeld => End::NotSent(RefusalCause::LinkHeld),
         HostError::EventsLost => End::Unknown(UnknownCause::EventsLost),
@@ -3914,7 +3927,7 @@ fn host_error_name(error: &HostError) -> &'static str {
         HostError::WorkerStart { .. } => "WorkerStart",
         HostError::LinkHeld => "LinkHeld",
         HostError::EventStreamEnded => "EventStreamEnded",
-        HostError::NoResponse => "NoResponse",
+        HostError::NoResponse | HostError::DeadlinePassed(_) => "NoResponse",
         HostError::EventsLost => "EventsLost",
         HostError::VciLost { .. } => "VciLost",
         HostError::PrimitiveFailed(_) => "PrimitiveFailed",
@@ -4238,7 +4251,7 @@ fn vci_ended(
 ) -> bool {
     let took_a_result = match result {
         Ok(_) => true,
-        Err(HostError::NoResponse) => rejected_read,
+        Err(error) if error.is_no_response() => rejected_read,
         Err(_) => false,
     };
     rx_timeout || (finished && took_a_result && (collecting || result.is_err()))
@@ -6109,6 +6122,42 @@ mod tests {
             event(Some(COP), status(PduComPrimitiveStatus::PduCopstFinished)),
         ]);
         assert_eq!(got.unwrap().unwrap(), [0x62, 0xF1, 0x90]);
+    }
+
+    /// The agent's own deadline gives `DeadlinePassed` with the timer's `Elapsed` as its cause,
+    /// and every judgement of an unanswered request, the exchange's end, the logged name and what
+    /// the runner's repeat policy reads (ADR-392), is the one `NoResponse` gets.
+    #[tokio::test]
+    async fn the_agent_s_deadline_is_judged_as_no_response() {
+        use std::error::Error as _;
+        let waited = tokio::time::timeout(
+            Duration::from_millis(1),
+            std::future::pending::<Result<Vec<u8>, HostError>>(),
+        )
+        .await;
+        let error = deadline_outcome(waited).unwrap_err();
+        assert!(matches!(error, HostError::DeadlinePassed(_)), "{error:?}");
+        assert!(
+            error
+                .source()
+                .is_some_and(|cause| cause.is::<tokio::time::error::Elapsed>())
+        );
+        let vci = HostError::NoResponse;
+        assert!(error.is_no_response() && vci.is_no_response());
+        let (end, detail) = end_of(&[0x22, 0xF1, 0x90], &Err(error));
+        let (vci_end, vci_detail) = end_of(&[0x22, 0xF1, 0x90], &Err(HostError::NoResponse));
+        assert!(matches!(end, End::NoResponse));
+        assert!(matches!(vci_end, End::NoResponse));
+        assert_eq!(detail.host_error, Some("NoResponse"));
+        assert_eq!(detail.host_error, vci_detail.host_error);
+        let waited = tokio::time::timeout(
+            Duration::from_millis(1),
+            std::future::pending::<Result<Vec<u8>, HostError>>(),
+        )
+        .await;
+        let error = deadline_outcome(waited).unwrap_err();
+        assert_eq!(error.send_state(), vci.send_state());
+        assert_eq!(error.resend_class(), vci.resend_class());
     }
 
     /// Design 8.11 `vci_did_not_end`: the agent's own deadline ending the wait is no response

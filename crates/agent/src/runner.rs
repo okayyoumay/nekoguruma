@@ -16893,7 +16893,10 @@ def main():
         let (client, fake) = fake_worker_starting(CancelAnswer::Done).await;
         let results = reads_past_the_deadline(client, 2).await;
         for result in &results {
-            assert!(matches!(result, Err(HostError::NoResponse)), "{result:?}");
+            assert!(
+                matches!(result, Err(HostError::DeadlinePassed(_))),
+                "{result:?}"
+            );
         }
         // The first primitive is cancelled before the second starts; the second, also left
         // running, waits for a next request that does not come.
@@ -16924,9 +16927,13 @@ def main():
         let (client, fake) = fake_worker_starting(CancelAnswer::Done).await;
         let log = crate::comm_log::CommLog::open(&comm_log_setup_in(&dir)).expect("the log opens");
         let results = reads_past_the_deadline_logged(client, 1, Some(log)).await;
+        // The agent's own deadline, not the VCI's receive timeout: the cause is the timer's.
+        let Err(error @ HostError::DeadlinePassed(_)) = &results[0] else {
+            panic!("{results:?}");
+        };
         assert!(
-            matches!(results[0], Err(HostError::NoResponse)),
-            "{results:?}"
+            std::error::Error::source(error).is_some_and(|c| c.is::<tokio::time::error::Elapsed>()),
+            "{error:?}"
         );
         let calls = fake.calls.lock().unwrap().clone();
         let started = calls.iter().position(|call| *call == "StartComPrimitive");
@@ -17021,7 +17028,10 @@ def main():
                 host.own_reads(Some(OwnRead::Identification));
                 host.set_job_end_wait(JOB_END_WAIT);
                 let result = host.service_request(0x22, &[0xF1, 0x90]);
-                assert!(matches!(result, Err(HostError::NoResponse)), "{result:?}");
+                assert!(
+                    matches!(&result, Err(e) if e.is_no_response()),
+                    "{result:?}"
+                );
                 released.add_permits(1);
                 host.settle_at_end();
             })
@@ -17148,7 +17158,10 @@ def main():
             host.own_reads(Some(OwnRead::Identification));
             host.set_job_end_wait(JOB_END_WAIT);
             let result = host.service_request(0x22, &[0xF1, 0x90]);
-            assert!(matches!(result, Err(HostError::NoResponse)), "{result:?}");
+            assert!(
+                matches!(result, Err(HostError::DeadlinePassed(_))),
+                "{result:?}"
+            );
             if forget_exchange {
                 let seq = comm_log_lines(&read_dir)
                     .iter()
@@ -17207,7 +17220,7 @@ def main():
             // The agent's deadline ends the first window, which the VCI has not ended.
             let first = host.presence(&request);
             assert!(
-                matches!(first.end, Err(HostError::NoResponse)),
+                matches!(first.end, Err(HostError::DeadlinePassed(_))),
                 "{:?}",
                 first.end
             );
@@ -17273,7 +17286,7 @@ def main():
             // The agent's deadline ends the window, which the VCI has not ended.
             let first = host.presence(&[0x3E, 0x00]);
             assert!(
-                matches!(first.end, Err(HostError::NoResponse)),
+                matches!(first.end, Err(HostError::DeadlinePassed(_))),
                 "{:?}",
                 first.end
             );
@@ -17485,7 +17498,10 @@ def main():
             host.own_reads(Some(OwnRead::Identification));
             host.set_job_end_wait(JOB_END_WAIT);
             let result = host.service_request(0x22, &[0xF1, 0x90]);
-            assert!(matches!(result, Err(HostError::NoResponse)), "{result:?}");
+            assert!(
+                matches!(&result, Err(e) if e.is_no_response()),
+                "{result:?}"
+            );
             let until = std::time::Instant::now() + Duration::from_secs(30);
             for events in stages {
                 released.add_permits(1);
@@ -18468,7 +18484,10 @@ def main():
             host.set_job_end_wait(wait);
             for _ in 0..requests {
                 let result = host.service_request(0x22, &[0xF1, 0x90]);
-                assert!(matches!(result, Err(HostError::NoResponse)), "{result:?}");
+                assert!(
+                    matches!(result, Err(HostError::DeadlinePassed(_))),
+                    "{result:?}"
+                );
             }
             host.settle_at_end();
         })
@@ -18602,7 +18621,10 @@ def main():
                 host.own_reads(Some(OwnRead::Identification));
                 host.set_job_end_wait(JOB_END_WAIT);
                 let result = host.service_request(0x22, &[0xF1, 0x90]);
-                assert!(matches!(result, Err(HostError::NoResponse)), "{result:?}");
+                assert!(
+                    matches!(result, Err(HostError::DeadlinePassed(_))),
+                    "{result:?}"
+                );
                 released.add_permits(1);
                 host.settle_at_end();
             })
@@ -18726,7 +18748,10 @@ def main():
                 host.own_reads(Some(OwnRead::Identification));
                 host.set_job_end_wait(JOB_END_WAIT);
                 let first = host.service_request(0x22, &[0xF1, 0x90]);
-                assert!(matches!(first, Err(HostError::NoResponse)), "{first:?}");
+                assert!(
+                    matches!(first, Err(HostError::DeadlinePassed(_))),
+                    "{first:?}"
+                );
                 // Only the first primitive's events are released; the second's never come.
                 released.add_permits(1);
                 // The first primitive's end, if any, is on the stream before the next request:
@@ -18739,7 +18764,10 @@ def main():
                 if lost {
                     assert!(matches!(second, Err(HostError::EventsLost)), "{second:?}");
                 } else {
-                    assert!(matches!(second, Err(HostError::NoResponse)), "{second:?}");
+                    assert!(
+                        matches!(second, Err(HostError::DeadlinePassed(_))),
+                        "{second:?}"
+                    );
                 }
                 host.settle_at_end();
             })
@@ -18797,7 +18825,7 @@ def main():
         let wait = Duration::from_millis(200);
         let (results, took) = reads_then_job_end(client, &fake, 1, PAST_DEADLINE, wait).await;
         assert!(
-            matches!(results[0], Err(HostError::NoResponse)),
+            matches!(results[0], Err(HostError::DeadlinePassed(_))),
             "{results:?}"
         );
         assert!(took >= wait, "{took:?}");
@@ -18819,7 +18847,7 @@ def main():
         let wait = Duration::from_secs(5);
         let (results, took) = reads_then_job_end(client, &fake, 1, PAST_DEADLINE, wait).await;
         assert!(
-            matches!(results[0], Err(HostError::NoResponse)),
+            matches!(results[0], Err(HostError::DeadlinePassed(_))),
             "{results:?}"
         );
         assert!(took < Duration::from_secs(2), "{took:?}");
@@ -18969,7 +18997,7 @@ def main():
         let (client, fake) = fake_worker_starting(CancelAnswer::Failed).await;
         let results = reads_past_the_deadline(client, 3).await;
         assert!(
-            matches!(results[0], Err(HostError::NoResponse)),
+            matches!(results[0], Err(HostError::DeadlinePassed(_))),
             "{results:?}"
         );
         for held in &results[1..] {
@@ -19145,7 +19173,10 @@ def main():
                 // The tagged item is on the stream before the next request.
                 ctx.wait_sent();
                 let second = host.service_request(0x22, &[0xF1, 0x90]);
-                assert!(matches!(second, Err(HostError::NoResponse)), "{second:?}");
+                assert!(
+                    matches!(second, Err(HostError::DeadlinePassed(_))),
+                    "{second:?}"
+                );
                 host.settle_at_end();
             },
         )
@@ -19209,7 +19240,10 @@ def main():
                 ctx.released.add_permits(1);
                 ctx.wait_sent();
                 let third = host.service_request(0x22, &[0xF1, 0x90]);
-                assert!(matches!(third, Err(HostError::NoResponse)), "{third:?}");
+                assert!(
+                    matches!(third, Err(HostError::DeadlinePassed(_))),
+                    "{third:?}"
+                );
                 host.settle_at_end();
             },
         )
@@ -19253,7 +19287,10 @@ def main():
                 assert!(matches!(first, Err(HostError::WorkerUnresponsive(_))));
                 ctx.wait_sent();
                 let second = host.service_request(0x22, &[0xF1, 0x90]);
-                assert!(matches!(second, Err(HostError::NoResponse)), "{second:?}");
+                assert!(
+                    matches!(second, Err(HostError::DeadlinePassed(_))),
+                    "{second:?}"
+                );
             },
         )
         .await;
@@ -19303,7 +19340,10 @@ def main():
                             "{second:?}"
                         );
                     } else {
-                        assert!(matches!(second, Err(HostError::NoResponse)), "{second:?}");
+                        assert!(
+                            matches!(second, Err(HostError::DeadlinePassed(_))),
+                            "{second:?}"
+                        );
                     }
                 },
             )
@@ -19357,7 +19397,10 @@ def main():
                 assert!(matches!(first, Err(HostError::WorkerUnresponsive(_))));
                 ctx.wait_sent();
                 let second = host.service_request(0x22, &[0xF1, 0x90]);
-                assert!(matches!(second, Err(HostError::NoResponse)), "{second:?}");
+                assert!(
+                    matches!(second, Err(HostError::DeadlinePassed(_))),
+                    "{second:?}"
+                );
             },
         )
         .await;
@@ -19386,7 +19429,10 @@ def main():
                 assert!(matches!(first, Err(HostError::WorkerUnresponsive(_))));
                 ctx.wait_sent();
                 let second = host.service_request(0x22, &[0xF1, 0x90]);
-                assert!(matches!(second, Err(HostError::NoResponse)), "{second:?}");
+                assert!(
+                    matches!(second, Err(HostError::DeadlinePassed(_))),
+                    "{second:?}"
+                );
             },
         )
         .await;
@@ -19443,7 +19489,10 @@ def main():
                 assert!(matches!(first, Err(HostError::WorkerUnresponsive(_))));
                 ctx.wait_sent();
                 let second = host.service_request(0x22, &[0xF1, 0x90]);
-                assert!(matches!(second, Err(HostError::NoResponse)), "{second:?}");
+                assert!(
+                    matches!(second, Err(HostError::DeadlinePassed(_))),
+                    "{second:?}"
+                );
             },
         )
         .await;
@@ -19529,7 +19578,10 @@ def main():
                 assert!(matches!(first, Err(HostError::WorkerUnresponsive(_))));
                 ctx.wait_sent();
                 let second = host.service_request(0x22, &[0xF1, 0x90]);
-                assert!(matches!(second, Err(HostError::NoResponse)), "{second:?}");
+                assert!(
+                    matches!(second, Err(HostError::DeadlinePassed(_))),
+                    "{second:?}"
+                );
             },
         )
         .await;
@@ -19567,7 +19619,10 @@ def main():
                     ctx.wait_sent();
                 }
                 let third = host.service_request(0x22, &[0xF1, 0x90]);
-                assert!(matches!(third, Err(HostError::NoResponse)), "{third:?}");
+                assert!(
+                    matches!(third, Err(HostError::DeadlinePassed(_))),
+                    "{third:?}"
+                );
             },
         )
         .await;
@@ -19638,7 +19693,10 @@ def main():
             assert!(matches!(first, Err(HostError::WorkerUnresponsive(_))));
             wait_sent(&sent);
             let second = host.service_request(0x22, &[0xF1, 0x90]);
-            assert!(matches!(second, Err(HostError::NoResponse)), "{second:?}");
+            assert!(
+                matches!(second, Err(HostError::DeadlinePassed(_))),
+                "{second:?}"
+            );
         })
         .await
         .unwrap();
@@ -19756,7 +19814,10 @@ def main():
                 assert!(matches!(first, Err(HostError::Setup(_))), "{first:?}");
                 ctx.wait_sent();
                 let second = host.service_request(0x22, &[0xF1, 0x90]);
-                assert!(matches!(second, Err(HostError::NoResponse)), "{second:?}");
+                assert!(
+                    matches!(second, Err(HostError::DeadlinePassed(_))),
+                    "{second:?}"
+                );
             },
         )
         .await;
@@ -25074,7 +25135,7 @@ def main():
             };
             let hung: &[Step] = &[];
             let run = keep_run(setup(), &[hung], &[DSC_02], None).await;
-            assert!(matches!(run.results[0], Err(HostError::NoResponse)));
+            assert!(matches!(run.results[0], Err(HostError::DeadlinePassed(_))));
             assert_eq!(run.called("GetStatus"), 0);
             assert_eq!(run.called("CancelComPrimitive"), 0);
 
@@ -25633,7 +25694,7 @@ def main():
                 .await;
                 let (timed_out, settling, after) = results;
                 assert!(
-                    matches!(timed_out, Err(HostError::NoResponse)),
+                    matches!(timed_out, Err(HostError::DeadlinePassed(_))),
                     "{timed_out:?}"
                 );
                 assert!(settling.is_ok(), "{settling:?}");
@@ -25660,7 +25721,7 @@ def main():
                         timed_out
                     })
                     .await;
-                assert!(matches!(timed_out, Err(HostError::NoResponse)));
+                assert!(matches!(timed_out, Err(HostError::DeadlinePassed(_))));
                 let lines = comm_log_lines(&dir);
                 let errors = error_entries(&lines);
                 assert_eq!(errors.len(), 1, "{lines:?}");

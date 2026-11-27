@@ -16,7 +16,7 @@ message)` takes the addressing mode. `message` is the A_Data starting with the S
 via `to_bytes()`), or no response. `exchange(addressing, message)` returns the same response
 together with the delay before it is sent (`EcuConfig::response_delay_ms` plus any injected
 delay); the VCI side (`sim-vci` for the J2534 worker, `iso22900-mock` for the D-PDU worker,
-ADR-299) applies it. Its `reached` says whether the request reached the ECU at all: not while
+ADR-299, and `ngr-stand-in-ecu` on a SocketCAN interface) applies it. Its `reached` says whether the request reached the ECU at all: not while
 the ECU is off or starting up after a reset, nor when a bus error or `drop_at_block` loses it.
 `sim-vci` gives such a request no TxDone when it is segmented, since no flow control would come
 (ADR-352).
@@ -220,7 +220,7 @@ directly.
 `SimEcu::restore(snapshot, clock, elapsed)` rebuilds it on another clock, as it was `elapsed`
 after the snapshot: running timers have that much less to go, and one that has run out takes
 effect at once. It refuses (`InvalidSnapshot`) a snapshot whose download, image and block
-numbers contradict each other or exceed the flash window, which the ECU itself never produces. The snapshot holds the configuration, so a value written to a configured DID and the key mask survive with it. `sim-vci` uses this to keep the ECU across worker processes (ADR-241).
+numbers contradict each other or exceed the flash window, which the ECU itself never produces. The snapshot holds the configuration, so a value written to a configured DID and the key mask survive with it. `sim-vci` uses this to keep the ECU across worker processes (ADR-241). The `persist` module holds the files that start an ECU, shared by `sim-vci` and `ngr-stand-in-ecu`: `read_ecu_config` reads and checks a JSON `EcuConfig`, `default_ecu_config` is the configuration used when none is given, and `load_ecu_state` and `save_ecu_state` read and write the state file (postcard, a version number first, the snapshot, and the wall-clock time of the write, which counts against the ECU's timers when the next process reads it). A state file is written through a temporary file renamed over it, and one of another version is refused.
 
 ## Fault injection
 
@@ -291,3 +291,55 @@ to discard responses it was still delaying when the ECU lost power or reset.
 `Fault` serializes in snake case (`"power_loss"`, `{"delay_response": {"ms": 500}}`), the form
 `sim-vci`'s control commands take. A response code is named the same way, not by its number:
 `{"negative_response": {"nrc": "conditions_not_correct"}}`.
+
+## Stand-in ECU on SocketCAN (`ngr-stand-in-ecu`)
+
+`ngr-stand-in-ecu` (`crates/ngr-stand-in-ecu`) serves a `SimEcu` on a Linux SocketCAN interface:
+the stand-in ECU of the T1 hardware checks (design 13.5, ADR-275). It uses the kernel's ISO-TP
+sockets (`CAN_ISOTP`, the `can-isotp` module), so the kernel segments messages and runs the flow
+control of ISO 15765-2 (2024) clauses 9 and 10 on classical CAN, and the process reads and writes
+whole UDS messages. It opens two sockets on the interface: physical requests (receive on the
+request ID, send on the response ID) and functional requests (receive on the functional ID, send
+on the response ID). A request goes to `SimEcu::exchange` with its addressing; the messages the
+exchange returns (response pending messages, the response, repeated responses) go out on the
+socket the request arrived on, each after its delay, and a response that is `NoResponse` is not
+sent. The sockets use normal addressing and no padding. It builds on every platform, but off
+Linux the binary exits with an error saying it is Linux only.
+
+```text
+ngr-stand-in-ecu --interface <ifname> [--request-id <id>] [--response-id <id>]
+                 [--functional-id <id>] [--extended] [--config <file>] [--state <file>]
+```
+
+| Flag | Meaning |
+|---|---|
+| `--interface <ifname>` | The CAN interface (required), for example `vcan0` |
+| `--request-id`, `--response-id`, `--functional-id` | The physical request, response and functional request CAN IDs; default `0x7E0`, `0x7E8` and `0x7DF` (the IDs `sim-vci` uses). Decimal or `0x` hexadecimal; the three must differ |
+| `--extended` | The three IDs are 29-bit IDs (the kernel sees them with the extended-frame flag); an ID too wide for the selected width is refused. Default: 11-bit |
+| `--config <file>` | A JSON `EcuConfig` (the format of `sim-vci`'s `NGR_SIM_ECU_CONFIG`): the ECU's identity, response delay, `drop_at_block`, DIDs and so on. Without it the built-in configuration is used |
+| `--state <file>` | The state file (the format of `sim-vci`'s `NGR_SIM_ECU_STATE`, ADR-241) |
+
+Faults come from the configuration only: the process has no runtime control channel. With
+`--state`, the process continues from the file if it exists (and then reads no `--config`), and
+writes it at start, after every exchange before the response goes out (a write that fails ends the
+process without sending the response), and when SIGTERM or SIGINT stops it. A new process
+counts as the ECU's power-up: its session and security state are gone and an ECU that went
+silent (`drop_at_block`, `Fault::PowerLoss`) answers again, with its flash progress kept, so a
+restart with the same file continues an interrupted download as described under "Interruption
+and resume". The process prints `ngr-stand-in-ecu: serving on <ifname>` once its sockets are
+open.
+
+On a virtual interface, without hardware:
+
+```sh
+sudo modprobe vcan can-isotp
+sudo ip link add dev vcan0 type vcan && sudo ip link set up vcan0
+echo '{"vin":"NGRSIMECU00000001","part_number":"NGR-SIM-ECU","sw_version":"1.0.0",
+       "response_delay_ms":0,"drop_at_block":2,"require_security_access":false,
+       "require_gateway_auth":false,"fail_checksum":false}' > ecu.json
+cargo run -p ngr-stand-in-ecu -- --interface vcan0 --config ecu.json --state ecu.state
+# a UDS client on vcan0 now reaches the ECU at request ID 0x7E0, response ID 0x7E8
+```
+
+`crates/ngr-stand-in-ecu/tests/vcan.rs` does this from a client ISO-TP socket. It runs only with
+`NGR_TEST_VCAN=1`, and then fails, rather than skips, when `vcan0` or `can-isotp` is missing.

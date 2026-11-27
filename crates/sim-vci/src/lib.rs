@@ -30,11 +30,12 @@ pub type PassThruUlong = std::os::raw::c_ulong;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use j2534_defs::consts::{connect_flag, filter, ioctl, protocol, rx_flag, status, tx_flag};
-use serde::{Deserialize, Serialize};
-use sim_ecu::{Addressing, EcuConfig, EcuSnapshot, Fault, SimEcu, SystemClock};
+use serde::Deserialize;
+use sim_ecu::persist::{default_ecu_config, load_ecu_state, read_ecu_config, save_ecu_state};
+use sim_ecu::{Addressing, EcuConfig, Fault, SimEcu};
 
 pub const STATUS_NOERROR: PassThruUlong = status::STATUS_NOERROR as PassThruUlong;
 pub const ERR_NOT_SUPPORTED: PassThruUlong = status::ERR_NOT_SUPPORTED as PassThruUlong;
@@ -117,88 +118,6 @@ pub const ECU_CONFIG_ENV: &str = "NGR_SIM_ECU_CONFIG";
 /// from it (and `NGR_SIM_ECU_CONFIG` is not read); otherwise the ECU starts fresh. Rewritten
 /// after every change to the ECU. Without it the ECU lives only as long as the process.
 pub const ECU_STATE_ENV: &str = "NGR_SIM_ECU_STATE";
-
-/// Format of the state file; a file of another version is refused. postcard has no field names,
-/// so any change to the encoded `EcuSnapshot` (version 2: `EcuConfig::startup_ms` and the time
-/// left of the ECU's startup, ADR-265; version 3: the faults waiting for a request,
-/// `SimEcu::inject_for_request`; version 4: `EcuConfig::p2_server_max_ms` and
-/// `p2_star_server_max_ms`; version 5: a held session, `SimEcu::hold_session`; version 6:
-/// `EcuConfig::security_key_mask` and `EcuConfig::dids`; version 7: the matches a fault for a
-/// request still waits for, `SimEcu::inject_for_nth_request`) needs a new version.
-const STATE_FILE_VERSION: u32 = 7;
-
-/// The contents of the [`ECU_STATE_ENV`] file (postcard).
-#[derive(Serialize, Deserialize)]
-struct StateFile {
-    version: u32,
-    /// Wall-clock time of the write, in milliseconds since the Unix epoch: the time until the
-    /// next process reads it counts against the ECU's timers.
-    saved_at_ms: u64,
-    ecu: EcuSnapshot,
-}
-
-fn unix_ms(at: SystemTime) -> u64 {
-    at.duration_since(UNIX_EPOCH)
-        .map_or(0, |since| since.as_millis().try_into().unwrap_or(u64::MAX))
-}
-
-/// The ECU the state file at `path` holds, with the time since it was written counted against
-/// its timers: `Ok(None)` if there is no such file, `Err(())` if it cannot be read (for any other
-/// reason than not existing), is not a state file of this version, or holds a state the ECU
-/// could not have been in.
-fn load_ecu_state(path: &Path) -> Result<Option<SimEcu>, String> {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("state file unreadable: {error}")),
-    };
-    // The version comes first and is checked before the rest is decoded: a file of another
-    // version has another layout, which could otherwise decode into wrong fields.
-    let (version, _) = postcard::take_from_bytes::<u32>(&bytes)
-        .map_err(|e| format!("state file version unreadable: {e}"))?;
-    if version != STATE_FILE_VERSION {
-        return Err(format!(
-            "state file has version {version}, not {STATE_FILE_VERSION}"
-        ));
-    }
-    let state: StateFile =
-        postcard::from_bytes(&bytes).map_err(|e| format!("state file does not decode: {e}"))?;
-    // A wall clock set back since the write counts as no time passed.
-    let elapsed = unix_ms(SystemTime::now()).saturating_sub(state.saved_at_ms);
-    SimEcu::restore(
-        state.ecu,
-        SystemClock::default(),
-        Duration::from_millis(elapsed),
-    )
-    .map(Some)
-    .map_err(|e| format!("state file holds an invalid snapshot: {e}"))
-}
-
-/// Writes `ecu`'s state to `path`, through a temporary file renamed over it, so a process killed
-/// while writing leaves the previous state.
-fn save_ecu_state(path: &Path, ecu: &mut SimEcu) -> std::io::Result<()> {
-    let state = StateFile {
-        version: STATE_FILE_VERSION,
-        saved_at_ms: unix_ms(SystemTime::now()),
-        ecu: ecu.snapshot(),
-    };
-    let bytes = postcard::to_allocvec(&state).map_err(std::io::Error::other)?;
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    std::fs::write(&tmp, bytes)?;
-    // On Windows another process (a virus scanner, for one) can hold the new file open for a
-    // moment, and replacing it then fails; try again a few times before giving up.
-    let mut attempts = 0;
-    loop {
-        match std::fs::rename(&tmp, path) {
-            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied && attempts < 10 => {
-                attempts += 1;
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            result => return result,
-        }
-    }
-}
 
 /// The device ID the first `PassThruOpen` returns. The simulator has one device; it gets a new
 /// ID only when it is opened again after it was lost (`ERR_DEVICE_NOT_CONNECTED`) or closed while
@@ -474,25 +393,10 @@ fn wait(guard: MutexGuard<'static, Bus>, timeout: Duration) -> MutexGuard<'stati
         .0
 }
 
-/// Configuration used when `NGR_SIM_ECU_CONFIG` is not set.
-fn default_ecu_config() -> EcuConfig {
-    EcuConfig {
-        vin: "NGRSIMECU00000001".into(),
-        part_number: "NGR-SIM-ECU".into(),
-        sw_version: "1.0.0".into(),
-        ..Default::default()
-    }
-}
-
 fn load_ecu_config() -> Option<EcuConfig> {
     match std::env::var_os(ECU_CONFIG_ENV) {
         None => Some(default_ecu_config()),
-        Some(path) => {
-            let text = std::fs::read_to_string(path).ok()?;
-            let config: EcuConfig = serde_json::from_str(&text).ok()?;
-            config.validate().ok()?;
-            Some(config)
-        }
+        Some(path) => read_ecu_config(Path::new(&path)).ok(),
     }
 }
 
@@ -793,16 +697,7 @@ impl Bus {
         // Response pending messages (NRC 78) first, then the response itself, then the copies
         // of it a `repeat_response` fault sends.
         let now = Instant::now();
-        let final_response = exchange
-            .response
-            .to_bytes()
-            .map(|bytes| (exchange.delay_ms, bytes));
-        let sends = exchange
-            .pending
-            .into_iter()
-            .chain(final_response)
-            .chain(exchange.after);
-        for (delay_ms, bytes) in sends {
+        for (delay_ms, bytes) in exchange.into_sends() {
             let mut data = ECU_RESPONSE_ID.to_be_bytes().to_vec();
             data.extend_from_slice(&bytes);
             let ready_at = now + Duration::from_millis(delay_ms.into());

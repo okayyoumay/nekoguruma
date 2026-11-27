@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+pub mod persist;
 mod services;
 #[cfg(test)]
 mod tests;
@@ -765,6 +766,14 @@ pub struct Exchange {
 }
 
 impl Exchange {
+    /// Every message the exchange sends, each with its delay from the request in milliseconds:
+    /// the response pending messages, then the response itself (if there is one), then the
+    /// messages sent after it.
+    pub fn into_sends(self) -> impl Iterator<Item = (u32, Vec<u8>)> {
+        let response = self.response.to_bytes().map(|bytes| (self.delay_ms, bytes));
+        self.pending.into_iter().chain(response).chain(self.after)
+    }
+
     fn none() -> Self {
         Self {
             response: SimResponse::NoResponse,

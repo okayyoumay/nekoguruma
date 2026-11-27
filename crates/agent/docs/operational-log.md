@@ -23,8 +23,9 @@ A review of a new or changed `tracing` call in any of them checks it against the
     level.
   - A `diag.fail` detail stays in the journal and the job's result; the operational log records
     its code.
-  - A run-time value a VM error prints (an index, a byte, a shift amount, a wait) is left out
-    (`vm_error_text`).
+  - A run-time value a VM error prints (an index, a byte, a shift amount, a wait) is left out,
+    and so is the cause text a VM error carries, since a decode error's text holds values read
+    from the vehicle (`vm_error_text`).
 
 ## Logged only in `external`
 

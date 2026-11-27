@@ -9,6 +9,8 @@
 
 `VciService` is a single gRPC service that exposes the ISO 22900-2 D-PDU API over the network. It defines **25 RPC methods** across eleven functional groups. `iso22900-service` (native D-PDU DLL) and `j2534-0404-service` (J2534 v04.04 adapter) implement the same service interface with real logic.
 
+A refused request is answered with a gRPC status code and a message. A client acts on the code; the message is for people, and where the worker could not convert a request field, it ends with the cause of that conversion (ADR-510).
+
 ---
 
 ## Connecting & Authentication

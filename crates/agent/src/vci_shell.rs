@@ -28,7 +28,7 @@ use crate::runner::JobError;
 const GUARD_POLL: Duration = Duration::from_millis(10);
 
 /// How long a stopping worker may take to close its link before it is killed.
-const STOP_GRACE: Duration = Duration::from_secs(5);
+pub(crate) const STOP_GRACE: Duration = Duration::from_secs(5);
 
 /// Why the shell could not run a job, or find the VCI to run it on.
 #[derive(Debug, thiserror::Error)]

@@ -89,8 +89,17 @@ pub const UNAVAILABLE_WAIT: Duration = Duration::from_secs(60);
 /// How often a waiting job looks at its start deadline.
 const DEADLINE_POLL: Duration = Duration::from_secs(1);
 /// How long a stop waits for a cancelled run to end, as its worker stops and its locks are
-/// released, before the run is dropped.
-const RUN_STOP_BOUND: Duration = Duration::from_secs(8);
+/// released, before the run is dropped: the wait for a job's end on the link, the worker's stop
+/// and 5 seconds of margin.
+pub(crate) const RUN_STOP_BOUND: Duration = Duration::from_secs(
+    crate::link::JOB_END_WAIT_MAX.as_secs() + crate::vci_shell::STOP_GRACE.as_secs() + 5,
+);
+
+const _: () = assert!(
+    RUN_STOP_BOUND.as_secs()
+        > crate::link::JOB_END_WAIT_MAX.as_secs() + crate::vci_shell::STOP_GRACE.as_secs(),
+    "a cancelled run's wind-down must fit in the bound with a margin"
+);
 /// How often an end that could not be appended is tried again while the intake is idle.
 const OWED_RETRY: Duration = Duration::from_secs(60);
 
@@ -419,6 +428,17 @@ enum Prepared {
     },
 }
 
+/// What failed about a job's end, for logging each kind once per job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum FailureKind {
+    /// The `reported` record was not written.
+    RecordReported,
+    /// The append to the outbox failed.
+    Append,
+    /// Neither write worked and the end is kept in memory.
+    KeptInMemory,
+}
+
 /// The task's state.
 struct Worker {
     parts: Parts,
@@ -427,8 +447,8 @@ struct Worker {
     /// Ends the record holds unreported that were appended in this start: appended once per start,
     /// whatever becomes of their `reported` record.
     appended: Mutex<HashSet<(String, u64)>>,
-    /// Ends whose failure was logged at `warn`: the repeats are `debug`.
-    warned: Mutex<HashSet<(String, u64)>>,
+    /// The failures logged at their first level, by job and kind: the repeats are `debug`.
+    warned: Mutex<HashSet<(String, u64, FailureKind)>>,
     /// Ends neither recorded nor appended (both writes failed): kept here, tried again, and lost
     /// only if the agent ends first.
     in_memory: Mutex<Vec<(JobKey, JobState)>>,
@@ -462,7 +482,12 @@ impl Worker {
             if let Some(next) = self.queue.lock().ready.pop_front() {
                 return next;
             }
-            let owed = !self.parts.outcomes.owed().is_empty();
+            let owed = !self.parts.outcomes.owed().is_empty()
+                || !self
+                    .in_memory
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_empty();
             tokio::select! {
                 () = ready => {}
                 () = tokio::time::sleep(OWED_RETRY), if owed => self.recover().await,
@@ -500,9 +525,13 @@ impl Worker {
     }
 
     fn keep_in_memory(&self, key: JobKey, state: JobState) {
-        tracing::error!(
-            "the job's end is neither recorded nor appended; it is kept in memory and tried again, and is lost if the agent ends first"
-        );
+        let first = self.first_failure(&key, FailureKind::KeptInMemory);
+        let text = "the job's end is neither recorded nor appended; it is kept in memory and tried again, and is lost if the agent ends first";
+        if first {
+            tracing::error!("{text}");
+        } else {
+            tracing::debug!("{text}");
+        }
         self.in_memory
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -985,11 +1014,21 @@ impl Worker {
                 log_run_end(&comm_log, &worker_end);
                 // The journal is read on a blocking thread.
                 let span = tracing::Span::current();
-                let standing =
-                    match tokio::task::spawn_blocking(move || span.in_scope(standing)).await {
-                        Ok(standing) => standing,
-                        Err(_) => return Ending::panicked(),
-                    };
+                // The standing does not decide an `Ok` run's outcome, so a read that fails
+                // leaves a finished run `completed`.
+                let standing = match tokio::task::spawn_blocking(move || span.in_scope(standing))
+                    .await
+                {
+                    Ok(standing) => standing,
+                    Err(error) if result.is_ok() => {
+                        tracing::warn!(
+                            error = &error as &dyn std::error::Error,
+                            "the journal's standing could not be read; the finished run is reported all the same"
+                        );
+                        JournalStanding::Clean
+                    }
+                    Err(_) => return Ending::panicked(),
+                };
                 match job_report::outcome(&result, true, &standing) {
                     JobOutcome::Terminal(JobState::Completed) => {
                         let value = result.as_ref().ok();
@@ -1079,20 +1118,31 @@ impl Worker {
         if let Err(error) = self.record(move |record| record.reported(&reported)).await {
             self.log_failure(
                 key,
+                FailureKind::RecordReported,
                 &error,
                 "the job's report was not recorded; it is appended again at the next start",
             );
         }
     }
 
-    /// Logs a failure at `warn` the first time for a job in this start and at `debug` after.
-    fn log_failure(&self, key: &JobKey, error: &(dyn std::error::Error + 'static), text: &str) {
-        let first = self
-            .warned
+    /// Whether this is the first failure of `kind` for the job in this start.
+    fn first_failure(&self, key: &JobKey, kind: FailureKind) -> bool {
+        self.warned
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert((key.job_id.0.clone(), key.generation));
-        if first {
+            .insert((key.job_id.0.clone(), key.generation, kind))
+    }
+
+    /// Logs a failure at `warn` the first time for a job and kind in this start and at `debug`
+    /// after.
+    fn log_failure(
+        &self,
+        key: &JobKey,
+        kind: FailureKind,
+        error: &(dyn std::error::Error + 'static),
+        text: &str,
+    ) {
+        if self.first_failure(key, kind) {
             tracing::warn!(error, "{text}");
         } else {
             tracing::debug!(error, "{text}");
@@ -1119,6 +1169,7 @@ impl Worker {
             Err(error) => {
                 self.log_failure(
                     key,
+                    FailureKind::Append,
                     &error,
                     "the job's end was not appended; it is tried again",
                 );

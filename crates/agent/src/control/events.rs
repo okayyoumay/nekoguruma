@@ -97,7 +97,7 @@ impl SharedOutbox {
     /// Reopens the outbox on a blocking task when it is poisoned (see [`Outbox::reopen`]);
     /// `Ok(true)` when it did, `Ok(false)` when it was not poisoned. The session calls it before
     /// each connection attempt, so the reconnect delay paces the retries.
-    pub(super) async fn reopen_if_poisoned(&self) -> Result<bool, OutboxError> {
+    pub(crate) async fn reopen_if_poisoned(&self) -> Result<bool, OutboxError> {
         let inner = self.inner.clone();
         let reopened = tokio::task::spawn_blocking(move || {
             let mut outbox = inner.outbox.blocking_lock();

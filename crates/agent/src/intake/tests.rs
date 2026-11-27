@@ -90,6 +90,7 @@ struct Spec {
     kind: JobKind,
     documents: Vec<[u8; 32]>,
     plan: Option<[u8; 32]>,
+    artifact: Option<[u8; 32]>,
     vci: &'static str,
     /// Seconds after the start of the test.
     deadline_in: u64,
@@ -105,6 +106,7 @@ impl Spec {
             kind,
             documents: hashes,
             plan: None,
+            artifact: None,
             vci: "vci-a",
             deadline_in: 600,
         }
@@ -122,7 +124,7 @@ impl Spec {
             vci: VciId(self.vci.to_owned()),
             vin: None,
             document_hashes: self.documents.clone(),
-            artifact_hash: None,
+            artifact_hash: self.artifact,
             plan_hash: self.plan,
             issued_at: 1,
             start_deadline: NOW + self.deadline_in,
@@ -163,6 +165,10 @@ struct FakeObjects {
     fetched: StdMutex<Vec<String>>,
     /// The digests asked of `read_document`.
     read: StdMutex<Vec<[u8; 32]>>,
+    /// How `read_document` fails, when it does (`Retry` or `Local`).
+    read_fails: StdMutex<Option<Answer>>,
+    /// An artifact `fetch_all` lists among its objects, at this path.
+    artifact: StdMutex<Option<PathBuf>>,
     gate: tokio::sync::Semaphore,
 }
 
@@ -176,6 +182,8 @@ impl FakeObjects {
             unrelated: StdMutex::default(),
             fetched: StdMutex::default(),
             read: StdMutex::default(),
+            read_fails: StdMutex::default(),
+            artifact: StdMutex::default(),
             gate: tokio::sync::Semaphore::new(0),
         }
     }
@@ -236,6 +244,11 @@ impl Objects for FakeObjects {
                             length: 1,
                         })
                         .collect();
+                    objects.extend(self.artifact.lock().unwrap().iter().map(|path| Fetched {
+                        kind: ObjectKind::Artifact,
+                        path: path.clone(),
+                        length: 1,
+                    }));
                     objects.extend(self.unrelated.lock().unwrap().iter().map(|path| Fetched {
                         kind: ObjectKind::Document,
                         path: path.clone(),
@@ -265,6 +278,18 @@ impl Objects for FakeObjects {
         _attempts: u32,
     ) -> ObjectFuture<'a, Vec<u8>> {
         self.read.lock().unwrap().push(*digest);
+        let failure = match *self.read_fails.lock().unwrap() {
+            Some(Answer::Retry) => Some(FetchError::Retry {
+                why: "scripted",
+                status: None,
+                retry_after_secs: None,
+            }),
+            Some(_) => Some(FetchError::Local { why: "scripted" }),
+            None => None,
+        };
+        if let Some(failure) = failure {
+            return Box::pin(std::future::ready(Err(failure)));
+        }
         let bytes = self
             .lie
             .lock()
@@ -620,6 +645,45 @@ async fn a_local_fetch_failure_is_an_internal_precondition_failure() {
         state("preconditionFailed", Some("internal"))
     );
     assert_eq!(rig.objects.fetches().len(), 1);
+}
+
+/// A document read the server does not answer is waited for as a fetch is, until the start
+/// deadline passes: the job then ends `expired`.
+#[tokio::test(start_paused = true)]
+async fn an_unanswered_document_read_is_waited_for_until_the_start_deadline() {
+    let rig = Rig::new();
+    let read = reading_document();
+    *rig.objects.read_fails.lock().unwrap() = Some(Answer::Retry);
+    let mut spec = Spec::new(1, JobKind::Acquire, &[&read]);
+    spec.deadline_in = 200;
+    let begun = Instant::now();
+    rig.deliver(&spec).await;
+    assert_eq!(rig.ended(1).await, state("expired", None));
+    let waited = begun.elapsed();
+    assert!(
+        waited >= Duration::from_secs(190) && waited < Duration::from_secs(260),
+        "{waited:?}"
+    );
+    let reads = rig.objects.read.lock().unwrap().len();
+    assert!((3..=5).contains(&reads), "{reads} reads");
+    assert_eq!(rig.vcis.found.load(Ordering::SeqCst), 0);
+}
+
+/// A cached artifact the agent cannot read is its own fault, not the job's data.
+#[tokio::test(start_paused = true)]
+async fn an_unreadable_cached_artifact_is_an_internal_precondition_failure() {
+    let rig = Rig::new();
+    let read = reading_document();
+    rig.objects.has(&read);
+    *rig.objects.artifact.lock().unwrap() = Some(rig.dir.path().join("no-such-artifact"));
+    let mut spec = Spec::new(1, JobKind::Acquire, &[&read]);
+    spec.artifact = Some([7; 32]);
+    rig.deliver(&spec).await;
+    assert_eq!(
+        rig.ended(1).await,
+        state("preconditionFailed", Some("internal"))
+    );
+    assert_eq!(rig.vcis.found.load(Ordering::SeqCst), 0);
 }
 
 // ---------------------------------------------------------------- the documents held
@@ -1247,4 +1311,67 @@ async fn an_owed_end_is_appended_once_per_start() {
     worker.recover().await;
     worker.recover().await;
     assert_eq!(rig.events(2).await.len(), 1);
+}
+
+/// An end that neither the record nor the outbox took is kept in memory, and is appended while the
+/// intake is idle, within the retry period, once the writes work again.
+#[tokio::test(start_paused = true)]
+async fn an_end_kept_in_memory_is_appended_while_the_intake_is_idle() {
+    let dir = tempfile::tempdir().unwrap();
+    let registration = dir.path().join("registration");
+    std::fs::create_dir_all(&registration).unwrap();
+    let outbox_dir = dir.path().join("outbox");
+    std::fs::create_dir_all(&outbox_dir).unwrap();
+    let uploads_dir = dir.path().join("uploads");
+    std::fs::create_dir_all(&uploads_dir).unwrap();
+    let failing = Arc::new(AtomicBool::new(true));
+    let probe = |failing: &Arc<AtomicBool>| -> crate::outbox::Probe {
+        let failing = failing.clone();
+        Box::new(move |step| {
+            if step == crate::outbox::Step::BeforeWrite && failing.load(Ordering::SeqCst) {
+                return Err(std::io::Error::other("scripted"));
+            }
+            Ok(())
+        })
+    };
+    let outcomes = OutcomeRecord::open_with(&registration, AGENT_ID, probe(&failing)).unwrap();
+    let outbox =
+        SharedOutbox::new(Outbox::open_with(&outbox_dir, AGENT_ID, probe(&failing)).unwrap());
+    let objects = Arc::new(FakeObjects::new());
+    objects.then(Answer::Refused);
+    let (intake, handle) = start(Parts {
+        objects: objects.clone(),
+        plans: Arc::new(NoPlans),
+        vcis: Arc::new(FakeVcis {
+            dir: dir.path().to_owned(),
+            found: AtomicUsize::new(0),
+        }),
+        mode: OperatingMode::User,
+        journal_dir: Arc::new(|| Ok(PathBuf::from("journal"))),
+        outbox: outbox.clone(),
+        uploads: SharedLedger::new(UploadLedger::open_in(&uploads_dir, AGENT_ID).unwrap()),
+        marks: IssueMark::open_in(&registration, AGENT_ID).unwrap(),
+        clock: Arc::new(TokioClock {
+            start: Instant::now(),
+        }),
+        outcomes: outcomes.clone(),
+    });
+    let spec = Spec::new(1, JobKind::Acquire, &[&reading_document()]);
+    intake.take(spec.sign()).await.unwrap();
+    intake.received(&job_id(1), 1);
+    // The job ends; neither write works, so the queue is empty and the end is owed only in memory.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(objects.fetches().len(), 1);
+    assert!(outbox.texts_for_test().await.is_empty());
+    assert!(outcomes.owed().is_empty());
+    failing.store(false, Ordering::SeqCst);
+    // A failed append poisons the outbox until the session opens it again, as it does before a
+    // connection.
+    outbox.reopen_if_poisoned().await.unwrap();
+    tokio::time::sleep(OWED_RETRY + Duration::from_secs(5)).await;
+    let texts = outbox.texts_for_test().await;
+    assert_eq!(texts.len(), 1, "{texts:?}");
+    assert!(texts[0].contains("instructionRejected"), "{texts:?}");
+    handle.stop();
+    handle.stopped().await;
 }

@@ -1,5 +1,6 @@
 //! The flow of `ngr-agent connect` (design 5.3, 6.4; ADR-471; `crates/agent/docs/ngr-agent.md`):
-//! it runs the control channel session ([`crate::control`]) until a stop signal.
+//! it runs the control channel session ([`crate::control`]) until a stop signal. The end of the
+//! session task or of the job intake task without a stop ends the command too.
 //!
 //! The order, where the first step that fails decides:
 //!
@@ -45,7 +46,9 @@
 //!    state: one that another process holds is exit 3) and the outcome record
 //!    ([`crate::outcome_record::OutcomeRecord`], beside the received-jobs ledger, opened as it is).
 //!    It runs the instructions the session takes, across the session's connections, and is
-//!    stopped after the session and awaited for [`STOP_BOUND`] at most, as the uploader is.
+//!    stopped after the session and awaited for [`STOP_BOUND`] at most, as the uploader is. An
+//!    intake that ends alone (a panic) ends the command with exit 3, which the unit restarts: the
+//!    session would acknowledge jobs nothing runs.
 //!
 //! The command prints and logs nothing the server sent and no token; its messages are fixed
 //! wording.
@@ -79,10 +82,16 @@ const RETRY_INITIAL: Duration = Duration::from_secs(1);
 /// The longest wait between two tries of the key store.
 const RETRY_CAP: Duration = Duration::from_secs(60);
 
-/// How long a stop waits for the uploader and the intake to end. Each drops the request or the run
-/// in flight at once and awaits only a file write that is running, so the wait is short; the bound
-/// keeps a stuck write from holding the process.
-const STOP_BOUND: Duration = Duration::from_secs(10);
+/// How long a stop waits for the uploader and the intake to end. The uploader drops the request in
+/// flight at once and awaits only a file write that is running. The intake awaits a cancelled run
+/// for [`intake::RUN_STOP_BOUND`] and then syncs the end's records; the bound is that plus 10
+/// seconds for them, and keeps a stuck write from holding the process.
+const STOP_BOUND: Duration = Duration::from_secs(intake::RUN_STOP_BOUND.as_secs() + 10);
+
+const _: () = assert!(
+    STOP_BOUND.as_secs() >= intake::RUN_STOP_BOUND.as_secs() + 10,
+    "a stop must wait for the intake's run bound and the end's record syncs"
+);
 
 /// The exit status of a command that did not end by a stop signal (the usage text lists them; a
 /// stop is 0 and a usage error 2, which the caller decides).
@@ -453,6 +462,7 @@ async fn run_opened(
     // then free and no session is left, so the process must not stay up.
     let mut uploader_ended = false;
     let mut session_ended = false;
+    let mut intake_ended = false;
     let outcome = loop {
         tokio::select! {
             biased;
@@ -473,16 +483,18 @@ async fn run_opened(
                 });
             }
             // The intake ended on its own: the session would acknowledge jobs nothing runs, and
-            // their redeliveries would be duplicates, so the command ends (exit 1).
+            // their redeliveries would be duplicates, so the command ends. The task ends alone
+            // only by a panic, which a restart can repair: exit 3, which the unit restarts.
             () = async {
                 match &intake {
                     Some(intake) => intake.stopped().await,
                     None => std::future::pending().await,
                 }
             } => {
+                intake_ended = true;
                 tracing::error!("the job intake ended; the agent ends with it");
                 break Err(fail(
-                    Exit::CannotConnect,
+                    Exit::Unavailable,
                     "the job intake ended unexpectedly",
                 ));
             }
@@ -504,7 +516,9 @@ async fn run_opened(
     }
     // The intake is stopped after the session, on the error path too: it leaves a job it was
     // running open, and the process then ends within a short timeout.
-    if let Some(intake) = &intake {
+    if let Some(intake) = &intake
+        && !intake_ended
+    {
         intake.stop();
         if tokio::time::timeout(stop_bound, intake.stopped())
             .await

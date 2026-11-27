@@ -342,10 +342,10 @@ async fn a_stop_during_the_key_retry_is_ok_and_frees_the_locks() {
     dirs.open().expect("the locks are free");
 }
 
-/// A job intake that ends without a stop ends the command (exit 1): a session that went on would
-/// acknowledge jobs nothing runs.
+/// A job intake that ends without a stop ends the command with exit 3, which the unit restarts (a
+/// panic is repaired by a restart): a session that went on would acknowledge jobs nothing runs.
 #[tokio::test(start_paused = true)]
-async fn an_intake_that_ends_on_its_own_is_exit_1() {
+async fn an_intake_that_ends_on_its_own_is_exit_3() {
     let key = existing_key();
     let dirs = Dirs::new(&key);
     let opened = dirs.open().unwrap();
@@ -365,7 +365,7 @@ async fn an_intake_that_ends_on_its_own_is_exit_1() {
     )
     .await;
     let error = result.unwrap_err();
-    assert_eq!(error.exit_code(), 1);
+    assert_eq!(error.exit_code(), 3);
     assert_eq!(error.to_string(), "the job intake ended unexpectedly");
     dirs.open().expect("the locks are free");
 }

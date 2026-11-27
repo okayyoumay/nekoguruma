@@ -12,7 +12,7 @@
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use worker_host::service::{LaunchOptions, OperatingMode, ServiceError, Stopped, WorkerLayout};
@@ -20,7 +20,7 @@ use worker_host::service::{LaunchOptions, OperatingMode, ServiceError, Stopped, 
 use crate::comm_log::{CommLogStatus, VciFacts};
 use crate::guards::{GuardError, GuardSetup, JobGuards};
 use crate::launch::{
-    Api, LaunchError, Registered, RelaunchingWorker, launch_worker, registered_api,
+    Api, LaunchError, Registered, RegisteredError, RelaunchingWorker, launch_worker, registered_api,
 };
 use crate::runner::JobError;
 
@@ -40,6 +40,15 @@ pub enum VciShellError {
     /// is not decided by its name.
     #[error("the VCI {vci:?} is named by both a J2534 and a D-PDU API registration definition")]
     AmbiguousVci { vci: String },
+    /// The registration definitions could not be read, so whether they name the VCI is unknown.
+    /// The intake answers it as for [`VciShellError::UnknownVci`]: `preconditionFailed` with
+    /// `linkNotOpened`.
+    #[error("cannot look the VCI {vci:?} up: {source}")]
+    Lookup {
+        vci: String,
+        #[source]
+        source: RegisteredError,
+    },
     /// The cancel flag was set while the shell waited for the job's locks.
     #[error("the wait for the job's locks was cancelled")]
     Cancelled,
@@ -59,7 +68,7 @@ pub struct VciRoute {
     pub api: Api,
     /// The directory of worker builds (design 7.3).
     pub workers: PathBuf,
-    /// The device's lock directory, as an absolute path.
+    /// The device's lock directory. The lock files are created in it under the VCI's name.
     pub locks: PathBuf,
 }
 
@@ -81,7 +90,11 @@ pub struct RegisteredVcis {
 
 impl VciLookup for RegisteredVcis {
     fn find(&self, vci: &str) -> Result<VciRoute, VciShellError> {
-        let api = match registered_api(vci) {
+        let registered = registered_api(vci).map_err(|source| VciShellError::Lookup {
+            vci: vci.to_owned(),
+            source,
+        })?;
+        let api = match registered {
             Registered::Only(api) => api,
             Registered::Neither => {
                 return Err(VciShellError::UnknownVci {
@@ -139,6 +152,20 @@ pub struct ShellRun<T> {
     pub worker_end: WorkerEnd,
 }
 
+/// Sets a cancel flag when dropped while armed.
+struct CancelOnDrop {
+    flag: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            self.flag.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
 /// The shell every job runs in (ADR-397): the per-VCI lock (and the reprogramming slot for a job
 /// that `writes`, design 8.8.1), the worker launch, the worker's source with its slot, the
 /// worker's stop and the guards' release. `job` runs on what the shell sets up: the worker's
@@ -146,8 +173,10 @@ pub struct ShellRun<T> {
 /// hands it to the job. Returns the job's result and how it ended.
 ///
 /// `cancel` ends the wait for the locks: a flag set while the shell waits gives
-/// [`VciShellError::Cancelled`], with no worker launched. Once the job has the locks the flag
-/// does not concern the shell, whose job takes its own cancel.
+/// [`VciShellError::Cancelled`], with no worker launched. A flag set while the worker launches
+/// stops that worker and gives the same error, without running the job. Dropping the returned
+/// future during the wait sets the flag, so the wait ends. Once the job has started the flag does
+/// not concern the shell, whose job takes its own cancel.
 pub async fn run_on_vci<T, Fut>(
     shell: VciShell,
     writes: bool,
@@ -169,19 +198,28 @@ where
         dir: locks,
         vci: vci.clone(),
     };
-    let guards = tokio::task::spawn_blocking(move || {
+    // A future dropped mid-wait (a `select!`, a timeout, a stop) leaves the blocking task
+    // polling; the guard sets the flag so the task ends instead of taking locks nobody holds.
+    let mut cancel_on_drop = CancelOnDrop {
+        flag: Arc::clone(&cancel),
+        armed: true,
+    };
+    let wait_cancel = Arc::clone(&cancel);
+    let waited = tokio::task::spawn_blocking(move || {
         if writes {
-            JobGuards::take(&guard_setup, GUARD_POLL, &cancel)
+            JobGuards::take(&guard_setup, GUARD_POLL, &wait_cancel)
         } else {
-            JobGuards::take_vci_only(&guard_setup, GUARD_POLL, &cancel)
+            JobGuards::take_vci_only(&guard_setup, GUARD_POLL, &wait_cancel)
         }
     })
-    .await
-    .map_err(VciShellError::GuardsTask)?
-    .map_err(|error| match error {
-        GuardError::Cancelled => VciShellError::Cancelled,
-        error => VciShellError::Guards(error),
-    })?;
+    .await;
+    cancel_on_drop.armed = false;
+    let guards = waited
+        .map_err(VciShellError::GuardsTask)?
+        .map_err(|error| match error {
+            GuardError::Cancelled => VciShellError::Cancelled,
+            error => VciShellError::Guards(error),
+        })?;
     let worker = launch_worker(
         api,
         &vci,
@@ -191,6 +229,19 @@ where
         None,
     )
     .await?;
+    // A cancel set while the worker launched: stop it and give the locks back without a job.
+    if cancel.load(Ordering::Relaxed) {
+        // The job never ran, so no link was opened: the guards are not marked, and a failed
+        // stop leaves nothing for them to keep.
+        if let Err(error) = worker.process.stop(STOP_GRACE).await {
+            tracing::warn!(
+                error = &error as &dyn std::error::Error,
+                "the worker of a cancelled launch did not stop cleanly"
+            );
+        }
+        drop(guards);
+        return Err(VciShellError::Cancelled);
+    }
     let facts = VciFacts {
         api,
         long_size: worker.long_size,
@@ -234,8 +285,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::Ordering;
-
     use super::*;
 
     fn route(locks: PathBuf) -> VciRoute {
@@ -309,6 +358,54 @@ mod tests {
             ended.map(|run| run.worker_end)
         );
         drop(holder);
+    }
+
+    /// A future dropped while it waits (a timeout, a `select!`, a stop) sets the flag, so the
+    /// blocking wait ends while the lock is still held, and takes nothing once it is released.
+    #[test]
+    fn a_dropped_wait_ends_its_thread_and_takes_no_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let locks = dir.path().join("locks");
+        let setup = GuardSetup {
+            dir: locks.clone(),
+            vci: "vci-a".to_owned(),
+        };
+        let holder =
+            JobGuards::take_vci_only(&setup, Duration::from_millis(1), &AtomicBool::new(false))
+                .unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let timed_out = runtime.block_on(async {
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                run_on_vci(
+                    shell(locks),
+                    false,
+                    Arc::clone(&cancel),
+                    |_source, _facts, _guards| never(),
+                ),
+            )
+            .await
+        });
+        // Shutting the runtime down waits for blocking threads, up to the limit: a wait that
+        // kept polling the held lock would use all of it. (Asserting first would panic into a
+        // runtime drop that waits for that thread forever.)
+        let started = std::time::Instant::now();
+        runtime.shutdown_timeout(Duration::from_secs(10));
+        let shutdown = started.elapsed();
+        assert!(timed_out.is_err(), "the wait outlasts the timeout");
+        assert!(cancel.load(Ordering::Relaxed), "dropping sets the flag");
+        assert!(
+            shutdown < Duration::from_secs(5),
+            "the blocking wait kept polling: {shutdown:?}"
+        );
+        drop(holder);
+        // Nothing holds the lock: no phantom taker kept it.
+        let again = JobGuards::try_take(&setup).unwrap();
+        assert!(again.is_some(), "the lock is free");
     }
 
     /// A worker that cannot launch is its own error, after the locks were taken and released.

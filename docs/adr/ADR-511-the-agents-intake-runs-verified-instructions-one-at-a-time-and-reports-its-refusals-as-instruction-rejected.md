@@ -48,7 +48,7 @@ launches its worker in the binary, out of reach of a second caller.
 4. **Other failures before the run:**
    - a document or plan that does not load: `preconditionFailed` with `jobRefused` (ADR-475 item 2);
    - a fault of the agent's own, or a held set that is not the named set: `preconditionFailed` with `internal`;
-   - a VCI that the registration definitions do not name, that both the J2534 and the D-PDU API definitions name (no API is preferred), or whose worker does not launch: `preconditionFailed` with `linkNotOpened`.
+   - a VCI that the registration definitions do not name, that both the J2534 and the D-PDU API definitions name (no API is preferred), or whose worker does not launch: `preconditionFailed` with `linkNotOpened`. A definition that names the VCI ambiguously or with an invalid entry still counts as naming it, and a definition that cannot be read fails the lookup with its cause, again `linkNotOpened`.
 5. **An unavailable server is waited for, until the start deadline.**
    - A fetch that runs out of attempts, including an answer that mismatches twice, is the server unavailable, never a refusal (ADR-504 item 3).
    - The intake waits as ADR-504 item 7 does, at most 60 seconds, and fetches again.

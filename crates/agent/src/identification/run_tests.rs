@@ -4339,20 +4339,28 @@ async fn a_refused_variant_with_only_a_rule_request_leaves_the_definition_conclu
     );
 }
 
-/// How many requests the fake had started when the hook ran, one entry per call of the hook.
-fn stepping(fake: &Fake) -> (FirstStep, Arc<Mutex<Vec<usize>>>) {
+/// What the fake showed when the hook ran: requests started, links open.
+type HookCall = (usize, usize);
+
+/// How many requests the fake had started, and how many links it had open, when the hook ran,
+/// one entry per call of the hook.
+fn stepping(fake: &Fake) -> (FirstStep, Arc<Mutex<Vec<HookCall>>>) {
     let fired = Arc::new(Mutex::new(Vec::new()));
     let hook = {
         let (fired, fake) = (Arc::clone(&fired), fake.clone());
         Box::new(move || {
-            let started = fake.state().starts.len();
-            fired.lock().unwrap().push(started);
+            let state = fake.state();
+            fired
+                .lock()
+                .unwrap()
+                .push((state.starts.len(), state.open_links));
         })
     };
     (hook, fired)
 }
 
-/// The first-step hook runs once, before the run's first request is started.
+/// The first-step hook runs once, with the first link open and before the run's first request
+/// is started.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_first_step_hook_runs_once_before_the_first_request() {
     let fake = Fake::default();
@@ -4369,7 +4377,31 @@ async fn the_first_step_hook_runs_once_before_the_first_request() {
     .await;
     ran.report();
     assert!(!fake.state().starts.is_empty(), "the run sent a request");
-    assert_eq!(*fired.lock().unwrap(), [0]);
+    assert_eq!(*fired.lock().unwrap(), [(0, 1)]);
+}
+
+/// A run whose first link does not open never calls the hook.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_whose_first_link_fails_does_not_call_the_first_step_hook() {
+    let fake = Fake::default();
+    fake.state().create_status = Some(tonic::Status::permission_denied("no"));
+    let (hook, fired) = stepping(&fake);
+    let ran = run_shared_stepping(
+        plan_of(&[A], Some(0x7DF)),
+        fake.clone(),
+        limits(),
+        Arc::new(AtomicBool::new(false)),
+        tempfile::tempdir().unwrap(),
+        VciMargins::default(),
+        Some(hook),
+    )
+    .await;
+    assert!(
+        matches!(&ran.run.result, Err(JobError::Link(_))),
+        "{:?}",
+        ran.run.result
+    );
+    assert!(fired.lock().unwrap().is_empty());
 }
 
 /// A run refused before its first request does not call it.

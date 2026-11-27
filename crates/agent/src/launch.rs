@@ -486,28 +486,95 @@ pub enum Registered {
     Both,
 }
 
+/// A lookup that could not tell whether the definitions name a VCI.
+#[derive(Debug, thiserror::Error)]
+pub enum RegisteredError {
+    /// The J2534 registration definitions could not be read.
+    #[error("cannot look the VCI up in the J2534 registration definitions: {0}")]
+    J2534(#[source] j2534_0404::ResolveError),
+    /// The D-PDU API root file could not be read.
+    #[error("cannot look the VCI up in the D-PDU API root file: {0}")]
+    Dpdu(#[source] iso22900::ResolveError),
+}
+
+/// What one resolver outcome says about whether the definitions name the VCI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Naming {
+    /// A definition names it, even one that is ambiguous or invalid: the launch reports that.
+    Named,
+    /// No definition names it, or there is no definition to name it.
+    NotNamed,
+    /// The definitions could not be read.
+    Unreadable,
+}
+
+fn j2534_naming(result: &Result<Library, j2534_0404::ResolveError>) -> Naming {
+    use j2534_0404::ResolveError as E;
+    match result {
+        Ok(_) | Err(E::Ambiguous { .. }) => Naming::Named,
+        Err(E::NotFound { .. }) => Naming::NotNamed,
+        Err(_) => Naming::Unreadable,
+    }
+}
+
+fn dpdu_naming(result: &Result<Library, iso22900::ResolveError>) -> Naming {
+    use iso22900::ResolveError as E;
+    match result {
+        Ok(_) | Err(E::Ambiguous { .. } | E::InvalidEntry { .. }) => Naming::Named,
+        Err(E::NotFound { .. } | E::NoRootFile { .. }) => Naming::NotNamed,
+        Err(_) => Naming::Unreadable,
+    }
+}
+
 /// Which API's definitions name `vci`, as a worker build of this agent would resolve it: the
 /// J2534 registration definition or registry key, and the D-PDU API root file entry. Only the
-/// name is looked up; the library's file and ABI are checked when the worker is launched.
-pub fn registered_api(vci: &str) -> Registered {
+/// name is looked up; the library's file and ABI are checked when the worker is launched. A
+/// definition that cannot be read fails the lookup, since the name might be in it.
+pub fn registered_api(vci: &str) -> Result<Registered, RegisteredError> {
     registered_with(
         RESOLUTIONS,
-        |resolution| lookup_j2534(vci, resolution).is_ok(),
-        |resolution| lookup_dpdu(vci, resolution).is_ok(),
+        |resolution| lookup_j2534(vci, resolution),
+        |resolution| lookup_dpdu(vci, resolution),
     )
 }
 
 fn registered_with(
     resolutions: &[Resolution],
-    j2534: impl Fn(&Resolution) -> bool,
-    dpdu: impl Fn(&Resolution) -> bool,
-) -> Registered {
-    match (resolutions.iter().any(j2534), resolutions.iter().any(dpdu)) {
+    j2534: impl Fn(&Resolution) -> Result<Library, j2534_0404::ResolveError>,
+    dpdu: impl Fn(&Resolution) -> Result<Library, iso22900::ResolveError>,
+) -> Result<Registered, RegisteredError> {
+    let in_j2534 = names(resolutions, j2534, j2534_naming, RegisteredError::J2534)?;
+    let in_dpdu = names(resolutions, dpdu, dpdu_naming, RegisteredError::Dpdu)?;
+    Ok(match (in_j2534, in_dpdu) {
         (false, false) => Registered::Neither,
         (true, false) => Registered::Only(Api::J2534),
         (false, true) => Registered::Only(Api::Dpdu),
         (true, true) => Registered::Both,
+    })
+}
+
+/// Whether one API's definitions name the VCI in any worker build. A build that names it
+/// decides; otherwise a build whose definitions cannot be read fails the lookup.
+fn names<E>(
+    resolutions: &[Resolution],
+    lookup: impl Fn(&Resolution) -> Result<Library, E>,
+    naming: impl Fn(&Result<Library, E>) -> Naming,
+    fail: impl FnOnce(E) -> RegisteredError,
+) -> Result<bool, RegisteredError> {
+    let mut unreadable = None;
+    for resolution in resolutions {
+        let result = lookup(resolution);
+        match naming(&result) {
+            Naming::Named => return Ok(true),
+            Naming::NotNamed => {}
+            Naming::Unreadable => {
+                if unreadable.is_none() {
+                    unreadable = result.err();
+                }
+            }
+        }
     }
+    unreadable.map_or(Ok(false), |error| Err(fail(error)))
 }
 
 /// What one J2534 worker build would load for `vci`.
@@ -648,25 +715,157 @@ mod tests {
         assert_eq!(views, [RegistryView::Wow64_64, RegistryView::Wow64_32]);
     }
 
+    fn j2534_not_found() -> j2534_0404::ResolveError {
+        j2534_0404::ResolveError::NotFound {
+            name: "v".to_owned(),
+            skipped_invalid: 0,
+        }
+    }
+
+    fn j2534_ambiguous() -> j2534_0404::ResolveError {
+        j2534_0404::ResolveError::Ambiguous {
+            name: "v".to_owned(),
+            files: Vec::new(),
+        }
+    }
+
+    fn j2534_io() -> j2534_0404::ResolveError {
+        j2534_0404::ResolveError::Io {
+            path: PathBuf::from("defs"),
+            source: std::io::Error::other("disk"),
+        }
+    }
+
+    fn dpdu_not_found() -> iso22900::ResolveError {
+        iso22900::ResolveError::NotFound {
+            name: "v".to_owned(),
+            skipped_invalid: 0,
+        }
+    }
+
+    fn dpdu_no_root() -> iso22900::ResolveError {
+        iso22900::ResolveError::NoRootFile { path: None }
+    }
+
+    fn dpdu_ambiguous() -> iso22900::ResolveError {
+        iso22900::ResolveError::Ambiguous {
+            name: "v".to_owned(),
+            root_file: PathBuf::from("root.xml"),
+            count: 2,
+        }
+    }
+
+    fn dpdu_too_large() -> iso22900::ResolveError {
+        iso22900::ResolveError::TooLarge {
+            path: PathBuf::from("root.xml"),
+        }
+    }
+
+    type J = Result<Library, j2534_0404::ResolveError>;
+    type D = Result<Library, iso22900::ResolveError>;
+
+    fn registered(
+        j2534: impl Fn() -> J,
+        dpdu: impl Fn() -> D,
+    ) -> Result<Registered, RegisteredError> {
+        registered_with(&[X64, X86], |_| j2534(), |_| dpdu())
+    }
+
     #[test]
     fn a_name_is_registered_for_the_api_whose_definitions_name_it() {
-        let of = |apis: &[Api]| {
-            registered_with(
-                &[X64, X86],
-                |_| apis.contains(&Api::J2534),
-                |_| apis.contains(&Api::Dpdu),
-            )
-        };
-        assert_eq!(of(&[]), Registered::Neither);
-        assert_eq!(of(&[Api::J2534]), Registered::Only(Api::J2534));
-        assert_eq!(of(&[Api::Dpdu]), Registered::Only(Api::Dpdu));
-        assert_eq!(of(&[Api::J2534, Api::Dpdu]), Registered::Both);
-        // One build that finds the name is enough.
-        let in_x86_only = |resolution: &Resolution| resolution.abi == Some(Abi::WinX86);
+        let found_j = || Ok(library("lib.dll"));
+        let found_d = || Ok(library("lib.dll"));
         assert_eq!(
-            registered_with(&[X64, X86], in_x86_only, |_| false),
+            registered(|| Err(j2534_not_found()), || Err(dpdu_not_found())).unwrap(),
+            Registered::Neither
+        );
+        // A missing root file is a D-PDU API that names nothing.
+        assert_eq!(
+            registered(|| Err(j2534_not_found()), || Err(dpdu_no_root())).unwrap(),
+            Registered::Neither
+        );
+        assert_eq!(
+            registered(found_j, || Err(dpdu_not_found())).unwrap(),
             Registered::Only(Api::J2534)
         );
+        assert_eq!(
+            registered(|| Err(j2534_not_found()), found_d).unwrap(),
+            Registered::Only(Api::Dpdu)
+        );
+        assert_eq!(registered(found_j, found_d).unwrap(), Registered::Both);
+        // One build that finds the name is enough.
+        let in_x86_only = registered_with(
+            &[X64, X86],
+            |r| {
+                if r.abi == Some(Abi::WinX86) {
+                    Ok(library("x86.dll"))
+                } else {
+                    Err(j2534_not_found())
+                }
+            },
+            |_| Err(dpdu_not_found()),
+        );
+        assert_eq!(in_x86_only.unwrap(), Registered::Only(Api::J2534));
+    }
+
+    /// A definition that names the VCI badly still names it.
+    #[test]
+    fn an_ambiguous_or_invalid_definition_still_names_the_vci() {
+        assert_eq!(
+            registered(|| Err(j2534_ambiguous()), || Err(dpdu_not_found())).unwrap(),
+            Registered::Only(Api::J2534)
+        );
+        assert_eq!(
+            registered(|| Err(j2534_not_found()), || Err(dpdu_ambiguous())).unwrap(),
+            Registered::Only(Api::Dpdu)
+        );
+        let invalid_entry = || {
+            Err(iso22900::ResolveError::InvalidEntry {
+                name: "v".to_owned(),
+                root_file: PathBuf::from("root.xml"),
+                source: iso22900::EntryError::MissingLibrary,
+            })
+        };
+        assert_eq!(
+            registered(|| Err(j2534_not_found()), invalid_entry).unwrap(),
+            Registered::Only(Api::Dpdu)
+        );
+        assert_eq!(
+            registered(|| Err(j2534_ambiguous()), || Err(dpdu_ambiguous())).unwrap(),
+            Registered::Both
+        );
+    }
+
+    /// A definition that cannot be read fails the lookup with its cause, whatever the other
+    /// API says.
+    #[test]
+    fn an_unreadable_definition_fails_the_lookup_with_its_cause() {
+        let error = registered(|| Err(j2534_io()), || Err(dpdu_not_found())).unwrap_err();
+        assert!(matches!(
+            &error,
+            RegisteredError::J2534(j2534_0404::ResolveError::Io { .. })
+        ));
+        assert!(std::error::Error::source(&error).is_some());
+        let error = registered(|| Err(j2534_not_found()), || Err(dpdu_too_large())).unwrap_err();
+        assert!(matches!(
+            &error,
+            RegisteredError::Dpdu(iso22900::ResolveError::TooLarge { .. })
+        ));
+        // The other API naming the VCI does not settle whether this one does too.
+        registered(|| Ok(library("lib.dll")), || Err(dpdu_too_large())).unwrap_err();
+        // A build that names the VCI decides over a build that cannot be read.
+        let mixed = registered_with(
+            &[X64, X86],
+            |r| {
+                if r.abi == Some(Abi::WinX86) {
+                    Ok(library("x86.dll"))
+                } else {
+                    Err(j2534_io())
+                }
+            },
+            |_| Err(dpdu_not_found()),
+        );
+        assert_eq!(mixed.unwrap(), Registered::Only(Api::J2534));
     }
 
     #[test]

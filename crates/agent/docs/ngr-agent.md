@@ -535,7 +535,8 @@ printed, as `register` prints no argument value.
   ends promptly, though a load already running on a blocking thread may still finish in the
   background (or be cut off by the exit) before the process ends. A session task that ends
   without a stop (a panic) is exit 1 with "the control channel session ended unexpectedly"; both
-  locks are free by then.
+  locks are free by then. A job intake that ends without a stop is exit 1 with "the job intake
+  ended unexpectedly", after the session is stopped.
 - **The locks** make a second `connect` exit 3 ("a control channel session is already running")
   and `register` exit 3 while a session lives.
 - **A release build** on a machine without an installation file at the fixed location exits 1
@@ -695,7 +696,7 @@ connect`, above) loads the agent key and passes it in.
 - **The order on a command**: the gate verifies; the channel raises the mark to the instruction's issue time (a maximum, the one place the mark changes); the operator check; the duplicate check (ledger, below); the deadline (the device clock is read once, here, and not for a rejected, an operator-refused or a duplicate command); the synced write when the file is behind, for every verified command, a duplicate included; the ledger record; the intake; the first event; `commandAck`.
 - **A write that fails** (the write, a sync, the rename or the directory sync) withholds the intake, the event and the acknowledgement, warns once per `hello` under the class `mark-write` and closes with 1011. The mark in memory stays raised and the file's known value unchanged, so the next verified command writes again. A stop during the write ends as a stop.
 - **Status**: an expired job adds one to `commands_acknowledged`; `commands_rejected` is for the gate's refusals only.
-- **Not covered**: a deadline that passes between the acknowledgement and the real start of a job, and the resume of a recorded job (nothing starts a job from the control channel yet; those call the same raise and judgement when they land).
+- **After the acknowledgement**: the job intake judges the deadline again, with the same mark, when the job leaves its queue and while it waits for the server or the locks ("The job intake"); once the job has begun the deadline no longer applies. A job recorded before a restart is not resumed, so no deadline is judged for it.
 
 ## Received-jobs ledger
 
@@ -705,7 +706,7 @@ connect`, above) loads the agent key and passes it in.
 - **The rule**: a verified instruction for job `J` at generation `g` is a duplicate when `J` is recorded at `g` or higher; otherwise it is new, and a higher generation adds a second record. A duplicate is answered `commandAck` and counted in `commands_acknowledged`; no event, no intake call, no ledger write, no clock read, and a job past its deadline is still a duplicate. The record is made after the deadline check and the mark's write and before the intake.
 - **A record that fails** (write, sync, rename, directory sync; a blocking task that panics fails the command the same way but does not poison the ledger) withholds the intake, the event and the acknowledgement, warns once per `hello` under `ledger-write` and closes with 1011; the index is unchanged and the ledger then refuses records (`ledger-poisoned`, 1011) until `ReceivedJobs::reopen_if_poisoned` succeeds, which the session calls before each connection: a frame that reached the file counts, a torn one is cut, a corrupt file ends the session (`Ended::LedgerUnusable`, exit 1), another failure warns once per `hello` as `ledger-reopen` and is tried again. A duplicate is acknowledged while the ledger is poisoned. An `Intake` that fails after the record was made leaves the record, writes no event and no acknowledgement and closes with 1011 under `intake`.
 - **A stop during the write** ends as a stop; the write goes on holding the store and its lock, so a session started at once finds it in use (exit 3) until it ends.
-- **Not covered**: starting or resuming a recorded job, verifying its envelope again, and judging acceptance and the deadline again then (nothing starts a job from the control channel yet). A recorded job whose hand-over failed stays unrun until that exists.
+- **After a restart**: a recorded job is not resumed, and its envelope, acceptance and deadline are not judged again; a recorded job whose hand-over failed stays unrun. The job intake ("The job intake") runs only the jobs handed to it in the running session.
 
 ## Job instruction gate
 

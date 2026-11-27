@@ -151,7 +151,7 @@ operations:
       acknowledges it with commandAck and appends no event and hands nothing to its intake, also
       after the start deadline, so a redelivery never produces a second received and never an
       expired for a job the agent holds. A command whose
-      instruction fails verification is answered with commandRejected (ADR-461) and creates no job. Jobs past their start deadline are not run; Expired is reported instead (ADR-486): after the operator check, the agent judges the deadline against the later of its clock and the highest issue time it has verified, and appends a terminal expired jobState (no failure code, no detail) in place of received, then answers commandAck.
+      instruction fails verification is answered with commandRejected (ADR-461) and creates no job. Jobs past their start deadline are not run; Expired is reported instead (ADR-486): after the operator check, the agent judges the deadline against the later of its clock and the highest issue time it has verified, and appends a terminal expired jobState (no failure code, no detail) in place of received, then answers commandAck. After received, the agent's job intake (ADR-511) reports the job's run: running once its first step begins, then completed, or an end such as failed (instructionRejected for its own refusals), preconditionFailed or expired.
       The agent settles each delivery with commandAck or commandRejected (ADR-466). A new
       verified command's received jobState is appended to the agent's outbox after the ledger
       record and the hand-over to the intake and before commandAck, and sent as a numbered

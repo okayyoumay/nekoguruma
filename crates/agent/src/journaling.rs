@@ -371,17 +371,18 @@ impl<S: Store> JobJournal<S> {
             // A plain procedure's resume origin (ADR-335 item 2); the flash-plan facts do not
             // read it.
             let encoded = encode(after)?;
-            // A state too large for a frame is skipped, not the job's end: `commit_checkpoint`
-            // refuses it before anything is appended, so the journal is unchanged and the job
-            // goes on. A missing checkpoint only makes a restart more conservative (ADR-335):
+            // A state too large for a frame, or a record that cannot be encoded, is skipped, not
+            // the job's end: `commit_checkpoint` refuses either before anything is appended, so
+            // the journal is unchanged and the job goes on. A missing checkpoint only makes a restart more conservative (ADR-335):
             // the latest checkpoint stays an older one, from which a resume re-runs only
             // primitives that are safe to repeat, and a completed request that is not safe to
             // repeat, with no state after it, counts as unconfirmed.
             match self.journal.commit_checkpoint(at, &encoded) {
-                Err(JournalError::TooLarge) => {
+                Err(error @ (JournalError::TooLarge | JournalError::Unencodable(_))) => {
                     tracing::warn!(
                         pc = at.pc,
-                        "the VM state is too large for a checkpoint; none is recorded"
+                        error = &error as &dyn std::error::Error,
+                        "the VM state cannot be recorded as a checkpoint; none is recorded"
                     );
                 }
                 result => result?,

@@ -957,7 +957,7 @@ async fn record_job_state(w: &Wiring, stop: &Stop, job_id: String, state: JobSta
             let class = match error {
                 OutboxError::Full => "outbox-full",
                 OutboxError::Poisoned => "outbox-poisoned",
-                OutboxError::TooLarge => "outbox-event",
+                OutboxError::TooLarge | OutboxError::FrameTooLarge(..) => "outbox-event",
                 _ => "outbox-write",
             };
             Recorded::Failed(class, error)

@@ -371,13 +371,14 @@ impl Warnings {
     /// A failed upgrade attempt: [`Warnings::failure`], with the error that ended it when there
     /// is one.
     fn upgrade_failure(&mut self, fail: &channel::UpgradeFail) {
-        let Some(source) = &fail.source else {
+        let Some(source) = fail.source.as_deref() else {
             return self.failure(fail.class, fail.status);
         };
+        let source = source as &(dyn std::error::Error + 'static);
         if self.seen.insert(fail.class) {
-            tracing::warn!(class = fail.class, status = ?fail.status, %source, "control channel attempt failed");
+            tracing::warn!(class = fail.class, status = ?fail.status, error = source, "control channel attempt failed");
         } else {
-            tracing::debug!(class = fail.class, status = ?fail.status, %source, "control channel attempt failed");
+            tracing::debug!(class = fail.class, status = ?fail.status, error = source, "control channel attempt failed");
         }
     }
 

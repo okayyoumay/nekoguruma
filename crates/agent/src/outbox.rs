@@ -309,9 +309,10 @@ impl Outbox {
     /// Gives the event the next number, asks `text` for the exact text of its control frame with
     /// that number in it, and makes it durable. Blocking (a file sync): the channel calls it on a
     /// blocking task. Returns the number; the event is pending from then on. A refusal
-    /// ([`OutboxError::Full`], [`OutboxError::TooLarge`]) writes no event and uses no number;
-    /// before answering `Full` it retries an owed rewrite, which writes the rewritten file and
-    /// answers [`OutboxError::Poisoned`] if that rewrite poisons the outbox (its cause is logged).
+    /// ([`OutboxError::Full`], [`OutboxError::TooLarge`], [`OutboxError::FrameTooLarge`]) writes
+    /// no event and uses no number; before answering `Full` it retries an owed rewrite, which
+    /// writes the rewritten file and answers [`OutboxError::Poisoned`] if that rewrite poisons the
+    /// outbox (its cause is logged).
     pub fn append(
         &mut self,
         kind: Kind,

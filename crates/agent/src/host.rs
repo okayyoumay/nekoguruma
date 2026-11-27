@@ -57,8 +57,9 @@ pub enum HostError {
     NoResponse,
     /// The ECU gave no response before the agent's own deadline ran out. The cause is the
     /// timer's `Elapsed`. Everywhere the host judges an unanswered request it counts as
-    /// [`HostError::NoResponse`] (see [`HostError::is_no_response`]).
-    #[error("no response from the ECU before the agent's deadline")]
+    /// [`HostError::NoResponse`] (see [`HostError::is_no_response`]), and its text is the same, so
+    /// what the server and the logs read does not tell the two paths apart.
+    #[error("no response from the ECU")]
     DeadlinePassed(#[source] tokio::time::error::Elapsed),
     /// The worker dropped events of the link, so the primitive's outcome is unknown: the
     /// request may have been answered.
@@ -6144,6 +6145,7 @@ mod tests {
         );
         let vci = HostError::NoResponse;
         assert!(error.is_no_response() && vci.is_no_response());
+        assert_eq!(error.to_string(), vci.to_string());
         let (end, detail) = end_of(&[0x22, 0xF1, 0x90], &Err(error));
         let (vci_end, vci_detail) = end_of(&[0x22, 0xF1, 0x90], &Err(HostError::NoResponse));
         assert!(matches!(end, End::NoResponse));

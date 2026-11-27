@@ -36,8 +36,10 @@ cheapest way through.
    comparing the whole value. A comparable stand-in for the cause (its kind, its text) would
    end the `source()` chain, and is not used.
 4. **An error sent to another process carries the cause in its text.** This covers a worker's
-   gRPC `Status`, the launcher's JSON-RPC error and the server's HTTP answers. The text says
-   what was wrong with the request, so the cause is appended to the fixed text.
+   gRPC `Status` and the launcher's JSON-RPC error. The text says what was wrong with the
+   request, so the cause is appended to the fixed text. The server's HTTP answers are not
+   changed: they keep their titles and codes, and the server keeps the cause in its own error
+   and in its logs.
 5. **At a trust boundary the answer stays the same, and the cause is logged on the refusing
    side.** This covers verification of a signature, proof or MAC; parsing a key, certificate or
    token received from the other side; and a registration or session refusal.

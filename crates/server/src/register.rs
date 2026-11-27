@@ -525,7 +525,10 @@ pub(crate) async fn bounded_body_for(
             ),
             BodyError::Broken(source) => {
                 // The answer names no cause; the server records it.
-                tracing::debug!(error = %source, "a request body broke while it was read");
+                tracing::debug!(
+                    error = &source as &dyn std::error::Error,
+                    "a request body broke while it was read"
+                );
                 closing(StatusCode::BAD_REQUEST, broken)
             }
         })
@@ -544,7 +547,7 @@ pub async fn register(State(registrar): State<Registrar>, request: Request) -> R
         Err(error) => {
             // The answer names no cause; the server records it.
             if let Some(source) = std::error::Error::source(&error) {
-                tracing::debug!(rule = %error, error = %source, "a registration request was refused");
+                tracing::debug!(rule = %error, error = source, "a registration request was refused");
             }
             return Problem::new(StatusCode::BAD_REQUEST, error.title()).into_response();
         }

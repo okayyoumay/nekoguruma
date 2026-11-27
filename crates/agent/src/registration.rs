@@ -365,8 +365,7 @@ fn judge(
             };
             answer::check(reply.json_content_type, body, &expected).map_err(|error| {
                 tracing::warn!(
-                    %error,
-                    source = std::error::Error::source(&error).map(tracing::field::display),
+                    error = &error as &dyn std::error::Error,
                     "the server's registration answer was refused"
                 );
                 fail(error.exit_kind(), error.to_string())

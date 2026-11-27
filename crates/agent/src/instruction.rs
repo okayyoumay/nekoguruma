@@ -156,24 +156,37 @@ fn check(
 /// otherwise (the control channel's gate bounds its warnings that way; [`open`] always warns).
 pub(crate) fn log_refusal(refusal: &Refusal, envelope_len: usize, first: bool) {
     let reason = format!("{:?}", refusal.reason);
-    let cause = refusal.source.as_deref().map(tracing::field::display);
+    let cause = refusal
+        .source
+        .as_deref()
+        .map(|source| source as &(dyn std::error::Error + 'static));
     match (&refusal.offered, first) {
         (Some(fingerprint), true) => tracing::warn!(
             reason,
             envelope_len,
             offered_key = %hex(fingerprint),
-            cause,
+            error = cause,
             "job instruction refused"
         ),
         (Some(fingerprint), false) => tracing::debug!(
             reason,
             envelope_len,
             offered_key = %hex(fingerprint),
-            cause,
+            error = cause,
             "job instruction refused"
         ),
-        (None, true) => tracing::warn!(reason, envelope_len, cause, "job instruction refused"),
-        (None, false) => tracing::debug!(reason, envelope_len, cause, "job instruction refused"),
+        (None, true) => tracing::warn!(
+            reason,
+            envelope_len,
+            error = cause,
+            "job instruction refused"
+        ),
+        (None, false) => tracing::debug!(
+            reason,
+            envelope_len,
+            error = cause,
+            "job instruction refused"
+        ),
     }
 }
 

@@ -67,7 +67,10 @@ impl IntoResponse for AskError {
     fn into_response(self) -> Response {
         // The answer names no cause; the refusing side records it.
         if let AskError::NonceText(source) = &self {
-            tracing::debug!(error = %source, "the Ngr-Nonce header was refused");
+            tracing::debug!(
+                error = source as &dyn std::error::Error,
+                "the Ngr-Nonce header was refused"
+            );
         }
         Problem::new(StatusCode::BAD_REQUEST, self.title()).into_response()
     }
@@ -228,9 +231,9 @@ impl Prover {
     }
 
     /// Logs a failed proof through the one gate and says it as a value.
-    fn failed(&self, what: &'static str, cause: &dyn std::error::Error) -> Unprovable {
+    fn failed(&self, what: &'static str, cause: &(dyn std::error::Error + 'static)) -> Unprovable {
         if may_log(&self.gate, now(), LOG_EVERY) {
-            tracing::error!(what, error = %cause, "an answer could not be proved");
+            tracing::error!(what, error = cause, "an answer could not be proved");
         }
         Unprovable
     }

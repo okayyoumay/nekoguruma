@@ -14,8 +14,9 @@
 //!
 //! The session algorithm is `plain`: the key crosses the bus unencrypted, which the bus's
 //! same-account trust allows (the account's own processes can read the key from the unlocked
-//! collection anyway). Error sources are fixed strings, never the daemon's text, which may echo
-//! what the call carried.
+//! collection anyway). The reason of a failed call is a fixed string with no source, never the
+//! daemon's text, which may echo what the call carried; only a failure to open the session bus
+//! keeps its cause.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -300,7 +301,7 @@ impl DbusTransport {
                 .await?;
             reply.body().deserialize::<R>()
         })
-        .map_err(reason)
+        .map_err(|error| Reason::from(reason(&error)))
     }
 }
 
@@ -384,13 +385,8 @@ impl Drop for DbusTransport {
     }
 }
 
-/// The reason for a failed call: fixed words, with the error as their source.
-fn reason(error: zbus::Error) -> Reason {
-    Reason::caused_by(reason_text(&error), error)
-}
-
-/// The fixed words for a failed call. The daemon's own text is not among them.
-fn reason_text(error: &zbus::Error) -> &'static str {
+/// The fixed reason for a failed call. The daemon's own text is dropped.
+fn reason(error: &zbus::Error) -> &'static str {
     use zbus::fdo::Error as Fdo;
     match error {
         zbus::Error::FDO(fdo) => match &**fdo {
@@ -443,6 +439,10 @@ impl Transport for DbusTransport {
         Ok((path.as_str() != "/").then(|| path.as_str().to_owned()))
     }
 
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "the Secret Service daemon's error text may repeat the secret the call carried"
+    )]
     fn collection_locked(&self, collection: &str) -> Result<bool, Reason> {
         let (value,): (zbus::OwnedVariant,) = self.call(
             collection,
@@ -450,8 +450,7 @@ impl Transport for DbusTransport {
             "Get",
             &(COLLECTION_IFACE, "Locked"),
         )?;
-        bool::try_from(value)
-            .map_err(|error| Reason::caused_by("Secret Service call failed", error))
+        bool::try_from(value).map_err(|_| Reason::from("Secret Service call failed"))
     }
 
     fn open_session(&self) -> Result<SessionReply, Reason> {
@@ -467,9 +466,13 @@ impl Transport for DbusTransport {
         })
     }
 
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "the Secret Service daemon's error text may repeat the secret the call carried"
+    )]
     fn get_secret(&self, item: &str, session: &str) -> Result<SecretReply, Reason> {
-        let session = zbus::ObjectPath::try_from(session)
-            .map_err(|error| Reason::caused_by("bad session", error))?;
+        let session =
+            zbus::ObjectPath::try_from(session).map_err(|_| Reason::from("bad session"))?;
         let ((reply_session, parameters, value, _content_type),): ((
             OwnedObjectPath,
             Vec<u8>,
@@ -483,6 +486,10 @@ impl Transport for DbusTransport {
         })
     }
 
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "the Secret Service daemon's error text may repeat the secret the call carried"
+    )]
     fn create_item(
         &self,
         collection: &str,
@@ -490,8 +497,8 @@ impl Transport for DbusTransport {
         name: &SecretName,
         secret: &[u8],
     ) -> Result<Created, Reason> {
-        let session = zbus::ObjectPath::try_from(session)
-            .map_err(|error| Reason::caused_by("bad session", error))?;
+        let session =
+            zbus::ObjectPath::try_from(session).map_err(|_| Reason::from("bad session"))?;
         let properties: HashMap<&str, Variant> = HashMap::from([
             ("org.freedesktop.Secret.Item.Label", Variant::from(LABEL)),
             (
@@ -851,10 +858,10 @@ mod tests {
     #[test]
     fn a_failed_call_gives_a_fixed_reason() {
         let error = zbus::Error::Failure("secret text".into());
-        assert_eq!(reason_text(&error), "Secret Service call failed");
+        assert_eq!(reason(&error), "Secret Service call failed");
         let error = zbus::Error::FDO(Box::new(zbus::fdo::Error::ServiceUnknown("x".into())));
-        assert_eq!(reason_text(&error), "no Secret Service");
+        assert_eq!(reason(&error), "no Secret Service");
         let error = zbus::Error::FDO(Box::new(zbus::fdo::Error::NoReply("x".into())));
-        assert_eq!(reason_text(&error), "no answer in time");
+        assert_eq!(reason(&error), "no answer in time");
     }
 }

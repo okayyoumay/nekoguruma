@@ -59,10 +59,10 @@ use crate::config::is_valid_bucket;
 use crate::object_server::Credentials;
 use xml::ErrorCode;
 
-/// The region the requests are signed for (the object server's default).
 /// The error behind a [`StoreError`] that the store keeps as its source.
 type Cause = Box<dyn std::error::Error + Send + Sync>;
 
+/// The region the requests are signed for (the object server's default).
 const REGION: &str = "us-east-1";
 /// The most rounds of listing and aborting a delete makes before it deletes the object.
 const DELETE_ROUNDS: usize = 3;

@@ -645,7 +645,7 @@ impl Inner {
             tracing::warn!(
                 reason = reason.word(),
                 %agent_id,
-                cause = cause.map(tracing::field::debug),
+                error = cause.map(|cause| cause as &(dyn std::error::Error + 'static)),
                 "session refused"
             );
         }

@@ -6,7 +6,7 @@ Design goals:
 - Match workspace patterns used by iso22900-sys.
 - Keep ABI-facing definitions in a single C header: src/bindings/j2534_v0404.h.
 - Support pre-generated per-target bindings by default.
-- Support regeneration via bindgen feature for maintenance.
+- Support regeneration with the `bindgen` feature and `NGR_REGENERATE_FFI=1` for maintenance.
 
 Primary API scope (04.04):
 - PassThruOpen / PassThruClose

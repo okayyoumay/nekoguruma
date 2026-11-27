@@ -71,7 +71,7 @@ which is kept with the project's working material rather than in the design docu
 | Role | FFI bindings for the ISO 22900 D-PDU API native DLL |
 | Responsibility | Dynamic loading via `libloading`, C function pointer definitions |
 | Key types | `DPduApiSys` (aggregate of function pointers) |
-| Notes | Can be regenerated from headers when the `bindgen` feature is enabled |
+| Notes | Can be regenerated from headers with the `bindgen` feature and `NGR_REGENERATE_FFI=1` |
 
 #### `iso22900`
 | Item | Description |
@@ -197,7 +197,7 @@ worker is built for:
 | `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` | LP64 Linux (see `unsigned long` width below) |
 | `i686-unknown-linux-gnu`, `armv7-unknown-linux-gnueabihf`, `armv5te-unknown-linux-gnueabi` | 32-bit Linux |
 
-Regenerate with `cargo build -p <crate> --features bindgen --target <target>` after a header
+Regenerate with `NGR_REGENERATE_FFI=1 cargo build -p <crate> --features bindgen --target <target>` after a header
 edit (libclang 18; a cross Linux target needs its libc headers, for example
 `BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu=--sysroot=/usr/aarch64-linux-gnu` with
 Ubuntu's `libc6-dev-*-cross` packages (the variable's suffix is the target with `-` replaced by
@@ -311,7 +311,7 @@ Each protocol is split into a `-sys` crate (unsafe FFI) and a higher-level safe 
 - unsafe code is confined to `-sys` and the safe wrapper, which makes the FFI calls and exposes a
   safe API; the `*-service` crates above it call the wrapper (ADR-502 grants `unsafe_code` only to
   these crates, the mocks and `sim-vci`)
-- bindings can be regenerated from header files via the `bindgen` feature
+- bindings can be regenerated from header files with the `bindgen` feature and `NGR_REGENERATE_FFI=1`
 - testability is ensured by swapping in mocks
 
 ### Opaque Handle Pattern

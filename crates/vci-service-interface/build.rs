@@ -3,8 +3,22 @@ use prost_build::Config;
 #[cfg(feature = "protoc")]
 use tonic_prost_build::configure;
 
+/// The variable that turns the regeneration on. The `protoc` feature alone builds the generator
+/// but leaves the committed bindings as they are, so a `--all-features` check or Clippy run of the
+/// workspace does not rewrite them.
+const REGENERATE: &str = "NGR_REGENERATE_PROTO";
+
 fn main() {
-    build_protobuf();
+    println!("cargo:rerun-if-env-changed={REGENERATE}");
+    if std::env::var_os(REGENERATE).is_some_and(|value| value == "1") {
+        if cfg!(feature = "protoc") {
+            build_protobuf();
+        } else {
+            println!(
+                "cargo:warning={REGENERATE}=1 has no effect without the 'protoc' or 'vendored-protoc' feature"
+            );
+        }
+    }
 }
 #[cfg(not(feature = "protoc"))]
 fn build_protobuf() {}

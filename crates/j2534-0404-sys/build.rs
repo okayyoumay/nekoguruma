@@ -1,5 +1,5 @@
-#[cfg(not(feature = "bindgen"))]
-fn run_bindgen() {
+/// Uses the committed bindings for the target, which must exist.
+fn use_committed_bindings() {
     use std::fs;
 
     let target = std::env::var("TARGET").expect("TARGET env var not set");
@@ -12,13 +12,13 @@ fn run_bindgen() {
 
     if fs::metadata(&bindings_file).is_err() {
         panic!(
-            "Bindings file {bindings_file} does not exist. Please enable the 'bindgen' feature to generate it."
+            "Bindings file {bindings_file} does not exist. Generate it by building with the 'bindgen' feature and {REGENERATE}=1."
         );
     }
 }
 
 #[cfg(feature = "bindgen")]
-fn run_bindgen() {
+fn generate_bindings() {
     let target = std::env::var("TARGET").expect("TARGET env var not set");
     println!("cargo:rustc-env=BINDINGS_RS_FILENAME={target}.rs");
 
@@ -51,6 +51,24 @@ fn run_bindgen() {
     bindings
         .write_to_file(&bindings_file)
         .expect("Couldn't write bindings");
+}
+
+/// The variable that turns the regeneration on. The `bindgen` feature alone builds the generator
+/// but uses the committed bindings, so a workspace `--all-features` build does not rewrite them.
+const REGENERATE: &str = "NGR_REGENERATE_FFI";
+
+fn run_bindgen() {
+    println!("cargo:rerun-if-env-changed={REGENERATE}");
+    #[cfg(feature = "bindgen")]
+    if std::env::var_os(REGENERATE).is_some_and(|value| value == "1") {
+        generate_bindings();
+        return;
+    }
+    #[cfg(not(feature = "bindgen"))]
+    if std::env::var_os(REGENERATE).is_some_and(|value| value == "1") {
+        println!("cargo:warning={REGENERATE}=1 has no effect without the 'bindgen' feature");
+    }
+    use_committed_bindings();
 }
 
 fn main() {

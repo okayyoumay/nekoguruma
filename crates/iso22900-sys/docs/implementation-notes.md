@@ -7,7 +7,7 @@ Low-level FFI and dynamic loading crate. It provides raw bindings only; higher-l
 ## Assumptions
 
 - Pre-generated target binding files are the default compilation path.
-- Missing binding files are treated as hard build failures unless bindgen generation is explicitly enabled.
+- Missing binding files are treated as hard build failures unless bindgen generation is explicitly enabled (the `bindgen` feature and `NGR_REGENERATE_FFI=1`).
 - bindgen execution depends on host tooling (Clang/libclang and compatible headers).
 - Runtime loading behavior follows generated ABI declarations and libloading semantics.
 - Plain C enum newtypes (`.newtype_enum("E_PDU_.*")`) have a target-ABI-dependent underlying integer type: `c_uint` on Itanium-derived ABIs (Linux, `*-pc-windows-gnullvm`, `armv5te-unknown-linux-gnueabi`), `c_int` on `x86_64-pc-windows-msvc` (Microsoft ABI). Consumers must not assume a fixed width/signedness across targets (see ADR-108).

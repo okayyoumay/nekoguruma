@@ -11,9 +11,13 @@ paths:
 
 - **Proto bindings** (`crates/vci-service-interface`): after editing
   `src/proto/service.proto`, regenerate with
-  `cargo build -p vci-service-interface --features vendored-protoc` and commit
+  `NGR_REGENERATE_PROTO=1 cargo build -p vci-service-interface --features vendored-protoc`
+  (the feature alone builds the generator and writes nothing, so a `--all-features` run
+  leaves the bindings as they are) and commit
   the result with the proto change. Update `docs/rpc-api-guide.md` in the same
-  PR.
+  PR. The committed file is what the generator at its `Cargo.lock` versions produces: a
+  generator update that changes the output is committed with the regenerated file, even
+  with no proto change.
 - **IR FlatBuffers bindings** (`crates/diag-ir`): `schema/ir.fbs` is the
   source of truth; `src/generated/ir_generated.rs` is regenerated with
   `cargo build -p diag-ir --features download-flatc`, which fetches the pinned
@@ -25,10 +29,11 @@ paths:
   `src/bindings/{target}.rs` is committed for every target listed in
   `docs/worker-crates.md` ("Target ABIs"). Never hand-edit a `{target}.rs`.
 - Regenerate FFI bindings with
-  `cargo build -p <crate> --features bindgen --target <target>`. This is slow
+  `NGR_REGENERATE_FFI=1 cargo build -p <crate> --features bindgen --target <target>`
+  (the feature alone builds bindgen and uses the committed file). This is slow
   and needs cross toolchains, so a header edit alone is not a request to
   regenerate: ask whether to regenerate now or defer. Never commit a header
   edit with stale bindings silently; record a deferral as an open item in
   `work/`.
-- Without `--features bindgen` the build expects the committed `{target}.rs`
+- Unless both `--features bindgen` and `NGR_REGENERATE_FFI=1` are given, the build uses the committed `{target}.rs`
   and fails if it is missing, so adding a target means generating its file.

@@ -15,7 +15,7 @@
 
 use std::path::Path;
 
-use diag_ir::{IdentityKind, Program, VmState};
+use diag_ir::{IdentityKind, Program};
 use shared_proto::{FailureCode, JobState, MAX_PROCEDURE_CODE_LEN};
 
 use crate::host::HostError;
@@ -113,7 +113,8 @@ pub enum JobOutcome {
     None,
 }
 
-/// The outcome of a run that ended with `result`. `first_run` says the run was the job's first
+/// The outcome of a run that ended with `result` (a program's final state or an identification's
+/// report: the value is not read). `first_run` says the run was the job's first
 /// (no earlier run of it on this agent); `standing` is the journal's after the run.
 ///
 /// Another run's job (`Journal(InUse)`, `Journal(AlreadyExists)`) reports nothing. Otherwise a
@@ -130,8 +131,8 @@ pub enum JobOutcome {
 ///   the job cannot go on by itself; any other error leaves the job open;
 /// - clean, the error is terminal. A refusal or a failure before anything was sent on a first
 ///   run is a precondition failure; on a resume the same causes are failures.
-pub fn outcome(
-    result: &Result<VmState, JobError>,
+pub fn outcome<T>(
+    result: &Result<T, JobError>,
     first_run: bool,
     standing: &JournalStanding,
 ) -> JobOutcome {
@@ -465,6 +466,7 @@ mod tests {
     use crate::guards::GuardError;
     use crate::inputs::TableError;
     use crate::journal::StepRef;
+    use diag_ir::VmState;
     use diag_ir::{Idempotency, Interruptible, Op, Section, Vm, VmError, WaitingOn};
     use std::path::PathBuf;
 
@@ -475,7 +477,7 @@ mod tests {
     }
 
     fn run(error: JobError, first_run: bool, standing: &JournalStanding) -> JobOutcome {
-        outcome(&Err(error), first_run, standing)
+        outcome::<VmState>(&Err(error), first_run, standing)
     }
 
     fn state(error: JobError, first_run: bool, standing: &JournalStanding) -> JobState {

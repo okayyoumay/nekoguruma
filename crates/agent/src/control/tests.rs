@@ -380,6 +380,9 @@ struct Opts {
     ledger_probe: Option<Probe>,
     /// What log requests go to, in place of the scripted handler.
     log_uploads: Option<Arc<dyn LogUploads>>,
+    /// Gives the session the agent's own job intake over the fixture's stores, in place of the
+    /// recording one.
+    job_intake: bool,
 }
 
 impl Default for Opts {
@@ -393,8 +396,78 @@ impl Default for Opts {
             mark_probe: None,
             ledger_probe: None,
             log_uploads: None,
+            job_intake: false,
         }
     }
+}
+
+/// An object source that refuses everything: no job of these tests gets as far as a document.
+struct NoObjects;
+
+impl crate::intake::Objects for NoObjects {
+    fn fetch_all<'a>(
+        &'a self,
+        _instruction: &'a VerifiedInstruction,
+        _attempts: u32,
+    ) -> crate::intake::ObjectFuture<'a, Vec<crate::fetch::Fetched>> {
+        Box::pin(std::future::ready(Err(crate::fetch::FetchError::Refused {
+            why: "test",
+            status: Some(404),
+        })))
+    }
+
+    fn read_document<'a>(
+        &'a self,
+        _instruction: &'a VerifiedInstruction,
+        _digest: &'a [u8; 32],
+        _attempts: u32,
+    ) -> crate::intake::ObjectFuture<'a, Vec<u8>> {
+        Box::pin(std::future::ready(Err(crate::fetch::FetchError::Refused {
+            why: "test",
+            status: Some(404),
+        })))
+    }
+}
+
+/// A VCI lookup that knows no VCI.
+struct NoVcis;
+
+impl crate::vci_shell::VciLookup for NoVcis {
+    fn find(
+        &self,
+        vci: &str,
+    ) -> Result<crate::vci_shell::VciRoute, crate::vci_shell::VciShellError> {
+        Err(crate::vci_shell::VciShellError::UnknownVci {
+            vci: vci.to_owned(),
+        })
+    }
+}
+
+/// The agent's job intake over the stores of the fixture.
+fn job_intake(
+    fx: &Fixture,
+    outbox: &SharedOutbox,
+    marks: &IssueMark,
+    clock: &Arc<TestClock>,
+) -> (Arc<crate::intake::JobIntake>, crate::intake::Handle) {
+    let uploads = fx.dir.path().join("uploads");
+    std::fs::create_dir_all(&uploads).unwrap();
+    let journal = fx.dir.path().join("journal");
+    crate::intake::start(crate::intake::Parts {
+        objects: Arc::new(NoObjects),
+        plans: Arc::new(crate::identification::NoPlans),
+        vcis: Arc::new(NoVcis),
+        mode: OperatingMode::User,
+        journal_dir: Arc::new(move || Ok(journal.clone())),
+        outbox: outbox.clone(),
+        uploads: crate::uploader::SharedLedger::new(
+            crate::upload_ledger::UploadLedger::open_in(&uploads, AGENT_ID).unwrap(),
+        ),
+        marks: marks.clone(),
+        clock: clock.clone(),
+        outcomes: crate::outcome_record::OutcomeRecord::open_in(&fx.registration_dir(), AGENT_ID)
+            .unwrap(),
+    })
 }
 
 /// The outbox of the fixture's agent in its state directory.
@@ -456,6 +529,8 @@ fn open_ledger(fx: &Fixture, probe: Option<Probe>) -> ReceivedJobs {
 #[derive(Default)]
 struct RecordingIntake {
     taken: Mutex<Vec<(String, Vec<u8>)>>,
+    /// The job and generation of each [`Intake::received`] call.
+    received: Mutex<Vec<(String, u64)>>,
     fail: AtomicBool,
     hang: AtomicBool,
 }
@@ -467,6 +542,13 @@ impl RecordingIntake {
 }
 
 impl Intake for RecordingIntake {
+    fn received(&self, job_id: &str, generation: u64) {
+        self.received
+            .lock()
+            .unwrap()
+            .push((job_id.to_owned(), generation));
+    }
+
     fn take(&self, instruction: VerifiedInstruction) -> Taken<'_> {
         self.taken.lock().unwrap().push((
             instruction.instruction().job_id.0.clone(),
@@ -552,6 +634,8 @@ struct Env {
     dial: Arc<FakeDial>,
     log: Log,
     started: Instant,
+    /// The agent's own intake, when the test asked for it.
+    _job_intake: Option<crate::intake::Handle>,
     // Dropped last: the log stays captured until the loop has ended.
     _subscriber: tracing::subscriber::DefaultGuard,
 }
@@ -646,11 +730,17 @@ impl Env {
         let marks = open_marks(&fx, opts.mark_probe);
         let ledger = open_ledger(&fx, opts.ledger_probe);
         let clock = TestClock::at(DEVICE_NOW);
+        let (session_intake, job_intake): (Arc<dyn Intake>, _) = if opts.job_intake {
+            let (job_intake, handle) = job_intake(&fx, &outbox, &marks, &clock);
+            (job_intake, Some(handle))
+        } else {
+            (intake.clone(), None)
+        };
         let seams = Seams {
             dial: dial.clone(),
             signer,
             random: opts.random,
-            intake: intake.clone(),
+            intake: session_intake,
             outbox: outbox.clone(),
             marks: marks.clone(),
             clock: clock.clone(),
@@ -677,6 +767,7 @@ impl Env {
             dial,
             log,
             started,
+            _job_intake: job_intake,
             _subscriber: guard,
         }
     }
@@ -6629,6 +6720,64 @@ async fn ledger_c4_an_intake_error_keeps_the_record_withholds_the_ack_and_closes
     acked(&mut ws, "a").await;
     assert_after(hello_at, heartbeat(&mut ws).await, 60, "tick: no event");
     assert_eq!(env.intake.calls(), 1);
+}
+
+/// The intake is told once, after the job's `received` event is in the outbox and before the
+/// event reaches the server's side of the connection; an intake that failed is not told.
+#[tokio::test(start_paused = true)]
+async fn the_intake_is_told_of_a_job_once_its_received_event_is_appended() {
+    let mut env = Env::new();
+    let (_, mut ws) = env.connected(60).await;
+    send(&mut ws, &verified(&env, "a")).await;
+    acked(&mut ws, "a").await;
+    let events = texts(&mut ws, 1).await;
+    assert!(events[0].contains(r#""state":"received""#), "{events:?}");
+    assert_eq!(
+        *env.intake.received.lock().unwrap(),
+        vec![(JOB_ID.to_owned(), GENERATION)]
+    );
+    // The redelivery is a duplicate: the intake is not told again.
+    send(&mut ws, &verified(&env, "again")).await;
+    acked(&mut ws, "again").await;
+    assert_eq!(env.intake.received.lock().unwrap().len(), 1);
+    assert_eq!(env.intake.calls(), 1);
+
+    env.intake.fail.store(true, Ordering::SeqCst);
+    send(&mut ws, &verified_job(&env, "two", 2)).await;
+    close_of(&mut ws, 1011, true).await;
+    assert_eq!(
+        env.intake.received.lock().unwrap().len(),
+        1,
+        "a job whose take failed has no `received` event and the intake is not told"
+    );
+}
+
+/// The agent's own intake behind the channel: a verified instruction that names no document is
+/// refused by it, and the refusal reaches the server after the job's `received` event, on the same
+/// connection, with the failure code and nothing of which check refused.
+#[tokio::test(start_paused = true)]
+async fn a_verified_instruction_is_refused_by_the_job_intake_after_its_received_event() {
+    let mut env = Env::with(Opts {
+        job_intake: true,
+        ..Opts::default()
+    });
+    let (_, mut ws) = env.connected(60).await;
+    send(&mut ws, &verified(&env, "a")).await;
+    acked(&mut ws, "a").await;
+    let events = texts(&mut ws, 2).await;
+    let states: Vec<serde_json::Value> = events
+        .iter()
+        .map(|text| serde_json::from_str(text).unwrap())
+        .collect();
+    assert_eq!(states[0]["state"], "received");
+    assert_eq!(states[1]["state"], "failed");
+    assert_eq!(states[1]["failureCode"], "instructionRejected");
+    assert!(
+        states[1]["detail"].is_null(),
+        "no word of which check refused"
+    );
+    assert_eq!(states[1]["jobId"], JOB_ID);
+    assert!(states[0]["seq"].as_u64() < states[1]["seq"].as_u64());
 }
 
 // C1, C5, C6

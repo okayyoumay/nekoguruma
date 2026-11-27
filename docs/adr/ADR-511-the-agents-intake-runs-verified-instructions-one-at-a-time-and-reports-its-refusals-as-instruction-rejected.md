@@ -73,6 +73,13 @@ launches its worker in the binary, out of reach of a second caller.
    - The communication log is written at `comm_log_path` under `journal_dir(mode)`. It is uploaded only on an operator's request (ADR-455 item 1, ADR-508); the intake does not enqueue it.
 9. **The VCI shell is in the library.** Finding the instruction's VCI by its name in the registration definitions, taking its locks and launching its worker is one function, used by the intake and by `ngr-agent run` and `ngr-agent identify`. Its wait for the locks can be cancelled. Tests replace the lookup.
 10. **Identification has a plan source.** The server serves no identification plan yet, so the production plan source has none, and an identification instruction is refused before any fetch. Tests supply a matching and a differing plan, so the plan-hash check is exercised.
+11. **A job is served after its `received` event is appended.** The control channel appends the
+    job's `received` event after `take` returns (ADR-489, ADR-478 item 5), and a refusal needs no
+    time, so an intake that served a job at once could append a terminal state before
+    `received`. `Intake` therefore has a second method, `received(job_id, generation)`, which the
+    channel calls once that append has returned (not when it failed or the stop came first), and
+    the intake moves the job from the jobs it has taken to the queue it serves only then. A job
+    whose `received` is never appended stays taken and unserved until the resume item starts it.
 
 ## Rejected
 

@@ -2,6 +2,7 @@
 //! paused clock. The whole
 //! command is driven as a process by `tests/connect.rs`.
 
+use crate::control::LogIntake;
 use std::io;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -128,18 +129,20 @@ fn start_session(
     opened: control::Opened,
     key: &AgentKey,
     dir: &std::path::Path,
-) -> Result<control::Handle, ControlError> {
-    opened.start(
-        key,
-        Collaborators {
-            intake: Arc::new(LogIntake),
-            outbox: outbox_in(dir),
-            marks: marks_in(dir),
-            clock: Arc::new(SystemClock),
-            ledger: ledger_in(dir),
-            log_uploads: Arc::new(NoLogUploads),
-        },
-    )
+) -> Result<Started, ControlError> {
+    opened
+        .start(
+            key,
+            Collaborators {
+                intake: Arc::new(LogIntake),
+                outbox: outbox_in(dir),
+                marks: marks_in(dir),
+                clock: Arc::new(SystemClock),
+                ledger: ledger_in(dir),
+                log_uploads: Arc::new(NoLogUploads),
+            },
+        )
+        .map(Started::from)
 }
 
 fn unavailable() -> IdentityError {
@@ -328,7 +331,7 @@ async fn a_stop_during_the_key_retry_is_ok_and_frees_the_locks() {
         || Err(unavailable()),
         |_, _| unreachable!("the uploader must not start"),
         |_, _| unreachable!("the session must not start"),
-        UPLOADER_STOP_BOUND,
+        STOP_BOUND,
         tokio::time::sleep(Duration::from_secs(5)),
     )
     .await;
@@ -351,14 +354,16 @@ async fn a_session_that_ends_on_its_own_is_exit_1() {
         move || Ok(slot.lock().unwrap().take().unwrap()),
         |record, key| uploader::start(record, key, uploads_in(dirs.dir.path())),
         |opened, key| {
-            opened.start_panicking(
-                key,
-                outbox_in(dirs.dir.path()),
-                marks_in(dirs.dir.path()),
-                ledger_in(dirs.dir.path()),
-            )
+            opened
+                .start_panicking(
+                    key,
+                    outbox_in(dirs.dir.path()),
+                    marks_in(dirs.dir.path()),
+                    ledger_in(dirs.dir.path()),
+                )
+                .map(Started::from)
         },
-        UPLOADER_STOP_BOUND,
+        STOP_BOUND,
         std::future::pending::<()>(),
     )
     .await;
@@ -412,20 +417,8 @@ async fn an_uploader_that_ends_on_its_own_does_not_end_the_session() {
         opened,
         move || Ok(slot.lock().unwrap().take().unwrap()),
         move |record, key| uploader::start(record, key, ledger),
-        |opened, key| {
-            opened.start(
-                key,
-                Collaborators {
-                    intake: Arc::new(LogIntake),
-                    outbox: outbox_in(dirs.dir.path()),
-                    marks: marks_in(dirs.dir.path()),
-                    clock: Arc::new(SystemClock),
-                    ledger: ledger_in(dirs.dir.path()),
-                    log_uploads: Arc::new(NoLogUploads),
-                },
-            )
-        },
-        UPLOADER_STOP_BOUND,
+        |opened, key| start_session(opened, key, dirs.dir.path()),
+        STOP_BOUND,
         tokio::time::sleep(Duration::from_secs(5)),
     )
     .await;
@@ -451,7 +444,7 @@ async fn a_record_or_key_the_session_refuses_starts_neither_task() {
         move || Ok(slot.lock().unwrap().take().unwrap()),
         |_, _| unreachable!("the uploader must not start"),
         |_, _| unreachable!("the session must not start"),
-        UPLOADER_STOP_BOUND,
+        STOP_BOUND,
         std::future::pending::<()>(),
     )
     .await;
@@ -489,7 +482,7 @@ async fn a_stop_stops_the_uploader_and_frees_its_ledger() {
         move || Ok(slot.lock().unwrap().take().unwrap()),
         move |record, key| uploader::start(record, key, ledger),
         |opened, key| start_session(opened, key, dirs.dir.path()),
-        UPLOADER_STOP_BOUND,
+        STOP_BOUND,
         tokio::time::sleep(Duration::from_secs(5)),
     )
     .await;

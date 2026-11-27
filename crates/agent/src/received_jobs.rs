@@ -12,35 +12,26 @@
 //! re-registration (a new agent ID, ADR-461 Decision item 8) starts with an empty ledger and
 //! leaves the old file alone. Nothing is ever removed from it.
 //!
-//! Layout: the magic, the format version (`u32` LE), then frames in the journal's format (`len`,
-//! CRC-32, payload; [`crate::journal`]). The first frame is the header (the agent ID and a
-//! protection word that is 0); each later frame is one record, with consecutive numbers from 0.
-//! The store is opened as the outbox is (ADR-478): a lock file of its own, never deleted, taken
-//! first; an absent file is an empty ledger and is not created by the open; the first record
-//! creates the file (a temporary file made owner-only, synced, renamed, the directory synced);
-//! later records are appended and synced. The open reads the whole file once and keeps only an
-//! index from job ID to the highest generation. A last frame that a crash tore is cut off (and
-//! the cut synced); anything else that does not read back is [`LedgerError::Corrupt`] and is never
-//! repaired. After a failed write the ledger refuses records until it is opened again
-//! ([`ReceivedJobs::reopen_if_poisoned`]), since a failed sync can lose data the OS had accepted; a frame
-//! that did reach the file counts at that open, and one that did not is cut. [`ReceivedJobs::highest`]
-//! reads memory only, so a poisoned ledger still recognises its duplicates.
+//! The file's layout, its open, its torn tail and its poisoning after a failed write are
+//! [`crate::frame_file`]'s. Each later frame is one record, with consecutive numbers from 0. The
+//! open reads the whole file once and keeps only an index from job ID to the highest generation.
+//! A ledger that does not read back is [`LedgerError::Corrupt`] and is never repaired. After a
+//! failed write the ledger refuses records until it is opened again
+//! ([`ReceivedJobs::reopen_if_poisoned`]). [`ReceivedJobs::highest`] reads memory only, so a
+//! poisoned ledger still recognises its duplicates.
 
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::io;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use shared_crypto::instruction::{HEADER_LEN, MAX_PAYLOAD_LEN};
 use worker_host::service::OperatingMode;
 
-use crate::journal::{
-    FRAME_HEADER, FrameRead, JournalError, WriterLock, encode, push_frame, read_frame,
-    record_follows, sync_after_rename,
-};
-use crate::outbox::{Probe, Step};
+use crate::frame_file::{FileError, FrameFile, Layout};
+use crate::journal::{FRAME_HEADER, JournalError};
+use crate::outbox::Probe;
 use crate::registration::record;
 use crate::state::{StateDirError, private_subdir};
 
@@ -51,6 +42,7 @@ pub const MAX_ENVELOPE: usize = HEADER_LEN + MAX_PAYLOAD_LEN;
 
 const MAGIC: [u8; 8] = *b"NGRRJOB\0";
 /// Magic and format version.
+#[cfg(test)]
 const PREAMBLE: usize = MAGIC.len() + 4;
 /// The ledger file's name ends with this; the agent ID comes first.
 const FILE_SUFFIX: &str = ".received-jobs.v1";
@@ -60,6 +52,15 @@ const LOCK_FILE: &str = "received-jobs.lock";
 const RECORD_OVERHEAD: usize = 128;
 /// The longest a frame that a crash left unfinished can be.
 const MAX_TORN: usize = FRAME_HEADER + MAX_ENVELOPE + RECORD_OVERHEAD;
+
+const LAYOUT: Layout = Layout {
+    magic: MAGIC,
+    version: FORMAT_VERSION,
+    suffix: FILE_SUFFIX,
+    lock_file: LOCK_FILE,
+    max_torn: MAX_TORN,
+    what: "received-jobs ledger",
+};
 
 /// Why the ledger cannot be opened or written. The texts name no path and no job.
 #[derive(Debug, thiserror::Error)]
@@ -95,10 +96,16 @@ impl From<io::Error> for LedgerError {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-struct Header {
-    agent_id: String,
-    protection: u32,
+impl From<FileError> for LedgerError {
+    fn from(error: FileError) -> Self {
+        match error {
+            FileError::Io(kind) => LedgerError::Io(kind),
+            FileError::Corrupt(reason, source) => LedgerError::Corrupt(reason, source),
+            FileError::InUse => LedgerError::InUse,
+            FileError::Poisoned => LedgerError::Poisoned,
+            FileError::Unencodable(source) => LedgerError::Unencodable(source),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -126,32 +133,7 @@ struct Inner {
     /// reopen that read the file again.
     index: Mutex<HashMap<String, u64>>,
     /// The write path; one writer at a time, held by a write that is still running after a stop.
-    io: Mutex<Io>,
-}
-
-struct Io {
-    dir: PathBuf,
-    path: PathBuf,
-    agent_id: String,
-    /// `None` while the file does not exist yet, and while the ledger is poisoned and closed.
-    file: Option<File>,
-    /// The writer lock; `None` only while the ledger is being opened or after a failed reopen.
-    lock: Option<WriterLock>,
-    /// The file's length up to the end of the last frame this process knows to be whole.
-    len: u64,
-    /// The number the next record takes.
-    next: u64,
-    poisoned: bool,
-    probe: Probe,
-}
-
-/// What reading the file gave.
-struct Parsed {
-    index: HashMap<String, u64>,
-    /// The number of records.
-    records: u64,
-    /// The length up to the end of the last whole frame.
-    len: usize,
+    file: Mutex<FrameFile>,
 }
 
 impl ReceivedJobs {
@@ -176,22 +158,12 @@ impl ReceivedJobs {
         if !shared_proto::is_canonical_uuid(agent_id) {
             return Err(LedgerError::BadAgentId);
         }
-        let mut io = Io {
-            dir: dir.to_owned(),
-            path: dir.join(format!("{agent_id}{FILE_SUFFIX}")),
-            agent_id: agent_id.to_owned(),
-            file: None,
-            lock: None,
-            len: 0,
-            next: 0,
-            poisoned: false,
-            probe,
-        };
-        let index = io.open_state()?;
+        let mut file = FrameFile::new(dir, agent_id, LAYOUT, probe);
+        let index = read_index(&mut file)?;
         Ok(ReceivedJobs {
             inner: Arc::new(Inner {
                 index: Mutex::new(index),
-                io: Mutex::new(io),
+                file: Mutex::new(file),
             }),
         })
     }
@@ -220,8 +192,8 @@ impl ReceivedJobs {
         generation: u64,
         envelope: &[u8],
     ) -> Result<(), LedgerError> {
-        let mut io = self.inner.io.lock().unwrap_or_else(|e| e.into_inner());
-        if io.poisoned {
+        let mut file = self.inner.file.lock().unwrap_or_else(|e| e.into_inner());
+        if file.is_poisoned() {
             return Err(LedgerError::Poisoned);
         }
         if !shared_proto::is_canonical_uuid(job_id)
@@ -231,22 +203,12 @@ impl ReceivedJobs {
             return Err(LedgerError::Refused);
         }
         let entry = Entry {
-            seq: io.next,
+            seq: file.next(),
             job_id: job_id.to_owned(),
             generation,
             envelope: envelope.to_vec(),
         };
-        let mut frame = Vec::new();
-        let encoded = encode(&entry)
-            .and_then(|payload| push_frame(&mut frame, &payload))
-            .map_err(LedgerError::Unencodable);
-        encoded?;
-        if let Err(error) = io.write(&frame) {
-            io.poisoned = true;
-            return Err(error.into());
-        }
-        io.len += frame.len() as u64;
-        io.next += 1;
+        file.append(&FrameFile::encode(&entry)?)?;
         self.index()
             .entry(job_id.to_owned())
             .and_modify(|highest| *highest = (*highest).max(generation))
@@ -257,10 +219,10 @@ impl ReceivedJobs {
     /// Whether the ledger refuses records until [`ReceivedJobs::reopen_if_poisoned`] succeeds.
     pub fn is_poisoned(&self) -> bool {
         self.inner
-            .io
+            .file
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .poisoned
+            .is_poisoned()
     }
 
     /// Opens the ledger again when it is poisoned: it releases its file handle and its lock, then
@@ -269,140 +231,28 @@ impl ReceivedJobs {
     /// ledger stays poisoned, holds neither the file nor the lock and keeps the index it had.
     /// Blocking.
     pub fn reopen_if_poisoned(&self) -> Result<bool, LedgerError> {
-        let mut io = self.inner.io.lock().unwrap_or_else(|e| e.into_inner());
-        if !io.poisoned {
+        let mut file = self.inner.file.lock().unwrap_or_else(|e| e.into_inner());
+        if !file.is_poisoned() {
             return Ok(false);
         }
-        io.file = None;
-        io.lock = None;
-        let index = match io.open_state() {
-            Ok(index) => index,
-            Err(error) => {
-                // Neither the file nor the lock stays held after a reopen that failed.
-                io.file = None;
-                io.lock = None;
-                return Err(error);
-            }
-        };
-        io.poisoned = false;
+        let mut index = HashMap::new();
+        file.reopen_if_poisoned(
+            &mut |seq, payload| read_record(&mut index, seq, payload),
+            &seq_of,
+        )?;
         *self.index() = index;
         Ok(true)
     }
 }
 
-impl Io {
-    /// Takes the writer lock, then reads the file: the steps of an open, which a reopen repeats.
-    /// Returns the index; sets the file, the length and the next number only when it succeeds.
-    fn open_state(&mut self) -> Result<HashMap<String, u64>, LedgerError> {
-        self.file = None;
-        self.lock = None;
-        let lock = WriterLock::at(&self.dir.join(LOCK_FILE)).map_err(|error| match error {
-            JournalError::InUse => LedgerError::InUse,
-            JournalError::Io(error) => error.into(),
-            _ => LedgerError::Io(io::ErrorKind::Other),
-        })?;
-        self.lock = Some(lock);
-        let meta = match fs::symlink_metadata(&self.path) {
-            Ok(meta) => meta,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                self.len = 0;
-                self.next = 0;
-                return Ok(HashMap::new());
-            }
-            Err(error) => return Err(error.into()),
-        };
-        if !meta.is_file() {
-            return Err(LedgerError::Corrupt("not a regular file", None));
-        }
-        let bytes = fs::read(&self.path)?;
-        let parsed = parse(&bytes, &self.agent_id)?;
-        let file = open_rw(&self.path)?;
-        if parsed.len < bytes.len() {
-            tracing::warn!(
-                cut = bytes.len() - parsed.len,
-                "the received-jobs ledger ends in a frame its append did not finish; cutting it off"
-            );
-            file.set_len(parsed.len as u64)?;
-        }
-        // A frame that landed after a failed sync may be only in the OS's cache, and the file may
-        // be one that a creation renamed into place whose directory entry never reached the disk:
-        // make both durable before the records count. A failure fails the open.
-        file.sync_all()?;
-        (self.probe)(Step::AfterRename)?;
-        sync_after_rename(&self.dir, &self.path)?;
-        self.file = Some(file);
-        self.len = parsed.len as u64;
-        self.next = parsed.records;
-        Ok(parsed.index)
-    }
-
-    fn tmp_path(&self) -> PathBuf {
-        self.dir.join(format!("{}{FILE_SUFFIX}.tmp", self.agent_id))
-    }
-
-    /// Appends `frame` and syncs it, or, when the file does not exist yet, creates the file with
-    /// it.
-    fn write(&mut self, frame: &[u8]) -> io::Result<()> {
-        let Some(file) = self.file.as_mut() else {
-            return self.create(frame);
-        };
-        (self.probe)(Step::BeforeWrite)?;
-        file.seek(SeekFrom::Start(self.len))?;
-        file.write_all(frame)?;
-        (self.probe)(Step::AfterWrite)?;
-        file.sync_all()?;
-        (self.probe)(Step::AfterSync)
-    }
-
-    /// Writes the file whole (the preamble, the header and the first record) under a temporary
-    /// name, owner-only, syncs it, renames it into place and syncs the directory. A stale
-    /// temporary file is removed first. An error before the rename leaves no file and no
-    /// temporary file.
-    fn create(&mut self, frame: &[u8]) -> io::Result<()> {
-        let tmp = self.tmp_path();
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&MAGIC);
-        bytes.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-        let header = postcard::to_allocvec(&Header {
-            agent_id: self.agent_id.clone(),
-            protection: 0,
-        })
-        .map_err(io::Error::other)?;
-        push_frame(&mut bytes, &header).map_err(io::Error::other)?;
-        let preface = bytes.len() as u64;
-        bytes.extend_from_slice(frame);
-        let prepared = (|| {
-            match fs::remove_file(&tmp) {
-                Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
-                _ => {}
-            }
-            (self.probe)(Step::BeforeWrite)?;
-            let mut file = record::create_private(&tmp)?;
-            file.write_all(&bytes)?;
-            (self.probe)(Step::AfterWrite)?;
-            file.sync_all()?;
-            (self.probe)(Step::AfterSync)?;
-            (self.probe)(Step::BeforeRename)?;
-            drop(file);
-            fs::rename(&tmp, &self.path)
-        })();
-        if let Err(error) = prepared {
-            let _ = fs::remove_file(&tmp);
-            return Err(error);
-        }
-        // The file is in place; a failure from here poisons the ledger, and the next open reads
-        // the file and syncs its entry.
-        (self.probe)(Step::AfterRename)?;
-        sync_after_rename(&self.dir, &self.path)?;
-        self.file = Some(open_rw(&self.path)?);
-        // `record` adds the frame's length to the length held: it is the length before the frame.
-        self.len = preface;
-        Ok(())
-    }
-}
-
-fn open_rw(path: &Path) -> io::Result<File> {
-    OpenOptions::new().read(true).write(true).open(path)
+/// Opens `file` and builds the index from its records.
+fn read_index(file: &mut FrameFile) -> Result<HashMap<String, u64>, LedgerError> {
+    let mut index = HashMap::new();
+    file.open_state(
+        &mut |seq, payload| read_record(&mut index, seq, payload),
+        &seq_of,
+    )?;
+    Ok(index)
 }
 
 /// A record frame's number, `None` when the payload is not a record.
@@ -410,69 +260,29 @@ fn seq_of(payload: &[u8]) -> Option<u64> {
     postcard::from_bytes::<Entry>(payload).ok().map(|e| e.seq)
 }
 
-/// Reads a whole file: the index, the number of records and the length up to the end of the last
-/// whole frame. Anything that is not one unfinished append at the end is corrupt.
-fn parse(bytes: &[u8], agent_id: &str) -> Result<Parsed, LedgerError> {
-    let corrupt = |reason| LedgerError::Corrupt(reason, None);
-    if bytes.len() < PREAMBLE || bytes[..MAGIC.len()] != MAGIC {
-        return Err(corrupt("not a received-jobs ledger"));
+/// Checks the record number `seq`'s `payload` and counts it in `index`.
+fn read_record(
+    index: &mut HashMap<String, u64>,
+    seq: u64,
+    payload: &[u8],
+) -> Result<(), FileError> {
+    let corrupt = |reason| FileError::Corrupt(reason, None);
+    let entry: Entry = postcard::from_bytes(payload)
+        .map_err(|e| FileError::Corrupt("a record does not decode", Some(e)))?;
+    if entry.seq != seq {
+        return Err(corrupt("record numbers are not contiguous"));
     }
-    let version = u32::from_le_bytes(bytes[MAGIC.len()..PREAMBLE].try_into().expect("four bytes"));
-    if version != FORMAT_VERSION {
-        return Err(corrupt("unknown format version"));
+    if !shared_proto::is_canonical_uuid(&entry.job_id) {
+        return Err(corrupt("a job ID is not a canonical UUID"));
     }
-    let FrameRead::Ok { payload, next } = read_frame(bytes, PREAMBLE) else {
-        return Err(corrupt("the header does not read back"));
-    };
-    let header: Header = postcard::from_bytes(payload)
-        .map_err(|e| LedgerError::Corrupt("the header does not decode", Some(e)))?;
-    if header.agent_id != agent_id {
-        return Err(corrupt("the file belongs to another agent ID"));
+    if entry.envelope.is_empty() || entry.envelope.len() > MAX_ENVELOPE {
+        return Err(corrupt("an envelope has a length no record holds"));
     }
-    if header.protection != 0 {
-        return Err(corrupt("unknown protection"));
-    }
-    let mut index: HashMap<String, u64> = HashMap::new();
-    let mut records = 0u64;
-    let mut offset = next;
-    while offset < bytes.len() {
-        match read_frame(bytes, offset) {
-            FrameRead::Ok { payload, next } => {
-                let entry: Entry = postcard::from_bytes(payload)
-                    .map_err(|e| LedgerError::Corrupt("a record does not decode", Some(e)))?;
-                if entry.seq != records {
-                    return Err(corrupt("record numbers are not contiguous"));
-                }
-                if !shared_proto::is_canonical_uuid(&entry.job_id) {
-                    return Err(corrupt("a job ID is not a canonical UUID"));
-                }
-                if entry.envelope.is_empty() || entry.envelope.len() > MAX_ENVELOPE {
-                    return Err(corrupt("an envelope has a length no record holds"));
-                }
-                index
-                    .entry(entry.job_id)
-                    .and_modify(|highest| *highest = (*highest).max(entry.generation))
-                    .or_insert(entry.generation);
-                records += 1;
-                offset = next;
-            }
-            // One unfinished append leaves at most one frame and no record after it; a damaged
-            // length field or a zeroed block followed by whole records is damage.
-            FrameRead::Torn
-                if bytes.len() - offset <= MAX_TORN
-                    && !record_follows(bytes, offset, records, seq_of) =>
-            {
-                break;
-            }
-            FrameRead::Torn => return Err(corrupt("a record does not read back")),
-            FrameRead::Bad => return Err(corrupt("a record fails its checksum")),
-        }
-    }
-    Ok(Parsed {
-        index,
-        records,
-        len: offset,
-    })
+    index
+        .entry(entry.job_id)
+        .and_modify(|highest| *highest = (*highest).max(entry.generation))
+        .or_insert(entry.generation);
+    Ok(())
 }
 
 #[cfg(test)]

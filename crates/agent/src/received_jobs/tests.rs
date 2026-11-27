@@ -1,13 +1,17 @@
 //! The received-jobs ledger's cases (ADR-489; the row's letter and number of the case table begin
 //! each test's name where there is one).
 
+use std::fs;
 use std::io;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tracing_subscriber::fmt::MakeWriter;
 
 use super::*;
+use crate::journal::push_frame;
+use crate::outbox::Step;
 
 const ID: &str = "0194f0a2-7c3e-7d11-8a52-3f6f9b1c2d4e";
 const OTHER: &str = "0194f0a2-7c3e-7d11-8a52-000000000001";
@@ -56,11 +60,7 @@ fn crafted(agent_id: &str, entries: &[Entry]) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&MAGIC);
     out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-    let header = Header {
-        agent_id: agent_id.to_owned(),
-        protection: 0,
-    };
-    push_frame(&mut out, &postcard::to_allocvec(&header).unwrap()).unwrap();
+    crate::frame_file::header_frame(agent_id, &mut out);
     for entry in entries {
         push_frame(&mut out, &postcard::to_allocvec(entry).unwrap()).unwrap();
     }

@@ -88,6 +88,26 @@ pub struct RegisteredVcis {
     pub locks: PathBuf,
 }
 
+impl RegisteredVcis {
+    /// The lookup with the worker builds and the lock directory the agent's own installation has:
+    /// the `workers` and `locks` directories next to the running executable.
+    pub fn beside_executable() -> std::io::Result<Self> {
+        Ok(Self {
+            workers: beside_executable("workers")?,
+            locks: beside_executable("locks")?,
+        })
+    }
+}
+
+/// The directory `name` next to the running executable.
+pub fn beside_executable(name: &str) -> std::io::Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    let dir = exe.parent().ok_or_else(|| {
+        std::io::Error::other("the running executable has no directory to look beside")
+    })?;
+    Ok(dir.join(name))
+}
+
 impl VciLookup for RegisteredVcis {
     fn find(&self, vci: &str) -> Result<VciRoute, VciShellError> {
         let registered = registered_api(vci).map_err(|source| VciShellError::Lookup {

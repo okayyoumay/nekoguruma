@@ -35,7 +35,7 @@ use shared_proto::{LogUploadOutcome, is_canonical_uuid};
 use worker_host::service::OperatingMode;
 
 use crate::comm_log::{UploadRead, UploadStage, comm_log_path, digest_for_upload_traced};
-use crate::journal::{JobKey, journal_dir};
+use crate::journal::{DirSource, JobKey, dir_source};
 use crate::received_jobs::ReceivedJobs;
 use crate::upload_ledger::{LedgerError, MAX_COMM_LOG_BYTES};
 use crate::uploader::SharedLedger;
@@ -82,12 +82,9 @@ impl LogUploads for NoLogUploads {
     }
 }
 
-/// Where the logs are.
-type LogDir = Arc<dyn Fn() -> io::Result<PathBuf> + Send + Sync>;
-
 /// The agent's own handling: its received jobs, its upload ledger and its journal directory.
 pub struct LogUploader {
-    dir: LogDir,
+    dir: DirSource,
     received: ReceivedJobs,
     uploads: SharedLedger,
     /// The longest log that is sent: the largest the upload ledger takes, which tests lower.
@@ -106,8 +103,7 @@ impl LogUploader {
     /// The handling for the journal directory of `mode`, resolved at each command (a failure to
     /// resolve it is a command left unanswered).
     pub fn new(mode: OperatingMode, received: ReceivedJobs, uploads: SharedLedger) -> Self {
-        let dir = Arc::new(move || journal_dir(mode).map_err(io::Error::other));
-        Self::with(dir, received, uploads)
+        Self::with(dir_source(mode), received, uploads)
     }
 
     /// The handling for logs in `dir`, which must be an absolute path.
@@ -115,7 +111,7 @@ impl LogUploader {
         Self::with(Arc::new(move || Ok(dir.clone())), received, uploads)
     }
 
-    fn with(dir: LogDir, received: ReceivedJobs, uploads: SharedLedger) -> Self {
+    fn with(dir: DirSource, received: ReceivedJobs, uploads: SharedLedger) -> Self {
         Self {
             dir,
             received,

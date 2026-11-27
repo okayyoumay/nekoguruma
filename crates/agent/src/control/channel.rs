@@ -49,10 +49,10 @@ use base64::engine::general_purpose::STANDARD;
 use futures_util::{SinkExt, StreamExt};
 use hyper::header::HeaderName;
 use shared_proto::{
-    AgentEventMessage, AgentMessage, CLOSE_CODE_BINARY, CLOSE_CODE_GOING_AWAY, CLOSE_CODE_IDLE,
-    CLOSE_CODE_PROTOCOL, CLOSE_CODE_REPLACED, CLOSE_CODE_REVOKED, CLOSE_CODE_TOO_BIG,
-    CONTROL_SUBPROTOCOL, FailureCode, HEARTBEAT_MISSED_LIMIT, JobId, JobState,
-    MAX_CONTROL_MESSAGE_LEN, NONCE_HEADER, PROOF_HEADER, ServerMessage, close_reason,
+    AgentMessage, CLOSE_CODE_BINARY, CLOSE_CODE_GOING_AWAY, CLOSE_CODE_IDLE, CLOSE_CODE_PROTOCOL,
+    CLOSE_CODE_REPLACED, CLOSE_CODE_REVOKED, CLOSE_CODE_TOO_BIG, CONTROL_SUBPROTOCOL, FailureCode,
+    HEARTBEAT_MISSED_LIMIT, JobId, JobState, MAX_CONTROL_MESSAGE_LEN, NONCE_HEADER, PROOF_HEADER,
+    ServerMessage, close_reason,
 };
 use tokio::time::Instant;
 use tokio_tungstenite::WebSocketStream;
@@ -62,7 +62,7 @@ use tokio_tungstenite::tungstenite::{self, ClientRequestBuilder, Message, http};
 
 use super::backoff::lived;
 use super::dial::{self, ConnectError, Stream};
-use super::events::{Acked, Sender};
+use super::events::{Acked, JobStateError, Sender};
 use super::exchange::Token;
 use super::gate::{Admitted, Gate, IntakeError};
 use super::{Fail, Outcome, Phase, SessionState, Stop, Wiring};
@@ -877,7 +877,11 @@ async fn take_job(w: &Wiring, stop: &Stop, verified: Box<VerifiedInstruction>) -
     if let Err(error) = taken {
         return Handled::Intake(error);
     }
-    Handled::from(record_job_state(w, stop, job_id, JobState::Received).await)
+    let recorded = record_job_state(w, stop, job_id.clone(), JobState::Received).await;
+    if matches!(recorded, Recorded::Done) {
+        w.intake.received(&job_id, generation);
+    }
+    Handled::from(recorded)
 }
 
 /// What making the mark durable came to.
@@ -918,34 +922,11 @@ enum Recorded {
     Failed(&'static str, OutboxError),
 }
 
-/// The text of the first event of `job_id` with number `seq`: the job's `state`, `received`, the
-/// terminal `preconditionFailed` of a refusal (ADR-483) or the terminal `expired` (ADR-486). No device time is given: the property
-/// is optional and the server stamps its own receive time (16.3).
-fn first_event(
-    job_id: &str,
-    seq: u64,
-    state: &shared_proto::JobState,
-) -> Result<String, shared_proto::ControlError> {
-    AgentMessage::AgentEvent(AgentEventMessage {
-        seq: Some(seq),
-        occurred_at_agent: None,
-        event: state.to_event_kind(JobId(job_id.to_owned())),
-    })
-    .encode()
-}
-
 /// Appends the job's first event on a blocking task, raced with the stop (ADR-478 item 5):
 /// `received`, or the refusal's or the expiry's terminal event. All are `Kind::Received` for the admission bound.
 /// It is tried once per command: the server's redelivery after the lease is the retry.
 async fn record_job_state(w: &Wiring, stop: &Stop, job_id: String, state: JobState) -> Recorded {
-    // The longest number the counter gives, so the text that is appended encodes as well.
-    if let Err(error) = first_event(&job_id, u64::MAX - 1, &state) {
-        let error = OutboxError::Io(std::io::Error::other(error.to_string()));
-        return Recorded::Failed("outbox-event", error);
-    }
-    let append = w.outbox.append(Kind::Received, move |seq| {
-        first_event(&job_id, seq, &state).unwrap_or_default()
-    });
+    let append = w.outbox.append_job_state(Kind::Received, job_id, state);
     let appended = tokio::select! {
         biased;
         () = stop.requested() => return Recorded::Stopped,
@@ -953,7 +934,12 @@ async fn record_job_state(w: &Wiring, stop: &Stop, job_id: String, state: JobSta
     };
     match appended {
         Ok(_) => Recorded::Done,
-        Err(error) => {
+        // The longest text the counter gives does not encode: the event's fault, not a write's.
+        Err(JobStateError::Text(error)) => {
+            let error = OutboxError::Io(std::io::Error::other(error.to_string()));
+            Recorded::Failed("outbox-event", error)
+        }
+        Err(JobStateError::Outbox(error)) => {
             let class = match error {
                 OutboxError::Full => "outbox-full",
                 OutboxError::Poisoned => "outbox-poisoned",

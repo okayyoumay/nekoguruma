@@ -1761,6 +1761,7 @@ dependencies = [
  "postcard",
  "serde_json",
  "serial_test",
+ "shared-crypto",
  "shared-proto",
  "sim-vci",
  "tempfile",

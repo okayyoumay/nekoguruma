@@ -475,6 +475,41 @@ fn long_size(vci: &str, abi: Abi, declared: Option<u8>) -> Result<u8, LaunchErro
     }
 }
 
+/// Which API's registration definitions name a VCI (design 7.1.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Registered {
+    /// No J2534 registration definition and no D-PDU API root file entry names it.
+    Neither,
+    /// Only the definitions of this API name it.
+    Only(Api),
+    /// Both APIs' definitions name it.
+    Both,
+}
+
+/// Which API's definitions name `vci`, as a worker build of this agent would resolve it: the
+/// J2534 registration definition or registry key, and the D-PDU API root file entry. Only the
+/// name is looked up; the library's file and ABI are checked when the worker is launched.
+pub fn registered_api(vci: &str) -> Registered {
+    registered_with(
+        RESOLUTIONS,
+        |resolution| lookup_j2534(vci, resolution).is_ok(),
+        |resolution| lookup_dpdu(vci, resolution).is_ok(),
+    )
+}
+
+fn registered_with(
+    resolutions: &[Resolution],
+    j2534: impl Fn(&Resolution) -> bool,
+    dpdu: impl Fn(&Resolution) -> bool,
+) -> Registered {
+    match (resolutions.iter().any(j2534), resolutions.iter().any(dpdu)) {
+        (false, false) => Registered::Neither,
+        (true, false) => Registered::Only(Api::J2534),
+        (false, true) => Registered::Only(Api::Dpdu),
+        (true, true) => Registered::Both,
+    }
+}
+
 /// What one J2534 worker build would load for `vci`.
 fn lookup_j2534(vci: &str, resolution: &Resolution) -> Result<Library, j2534_0404::ResolveError> {
     #[cfg(windows)]
@@ -611,6 +646,27 @@ mod tests {
         // The D-PDU API lookup reads the same view for each build.
         let views: Vec<_> = RESOLUTIONS.iter().map(registry_view).collect();
         assert_eq!(views, [RegistryView::Wow64_64, RegistryView::Wow64_32]);
+    }
+
+    #[test]
+    fn a_name_is_registered_for_the_api_whose_definitions_name_it() {
+        let of = |apis: &[Api]| {
+            registered_with(
+                &[X64, X86],
+                |_| apis.contains(&Api::J2534),
+                |_| apis.contains(&Api::Dpdu),
+            )
+        };
+        assert_eq!(of(&[]), Registered::Neither);
+        assert_eq!(of(&[Api::J2534]), Registered::Only(Api::J2534));
+        assert_eq!(of(&[Api::Dpdu]), Registered::Only(Api::Dpdu));
+        assert_eq!(of(&[Api::J2534, Api::Dpdu]), Registered::Both);
+        // One build that finds the name is enough.
+        let in_x86_only = |resolution: &Resolution| resolution.abi == Some(Abi::WinX86);
+        assert_eq!(
+            registered_with(&[X64, X86], in_x86_only, |_| false),
+            Registered::Only(Api::J2534)
+        );
     }
 
     #[test]

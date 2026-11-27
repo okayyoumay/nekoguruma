@@ -643,6 +643,19 @@ async fn run_shared_with_margins(
     dir: tempfile::TempDir,
     margins: VciMargins,
 ) -> Ran {
+    run_shared_stepping(plan, fake, limits, cancel, dir, margins, None).await
+}
+
+/// [`run_shared_with_margins`] with the hook the run calls before its first request.
+async fn run_shared_stepping(
+    plan: CheckedPlan,
+    fake: Fake,
+    limits: JobLimits,
+    cancel: Arc<AtomicBool>,
+    dir: tempfile::TempDir,
+    margins: VciMargins,
+    first_step: Option<FirstStep>,
+) -> Ran {
     let setup = CommLogSetup::for_run(dir.path().join("log")).unwrap();
     let guards = JobGuards::take_vci_only(
         &GuardSetup {
@@ -665,6 +678,7 @@ async fn run_shared_with_margins(
         }),
         margins,
         cancel,
+        first_step,
     )
     .await;
     let log = std::fs::read_to_string(setup.path().unwrap())
@@ -1392,6 +1406,7 @@ async fn a_worker_that_exits_between_parts_is_logged() {
         None,
         VciMargins::default(),
         Arc::new(AtomicBool::new(false)),
+        None,
     )
     .await;
     assert!(run.result.is_ok(), "{:?}", run.result);
@@ -1466,6 +1481,7 @@ async fn run_with_worker_lost_in_setup(exits: u32) -> (IdentificationRun, Vec<St
         None,
         VciMargins::default(),
         Arc::new(AtomicBool::new(false)),
+        None,
     )
     .await;
     let events = std::fs::read_to_string(setup.path().unwrap())
@@ -1547,6 +1563,7 @@ async fn run_with_a_hung_worker(ends: bool) -> (IdentificationRun, Vec<String>) 
         None,
         VciMargins::default(),
         Arc::new(AtomicBool::new(false)),
+        None,
     )
     .await;
     let events = std::fs::read_to_string(setup.path().unwrap())
@@ -2271,6 +2288,7 @@ async fn run_with_the_last_close_hanging_plan<S: WorkerSource>(
         None,
         VciMargins::default(),
         Arc::new(AtomicBool::new(false)),
+        None,
     )
     .await
 }
@@ -4319,4 +4337,56 @@ async fn a_refused_variant_with_only_a_rule_request_leaves_the_definition_conclu
         read.conclusive,
         "the rule-only refused variant rules nothing out"
     );
+}
+
+/// How many requests the fake had started when the hook ran, one entry per call of the hook.
+fn stepping(fake: &Fake) -> (FirstStep, Arc<Mutex<Vec<usize>>>) {
+    let fired = Arc::new(Mutex::new(Vec::new()));
+    let hook = {
+        let (fired, fake) = (Arc::clone(&fired), fake.clone());
+        Box::new(move || {
+            let started = fake.state().starts.len();
+            fired.lock().unwrap().push(started);
+        })
+    };
+    (hook, fired)
+}
+
+/// The first-step hook runs once, before the run's first request is started.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_first_step_hook_runs_once_before_the_first_request() {
+    let fake = Fake::default();
+    let (hook, fired) = stepping(&fake);
+    let ran = run_shared_stepping(
+        plan_of(&[A], Some(0x7DF)),
+        fake.clone(),
+        limits(),
+        Arc::new(AtomicBool::new(false)),
+        tempfile::tempdir().unwrap(),
+        VciMargins::default(),
+        Some(hook),
+    )
+    .await;
+    ran.report();
+    assert!(!fake.state().starts.is_empty(), "the run sent a request");
+    assert_eq!(*fired.lock().unwrap(), [0]);
+}
+
+/// A run refused before its first request does not call it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancelled_run_does_not_call_the_first_step_hook() {
+    let fake = Fake::default();
+    let (hook, fired) = stepping(&fake);
+    let ran = run_shared_stepping(
+        plan_of(&[A], Some(0x7DF)),
+        fake.clone(),
+        limits(),
+        Arc::new(AtomicBool::new(true)),
+        tempfile::tempdir().unwrap(),
+        VciMargins::default(),
+        Some(hook),
+    )
+    .await;
+    assert!(matches!(ran.run.result, Err(JobError::Cancelled)));
+    assert!(fired.lock().unwrap().is_empty());
 }

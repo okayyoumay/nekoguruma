@@ -615,6 +615,7 @@ impl Env {
                     JobLimits::default(),
                     journal,
                     guards,
+                    None,
                 )
                 .await
             });
@@ -1072,6 +1073,7 @@ fn agent_main(spec: &JobSpec) {
             JobLimits::default(),
             spec.journal_setup(&root.join("journal")),
             guards,
+            None,
         )
         .await;
         result

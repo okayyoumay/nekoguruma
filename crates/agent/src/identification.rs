@@ -56,8 +56,9 @@ use crate::journal::Vin;
 use crate::link::{BUS_TYPE_DWCAN, CloseEvidence, LinkConfig};
 use crate::policy::{ApplicationLayer, PRESENCE_REQUEST};
 use crate::runner::{
-    CancelOnDrop, GuardSlot, JobError, JobLimits, JobLink, LinkRefused, WORKER_EXIT_GRACE,
-    base_facts, close_job_link, on_job_thread, open_job_link, promote_to_vehicle, reopen_attempts,
+    CancelOnDrop, FirstStep, GuardSlot, JobError, JobLimits, JobLink, LinkRefused,
+    WORKER_EXIT_GRACE, base_facts, close_job_link, on_job_thread, open_job_link,
+    promote_to_vehicle, reopen_attempts,
 };
 use crate::send_receive::declared_sid;
 
@@ -300,6 +301,37 @@ pub struct LoadedPlan {
     plan: IdentificationPlan,
     plan_sha256: Sha256,
     documents: Vec<(Sha256, JobDocument)>,
+}
+
+/// Where the plan bytes named by an identification instruction's plan hash come from, for the
+/// intake (ADR-511 item 10). The bytes are checked afterwards by [`load_plan`], which compares
+/// their SHA-256 with the instruction's hash, so a source is not trusted.
+pub trait PlanSource {
+    /// The bytes of the plan whose SHA-256 is `plan_hash`.
+    fn plan(&self, plan_hash: &Sha256) -> Result<Vec<u8>, PlanSourceError>;
+}
+
+/// Why a [`PlanSource`] gave no plan.
+#[derive(Debug, thiserror::Error)]
+pub enum PlanSourceError {
+    /// The source serves no identification plans at all.
+    #[error("this agent has no source of identification plans")]
+    NoSource,
+    /// The source holds no plan with this hash.
+    #[error("no identification plan with SHA-256 {0}")]
+    NotFound(String),
+}
+
+/// The plan source of the production agent: the server serves no identification plan yet, so
+/// it has none and every request is refused with [`PlanSourceError::NoSource`] (ADR-511 item
+/// 10).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoPlans;
+
+impl PlanSource for NoPlans {
+    fn plan(&self, _plan_hash: &Sha256) -> Result<Vec<u8>, PlanSourceError> {
+        Err(PlanSourceError::NoSource)
+    }
 }
 
 /// Reads a plan and the documents it names. `supplied` holds the documents with the hash each
@@ -1883,6 +1915,10 @@ fn identification_facts(
 /// communication log only. Last, unless the VIN phase was interrupted, it reads each ECU
 /// definition of the plan (ADR-401) the same way, with the lock held, and reports the entry
 /// states; guards still marked end the run in [`JobError::LinkUnconfirmed`] when a read remains.
+///
+/// `first_step` is called once, on the job thread, after the run's checks and before its first
+/// request is sent ([`FirstStep`]); a run refused before that point, by the runtime, the guards,
+/// the worker or a cancel, never calls it.
 #[expect(
     clippy::too_many_arguments,
     reason = "the run's whole context, each part owned by the caller"
@@ -1896,6 +1932,7 @@ pub async fn run_identification<W: WorkerSource>(
     vci: Option<VciFacts>,
     margins: VciMargins,
     cancel: Arc<AtomicBool>,
+    first_step: Option<FirstStep>,
 ) -> IdentificationRun {
     let handle = Handle::current();
     let slot: GuardSlot = Arc::new(Mutex::new(Some(guards)));
@@ -1934,6 +1971,7 @@ pub async fn run_identification<W: WorkerSource>(
                 &cancel,
                 &job_slot,
                 log,
+                first_step,
             )
         },
         |log, result| {
@@ -2020,6 +2058,10 @@ enum PartEnd {
 }
 
 /// The run on the job's blocking thread.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the run's whole context, each part owned by the caller"
+)]
 fn identify<W: WorkerSource>(
     handle: &Handle,
     source: &Arc<Mutex<W>>,
@@ -2028,11 +2070,16 @@ fn identify<W: WorkerSource>(
     cancelled: &AtomicBool,
     guards: &GuardSlot,
     log: &mut JobLog,
+    first_step: Option<FirstStep>,
 ) -> Result<IdentificationReport, JobError> {
     // The guards stay held until this function returns, after every link is closed.
     let _guards = Arc::clone(guards);
     if cancelled.load(Ordering::Relaxed) {
         return Err(JobError::Cancelled);
+    }
+    // Every check that can refuse the run is behind us: the next thing is the first request.
+    if let Some(first_step) = first_step {
+        first_step();
     }
     let mut report = plan.report();
     let comm_log = log.open(RunKind::First);
@@ -4034,6 +4081,48 @@ mod tests {
         assert!(matches!(
             load_plan(&bytes, &[doc], Some(&instruction)),
             Err(PlanRefused::PlanHashMismatch)
+        ));
+    }
+
+    /// A plan source that serves one given byte string for whatever hash it is asked.
+    struct FixedPlan(Vec<u8>);
+
+    impl PlanSource for FixedPlan {
+        fn plan(&self, _plan_hash: &Sha256) -> Result<Vec<u8>, PlanSourceError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// What the source serves is not trusted: bytes whose SHA-256 is not the instruction's plan
+    /// hash are refused, and the same source's bytes load when the hash is theirs.
+    #[test]
+    fn a_plan_served_under_another_hash_is_refused() {
+        let doc = named(document(0x90, 0x7E0, 0x7E8, |_| {}));
+        let served = plan(&[doc.0]).encode().unwrap();
+        let served_hash: Sha256 = sha2::Sha256::digest(&served).into();
+        let source = FixedPlan(served);
+
+        let asked = [7; 32];
+        let bytes = source.plan(&asked).unwrap();
+        assert!(matches!(
+            load_plan(
+                &bytes,
+                std::slice::from_ref(&doc),
+                Some(&verified(Some(asked)))
+            ),
+            Err(PlanRefused::PlanHashMismatch)
+        ));
+
+        let bytes = source.plan(&served_hash).unwrap();
+        let loaded = load_plan(&bytes, &[doc], Some(&verified(Some(served_hash)))).unwrap();
+        assert_eq!(loaded.plan_sha256, served_hash);
+    }
+
+    #[test]
+    fn the_production_plan_source_has_no_plans() {
+        assert!(matches!(
+            NoPlans.plan(&[1; 32]),
+            Err(PlanSourceError::NoSource)
         ));
     }
 

@@ -500,6 +500,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-508](ADR-508-an-operators-request-row-lets-a-communication-log-be-stored-and-the-agent-is-told-by-an-unsigned-control-message.md) | An Operator's Request Row Is What Lets a Communication Log Be Stored, and the Agent Is Told by an Unsigned Control Message | Accepted | design 4.3, 8.11, 13.4, 14.3, `crates/server` (`uploads`, `comm_log_requests`), `crates/agent`, `db/README.md`; details ADR-455; amends ADR-493 item 3's judgement of begin |
 | [ADR-509](ADR-509-dependencies-are-audited-with-cargo-deny-against-a-licence-allow-list-and-the-advisory-database.md) | Dependencies Are Audited With cargo-deny Against a Licence Allow-List and the Advisory Database | Accepted | `deny.toml`, `.github/workflows/ci.yml`, `CLAUDE.md`; `Cargo.toml` `license` keys |
 | [ADR-510](ADR-510-a-mapped-error-keeps-its-cause.md) | A Mapped Error Keeps Its Cause | Accepted | `Cargo.toml` lints; error types across the workspace; `CLAUDE.md` |
+| [ADR-511](ADR-511-the-agents-intake-runs-verified-instructions-one-at-a-time-and-reports-its-refusals-as-instruction-rejected.md) | The Agent's Intake Runs Verified Instructions One at a Time and Reports Its Refusals as Instruction Rejected | Accepted | design 5.3, 5.6, 8.2.6, `api/asyncapi.yaml`, `crates/agent`, `crates/server`; details ADR-473, ADR-475, ADR-489, ADR-504 |
 
 ## Status Legend
 
@@ -1129,3 +1130,4 @@ the predecessor repository these ADRs came from.
 - ADR-504 (Consequences' object-server listener and port window answered by ADR-505: the object server speaks TLS and the agent pins its certificate)
 - ADR-505 (items 9 to 14 added with the verifier and the agent's dial; items 15 to 19 added with the switch's design, and item 8 split by item 19; items 20 to 22 added with the switch, which meet item 6)
 - ADR-507
+- ADR-511

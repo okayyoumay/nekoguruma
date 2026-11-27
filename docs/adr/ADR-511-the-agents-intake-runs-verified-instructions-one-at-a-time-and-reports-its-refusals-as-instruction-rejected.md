@@ -56,10 +56,12 @@ launches its worker in the binary, out of reach of a second caller.
      - when a job leaves the queue;
      - after each failed round;
      - during a fetch in flight;
-     - during the wait for the locks.
+     - during the wait for the locks;
+     - between the shell's launch of the worker and the job's first step.
    - A job whose deadline passes ends as `expired`, and the next job starts.
+   - The last judgement is made at the first step, by the hook that item 6 describes, which either lets the job begin or refuses it: the deadline and the hook each take one shared state out of "waiting" by a compare-and-swap, so exactly one of them wins and the deadline cannot cut a job that has begun. A job refused there sends nothing to the ECU and ends `expired`, with no failure code and no detail. (Amendment by the maintainer, 2026-11-27: before it, the deadline stopped a job only until the shell launched the worker.)
 6. **What is reported, and when.**
-   - `running` is sent once, from a hook that the journaled run and the identification run call after their pre-run checks, before the first instruction.
+   - `running` is sent once, from a hook that the journaled run and the identification run call after their pre-run checks, before the first instruction. The hook decides whether the job begins (item 5) and sends `running` only when it does.
    - A run's end is mapped by `job_report::outcome` (ADR-475).
    - While the agent stops, nothing terminal is reported, except a run that ended `Ok`: its `completed` is reported and recorded, so a finished write is not lost.
 7. **The outcome record.** A per-agent append-only file beside the received-jobs ledger holds:

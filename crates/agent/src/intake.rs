@@ -44,7 +44,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -76,7 +76,7 @@ use crate::outbox::Kind as EventKind;
 use crate::outcome_record::{OutcomeRecord, RecordError};
 use crate::policy;
 use crate::result_json::{ResultJsonError, vm_state_json};
-use crate::runner::{Job, JobLimits, JobRun, check_job, run_program_journaled};
+use crate::runner::{Begin, FirstStep, Job, JobLimits, JobRun, check_job, run_program_journaled};
 use crate::uploader::SharedLedger;
 use crate::vci_shell::{ShellRun, VciLookup, VciShell, VciShellError, WorkerEnd, run_on_vci};
 
@@ -403,9 +403,64 @@ fn fetch_class(error: &FetchError) -> FetchClass {
     }
 }
 
+/// Where a job stands against its start deadline. The job's first-step hook and the deadline each
+/// move it out of `WAITING` by a compare-and-swap, so exactly one of "began" and "cut" happens
+/// (ADR-511 item 5).
+struct StartGate(AtomicU8);
+
+impl StartGate {
+    const WAITING: u8 = 0;
+    const BEGUN: u8 = 1;
+    const CUT: u8 = 2;
+
+    fn new() -> Self {
+        Self(AtomicU8::new(Self::WAITING))
+    }
+
+    /// The job's first step: the job begins unless the deadline cut it first.
+    fn begin(&self) -> Begin {
+        match self.0.compare_exchange(
+            Self::WAITING,
+            Self::BEGUN,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Begin::Go,
+            Err(_) => Begin::Expired,
+        }
+    }
+
+    /// The start deadline: true when the job had not begun, so that it never will.
+    fn cut(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::WAITING,
+                Self::CUT,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
+
+/// The hook a run calls at its first step: it asks `gate` whether the job may begin, and reports
+/// the beginning on `first_step`.
+fn first_step_hook(gate: Arc<StartGate>, first_step: mpsc::UnboundedSender<()>) -> FirstStep {
+    Box::new(move || {
+        let begin = gate.begin();
+        if begin == Begin::Go {
+            // The job thread does not wait: a send on an unbounded channel does not block.
+            let _ = first_step.send(());
+        }
+        begin
+    })
+}
+
 /// What watches a run that has not yet begun: the flag that cancels the wait for its locks, the
-/// flag that cancels the job, the channel its first step reports on, and the start deadline.
+/// flag that cancels the job, the channel its first step reports on, the gate that decides
+/// between its first step and the start deadline, and the start deadline.
 struct Watched {
+    gate: Arc<StartGate>,
     /// Ends the shell's wait for the locks and its launch: the start deadline and the stop set it.
     lock_cancel: Arc<AtomicBool>,
     /// Cancels the job itself: only a stop sets it.
@@ -834,11 +889,10 @@ impl Worker {
         let lock_cancel = Arc::new(AtomicBool::new(false));
         let job_cancel = Arc::new(AtomicBool::new(false));
         let (first_step, started) = mpsc::unbounded_channel::<()>();
-        let first = Box::new(move || {
-            // The job thread does not wait: a send on an unbounded channel does not block.
-            let _ = first_step.send(());
-        });
+        let gate = Arc::new(StartGate::new());
+        let first = first_step_hook(Arc::clone(&gate), first_step);
         let watched = Watched {
+            gate,
             lock_cancel: Arc::clone(&lock_cancel),
             job_cancel: Arc::clone(&job_cancel),
             started,
@@ -932,8 +986,9 @@ impl Worker {
     }
 
     /// Runs `run` as a task of its own and watches it: `running` once its first step begins, the
-    /// start deadline while it has not (it cancels the wait for the locks and the launch only, so
-    /// a job past them is not ended by it), the stop at any time. A stop cancels the job and the
+    /// start deadline while it has not (it cancels the wait for the locks and the launch, and
+    /// the first step then refuses to begin; a job that has begun is not ended by it), the stop at
+    /// any time. A stop cancels the job and the
     /// shell, and the run is awaited for [`RUN_STOP_BOUND`] so that its worker stops, its locks are
     /// released and a run that ended `Ok` is reported; only a run that does not end in time is
     /// dropped, and its job stays open.
@@ -946,6 +1001,7 @@ impl Worker {
         to_json: impl FnOnce(&T) -> Result<String, ResultJsonError>,
     ) -> Ending {
         let Watched {
+            gate,
             lock_cancel,
             job_cancel,
             mut started,
@@ -955,6 +1011,7 @@ impl Worker {
         let mut announced = false;
         let mut watching = true;
         let mut cut = false;
+        let mut deadline_seen = false;
         let mut stopping = false;
         let mut dropped = false;
         let deadline_watch = self.deadline_passed(deadline);
@@ -972,9 +1029,13 @@ impl Worker {
                         self.report_running(key).await;
                     }
                 }
-                () = &mut deadline_watch, if !announced && !cut => {
-                    cut = true;
-                    lock_cancel.store(true, Ordering::Relaxed);
+                () = &mut deadline_watch, if !deadline_seen => {
+                    deadline_seen = true;
+                    // A job that has begun is past its deadline's reach.
+                    cut = gate.cut();
+                    if cut {
+                        lock_cancel.store(true, Ordering::Relaxed);
+                    }
                 }
                 () = self.stop.requested(), if !stopping => {
                     stopping = true;

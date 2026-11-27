@@ -215,6 +215,8 @@ pub fn outcome<T>(
     };
     JobOutcome::Terminal(match error {
         JobError::Cancelled => JobState::Cancelled,
+        // No failure code and no detail: the job never began (ADR-511 item 5).
+        JobError::StartDeadlinePassed => JobState::Expired,
         JobError::Program(_)
         | JobError::SeveralTargets { .. }
         | JobError::Undeclared { .. }
@@ -334,6 +336,7 @@ fn repeats_on_every_resume(error: &JobError) -> bool {
         | JobError::Journal(_)
         | JobError::Panicked
         | JobError::Cancelled
+        | JobError::StartDeadlinePassed
         | JobError::Unanswerable(_) => false,
         // Terminal before the standing is read.
         JobError::ProcedureFailed { .. }

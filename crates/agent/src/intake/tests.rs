@@ -26,7 +26,7 @@ use crate::identification::{NoPlans, PlanSourceError};
 use crate::instruction;
 use crate::launch::Api;
 use crate::outbox::Outbox;
-use crate::runner::JobError;
+use crate::runner::{Begin, JobError};
 use crate::upload_ledger::UploadLedger;
 use crate::vci_shell::{VciRoute, WorkerEnd};
 
@@ -1053,22 +1053,17 @@ fn finished() -> Result<ShellRun<()>, VciShellError> {
 
 /// What a test hands `supervise` besides the run: its flags, its first-step channel and the
 /// deadline `in_secs` from the start of the test.
-fn watch_of(
-    rig: &Rig,
-    in_secs: u64,
-) -> (
-    Watched,
-    Arc<AtomicBool>,
-    Arc<AtomicBool>,
-    mpsc::UnboundedSender<()>,
-) {
+fn watch_of(rig: &Rig, in_secs: u64) -> (Watched, Arc<AtomicBool>, Arc<AtomicBool>, FirstStep) {
     let (lock_cancel, job_cancel) = (
         Arc::new(AtomicBool::new(false)),
         Arc::new(AtomicBool::new(false)),
     );
     let (first_step, started) = mpsc::unbounded_channel();
+    let gate = Arc::new(StartGate::new());
+    let hook = first_step_hook(Arc::clone(&gate), first_step);
     (
         Watched {
+            gate,
             lock_cancel: lock_cancel.clone(),
             job_cancel: job_cancel.clone(),
             started,
@@ -1076,7 +1071,7 @@ fn watch_of(
         },
         lock_cancel,
         job_cancel,
-        first_step,
+        hook,
     )
 }
 
@@ -1109,7 +1104,7 @@ async fn running_is_reported_before_the_terminal_event() {
     };
     let (watched, _lock, _job, first_step) = watch_of(&rig, 600);
     let run = async move {
-        first_step.send(()).unwrap();
+        assert_eq!(first_step(), Begin::Go);
         tokio::time::sleep(Duration::from_secs(2)).await;
         finished()
     };
@@ -1144,7 +1139,7 @@ async fn a_run_that_ends_ok_after_a_stop_is_completed_recorded_and_its_result_en
     let (watched, _lock, job_cancel, first_step) = watch_of(&rig, 600);
     let seen = job_cancel.clone();
     let run = async move {
-        first_step.send(()).unwrap();
+        assert_eq!(first_step(), Begin::Go);
         while !seen.load(Ordering::SeqCst) {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -1251,7 +1246,7 @@ async fn the_deadline_ends_only_a_job_that_has_not_begun() {
     let (watched, lock_cancel, job_cancel, first_step) = watch_of(&rig, 3);
     let (lock_seen, job_seen) = (lock_cancel.clone(), job_cancel.clone());
     let run = async move {
-        first_step.send(()).unwrap();
+        assert_eq!(first_step(), Begin::Go);
         tokio::time::sleep(Duration::from_secs(10)).await;
         assert!(!lock_seen.load(Ordering::SeqCst) && !job_seen.load(Ordering::SeqCst));
         finished()
@@ -1264,6 +1259,60 @@ async fn the_deadline_ends_only_a_job_that_has_not_begun() {
             ..
         }
     ));
+}
+
+/// The gate gives the job to whichever of its first step and the deadline comes first: a cut
+/// before the first step expires the job, and a beginning before the cut leaves the deadline with
+/// nothing to cut.
+#[test]
+fn the_gate_lets_the_first_step_or_the_deadline_win_never_both() {
+    let cut_first = StartGate::new();
+    assert!(cut_first.cut());
+    assert_eq!(cut_first.begin(), Begin::Expired);
+    assert!(!cut_first.cut(), "a cut job is cut once");
+
+    let begun_first = StartGate::new();
+    assert_eq!(begun_first.begin(), Begin::Go);
+    assert!(!begun_first.cut(), "the deadline ignores a job that began");
+    assert_eq!(begun_first.begin(), Begin::Expired);
+}
+
+/// A deadline that passes after the shell launched the worker and before the job's first step
+/// stops the job at that step: it is `expired`, `running` is never reported, and the run is not
+/// given a stop.
+#[tokio::test(start_paused = true)]
+async fn a_deadline_passing_before_the_first_step_expires_the_job_without_running() {
+    let rig = Rig::new();
+    let (worker, _stop) = rig.worker();
+    let key = JobKey {
+        job_id: JobId(job_id(1)),
+        generation: 1,
+    };
+    let (watched, lock_cancel, job_cancel, first_step) = watch_of(&rig, 3);
+    let run = async move {
+        // The locks are taken and the worker is launched: the first step is what remains.
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        match first_step() {
+            Begin::Go => finished(),
+            Begin::Expired => Ok(ShellRun {
+                result: Err(JobError::StartDeadlinePassed),
+                comm_log: CommLogStatus::None,
+                worker_end: WorkerEnd::Exited,
+            }),
+        }
+    };
+    let ending = supervise_unit(&worker, &key, watched, run).await;
+    assert!(matches!(
+        ending,
+        Ending::Ended {
+            state: JobState::Expired,
+            result: None
+        }
+    ));
+    assert!(lock_cancel.load(Ordering::SeqCst));
+    assert!(!job_cancel.load(Ordering::SeqCst));
+    worker.finish(&key, ending).await;
+    assert_eq!(rig.events(1).await, vec![state("expired", None)]);
 }
 
 /// The end is synced in the outcome record before its event is appended to the outbox: the

@@ -290,6 +290,9 @@ pub enum JobError {
     },
     #[error("the job was cancelled")]
     Cancelled,
+    /// The job's start deadline passed before its first step (design 5.3): nothing was sent.
+    #[error("the job's start deadline passed before it began")]
+    StartDeadlinePassed,
     /// The program lists more than one target, and this agent opens one link per job
     /// (ADR-325 item 8, ADR-409).
     #[error("the program lists {count} targets; this agent opens one link per job")]
@@ -560,10 +563,20 @@ pub(crate) fn truncated(mut text: String, max: usize) -> String {
 }
 
 /// What a run calls once, on its job thread, after its pre-run checks and before the first
-/// instruction is executed (the point where the job counts as running). It must not wait for
-/// anything: a send on a channel is the intended use. A run refused before that point drops it
-/// without calling it.
-pub type FirstStep = Box<dyn FnOnce() + Send>;
+/// instruction is executed (the point where the job counts as running). It decides whether the
+/// job may begin. It must not wait for anything: a send on a channel is the intended use. A run
+/// refused before that point drops it without calling it.
+pub type FirstStep = Box<dyn FnOnce() -> Begin + Send>;
+
+/// What a [`FirstStep`] decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Begin {
+    /// The job begins.
+    Go,
+    /// The job's start deadline has passed: nothing is sent, and the run ends in
+    /// [`JobError::StartDeadlinePassed`].
+    Expired,
+}
 
 /// What a job does with its journal.
 enum JournalMode {
@@ -1421,8 +1434,10 @@ fn run_job<C: WorkerApi>(
             let content = content.expect("computed above for a journaled job");
             let mut journal = JobJournal::create(setup, artifact_sha256.as_ref(), &content)?;
             // Everything that can refuse the job is behind us: the next thing is the program.
-            if let Some(first_step) = first_step {
-                first_step();
+            if let Some(first_step) = first_step
+                && first_step() == Begin::Expired
+            {
+                return Err(JobError::StartDeadlinePassed);
             }
             run_on(program, &mut host, limits, cancelled, Some(&mut journal))
         }
@@ -6234,6 +6249,7 @@ def main():
             Box::new(move || {
                 count.fetch_add(1, Ordering::SeqCst);
                 calls.lock().unwrap().push("first_step");
+                Begin::Go
             })
         };
         (hook, count)
@@ -6266,6 +6282,40 @@ def main():
             .position(|call| *call == "StartComPrimitive")
             .expect("the program sent a request");
         assert!(hook_at < start_at, "{calls:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A hook that refuses the start ends the run in `StartDeadlinePassed` with nothing sent to
+    /// the worker, and the journal it left holds no step, so the job stands clean.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hook_that_expires_the_job_stops_it_before_anything_is_sent() {
+        let dir = journal_dir("first-step-expired");
+        let (client, calls) = fake_worker_losing(Vec::new(), Vec::new(), Vec::new()).await;
+        let program = program(request_step(0x22).to_vec());
+        let run = run_program_journaled(
+            client,
+            &LinkConfig::iso15765(0x7E0, 0x7E8),
+            program.clone(),
+            JobLimits::default(),
+            file_setup_for(&dir, None),
+            vci_only_guards("first-step-expired"),
+            Some(Box::new(|| Begin::Expired)),
+        )
+        .await;
+        assert!(
+            matches!(run.result, Err(JobError::StartDeadlinePassed)),
+            "{:?}",
+            run.result
+        );
+        let calls = calls.lock().unwrap().clone();
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.starts_with("StartComPrimitive")),
+            "{calls:?}"
+        );
+        let standing = crate::job_report::JournalStanding::read(&dir, &job_key(), &program, true);
+        assert_eq!(standing, crate::job_report::JournalStanding::Clean);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

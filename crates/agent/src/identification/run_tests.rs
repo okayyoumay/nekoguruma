@@ -4354,6 +4354,7 @@ fn stepping(fake: &Fake) -> (FirstStep, Arc<Mutex<Vec<HookCall>>>) {
                 .lock()
                 .unwrap()
                 .push((state.starts.len(), state.open_links));
+            Begin::Go
         })
     };
     (hook, fired)
@@ -4421,4 +4422,29 @@ async fn a_cancelled_run_does_not_call_the_first_step_hook() {
     .await;
     assert!(matches!(ran.run.result, Err(JobError::Cancelled)));
     assert!(fired.lock().unwrap().is_empty());
+}
+
+/// A hook that refuses the start, called once the first link is open, closes that link and ends
+/// the run in `StartDeadlinePassed` with no request sent.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_first_step_hook_that_expires_the_job_closes_the_link_and_sends_nothing() {
+    let fake = Fake::default();
+    let ran = run_shared_stepping(
+        plan_of(&[A], Some(0x7DF)),
+        fake.clone(),
+        limits(),
+        Arc::new(AtomicBool::new(false)),
+        tempfile::tempdir().unwrap(),
+        VciMargins::default(),
+        Some(Box::new(|| Begin::Expired)),
+    )
+    .await;
+    assert!(
+        matches!(&ran.run.result, Err(JobError::StartDeadlinePassed)),
+        "{:?}",
+        ran.run.result
+    );
+    let state = fake.state();
+    assert!(state.starts.is_empty(), "no request was sent");
+    assert_eq!(state.open_links, 0, "the link was closed");
 }

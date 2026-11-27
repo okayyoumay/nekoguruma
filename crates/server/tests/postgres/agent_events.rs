@@ -1129,6 +1129,31 @@ async fn a_detail_with_nul_is_kept_with_a_replacement_cut_to_1024_bytes_and_a_ba
     )
     .await;
     say(&mut client, 3, &c, "running", "").await;
+    // The intake's refusal of an acknowledged instruction keeps its code (ADR-511 item 3); the
+    // server's own code for a retired key does not.
+    let d = own_job(&r.u, &r.u.id, true).await;
+    let e = own_job(&r.u, &r.u.id, true).await;
+    say(
+        &mut client,
+        4,
+        &d,
+        "failed",
+        r#","failureCode":"instructionRejected""#,
+    )
+    .await;
+    say(
+        &mut client,
+        5,
+        &e,
+        "failed",
+        r#","failureCode":"instructionKeyRetired""#,
+    )
+    .await;
+    assert_eq!(
+        line(&r.u, &d).await,
+        "failed|instructionRejected|-|-|true|true|true"
+    );
+    assert_eq!(line(&r.u, &e).await, "failed|other|-|-|true|true|true");
     let kept: String =
         r.u.w
             .sql(&format!("SELECT failure_detail FROM jobs WHERE id = '{a}'"))
@@ -1143,9 +1168,9 @@ async fn a_detail_with_nul_is_kept_with_a_replacement_cut_to_1024_bytes_and_a_ba
     );
     assert_eq!(line(&r.u, &b).await, "failed|other|-|-|true|true|true");
     assert_eq!(line(&r.u, &c).await, "running|-|-|-|false|true|true");
-    assert_eq!(rows(&r.u, &r.u.id).await.len(), 3);
-    assert_eq!(cursor(&r.u, &r.u.id).await, 3);
-    assert_eq!(r.counts.applied.load(Ordering::Relaxed), 3);
+    assert_eq!(rows(&r.u, &r.u.id).await.len(), 5);
+    assert_eq!(cursor(&r.u, &r.u.id).await, 5);
+    assert_eq!(r.counts.applied.load(Ordering::Relaxed), 5);
     r.finish().await;
 }
 

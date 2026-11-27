@@ -26,14 +26,16 @@ Defines gRPC/protobuf contract and generated Rust bindings consumed by service a
 
 Generated Rust bindings live in `src/bindings/vci.service.rs` and are
 committed to source.  Regeneration is triggered manually by building with
-one of two opt-in Cargo features:
+one of two opt-in Cargo features and `NGR_REGENERATE_PROTO=1`. The feature alone
+builds the generator and writes nothing, so a workspace `--all-features` check or
+Clippy run leaves the committed bindings as they are:
 
 ### `protoc` feature
 
 Uses the `protoc` binary already installed on the host.
 
 ```
-cargo build -p vci-service-interface --features protoc
+NGR_REGENERATE_PROTO=1 cargo build -p vci-service-interface --features protoc
 ```
 
 `build.rs` calls `tonic-prost-build` with the system-installed `protoc`
@@ -46,7 +48,7 @@ Downloads a pre-built `protoc` binary at build time via the
 `protoc-bin-vendored` crate.  No local `protoc` installation required.
 
 ```
-cargo build -p vci-service-interface --features vendored-protoc
+NGR_REGENERATE_PROTO=1 cargo build -p vci-service-interface --features vendored-protoc
 ```
 
 `build.rs` obtains the binary path from `protoc_bin_vendored::protoc_bin_path()`
@@ -63,13 +65,13 @@ vendored-protoc
         └─► tonic-prost-build  (optional dep)
 ```
 
-When neither feature is set, `build.rs` compiles to a no-op and the
-committed bindings are used as-is.
+When neither feature is set, or the variable is not `1`, `build.rs` does
+nothing and the committed bindings are used as-is.
 
 ### Regeneration workflow
 
 1. Edit `src/proto/service.proto`.
-2. Run `cargo build -p vci-service-interface --features vendored-protoc`.
+2. Run `NGR_REGENERATE_PROTO=1 cargo build -p vci-service-interface --features vendored-protoc`.
 3. Review `src/bindings/vci.service.rs` for correctness.
 4. Fix up any compilation errors in dependent crates.
 5. Commit proto source and generated bindings together.

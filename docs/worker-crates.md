@@ -197,7 +197,7 @@ worker is built for:
 | `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` | LP64 Linux (see `unsigned long` width below) |
 | `i686-unknown-linux-gnu`, `armv7-unknown-linux-gnueabihf`, `armv5te-unknown-linux-gnueabi` | 32-bit Linux |
 
-Regenerate with `cargo build -p <crate> --features bindgen --target <target>` after a header
+Regenerate with `NGR_REGENERATE_FFI=1 cargo build -p <crate> --features bindgen --target <target>` after a header
 edit (libclang 18; a cross Linux target needs its libc headers, for example
 `BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu=--sysroot=/usr/aarch64-linux-gnu` with
 Ubuntu's `libc6-dev-*-cross` packages (the variable's suffix is the target with `-` replaced by

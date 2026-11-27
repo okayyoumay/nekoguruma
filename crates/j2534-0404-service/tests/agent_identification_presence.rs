@@ -230,6 +230,7 @@ async fn run_once(
             ..agent::VciMargins::default()
         },
         Arc::new(AtomicBool::new(false)),
+        None,
     )
     .await;
     let log = log_lines(&setup);

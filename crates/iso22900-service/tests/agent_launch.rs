@@ -242,3 +242,89 @@ async fn naming_an_abi_the_host_cannot_run_is_refused_first() {
         "{error}"
     );
 }
+
+/// Installs a worker that waits a second and then becomes the service, so a launch takes long
+/// enough for the test to act in the middle of it.
+#[cfg(unix)]
+fn install_slow_worker(workers: &Path, abi_name: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let service = Path::new(env!("CARGO_BIN_EXE_iso22900-service"));
+    let dir = workers.join(abi_name);
+    std::fs::create_dir_all(&dir).expect("workers directory should be writable");
+    let target = dir.join(service.file_name().expect("service binary has a file name"));
+    std::fs::write(
+        &target,
+        format!("#!/bin/sh\nsleep 1\nexec '{}' \"$@\"\n", service.display()),
+    )
+    .expect("wrapper should be writable");
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))
+        .expect("wrapper should be executable");
+}
+
+/// A cancel set after the shell has the locks, while the worker launches, stops that worker and
+/// gives the locks back without running the job (ADR-511 item 9).
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_cancel_during_the_worker_launch_ends_the_shell_without_running_the_job() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use agent::guards::{GuardSetup, JobGuards};
+    use agent::vci_shell::{VciRoute, VciShell, VciShellError, run_on_vci};
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let (workers, abi) = set_up_mock(temp.path());
+    std::fs::remove_dir_all(&workers.root).expect("the installed worker is replaced");
+    install_slow_worker(&workers.root, abi.name());
+    let locks = temp.path().join("locks");
+    let cancel = Arc::new(AtomicBool::new(false));
+    let job_ran = Arc::new(AtomicBool::new(false));
+    // Sets the flag once the shell has created its lock directory and had time to take the
+    // locks, which is well before the slow worker's start completes.
+    let setter = tokio::spawn({
+        let locks = locks.clone();
+        let cancel = Arc::clone(&cancel);
+        async move {
+            while !locks.join("reprogramming.lock").exists() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            cancel.store(true, Ordering::Relaxed);
+        }
+    });
+    let shell = VciShell {
+        vci: LIBRARY_NAME.to_owned(),
+        mode: OperatingMode::User,
+        route: VciRoute {
+            api: Api::Dpdu,
+            workers: workers.root.clone(),
+            locks: locks.clone(),
+        },
+    };
+    let ran = Arc::clone(&job_ran);
+    let ended = run_on_vci::<(), _>(
+        shell,
+        true,
+        cancel,
+        move |_source, _facts, _guards| async move {
+            ran.store(true, Ordering::Relaxed);
+            unreachable!("the job must not run after a cancel")
+        },
+    )
+    .await;
+    setter.await.expect("the setter ends");
+    assert!(
+        matches!(ended, Err(VciShellError::Cancelled)),
+        "{:?}",
+        ended.map(|run| run.worker_end)
+    );
+    assert!(!job_ran.load(Ordering::Relaxed));
+    JobGuards::try_take(&GuardSetup {
+        dir: locks,
+        vci: LIBRARY_NAME.to_owned(),
+    })
+    .expect("the lock directory is usable")
+    .expect("the cancelled shell released its locks");
+}

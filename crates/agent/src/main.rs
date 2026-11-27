@@ -13,23 +13,23 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::time::Duration;
 
 use agent::artifact::{Artifact, SHA256_LEN, parse_sha256};
-use agent::guards::{GuardSetup, JobGuards};
+use agent::guards::JobGuards;
 use agent::identification::{check_plan, load_plan, run_identification};
 use agent::journal::JobKey;
-use agent::launch::{Api, RelaunchingWorker, launch_worker};
+use agent::launch::{Api, RelaunchingWorker};
 use agent::policy::build_ceiling;
+use agent::vci_shell::{JobOutcome, VciRoute, VciShell, WorkerEnd, run_on_vci};
 use agent::{
-    CommLogSetup, CommLogStatus, Job, JobDocument, JobError, JobLimits, JobRun, VciFacts,
-    VciMargins, check_job, run_key, run_program,
+    CommLogSetup, CommLogStatus, Job, JobDocument, JobLimits, JobRun, VciFacts, VciMargins,
+    check_job, run_key, run_program,
 };
 use diag_ir::plan::Sha256;
 use diag_ir::{Value, VmState};
 use sha2::Digest;
 use tracing::Instrument;
-use worker_host::service::{LaunchOptions, OperatingMode, Stopped, WorkerLayout};
+use worker_host::service::OperatingMode;
 
 const USAGE: &str = "\
 usage: ngr-agent run --vci <name> --mode <device|user> --document <file> [options]
@@ -138,12 +138,6 @@ options:
                        created if missing, and prints the log's path on stderr; without it
                        the run writes none, unless its procedure logs messages (diag.log):
                        then it writes one to the 'commlog' directory next to ngr-agent";
-
-/// How often a job waiting for its guards tries again.
-const GUARD_POLL: Duration = Duration::from_millis(10);
-
-/// How long a stopping worker may take to close its link before it is killed.
-const STOP_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(Debug, PartialEq, Eq)]
 struct RunArgs {
@@ -1108,22 +1102,16 @@ async fn run_job(args: RunArgs, key: JobKey) -> Result<String, String> {
         None if job.logs_messages() => Some(default_comm_logs()?),
         None => None,
     };
-    let shell = VciShell {
-        api: args.api,
-        vci: args.vci,
-        mode: args.mode,
-        workers: args.workers,
-        locks: args.locks,
-    };
+    let shell = vci_shell(args.api, args.vci, args.mode, args.workers, args.locks)?;
+    let log = open_comm_log(log_dir, key)?;
     let writes = job.writes();
-    let state = run_on_vci(
+    let state = run_in_shell(
         shell,
-        key,
-        log_dir,
+        log.as_ref().and_then(|log| log.path.clone()),
         writes,
-        |source, setup, vci, guards| async move {
-            if let Some(setup) = setup {
-                job = job.with_comm_log(setup);
+        |source, vci, guards| async move {
+            if let Some(log) = log {
+                job = job.with_comm_log(log.setup);
             }
             // The communication log's `vci_connected` names the API and the width (design 8.11).
             let job = job.with_vci(vci);
@@ -1188,31 +1176,26 @@ async fn identify_job(args: IdentifyArgs, key: JobKey) -> Result<String, String>
         }
     }
     let plan = check_plan(&loaded).map_err(|error| format!("plan refused: {error}"))?;
-    let shell = VciShell {
-        api: args.api,
-        vci: args.vci,
-        mode: args.mode,
-        workers: args.workers,
-        locks: args.locks,
-    };
+    let shell = vci_shell(args.api, args.vci, args.mode, args.workers, args.locks)?;
+    let log = open_comm_log(args.comm_log, key)?;
     // The job sends only the presence request and read-only VIN and ECU reads, so it needs the VCI lock
     // (the vehicle's lock follows from the VIN it reads), and it keeps a log only when asked.
-    let report = run_on_vci(
+    let report = run_in_shell(
         shell,
-        key,
-        args.comm_log,
+        log.as_ref().and_then(|log| log.path.clone()),
         false,
-        |source, setup, vci, guards| async move {
+        |source, vci, guards| async move {
             let run = run_identification(
                 source,
                 plan,
                 JobLimits::default(),
                 guards,
-                setup,
+                log.map(|log| log.setup),
                 Some(vci),
                 // No VCI profile gives the agent margins, as for `run`.
                 VciMargins::default(),
                 Arc::new(AtomicBool::new(false)),
+                None,
             )
             .await;
             (run.result, run.guards, run.comm_log)
@@ -1222,91 +1205,69 @@ async fn identify_job(args: IdentifyArgs, key: JobKey) -> Result<String, String>
     serde_json::to_string(&report).map_err(|error| format!("cannot print the result: {error}"))
 }
 
-/// What a command needs to reach its VCI.
-struct VciShell {
+/// The shell's VCI for a command, from the command line: its API and name, the worker builds
+/// and the lock directory it names or the ones next to the executable.
+fn vci_shell(
     api: Api,
     vci: String,
     mode: OperatingMode,
     workers: Option<PathBuf>,
     locks: Option<PathBuf>,
+) -> Result<VciShell, String> {
+    let workers = match workers {
+        Some(dir) => dir,
+        None => default_workers()?,
+    };
+    let locks = match locks {
+        Some(dir) => dir,
+        None => default_locks()?,
+    };
+    Ok(VciShell {
+        vci,
+        mode,
+        route: VciRoute {
+            api,
+            workers,
+            locks,
+        },
+    })
 }
 
-/// What a command's job gives back to the shell: its result, the guards it was given and how
-/// its communication log ended.
-type JobOutcome<T> = (Result<T, JobError>, JobGuards, CommLogStatus);
+/// A command's communication log: what the job writes to, and where it is.
+struct CommLog {
+    setup: CommLogSetup,
+    path: Option<PathBuf>,
+}
 
-/// The shell both commands run their job in (ADR-397): the communication log's setup, the
-/// per-VCI lock (and the reprogramming slot for a job that `writes`, design 8.8.1), the worker
-/// launch, the worker's source with its slot, the log path report, the worker's stop with the
-/// guards' release. `job` runs on what the shell sets up: the worker's source, the log's setup
-/// (when the command has a directory for one), the VCI's facts and the guards. Returns the job's
-/// result, or the message the command exits with.
-async fn run_on_vci<T, Fut>(
+/// Creates the communication log in `dir` when the command has a directory for one.
+fn open_comm_log(dir: Option<PathBuf>, key: JobKey) -> Result<Option<CommLog>, String> {
+    let Some(dir) = dir else {
+        return Ok(None);
+    };
+    let setup = comm_log_setup(dir, key)?;
+    let path = setup.path().ok();
+    Ok(Some(CommLog { setup, path }))
+}
+
+/// A command's run in the library's VCI shell ([`run_on_vci`], ADR-397, ADR-511 item 9), with
+/// the command's reports on stderr: the log's path, once the log exists, then how the worker
+/// ended. Nothing cancels the wait for the locks here. Returns the job's result, or the message
+/// the command exits with.
+async fn run_in_shell<T, Fut>(
     shell: VciShell,
-    key: JobKey,
-    log_dir: Option<PathBuf>,
+    log_path: Option<PathBuf>,
     writes: bool,
-    job: impl FnOnce(RelaunchingWorker, Option<CommLogSetup>, VciFacts, JobGuards) -> Fut,
+    job: impl FnOnce(RelaunchingWorker, VciFacts, JobGuards) -> Fut,
 ) -> Result<T, String>
 where
     Fut: Future<Output = JobOutcome<T>>,
 {
-    let mut log_path = None;
-    let mut setup = None;
-    if let Some(dir) = log_dir {
-        let made = comm_log_setup(dir, key)?;
-        log_path = made.path().ok();
-        setup = Some(made);
-    }
-    // The per-VCI lock, and the reprogramming slot for a program that writes (design 8.8.1). The
-    // wait polls a file lock, so it runs off the runtime's threads; nothing cancels it here.
-    let dir = match shell.locks {
-        Some(dir) => dir,
-        None => default_locks()?,
-    };
-    let guard_setup = GuardSetup {
-        dir,
-        vci: shell.vci.clone(),
-    };
-    let guards = tokio::task::spawn_blocking(move || {
-        let never = AtomicBool::new(false);
-        if writes {
-            JobGuards::take(&guard_setup, GUARD_POLL, &never)
-        } else {
-            JobGuards::take_vci_only(&guard_setup, GUARD_POLL, &never)
-        }
-    })
-    .await
-    .map_err(|error| format!("taking the job's guards failed: {error}"))?
-    .map_err(|error| format!("cannot take the job's guards: {error}"))?;
-    let workers = WorkerLayout {
-        root: match shell.workers {
-            Some(root) => root,
-            None => default_workers()?,
-        },
-    };
-    let worker = launch_worker(
-        shell.api,
-        &shell.vci,
-        shell.mode,
-        &workers,
-        &LaunchOptions::default(),
-        None,
-    )
-    .await
-    .map_err(|error| error.to_string())?;
-    let vci = VciFacts {
-        api: shell.api,
-        long_size: worker.long_size,
-    };
-    // The run owns the worker's process through its source, which starts a new worker if the
-    // current one exits (ADR-394); the process in the slot is the one to stop at the end.
-    let source = RelaunchingWorker::new(worker.recipe, worker.process, worker.client);
-    let slot = source.slot();
-    let (result, mut guards, comm_log) = job(source, setup, vci, guards).await;
+    let run = run_on_vci(shell, writes, Arc::new(AtomicBool::new(false)), job)
+        .await
+        .map_err(|error| error.to_string())?;
     // The path is printed only once the log exists: a job that never ran, or a log that could
     // not be opened, names none.
-    match (&comm_log, &log_path) {
+    match (&run.comm_log, &log_path) {
         (CommLogStatus::None, _) => {}
         (CommLogStatus::Incomplete(agent::CommLogIncomplete::NotOpened(kind)), _) => {
             eprintln!("ngr-agent: communication log not opened: {kind:?}");
@@ -1319,32 +1280,19 @@ where
         }
         (_, None) => {}
     }
-    // The job has closed its link whatever the result, unless its guards say otherwise
-    // (ADR-258). A stop that reaped the worker means the worker no longer holds the link; a
-    // vendor device server may still hold the device a while, which the next open detects.
-    let process = slot
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take()
-        .expect("the run leaves its worker's process in the slot");
-    match process.stop(STOP_GRACE).await {
-        Ok(Stopped::Exited) => guards.worker_gone(),
-        Ok(Stopped::Killed) => {
+    match run.worker_end {
+        WorkerEnd::Exited => {}
+        WorkerEnd::Killed => {
             eprintln!("ngr-agent: the worker did not stop in time and was killed");
-            guards.worker_gone();
         }
-        // The worker's state is unknown: with an unconfirmed link, the guards stay locked when
-        // dropped, until this process exits.
-        Err(error) if guards.link_unconfirmed() => {
-            drop(guards);
+        WorkerEnd::NotClean(error) => {
+            eprintln!("ngr-agent: worker did not stop cleanly: {error}");
+        }
+        WorkerEnd::MayStillHold(error) => {
             return Err(format!("the worker may still hold the VCI: {error}"));
         }
-        Err(error) => eprintln!("ngr-agent: worker did not stop cleanly: {error}"),
     }
-    // Released only now: either the worker was reaped, or its stop failed after a confirmed
-    // close, so its link is closed either way.
-    drop(guards);
-    result.map_err(|error| format!("job failed: {error}"))
+    run.result.map_err(|error| format!("job failed: {error}"))
 }
 
 /// Whether any value in `state` is an infinite or NaN `F64`.

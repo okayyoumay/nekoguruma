@@ -189,10 +189,11 @@ fields the candidates' matching rules read, narrowing the candidates on what the
 rules and those fields show (`run_identification`, ADR-396, ADR-399, ADR-401, ADR-402, ADR-403;
 design 8.8.2), and prints the report, which lists the remaining candidates, the rule fields and
 the component values the rules gave. `--vci`, `--api`, `--mode`, `--workers`, `--locks` and
-`--comm-log` mean what they mean for `run`, and both commands run their job in one shell
-(`run_on_vci`, ADR-397): the communication log's setup, the guards, the worker's launch, its
-source with the slot, the report of the log's path, and the worker's stop with the guards'
-release. The differences:
+`--comm-log` mean what they mean for `run`, and both commands run their job in one shell, a
+library function the intake shares (`agent::vci_shell::run_on_vci`, ADR-397, ADR-511 item 9):
+the guards, the worker's launch, its source with the slot, and the worker's stop with the
+guards' release. The binary adds the communication log's setup and the report of its path.
+The differences:
 
 | Option | Meaning |
 |---|---|
@@ -2080,6 +2081,35 @@ state, with its step count after the journal's last record, and runs to the prog
 first run's journaling: a later plan journals as on a first run, and a step that fails, a cancel or
 the step limit (counted from the continuation's first step, ADR-287) end the job as on a first run. The continuation commits no run start (ADR-274 item
 4), since a run start that is not at the entry would leave a later redo without its entry state.
+
+## The VCI shell
+
+`agent::vci_shell` is the shell a job runs its VCI in (design 8.8.1, ADR-397, ADR-511 item 9).
+`run_on_vci(shell, writes, cancel, job)` takes the per-VCI lock (and the reprogramming slot for
+a job that `writes`), launches the worker of the VCI's API (`launch_worker`), runs `job` with
+the worker's `RelaunchingWorker`, the VCI's facts and the guards, stops the worker and releases
+the guards. It returns the job's result, how its communication log ended and how the worker
+ended (`WorkerEnd`); it prints nothing, so `ngr-agent run` and `ngr-agent identify` report the
+log's path and the worker's end on stderr, and the intake reports them its own way.
+
+- The wait for the locks takes a cancel flag (`Arc<AtomicBool>`). A flag set while it waits ends
+  it with `VciShellError::Cancelled`, with no worker launched. The commands pass a flag that is
+  never set.
+- `VciLookup::find(name)` gives the `VciRoute` (API, worker directory, lock directory) of the
+  VCI an instruction names; tests replace it. `RegisteredVcis`, the agent's lookup, asks the
+  registration definitions the workers resolve names with: a J2534 registration definition
+  (the registry key on Windows) or a D-PDU API root file entry (`launch::registered_api`). Its
+  API is the one whose definitions name the VCI. A name no definition holds is
+  `VciShellError::UnknownVci`, and one that both APIs' definitions name is
+  `VciShellError::AmbiguousVci`; the library file is not checked until the worker launches, which
+  fails as `VciShellError::Launch`.
+- A run's first step: `run_program_journaled` and `run_identification` take an optional
+  `runner::FirstStep`, a `FnOnce` the job thread calls once, after the run's checks and before
+  its first instruction or request. A run refused before that point never calls it, and the
+  hook must not wait (a channel send).
+- `identification::PlanSource` gives the bytes of the plan an identification instruction's
+  plan hash names. The agent's `NoPlans` has none, since the server serves no plan yet;
+  `load_plan` checks whatever a source gives against the instruction's hash.
 
 ## Job guards
 

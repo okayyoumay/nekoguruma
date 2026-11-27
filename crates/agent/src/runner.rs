@@ -546,6 +546,12 @@ pub(crate) fn truncated(mut text: String, max: usize) -> String {
     text
 }
 
+/// What a run calls once, on its job thread, after its pre-run checks and before the first
+/// instruction is executed (the point where the job counts as running). It must not wait for
+/// anything: a send on a channel is the intended use. A run refused before that point drops it
+/// without calling it.
+pub type FirstStep = Box<dyn FnOnce() + Send>;
+
 /// What a job does with its journal.
 enum JournalMode {
     /// A first run: the journal is created, and one that exists is an error.
@@ -789,7 +795,7 @@ pub async fn run_program<W: WorkerSource>(
     limits: JobLimits,
     guards: JobGuards,
 ) -> JobRun {
-    run_from_source(source, config, program, limits, None, guards).await
+    run_from_source(source, config, program, limits, None, guards, None).await
 }
 
 /// [`run_program`] that also writes the job's journal (ADR-244, ADR-252, ADR-335): the journal of
@@ -801,6 +807,10 @@ pub async fn run_program<W: WorkerSource>(
 /// is sent. `guards` are taken and returned as for [`run_program`]; a program that writes needs
 /// the reprogramming slot (`JobGuards::take`). The job's communication log goes beside the
 /// journal, under the same key (ADR-347).
+///
+/// `first_step` is called once, on the job thread, after the journal exists and before the
+/// program's first instruction runs ([`FirstStep`]); a job refused earlier, by a check, the
+/// link, the policy or the journal, never calls it.
 pub async fn run_program_journaled<W: WorkerSource>(
     source: W,
     config: &LinkConfig,
@@ -808,6 +818,7 @@ pub async fn run_program_journaled<W: WorkerSource>(
     limits: JobLimits,
     journal: JournalSetup,
     guards: JobGuards,
+    first_step: Option<FirstStep>,
 ) -> JobRun {
     run_from_source(
         source,
@@ -816,6 +827,7 @@ pub async fn run_program_journaled<W: WorkerSource>(
         limits,
         Some(JournalMode::Create(journal)),
         guards,
+        first_step,
     )
     .await
 }
@@ -950,6 +962,7 @@ pub async fn resume_program_journaled<W: WorkerSource>(
         limits,
         Some(JournalMode::Resume(journal)),
         guards,
+        None,
     )
     .await
 }
@@ -964,6 +977,7 @@ async fn run_from_source<W: WorkerSource>(
     limits: JobLimits,
     journal: Option<JournalMode>,
     guards: JobGuards,
+    first_step: Option<FirstStep>,
 ) -> JobRun {
     match source.client() {
         Ok(client) => {
@@ -976,6 +990,7 @@ async fn run_from_source<W: WorkerSource>(
                 policy::build_ceiling(),
                 journal,
                 guards,
+                first_step,
             )
             .await
         }
@@ -1002,6 +1017,7 @@ async fn run_guarded<C: WorkerApi>(
     ceiling: Permission,
     journal: Option<JournalMode>,
     guards: JobGuards,
+    first_step: Option<FirstStep>,
 ) -> JobRun {
     let slot: GuardSlot = Arc::new(Mutex::new(Some(guards)));
     let (result, comm_log) = run_program_within(
@@ -1013,6 +1029,7 @@ async fn run_guarded<C: WorkerApi>(
         ceiling,
         journal,
         Arc::clone(&slot),
+        first_step,
     )
     .await;
     let guards = slot
@@ -1042,9 +1059,10 @@ async fn run_program_within<C: WorkerApi>(
     ceiling: Permission,
     journal: Option<JournalMode>,
     guards: GuardSlot,
+    first_step: Option<FirstStep>,
 ) -> (Result<VmState, JobError>, CommLogStatus) {
     match run_checked(
-        client, source, config, job, limits, ceiling, journal, guards,
+        client, source, config, job, limits, ceiling, journal, guards, first_step,
     )
     .await
     {
@@ -1151,6 +1169,7 @@ async fn run_checked<C: WorkerApi>(
     ceiling: Permission,
     journal: Option<JournalMode>,
     guards: GuardSlot,
+    first_step: Option<FirstStep>,
 ) -> Result<(Result<VmState, JobError>, CommLogStatus), JobError> {
     let handle = Handle::current();
     if handle.runtime_flavor() == RuntimeFlavor::CurrentThread {
@@ -1226,6 +1245,7 @@ async fn run_checked<C: WorkerApi>(
                 journal,
                 &guards,
                 comm_log,
+                first_step,
             )
         },
         |log, result| log.finish(result),
@@ -1290,6 +1310,7 @@ fn run_job<C: WorkerApi>(
     journal: Option<JournalMode>,
     guards: &GuardSlot,
     comm_log: &mut JobLog,
+    first_step: Option<FirstStep>,
 ) -> Result<VmState, JobError> {
     // The job's guards stay held until the end of this function, after the link is closed
     // (`OpenLink`, declared below, closes it on every way out, a panic included): declared
@@ -1385,6 +1406,10 @@ fn run_job<C: WorkerApi>(
         Some(JournalMode::Create(setup)) => {
             let content = content.expect("computed above for a journaled job");
             let mut journal = JobJournal::create(setup, artifact_sha256.as_ref(), &content)?;
+            // Everything that can refuse the job is behind us: the next thing is the program.
+            if let Some(first_step) = first_step {
+                first_step();
+            }
             run_on(program, &mut host, limits, cancelled, Some(&mut journal))
         }
         Some(JournalMode::Resume(setup)) => resume_on(
@@ -5615,6 +5640,7 @@ def main():
                         Some(JournalMode::Create(setup)),
                         &slot,
                         &mut JobLog::none(),
+                        None,
                     )
                 })
                 .await
@@ -5749,6 +5775,7 @@ def main():
                         Some(JournalMode::Resume(setup)),
                         &job_slot,
                         &mut JobLog::none(),
+                        None,
                     )
                 })
                 .await
@@ -6169,6 +6196,7 @@ def main():
                 JobLimits::default(),
                 file_setup_for(&dir, None),
                 vci_only_guards("plain-creates-journal"),
+                None,
             )
             .await
             .result
@@ -6178,6 +6206,115 @@ def main():
         assert_eq!(state.records, 2, "the job content and the run start");
         let again = run().await;
         assert!(matches!(again, Err(JobError::Journal(_))), "{again:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A hook that records "first_step" among the worker's RPCs, so a test reads its place
+    /// against the first request; the second value counts its calls.
+    fn recording_first_step(
+        calls: &Arc<Mutex<Vec<&'static str>>>,
+    ) -> (FirstStep, Arc<std::sync::atomic::AtomicUsize>) {
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hook = {
+            let (calls, count) = (Arc::clone(calls), Arc::clone(&count));
+            Box::new(move || {
+                count.fetch_add(1, Ordering::SeqCst);
+                calls.lock().unwrap().push("first_step");
+            })
+        };
+        (hook, count)
+    }
+
+    /// The hook runs once, on a run that executes, before the program's first request reaches
+    /// the worker.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_first_step_hook_runs_once_before_the_first_request() {
+        let dir = journal_dir("first-step-runs");
+        let (client, calls) = fake_worker_losing(Vec::new(), Vec::new(), Vec::new()).await;
+        let (hook, count) = recording_first_step(&calls);
+        run_program_journaled(
+            client,
+            &LinkConfig::iso15765(0x7E0, 0x7E8),
+            program(request_step(0x22).to_vec()),
+            JobLimits::default(),
+            file_setup_for(&dir, None),
+            vci_only_guards("first-step-runs"),
+            Some(hook),
+        )
+        .await
+        .result
+        .expect("the program runs");
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        let calls = calls.lock().unwrap().clone();
+        let hook_at = calls.iter().position(|call| *call == "first_step").unwrap();
+        let start_at = calls
+            .iter()
+            .position(|call| *call == "StartComPrimitive")
+            .expect("the program sent a request");
+        assert!(hook_at < start_at, "{calls:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A run refused in its pre-run checks, or by its journal, never calls the hook.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_run_does_not_call_the_first_step_hook() {
+        // The job's own check refuses an artifact that is not the one named.
+        let dir = journal_dir("first-step-refused-check");
+        let (client, calls) = fake_worker_losing(Vec::new(), Vec::new(), Vec::new()).await;
+        let (hook, count) = recording_first_step(&calls);
+        let artifact = Artifact::from_bytes(vec![1; 16]);
+        let run = run_program_journaled(
+            client,
+            &LinkConfig::iso15765(0x7E0, 0x7E8),
+            Job::from(program(request_step(0x22).to_vec())).with_artifact([0; 32], artifact),
+            JobLimits::default(),
+            file_setup_for(&dir, None),
+            vci_only_guards("first-step-refused-check"),
+            Some(hook),
+        )
+        .await;
+        assert!(
+            matches!(run.result, Err(JobError::ArtifactMismatch { .. })),
+            "{:?}",
+            run.result
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        // A journal that exists refuses a first run after its link is open, still before its
+        // first request.
+        let dir = journal_dir("first-step-refused-journal");
+        let (client, _calls) = fake_worker(false).await;
+        run_program_journaled(
+            client,
+            &LinkConfig::iso15765(0x7E0, 0x7E8),
+            program(Vec::new()),
+            JobLimits::default(),
+            file_setup_for(&dir, None),
+            vci_only_guards("first-step-refused-journal-first"),
+            None,
+        )
+        .await
+        .result
+        .expect("the first run ends");
+        let (client, calls) = fake_worker_losing(Vec::new(), Vec::new(), Vec::new()).await;
+        let (hook, count) = recording_first_step(&calls);
+        let run = run_program_journaled(
+            client,
+            &LinkConfig::iso15765(0x7E0, 0x7E8),
+            program(request_step(0x22).to_vec()),
+            JobLimits::default(),
+            file_setup_for(&dir, None),
+            vci_only_guards("first-step-refused-journal"),
+            Some(hook),
+        )
+        .await;
+        assert!(
+            matches!(run.result, Err(JobError::Journal(_))),
+            "{:?}",
+            run.result
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 0);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -6199,6 +6336,7 @@ def main():
             JobLimits::default(),
             file_setup_for(&dir, None),
             vci_only_guards("entry-points-artifact-run"),
+            None,
         )
         .await
         .result
@@ -6266,6 +6404,7 @@ def main():
                         Some(JournalMode::Create(setup)),
                         &slot,
                         &mut JobLog::none(),
+                        None,
                     )
                 })
                 .await
@@ -11645,6 +11784,7 @@ def main():
             Permission::ReadOnly,
             None,
             vci_only_guards("no-declarations"),
+            None,
         )
         .await;
         assert!(
@@ -11979,6 +12119,7 @@ def main():
                 Permission::ReadOnly,
                 None,
                 vci_only_guards(&format!("sources-{name}")),
+                None,
             )
             .await;
             assert!(
@@ -15143,6 +15284,7 @@ def main():
                         JobLimits::default(),
                         journal(),
                         vci_only_guards("declared-journaled"),
+                        None,
                     )
                     .await
                 }
@@ -15202,6 +15344,7 @@ def main():
             Permission::ReadOnly,
             None,
             vci_only_guards("refused"),
+            None,
         )
         .await;
         assert!(
@@ -15228,6 +15371,7 @@ def main():
             Permission::ReadOnly,
             None,
             vci_only_guards("reads"),
+            None,
         )
         .await;
         assert!(matches!(result, Err(JobError::Link(_))), "{result:?}");
@@ -15257,6 +15401,7 @@ def main():
             Permission::Simulator,
             None,
             full_guards("sim-ceiling"),
+            None,
         )
         .await;
         assert!(matches!(result, Err(JobError::Link(_))), "{result:?}");
@@ -15367,6 +15512,7 @@ def main():
                 None,
                 &slot,
                 &mut JobLog::none(),
+                None,
             )
         })
         .await
@@ -21372,6 +21518,7 @@ def main():
             JobLimits::default(),
             file_setup_for(&dir, Some(TARGET_VIN)),
             vci_only_guards("comm-log-journaled"),
+            None,
         )
         .await;
         run.result.expect("the program runs");
@@ -21470,6 +21617,7 @@ def main():
                         JobLimits::default(),
                         journal,
                         guards,
+                        None,
                     )
                     .await
                 };
@@ -21542,6 +21690,7 @@ def main():
             JobLimits::default(),
             file_setup_for(&dir, None),
             vci_only_guards("comm-log-journal-in-use"),
+            None,
         )
         .await
         .result
@@ -26611,6 +26760,7 @@ def main():
                 JobLimits::default(),
                 file_setup_for(&dir, None),
                 vci_only_guards("entry-content-program-run"),
+                None,
             )
             .await
             .result
@@ -26708,6 +26858,7 @@ def main():
                 JobLimits::default(),
                 file_setup_for(&dir, None),
                 vci_only_guards("entry-content-document-run"),
+                None,
             )
             .await
             .result

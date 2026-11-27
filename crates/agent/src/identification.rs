@@ -56,8 +56,9 @@ use crate::journal::Vin;
 use crate::link::{BUS_TYPE_DWCAN, CloseEvidence, LinkConfig};
 use crate::policy::{ApplicationLayer, PRESENCE_REQUEST};
 use crate::runner::{
-    CancelOnDrop, GuardSlot, JobError, JobLimits, JobLink, LinkRefused, WORKER_EXIT_GRACE,
-    base_facts, close_job_link, on_job_thread, open_job_link, promote_to_vehicle, reopen_attempts,
+    CancelOnDrop, FirstStep, GuardSlot, JobError, JobLimits, JobLink, LinkRefused,
+    WORKER_EXIT_GRACE, base_facts, close_job_link, on_job_thread, open_job_link,
+    promote_to_vehicle, reopen_attempts,
 };
 use crate::send_receive::declared_sid;
 
@@ -300,6 +301,37 @@ pub struct LoadedPlan {
     plan: IdentificationPlan,
     plan_sha256: Sha256,
     documents: Vec<(Sha256, JobDocument)>,
+}
+
+/// Where the plan bytes named by an identification instruction's plan hash come from, for the
+/// intake (ADR-511 item 10). The bytes are checked afterwards by [`load_plan`], which compares
+/// their SHA-256 with the instruction's hash, so a source is not trusted.
+pub trait PlanSource {
+    /// The bytes of the plan whose SHA-256 is `plan_hash`.
+    fn plan(&self, plan_hash: &Sha256) -> Result<Vec<u8>, PlanSourceError>;
+}
+
+/// Why a [`PlanSource`] gave no plan.
+#[derive(Debug, thiserror::Error)]
+pub enum PlanSourceError {
+    /// The source serves no identification plans at all.
+    #[error("this agent has no source of identification plans")]
+    NoSource,
+    /// The source holds no plan with this hash.
+    #[error("no identification plan with SHA-256 {0}")]
+    NotFound(String),
+}
+
+/// The plan source of the production agent: the server serves no identification plan yet, so
+/// it has none and every request is refused with [`PlanSourceError::NoSource`] (ADR-511 item
+/// 10).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoPlans;
+
+impl PlanSource for NoPlans {
+    fn plan(&self, _plan_hash: &Sha256) -> Result<Vec<u8>, PlanSourceError> {
+        Err(PlanSourceError::NoSource)
+    }
 }
 
 /// Reads a plan and the documents it names. `supplied` holds the documents with the hash each
@@ -1883,6 +1915,11 @@ fn identification_facts(
 /// communication log only. Last, unless the VIN phase was interrupted, it reads each ECU
 /// definition of the plan (ADR-401) the same way, with the lock held, and reports the entry
 /// states; guards still marked end the run in [`JobError::LinkUnconfirmed`] when a read remains.
+///
+/// `first_step` is called once, on the job thread, after the run's checks and its first link's
+/// open and before its first request is sent ([`FirstStep`]); a run refused before that point,
+/// by the runtime, the guards, the worker, a cancel or a first link that does not open, never
+/// calls it.
 #[expect(
     clippy::too_many_arguments,
     reason = "the run's whole context, each part owned by the caller"
@@ -1896,6 +1933,7 @@ pub async fn run_identification<W: WorkerSource>(
     vci: Option<VciFacts>,
     margins: VciMargins,
     cancel: Arc<AtomicBool>,
+    first_step: Option<FirstStep>,
 ) -> IdentificationRun {
     let handle = Handle::current();
     let slot: GuardSlot = Arc::new(Mutex::new(Some(guards)));
@@ -1934,6 +1972,7 @@ pub async fn run_identification<W: WorkerSource>(
                 &cancel,
                 &job_slot,
                 log,
+                first_step,
             )
         },
         |log, result| {
@@ -1962,14 +2001,14 @@ fn settle(
     evidence: CloseEvidence,
     comm_log: &Option<crate::comm_log::CommLog>,
     guards: &GuardSlot,
-    worker_ended: &Cell<bool>,
+    state: &RunState,
 ) -> bool {
-    if worker_ended.get()
+    if state.worker_ended.get()
         || !settle_worker(source, evidence, WORKER_EXIT_GRACE, comm_log.as_ref(), &[])
     {
         return false;
     }
-    worker_ended.set(true);
+    state.worker_ended.set(true);
     if let Some(held) = guards.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         held.worker_gone();
     }
@@ -2020,6 +2059,10 @@ enum PartEnd {
 }
 
 /// The run on the job's blocking thread.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the run's whole context, each part owned by the caller"
+)]
 fn identify<W: WorkerSource>(
     handle: &Handle,
     source: &Arc<Mutex<W>>,
@@ -2028,6 +2071,7 @@ fn identify<W: WorkerSource>(
     cancelled: &AtomicBool,
     guards: &GuardSlot,
     log: &mut JobLog,
+    first_step: Option<FirstStep>,
 ) -> Result<IdentificationReport, JobError> {
     // The guards stay held until this function returns, after every link is closed.
     let _guards = Arc::clone(guards);
@@ -2037,7 +2081,7 @@ fn identify<W: WorkerSource>(
     let mut report = plan.report();
     let comm_log = log.open(RunKind::First);
     let mut reopens = 0u8;
-    let worker_ended = Cell::new(false);
+    let state = RunState::new(first_step);
     'groups: for group in report.presence_groups.clone() {
         let base = plan.presence_link(&group);
         let mut queue = VecDeque::from([plan.bus_table(&group.bus)]);
@@ -2052,7 +2096,7 @@ fn identify<W: WorkerSource>(
                 cancelled,
                 guards,
                 &mut reopens,
-                &worker_ended,
+                &state,
             )?;
             let (heard, interrupted, opened) = match part {
                 PartEnd::Done(heard) => (heard, false, true),
@@ -2104,7 +2148,7 @@ fn identify<W: WorkerSource>(
         guards,
         &comm_log,
         &mut reopens,
-        &worker_ended,
+        &state,
         &mut report,
     )?;
     if report.vin_interrupted {
@@ -2120,7 +2164,7 @@ fn identify<W: WorkerSource>(
         // open does: a worker that exited during the last close is found, and its mark cleared.
         // Guards still marked take no lock (ADR-258); an ECU read that remains then ends the run
         // in `LinkUnconfirmed` as its link opens (ADR-401), and a run with none reports so.
-        match settle_before_open(source, &comm_log, cancelled, guards, &worker_ended) {
+        match settle_before_open(source, &comm_log, cancelled, guards, &state) {
             Ok(_) => {
                 promote_to_vehicle(
                     guards,
@@ -2143,7 +2187,7 @@ fn identify<W: WorkerSource>(
         guards,
         &comm_log,
         &mut reopens,
-        &worker_ended,
+        &state,
         &mut report,
     )?;
     // An interrupted phase leaves every entry not read, as an interrupted VIN phase establishes
@@ -2173,7 +2217,7 @@ fn settle_before_open<W: WorkerSource>(
     comm_log: &Option<crate::comm_log::CommLog>,
     cancelled: &AtomicBool,
     guards: &GuardSlot,
-    worker_ended: &Cell<bool>,
+    state: &RunState,
 ) -> Result<SharedSource<W>, JobError> {
     if cancelled.load(Ordering::Relaxed) {
         return Err(JobError::Cancelled);
@@ -2184,12 +2228,36 @@ fn settle_before_open<W: WorkerSource>(
         CloseEvidence::default(),
         comm_log,
         guards,
-        worker_ended,
+        state,
     );
     if link_unconfirmed(guards) {
         return Err(JobError::LinkUnconfirmed);
     }
     Ok(shared)
+}
+
+/// What the run's parts share while it runs on its job thread.
+struct RunState {
+    /// Whether the worker was found exited and not yet logged as restarted.
+    worker_ended: Cell<bool>,
+    /// The run's [`FirstStep`], until its first link has opened.
+    first_step: Cell<Option<FirstStep>>,
+}
+
+impl RunState {
+    fn new(first_step: Option<FirstStep>) -> Self {
+        Self {
+            worker_ended: Cell::new(false),
+            first_step: Cell::new(first_step),
+        }
+    }
+
+    /// Calls the run's first-step hook, once: the first link has opened.
+    fn link_opened(&self) {
+        if let Some(first_step) = self.first_step.take() {
+            first_step();
+        }
+    }
 }
 
 /// How [`open_part`] ended without an open link.
@@ -2225,7 +2293,7 @@ fn open_part<W: WorkerSource>(
     cancelled: &AtomicBool,
     guards: &GuardSlot,
     reopens: &mut u8,
-    worker_ended: &Cell<bool>,
+    state: &RunState,
 ) -> Result<Opened<W::Client>, JobError> {
     let timings = Timings::for_link(config);
     let try_open = || {
@@ -2236,11 +2304,11 @@ fn open_part<W: WorkerSource>(
             evidence: CloseEvidence::default(),
         };
         let mut shared =
-            settle_before_open(source, comm_log, cancelled, guards, worker_ended).map_err(stop)?;
+            settle_before_open(source, comm_log, cancelled, guards, state).map_err(stop)?;
         let client = shared
             .client()
             .map_err(|error| stop(JobError::Link(error)))?;
-        if worker_ended.replace(false)
+        if state.worker_ended.replace(false)
             && let Some(log) = &comm_log
         {
             log.worker_restart(shared.pid());
@@ -2263,13 +2331,7 @@ fn open_part<W: WorkerSource>(
             let lost = matches!(&refused.error, JobError::Link(error)
                 if error.resend_class() == ResendClass::PathLost);
             if !refused.cleaned_up && lost && refused.evidence.silent() {
-                refused.cleaned_up = settle(
-                    &mut shared,
-                    refused.evidence,
-                    comm_log,
-                    guards,
-                    worker_ended,
-                );
+                refused.cleaned_up = settle(&mut shared, refused.evidence, comm_log, guards, state);
             }
             refused
         })
@@ -2302,7 +2364,12 @@ fn open_part<W: WorkerSource>(
         };
     }
     match opened {
-        Ok(link) => Ok(Opened::Link(Box::new(link))),
+        Ok(link) => {
+            // Every check that can refuse the run, the first link's open included, is behind
+            // us: the next thing is the first request.
+            state.link_opened();
+            Ok(Opened::Link(Box::new(link)))
+        }
         // A refusal whose teardown failed left the guards marked: nothing more opens (ADR-258).
         Err(refused) if refused.table_refused && refused.cleaned_up => {
             Ok(Opened::Refused(refused.error))
@@ -2403,18 +2470,10 @@ fn presence_part<W: WorkerSource>(
     cancelled: &AtomicBool,
     guards: &GuardSlot,
     reopens: &mut u8,
-    worker_ended: &Cell<bool>,
+    state: &RunState,
 ) -> Result<PartEnd, JobError> {
     let link = match open_part(
-        handle,
-        source,
-        config,
-        comm_log,
-        limits,
-        cancelled,
-        guards,
-        reopens,
-        worker_ended,
+        handle, source, config, comm_log, limits, cancelled, guards, reopens, state,
     )? {
         Opened::Link(link) => link,
         Opened::Refused(error) => return Ok(PartEnd::Refused(error)),
@@ -2476,19 +2535,11 @@ fn open_read_link<W: WorkerSource>(
     cancelled: &AtomicBool,
     guards: &GuardSlot,
     reopens: &mut u8,
-    worker_ended: &Cell<bool>,
+    state: &RunState,
 ) -> Result<ReadLink<W::Client>, JobError> {
     Ok(
         match open_part(
-            handle,
-            source,
-            link,
-            comm_log,
-            limits,
-            cancelled,
-            guards,
-            reopens,
-            worker_ended,
+            handle, source, link, comm_log, limits, cancelled, guards, reopens, state,
         )? {
             Opened::Link(link) => ReadLink::Link(link),
             Opened::Refused(_) | Opened::Failed(_) => ReadLink::Refused,
@@ -2573,18 +2624,10 @@ fn vin_read<W: WorkerSource>(
     cancelled: &AtomicBool,
     guards: &GuardSlot,
     reopens: &mut u8,
-    worker_ended: &Cell<bool>,
+    state: &RunState,
 ) -> Result<VinReadEnd, JobError> {
     let link = match open_read_link(
-        handle,
-        source,
-        link,
-        comm_log,
-        limits,
-        cancelled,
-        guards,
-        reopens,
-        worker_ended,
+        handle, source, link, comm_log, limits, cancelled, guards, reopens, state,
     )? {
         ReadLink::Link(link) => link,
         // The worker refused the link at run time: its sources are reported so and the other
@@ -2680,7 +2723,7 @@ fn vin_phase<W: WorkerSource>(
     guards: &GuardSlot,
     comm_log: &Option<crate::comm_log::CommLog>,
     reopens: &mut u8,
-    worker_ended: &Cell<bool>,
+    state: &RunState,
     report: &mut IdentificationReport,
 ) -> Result<(), JobError> {
     for (at, read) in plan.vin_reads.iter().enumerate() {
@@ -2688,16 +2731,7 @@ fn vin_phase<W: WorkerSource>(
             continue;
         };
         let end = vin_read(
-            handle,
-            source,
-            read,
-            link,
-            comm_log,
-            limits,
-            cancelled,
-            guards,
-            reopens,
-            worker_ended,
+            handle, source, read, link, comm_log, limits, cancelled, guards, reopens, state,
         )?;
         let (outcomes, accepted) = match end {
             VinReadEnd::Done(outcomes, accepted) => (outcomes, accepted),
@@ -2795,18 +2829,10 @@ fn ecu_read_group<W: WorkerSource>(
     cancelled: &AtomicBool,
     guards: &GuardSlot,
     reopens: &mut u8,
-    worker_ended: &Cell<bool>,
+    state: &RunState,
 ) -> Result<Option<GroupRead>, JobError> {
     let link = match open_read_link(
-        handle,
-        source,
-        link,
-        comm_log,
-        limits,
-        cancelled,
-        guards,
-        reopens,
-        worker_ended,
+        handle, source, link, comm_log, limits, cancelled, guards, reopens, state,
     )? {
         ReadLink::Link(link) => link,
         // The worker refused the link at run time: its declarations are reported so and the
@@ -3336,7 +3362,7 @@ fn ecu_phase<W: WorkerSource>(
     guards: &GuardSlot,
     comm_log: &Option<crate::comm_log::CommLog>,
     reopens: &mut u8,
-    worker_ended: &Cell<bool>,
+    state: &RunState,
     report: &mut IdentificationReport,
 ) -> Result<(), JobError> {
     let mut remaining = narrow(plan, report, None);
@@ -3351,16 +3377,7 @@ fn ecu_phase<W: WorkerSource>(
                 continue;
             }
             let interrupted = read_definition_at(
-                handle,
-                source,
-                plan,
-                at,
-                limits,
-                cancelled,
-                guards,
-                comm_log,
-                reopens,
-                worker_ended,
+                handle, source, plan, at, limits, cancelled, guards, comm_log, reopens, state,
                 report,
             )?;
             if interrupted {
@@ -3395,7 +3412,7 @@ fn read_definition_at<W: WorkerSource>(
     guards: &GuardSlot,
     comm_log: &Option<crate::comm_log::CommLog>,
     reopens: &mut u8,
-    worker_ended: &Cell<bool>,
+    state: &RunState,
     report: &mut IdentificationReport,
 ) -> Result<bool, JobError> {
     let planned = &plan.ecu_reads[at];
@@ -3419,7 +3436,7 @@ fn read_definition_at<W: WorkerSource>(
             cancelled,
             guards,
             reopens,
-            worker_ended,
+            state,
         )?;
         let reported = &mut report.ecu_reads[at].requests[first..first + count];
         match end {

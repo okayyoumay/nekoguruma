@@ -38,6 +38,8 @@
 //! - [`restart`]: how a job whose journal exists goes on (ADR-253, ADR-255)
 //! - [`guards`]: the per-VCI lock, the reprogramming slot and the per-vehicle lock (ADR-256,
 //!   ADR-262)
+//! - [`vci_shell`]: the shell a job runs its VCI in: the VCI's lookup by name, its locks, its worker
+//!   (design 5.3, 8.8.1, ADR-397, ADR-511)
 //! - [`policy`]: which requests the runner may send (read-only, except on the simulator in a debug build)
 //! - [`runner`]: runs a [`diag_ir::Program`] to its end on a link
 //! - [`document`]: the variant's document a job's program decodes responses with (ADR-316)
@@ -83,6 +85,7 @@ pub mod server_http;
 pub mod state;
 pub mod upload_ledger;
 pub mod uploader;
+pub mod vci_shell;
 
 pub use artifact::Artifact;
 pub use client::{ExitHow, WorkerApi, WorkerExit, WorkerSource, WorkerStatus};

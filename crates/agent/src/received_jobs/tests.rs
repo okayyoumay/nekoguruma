@@ -373,7 +373,7 @@ fn d4_a_file_that_does_not_read_back_is_corrupt_and_is_never_touched() {
         let error = open(dir.path())
             .err()
             .unwrap_or_else(|| panic!("{what} opened"));
-        assert!(matches!(error, LedgerError::Corrupt(_)), "{what}: {error}");
+        assert!(matches!(error, LedgerError::Corrupt(..)), "{what}: {error}");
         assert_eq!(
             fs::read(file_of(dir.path())).unwrap(),
             bytes,
@@ -388,7 +388,7 @@ fn d5_a_path_that_is_not_a_regular_file_is_corrupt() {
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir(file_of(dir.path())).unwrap();
     let error = open(dir.path()).expect_err("a directory does not open");
-    assert!(matches!(error, LedgerError::Corrupt(_)), "{error}");
+    assert!(matches!(error, LedgerError::Corrupt(..)), "{error}");
 }
 
 // D7

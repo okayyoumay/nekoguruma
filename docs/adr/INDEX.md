@@ -277,7 +277,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-285](ADR-285-launcher-checks-the-configuration-file.md) | The Launcher Checks the Worker's Configuration File Before Reading It | Accepted (the agent's installation file takes the same check with no leniency in user mode, ADR-494) | `vci-service-launcher`, `ngr-library-resolver`, `iso22900-service`, `j2534-0404-service`, design 7.2 |
 | [ADR-286](ADR-286-restart-identity-abort-is-journaled.md) | The Restart's Identity Abort Is Journaled as a Terminal Record | Accepted (Decision item 5's open point decided by ADR-290: the on-site endings after the resume count stay re-resumable within the resume limit) | `agent` journal, restart, runner; design 5.6 / 8.2.5 |
 | [ADR-287](ADR-287-the-step-limit-applies-per-run.md) | The Job's Step Limit Applies to Each Run | Accepted (the open consequence on a plain start after a step-limited run decided by ADR-288: the stop is journaled as terminal) | `agent` runner |
-| [ADR-288](ADR-288-a-stopped-run-is-journaled-as-terminal.md) | A Run Stopped on the Step Limit or a VM Error Is Journaled as a Terminal Record | Accepted (the state reported for a stopped run decided by ADR-475) | `agent` journal, restart, runner; `diag-ir` `VmError`; design 5.6 |
+| [ADR-288](ADR-288-a-stopped-run-is-journaled-as-terminal.md) | A Run Stopped on the Step Limit or a VM Error Is Journaled as a Terminal Record | Accepted (the state reported for a stopped run decided by ADR-475; `VmError`'s variants carry their cause as text and the journal's format version is 2 since ADR-510) | `agent` journal, restart, runner; `diag-ir` `VmError`; design 5.6 |
 | [ADR-289](ADR-289-a-lost-vci-ends-the-primitive-at-once.md) | A Lost VCI Ends the Pending Primitive at Once, as `HostError::VciLost` | Accepted (the consequence on a VCI lost between two primitives closed by ADR-294: the next request ends in `VciLost` too; item 2's events of an earlier primitive read and written to the communication log rather than dropped, though they still do not end the pending request, by ADR-346; item 4's run ended on a lost VCI continues within the run when the VCI comes back, by ADR-393) | `agent` host; design 5.6 / 8.2.5 |
 | [ADR-290](ADR-290-restart-on-site-endings-stay-re-resumable.md) | The Restart's On-Site Endings after the Resume Count Stay Re-Resumable | Accepted | `agent` restart; design 5.6 / 8.2.5 |
 | [ADR-291](ADR-291-recovery-required-sections-outside-the-plans-are-written-ahead.md) | A `RecoveryRequired` Section outside the Flash Recovery Plans Is Written Ahead | Accepted (the consequence on programs without a flash recovery plan superseded by ADR-293: such a program with a `RecoveryRequired` section keeps a journal) | `agent` journaling, restart; design 8.2.5 / 8.10.1 |
@@ -499,6 +499,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-507](ADR-507-the-windows-key-is-a-dpapi-blob-file-in-the-accounts-state-directory-created-once-and-tied-to-a-persistent-profile.md) | The Windows Key Is a DPAPI Blob File in the Account's State Directory, Created Once and Tied to a Persistent Profile | Accepted | design 6.4, `crates/agent` (`identity::blob_store`, `identity::dpapi`, store selection), `core-windows`; details ADR-459 item 4 and ADR-460 |
 | [ADR-508](ADR-508-an-operators-request-row-lets-a-communication-log-be-stored-and-the-agent-is-told-by-an-unsigned-control-message.md) | An Operator's Request Row Is What Lets a Communication Log Be Stored, and the Agent Is Told by an Unsigned Control Message | Accepted | design 4.3, 8.11, 13.4, 14.3, `crates/server` (`uploads`, `comm_log_requests`), `crates/agent`, `db/README.md`; details ADR-455; amends ADR-493 item 3's judgement of begin |
 | [ADR-509](ADR-509-dependencies-are-audited-with-cargo-deny-against-a-licence-allow-list-and-the-advisory-database.md) | Dependencies Are Audited With cargo-deny Against a Licence Allow-List and the Advisory Database | Accepted | `deny.toml`, `.github/workflows/ci.yml`, `CLAUDE.md`; `Cargo.toml` `license` keys |
+| [ADR-510](ADR-510-a-mapped-error-keeps-its-cause.md) | A Mapped Error Keeps Its Cause | Accepted | `Cargo.toml` lints; error types across the workspace; `CLAUDE.md` |
 
 ## Status Legend
 
@@ -782,6 +783,7 @@ the predecessor repository these ADRs came from.
 - ADR-354
 - ADR-355
 - ADR-359 (item 3 extended by ADR-437: a collecting request lists its rejected results among its answers, and its end is a rejected result only while no usable answer stands; item 3's "the request stays owed" amended by ADR-443: the primitive the VCI finished on a wrong echo counts as the VCI ending its wait, so its exchange is kept and the ECU's usable answer is its `late_response`; item 1's list item gains `late_response` and item 3's "counts for nothing else" revised by ADR-447: a wrong echo bound to a later primitive is first offered to the kept owed exchanges)
+- ADR-510
 
 ### Configuration & Deployment
 - ADR-024 (default `VCI_CONFIG_PATH` and the non-Windows root superseded by ADR-228)
@@ -986,7 +988,7 @@ the predecessor repository these ADRs came from.
 - ADR-280 (schema-compatibility consequence relaxed by ADR-281 item 4; the terminal-record rule extended to the restart's identity abort by ADR-286; the open consequence on the step limit and a VM error decided by ADR-288, which journals both as terminal; ADR-325 item 12 ends a job the same way on a lost access target; the state reported for a procedure failure decided by ADR-475)
 - ADR-286 (Decision item 5's open point decided by ADR-290: the on-site endings after the resume count stay re-resumable within the resume limit)
 - ADR-287 (the open consequence on a plain start after a step-limited run decided by ADR-288: the stop is journaled as terminal)
-- ADR-288 (the state reported for a stopped run decided by ADR-475)
+- ADR-288 (the state reported for a stopped run decided by ADR-475; `VmError`'s variants carry their cause as text and the journal's format version is 2 since ADR-510)
 - ADR-289 (the consequence on a VCI lost between two primitives closed by ADR-294: the next request ends in `VciLost` too; item 2's events of an earlier primitive read and written to the communication log rather than dropped, though they still do not end the pending request, by ADR-346; item 4's run ended on a lost VCI continues within the run when the VCI comes back, by ADR-393)
 - ADR-290
 - ADR-291 (the consequence on programs without a flash recovery plan superseded by ADR-293: such a program with a `RecoveryRequired` section keeps a journal)

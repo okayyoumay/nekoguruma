@@ -42,6 +42,9 @@ pub enum StoreError {
     Io(io::ErrorKind),
     #[error("a cached object's name is not a regular file")]
     NotRegular,
+    /// The random source gave nothing for a temporary file's name.
+    #[error("the object cache cannot name a temporary file")]
+    Random(#[source] shared_crypto::RandomError),
 }
 
 impl From<io::Error> for StoreError {
@@ -192,7 +195,7 @@ impl ObjectStore {
     /// A new file under `tmp/` (created with `create_new`, owner-only) and its guard.
     pub(crate) fn begin(&self) -> Result<(Tmp, Sink), StoreError> {
         let name = shared_crypto::random_32()
-            .map_err(|_| StoreError::Io(io::ErrorKind::Other))
+            .map_err(StoreError::Random)
             .map(|bytes| hex(&bytes))?;
         let path = self.root.join(TMP_DIR).join(name);
         let file = create_private(&path)?;

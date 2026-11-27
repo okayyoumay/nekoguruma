@@ -811,7 +811,8 @@ impl Inner {
         // The deadline's bounds are judged against the database's time of the permission read,
         // after the permission and before the key (ADR-487): a refused caller learns nothing
         // about them.
-        let now_ms = u64::try_from(now_ms).map_err(|_| JobError::Internal("clock".to_owned()))?;
+        let now_ms =
+            u64::try_from(now_ms).map_err(|e| JobError::Internal(format!("clock: {e}")))?;
         let issued_at = now_ms / 1000;
         if !deadline_in_bounds(spec.start_deadline, issued_at) {
             return Ok(Outcome::DeadlineOutOfBounds);

@@ -108,7 +108,7 @@ fn store_failure(d: &Downloads, error: &StoreError) -> Response {
         &error.to_string(),
     );
     match error {
-        StoreError::Random => internal(),
+        StoreError::Random(_) => internal(),
         _ => no_store(),
     }
 }

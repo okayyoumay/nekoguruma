@@ -30,7 +30,7 @@ use worker_host::service::OperatingMode;
 use crate::state::StateDirError;
 
 /// The journal format this build writes and reads.
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 /// The longest procedure failure code a journal record holds, in bytes: the longest code
 /// `Program::validate` accepts (ADR-280).
 pub const MAX_FAILURE_CODE_LEN: usize = diag_ir::MAX_FAILURE_CODE_LEN;
@@ -677,12 +677,24 @@ pub enum JournalError {
     UnsupportedVersion(u32),
     #[error("the journal belongs to another job or generation")]
     WrongJob,
+    /// `source` is the decoder's error when a header or record did not decode.
     #[error("the journal is corrupt at byte {offset}: {reason}")]
-    Corrupt { offset: u64, reason: &'static str },
+    Corrupt {
+        offset: u64,
+        reason: &'static str,
+        #[source]
+        source: Option<postcard::Error>,
+    },
     #[error("the record does not fit the journal: {0}")]
     Invariant(&'static str),
     #[error("the record is larger than a journal frame")]
     TooLarge,
+    /// The record could not be encoded.
+    #[error("the record cannot be encoded")]
+    Unencodable(#[source] postcard::Error),
+    /// A block count does not fit the journal's range.
+    #[error("the record does not fit the journal: the block count is beyond the journal's range")]
+    BlockCount(#[source] std::num::TryFromIntError),
     /// Another `Journal` of this job and generation is open for writing, in this process or
     /// another (ADR-255).
     #[error("the journal is open for writing elsewhere")]
@@ -1454,8 +1466,8 @@ fn unix_ms() -> u64 {
         .map_or(0, |elapsed| elapsed.as_millis() as u64)
 }
 
-fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, JournalError> {
-    postcard::to_allocvec(value).map_err(|_| JournalError::TooLarge)
+pub(crate) fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, JournalError> {
+    postcard::to_allocvec(value).map_err(JournalError::Unencodable)
 }
 
 pub(crate) fn push_frame(out: &mut Vec<u8>, payload: &[u8]) -> Result<(), JournalError> {
@@ -1515,6 +1527,7 @@ fn load(bytes: &[u8], key: &JobKey) -> Result<Loaded, JournalError> {
     let corrupt = |offset: usize, reason| JournalError::Corrupt {
         offset: offset as u64,
         reason,
+        source: None,
     };
     if bytes.len() < PREAMBLE || bytes[..MAGIC.len()] != MAGIC {
         return Err(corrupt(0, "not a journal"));
@@ -1527,8 +1540,11 @@ fn load(bytes: &[u8], key: &JobKey) -> Result<Loaded, JournalError> {
     let FrameRead::Ok { payload, next } = read_frame(bytes, PREAMBLE) else {
         return Err(corrupt(PREAMBLE, "the header does not read back"));
     };
-    let header: Header = postcard::from_bytes(payload)
-        .map_err(|_| corrupt(PREAMBLE, "the header does not decode"))?;
+    let header: Header = postcard::from_bytes(payload).map_err(|source| JournalError::Corrupt {
+        offset: PREAMBLE as u64,
+        reason: "the header does not decode",
+        source: Some(source),
+    })?;
     if header.key != *key {
         return Err(JournalError::WrongJob);
     }
@@ -1558,8 +1574,12 @@ fn load(bytes: &[u8], key: &JobKey) -> Result<Loaded, JournalError> {
             FrameRead::Torn => return Err(corrupt(offset, "a record does not read back")),
             FrameRead::Bad => return Err(corrupt(offset, "a record fails its checksum")),
         };
-        let entry: Entry = postcard::from_bytes(payload)
-            .map_err(|_| corrupt(offset, "a record does not decode"))?;
+        let entry: Entry =
+            postcard::from_bytes(payload).map_err(|source| JournalError::Corrupt {
+                offset: offset as u64,
+                reason: "a record does not decode",
+                source: Some(source),
+            })?;
         if entry.seq != state.records {
             return Err(corrupt(offset, "a record is out of sequence"));
         }
@@ -2236,11 +2256,11 @@ mod tests {
         ));
 
         let mut newer = good.clone();
-        newer[MAGIC.len()..PREAMBLE].copy_from_slice(&2u32.to_le_bytes());
+        newer[MAGIC.len()..PREAMBLE].copy_from_slice(&(FORMAT_VERSION + 1).to_le_bytes());
         fs::write(path(&dir), &newer).expect("write");
         assert!(matches!(
             Journal::open(&dir.0, &key()),
-            Err(JournalError::UnsupportedVersion(2))
+            Err(JournalError::UnsupportedVersion(v)) if v == FORMAT_VERSION + 1
         ));
 
         let mut foreign = good.clone();
@@ -3771,10 +3791,16 @@ mod tests {
             VmError::DivisionByZero,
             VmError::ShiftOutOfRange(0),
             VmError::BadConstant(0),
-            VmError::InvalidUtf8(0),
+            VmError::InvalidUtf8 {
+                constant: 0,
+                cause: String::new(),
+            },
             VmError::UndefinedVariable(0),
             VmError::IndexOutOfRange(0),
-            VmError::ByteOutOfRange(0),
+            VmError::ByteOutOfRange {
+                value: 0,
+                cause: String::new(),
+            },
             VmError::BytesTooLong(0),
             VmError::FloatNotConvertible,
             VmError::NoDeclarations,
@@ -3786,9 +3812,15 @@ mod tests {
                 service: 0,
                 field: 0,
             },
-            VmError::Undecodable { service: 0 },
+            VmError::Undecodable {
+                service: 0,
+                cause: String::new(),
+            },
             VmError::UnknownService { service: 0 },
-            VmError::WaitOutOfRange(0),
+            VmError::WaitOutOfRange {
+                millis: 0,
+                cause: String::new(),
+            },
             VmError::UnknownFlashSession { session: 0 },
             VmError::UnknownFlashSegment {
                 session: 0,
@@ -3802,6 +3834,7 @@ mod tests {
                 session: 0,
                 segment: 0,
                 index: 0,
+                cause: None,
             },
             VmError::ArtifactLength {
                 expected: 0,
@@ -3810,6 +3843,9 @@ mod tests {
             VmError::BadHmiForm(0),
             VmError::HmiFormTooLong(0),
             VmError::BadTarget(0),
+            VmError::UnsignedOutOfRange {
+                cause: String::new(),
+            },
         ];
         // The match fails to compile when a variant is added, so the list above stays complete.
         for error in &errors {
@@ -3828,10 +3864,10 @@ mod tests {
                 | VmError::DivisionByZero
                 | VmError::ShiftOutOfRange(_)
                 | VmError::BadConstant(_)
-                | VmError::InvalidUtf8(_)
+                | VmError::InvalidUtf8 { .. }
                 | VmError::UndefinedVariable(_)
                 | VmError::IndexOutOfRange(_)
-                | VmError::ByteOutOfRange(_)
+                | VmError::ByteOutOfRange { .. }
                 | VmError::BytesTooLong(_)
                 | VmError::FloatNotConvertible
                 | VmError::NoDeclarations
@@ -3839,7 +3875,7 @@ mod tests {
                 | VmError::ShapedField { .. }
                 | VmError::Undecodable { .. }
                 | VmError::UnknownService { .. }
-                | VmError::WaitOutOfRange(_)
+                | VmError::WaitOutOfRange { .. }
                 | VmError::UnknownFlashSession { .. }
                 | VmError::UnknownFlashSegment { .. }
                 | VmError::ZeroBlockSize { .. }
@@ -3847,7 +3883,8 @@ mod tests {
                 | VmError::ArtifactLength { .. }
                 | VmError::BadHmiForm(_)
                 | VmError::HmiFormTooLong(_)
-                | VmError::BadTarget(_) => {}
+                | VmError::BadTarget(_)
+                | VmError::UnsignedOutOfRange { .. } => {}
             }
         }
         let encoded = |reason: RunStop| {
@@ -4099,11 +4136,11 @@ mod tests {
         }
     }
 
-    /// The two kinds keep their variant index in the encoding, and the format version is
-    /// unchanged by the record (ADR-485 item 2).
+    /// The two kinds keep their variant index in the encoding, and the record does not change
+    /// the format version (ADR-485 item 2).
     #[test]
     fn the_job_content_keeps_its_encoding_and_the_format_version() {
-        assert_eq!(FORMAT_VERSION, 1);
+        assert_eq!(FORMAT_VERSION, 2);
         let document = postcard::to_allocvec(&JobContent::Document([3; 32])).expect("encode");
         let program = postcard::to_allocvec(&JobContent::Program([3; 32])).expect("encode");
         assert_eq!((document[0], program[0]), (0, 1));

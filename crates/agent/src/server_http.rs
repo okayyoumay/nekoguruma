@@ -104,15 +104,26 @@ pub enum ReplyBody {
 }
 
 /// Why no answer came back.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error)]
 pub enum PostError {
     /// The connection was refused or the address is unreachable: nothing was sent.
+    #[error("the connection failed ({0:?}); nothing was sent")]
     NotSent(std::io::ErrorKind),
     /// The connect did not finish in time: nothing was sent.
+    #[error("the connect timed out; nothing was sent")]
     ConnectTimeout,
     /// The request may have been sent and no complete answer came: a time out, a reset, a head
-    /// over the limits, an answer that is not HTTP, or a body that is late.
-    Unknown,
+    /// over the limits, an answer that is not HTTP, or a body that is late. The source is the
+    /// failure the HTTP client reported, when there was one.
+    #[error("no complete answer came; the request may have been sent")]
+    Unknown(#[source] Option<Box<dyn std::error::Error + Send + Sync>>),
+}
+
+impl PostError {
+    /// [`PostError::Unknown`] caused by `source`.
+    fn unknown(source: impl std::error::Error + Send + Sync + 'static) -> Self {
+        PostError::Unknown(Some(Box::new(source)))
+    }
 }
 
 /// Aborts the connection's task when the call ends, however it ends.
@@ -158,7 +169,7 @@ where
 {
     tokio::time::timeout_at(deadline, exchange(stream, request, body_statuses))
         .await
-        .unwrap_or(Err(PostError::Unknown))
+        .unwrap_or(Err(PostError::Unknown(None)))
 }
 
 /// The usable value of a `Retry-After` header: digits only, from 1 to 60 seconds (the range the
@@ -190,7 +201,7 @@ where
         .max_headers(MAX_HEADERS)
         .handshake::<_, Full<Bytes>>(TokioIo::new(stream))
         .await
-        .map_err(|_| PostError::Unknown)?;
+        .map_err(PostError::unknown)?;
     let _driver = Driver(tokio::spawn(async move {
         let _ = connection.await;
     }));
@@ -201,11 +212,11 @@ where
         .header(CONNECTION, "close")
         .header(CONTENT_TYPE, "application/json")
         .body(Full::new(Bytes::from(request.body.clone())))
-        .map_err(|_| PostError::Unknown)?;
+        .map_err(PostError::unknown)?;
     let response = sender
         .send_request(http_request)
         .await
-        .map_err(|_| PostError::Unknown)?;
+        .map_err(PostError::unknown)?;
     let status = response.status().as_u16();
     let headers = response.headers();
     let retry_after = single_text(headers, &RETRY_AFTER);
@@ -460,7 +471,10 @@ mod tests {
         });
         for port in [slow, endless] {
             let started = std::time::Instant::now();
-            assert_eq!(run(port, 201, timeouts).unwrap_err(), PostError::Unknown);
+            assert!(matches!(
+                run(port, 201, timeouts).unwrap_err(),
+                PostError::Unknown(None)
+            ));
             assert!(started.elapsed() < Duration::from_secs(2));
         }
     }
@@ -552,26 +566,29 @@ mod tests {
             connect: Duration::from_secs(5),
             total: Duration::from_millis(300),
         };
-        assert_eq!(run(port, 201, timeouts).unwrap_err(), PostError::Unknown);
+        assert!(matches!(
+            run(port, 201, timeouts).unwrap_err(),
+            PostError::Unknown(None)
+        ));
     }
 
     #[test]
     fn a_reset_a_big_head_and_a_non_http_answer_are_unknown() {
         let reset = stub(drop);
-        assert_eq!(
+        assert!(matches!(
             run(reset, 201, Timeouts::default()).unwrap_err(),
-            PostError::Unknown
-        );
+            PostError::Unknown(Some(_))
+        ));
         let big = stub(|mut s| {
             let mut head = b"HTTP/1.1 403 Forbidden\r\nX-Pad: ".to_vec();
             head.extend(std::iter::repeat_n(b'a', MAX_HEAD + 100));
             head.extend_from_slice(b"\r\n\r\n");
             let _ = s.write_all(&head);
         });
-        assert_eq!(
+        assert!(matches!(
             run(big, 201, Timeouts::default()).unwrap_err(),
-            PostError::Unknown
-        );
+            PostError::Unknown(Some(_))
+        ));
         let many = stub(|mut s| {
             let mut head = b"HTTP/1.1 403 Forbidden\r\n".to_vec();
             for i in 0..=MAX_HEADERS {
@@ -580,16 +597,16 @@ mod tests {
             head.extend_from_slice(b"\r\n");
             let _ = s.write_all(&head);
         });
-        assert_eq!(
+        assert!(matches!(
             run(many, 201, Timeouts::default()).unwrap_err(),
-            PostError::Unknown
-        );
+            PostError::Unknown(Some(_))
+        ));
         let not_http = stub(|mut s| {
             let _ = s.write_all(b"SSH-2.0-OpenSSH_9.6\r\n\r\n");
         });
-        assert_eq!(
+        assert!(matches!(
             run(not_http, 201, Timeouts::default()).unwrap_err(),
-            PostError::Unknown
-        );
+            PostError::Unknown(Some(_))
+        ));
     }
 }

@@ -175,6 +175,10 @@ fn root_description_file_path(mode: RegistryViewMode) -> Result<PathBuf, Registr
     ))
 }
 
+#[expect(
+    clippy::map_err_ignore,
+    reason = "`Url::to_file_path` fails with the unit type, which holds no cause to keep"
+)]
 fn uri_to_path(uri: &str) -> Result<PathBuf, RegistryError> {
     let parsed = Url::parse(uri)?;
     if parsed.scheme() != "file" {

@@ -199,12 +199,12 @@ fn dry_run_verdict(
 ) -> Result<(), StarError> {
     let reason = match &report.end {
         DryRunEnd::Finished | DryRunEnd::Failed(_) => return Ok(()),
-        DryRunEnd::Vm(VmError::Undecodable { service })
+        DryRunEnd::Vm(VmError::Undecodable { service, .. })
             if built_answer_undecodable(variant, report, *service) =>
         {
             return Ok(());
         }
-        DryRunEnd::Vm(VmError::Undecodable { service }) => {
+        DryRunEnd::Vm(VmError::Undecodable { service, .. }) => {
             let name = variant
                 .services()
                 .and_then(|services| services.iter().find(|s| s.id() == *service))

@@ -77,7 +77,7 @@ impl Iso22900Service {
     ) -> Result<Response<ObjectIdResponse>, Status> {
         let request = request.into_inner();
         let object_type = match ObjectType::try_from(request.object_type)
-            .map_err(|_| Status::invalid_argument("object_type is invalid"))?
+            .map_err(|e| Status::invalid_argument(format!("object_type is invalid: {e}")))?
         {
             ObjectType::ObjtProtocol => E_PDU_OBJT::PDU_OBJT_PROTOCOL,
             ObjectType::ObjtBustype => E_PDU_OBJT::PDU_OBJT_BUSTYPE,

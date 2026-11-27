@@ -59,6 +59,9 @@ use crate::config::is_valid_bucket;
 use crate::object_server::Credentials;
 use xml::ErrorCode;
 
+/// The error behind a [`StoreError`] that the store keeps as its source.
+type Cause = Box<dyn std::error::Error + Send + Sync>;
+
 /// The region the requests are signed for (the object server's default).
 const REGION: &str = "us-east-1";
 /// The most rounds of listing and aborting a delete makes before it deletes the object.
@@ -195,18 +198,20 @@ impl Inner {
         if !is_valid_bucket(bucket) {
             return Err(StoreError::Refused {
                 op: "use the bucket name",
+                source: None,
             });
         }
-        let endpoint: Url =
-            format!("https://127.0.0.1:{port}")
-                .parse()
-                .map_err(|_| StoreError::Refused {
-                    op: "build the endpoint",
-                })?;
+        let endpoint: Url = format!("https://127.0.0.1:{port}")
+            .parse()
+            .map_err(|error| StoreError::Refused {
+                op: "build the endpoint",
+                source: Some(Box::new(error)),
+            })?;
         let bucket =
-            Bucket::new(endpoint, UrlStyle::Path, bucket.to_owned(), REGION).map_err(|_| {
+            Bucket::new(endpoint, UrlStyle::Path, bucket.to_owned(), REGION).map_err(|error| {
                 StoreError::Refused {
                     op: "build the bucket's URL",
+                    source: Some(Box::new(error)),
                 }
             })?;
         Ok(Inner {
@@ -256,9 +261,10 @@ impl Inner {
         };
         tokio::time::timeout(self.tuning.request_timeout, work)
             .await
-            .map_err(|_| StoreError::Io {
+            .map_err(|error| StoreError::Io {
                 op,
                 kind: std::io::ErrorKind::TimedOut,
+                source: Some(Box::new(error)),
             })?
     }
 
@@ -291,8 +297,12 @@ impl Inner {
     /// status.
     fn unexpected(op: &'static str, status: u16) -> StoreError {
         match status {
-            401 | 403 => StoreError::Refused { op },
-            _ => StoreError::Server { op, status },
+            401 | 403 => StoreError::Refused { op, source: None },
+            _ => StoreError::Server {
+                op,
+                status,
+                source: None,
+            },
         }
     }
 
@@ -308,6 +318,7 @@ impl Inner {
         let mut last = StoreError::Io {
             op: "reach the object server",
             kind: std::io::ErrorKind::TimedOut,
+            source: None,
         };
         loop {
             match tokio::time::timeout_at(deadline, self.ensure_bucket()).await {
@@ -350,7 +361,10 @@ impl Inner {
             200 => Ok(()),
             // Another start made it between the check and the create.
             409 if xml::error_code(&reply.body) == ErrorCode::BucketAlreadyOwnedByYou => Ok(()),
-            409 => Err(StoreError::Refused { op: OP }),
+            409 => Err(StoreError::Refused {
+                op: OP,
+                source: None,
+            }),
             status => Err(Inner::unexpected(OP, status)),
         }
     }
@@ -368,16 +382,18 @@ impl Inner {
         if reply.status != 200 {
             return Err(Inner::unexpected(OP, reply.status));
         }
-        let bad = || StoreError::Server {
+        let bad = |source: Option<Cause>| StoreError::Server {
             op: OP,
             status: reply.status,
+            source,
         };
-        let text = std::str::from_utf8(&reply.body).map_err(|_| bad())?;
+        let text = std::str::from_utf8(&reply.body).map_err(|error| bad(Some(Box::new(error))))?;
         if reply.truncated {
-            return Err(bad());
+            return Err(bad(None));
         }
-        let parsed = CreateMultipartUpload::parse_response(text).map_err(|_| bad())?;
-        let id = UploadId::parse(parsed.upload_id()).map_err(|_| bad())?;
+        let parsed = CreateMultipartUpload::parse_response(text)
+            .map_err(|error| bad(Some(Box::new(error))))?;
+        let id = UploadId::parse(parsed.upload_id()).map_err(|error| bad(Some(Box::new(error))))?;
         Ok(Upload { key, id })
     }
 
@@ -465,22 +481,25 @@ impl Inner {
                 }
                 status => return Err(Inner::unexpected(OP, status)),
             }
-            let bad = || StoreError::Server {
+            let bad = |source: Option<Cause>| StoreError::Server {
                 op: OP,
                 status: 200,
+                source,
             };
             if reply.truncated {
-                return Err(bad());
+                return Err(bad(None));
             }
-            let text = std::str::from_utf8(&reply.body).map_err(|_| bad())?;
-            let page = ListParts::parse_response(text).map_err(|_| bad())?;
+            let text =
+                std::str::from_utf8(&reply.body).map_err(|error| bad(Some(Box::new(error))))?;
+            let page =
+                ListParts::parse_response(text).map_err(|error| bad(Some(Box::new(error))))?;
             for part in page.parts {
                 let ascending = parts.last().is_none_or(|last| part.number > last.number);
                 if !(1..=MAX_PARTS).contains(&part.number)
                     || !ascending
                     || parts.len() >= usize::from(MAX_PARTS)
                 {
-                    return Err(StoreError::PartsChanged);
+                    return Err(StoreError::PartsChanged { source: None });
                 }
                 parts.push(RawPart {
                     number: part.number,
@@ -494,7 +513,7 @@ impl Inner {
                     // The marker is the last part listed; one that does not move past the
                     // previous marker would repeat a page for ever.
                     if marker.is_some_and(|previous| next <= previous) {
-                        return Err(StoreError::PartsChanged);
+                        return Err(StoreError::PartsChanged { source: None });
                     }
                     marker = Some(next);
                 }
@@ -503,6 +522,7 @@ impl Inner {
         Err(StoreError::Server {
             op: OP,
             status: 200,
+            source: None,
         })
     }
 
@@ -548,10 +568,12 @@ impl Inner {
             return Err(StoreError::NoParts);
         }
         if parts.len() > usize::from(MAX_PARTS) {
-            return Err(StoreError::PartsChanged);
+            return Err(StoreError::PartsChanged { source: None });
         }
         for (index, part) in parts.iter().enumerate() {
-            let expected = u16::try_from(index + 1).map_err(|_| StoreError::PartsChanged)?;
+            let expected = u16::try_from(index + 1).map_err(|error| StoreError::PartsChanged {
+                source: Some(error),
+            })?;
             if part.number != expected {
                 return Err(StoreError::MissingPart { part: expected });
             }
@@ -629,17 +651,18 @@ impl Inner {
                 if text.is_some_and(|text| CompleteMultipartUploadResponse::parse(text).is_ok()) {
                     Ok(true)
                 } else if xml::error_code(&reply.body) == ErrorCode::InvalidPart {
-                    Err(StoreError::PartsChanged)
+                    Err(StoreError::PartsChanged { source: None })
                 } else {
                     Err(StoreError::Server {
                         op: OP,
                         status: 200,
+                        source: None,
                     })
                 }
             }
             404 if xml::error_code(&reply.body) == ErrorCode::NoSuchUpload => Ok(false),
             400 if xml::error_code(&reply.body) == ErrorCode::InvalidPart => {
-                Err(StoreError::PartsChanged)
+                Err(StoreError::PartsChanged { source: None })
             }
             status => Err(Inner::unexpected(OP, status)),
         }
@@ -671,6 +694,7 @@ impl Inner {
                         .map_err(|error| StoreError::Io {
                             op: "read the object back",
                             kind: error.kind(),
+                            source: Some(Box::new(error)),
                         })?;
                     if n == 0 {
                         break;
@@ -710,9 +734,10 @@ impl Inner {
         let sending = self.client.send(OP, Method::GET, &url, None);
         let response = tokio::time::timeout(self.tuning.request_timeout, sending)
             .await
-            .map_err(|_| StoreError::Io {
+            .map_err(|error| StoreError::Io {
                 op: OP,
                 kind: std::io::ErrorKind::TimedOut,
+                source: Some(Box::new(error)),
             })??;
         match response.status {
             200 => {}
@@ -729,11 +754,13 @@ impl Inner {
                     Ok(Ok(_)) => Err(StoreError::Server {
                         op: OP,
                         status: 404,
+                        source: None,
                     }),
                     Ok(Err(error)) => Err(error),
-                    Err(_) => Err(StoreError::Io {
+                    Err(error) => Err(StoreError::Io {
                         op: OP,
                         kind: std::io::ErrorKind::TimedOut,
+                        source: Some(Box::new(error)),
                     }),
                 };
             }
@@ -742,6 +769,7 @@ impl Inner {
         let length = response.content_length().ok_or(StoreError::Server {
             op: OP,
             status: 200,
+            source: None,
         })?;
         Ok(ObjectBody {
             length,
@@ -831,7 +859,11 @@ impl Inner {
         prefix: Option<&str>,
     ) -> Result<(Vec<ListedUpload>, usize), StoreError> {
         const OP: &str = "list the uploads";
-        let bad = |status| StoreError::Server { op: OP, status };
+        let bad = |status, source: Option<Cause>| StoreError::Server {
+            op: OP,
+            status,
+            source,
+        };
         let max_uploads = self.tuning.page_size.to_string();
         let mut found = Vec::new();
         let mut skipped = 0usize;
@@ -868,10 +900,11 @@ impl Inner {
                 return Err(Inner::unexpected(OP, reply.status));
             }
             if reply.truncated {
-                return Err(bad(200));
+                return Err(bad(200, None));
             }
-            let text = std::str::from_utf8(&reply.body).map_err(|_| bad(200))?;
-            let page = xml::parse_uploads(text).ok_or_else(|| bad(200))?;
+            let text = std::str::from_utf8(&reply.body)
+                .map_err(|error| bad(200, Some(Box::new(error))))?;
+            let page = xml::parse_uploads(text).ok_or_else(|| bad(200, None))?;
             for entry in page.uploads {
                 let initiated = entry.initiated.parse::<Timestamp>().ok();
                 let key = ObjectKey::parse(&entry.key).ok();
@@ -891,19 +924,19 @@ impl Inner {
             let next_key = page.next_key_marker.filter(|key| !key.is_empty());
             let next_id = page.next_upload_id_marker.unwrap_or_default();
             let Some(next_key) = next_key else {
-                return Err(bad(200));
+                return Err(bad(200, None));
             };
             if next_key.len() > MAX_MARKER_LEN || next_id.len() > MAX_UPLOAD_ID_LEN {
-                return Err(bad(200));
+                return Err(bad(200, None));
             }
             let next = (next_key, next_id);
             // A marker that does not move would repeat a page for ever.
             if markers.as_ref() == Some(&next) {
-                return Err(bad(200));
+                return Err(bad(200, None));
             }
             markers = Some(next);
         }
-        Err(bad(200))
+        Err(bad(200, None))
     }
 }
 

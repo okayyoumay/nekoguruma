@@ -1317,9 +1317,11 @@ async fn commands_reach_the_agent_in_order_and_the_size_and_presence_errors_are_
     let u = Up::new().await;
     let t = token(&u).await;
     let agent = agent_id(&u);
-    assert_eq!(
-        u.hub.send_job_command(&agent, "x".to_owned()),
-        Err(SendError::NotConnected),
+    assert!(
+        matches!(
+            u.hub.send_job_command(&agent, "x".to_owned()),
+            Err(SendError::NotConnected)
+        ),
         "D2: nobody connected"
     );
     let mut client = open(u.s.addr, &t).await;
@@ -1333,11 +1335,11 @@ async fn commands_reach_the_agent_in_order_and_the_size_and_presence_errors_are_
     .len();
     let limit = 128 * 1024;
     // `c-1` went to the call with nobody connected and `c-2` to this refusal.
-    assert_eq!(
+    assert!(matches!(
         u.hub
             .send_job_command(&agent, "x".repeat(limit - overhead + 1)),
-        Err(SendError::TooLarge)
-    );
+        Err(SendError::TooLarge { .. })
+    ));
     let exact = "x".repeat(limit - overhead);
     let delivery: Delivery = u.hub.send_job_command(&agent, exact.clone()).unwrap();
     assert_eq!(delivery.command_id, "c-3");
@@ -1370,10 +1372,10 @@ async fn commands_reach_the_agent_in_order_and_the_size_and_presence_errors_are_
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    assert_eq!(
+    assert!(matches!(
         u.hub.send_job_command(&agent, "x".to_owned()),
         Err(SendError::NotConnected)
-    );
+    ));
     u.finish().await;
 }
 

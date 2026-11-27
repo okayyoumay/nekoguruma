@@ -221,9 +221,9 @@ pub(super) async fn install_client_message_filters(
     let install_result: Result<(), InstallFilterFailure> = (|| {
         for filter in filters {
             let filter_type = vci_service_interface::PduFilter::try_from(filter.filter_type)
-                .map_err(|_| {
+                .map_err(|e| {
                     InstallFilterFailure::Status(Status::invalid_argument(format!(
-                        "unrecognized PDU_FLT filter_type {}",
+                        "unrecognized PDU_FLT filter_type {}: {e}",
                         filter.filter_type
                     )))
                 })?;

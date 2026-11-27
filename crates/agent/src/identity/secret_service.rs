@@ -14,8 +14,9 @@
 //!
 //! The session algorithm is `plain`: the key crosses the bus unencrypted, which the bus's
 //! same-account trust allows (the account's own processes can read the key from the unlocked
-//! collection anyway). Error sources are fixed strings, never the daemon's text, which may echo
-//! what the call carried.
+//! collection anyway). The reason of a failed call is a fixed string with no source, never the
+//! daemon's text, which may echo what the call carried; only a failure to open the session bus
+//! keeps its cause.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -43,8 +44,42 @@ const CONTENT_TYPE: &str = "application/octet-stream";
 /// How long one method call may take before it counts as unanswered.
 const CALL_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Why a call failed, in words fixed in this file.
-type Reason = &'static str;
+/// Why a call failed: words fixed in this file, and the error that led to it when there is one.
+#[derive(Debug)]
+struct Reason {
+    text: &'static str,
+    source: Option<Box<dyn std::error::Error + Send + Sync>>,
+}
+
+impl Reason {
+    fn caused_by(
+        text: &'static str,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            text,
+            source: Some(Box::new(source)),
+        }
+    }
+}
+
+impl From<&'static str> for Reason {
+    fn from(text: &'static str) -> Self {
+        Self { text, source: None }
+    }
+}
+
+impl std::fmt::Display for Reason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.text)
+    }
+}
+
+impl std::error::Error for Reason {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.as_deref().map(|source| source as _)
+    }
+}
 
 /// What a search found: the item paths, split by their collection's lock state.
 #[derive(Debug, Default)]
@@ -97,8 +132,8 @@ trait Transport {
     ) -> Result<Created, Reason>;
 }
 
-fn unavailable(reason: Reason) -> StoreError {
-    StoreError::with_source(StoreErrorKind::Unavailable, reason)
+fn unavailable(reason: impl Into<Reason>) -> StoreError {
+    StoreError::with_source(StoreErrorKind::Unavailable, reason.into())
 }
 
 /// Opens a `plain` session and checks the answer is one.
@@ -237,7 +272,7 @@ impl DbusTransport {
             Builder::session().method_timeout(CALL_TIMEOUT).build(),
         ))
         .ok_or("no answer in time")?
-        .map_err(|_| "no session bus")?;
+        .map_err(|error| Reason::caused_by("no session bus", error))?;
         Ok(Self {
             connection: Some(connection),
         })
@@ -266,7 +301,7 @@ impl DbusTransport {
                 .await?;
             reply.body().deserialize::<R>()
         })
-        .map_err(|error| reason(&error))
+        .map_err(|error| Reason::from(reason(&error)))
     }
 }
 
@@ -351,7 +386,7 @@ impl Drop for DbusTransport {
 }
 
 /// The fixed reason for a failed call. The daemon's own text is dropped.
-fn reason(error: &zbus::Error) -> Reason {
+fn reason(error: &zbus::Error) -> &'static str {
     use zbus::fdo::Error as Fdo;
     match error {
         zbus::Error::FDO(fdo) => match &**fdo {
@@ -404,6 +439,10 @@ impl Transport for DbusTransport {
         Ok((path.as_str() != "/").then(|| path.as_str().to_owned()))
     }
 
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "the Secret Service daemon's error text may repeat the secret the call carried"
+    )]
     fn collection_locked(&self, collection: &str) -> Result<bool, Reason> {
         let (value,): (zbus::OwnedVariant,) = self.call(
             collection,
@@ -411,7 +450,7 @@ impl Transport for DbusTransport {
             "Get",
             &(COLLECTION_IFACE, "Locked"),
         )?;
-        bool::try_from(value).map_err(|_| "Secret Service call failed")
+        bool::try_from(value).map_err(|_| Reason::from("Secret Service call failed"))
     }
 
     fn open_session(&self) -> Result<SessionReply, Reason> {
@@ -427,8 +466,13 @@ impl Transport for DbusTransport {
         })
     }
 
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "the Secret Service daemon's error text may repeat the secret the call carried"
+    )]
     fn get_secret(&self, item: &str, session: &str) -> Result<SecretReply, Reason> {
-        let session = zbus::ObjectPath::try_from(session).map_err(|_| "bad session")?;
+        let session =
+            zbus::ObjectPath::try_from(session).map_err(|_| Reason::from("bad session"))?;
         let ((reply_session, parameters, value, _content_type),): ((
             OwnedObjectPath,
             Vec<u8>,
@@ -442,6 +486,10 @@ impl Transport for DbusTransport {
         })
     }
 
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "the Secret Service daemon's error text may repeat the secret the call carried"
+    )]
     fn create_item(
         &self,
         collection: &str,
@@ -449,7 +497,8 @@ impl Transport for DbusTransport {
         name: &SecretName,
         secret: &[u8],
     ) -> Result<Created, Reason> {
-        let session = zbus::ObjectPath::try_from(session).map_err(|_| "bad session")?;
+        let session =
+            zbus::ObjectPath::try_from(session).map_err(|_| Reason::from("bad session"))?;
         let properties: HashMap<&str, Variant> = HashMap::from([
             ("org.freedesktop.Secret.Item.Label", Variant::from(LABEL)),
             (
@@ -481,14 +530,14 @@ mod tests {
     /// A scripted transport: each field is the answer of its call, and `calls` records the
     /// calls made.
     struct Fake {
-        search: Result<(Vec<&'static str>, Vec<&'static str>), Reason>,
-        default: Result<Option<&'static str>, Reason>,
-        locked: Result<bool, Reason>,
-        session: Result<&'static str, Reason>,
+        search: Result<(Vec<&'static str>, Vec<&'static str>), &'static str>,
+        default: Result<Option<&'static str>, &'static str>,
+        locked: Result<bool, &'static str>,
+        session: Result<&'static str, &'static str>,
         session_output_empty: bool,
         reply_session: &'static str,
-        secret: Result<(Vec<u8>, Vec<u8>), Reason>,
-        create: Result<Created, Reason>,
+        secret: Result<(Vec<u8>, Vec<u8>), &'static str>,
+        create: Result<Created, &'static str>,
         calls: RefCell<Vec<&'static str>>,
     }
 
@@ -523,37 +572,47 @@ mod tests {
     impl Transport for Fake {
         fn search(&self, _: &SecretName) -> Result<Found, Reason> {
             self.calls.borrow_mut().push("search");
-            self.search.clone().map(|(unlocked, locked)| Found {
-                unlocked: unlocked.iter().map(|p| p.to_string()).collect(),
-                locked: locked.iter().map(|p| p.to_string()).collect(),
-            })
+            self.search
+                .clone()
+                .map(|(unlocked, locked)| Found {
+                    unlocked: unlocked.iter().map(|p| p.to_string()).collect(),
+                    locked: locked.iter().map(|p| p.to_string()).collect(),
+                })
+                .map_err(Reason::from)
         }
 
         fn default_collection(&self) -> Result<Option<String>, Reason> {
             self.calls.borrow_mut().push("default");
-            self.default.map(|path| path.map(str::to_owned))
+            self.default
+                .map(|path| path.map(str::to_owned))
+                .map_err(Reason::from)
         }
 
         fn collection_locked(&self, _: &str) -> Result<bool, Reason> {
             self.calls.borrow_mut().push("locked");
-            self.locked
+            self.locked.map_err(Reason::from)
         }
 
         fn open_session(&self) -> Result<SessionReply, Reason> {
             self.calls.borrow_mut().push("session");
-            self.session.map(|path| SessionReply {
-                output_empty: self.session_output_empty,
-                path: path.to_owned(),
-            })
+            self.session
+                .map(|path| SessionReply {
+                    output_empty: self.session_output_empty,
+                    path: path.to_owned(),
+                })
+                .map_err(Reason::from)
         }
 
         fn get_secret(&self, _: &str, _: &str) -> Result<SecretReply, Reason> {
             self.calls.borrow_mut().push("get_secret");
-            self.secret.clone().map(|(parameters, value)| SecretReply {
-                session: self.reply_session.to_owned(),
-                parameters,
-                value: Zeroizing::new(value),
-            })
+            self.secret
+                .clone()
+                .map(|(parameters, value)| SecretReply {
+                    session: self.reply_session.to_owned(),
+                    parameters,
+                    value: Zeroizing::new(value),
+                })
+                .map_err(Reason::from)
         }
 
         fn create_item(
@@ -567,7 +626,7 @@ mod tests {
             match &self.create {
                 Ok(Created::Done) => Ok(Created::Done),
                 Ok(Created::Prompt) => Ok(Created::Prompt),
-                Err(reason) => Err(reason),
+                Err(reason) => Err(Reason::from(*reason)),
             }
         }
     }

@@ -15,7 +15,7 @@
 use diag_ir::declaration::EcuVariant;
 use diag_ir::{Op, Program};
 
-use crate::host::HostError;
+use crate::host::{HostError, service_id};
 
 /// What a job may send, decided per link.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,7 +149,7 @@ pub fn check_service(
     layer: Option<ApplicationLayer>,
     permission: Permission,
 ) -> Result<(), HostError> {
-    let sid = u8::try_from(service).map_err(|_| HostError::BadService(service))?;
+    let sid = service_id(service)?;
     match permission {
         Permission::ReadOnly
             if layer.is_some_and(|layer| layer.read_only_services().contains(&sid)) =>
@@ -343,7 +343,7 @@ mod tests {
     fn values_that_are_not_service_ids_are_bad_services() {
         assert!(matches!(
             check_service(0x122, UDS, READ_ONLY),
-            Err(HostError::BadService(0x122))
+            Err(HostError::BadService(0x122, _))
         ));
     }
 
@@ -672,7 +672,7 @@ mod tests {
         fn values_that_are_not_service_ids_are_still_bad_services() {
             assert!(matches!(
                 check_service(0x122, None, SIMULATOR),
-                Err(HostError::BadService(0x122))
+                Err(HostError::BadService(0x122, _))
             ));
             assert!(matches!(
                 check_request(&[], None, SIMULATOR),
@@ -739,7 +739,7 @@ mod tests {
                 SIMULATOR,
             );
             assert!(
-                matches!(refused, Err((0, HostError::BadService(0x122)))),
+                matches!(refused, Err((0, HostError::BadService(0x122, _)))),
                 "{refused:?}"
             );
         }

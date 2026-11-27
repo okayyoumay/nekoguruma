@@ -18,8 +18,9 @@
 //! | unreadable, not a P-256 PKCS#8 key, or too open | any | refused, the file is never touched |
 //! | valid | another key | refused |
 //!
-//! Errors are fixed text and, for a failed file operation, the [`std::io::ErrorKind`]: never key
-//! bytes and never the file's contents.
+//! Errors are fixed text and, for a failed file operation, the [`std::io::ErrorKind`]. A key that
+//! does not parse and a failed random source keep the library's error as their source. None of
+//! them holds key bytes or the file's contents.
 
 use std::io::{self, Read};
 use std::path::Path;
@@ -65,10 +66,16 @@ pub enum KeyError {
          writable by the server's account only"
     )]
     DirectoryWritable,
+    /// `source` is the decoder's error when the decoder refused the bytes, and `None` for a file
+    /// over the length bound.
     #[error("the instruction key file is not a PKCS#8 P-256 private key")]
-    NotAKey,
+    NotAKey {
+        #[source]
+        source: Option<shared_crypto::KeyError>,
+    },
+    /// The source is the generator's error.
     #[error("operating-system randomness is unavailable")]
-    Random,
+    Random(#[source] shared_crypto::RandomError),
     #[error(
         "the database records an active instruction key but its file is absent; restore the \
          file, or retire the record (ADR-462) to start a new deployment key"
@@ -318,11 +325,11 @@ pub(crate) fn read_key(path: &Path) -> Result<Option<SigningKey>, KeyError> {
         .read_to_end(&mut bytes)
         .map_err(io_error("read"))?;
     if bytes.len() as u64 > MAX_KEY_FILE_LEN {
-        return Err(KeyError::NotAKey);
+        return Err(KeyError::NotAKey { source: None });
     }
     SigningKey::from_pkcs8_der(&bytes)
         .map(Some)
-        .map_err(|_| KeyError::NotAKey)
+        .map_err(|e| KeyError::NotAKey { source: Some(e) })
 }
 
 /// Creates the key file if it is still absent and returns the key that ends up in it, and whether
@@ -331,11 +338,11 @@ pub(crate) fn read_key(path: &Path) -> Result<Option<SigningKey>, KeyError> {
 pub(crate) fn create_or_load(path: &Path) -> Result<(SigningKey, bool), KeyError> {
     let dir = directory(path)?;
     check_directory(dir).map_err(directory_error)?;
-    let key = SigningKey::generate().map_err(|_| KeyError::Random)?;
+    let key = SigningKey::generate().map_err(KeyError::Random)?;
     let bytes = key.to_pkcs8_der();
     let created = match fs_guard::create_by_link(dir, path, ".instruction-key-", &bytes) {
         Ok(created) => created,
-        Err(fs_guard::LinkFault::Random) => return Err(KeyError::Random),
+        Err(fs_guard::LinkFault::Random(source)) => return Err(KeyError::Random(source)),
         Err(fs_guard::LinkFault::Io { op, error }) => return Err(io_error(op)(error)),
     };
     // What the file holds is what was just written, or what the winner wrote; read it back as
@@ -536,10 +543,13 @@ mod tests {
             vec![0x30; 10_000],
         ] {
             write_private(&path, &content);
-            assert!(matches!(read_key(&path), Err(KeyError::NotAKey)));
+            assert!(matches!(read_key(&path), Err(KeyError::NotAKey { .. })));
             assert_eq!(std::fs::read(&path).unwrap(), content);
             // Creating never replaces what is there: the creator loads it, and it is refused.
-            assert!(matches!(create_or_load(&path), Err(KeyError::NotAKey)));
+            assert!(matches!(
+                create_or_load(&path),
+                Err(KeyError::NotAKey { .. })
+            ));
             assert_eq!(std::fs::read(&path).unwrap(), content);
             std::fs::remove_file(&path).unwrap();
         }
@@ -551,7 +561,7 @@ mod tests {
         let path = key_path(&dir);
         let public = SigningKey::generate().unwrap().public_key().to_spki_der();
         write_private(&path, &public);
-        assert!(matches!(read_key(&path), Err(KeyError::NotAKey)));
+        assert!(matches!(read_key(&path), Err(KeyError::NotAKey { .. })));
     }
 
     #[test]
@@ -746,7 +756,7 @@ mod tests {
         assert!(shown.contains(&key.key_id()));
         assert!(!shown.contains(&secret[secret.len() - 64..]), "{shown}");
         assert_eq!(key.key_id().len(), 64);
-        let error = KeyError::NotAKey.to_string();
+        let error = KeyError::NotAKey { source: None }.to_string();
         assert!(!error.contains(&secret[..16]));
     }
 

@@ -4,7 +4,8 @@
 //!
 //! The certificate is for `127.0.0.1` (an IP subject alternative name) and signed by its own key.
 //! Its validity is rcgen's default and is not judged by anything: the verifier compares the pin
-//! only (ADR-505 item 9). Errors have fixed text and carry nothing from the files.
+//! only (ADR-505 item 9). The text of an error is fixed and says nothing of the files; the cause
+//! a library reported is the error's source, for the caller's log.
 
 use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
 use rustls::crypto::aws_lc_rs;
@@ -24,20 +25,26 @@ pub enum Pem {
 }
 
 /// Why a key, a certificate or a pair was refused. The words are fixed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum IdentityError {
     /// The text is not exactly one section of the expected label and nothing else (a missing
     /// section, a second one, a section of another label, text before or after the section, or
-    /// text that is not PEM). Only white space may surround the section.
-    NotOnePem { what: Pem },
+    /// text that is not PEM). Only white space may surround the section. `source` is the PEM
+    /// reader's error when it refused the text, and `None` when the checks before and after it
+    /// did.
+    NotOnePem {
+        what: Pem,
+        source: Option<pem::Error>,
+    },
     /// The key is not a P-256 key.
     NotP256,
     /// The key is not the certificate's key.
     Mismatch,
-    /// The key or the certificate cannot be parsed.
-    Malformed,
-    /// Operating-system randomness is unavailable, so no key could be made.
-    Random,
+    /// The key or the certificate cannot be parsed; the source is the library's error.
+    Malformed(Box<dyn std::error::Error + Send + Sync>),
+    /// Operating-system randomness is unavailable, so no key could be made; the source is the
+    /// generator's error.
+    Random(rcgen::Error),
 }
 
 impl std::fmt::Display for IdentityError {
@@ -45,36 +52,48 @@ impl std::fmt::Display for IdentityError {
         f.write_str(match self {
             Self::NotOnePem {
                 what: Pem::Certificate,
+                ..
             } => "the certificate file is not exactly one certificate in PEM form",
-            Self::NotOnePem { what: Pem::Key } => {
+            Self::NotOnePem { what: Pem::Key, .. } => {
                 "the key file is not exactly one PKCS#8 private key in PEM form"
             }
             Self::NotP256 => "the key is not a P-256 key",
             Self::Mismatch => "the key does not belong to the certificate",
-            Self::Malformed => "the key or the certificate is malformed",
-            Self::Random => "operating-system randomness is unavailable",
+            Self::Malformed(_) => "the key or the certificate is malformed",
+            Self::Random(_) => "operating-system randomness is unavailable",
         })
     }
 }
 
-impl std::error::Error for IdentityError {}
+impl std::error::Error for IdentityError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::NotOnePem { source, .. } => source
+                .as_ref()
+                .map(|error| error as &(dyn std::error::Error + 'static)),
+            Self::NotP256 | Self::Mismatch => None,
+            Self::Malformed(error) => Some(error.as_ref()),
+            Self::Random(error) => Some(error),
+        }
+    }
+}
 
 /// A new P-256 private key as PKCS#8 PEM, wiped when dropped. Fails with
 /// [`IdentityError::Random`] when the operating system has no randomness to give.
 pub fn generate_key() -> Result<Zeroizing<String>, IdentityError> {
     KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
         .map(|key| Zeroizing::new(key.serialize_pem()))
-        .map_err(|_| IdentityError::Random)
+        .map_err(IdentityError::Random)
 }
 
 /// A certificate for `127.0.0.1`, signed by the key `key_pem` (PKCS#8 PEM), as PEM.
 pub fn self_signed(key_pem: &str) -> Result<String, IdentityError> {
-    let key = KeyPair::from_pem(key_pem).map_err(|_| IdentityError::Malformed)?;
+    let key = KeyPair::from_pem(key_pem).map_err(|error| IdentityError::Malformed(error.into()))?;
     let params = CertificateParams::new(["127.0.0.1".to_owned()])
         .expect("the loopback address is a valid name");
     let certificate = params
         .self_signed(&key)
-        .map_err(|_| IdentityError::Malformed)?;
+        .map_err(|error| IdentityError::Malformed(error.into()))?;
     Ok(certificate.pem())
 }
 
@@ -98,7 +117,7 @@ pub fn pin_of_pair(cert_pem: &str, key_pem: &str) -> Result<CertPin, IdentityErr
     let signing = aws_lc_rs::default_provider()
         .key_provider
         .load_private_key(PrivateKeyDer::Pkcs8(key))
-        .map_err(|_| IdentityError::Malformed)?;
+        .map_err(|error| IdentityError::Malformed(error.into()))?;
     if signing
         .choose_scheme(&[SignatureScheme::ECDSA_NISTP256_SHA256])
         .is_none()
@@ -112,7 +131,7 @@ pub fn pin_of_pair(cert_pem: &str, key_pem: &str) -> Result<CertPin, IdentityErr
         .keys_match()
         .map_err(|error| match error {
             TlsError::InconsistentKeys(InconsistentKeys::KeyMismatch) => IdentityError::Mismatch,
-            _ => IdentityError::Malformed,
+            error => IdentityError::Malformed(error.into()),
         })?;
     Ok(pin)
 }
@@ -131,24 +150,28 @@ fn only_section(
     kind: SectionKind,
     what: Pem,
 ) -> Result<Zeroizing<Vec<u8>>, IdentityError> {
-    let refused = IdentityError::NotOnePem { what };
+    let refused = |source| IdentityError::NotOnePem { what, source };
     let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
-    let first = lines.next().ok_or(refused)?;
+    let first = lines.next().ok_or_else(|| refused(None))?;
     let last = lines.next_back().unwrap_or(first);
     let begins = text
         .lines()
         .filter(|line| line.trim().starts_with("-----BEGIN "))
         .count();
     if !first.starts_with("-----BEGIN ") || !last.starts_with("-----END ") || begins != 1 {
-        return Err(refused);
+        return Err(refused(None));
     }
     let mut rest = text.as_bytes();
     let (section, der) = pem::from_buf(&mut rest)
-        .map_err(|_| refused)?
-        .ok_or(refused)?;
+        .map_err(|error| refused(Some(error)))?
+        .ok_or_else(|| refused(None))?;
     let der = Zeroizing::new(der);
-    if section != kind || pem::from_buf(&mut rest).map_err(|_| refused)?.is_some() {
-        return Err(refused);
+    if section != kind
+        || pem::from_buf(&mut rest)
+            .map_err(|error| refused(Some(error)))?
+            .is_some()
+    {
+        return Err(refused(None));
     }
     Ok(der)
 }
@@ -183,7 +206,7 @@ mod tests {
         let pin = pin_of_pair(&cert, &key).unwrap();
         assert_eq!(pin, CertPin::of_certificate(&cert_der(&cert)));
         // The same pair has the same pin; a second pair has another.
-        assert_eq!(pin_of_pair(&cert, &key), Ok(pin));
+        assert_eq!(pin_of_pair(&cert, &key).unwrap(), pin);
         let (other_cert, other_key) = pair();
         assert_ne!(pin_of_pair(&other_cert, &other_key).unwrap(), pin);
     }
@@ -200,18 +223,15 @@ mod tests {
     fn crlf_line_ends_are_accepted_in_either_text() {
         let (cert, key) = pair();
         let expected = pin_of_pair(&cert, &key).unwrap();
-        assert_eq!(pin_of_pair(&crlf(&cert), &key), Ok(expected));
-        assert_eq!(pin_of_pair(&cert, &crlf(&key)), Ok(expected));
-        assert_eq!(pin_of_pair(&crlf(&cert), &crlf(&key)), Ok(expected));
+        assert_eq!(pin_of_pair(&crlf(&cert), &key).unwrap(), expected);
+        assert_eq!(pin_of_pair(&cert, &crlf(&key)).unwrap(), expected);
+        assert_eq!(pin_of_pair(&crlf(&cert), &crlf(&key)).unwrap(), expected);
     }
 
     #[test]
     fn a_text_that_is_not_one_certificate_is_refused() {
         let (cert, key) = pair();
         let (other_cert, _) = pair();
-        let expected = IdentityError::NotOnePem {
-            what: Pem::Certificate,
-        };
         let cases = [
             ("empty", String::new()),
             ("garbage", "not a pem file".to_owned()),
@@ -234,7 +254,16 @@ mod tests {
             ),
         ];
         for (name, text) in cases {
-            assert_eq!(pin_of_pair(&text, &key), Err(expected), "{name}");
+            assert!(
+                matches!(
+                    pin_of_pair(&text, &key),
+                    Err(IdentityError::NotOnePem {
+                        what: Pem::Certificate,
+                        ..
+                    })
+                ),
+                "{name}"
+            );
         }
     }
 
@@ -242,7 +271,6 @@ mod tests {
     fn a_text_that_is_not_one_pkcs8_key_is_refused() {
         let (cert, key) = pair();
         let (_, other_key) = pair();
-        let expected = IdentityError::NotOnePem { what: Pem::Key };
         let cases = [
             ("empty", String::new()),
             ("garbage", "not a pem file".to_owned()),
@@ -261,7 +289,13 @@ mod tests {
             ),
         ];
         for (name, text) in cases {
-            assert_eq!(pin_of_pair(&cert, &text), Err(expected), "{name}");
+            assert!(
+                matches!(
+                    pin_of_pair(&cert, &text),
+                    Err(IdentityError::NotOnePem { what: Pem::Key, .. })
+                ),
+                "{name}"
+            );
         }
     }
 
@@ -270,20 +304,29 @@ mod tests {
         let (cert, key) = pair();
         let expected = pin_of_pair(&cert, &key).unwrap();
         let padded = |text: &str| format!("\n  \r\n{text}\n\n \t\n");
-        assert_eq!(pin_of_pair(&padded(&cert), &padded(&key)), Ok(expected));
+        assert_eq!(
+            pin_of_pair(&padded(&cert), &padded(&key)).unwrap(),
+            expected
+        );
     }
 
     #[test]
     fn a_key_that_is_not_p256_is_refused() {
         let (cert, _) = pair();
-        assert_eq!(pin_of_pair(&cert, &p384_key()), Err(IdentityError::NotP256));
+        assert!(matches!(
+            pin_of_pair(&cert, &p384_key()),
+            Err(IdentityError::NotP256)
+        ));
     }
 
     #[test]
     fn a_key_of_another_pair_is_refused() {
         let (cert, _) = pair();
         let (_, other_key) = pair();
-        assert_eq!(pin_of_pair(&cert, &other_key), Err(IdentityError::Mismatch));
+        assert!(matches!(
+            pin_of_pair(&cert, &other_key),
+            Err(IdentityError::Mismatch)
+        ));
     }
 
     #[test]
@@ -291,13 +334,19 @@ mod tests {
         let (cert, key) = pair();
         let bad_cert = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
         let bad_key = "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n";
-        assert_eq!(pin_of_pair(bad_cert, &key), Err(IdentityError::Malformed));
-        assert_eq!(pin_of_pair(&cert, bad_key), Err(IdentityError::Malformed));
+        for result in [pin_of_pair(bad_cert, &key), pin_of_pair(&cert, bad_key)] {
+            let error = result.unwrap_err();
+            assert!(matches!(error, IdentityError::Malformed(_)), "{error:?}");
+            assert!(std::error::Error::source(&error).is_some());
+        }
     }
 
     #[test]
     fn a_made_certificate_needs_a_key() {
-        assert_eq!(self_signed("garbage"), Err(IdentityError::Malformed));
+        assert!(matches!(
+            self_signed("garbage"),
+            Err(IdentityError::Malformed(_))
+        ));
     }
 
     #[test]

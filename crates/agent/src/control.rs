@@ -368,6 +368,20 @@ impl Warnings {
         }
     }
 
+    /// A failed upgrade attempt: [`Warnings::failure`], with the error that ended it when there
+    /// is one.
+    fn upgrade_failure(&mut self, fail: &channel::UpgradeFail) {
+        let Some(source) = fail.source.as_deref() else {
+            return self.failure(fail.class, fail.status);
+        };
+        let source = source as &(dyn std::error::Error + 'static);
+        if self.seen.insert(fail.class) {
+            tracing::warn!(class = fail.class, status = ?fail.status, error = source, "control channel attempt failed");
+        } else {
+            tracing::debug!(class = fail.class, status = ?fail.status, error = source, "control channel attempt failed");
+        }
+    }
+
     fn refusal(&mut self, class: &'static str, status: u16) {
         if self.refused {
             tracing::debug!(class, status, "control channel refused again");
@@ -590,8 +604,7 @@ impl Opened {
     }
 
     fn origin(&self) -> Result<ServerOrigin, ControlError> {
-        ServerOrigin::parse(&self.record.server_origin)
-            .map_err(|_| RecordError::Field("server_origin").into())
+        Ok(self.record.origin()?)
     }
 
     /// The checks every start makes on the record and the key, before anything is spawned: the
@@ -688,7 +701,7 @@ async fn run(wiring: Wiring, stop: Stop, status: StatusTx, ended: Arc<OnceLock<E
         match reopened {
             Ok(true) => tracing::info!("the outbox was opened again"),
             Ok(false) => {}
-            Err(error @ (OutboxError::Corrupt(_) | OutboxError::BadAgentId)) => {
+            Err(error @ (OutboxError::Corrupt(..) | OutboxError::BadAgentId)) => {
                 tracing::error!(%error, "the outbox cannot be opened again; the session ends");
                 let _ = ended.set(Ended::OutboxUnusable);
                 break;
@@ -705,7 +718,7 @@ async fn run(wiring: Wiring, stop: Stop, status: StatusTx, ended: Arc<OnceLock<E
         match reopened {
             Ok(true) => tracing::info!("the received-jobs ledger was opened again"),
             Ok(false) => {}
-            Err(error @ (LedgerError::Corrupt(_) | LedgerError::BadAgentId)) => {
+            Err(error @ (LedgerError::Corrupt(..) | LedgerError::BadAgentId)) => {
                 tracing::error!(%error, "the received-jobs ledger cannot be opened again; the session ends");
                 let _ = ended.set(Ended::LedgerUnusable);
                 break;
@@ -795,7 +808,7 @@ async fn attempt(w: &Wiring, stop: &Stop, status: &StatusTx, warnings: &mut Warn
             return failed(Fail::Cap);
         }
         Err(error) => {
-            warnings.failure(error.class, error.status);
+            warnings.upgrade_failure(&error);
             return failed(Fail::Ord);
         }
     };

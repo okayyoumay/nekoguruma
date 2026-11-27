@@ -29,7 +29,7 @@ use base64::engine::general_purpose::STANDARD;
 use http_body_util::BodyExt;
 use serde::de::{self, MapAccess, Visitor};
 use shared_crypto::registration::{
-    Mode, Preset, RegistrationCode, RegistrationTranscript, verify_registration,
+    CodeError, Mode, Preset, RegistrationCode, RegistrationTranscript, verify_registration,
 };
 use shared_crypto::{PublicKey, Signature};
 use sqlx::PgPool;
@@ -141,26 +141,52 @@ impl Limiter {
 // ---------------------------------------------------------------------------------------------
 // The shape of a request
 
-/// Which rule of the request's shape failed. Each is a 400; none touches the database.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Which rule of the request's shape failed. Each is a 400; none touches the database. The
+/// answer is the fixed [`ShapeError::title`]; the source of `Code` and `PublicKey` stays on the
+/// server.
+#[derive(Debug)]
 pub enum ShapeError {
     ContentType,
     Json,
-    Code,
-    PublicKey,
+    /// `source` is the parser's error, and `None` for a code over the length bound.
+    Code {
+        source: Option<CodeError>,
+    },
+    /// `source` is the decoder's error, and `None` for a key text over the length bound.
+    PublicKey {
+        source: Option<shared_crypto::KeyError>,
+    },
     Mode,
     Proof,
 }
 
 impl ShapeError {
-    fn title(self) -> &'static str {
+    fn title(&self) -> &'static str {
         match self {
             ShapeError::ContentType => "Content-Type must be application/json",
             ShapeError::Json => "The body is not the expected JSON object",
-            ShapeError::Code => "Invalid registration code format",
-            ShapeError::PublicKey => "Invalid public key",
+            ShapeError::Code { .. } => "Invalid registration code format",
+            ShapeError::PublicKey { .. } => "Invalid public key",
             ShapeError::Mode => "Invalid mode",
             ShapeError::Proof => "Invalid proof",
+        }
+    }
+}
+
+impl std::fmt::Display for ShapeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.title())
+    }
+}
+
+impl std::error::Error for ShapeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ShapeError::Code { source } => source.as_ref().map(|e| e as _),
+            ShapeError::PublicKey { source } => source.as_ref().map(|e| e as _),
+            ShapeError::ContentType | ShapeError::Json | ShapeError::Mode | ShapeError::Proof => {
+                None
+            }
         }
     }
 }
@@ -251,13 +277,15 @@ fn shape(headers: &HeaderMap, body: &[u8]) -> Result<Shaped, ShapeError> {
         proof,
     };
     if fields.code.len() > MAX_CODE {
-        return Err(ShapeError::Code);
+        return Err(ShapeError::Code { source: None });
     }
-    let code = RegistrationCode::parse(&fields.code).map_err(|_| ShapeError::Code)?;
+    let code =
+        RegistrationCode::parse(&fields.code).map_err(|e| ShapeError::Code { source: Some(e) })?;
     if fields.public_key.len() > MAX_PUBLIC_KEY {
-        return Err(ShapeError::PublicKey);
+        return Err(ShapeError::PublicKey { source: None });
     }
-    let key = PublicKey::from_spki_pem(&fields.public_key).map_err(|_| ShapeError::PublicKey)?;
+    let key = PublicKey::from_spki_pem(&fields.public_key)
+        .map_err(|e| ShapeError::PublicKey { source: Some(e) })?;
     let mode = Mode::parse(&fields.mode).ok_or(ShapeError::Mode)?;
     if fields.proof.len() > MAX_PROOF {
         return Err(ShapeError::Proof);
@@ -412,7 +440,8 @@ struct Registered {
 pub(crate) enum BodyError {
     TooLarge,
     Timeout,
-    Broken,
+    /// The body stream failed; the source is the stream's error.
+    Broken(axum::Error),
 }
 
 /// Reads the body in full within `budget`, refusing more than `limit` bytes as soon as they have
@@ -426,7 +455,7 @@ async fn read_body(
         let mut body = body;
         let mut bytes = Vec::new();
         while let Some(frame) = body.frame().await {
-            let frame = frame.map_err(|_| BodyError::Broken)?;
+            let frame = frame.map_err(BodyError::Broken)?;
             if let Ok(data) = frame.into_data() {
                 if bytes.len() + data.len() > limit {
                     return Err(BodyError::TooLarge);
@@ -494,7 +523,14 @@ pub(crate) async fn bounded_body_for(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "The request body is too large",
             ),
-            BodyError::Broken => closing(StatusCode::BAD_REQUEST, broken),
+            BodyError::Broken(source) => {
+                // The answer names no cause; the server records it.
+                tracing::debug!(
+                    error = &source as &dyn std::error::Error,
+                    "a request body broke while it was read"
+                );
+                closing(StatusCode::BAD_REQUEST, broken)
+            }
         })
 }
 
@@ -508,7 +544,13 @@ pub async fn register(State(registrar): State<Registrar>, request: Request) -> R
     };
     let shaped = match shape(&parts.headers, &bytes) {
         Ok(shaped) => shaped,
-        Err(error) => return Problem::new(StatusCode::BAD_REQUEST, error.title()).into_response(),
+        Err(error) => {
+            // The answer names no cause; the server records it.
+            if let Some(source) = std::error::Error::source(&error) {
+                tracing::debug!(rule = %error, error = source, "a registration request was refused");
+            }
+            return Problem::new(StatusCode::BAD_REQUEST, error.title()).into_response();
+        }
     };
 
     // The key is read once: its ID, its PEM and the transcript all come from this value.
@@ -935,11 +977,24 @@ mod tests {
         shape(headers, body).map(|_| ())
     }
 
+    /// Asserts that `got` is the error `want` names, the same variant whatever its source.
+    #[track_caller]
+    fn assert_shape_error(got: Result<(), ShapeError>, want: &ShapeError, context: &str) {
+        match got {
+            Err(error) => assert_eq!(
+                std::mem::discriminant(&error),
+                std::mem::discriminant(want),
+                "{context}: {error:?}"
+            ),
+            Ok(()) => panic!("{context}: the shape passed"),
+        }
+    }
+
     #[test]
     fn a_well_formed_request_passes() {
         let p = parts();
         let b = body(&p.code, &p.public_key, "user", &p.proof);
-        assert_eq!(shape_of(&json_headers(), &b), Ok(()));
+        shape_of(&json_headers(), &b).unwrap();
         // Parameters on the media type, any case, and a typed code.
         let mut h = HeaderMap::new();
         h.insert(
@@ -952,7 +1007,7 @@ mod tests {
             "device",
             &p.proof,
         );
-        assert_eq!(shape_of(&h, &typed), Ok(()));
+        shape_of(&h, &typed).unwrap();
     }
 
     #[test]
@@ -978,7 +1033,11 @@ mod tests {
         );
         cases.push(twice);
         for h in cases {
-            assert_eq!(shape_of(&h, &b), Err(ShapeError::ContentType), "{h:?}");
+            assert_shape_error(
+                shape_of(&h, &b),
+                &ShapeError::ContentType,
+                &format!("{h:?}"),
+            );
         }
     }
 
@@ -1035,15 +1094,11 @@ mod tests {
             ),
         ];
         for (name, b) in cases {
-            assert_eq!(
-                shape_of(&json_headers(), &b),
-                Err(ShapeError::Json),
-                "{name}"
-            );
+            assert_shape_error(shape_of(&json_headers(), &b), &ShapeError::Json, name);
         }
         // Whitespace after the value is part of a JSON text.
         let spaced = [good.as_slice(), b" \n"].concat();
-        assert_eq!(shape_of(&json_headers(), &spaced), Ok(()));
+        shape_of(&json_headers(), &spaced).unwrap();
     }
 
     #[test]
@@ -1051,51 +1106,63 @@ mod tests {
         let p = parts();
         let h = json_headers();
         let check = |code: &str, key: &str, mode: &str, proof: &str, want: ShapeError| {
-            assert_eq!(
+            assert_shape_error(
                 shape_of(&h, &body(code, key, mode, proof)),
-                Err(want),
-                "{code:?} {mode:?} {proof:?}"
+                &want,
+                &format!("{code:?} {mode:?} {proof:?}"),
             );
         };
         let good_proof = &p.proof;
         // code
-        check("", &p.public_key, "user", good_proof, ShapeError::Code);
+        check(
+            "",
+            &p.public_key,
+            "user",
+            good_proof,
+            ShapeError::Code { source: None },
+        );
         check(
             &"a".repeat(65),
             &p.public_key,
             "user",
             good_proof,
-            ShapeError::Code,
+            ShapeError::Code { source: None },
         );
         check(
             &p.code[1..],
             &p.public_key,
             "user",
             good_proof,
-            ShapeError::Code,
+            ShapeError::Code { source: None },
         );
         check(
             &format!("{}0", p.code),
             &p.public_key,
             "user",
             good_proof,
-            ShapeError::Code,
+            ShapeError::Code { source: None },
         );
         // publicKey
-        check(&p.code, "", "user", good_proof, ShapeError::PublicKey);
+        check(
+            &p.code,
+            "",
+            "user",
+            good_proof,
+            ShapeError::PublicKey { source: None },
+        );
         check(
             &p.code,
             "not a pem",
             "user",
             good_proof,
-            ShapeError::PublicKey,
+            ShapeError::PublicKey { source: None },
         );
         check(
             &p.code,
             &"A".repeat(513),
             "user",
             good_proof,
-            ShapeError::PublicKey,
+            ShapeError::PublicKey { source: None },
         );
         let der_less = p.public_key.replace("PUBLIC KEY", "PRIVATE KEY");
         check(
@@ -1103,7 +1170,7 @@ mod tests {
             &der_less,
             "user",
             good_proof,
-            ShapeError::PublicKey,
+            ShapeError::PublicKey { source: None },
         );
         // mode
         for mode in ["", "User", "USER", "machine", "user ", " device", "admin"] {
@@ -1138,10 +1205,7 @@ mod tests {
         if url_safe != *good_proof {
             check(&p.code, &p.public_key, "user", &url_safe, ShapeError::Proof);
         }
-        assert_eq!(
-            shape_of(&h, &body(&p.code, &p.public_key, "device", good_proof)),
-            Ok(())
-        );
+        shape_of(&h, &body(&p.code, &p.public_key, "device", good_proof)).unwrap();
     }
 
     #[test]
@@ -1151,22 +1215,42 @@ mod tests {
         // A code the parser accepts, padded with the whitespace it trims: 64 pass, 65 do not.
         let pad = |n: usize| format!("{}{}", " ".repeat(n - p.code.len()), p.code);
         assert_eq!(pad(64).len(), 64);
-        assert_eq!(
-            shape_of(&h, &body(&pad(64), &p.public_key, "user", &p.proof)),
-            Ok(())
-        );
-        assert_eq!(
+        shape_of(&h, &body(&pad(64), &p.public_key, "user", &p.proof)).unwrap();
+        assert_shape_error(
             shape_of(&h, &body(&pad(65), &p.public_key, "user", &p.proof)),
-            Err(ShapeError::Code)
+            &ShapeError::Code { source: None },
+            "65 characters",
         );
         // The PEM cap cannot be shown with a PEM that parses: the parser takes no padding but
         // CRLF line ends, and a P-256 key's document is under 200 characters, so 512 is only a
         // ceiling on what is handed to the parser.
         let long = body(&p.code, &"A".repeat(513), "user", &p.proof);
-        assert_eq!(shape_of(&h, &long), Err(ShapeError::PublicKey));
+        assert_shape_error(
+            shape_of(&h, &long),
+            &ShapeError::PublicKey { source: None },
+            "513 characters",
+        );
         // A 64-byte proof is 88 characters, and strict base64 admits no padding with other
         // characters, so the 128-character cap is reached only by input that is invalid anyway.
         assert_eq!(p.proof.len(), 88);
+    }
+
+    #[test]
+    fn a_code_or_key_the_parser_refuses_keeps_the_parser_error_as_its_source() {
+        let p = parts();
+        let h = json_headers();
+        let code_error =
+            shape_of(&h, &body("RC1-nothing", &p.public_key, "user", &p.proof)).unwrap_err();
+        assert!(matches!(code_error, ShapeError::Code { source: Some(_) }));
+        assert!(std::error::Error::source(&code_error).is_some());
+        let key_error = shape_of(&h, &body(&p.code, "not a key", "user", &p.proof)).unwrap_err();
+        assert!(matches!(
+            key_error,
+            ShapeError::PublicKey { source: Some(_) }
+        ));
+        assert!(std::error::Error::source(&key_error).is_some());
+        // The answer's text is the same either way.
+        assert_eq!(key_error.to_string(), "Invalid public key");
     }
 
     #[test]

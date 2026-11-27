@@ -36,6 +36,22 @@ fn a_url_on_the_registered_host_is_accepted_with_its_port_and_target() {
     );
 }
 
+/// The refusal of a port that is canonical digits but does not fit 16 bits.
+fn out_of_range(digits: &str) -> Refused {
+    Refused::PortOutOfRange(digits.parse::<u16>().unwrap_err())
+}
+
+#[test]
+fn a_port_beyond_16_bits_keeps_the_parsers_error_as_its_source() {
+    let error = check(&origin(), "https://127.0.0.1:65536/x", pin()).unwrap_err();
+    assert!(std::error::Error::source(&error).is_some(), "{error:?}");
+    assert_eq!(
+        error.to_string(),
+        Refused::Port.to_string(),
+        "the text is the same as for any other bad port"
+    );
+}
+
 #[test]
 fn the_host_rule_refuses_what_is_not_the_registered_host() {
     let table: &[(&str, Refused)] = &[
@@ -64,8 +80,8 @@ fn the_host_rule_refuses_what_is_not_the_registered_host() {
         ("https://127.0.0.1:", Refused::NoPath),
         ("https://127.0.0.1:/x", Refused::Port),
         ("https://127.0.0.1:0/x", Refused::Port),
-        ("https://127.0.0.1:65536/x", Refused::Port),
-        ("https://127.0.0.1:99999/x", Refused::Port),
+        ("https://127.0.0.1:65536/x", out_of_range("65536")),
+        ("https://127.0.0.1:99999/x", out_of_range("99999")),
         ("https://127.0.0.1:123456/x", Refused::Port),
         ("https://127.0.0.1:09000/x", Refused::Port),
         ("https://127.0.0.1:00080/x", Refused::Port),
@@ -80,7 +96,7 @@ fn the_host_rule_refuses_what_is_not_the_registered_host() {
         ("https://127.0.0.1:9000/\0", Refused::Bytes),
     ];
     for (url, why) in table {
-        assert_eq!(check(&origin(), url, pin()), Err(*why), "{url:?}");
+        assert_eq!(check(&origin(), url, pin()), Err(why.clone()), "{url:?}");
     }
 }
 

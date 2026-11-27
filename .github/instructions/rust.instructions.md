@@ -66,6 +66,10 @@ Flag as Medium:
   belongs in an ADR.
 - **A second public path**: a `pub use` left at an item's old path after it moved, so the same
   public item is reachable two ways.
+- **A dropped error cause**: a `map_err(|_| ...)` or other mapping that discards the original
+  error where the target could hold it as a source or in its text (ADR-510). A trust-boundary
+  refusal keeps its answer unchanged and logs the cause on the refusing side, never in the
+  answer.
 - **Panics without a message**: an intentional `panic!`, `assert!` or `unreachable!` in non-test
   code that does not say which invariant broke.
 - **Out-of-scope targets**: Windows workers target `*-pc-windows-gnullvm` only (ADR-227). An MSVC

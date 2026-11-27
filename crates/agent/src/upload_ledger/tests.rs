@@ -183,7 +183,7 @@ fn assert_corrupt(name: &str, bytes: &[u8]) {
         }
         let result = UploadLedger::open_in(dir.path(), ID);
         assert!(
-            matches!(result, Err(LedgerError::Corrupt(_))),
+            matches!(result, Err(LedgerError::Corrupt(..))),
             "{name}: {:?}",
             result.as_ref().err()
         );
@@ -1019,11 +1019,11 @@ fn a_bad_source_path_or_job_id_is_refused() {
         };
         assert!(matches!(
             ledger.enqueue_result(&key, b"a"),
-            Err(LedgerError::BadJobId)
+            Err(LedgerError::BadJobId(_))
         ));
         assert!(matches!(
             ledger.enqueue_comm_log(&key, &comm_path(dir.path(), 1), digest),
-            Err(LedgerError::BadJobId)
+            Err(LedgerError::BadJobId(_))
         ));
     }
     assert_eq!(ledger.highest(), 1);
@@ -1188,7 +1188,7 @@ fn a_reopen_that_finds_the_file_gone_creates_nothing_sweeps_nothing_and_stays_po
     fs::remove_file(file_of(dir.path())).unwrap();
     assert!(matches!(
         ledger.reopen(),
-        Err(LedgerError::Corrupt("the ledger file is gone"))
+        Err(LedgerError::Corrupt("the ledger file is gone", None))
     ));
     assert!(!file_of(dir.path()).exists(), "no file was created");
     assert_eq!(names(&objects_of(dir.path())), ["1"]);
@@ -1212,7 +1212,7 @@ fn a_reopen_that_finds_the_file_corrupt_keeps_memory_sweeps_nothing_and_stays_po
     ledger.poisoned = true;
     let (file_len, stored) = (ledger.file_len, ledger.stored_bytes);
     fs::write(file_of(dir.path()), b"not a ledger").unwrap();
-    assert!(matches!(ledger.reopen(), Err(LedgerError::Corrupt(_))));
+    assert!(matches!(ledger.reopen(), Err(LedgerError::Corrupt(..))));
     assert!(ledger.is_poisoned());
     assert_eq!(seqs(&ledger), [1, 2]);
     assert_eq!(
@@ -1570,7 +1570,7 @@ fn the_counter_stops_below_the_largest_number_the_file_can_read_back() {
     assert_eq!(put_result(&mut ledger, 2), u64::MAX - 1);
     assert!(matches!(
         ledger.enqueue_result(&jk(3), b"x"),
-        Err(LedgerError::Corrupt(_))
+        Err(LedgerError::Corrupt(..))
     ));
     drop(ledger);
     let ledger = UploadLedger::open_in(dir.path(), ID).unwrap();

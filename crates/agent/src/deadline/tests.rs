@@ -199,11 +199,15 @@ fn f3_a_file_that_is_not_the_writers_object_is_corrupt_and_never_read_as_zero() 
     for (name, bytes) in cases {
         fs::write(&path, &bytes).unwrap();
         match IssueMark::open_in(dir.path(), AGENT) {
-            Err(MarkError::Corrupt(_)) => {}
+            Err(MarkError::Corrupt(..)) => {}
             other => panic!("{name}: {:?}", other.map(|_| ())),
         }
         assert_eq!(fs::read(&path).unwrap(), bytes, "{name}: never repaired");
     }
+    // A content that is not the expected object keeps the parser's error.
+    fs::write(&path, b"[]").unwrap();
+    let error = IssueMark::open_in(dir.path(), AGENT).err().unwrap();
+    assert!(std::error::Error::source(&error).is_some(), "{error}");
     // The largest value reads back whole.
     fs::write(&path, json(u64::MAX)).unwrap();
     assert_eq!(mark_in(dir.path()).highest(), u64::MAX);
@@ -216,7 +220,7 @@ fn f4_a_directory_or_a_link_where_the_file_belongs_is_corrupt() {
     fs::create_dir(file_in(dir.path())).unwrap();
     assert!(matches!(
         IssueMark::open_in(dir.path(), AGENT),
-        Err(MarkError::Corrupt(_))
+        Err(MarkError::Corrupt(..))
     ));
     fs::remove_dir(file_in(dir.path())).unwrap();
     #[cfg(unix)]
@@ -226,7 +230,7 @@ fn f4_a_directory_or_a_link_where_the_file_belongs_is_corrupt() {
         std::os::unix::fs::symlink(&real, file_in(dir.path())).unwrap();
         assert!(matches!(
             IssueMark::open_in(dir.path(), AGENT),
-            Err(MarkError::Corrupt(_))
+            Err(MarkError::Corrupt(..))
         ));
     }
 }

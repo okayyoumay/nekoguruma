@@ -23,7 +23,7 @@ use crate::declaration::{
     Shape, Termination,
 };
 use crate::decode::{DecodeError, DecodedField, Layouts, PhysicalValue, decode_positive_response};
-use crate::hmi::{self, HmiForm};
+use crate::hmi::{self, HmiError, HmiForm};
 use crate::{
     DiagHost, Failure, Op, Program, ProgramError, RuntimeInput, StepError, StepOutcome, Vm,
     VmError, WaitingOn, suppresses_positive_response,
@@ -334,16 +334,21 @@ pub enum DryRunError {
     },
     /// A `ServiceRequest` operand wider than one byte, which is no SID.
     #[error("service {service:#X} is not a one-byte SID")]
-    NotASid { service: u16 },
+    NotASid {
+        service: u16,
+        #[source]
+        source: std::num::TryFromIntError,
+    },
     /// The service has no declared positive response and no answer is scripted.
     #[error("service {service} has no positive response to build an answer from")]
     NoPositiveResponse { service: String },
     /// The script has no answer of this kind.
     #[error("the script has no {what}")]
     NotScripted { what: &'static str },
-    /// The host was sent bytes that are not an encoded [`HmiForm`], which the VM never sends.
+    /// The host was sent bytes that are not an encoded [`HmiForm`], which the VM never sends;
+    /// the source is the decoder's error.
     #[error("the HMI form sent is not an encoded form")]
-    BadHmiForm,
+    BadHmiForm(#[source] HmiError),
     /// The report would grow past [`MAX_REPORT_BYTES`].
     #[error("the report would hold more than {MAX_REPORT_BYTES} bytes")]
     ReportTooLarge,
@@ -965,7 +970,7 @@ impl DiagHost for ScriptedHost<'_, '_> {
     fn service_request(&mut self, service: u16, payload: &[u8]) -> Result<Vec<u8>, DryRunError> {
         // A `ServiceRequest` operand is the SID (ADR-233); a wider one is no SID any service has.
         let mut request =
-            vec![u8::try_from(service).map_err(|_| DryRunError::NotASid { service })?];
+            vec![u8::try_from(service).map_err(|source| DryRunError::NotASid { service, source })?];
         request.extend_from_slice(payload);
         let resolved = resolve(self.variant(), &request);
         // `Ambiguous` and every other error end the run, as for any request (ADR-328 item 2):
@@ -1062,7 +1067,7 @@ impl DiagHost for ScriptedHost<'_, '_> {
         };
         // Decoding is bounded by the form's 16 KiB (ADR-340 item 1); what the report keeps is
         // the decoded form.
-        let form = hmi::decode_form(form).map_err(|_| DryRunError::BadHmiForm)?;
+        let form = hmi::decode_form(form).map_err(DryRunError::BadHmiForm)?;
         self.charge(form_cost(&form).saturating_add(answer.len()))?;
         self.events.push(DryRunEvent::Hmi {
             form,
@@ -1083,7 +1088,7 @@ impl DiagHost for ScriptedHost<'_, '_> {
                     what: "record answer",
                 })?
         };
-        let template = hmi::decode_form(template).map_err(|_| DryRunError::BadHmiForm)?;
+        let template = hmi::decode_form(template).map_err(DryRunError::BadHmiForm)?;
         self.charge(form_cost(&template).saturating_add(answer.len()))?;
         self.events.push(DryRunEvent::RecordInput {
             template,

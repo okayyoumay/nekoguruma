@@ -250,7 +250,7 @@ async fn a_store_that_comes_back_gives_its_key() {
 #[tokio::test(start_paused = true)]
 async fn the_other_store_errors_end_the_load_without_a_retry() {
     for (error, exit) in [
-        (IdentityError::KeyUnusable("test"), 4),
+        (IdentityError::KeyUnusable("test", None), 4),
         (IdentityError::NoStore("test"), 1),
         (IdentityError::NotProvisioned, 1),
         (
@@ -285,7 +285,7 @@ fn a_local_fault_is_exit_3_with_its_reason() {
     assert!(mapped.to_string().contains("refused"), "{mapped}");
     let mapped = identity_error(&IdentityError::NoStore("the reason"));
     assert!(mapped.to_string().contains("the reason"), "{mapped}");
-    let mapped = identity_error(&IdentityError::KeyUnusable("the other reason"));
+    let mapped = identity_error(&IdentityError::KeyUnusable("the other reason", None));
     assert!(mapped.to_string().contains("the other reason"), "{mapped}");
 }
 
@@ -558,7 +558,7 @@ async fn an_uploader_that_does_not_stop_is_waited_for_at_most_the_bound() {
 
 #[test]
 fn every_control_error_has_the_documented_exit() {
-    let record = RecordError::Json;
+    let record = RecordError::Json(serde_json::from_str::<u8>("").unwrap_err());
     for (error, exit) in [
         (
             ControlError::Record(RecordError::Io(io::ErrorKind::PermissionDenied)),
@@ -605,7 +605,7 @@ fn every_control_error_has_the_documented_exit() {
 #[test]
 fn every_outbox_error_has_the_documented_exit() {
     for (error, exit) in [
-        (OutboxError::Corrupt("a bad frame"), 1),
+        (OutboxError::Corrupt("a bad frame", None), 1),
         (OutboxError::BadAgentId, 1),
         (OutboxError::InUse, 3),
         (
@@ -618,7 +618,7 @@ fn every_outbox_error_has_the_documented_exit() {
         assert_eq!(mapped.exit_code(), exit, "{mapped}");
     }
     assert!(
-        outbox_error(&OutboxError::Corrupt("x"))
+        outbox_error(&OutboxError::Corrupt("x", None))
             .to_string()
             .contains("register again")
     );
@@ -629,7 +629,7 @@ fn every_outbox_error_has_the_documented_exit() {
 #[test]
 fn every_mark_error_has_the_documented_exit() {
     for (error, exit) in [
-        (MarkError::Corrupt("a bad file"), 1),
+        (MarkError::Corrupt("a bad file", None), 1),
         (MarkError::BadAgentId, 1),
         (MarkError::InUse, 3),
         (MarkError::Io(io::ErrorKind::PermissionDenied), 3),
@@ -638,7 +638,7 @@ fn every_mark_error_has_the_documented_exit() {
         assert_eq!(mapped.exit_code(), exit, "{mapped}");
     }
     assert!(
-        mark_error(&MarkError::Corrupt("x"))
+        mark_error(&MarkError::Corrupt("x", None))
             .to_string()
             .contains("register again")
     );
@@ -660,7 +660,7 @@ fn a_corrupt_mark_file_does_not_open_and_one_in_use_is_exit_3() {
     std::fs::write(&file, b"not a mark").unwrap();
     let error =
         IssueMark::open_in(&registration, AGENT_ID).expect_err("a corrupt file does not open");
-    assert!(matches!(error, MarkError::Corrupt(_)), "{error}");
+    assert!(matches!(error, MarkError::Corrupt(..)), "{error}");
     assert_eq!(mark_error(&error).exit_code(), 1);
     std::fs::remove_file(&file).unwrap();
     let first = IssueMark::open_in(&registration, AGENT_ID).unwrap();
@@ -686,7 +686,7 @@ fn a_corrupt_outbox_file_does_not_open_and_maps_to_exit_1() {
     let opened = dirs.open().unwrap();
     let error = Outbox::open_in(&outbox_dir, &opened.record().agent_id)
         .expect_err("a corrupt file does not open");
-    assert!(matches!(error, OutboxError::Corrupt(_)), "{error}");
+    assert!(matches!(error, OutboxError::Corrupt(..)), "{error}");
     assert_eq!(outbox_error(&error).exit_code(), 1);
     drop(opened);
     dirs.open().expect("the locks are free");
@@ -697,7 +697,7 @@ fn a_corrupt_outbox_file_does_not_open_and_maps_to_exit_1() {
 #[test]
 fn every_ledger_error_has_the_documented_exit() {
     for (error, exit) in [
-        (LedgerError::Corrupt("a bad file"), 1),
+        (LedgerError::Corrupt("a bad file", None), 1),
         (LedgerError::BadAgentId, 1),
         (LedgerError::InUse, 3),
         (LedgerError::Io(io::ErrorKind::PermissionDenied), 3),
@@ -707,7 +707,7 @@ fn every_ledger_error_has_the_documented_exit() {
         assert_eq!(mapped.exit_code(), exit, "{mapped}");
     }
     assert!(
-        ledger_error(&LedgerError::Corrupt("x"))
+        ledger_error(&LedgerError::Corrupt("x", None))
             .to_string()
             .contains("register again")
     );
@@ -721,7 +721,7 @@ fn every_ledger_error_has_the_documented_exit() {
 #[test]
 fn every_upload_ledger_error_has_the_documented_exit() {
     for (error, exit) in [
-        (UploadLedgerError::Corrupt("a bad file"), 1),
+        (UploadLedgerError::Corrupt("a bad file", None), 1),
         (UploadLedgerError::BadAgentId, 1),
         (UploadLedgerError::InUse, 3),
         (
@@ -734,7 +734,7 @@ fn every_upload_ledger_error_has_the_documented_exit() {
         assert_eq!(mapped.exit_code(), exit, "{mapped}");
     }
     assert!(
-        upload_ledger_error(&UploadLedgerError::Corrupt("x"))
+        upload_ledger_error(&UploadLedgerError::Corrupt("x", None))
             .to_string()
             .contains("register again")
     );
@@ -751,7 +751,7 @@ fn a_corrupt_ledger_file_does_not_open_and_one_in_use_is_exit_3() {
     std::fs::write(&file, b"not a ledger").unwrap();
     let error =
         ReceivedJobs::open_in(&registration, AGENT_ID).expect_err("a corrupt file does not open");
-    assert!(matches!(error, LedgerError::Corrupt(_)), "{error}");
+    assert!(matches!(error, LedgerError::Corrupt(..)), "{error}");
     assert_eq!(ledger_error(&error).exit_code(), 1);
     assert_eq!(
         std::fs::read(&file).unwrap(),

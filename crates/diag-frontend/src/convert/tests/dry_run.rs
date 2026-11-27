@@ -343,7 +343,12 @@ fn the_verdict_accepts_a_finish_and_every_failure() {
 #[test]
 fn the_verdict_accepts_an_undecodable_answer_only_when_it_was_built() {
     let (service, name) = some_service();
-    let undecodable = || DryRunEnd::Vm(VmError::Undecodable { service });
+    let undecodable = || {
+        DryRunEnd::Vm(VmError::Undecodable {
+            service,
+            cause: String::new(),
+        })
+    };
     let bad = || Some(Err(DecodeError::Empty));
     let built = report(undecodable(), vec![request_event(&name, true, bad())]);
     assert_eq!(verdict(&built), Ok(()));
@@ -369,7 +374,10 @@ fn the_verdict_accepts_an_undecodable_answer_only_when_it_was_built() {
     }
     // A service the variant does not declare is named by its number.
     let unknown = verdict(&report(
-        DryRunEnd::Vm(VmError::Undecodable { service: u32::MAX }),
+        DryRunEnd::Vm(VmError::Undecodable {
+            service: u32::MAX,
+            cause: String::new(),
+        }),
         vec![],
     ))
     .expect_err("refused");

@@ -58,8 +58,7 @@ use crate::control::exchange::{self, Fail};
 use crate::data_token::Holder;
 use crate::identity::AgentKey;
 use crate::instruction::VerifiedInstruction;
-use crate::registration::origin::ServerOrigin;
-use crate::registration::record::{Record, RecordError};
+use crate::registration::record::Record;
 use crate::server_http::retry_after_secs;
 use crate::uploader::http::{Client, Error as HttpError, GetBody};
 use crate::uploader::routes::{Class, Failure, transport};
@@ -106,7 +105,7 @@ pub struct Fetched {
 
 /// Why an attempt gave no object. The class is the variant; no text holds a URL, a token, a
 /// digest or a body.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum FetchError {
     #[error("the instruction does not name this object")]
     NotNamed,
@@ -133,6 +132,9 @@ pub enum FetchError {
     },
     #[error("local failure: {why}")]
     Local { why: &'static str },
+    /// A blocking task of the cache did not finish; the source says how it ended.
+    #[error("local failure: task")]
+    Task(#[source] tokio::task::JoinError),
     #[error("the download's digest differs from the instruction's hash")]
     Mismatch,
     #[error("two downloads in a row did not match the instruction's hash; no more until a restart")]
@@ -147,7 +149,7 @@ impl FetchError {
             FetchError::Retry { .. } | FetchError::ExchangeCapped => "retry",
             FetchError::Unproven { .. } => "unproven",
             FetchError::Refused { .. } => "refused",
-            FetchError::Local { .. } => "local",
+            FetchError::Local { .. } | FetchError::Task(_) => "local",
             FetchError::Mismatch => "mismatch",
             FetchError::MismatchTwice => "mismatch-twice",
         }
@@ -206,7 +208,7 @@ impl From<StoreError> for FetchError {
                 StoreError::NotRegular => "not-regular",
                 StoreError::InUse => "in-use",
                 StoreError::Dir(_) => "directory",
-                StoreError::Io(_) => "io",
+                StoreError::Io(_) | StoreError::Random(_) => "io",
             },
         }
     }
@@ -291,8 +293,7 @@ impl Fetcher {
         if key.fingerprint_hex() != record.agent_key_fingerprint {
             return Err(ControlError::KeyMismatch);
         }
-        let origin = ServerOrigin::parse(&record.server_origin)
-            .map_err(|_| RecordError::Field("server_origin"))?;
+        let origin = record.origin()?;
         let verifier = Arc::new(Verifier::from_record(record)?);
         Ok(Self {
             store: Arc::new(store),
@@ -516,7 +517,7 @@ impl Fetcher {
             }
         })
         .await
-        .map_err(|_| FetchError::Local { why: "task" })??;
+        .map_err(FetchError::Task)??;
         match loaded {
             Load::Hit { path, length } => return Ok((Fetched { kind, path, length }, bytes)),
             Load::Deleted => {
@@ -543,7 +544,7 @@ impl Fetcher {
         let store = self.store.clone();
         let (tmp, file) = tokio::task::spawn_blocking(move || store.begin())
             .await
-            .map_err(|_| FetchError::Local { why: "task" })??;
+            .map_err(FetchError::Task)??;
         let got = self
             .client
             .get(
@@ -589,7 +590,7 @@ impl Fetcher {
         let wanted = *digest;
         let stored = tokio::task::spawn_blocking(move || store.commit(tmp, writer, kind, &wanted))
             .await
-            .map_err(|_| FetchError::Local { why: "task" })??;
+            .map_err(FetchError::Task)??;
         let (path, length) = match stored {
             Stored::Done { path, length } => (path, length),
             Stored::Mismatch => {
@@ -608,7 +609,7 @@ impl Fetcher {
             let store = self.store.clone();
             match tokio::task::spawn_blocking(move || store.read(kind, &wanted, max))
                 .await
-                .map_err(|_| FetchError::Local { why: "task" })??
+                .map_err(FetchError::Task)??
             {
                 (Load::Hit { .. }, bytes) => bytes,
                 _ => return Err(FetchError::Local { why: "changed" }),

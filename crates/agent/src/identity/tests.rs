@@ -60,7 +60,7 @@ fn kind(error: &IdentityError) -> &'static str {
         IdentityError::Unavailable(_) => "Unavailable",
         IdentityError::CreationLockBusy => "CreationLockBusy",
         IdentityError::LocalFault(_) => "LocalFault",
-        IdentityError::KeyUnusable(_) => "KeyUnusable",
+        IdentityError::KeyUnusable(..) => "KeyUnusable",
         IdentityError::NotProvisioned => "NotProvisioned",
         IdentityError::Random(_) => "Random",
     }
@@ -496,9 +496,9 @@ fn only_unavailable_and_a_busy_lock_are_retryable() {
     for error in [
         IdentityError::LocalFault("x".into()),
         IdentityError::NoStore("x"),
-        IdentityError::KeyUnusable("x"),
+        IdentityError::KeyUnusable("x", None),
         IdentityError::NotProvisioned,
-        IdentityError::Random(RandomError),
+        IdentityError::Random(RandomError::new("test: no randomness")),
     ] {
         assert!(!error.retryable(), "{error}");
     }

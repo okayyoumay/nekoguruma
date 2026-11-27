@@ -1054,7 +1054,7 @@ rather than lost.
 - **`OBJT_PROTOCOL` is deliberately excluded from the above, unchanged by both ADR-078 and
   this verification** (`names.rs::resolve_object_id`'s `ObjtProtocol` arm, `:1918-1927`): an
   unmatched name that also fails to parse as a raw `u32` is rejected via
-  `Status::not_found("unknown protocol shortname")` — a different gRPC code and message style
+  `Status::not_found` with the text "unknown protocol shortname" and the parse error after it — a different gRPC code and message style
   than the other five types' `PDU_ERR_INVALID_PARAMETERS`, with no `PDU_ERR_` prefix at all.
   This is not a gap A3-3 leaves open: ADR-078's Decision section explicitly carves `OBJT_PROTOCOL`
   out ("aligning its status code/message style to the other five types was considered but is

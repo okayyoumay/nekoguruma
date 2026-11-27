@@ -158,7 +158,8 @@ pub fn provision_with(plan: &Plan<'_>) -> Result<PublicKey, ProvisionError> {
         })
     })?;
 
-    let generated = SigningKey::generate().map_err(|_| cannot("no random bytes for the key"))?;
+    let generated = SigningKey::generate()
+        .map_err(|error| cannot(format!("no random bytes for the key: {error}")))?;
     let public = generated.public_key();
     let plaintext = generated.to_pkcs8_der();
     drop(generated);

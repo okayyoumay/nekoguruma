@@ -317,10 +317,14 @@ fn the_longest_matching_prefix_decides_and_a_tie_is_ambiguous() {
         vec![vec![0xF1, 0x90]],
     );
     let report = run(&buf, &wide, &Script::new());
-    assert_eq!(
-        report.end,
-        DryRunEnd::Host(DryRunError::NotASid { service: 0x122 })
+    let DryRunEnd::Host(error) = report.end else {
+        panic!("the run ended with {:?}", report.end);
+    };
+    assert!(
+        matches!(error, DryRunError::NotASid { service: 0x122, .. }),
+        "{error:?}"
     );
+    assert!(std::error::Error::source(&error).is_some());
 }
 
 #[test]
@@ -1038,7 +1042,8 @@ fn a_flash_block_outside_the_declarations_ends_the_run_with_the_vms_error() {
         DryRunEnd::Vm(VmError::BlockOutOfRange {
             session: 2,
             segment: 0,
-            index: 3
+            index: 3,
+            cause: None
         })
     );
 }

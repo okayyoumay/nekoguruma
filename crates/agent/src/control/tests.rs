@@ -346,7 +346,7 @@ fn agent_key_for(signing: &SigningKey) -> AgentKey {
 // The environment: the loop under test and the fake server's side
 
 fn failing_random() -> Result<[u8; 32], RandomError> {
-    Err(RandomError)
+    Err(RandomError::new("test: no randomness"))
 }
 
 fn panicking_random() -> Result<[u8; 32], RandomError> {
@@ -529,7 +529,7 @@ impl LogUploads for ScriptedLogUploads {
                 self.gate.acquire().await.unwrap().forget();
             }
             let outcome = *self.outcome.lock().unwrap();
-            outcome.ok_or(LogUploadError::Task)
+            outcome.ok_or(LogUploadError::Task(None))
         })
     }
 }

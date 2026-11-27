@@ -229,7 +229,7 @@ fn bytes_come_back_as_stored_and_the_identity_code_rejects_a_bad_key() {
         LOCK_WAIT,
     )
     .unwrap_err();
-    assert!(matches!(error, IdentityError::KeyUnusable(_)), "{error}");
+    assert!(matches!(error, IdentityError::KeyUnusable(..)), "{error}");
 }
 
 /// Rows 9, 23, 24 through `load_or_create`: created once, then the same key.
@@ -274,7 +274,7 @@ fn two_items_are_undecryptable_and_a_deleted_item_is_absent() {
     let dir = lock_dir();
     let error =
         load_or_create(&store, &name, &|| Ok(dir.path().to_owned()), LOCK_WAIT).unwrap_err();
-    assert!(matches!(error, IdentityError::KeyUnusable(_)), "{error}");
+    assert!(matches!(error, IdentityError::KeyUnusable(..)), "{error}");
     assert_eq!(items(&connection, &name).len(), 2);
     drop(cleanup);
     assert_eq!(kind(store.get(&name)), StoreErrorKind::Absent);

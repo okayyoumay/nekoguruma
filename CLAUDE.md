@@ -169,6 +169,10 @@ CI; Clippy lints are checked by the local `cargo clippy` run before a pull reque
 - **Panics**: an intentional `panic!`, `assert!`, `unreachable!` or `expect` in non-test code says
   which invariant broke and gives the values involved. A failure that external input can cause
   returns an error instead.
+- **Error causes**: a mapped error keeps its cause, as a `#[source]` field or in the text
+  (ADR-510). An error sent to another process carries it after its fixed text. At a trust
+  boundary the answer stays as it was, and the refusing side logs the cause. An
+  `#[expect(clippy::map_err_ignore, reason = "...")]` is only for a cause that cannot be kept.
 - **Tests** check behaviour seen from outside or a property the code must hold; a test that
   restates a constant or mirrors the implementation's branches passes by construction and checks
   nothing.

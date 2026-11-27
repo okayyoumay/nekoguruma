@@ -2602,7 +2602,10 @@ fn a_run_time_wait_duration_out_of_range_stops_the_run() {
                 other => panic!("{other:?}"),
             }
         };
-        assert_eq!(error, VmError::WaitOutOfRange(expected), "{n}");
+        assert!(
+            matches!(error, VmError::WaitOutOfRange { millis, ref cause } if millis == expected && !cause.is_empty()),
+            "{n}: {error:?}"
+        );
         assert!(host.calls.is_empty(), "{n}: {:?}", host.calls);
     }
 }

@@ -85,14 +85,20 @@ pub enum TlsFilesError {
         "the object server's TLS {which} file is too long or not text; it is never rewritten: \
          fix or delete it"
     )]
-    Corrupt { which: &'static str },
+    Corrupt {
+        which: &'static str,
+        /// The UTF-8 decoder's error when the file's bytes are not text.
+        #[source]
+        source: Option<std::str::Utf8Error>,
+    },
     #[error(
         "the object server's TLS key and certificate files are not a good pair ({0}); they are \
          never rewritten: fix or delete both"
     )]
     NotAPair(IdentityError),
+    /// The source is the generator's error.
     #[error("operating-system randomness is unavailable")]
-    Random,
+    Random(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
 /// The key and certificate files of the object server and the pin of the certificate.
@@ -154,7 +160,7 @@ impl TlsFiles {
             ".object-server-tls-key-",
             MAX_FILE_LEN,
             || {
-                let key = identity::generate_key().map_err(|_| Fault::Random)?;
+                let key = identity::generate_key().map_err(|e| Fault::Random(e.into()))?;
                 Ok(Zeroizing::new(key.as_bytes().to_vec()))
             },
         )
@@ -218,7 +224,10 @@ fn make_certificate(key_text: &str) -> Result<Zeroizing<Vec<u8>>, Step> {
 }
 
 fn text<'a>(bytes: &'a [u8], which: &'static str) -> Result<&'a str, TlsFilesError> {
-    std::str::from_utf8(bytes).map_err(|_| TlsFilesError::Corrupt { which })
+    std::str::from_utf8(bytes).map_err(|source| TlsFilesError::Corrupt {
+        which,
+        source: Some(source),
+    })
 }
 
 fn directory_error(fault: DirectoryFault) -> TlsFilesError {
@@ -239,8 +248,11 @@ fn fault_error(fault: Fault, which: &'static str) -> TlsFilesError {
         Fault::File(FileFault::NotRegular) => TlsFilesError::NotRegularFile { which },
         Fault::File(FileFault::NotOwned) => TlsFilesError::FileNotOwned { which },
         Fault::File(FileFault::TooOpen) => TlsFilesError::FileTooOpen { which },
-        Fault::Random => TlsFilesError::Random,
-        Fault::TooLong => TlsFilesError::Corrupt { which },
+        Fault::Random(source) => TlsFilesError::Random(source),
+        Fault::TooLong => TlsFilesError::Corrupt {
+            which,
+            source: None,
+        },
     }
 }
 
@@ -310,7 +322,7 @@ mod tests {
         );
         let key = std::fs::read_to_string(key_path(dir.path())).unwrap();
         let cert = std::fs::read_to_string(cert_path(dir.path())).unwrap();
-        assert_eq!(identity::pin_of_pair(&cert, &key).as_ref(), Ok(first.pin()));
+        assert_eq!(&identity::pin_of_pair(&cert, &key).unwrap(), first.pin());
         #[cfg(unix)]
         for path in [key_path(dir.path()), cert_path(dir.path())] {
             use std::os::unix::fs::PermissionsExt;
@@ -348,10 +360,7 @@ mod tests {
         assert_eq!(loaded.created(), Some(Created::CertificateOnly));
         assert_eq!(std::fs::read_to_string(key_path(dir.path())).unwrap(), key);
         let cert = std::fs::read_to_string(cert_path(dir.path())).unwrap();
-        assert_eq!(
-            identity::pin_of_pair(&cert, &key).as_ref(),
-            Ok(loaded.pin())
-        );
+        assert_eq!(&identity::pin_of_pair(&cert, &key).unwrap(), loaded.pin());
     }
 
     #[test]
@@ -427,7 +436,7 @@ mod tests {
                 assert!(
                     matches!(
                         error,
-                        TlsFilesError::NotAPair(_) | TlsFilesError::Corrupt { which: "key" }
+                        TlsFilesError::NotAPair(_) | TlsFilesError::Corrupt { which: "key", .. }
                     ),
                     "{name}, certificate present {cert_present}: {error}"
                 );
@@ -447,7 +456,8 @@ mod tests {
                     error,
                     TlsFilesError::NotAPair(_)
                         | TlsFilesError::Corrupt {
-                            which: "certificate"
+                            which: "certificate",
+                            ..
                         }
                 ),
                 "{name}: {error}"

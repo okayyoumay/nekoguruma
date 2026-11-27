@@ -233,8 +233,9 @@ fn check_private_meta(meta: &std::fs::Metadata) -> Result<(), FileFault> {
 /// Why [`create_by_link`] failed.
 #[derive(Debug)]
 pub(crate) enum LinkFault {
-    /// The operating system has no randomness for the temporary name.
-    Random,
+    /// The operating system has no randomness for the temporary name; the source is the
+    /// generator's error.
+    Random(shared_crypto::RandomError),
     Io {
         op: &'static str,
         error: io::Error,
@@ -255,7 +256,7 @@ pub(crate) fn create_by_link(
     bytes: &[u8],
 ) -> Result<bool, LinkFault> {
     let suffix: String = shared_crypto::random_32()
-        .map_err(|_| LinkFault::Random)?
+        .map_err(LinkFault::Random)?
         .iter()
         .take(16)
         .map(|b| format!("{b:02x}"))

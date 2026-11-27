@@ -2853,6 +2853,7 @@ mod tests {
             JournalError::Corrupt {
                 offset: 12,
                 reason: "checksum",
+                source: None,
             },
             JournalError::UnsupportedVersion(9),
             JournalError::WrongJob,

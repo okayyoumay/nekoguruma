@@ -39,8 +39,9 @@ pub(super) fn ioctl_input_to_owned(input_data: DataItem) -> Result<OwnedDataItem
                     let filter_type = match vci_service_interface::PduFilter::try_from(
                         f.filter_type,
                     )
-                    .map_err(|_| Status::invalid_argument("filter.filter_type is invalid"))?
-                    {
+                    .map_err(|e| {
+                        Status::invalid_argument(format!("filter.filter_type is invalid: {e}"))
+                    })? {
                         vci_service_interface::PduFilter::PduFltPass => E_PDU_FILTER::PDU_FLT_PASS,
                         vci_service_interface::PduFilter::PduFltBlock => {
                             E_PDU_FILTER::PDU_FLT_BLOCK
@@ -70,8 +71,8 @@ pub(super) fn ioctl_input_to_owned(input_data: DataItem) -> Result<OwnedDataItem
         )),
         Some(DataItemData::EventQueueProperty(value)) => {
             let queue_mode = match vci_service_interface::PduQueueMode::try_from(value.queue_mode)
-                .map_err(|_| {
-                Status::invalid_argument("event_queue_property.queue_mode is invalid")
+                .map_err(|e| {
+                Status::invalid_argument(format!("event_queue_property.queue_mode is invalid: {e}"))
             })? {
                 vci_service_interface::PduQueueMode::PduQueUnlimited => {
                     E_PDU_QUEUE_MODE::PDU_QUE_UNLIMITED

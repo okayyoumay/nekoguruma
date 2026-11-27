@@ -490,10 +490,19 @@ pub struct IoTlsCertificateData {
 pub enum DPduApiError {
     LibLoading(iso22900_sys::libloading::Error),
     PduError(UNUM32),
-    InvalidShortName,
+    /// A short name or other text holds an interior NUL byte; the source is the conversion's
+    /// error.
+    InvalidShortName(std::ffi::NulError),
     NullPointer(&'static str),
     Unsupported(&'static str),
-    CallbackRegistryPoisoned,
+    /// A size or count of a payload does not fit its D-PDU API field; the source is the integer
+    /// conversion's error.
+    UnsupportedSize {
+        what: &'static str,
+        source: std::num::TryFromIntError,
+    },
+    /// The callback registry's lock is poisoned; the text is the lock error's.
+    CallbackRegistryPoisoned(String),
 }
 
 impl fmt::Display for DPduApiError {
@@ -501,10 +510,14 @@ impl fmt::Display for DPduApiError {
         match self {
             Self::LibLoading(error) => write!(f, "library loading error: {error}"),
             Self::PduError(code) => write!(f, "PDU error code: {code:#010x}"),
-            Self::InvalidShortName => write!(f, "short name contains an interior NUL byte"),
+            Self::InvalidShortName(_) => write!(f, "short name contains an interior NUL byte"),
             Self::NullPointer(name) => write!(f, "received null pointer for {name}"),
-            Self::Unsupported(name) => write!(f, "unsupported ISO22900 payload: {name}"),
-            Self::CallbackRegistryPoisoned => write!(f, "callback registry is poisoned"),
+            Self::Unsupported(name) | Self::UnsupportedSize { what: name, .. } => {
+                write!(f, "unsupported ISO22900 payload: {name}")
+            }
+            Self::CallbackRegistryPoisoned(reason) => {
+                write!(f, "callback registry is poisoned: {reason}")
+            }
         }
     }
 }
@@ -513,13 +526,20 @@ impl std::error::Error for DPduApiError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::LibLoading(error) => Some(error),
+            Self::InvalidShortName(error) => Some(error),
+            Self::UnsupportedSize { source, .. } => Some(source),
             Self::PduError(_)
-            | Self::InvalidShortName
             | Self::NullPointer(_)
             | Self::Unsupported(_)
-            | Self::CallbackRegistryPoisoned => None,
+            | Self::CallbackRegistryPoisoned(_) => None,
         }
     }
+}
+
+/// The error for a poisoned callback registry lock. The guard in the lock error cannot be kept,
+/// so its text is.
+fn poisoned<T>(error: std::sync::PoisonError<T>) -> DPduApiError {
+    DPduApiError::CallbackRegistryPoisoned(error.to_string())
 }
 
 impl From<iso22900_sys::libloading::Error> for DPduApiError {
@@ -940,7 +960,7 @@ impl DPduApi {
         self.api_tag_context
             .callbacks
             .lock()
-            .map_err(|_| DPduApiError::CallbackRegistryPoisoned)?
+            .map_err(poisoned)?
             .insert(key, Box::new(callback));
 
         let result = check(unsafe {
@@ -956,7 +976,7 @@ impl DPduApi {
                 .api_tag_context
                 .callbacks
                 .lock()
-                .map_err(|_| DPduApiError::CallbackRegistryPoisoned)?
+                .map_err(poisoned)?
                 .remove(&key);
         }
 
@@ -993,7 +1013,7 @@ impl DPduApi {
         self.api_tag_context
             .callbacks
             .lock()
-            .map_err(|_| DPduApiError::CallbackRegistryPoisoned)?
+            .map_err(poisoned)?
             .remove(&(module_handle, logical_link_handle));
         check(unsafe {
             self.sys
@@ -1007,7 +1027,7 @@ impl DPduApi {
         object_type: ObjectType,
         short_name: &str,
     ) -> Result<ObjectId, DPduApiError> {
-        let short_name = CString::new(short_name).map_err(|_| DPduApiError::InvalidShortName)?;
+        let short_name = CString::new(short_name).map_err(DPduApiError::InvalidShortName)?;
         let mut object_id = 0;
         check(unsafe {
             self.sys.PDUGetObjectId(

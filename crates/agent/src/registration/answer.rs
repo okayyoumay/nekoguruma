@@ -24,11 +24,14 @@ const MAX_SIGNATURE_TEXT: usize = 128;
 const SIGNATURE_BYTES: usize = 64;
 
 /// Why an answer is refused, with the exit status it gives.
-#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum AnswerError {
     /// V1: the body is not the shape of a registration answer.
     #[error("not a registration answer")]
     NotAnAnswer,
+    /// V7: the fields cannot form the response transcript; the source says why.
+    #[error("not a registration answer")]
+    BadTranscript(#[source] shared_crypto::registration::TranscriptError),
     /// V2, V4, V5, V6: a field breaks its rule. The text names the field.
     #[error("not a registration answer: the {0} is not valid")]
     BadField(&'static str),
@@ -38,9 +41,9 @@ pub enum AnswerError {
          nothing was stored"
     )]
     KeyMismatch { local: String },
-    /// V7: the response signature does not verify.
+    /// V7: the response signature is malformed or does not verify; the source says which.
     #[error("the answer's signature does not verify; nothing was stored")]
-    BadSignature,
+    BadSignature(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
 impl AnswerError {
@@ -51,8 +54,10 @@ impl AnswerError {
 
     pub(crate) fn exit_kind(&self) -> Exit {
         match self {
-            AnswerError::KeyMismatch { .. } | AnswerError::BadSignature => Exit::NotAuthentic,
-            AnswerError::NotAnAnswer | AnswerError::BadField(_) => Exit::CannotRegister,
+            AnswerError::KeyMismatch { .. } | AnswerError::BadSignature(_) => Exit::NotAuthentic,
+            AnswerError::NotAnAnswer | AnswerError::BadTranscript(_) | AnswerError::BadField(_) => {
+                Exit::CannotRegister
+            }
         }
     }
 }
@@ -192,8 +197,8 @@ pub fn check(
         .filter(|bytes| bytes.len() == SIGNATURE_BYTES)
         .ok_or(AnswerError::BadField("signature"))?;
     // V7: a 64-byte value that is no signature fails here, as one that does not verify.
-    let signature =
-        Signature::from_bytes(&signature_bytes).map_err(|_| AnswerError::BadSignature)?;
+    let signature = Signature::from_bytes(&signature_bytes)
+        .map_err(|error| AnswerError::BadSignature(Box::new(error)))?;
     let transcript = ResponseTranscript::new(
         expected.code,
         expected.agent_key,
@@ -202,8 +207,9 @@ pub fn check(
         preset,
         fields.allow_remote,
     )
-    .map_err(|_| AnswerError::NotAnAnswer)?;
-    verify_response(&key, &transcript, &signature).map_err(|_| AnswerError::BadSignature)?;
+    .map_err(AnswerError::BadTranscript)?;
+    verify_response(&key, &transcript, &signature)
+        .map_err(|error| AnswerError::BadSignature(Box::new(error)))?;
     Ok(Verified {
         agent_id: fields.agent_id,
         owner_id: fields.owner_id,
@@ -291,10 +297,10 @@ mod tests {
         let f = Fixture::new();
         let good = f.answer().to_string();
         let expected = f.expected();
-        assert_eq!(
+        assert!(matches!(
             check(false, good.as_bytes(), &expected),
             Err(AnswerError::NotAnAnswer)
-        );
+        ));
         let padded = format!("{good}{}", " ".repeat(MAX_BODY));
         let mut cases: Vec<Vec<u8>> = vec![
             Vec::new(),
@@ -331,9 +337,8 @@ mod tests {
         flag["allowRemote"] = "false".into();
         cases.push(flag.to_string().into_bytes());
         for body in cases {
-            assert_eq!(
-                check(true, &body, &expected),
-                Err(AnswerError::NotAnAnswer),
+            assert!(
+                matches!(check(true, &body, &expected), Err(AnswerError::NotAnAnswer)),
                 "{}",
                 String::from_utf8_lossy(&body[..body.len().min(80)])
             );
@@ -353,10 +358,10 @@ mod tests {
         ] {
             let mut answer = f.answer();
             answer["instructionKey"] = key.into();
-            assert_eq!(
+            assert!(matches!(
                 f.check(&answer),
                 Err(AnswerError::BadField("instruction key"))
-            );
+            ));
         }
     }
 
@@ -438,9 +443,8 @@ mod tests {
         for (field, value, name) in cases {
             let mut answer = f.answer();
             answer[field] = value.into();
-            assert_eq!(
-                f.check(&answer),
-                Err(AnswerError::BadField(name)),
+            assert!(
+                matches!(f.check(&answer), Err(AnswerError::BadField(got)) if got == name),
                 "{field}"
             );
         }
@@ -465,9 +469,8 @@ mod tests {
         ] {
             let mut answer = f.answer();
             answer["signature"] = signature.clone().into();
-            assert_eq!(
-                f.check(&answer),
-                Err(AnswerError::BadField("signature")),
+            assert!(
+                matches!(f.check(&answer), Err(AnswerError::BadField("signature"))),
                 "{signature}"
             );
         }
@@ -475,7 +478,10 @@ mod tests {
         if url_safe != good {
             let mut answer = f.answer();
             answer["signature"] = url_safe.into();
-            assert_eq!(f.check(&answer), Err(AnswerError::BadField("signature")));
+            assert!(matches!(
+                f.check(&answer),
+                Err(AnswerError::BadField("signature"))
+            ));
         }
     }
 
@@ -494,7 +500,11 @@ mod tests {
             };
             // The answer was made for `f`'s code and agent; `g` is what the agent holds.
             let error = g.check(&f.answer()).unwrap_err();
-            assert_eq!(error, AnswerError::BadSignature);
+            assert!(matches!(error, AnswerError::BadSignature(_)));
+            assert!(
+                std::error::Error::source(&error).is_some(),
+                "the verifier's error is kept"
+            );
             assert_eq!(error.exit_code(), 6);
         }
         for (field, value) in [
@@ -508,11 +518,17 @@ mod tests {
         ] {
             let mut answer = f.answer();
             answer[field] = value;
-            assert_eq!(f.check(&answer), Err(AnswerError::BadSignature), "{field}");
+            assert!(
+                matches!(f.check(&answer), Err(AnswerError::BadSignature(_))),
+                "{field}"
+            );
         }
         // 64 bytes that are no signature at all.
         let mut answer = f.answer();
         answer["signature"] = STANDARD.encode([0u8; 64]).into();
-        assert_eq!(f.check(&answer), Err(AnswerError::BadSignature));
+        assert!(matches!(
+            f.check(&answer),
+            Err(AnswerError::BadSignature(_))
+        ));
     }
 }

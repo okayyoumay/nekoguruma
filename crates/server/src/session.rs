@@ -343,30 +343,33 @@ impl Reason {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 enum Judged {
-    Refused(Reason),
+    /// The session is refused. The error is the check's own, when the refusal came from one; it is
+    /// logged on the server and never sent.
+    Refused(Reason, Option<Box<dyn std::error::Error + Send + Sync>>),
     /// The server's own data is unusable.
-    Internal(&'static str),
+    Internal(String),
 }
 
 /// Decides on the agent's row (`public_key`, revoked) and the proof, with no I/O. An unknown or
 /// revoked agent is refused without checking the signature.
 fn judge(row: Option<(Vec<u8>, bool)>, shaped: &Shaped, audience: &Audience) -> Result<(), Judged> {
     let Some((der, revoked)) = row else {
-        return Err(Judged::Refused(Reason::UnknownAgent));
+        return Err(Judged::Refused(Reason::UnknownAgent, None));
     };
     if revoked {
-        return Err(Judged::Refused(Reason::Revoked));
+        return Err(Judged::Refused(Reason::Revoked, None));
     }
     let key = PublicKey::from_spki_der(&der)
-        .map_err(|_| Judged::Internal("the stored public key does not decode"))?;
+        .map_err(|e| Judged::Internal(format!("the stored public key does not decode: {e}")))?;
     let transcript =
         ProofTranscript::new(audience, &shaped.agent_id, shaped.challenge, shaped.nonce)
-            .map_err(|_| Judged::Internal("the transcript could not be built"))?;
-    let signature =
-        Signature::from_bytes(&shaped.proof).map_err(|_| Judged::Refused(Reason::Proof))?;
-    verify_proof(&key, &transcript, &signature).map_err(|_| Judged::Refused(Reason::Proof))
+            .map_err(|e| Judged::Internal(format!("the transcript could not be built: {e}")))?;
+    let signature = Signature::from_bytes(&shaped.proof)
+        .map_err(|e| Judged::Refused(Reason::Proof, Some(Box::new(e))))?;
+    verify_proof(&key, &transcript, &signature)
+        .map_err(|e| Judged::Refused(Reason::Proof, Some(Box::new(e))))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -551,10 +554,10 @@ pub async fn session(State(exchange): State<Exchange>, request: Request) -> Resp
         Ok(()) => {}
         // The clock is read again after the row read, so instants enter the refusal limiter in
         // order, as in registration.
-        Err(Judged::Refused(reason)) => {
-            return inner.refuse(reason, &shaped.agent_id, self::now());
+        Err(Judged::Refused(reason, cause)) => {
+            return inner.refuse(reason, &shaped.agent_id, cause.as_deref(), self::now());
         }
-        Err(Judged::Internal(what)) => return inner.internal(Some(&shaped.agent_id), what, now),
+        Err(Judged::Internal(what)) => return inner.internal(Some(&shaped.agent_id), &what, now),
     }
 
     // The token's lifetime starts when it is minted: the clock is read again after the row read,
@@ -630,9 +633,21 @@ impl Inner {
 
     /// Logs a refusal through its reason's gate, then answers 403, or 429 when the limiter says
     /// so.
-    fn refuse(&self, reason: Reason, agent_id: &str, now: Instant) -> Response {
+    fn refuse(
+        &self,
+        reason: Reason,
+        agent_id: &str,
+        cause: Option<&(dyn std::error::Error + Send + Sync + 'static)>,
+        now: Instant,
+    ) -> Response {
         if self.gates.allow(reason.slot(), now) {
-            tracing::warn!(reason = reason.word(), %agent_id, "session refused");
+            // The answer names no cause; the log does.
+            tracing::warn!(
+                reason = reason.word(),
+                %agent_id,
+                error = cause.map(|cause| cause as &(dyn std::error::Error + 'static)),
+                "session refused"
+            );
         }
         match self.refusals.admit(now) {
             Admission::Counted => {
@@ -1117,31 +1132,35 @@ mod tests {
         Some((key.public_key().to_spki_der(), revoked))
     }
 
+    /// True when `result` is a refusal for `reason`.
+    fn refused_for(result: &Result<(), Judged>, reason: Reason) -> bool {
+        matches!(result, Err(Judged::Refused(got, _)) if *got == reason)
+    }
+
     #[test]
     fn judge_decides_on_the_row_and_the_proof() {
         let c = case();
-        assert_eq!(judge(row(&c.key, false), &c.shaped, &c.audience), Ok(()));
+        judge(row(&c.key, false), &c.shaped, &c.audience).unwrap();
         // No row, and a revoked row whose signature is valid.
-        assert_eq!(
-            judge(None, &c.shaped, &c.audience),
-            Err(Judged::Refused(Reason::UnknownAgent))
-        );
-        assert_eq!(
-            judge(row(&c.key, true), &c.shaped, &c.audience),
-            Err(Judged::Refused(Reason::Revoked))
-        );
-        let proof_refused = Err(Judged::Refused(Reason::Proof));
+        assert!(refused_for(
+            &judge(None, &c.shaped, &c.audience),
+            Reason::UnknownAgent
+        ));
+        assert!(refused_for(
+            &judge(row(&c.key, true), &c.shaped, &c.audience),
+            Reason::Revoked
+        ));
         // Another key.
         let other = SigningKey::generate().unwrap();
-        assert_eq!(
-            judge(row(&other, false), &c.shaped, &c.audience),
-            proof_refused
-        );
+        assert!(refused_for(
+            &judge(row(&other, false), &c.shaped, &c.audience),
+            Reason::Proof
+        ));
         // Another audience (the server's own is another port).
-        assert_eq!(
-            judge(row(&c.key, false), &c.shaped, &audience(8081)),
-            proof_refused
-        );
+        assert!(refused_for(
+            &judge(row(&c.key, false), &c.shaped, &audience(8081)),
+            Reason::Proof
+        ));
         // Another agent ID, challenge and nonce in the request than in the proof.
         let id2 = "ffffffff-4e5f-4a6b-8c7d-0123456789ab";
         let with = |f: &dyn Fn(&mut Shaped)| {
@@ -1156,24 +1175,47 @@ mod tests {
             f(&mut s);
             judge(row(&c.key, false), &s, &c.audience)
         };
-        assert_eq!(with(&|s| s.agent_id = id2.to_owned()), proof_refused);
-        assert_eq!(with(&|s| s.challenge = fresh()), proof_refused);
-        assert_eq!(with(&|s| s.nonce = fresh()), proof_refused);
+        assert!(refused_for(
+            &with(&|s| s.agent_id = id2.to_owned()),
+            Reason::Proof
+        ));
+        assert!(refused_for(
+            &with(&|s| s.challenge = fresh()),
+            Reason::Proof
+        ));
+        assert!(refused_for(&with(&|s| s.nonce = fresh()), Reason::Proof));
         // The same signature over the proof tag's other purpose cannot be told apart from a bad
         // one; the all-zero pair is no signature at all.
-        assert_eq!(with(&|s| s.proof = [0u8; 64]), proof_refused);
+        assert!(refused_for(&with(&|s| s.proof = [0u8; 64]), Reason::Proof));
         // The high-S twin of the valid signature.
-        assert_eq!(with(&|s| s.proof = high_s(s.proof)), proof_refused);
+        assert!(refused_for(
+            &with(&|s| s.proof = high_s(s.proof)),
+            Reason::Proof
+        ));
         // A stored key that does not decode is the server's own fault.
         assert!(matches!(
             judge(Some((vec![1, 2, 3], false)), &c.shaped, &c.audience),
             Err(Judged::Internal(_))
         ));
         // A revoked row is judged before its key is decoded.
-        assert_eq!(
-            judge(Some((vec![1, 2, 3], true)), &c.shaped, &c.audience),
-            Err(Judged::Refused(Reason::Revoked))
-        );
+        assert!(refused_for(
+            &judge(Some((vec![1, 2, 3], true)), &c.shaped, &c.audience),
+            Reason::Revoked
+        ));
+    }
+
+    #[test]
+    fn a_refused_proof_keeps_the_checks_error_and_an_unknown_agent_has_none() {
+        let c = case();
+        let other = SigningKey::generate().unwrap();
+        assert!(matches!(
+            judge(row(&other, false), &c.shaped, &c.audience),
+            Err(Judged::Refused(Reason::Proof, Some(_)))
+        ));
+        assert!(matches!(
+            judge(None, &c.shaped, &c.audience),
+            Err(Judged::Refused(Reason::UnknownAgent, None))
+        ));
     }
 
     /// The signature with `s` replaced by the group order minus `s`.

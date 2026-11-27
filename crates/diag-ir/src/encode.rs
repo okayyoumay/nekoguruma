@@ -43,9 +43,15 @@ pub enum EncodeError {
     /// The value is not of a kind the field's type takes.
     #[error("field {field}: {reason}")]
     WrongKind { field: String, reason: &'static str },
-    /// The value is of the right kind but the field cannot hold it.
+    /// The value is of the right kind but the field cannot hold it. `source` is the integer
+    /// conversion's error when a conversion found it out.
     #[error("field {field}: {reason}")]
-    OutOfRange { field: String, reason: &'static str },
+    OutOfRange {
+        field: String,
+        reason: &'static str,
+        #[source]
+        source: Option<std::num::TryFromIntError>,
+    },
     /// The field breaks a rule of `ir.fbs` that a frontend must enforce.
     #[error("field {field} is not a valid encode plan: {reason}")]
     InvalidPlan { field: String, reason: &'static str },
@@ -217,7 +223,7 @@ fn write(
         DataKind::Uint => {
             check_width(field, (1..=64).contains(&width))?;
             let n = int(field, value)?;
-            let n = u64::try_from(n).map_err(|_| range(field, "a negative value"))?;
+            let n = u64::try_from(n).map_err(|e| range_from(field, "a negative value", e))?;
             if width < 64 && n >> width != 0 {
                 return Err(range(field, "a value wider than the field"));
             }
@@ -238,7 +244,7 @@ fn write(
         DataKind::Bcd => {
             check_width(field, width.is_multiple_of(4) && (4..=64).contains(&width))?;
             let n = int(field, value)?;
-            let mut n = u64::try_from(n).map_err(|_| range(field, "a negative value"))?;
+            let mut n = u64::try_from(n).map_err(|e| range_from(field, "a negative value", e))?;
             let mut raw = 0u64;
             for digit in 0..width / 4 {
                 raw |= (n % 10) << (digit * 4);
@@ -308,7 +314,8 @@ fn string_bytes(field: &Field<'_>, value: ParamValue<'_>) -> Result<Vec<u8>, Enc
         (DataKind::Ascii, ParamValue::Text(t)) => t
             .chars()
             .map(|c| {
-                u8::try_from(u32::from(c)).map_err(|_| range(field, "a character above U+00FF"))
+                u8::try_from(u32::from(c))
+                    .map_err(|e| range_from(field, "a character above U+00FF", e))
             })
             .collect(),
         (DataKind::Utf8, ParamValue::Text(t)) => Ok(t.as_bytes().to_vec()),
@@ -318,7 +325,7 @@ fn string_bytes(field: &Field<'_>, value: ParamValue<'_>) -> Result<Vec<u8>, Enc
             for c in t.chars() {
                 // The decoder reads one UTF-16 unit per character and refuses surrogates.
                 let unit = u16::try_from(u32::from(c))
-                    .map_err(|_| range(field, "a character above U+FFFF"))?;
+                    .map_err(|e| range_from(field, "a character above U+FFFF", e))?;
                 out.extend_from_slice(&if little {
                     unit.to_le_bytes()
                 } else {
@@ -503,6 +510,20 @@ fn range(field: &Field<'_>, reason: &'static str) -> EncodeError {
     EncodeError::OutOfRange {
         field: name(field),
         reason,
+        source: None,
+    }
+}
+
+/// [`range`] for a value that an integer conversion refused.
+fn range_from(
+    field: &Field<'_>,
+    reason: &'static str,
+    source: std::num::TryFromIntError,
+) -> EncodeError {
+    EncodeError::OutOfRange {
+        field: name(field),
+        reason,
+        source: Some(source),
     }
 }
 

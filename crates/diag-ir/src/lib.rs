@@ -996,7 +996,10 @@ impl Vm {
                     return Err(VmError::TypeMismatch.into());
                 };
                 let index = byte_index(*index, bytes.len())?;
-                let value = u8::try_from(*value).map_err(|_| VmError::ByteOutOfRange(*value))?;
+                let value = u8::try_from(*value).map_err(|e| VmError::ByteOutOfRange {
+                    value: *value,
+                    cause: e.to_string(),
+                })?;
                 self.state.stack.truncate(self.state.stack.len() - 2);
                 let Some(Value::Bytes(bytes)) = self.state.stack.last_mut() else {
                     unreachable!("checked by top");
@@ -1101,7 +1104,10 @@ impl Vm {
             // stepping again gives the same outcome (ADR-280).
             Op::Fail { code } => {
                 let code = std::str::from_utf8(constant(program, *code)?)
-                    .map_err(|_| VmError::InvalidUtf8(*code))?
+                    .map_err(|e| VmError::InvalidUtf8 {
+                        constant: *code,
+                        cause: e.to_string(),
+                    })?
                     .to_owned();
                 let detail = failure_detail_prefix(self.bytes_operand()?).to_vec();
                 return Ok(Executed::Failed(Failure { code, detail }));
@@ -1143,15 +1149,22 @@ impl Vm {
                 HostInput::Nothing
             }
             Op::Log { message, .. } => HostInput::Text(
-                std::str::from_utf8(constant(program, *message)?)
-                    .map_err(|_| VmError::InvalidUtf8(*message))?,
+                std::str::from_utf8(constant(program, *message)?).map_err(|e| {
+                    VmError::InvalidUtf8 {
+                        constant: *message,
+                        cause: e.to_string(),
+                    }
+                })?,
             ),
             Op::Wait { .. } | Op::MonitorCapture { .. } => HostInput::Nothing,
             // The duration is the `I64` on top of the stack, which is popped once the wait is over.
             Op::WaitFromStack => match self.top(1)?[0] {
-                Value::I64(millis) => HostInput::Millis(
-                    u32::try_from(millis).map_err(|_| VmError::WaitOutOfRange(millis))?,
-                ),
+                Value::I64(millis) => HostInput::Millis(u32::try_from(millis).map_err(|e| {
+                    VmError::WaitOutOfRange {
+                        millis,
+                        cause: e.to_string(),
+                    }
+                })?),
                 _ => return Err(VmError::TypeMismatch),
             },
             // Not a diagnostic primitive: checked during execution.
@@ -1241,7 +1254,10 @@ impl Vm {
                 Value::Bool(b) => Ok(hmi::HmiValue::Bool(*b)),
                 Value::Bytes(bytes) => std::str::from_utf8(bytes)
                     .map(|text| hmi::HmiValue::Text(text.to_owned()))
-                    .map_err(|_| VmError::InvalidUtf8(index)),
+                    .map_err(|e| VmError::InvalidUtf8 {
+                        constant: index,
+                        cause: e.to_string(),
+                    }),
                 Value::F64(_) => Err(VmError::TypeMismatch),
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -1507,15 +1523,16 @@ fn flash_block_range(
     index: i64,
 ) -> Result<(u64, u32), VmError> {
     let (artifact_offset, block_size, length) = declared_segment(variant, session, segment)?;
-    let out_of_range = || VmError::BlockOutOfRange {
+    let out_of_range = |cause: Option<String>| VmError::BlockOutOfRange {
         session,
         segment,
         index,
+        cause,
     };
-    let block = u64::try_from(index).map_err(|_| out_of_range())?;
+    let block = u64::try_from(index).map_err(|e| out_of_range(Some(e.to_string())))?;
     let size = u64::from(block_size);
     if block >= length.div_ceil(size) {
-        return Err(out_of_range());
+        return Err(out_of_range(None));
     }
     // Sums that `declared_segment` already bounded; the products are checked again because the
     // document is data from outside.
@@ -1561,15 +1578,22 @@ fn decode_field(
     // Checked before decoding: an unknown or shaped field is an error of the program whatever
     // the response holds, so it is not reported as an undecodable response.
     let positive = declared_positive(variant, service, field)?;
-    let fields = decode::decode_positive_response(&positive, variant.layouts(), message)
-        .map_err(|_| VmError::Undecodable { service })?;
+    let fields =
+        decode::decode_positive_response(&positive, variant.layouts(), message).map_err(|e| {
+            VmError::Undecodable {
+                service,
+                cause: e.to_string(),
+            }
+        })?;
     let decoded = fields
         .into_iter()
         .find(|f| f.id == field)
         .ok_or_else(unknown)?;
     Ok(match decoded.value {
         decode::PhysicalValue::Unsigned(n) => {
-            Value::I64(i64::try_from(n).map_err(|_| VmError::Overflow)?)
+            Value::I64(i64::try_from(n).map_err(|e| VmError::UnsignedOutOfRange {
+                cause: e.to_string(),
+            })?)
         }
         decode::PhysicalValue::Signed(n) => Value::I64(n),
         decode::PhysicalValue::Float(x) => Value::F64(x),
@@ -1763,14 +1787,18 @@ pub enum VmError {
     #[error("invalid constant index: {0}")]
     BadConstant(u32),
     /// Also the error of an HMI form's text operand that is not UTF-8, with the form's constant.
-    #[error("constant {0}, or a text operand of the HMI form it holds, is not valid UTF-8")]
-    InvalidUtf8(u32),
+    /// `cause` is the text of the UTF-8 error.
+    #[error(
+        "constant {constant}, or a text operand of the HMI form it holds, is not valid UTF-8: {cause}"
+    )]
+    InvalidUtf8 { constant: u32, cause: String },
     #[error("variable slot {0} is not set")]
     UndefinedVariable(u16),
     #[error("index out of range: {0}")]
     IndexOutOfRange(i64),
-    #[error("byte value out of range: {0}")]
-    ByteOutOfRange(i64),
+    /// `cause` is the text of the integer conversion error.
+    #[error("byte value out of range: {value}: {cause}")]
+    ByteOutOfRange { value: i64, cause: String },
     #[error("byte string of {0} bytes is longer than {MAX_BYTES_LEN}")]
     BytesTooLong(u64),
     #[error("float is NaN, infinite or outside the integer range")]
@@ -1781,23 +1809,31 @@ pub enum VmError {
     UnknownField { service: u32, field: u32 },
     #[error("field {field} of service {service} is a nested layout, not a value")]
     ShapedField { service: u32, field: u32 },
-    #[error("the response does not decode as service {service}'s positive response")]
-    Undecodable { service: u32 },
+    /// `cause` is the text of the decode error.
+    #[error("the response does not decode as service {service}'s positive response: {cause}")]
+    Undecodable { service: u32, cause: String },
     #[error("service {service} has no declared positive response to send-receive")]
     UnknownService { service: u32 },
-    #[error("wait duration out of range: {0}")]
-    WaitOutOfRange(i64),
+    /// `cause` is the text of the integer conversion error.
+    #[error("wait duration out of range: {millis}: {cause}")]
+    WaitOutOfRange { millis: i64, cause: String },
     #[error("the declarations have no flash session {session}")]
     UnknownFlashSession { session: u32 },
     #[error("flash session {session} has no segment {segment}")]
     UnknownFlashSegment { session: u32, segment: u32 },
     #[error("segment {segment} of flash session {session} declares a block size of zero")]
     ZeroBlockSize { session: u32, segment: u32 },
-    #[error("block {index} is outside segment {segment} of flash session {session}")]
+    /// `cause` is the text of the integer conversion error, when the index was refused because
+    /// it does not convert (a negative index); `None` when it converted and lies past the end.
+    #[error(
+        "block {index} is outside segment {segment} of flash session {session}{}",
+        cause_suffix(cause.as_deref())
+    )]
     BlockOutOfRange {
         session: u32,
         segment: u32,
         index: i64,
+        cause: Option<String>,
     },
     #[error("the host gave {got} artifact bytes for a block of {expected}")]
     ArtifactLength { expected: u32, got: u64 },
@@ -1808,6 +1844,15 @@ pub enum VmError {
     HmiFormTooLong(u64),
     #[error("target {0} is not in the program's target list")]
     BadTarget(u8),
+    /// A decoded unsigned field value does not fit an `I64`; `cause` is the text of the integer
+    /// conversion error.
+    #[error("a decoded unsigned value does not fit a signed 64-bit integer: {cause}")]
+    UnsignedOutOfRange { cause: String },
+}
+
+/// The `: cause` a [`VmError`] message ends with when it has a cause, and nothing otherwise.
+fn cause_suffix(cause: Option<&str>) -> String {
+    cause.map_or_else(String::new, |c| format!(": {c}"))
 }
 
 #[cfg(test)]

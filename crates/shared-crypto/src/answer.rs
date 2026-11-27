@@ -292,7 +292,10 @@ mod tests {
         let all = variants();
         assert_eq!(all.len(), 8);
         for t in all {
-            assert_eq!(verify(&pk, &t, &sig), Err(VerifyError::Mismatch), "{t:?}");
+            assert!(
+                matches!(verify(&pk, &t, &sig), Err(VerifyError::Mismatch { .. })),
+                "{t:?}"
+            );
         }
     }
 
@@ -364,7 +367,10 @@ mod tests {
         let key = SigningKey::generate().unwrap();
         let sig = sign(&key, &base()).unwrap();
         let other = SigningKey::generate().unwrap().public_key();
-        assert_eq!(verify(&other, &base(), &sig), Err(VerifyError::Mismatch));
+        assert!(matches!(
+            verify(&other, &base(), &sig),
+            Err(VerifyError::Mismatch { .. })
+        ));
     }
 
     #[test]

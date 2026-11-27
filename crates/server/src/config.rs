@@ -113,7 +113,8 @@ impl Database {
     /// in the server's environment, still reaches the connection.
     pub(crate) fn connect_options(&self) -> Result<PgConnectOptions, ConfigError> {
         let text = self.url.expose();
-        let url = url::Url::parse(text).map_err(|_| ConfigError::DatabaseUrl)?;
+        let url =
+            url::Url::parse(text).map_err(|e| ConfigError::DatabaseUrl { source: Some(e) })?;
         let complete = matches!(url.scheme(), "postgres" | "postgresql")
             && url.host_str().is_some_and(|h| !h.is_empty())
             && !url.username().is_empty()
@@ -122,9 +123,14 @@ impl Database {
             && url.query().is_none()
             && url.fragment().is_none();
         if !complete {
-            return Err(ConfigError::DatabaseUrl);
+            return Err(ConfigError::DatabaseUrl { source: None });
         }
-        let options = PgConnectOptions::from_str(text).map_err(|_| ConfigError::DatabaseUrl)?;
+        #[expect(
+            clippy::map_err_ignore,
+            reason = "sqlx's error for a URL it refuses may repeat a part of the URL, which holds the password, so it cannot be kept as a source"
+        )]
+        let options = PgConnectOptions::from_str(text)
+            .map_err(|_| ConfigError::DatabaseUrl { source: None })?;
         Ok(options
             .port(url.port().unwrap_or(5432))
             .ssl_mode(PgSslMode::Disable)
@@ -271,11 +277,17 @@ pub enum ConfigError {
          {MAX_CONNECT_TIMEOUT_SECS}"
     )]
     ConnectTimeout,
-    /// The URL is not shown: it holds the password.
+    /// The URL is not shown: it holds the password. `source` is the URL parser's error when
+    /// that is what refused it (its text never holds a part of the URL), and `None` for a URL
+    /// that parses but is not of the accepted shape or that sqlx refuses (sqlx's message may
+    /// repeat a part of the URL).
     #[error(
         "invalid configuration: database.url is not a postgres://user:password@host[:port]/database URL without parameters"
     )]
-    DatabaseUrl,
+    DatabaseUrl {
+        #[source]
+        source: Option<url::ParseError>,
+    },
     #[error("invalid configuration: instruction_key.path must be an absolute path")]
     InstructionKeyPath,
     #[error("invalid configuration: the [object_server] table is required")]
@@ -795,7 +807,7 @@ mod tests {
             )
             .unwrap();
             let error = Config::load(&path).unwrap_err();
-            assert!(matches!(error, ConfigError::DatabaseUrl), "{url}");
+            assert!(matches!(error, ConfigError::DatabaseUrl { .. }), "{url}");
             let shown = format!("{error} / {error:?}");
             assert!(!shown.contains("s3cret-value"), "{shown}");
         }

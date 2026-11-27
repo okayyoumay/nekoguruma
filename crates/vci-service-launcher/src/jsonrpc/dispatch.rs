@@ -106,11 +106,18 @@ pub async fn dispatch<C: JsonRpcHandler>(
                 .and_then(|p| p.get("key"))
                 .and_then(Value::as_str)
                 .ok_or_else(|| JsonRpcError::invalid_params("missing 'key' parameter"))?;
+            #[expect(
+                clippy::map_err_ignore,
+                reason = "the base64 error names a character of the key, which is a secret"
+            )]
             let decoded = base64::engine::general_purpose::STANDARD
                 .decode(key_b64)
                 .map_err(|_| JsonRpcError::invalid_params("'key' must be valid base64"))?;
-            let key: [u8; 32] = decoded.try_into().map_err(|_| {
-                JsonRpcError::invalid_params("'key' must decode to exactly 32 bytes")
+            let key: [u8; 32] = decoded.try_into().map_err(|rejected: Vec<u8>| {
+                JsonRpcError::invalid_params(format!(
+                    "'key' must decode to exactly 32 bytes: got {} bytes",
+                    rejected.len()
+                ))
             })?;
 
             match ctx {

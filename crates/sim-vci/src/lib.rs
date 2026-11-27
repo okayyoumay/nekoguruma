@@ -146,19 +146,23 @@ fn unix_ms(at: SystemTime) -> u64 {
 /// its timers: `Ok(None)` if there is no such file, `Err(())` if it cannot be read (for any other
 /// reason than not existing), is not a state file of this version, or holds a state the ECU
 /// could not have been in.
-fn load_ecu_state(path: &Path) -> Result<Option<SimEcu>, ()> {
+fn load_ecu_state(path: &Path) -> Result<Option<SimEcu>, String> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Err(()),
+        Err(error) => return Err(format!("state file unreadable: {error}")),
     };
     // The version comes first and is checked before the rest is decoded: a file of another
     // version has another layout, which could otherwise decode into wrong fields.
-    let (version, _) = postcard::take_from_bytes::<u32>(&bytes).map_err(|_| ())?;
+    let (version, _) = postcard::take_from_bytes::<u32>(&bytes)
+        .map_err(|e| format!("state file version unreadable: {e}"))?;
     if version != STATE_FILE_VERSION {
-        return Err(());
+        return Err(format!(
+            "state file has version {version}, not {STATE_FILE_VERSION}"
+        ));
     }
-    let state: StateFile = postcard::from_bytes(&bytes).map_err(|_| ())?;
+    let state: StateFile =
+        postcard::from_bytes(&bytes).map_err(|e| format!("state file does not decode: {e}"))?;
     // A wall clock set back since the write counts as no time passed.
     let elapsed = unix_ms(SystemTime::now()).saturating_sub(state.saved_at_ms);
     SimEcu::restore(
@@ -167,7 +171,7 @@ fn load_ecu_state(path: &Path) -> Result<Option<SimEcu>, ()> {
         Duration::from_millis(elapsed),
     )
     .map(Some)
-    .map_err(|_| ())
+    .map_err(|e| format!("state file holds an invalid snapshot: {e}"))
 }
 
 /// Writes `ecu`'s state to `path`, through a temporary file renamed over it, so a process killed
@@ -526,10 +530,14 @@ impl Bus {
     /// ([`ECU_STATE_ENV`]) when there is one, and is otherwise created with the configuration
     /// from `NGR_SIM_ECU_CONFIG`. `ERR_FAILED` if the state file or the configuration cannot be
     /// read, or the new ECU's state cannot be written.
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "the cause of a failed state-file load has nowhere to go: a J2534 call answers with a status code and the simulator keeps no error descriptions (LAST_ERROR_TEXT)"
+    )]
     fn ecu(&mut self) -> Result<&mut SimEcu, PassThruUlong> {
         if self.ecu.is_none() {
             let restored = match &self.state_path {
-                Some(path) => load_ecu_state(path).map_err(|()| ERR_FAILED)?,
+                Some(path) => load_ecu_state(path).map_err(|_| ERR_FAILED)?,
                 None => None,
             };
             let ecu = match restored {
@@ -549,6 +557,10 @@ impl Bus {
 
     /// Writes the ECU's state to the state file, if there is one. `ERR_FAILED` if it cannot be
     /// written; the ECU keeps its new state in this process either way.
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "the I/O error of a failed state-file write has nowhere to go: a J2534 call answers with a status code and the simulator keeps no error descriptions (LAST_ERROR_TEXT)"
+    )]
     fn save_ecu(&mut self) -> Result<(), PassThruUlong> {
         match (&self.state_path, &mut self.ecu) {
             (Some(path), Some(ecu)) => save_ecu_state(path, ecu).map_err(|_| ERR_FAILED),

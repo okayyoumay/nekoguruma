@@ -68,7 +68,7 @@ impl std::fmt::Debug for PartTarget {
 }
 
 /// Why a URL was refused. The text of the URL is never repeated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Refused {
     #[error("the part URL is over the length limit")]
     TooLong,
@@ -78,6 +78,9 @@ pub enum Refused {
     Origin,
     #[error("the part URL's port is not a canonical number from 1 to 65535")]
     Port,
+    /// The port is canonical digits that do not fit 16 bits; the source is the parser's error.
+    #[error("the part URL's port is not a canonical number from 1 to 65535")]
+    PortOutOfRange(#[source] std::num::ParseIntError),
     #[error("the part URL has no path after its authority")]
     NoPath,
 }
@@ -120,7 +123,7 @@ fn port(digits: &str) -> Result<u16, Refused> {
     {
         return Err(Refused::Port);
     }
-    digits.parse::<u16>().map_err(|_| Refused::Port)
+    digits.parse::<u16>().map_err(Refused::PortOutOfRange)
 }
 
 #[cfg(test)]

@@ -66,7 +66,7 @@ enum InputError {
     #[error("the input holding the registration code is longer than {MAX_INPUT} bytes")]
     TooLong,
     #[error("the input holding the registration code is not UTF-8")]
-    NotUtf8,
+    NotUtf8(#[source] std::str::Utf8Error),
     #[error("the input holding the registration code starts with a byte order mark")]
     Bom,
     #[error("{0}")]
@@ -85,7 +85,7 @@ fn read_from(reader: impl Read) -> Result<RegistrationCode, InputError> {
     if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
         return Err(InputError::Bom);
     }
-    let text = std::str::from_utf8(&bytes).map_err(|_| InputError::NotUtf8)?;
+    let text = std::str::from_utf8(&bytes).map_err(InputError::NotUtf8)?;
     if text
         .trim_matches(|c: char| c.is_ascii_whitespace())
         .is_empty()
@@ -173,7 +173,10 @@ mod tests {
         );
         assert_eq!(exact.len(), MAX_INPUT);
         assert_eq!(parse(exact.as_bytes()).unwrap(), code);
-        assert_eq!(parse(&[0xFF, 0xFE, b'a']).unwrap_err(), InputError::NotUtf8);
+        assert!(matches!(
+            parse(&[0xFF, 0xFE, b'a']).unwrap_err(),
+            InputError::NotUtf8(_)
+        ));
         let mut bom = vec![0xEF, 0xBB, 0xBF];
         bom.extend_from_slice(code.as_str().as_bytes());
         assert_eq!(parse(&bom).unwrap_err(), InputError::Bom);

@@ -103,9 +103,9 @@ fn build_module_entries(
                         entry.label, entry.pname
                     )));
                 }
-                let pname = CString::new(entry.pname.clone()).map_err(|_| {
+                let pname = CString::new(entry.pname.clone()).map_err(|e| {
                     invalid_input(format!(
-                        "module {:?} pname {:?} must not contain an embedded NUL byte",
+                        "module {:?} pname {:?} must not contain an embedded NUL byte: {e}",
                         entry.label, entry.pname
                     ))
                 })?;
@@ -402,11 +402,9 @@ pub(crate) fn parse_startup_arg(startup_arg: &str) -> Result<StartupConfig, io::
                 "startup argument must not repeat the port query parameter",
             ));
         }
-        requested_port = Some(
-            value
-                .parse::<u16>()
-                .map_err(|_| invalid_input("port query parameter must be a valid u16"))?,
-        );
+        requested_port = Some(value.parse::<u16>().map_err(|e| {
+            invalid_input(format!("port query parameter must be a valid u16: {e}"))
+        })?);
     }
 
     let mode = mode.ok_or_else(|| {

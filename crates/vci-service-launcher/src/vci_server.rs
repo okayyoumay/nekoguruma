@@ -3,7 +3,7 @@ use std::{
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
 };
 
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -89,8 +89,14 @@ impl AuthKey {
 
         // Every verification failure reason maps to the same generic
         // message -- do not leak which specific check failed.
-        crate::token::verify(&key, token, std::time::SystemTime::now())
-            .map_err(|_| unauthenticated())?;
+        crate::token::verify(&key, token, std::time::SystemTime::now()).map_err(|error| {
+            // The cause stays on this side; the answer is the same for every reason.
+            debug!(
+                error = &error as &dyn std::error::Error,
+                "rejected a request: token verification failed"
+            );
+            unauthenticated()
+        })?;
 
         Ok(req)
     }

@@ -7179,7 +7179,10 @@ async fn write_can_frame(
             Ok(mut msg) => api
                 .write_messages(ctx.channel_id, std::slice::from_mut(&mut msg), 0)
                 .map(|_| ())
-                .map_err(|_| TxFailure::Event(PduErrorEvent::PduErrEvtTxError, None)),
+                .map_err(|error| {
+                    warn!(error = &error as &dyn std::error::Error, "transmit failed");
+                    TxFailure::Event(PduErrorEvent::PduErrEvtTxError, None)
+                }),
             Err(_) => Err(TxFailure::Event(PduErrorEvent::PduErrEvtFrameStruct, None)),
         }
     };
@@ -7629,7 +7632,10 @@ fn transmit_request_locked(
         Ok(mut msg) => api
             .write_messages(channel_id, std::slice::from_mut(&mut msg), 0)
             .map(|_| ())
-            .map_err(|_| TxFailure::Event(PduErrorEvent::PduErrEvtTxError, None)),
+            .map_err(|error| {
+                warn!(error = &error as &dyn std::error::Error, "transmit failed");
+                TxFailure::Event(PduErrorEvent::PduErrEvtTxError, None)
+            }),
         Err(_) => Err(TxFailure::Event(PduErrorEvent::PduErrEvtFrameStruct, None)),
     }
 }

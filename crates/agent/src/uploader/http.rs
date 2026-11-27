@@ -76,24 +76,39 @@ pub fn reads_body(status: u16) -> bool {
 }
 
 /// Why no answer came back.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// The connection was refused or the address is unreachable: nothing was sent.
-    NotSent,
+    /// The connection was refused or the address is unreachable: nothing was sent. The source is
+    /// the dial's error.
+    #[error("the connection failed; nothing was sent")]
+    NotSent(#[source] io::Error),
     /// The connect, or the TLS handshake after it, did not finish in time: nothing was sent.
+    #[error("the connect timed out; nothing was sent")]
     ConnectTimeout,
     /// The TLS handshake did not accept the server: nothing of the request was sent.
-    Tls(Refused),
+    #[error("the TLS handshake did not accept the server; nothing of the request was sent")]
+    Tls(#[source] Refused),
     /// No byte moved for [`NO_PROGRESS`].
+    #[error("no byte moved in time")]
     NoProgress,
     /// A JSON route did not finish within [`JSON_TOTAL`].
+    #[error("the request did not finish in time")]
     Timeout,
     /// The writer a GET streams into failed (the disk is full, the file cannot be written).
+    #[error("the writer failed: {0:?}")]
     Write(io::ErrorKind),
     /// The request may have been sent and no complete answer came: a reset, a head over the
     /// limits, an answer that is not HTTP, a body that is cut, or a request that could not be
-    /// built.
-    Failed,
+    /// built. The source is the failure the HTTP client reported, when there was one.
+    #[error("no complete answer came; the request may have been sent")]
+    Failed(#[source] Option<Box<dyn std::error::Error + Send + Sync>>),
+}
+
+impl Error {
+    /// [`Error::Failed`] caused by `source`.
+    fn failed(source: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Error::Failed(Some(Box::new(source)))
+    }
 }
 
 /// The body of an answer.
@@ -252,7 +267,7 @@ impl Client {
             || {
                 builder
                     .body(Full::new(Bytes::from(body)))
-                    .map_err(|_| Error::Failed)
+                    .map_err(Error::failed)
             },
             Some(JSON_TOTAL),
             request.reads,
@@ -289,7 +304,7 @@ impl Client {
             move || {
                 builder
                     .body(ChannelBody::start(length, source))
-                    .map_err(|_| Error::Failed)
+                    .map_err(Error::failed)
             },
             None,
             |_| false,
@@ -319,7 +334,7 @@ impl Client {
             .header(HOST, host)
             .header(CONNECTION, "close")
             .body(Empty::<Bytes>::new())
-            .map_err(|_| Error::Failed)?;
+            .map_err(Error::failed)?;
         let start = Instant::now();
         let progress = Progress::new(start);
         let stream = self.connect(port, Some(pin), start, &progress).await?;
@@ -339,11 +354,7 @@ impl Client {
         progress: &Progress,
     ) -> Result<Wire, Error> {
         let connecting = async {
-            let stream = self
-                .dial
-                .dial_port(port)
-                .await
-                .map_err(|_| Error::NotSent)?;
+            let stream = self.dial.dial_port(port).await.map_err(Error::NotSent)?;
             let stream = Tracked {
                 inner: stream,
                 progress: progress.clone(),
@@ -530,17 +541,14 @@ where
         .max_headers(MAX_HEADERS)
         .handshake::<_, B>(TokioIo::new(stream))
         .await
-        .map_err(|_| Error::Failed)?;
+        .map_err(Error::failed)?;
     let _driver = Driver(tokio::spawn(async move {
         let _ = connection.await;
     }));
     // The answer to a PUT is its status alone: a stored part is not undone by a body that is
     // late or cut.
     let is_put = request.method() == Method::PUT;
-    let response = sender
-        .send_request(request)
-        .await
-        .map_err(|_| Error::Failed)?;
+    let response = sender.send_request(request).await.map_err(Error::failed)?;
     let status = response.status().as_u16();
     let retry_after = single_text(response.headers(), &RETRY_AFTER);
     let proof = single_text(response.headers(), &HeaderName::from_static(PROOF_HEADER));
@@ -569,14 +577,11 @@ async fn exchange_get<W: Write + Send + 'static>(
         .max_headers(MAX_HEADERS)
         .handshake::<_, Empty<Bytes>>(TokioIo::new(stream))
         .await
-        .map_err(|_| Error::Failed)?;
+        .map_err(Error::failed)?;
     let _driver = Driver(tokio::spawn(async move {
         let _ = connection.await;
     }));
-    let response = sender
-        .send_request(request)
-        .await
-        .map_err(|_| Error::Failed)?;
+    let response = sender.send_request(request).await.map_err(Error::failed)?;
     let status = response.status().as_u16();
     let retry_after = single_text(response.headers(), &RETRY_AFTER);
     let answer = |body| Got {
@@ -629,7 +634,7 @@ async fn exchange_get<W: Write + Send + 'static>(
         Ok(Ok(writer)) if !failed && received == length => {
             Ok(answer(GetBody::Complete { length, writer }))
         }
-        Ok(Ok(_)) => Err(Error::Failed),
+        Ok(Ok(_)) => Err(Error::Failed(None)),
         Ok(Err(error)) => Err(Error::Write(error.kind())),
         Err(_) => Err(Error::Write(io::ErrorKind::Other)),
     }

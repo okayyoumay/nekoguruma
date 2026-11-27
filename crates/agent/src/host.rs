@@ -49,11 +49,18 @@ pub enum HostError {
     LinkHeld,
     #[error("the worker's event stream ended")]
     EventStreamEnded,
-    /// The ECU did not answer. Not the silence of a request whose positive response is
-    /// suppressed, which the VCI ended by its receive timeout with no pending seen: that is an
-    /// empty response (ADR-408).
+    /// The ECU did not answer, as the VCI's receive timeout or the link reports it; it carries
+    /// no `Elapsed`. [`HostError::DeadlinePassed`] is the agent's own deadline. Not the silence
+    /// of a request whose positive response is suppressed, which the VCI ended by its receive
+    /// timeout with no pending seen: that is an empty response (ADR-408).
     #[error("no response from the ECU")]
     NoResponse,
+    /// The ECU gave no response before the agent's own deadline ran out. The cause is the
+    /// timer's `Elapsed`. Everywhere the host judges an unanswered request it counts as
+    /// [`HostError::NoResponse`] (see [`HostError::is_no_response`]), and its text is the same, so
+    /// what the server and the logs read does not tell the two paths apart.
+    #[error("no response from the ECU")]
+    DeadlinePassed(#[source] tokio::time::error::Elapsed),
     /// The worker dropped events of the link, so the primitive's outcome is unknown: the
     /// request may have been answered.
     #[error("the worker lost events of the link")]
@@ -72,8 +79,10 @@ pub enum HostError {
     /// for it (for example a transmit error), so the request may not have been sent.
     #[error("the primitive failed: {}", error_event_name(*.0))]
     PrimitiveFailed(i32),
+    /// The value is not a one-byte service ID. The source is the failed narrowing, when there was
+    /// one (an empty request has no service byte to narrow).
     #[error("service {0:#x} is not a UDS service ID")]
-    BadService(u16),
+    BadService(u16, #[source] Option<std::num::TryFromIntError>),
     #[error(
         "service {0:#x} is not allowed: the agent's request policy refuses it (ADR-235 item 8, ADR-247)"
     )]
@@ -212,7 +221,7 @@ impl HostError {
         match self {
             // The agent refused before the start RPC.
             HostError::LinkHeld
-            | HostError::BadService(_)
+            | HostError::BadService(..)
             | HostError::NotAllowed(_)
             | HostError::EmptyRequest
             | HostError::UndeclaredService(_)
@@ -252,6 +261,7 @@ impl HostError {
                 refused_after_loss: false,
             }
             | HostError::NoResponse
+            | HostError::DeadlinePassed(_)
             | HostError::EventsLost
             | HostError::EventStreamEnded
             | HostError::PrimitiveFailed(_)
@@ -281,13 +291,21 @@ pub enum ResendClass {
 }
 
 impl HostError {
+    /// Whether the ECU gave no response: [`HostError::NoResponse`] from the VCI, or
+    /// [`HostError::DeadlinePassed`] from the agent's deadline. The host's judgement of an
+    /// unanswered request reads this and not the variant.
+    pub fn is_no_response(&self) -> bool {
+        matches!(self, HostError::NoResponse | HostError::DeadlinePassed(_))
+    }
+
     /// The class of this error for a resend (ADR-392).
     pub fn resend_class(&self) -> ResendClass {
         match self {
             HostError::StreamFailedBeforeSend(inner) => inner.resend_class(),
-            HostError::NoResponse | HostError::PrimitiveFailed(_) | HostError::EventsLost => {
-                ResendClass::EcuLevel
-            }
+            HostError::NoResponse
+            | HostError::DeadlinePassed(_)
+            | HostError::PrimitiveFailed(_)
+            | HostError::EventsLost => ResendClass::EcuLevel,
             HostError::LinkHeld => ResendClass::Transient,
             HostError::Rpc { rpc, status }
                 if *rpc == "StartComPrimitive"
@@ -391,9 +409,14 @@ impl Timings {
     }
 }
 
+/// The one-byte service ID of `service`, or [`HostError::BadService`] when it does not fit.
+pub fn service_id(service: u16) -> Result<u8, HostError> {
+    u8::try_from(service).map_err(|source| HostError::BadService(service, Some(source)))
+}
+
 /// The request a `ServiceRequest` sends: the SID, then the payload (ADR-235 item 2).
 pub fn service_request_bytes(service: u16, payload: &[u8]) -> Result<Vec<u8>, HostError> {
-    let sid = u8::try_from(service).map_err(|_| HostError::BadService(service))?;
+    let sid = service_id(service)?;
     let mut request = Vec::with_capacity(1 + payload.len());
     request.push(sid);
     request.extend_from_slice(payload);
@@ -439,7 +462,7 @@ impl TransferCounter {
     ///   the response: FlashTransfer would discard upload data, and the other four end or
     ///   invalidate the server's transfer (ADR-250).
     /// - Other services leave it as it is.
-    fn after_request(&mut self, request: &[u8], outcome: Result<&[u8], ()>) {
+    fn after_request(&mut self, request: &[u8], outcome: Result<&[u8], &HostError>) {
         match request.first() {
             Some(0x34) => {
                 (self.accepted, self.max_block_length) = match outcome {
@@ -1541,7 +1564,11 @@ impl<C: WorkerApi> WorkerHost<C> {
             // The same rule says whether that end is a rejected result, which is no answer of the
             // request (ADR-437).
             let (end, mut detail, collected_rejected) = match &sent.result {
-                Ok(_) | Err(HostError::NoResponse) if collecting && !sent.agent_deadline => {
+                result
+                    if collecting
+                        && !sent.agent_deadline
+                        && result.as_ref().err().is_none_or(HostError::is_no_response) =>
+                {
                     let (end, rejected) =
                         crate::comm_log::exchange::collecting_end(&answers, &expected);
                     (end, Detail::default(), Some(rejected))
@@ -2017,7 +2044,7 @@ impl<C: WorkerApi> WorkerHost<C> {
         // agent's deadline ended is, since the VCI did not end it.
         let end = match sent.result {
             Ok(_) => Ok(()),
-            Err(HostError::NoResponse) if !sent.agent_deadline => Ok(()),
+            Err(error) if error.is_no_response() && !sent.agent_deadline => Ok(()),
             Err(error) => Err(error),
         };
         // Only an identifier of the table marks presence (ADR-396); the log lists every result.
@@ -2380,9 +2407,7 @@ impl<C: WorkerApi> WorkerHost<C> {
                 progress: None,
             });
         }
-        let result = waited
-            .map_err(|_| HostError::NoResponse)
-            .and_then(|outcome| outcome);
+        let result = deadline_outcome(waited);
         Sent {
             result,
             error_events: std::mem::take(&mut progress.errors),
@@ -2534,6 +2559,16 @@ impl<C: WorkerApi> WorkerHost<C> {
     }
 }
 
+/// The outcome of a wait that may have run out its deadline: an expired deadline is
+/// [`HostError::DeadlinePassed`].
+fn deadline_outcome<T>(
+    waited: Result<Result<T, HostError>, tokio::time::error::Elapsed>,
+) -> Result<T, HostError> {
+    waited
+        .map_err(HostError::DeadlinePassed)
+        .and_then(|outcome| outcome)
+}
+
 /// Polls `future` once, with a waker that wakes nothing: its output if it is ready, `None` if it
 /// would wait.
 fn poll_now<F: Future>(future: F) -> Option<F::Output> {
@@ -2642,7 +2677,7 @@ fn entry_response_times(
 ) -> VciTimes {
     match result {
         Ok(_) => times,
-        Err(HostError::NoResponse) if collecting && !agent_deadline => VciTimes {
+        Err(error) if error.is_no_response() && collecting && !agent_deadline => VciTimes {
             finished: times.finished,
             ..VciTimes::default()
         },
@@ -3444,7 +3479,7 @@ impl Sent {
             && self.rx_timeout.is_some()
             && self.pendings.is_empty()
             && self.error_events.is_empty()
-            && matches!(self.result, Err(HostError::NoResponse))
+            && matches!(&self.result, Err(error) if error.is_no_response())
         {
             self.result = Ok(Vec::new());
         }
@@ -3795,7 +3830,7 @@ fn sent_end(
         ..Detail::default()
     };
     let end = match error {
-        HostError::NoResponse => End::NoResponse,
+        HostError::NoResponse | HostError::DeadlinePassed(_) => End::NoResponse,
         // The agent did not start it: an earlier primitive still holds the link.
         HostError::LinkHeld => End::NotSent(RefusalCause::LinkHeld),
         HostError::EventsLost => End::Unknown(UnknownCause::EventsLost),
@@ -3864,7 +3899,7 @@ fn link_error_kind(code: i32) -> LinkErrorKind {
 fn refusal_cause(request: &[u8], error: &HostError) -> RefusalCause {
     match error {
         // A service number no request can carry: the entry has no bytes for it.
-        HostError::BadService(_) | HostError::UndeclaredService(_) => {
+        HostError::BadService(..) | HostError::UndeclaredService(_) => {
             RefusalCause::UndeclaredService
         }
         _ if request.is_empty() => RefusalCause::EmptyRequest,
@@ -3893,11 +3928,11 @@ fn host_error_name(error: &HostError) -> &'static str {
         HostError::WorkerStart { .. } => "WorkerStart",
         HostError::LinkHeld => "LinkHeld",
         HostError::EventStreamEnded => "EventStreamEnded",
-        HostError::NoResponse => "NoResponse",
+        HostError::NoResponse | HostError::DeadlinePassed(_) => "NoResponse",
         HostError::EventsLost => "EventsLost",
         HostError::VciLost { .. } => "VciLost",
         HostError::PrimitiveFailed(_) => "PrimitiveFailed",
-        HostError::BadService(_) => "BadService",
+        HostError::BadService(..) => "BadService",
         HostError::NotAllowed(_) => "NotAllowed",
         HostError::NoTransferActive => "NoTransferActive",
         HostError::TransferRefused { .. } => "TransferRefused",
@@ -4217,7 +4252,7 @@ fn vci_ended(
 ) -> bool {
     let took_a_result = match result {
         Ok(_) => true,
-        Err(HostError::NoResponse) => rejected_read,
+        Err(error) if error.is_no_response() => rejected_read,
         Err(_) => false,
     };
     rx_timeout || (finished && took_a_result && (collecting || result.is_err()))
@@ -4368,7 +4403,7 @@ impl Progress {
     }
 
     fn for_request(request: &[u8]) -> Result<Self, HostError> {
-        let sid = *request.first().ok_or(HostError::BadService(0))?;
+        let sid = *request.first().ok_or(HostError::BadService(0, None))?;
         Ok(Self {
             sid,
             positive_prefix: positive_prefix(request),
@@ -4776,8 +4811,7 @@ impl<C: WorkerApi> DiagHost for WorkerHost<C> {
             return Err(error);
         }
         let response = self.send_recv(request.clone());
-        self.transfer
-            .after_request(&request, response.as_deref().map_err(|_| ()));
+        self.transfer.after_request(&request, response.as_deref());
         response
     }
 
@@ -4801,8 +4835,7 @@ impl<C: WorkerApi> DiagHost for WorkerHost<C> {
             }
         };
         let response = self.send_expecting(request.to_vec(), expected);
-        self.transfer
-            .after_request(request, response.as_deref().map_err(|_| ()));
+        self.transfer.after_request(request, response.as_deref());
         response
     }
 
@@ -5127,7 +5160,7 @@ mod tests {
         let cases: [(&[u8], HostError, RefusalCause); 11] = [
             (
                 &[],
-                HostError::BadService(0x1FF),
+                HostError::BadService(0x1FF, None),
                 RefusalCause::UndeclaredService,
             ),
             (
@@ -5733,7 +5766,7 @@ mod tests {
         assert_eq!(service_request_bytes(0x3E, &[]).unwrap(), [0x3E]);
         assert!(matches!(
             service_request_bytes(0x100, &[]),
-            Err(HostError::BadService(0x100))
+            Err(HostError::BadService(0x100, _))
         ));
         assert_eq!(
             routine_control_bytes(0xFF00, 0x01, &[0xAA]),
@@ -5864,7 +5897,7 @@ mod tests {
         counter.after_request(&download, Ok(&[0x7F, 0x34, 0x22]));
         assert_eq!(counter.accepted, None);
         counter.after_request(&download, Ok(&[0x74, 0x20]));
-        counter.after_request(&download, Err(()));
+        counter.after_request(&download, Err(&HostError::NoResponse));
         assert_eq!(counter.accepted, None);
         // A response of another service does not begin one.
         counter.after_request(&download, Ok(&[0x77]));
@@ -5884,7 +5917,11 @@ mod tests {
             &[0x10, 0x01],
             &[0x11, 0x01],
         ] {
-            for outcome in [Ok(&[0x7F, request[0], 0x22][..]), Ok(&[0x00][..]), Err(())] {
+            for outcome in [
+                Ok(&[0x7F, request[0], 0x22][..]),
+                Ok(&[0x00][..]),
+                Err(&HostError::NoResponse),
+            ] {
                 let mut counter = begun();
                 counter.after_request(request, outcome);
                 assert_eq!(counter.accepted, None, "{request:02X?}");
@@ -5894,7 +5931,7 @@ mod tests {
         // Other services leave it.
         let mut counter = begun();
         counter.after_request(&[0x22, 0xF1, 0x90], Ok(&[0x62, 0xF1, 0x90]));
-        counter.after_request(&[0x31, 0x01, 0xFF, 0x00], Err(()));
+        counter.after_request(&[0x31, 0x01, 0xFF, 0x00], Err(&HostError::NoResponse));
         assert_eq!(counter.accepted, Some(0));
     }
 
@@ -6086,6 +6123,43 @@ mod tests {
             event(Some(COP), status(PduComPrimitiveStatus::PduCopstFinished)),
         ]);
         assert_eq!(got.unwrap().unwrap(), [0x62, 0xF1, 0x90]);
+    }
+
+    /// The agent's own deadline gives `DeadlinePassed` with the timer's `Elapsed` as its cause,
+    /// and every judgement of an unanswered request, the exchange's end, the logged name and what
+    /// the runner's repeat policy reads (ADR-392), is the one `NoResponse` gets.
+    #[tokio::test]
+    async fn the_agent_s_deadline_is_judged_as_no_response() {
+        use std::error::Error as _;
+        let waited = tokio::time::timeout(
+            Duration::from_millis(1),
+            std::future::pending::<Result<Vec<u8>, HostError>>(),
+        )
+        .await;
+        let error = deadline_outcome(waited).unwrap_err();
+        assert!(matches!(error, HostError::DeadlinePassed(_)), "{error:?}");
+        assert!(
+            error
+                .source()
+                .is_some_and(|cause| cause.is::<tokio::time::error::Elapsed>())
+        );
+        let vci = HostError::NoResponse;
+        assert!(error.is_no_response() && vci.is_no_response());
+        assert_eq!(error.to_string(), vci.to_string());
+        let (end, detail) = end_of(&[0x22, 0xF1, 0x90], &Err(error));
+        let (vci_end, vci_detail) = end_of(&[0x22, 0xF1, 0x90], &Err(HostError::NoResponse));
+        assert!(matches!(end, End::NoResponse));
+        assert!(matches!(vci_end, End::NoResponse));
+        assert_eq!(detail.host_error, Some("NoResponse"));
+        assert_eq!(detail.host_error, vci_detail.host_error);
+        let waited = tokio::time::timeout(
+            Duration::from_millis(1),
+            std::future::pending::<Result<Vec<u8>, HostError>>(),
+        )
+        .await;
+        let error = deadline_outcome(waited).unwrap_err();
+        assert_eq!(error.send_state(), vci.send_state());
+        assert_eq!(error.resend_class(), vci.resend_class());
     }
 
     /// Design 8.11 `vci_did_not_end`: the agent's own deadline ending the wait is no response
@@ -7409,7 +7483,7 @@ mod tests {
     fn agent_refusals() -> Vec<HostError> {
         vec![
             HostError::LinkHeld,
-            HostError::BadService(0x1FF),
+            HostError::BadService(0x1FF, None),
             HostError::NotAllowed(0x2E),
             HostError::EmptyRequest,
             HostError::UndeclaredService(7),

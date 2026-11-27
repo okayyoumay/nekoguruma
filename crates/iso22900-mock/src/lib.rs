@@ -1619,13 +1619,15 @@ fn ecu_events(
 
 /// The `EcuConfig` in the file `path` names, if it names one (`NGR_SIM_ECU_CONFIG`); `Err` when
 /// the file cannot be read or parsed, or holds a value `EcuConfig::validate` refuses.
-fn ecu_config_from(path: Option<std::ffi::OsString>) -> Result<Option<EcuConfig>, ()> {
+fn ecu_config_from(path: Option<std::ffi::OsString>) -> Result<Option<EcuConfig>, String> {
     match path {
         None => Ok(None),
         Some(path) => {
-            let text = std::fs::read_to_string(path).map_err(|_| ())?;
-            let config: EcuConfig = serde_json::from_str(&text).map_err(|_| ())?;
-            config.validate().map_err(|_| ())?;
+            let text = std::fs::read_to_string(path)
+                .map_err(|e| format!("configuration file unreadable: {e}"))?;
+            let config: EcuConfig = serde_json::from_str(&text)
+                .map_err(|e| format!("configuration file does not parse: {e}"))?;
+            config.validate()?;
             Ok(Some(config))
         }
     }
@@ -1633,23 +1635,26 @@ fn ecu_config_from(path: Option<std::ffi::OsString>) -> Result<Option<EcuConfig>
 
 /// The commands in `text`, a JSON array of [`SimEcuCommand`]s (`NGR_SIM_ECU_COMMANDS`), if there
 /// is one; `Err` when it does not parse.
-fn ecu_commands_from(text: Option<std::ffi::OsString>) -> Result<Vec<SimEcuCommand>, ()> {
+fn ecu_commands_from(text: Option<std::ffi::OsString>) -> Result<Vec<SimEcuCommand>, String> {
     match text {
         None => Ok(Vec::new()),
         Some(text) => {
-            let text = text.to_str().ok_or(())?;
+            let text = text.to_str().ok_or("commands are not valid UTF-8")?;
             // A variable that is set but blank names no commands.
             if text.trim().is_empty() {
                 return Ok(Vec::new());
             }
-            serde_json::from_str(text).map_err(|_| ())
+            serde_json::from_str(text).map_err(|e| format!("commands do not parse: {e}"))
         }
     }
 }
 
 /// Applies the commands `text` holds (`NGR_SIM_ECU_COMMANDS`) in order; stops at the first that
 /// fails, leaving what the earlier ones did (the caller undoes it).
-fn apply_ecu_commands(state: &mut MockState, text: Option<std::ffi::OsString>) -> Result<(), ()> {
+fn apply_ecu_commands(
+    state: &mut MockState,
+    text: Option<std::ffi::OsString>,
+) -> Result<(), String> {
     for command in ecu_commands_from(text)? {
         apply_sim_ecu_command(state, command)?;
     }
@@ -1664,7 +1669,7 @@ fn attach_from_environment(
     state: &mut MockState,
     config: Option<std::ffi::OsString>,
     commands: Option<std::ffi::OsString>,
-) -> Result<(), ()> {
+) -> Result<(), String> {
     if state.ecu.is_some() {
         return Ok(());
     }
@@ -1744,19 +1749,23 @@ pub enum SimEcuCommand {
     },
 }
 
-fn apply_sim_ecu_command(state: &mut MockState, command: SimEcuCommand) -> Result<(), ()> {
+fn apply_sim_ecu_command(state: &mut MockState, command: SimEcuCommand) -> Result<(), String> {
     match command {
         SimEcuCommand::Attach { config } => {
-            let mut merged = serde_json::to_value(default_ecu_config()).map_err(|_| ())?;
-            let fields = merged.as_object_mut().ok_or(())?;
+            let mut merged = serde_json::to_value(default_ecu_config())
+                .map_err(|e| format!("default configuration does not serialize: {e}"))?;
+            let fields = merged
+                .as_object_mut()
+                .ok_or("default configuration is not an object")?;
             let config = config.unwrap_or_default();
             // A misspelled field would otherwise leave the default in place unnoticed.
             if config.keys().any(|key| !fields.contains_key(key)) {
-                return Err(());
+                return Err("attach names a field EcuConfig lacks".to_owned());
             }
             fields.extend(config);
-            let config: EcuConfig = serde_json::from_value(merged).map_err(|_| ())?;
-            config.validate().map_err(|_| ())?;
+            let config: EcuConfig = serde_json::from_value(merged)
+                .map_err(|e| format!("attach configuration does not fit EcuConfig: {e}"))?;
+            config.validate()?;
             state.ecu = Some(SimEcu::new(config));
         }
         SimEcuCommand::Detach {} => state.ecu = None,
@@ -1770,8 +1779,8 @@ fn apply_sim_ecu_command(state: &mut MockState, command: SimEcuCommand) -> Resul
                 None
             } else {
                 Some(UnboundIds {
-                    request: request_id.ok_or(())?,
-                    response: response_id.ok_or(())?,
+                    request: request_id.ok_or("an unbound binding needs request_id")?,
+                    response: response_id.ok_or("an unbound binding needs response_id")?,
                 })
             };
         }
@@ -1780,12 +1789,14 @@ fn apply_sim_ecu_command(state: &mut MockState, command: SimEcuCommand) -> Resul
             service,
             request,
         } => {
-            let ecu = state.ecu.as_mut().ok_or(())?;
+            let ecu = state.ecu.as_mut().ok_or("no ECU attached")?;
             match (service, request) {
                 (None, None) => ecu.inject(fault),
                 (Some(sid), None) => ecu.inject_for_service(sid, fault),
                 (None, Some(prefix)) => ecu.inject_for_request(&prefix, fault),
-                (Some(_), Some(_)) => return Err(()),
+                (Some(_), Some(_)) => {
+                    return Err("inject_fault takes service or request, not both".to_owned());
+                }
             }
         }
     }
@@ -2603,7 +2614,7 @@ exported_fn!(__mock_sim_ecu_control(command: *const c_char) -> UNUM32 {
     let mut guard = state().lock().expect("mock state poisoned");
     match apply_sim_ecu_command(&mut guard, command) {
         Ok(()) => 0,
-        Err(()) => 1,
+        Err(_) => 1,
     }
 });
 
@@ -5585,7 +5596,7 @@ mod tester_present_tests {
             let rig = Rig::new();
             let try_command = |text: &str| {
                 serde_json::from_str::<SimEcuCommand>(text)
-                    .map_err(|_| ())
+                    .map_err(|e| e.to_string())
                     .and_then(|command| {
                         apply_sim_ecu_command(&mut state().lock().unwrap(), command)
                     })

@@ -85,9 +85,10 @@ pub enum MarkError {
     #[error("the state directory: {0}")]
     State(#[from] StateDirError),
     /// The file is not what the writer makes: it is not a regular file, is too large, is not the
-    /// expected object, or names another agent.
+    /// expected object, or names another agent. The second field is the JSON error when the
+    /// content did not parse.
     #[error("the issue-time mark file is corrupt: {0}")]
-    Corrupt(&'static str),
+    Corrupt(&'static str, #[source] Option<serde_json::Error>),
     /// Another store of this directory is open, in this process or another.
     #[error("the issue-time mark is open for writing elsewhere")]
     InUse,
@@ -246,6 +247,7 @@ fn read(path: &Path, agent_id: &str) -> Result<u64, MarkError> {
     if !meta.is_file() || meta.len() > MAX_FILE {
         return Err(MarkError::Corrupt(
             "not a regular file of the expected size",
+            None,
         ));
     }
     let mut bytes = Vec::new();
@@ -255,15 +257,16 @@ fn read(path: &Path, agent_id: &str) -> Result<u64, MarkError> {
     if bytes.len() as u64 > MAX_FILE {
         return Err(MarkError::Corrupt(
             "not a regular file of the expected size",
+            None,
         ));
     }
     let stored: Stored = serde_json::from_slice(&bytes)
-        .map_err(|_| MarkError::Corrupt("not the expected object"))?;
+        .map_err(|e| MarkError::Corrupt("not the expected object", Some(e)))?;
     if stored.version != FORMAT_VERSION {
-        return Err(MarkError::Corrupt("unknown version"));
+        return Err(MarkError::Corrupt("unknown version", None));
     }
     if stored.agent_id != agent_id {
-        return Err(MarkError::Corrupt("another agent ID"));
+        return Err(MarkError::Corrupt("another agent ID", None));
     }
     Ok(stored.highest_issued_at)
 }

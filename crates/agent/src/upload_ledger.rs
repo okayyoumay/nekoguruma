@@ -39,8 +39,9 @@ use sha2::{Digest as _, Sha256};
 use worker_host::service::OperatingMode;
 
 use crate::journal::{
-    FRAME_HEADER, FrameRead, JobKey, LockFailure, WriterLock, job_file_stem, open_rw, push_frame,
-    read_frame, record_follows, sync_after_rename, sync_dir, take_writer_lock, valid_id,
+    FRAME_HEADER, FrameRead, JobKey, JournalError, LockFailure, WriterLock, job_file_stem, open_rw,
+    push_frame, read_frame, record_follows, sync_after_rename, sync_dir, take_writer_lock,
+    valid_id,
 };
 use crate::registration::record::create_private;
 use crate::state::{StateDirError, prepare_subdir, private_subdir};
@@ -192,15 +193,17 @@ pub enum LedgerError {
     Io(#[from] io::Error),
     #[error("the upload ledger directory: {0}")]
     State(#[from] StateDirError),
+    /// The second field is the decoder's error when a record did not decode.
     #[error("the upload ledger file is corrupt: {0}")]
-    Corrupt(&'static str),
+    Corrupt(&'static str, #[source] Option<postcard::Error>),
     /// Another ledger of this directory is open for writing, in this process or another.
     #[error("the upload ledger is open for writing elsewhere")]
     InUse,
     #[error("the agent ID cannot name a ledger file")]
     BadAgentId,
+    /// The source is why the job ID cannot name a file.
     #[error("the job ID cannot name a file")]
-    BadJobId,
+    BadJobId(#[source] JournalError),
     #[error("the source file must be an absolute UTF-8 path of at most 4096 bytes")]
     BadSource,
     #[error("the upload ledger is full")]
@@ -362,7 +365,7 @@ impl UploadLedger {
             // A ledger that was open and lost its file holds results the server may not have
             // received; making an empty file and sweeping their objects would lose them.
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Err(LedgerError::Corrupt("the ledger file is gone"));
+                return Err(LedgerError::Corrupt("the ledger file is gone", None));
             }
             Err(error) => return Err(error.into()),
         }
@@ -583,7 +586,7 @@ impl UploadLedger {
             .highest
             .checked_add(1)
             .filter(|seq| *seq < u64::MAX)
-            .ok_or(LedgerError::Corrupt("the entry counter overflows"))?;
+            .ok_or(LedgerError::Corrupt("the entry counter overflows", None))?;
         let entry = Entry {
             seq,
             key: key.clone(),
@@ -804,7 +807,7 @@ impl UploadLedger {
 fn check_key(key: &JobKey) -> Result<(), LedgerError> {
     job_file_stem(key)
         .map(|_| ())
-        .map_err(|_| LedgerError::BadJobId)
+        .map_err(LedgerError::BadJobId)
 }
 
 fn source_is_valid(source: &Source) -> bool {
@@ -841,7 +844,7 @@ fn other_entries(dir: &Path, agent_id: &str) -> usize {
 fn encode_frame(entry: &Entry) -> io::Result<Vec<u8>> {
     let payload = postcard::to_allocvec(&Wire::from(entry)).map_err(io::Error::other)?;
     let mut frame = Vec::with_capacity(FRAME_HEADER + payload.len());
-    push_frame(&mut frame, &payload).map_err(|_| io::Error::other("an entry is too large"))?;
+    push_frame(&mut frame, &payload).map_err(io::Error::other)?;
     Ok(frame)
 }
 
@@ -856,7 +859,7 @@ fn encode_file(agent_id: &str, highest: u64, entries: &[Entry]) -> io::Result<Ve
     out.extend_from_slice(&MAGIC);
     out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
     let header = postcard::to_allocvec(&header).map_err(io::Error::other)?;
-    push_frame(&mut out, &header).map_err(|_| io::Error::other("the header is too large"))?;
+    push_frame(&mut out, &header).map_err(io::Error::other)?;
     for entry in entries {
         out.extend_from_slice(&encode_frame(entry)?);
     }
@@ -896,7 +899,7 @@ struct Parsed {
 /// up to `highest`; the entries after them must be numbered `highest + 1` on, and the last of
 /// them may be one unfinished append, which is not part of the result. Anything else is corrupt.
 fn parse(bytes: &[u8], agent_id: &str) -> Result<Parsed, LedgerError> {
-    let corrupt = LedgerError::Corrupt;
+    let corrupt = |reason| LedgerError::Corrupt(reason, None);
     if bytes.len() < PREAMBLE || bytes[..MAGIC.len()] != MAGIC {
         return Err(corrupt("not an upload ledger"));
     }
@@ -907,8 +910,8 @@ fn parse(bytes: &[u8], agent_id: &str) -> Result<Parsed, LedgerError> {
     let FrameRead::Ok { payload, next } = read_frame(bytes, PREAMBLE) else {
         return Err(corrupt("the header does not read back"));
     };
-    let header: Header =
-        postcard::from_bytes(payload).map_err(|_| corrupt("the header does not decode"))?;
+    let header: Header = postcard::from_bytes(payload)
+        .map_err(|e| LedgerError::Corrupt("the header does not decode", Some(e)))?;
     if header.agent_id != agent_id {
         return Err(corrupt("the file belongs to another agent ID"));
     }
@@ -982,6 +985,7 @@ fn push_unique(
     if !seen.insert((entry.key.job_id.0.clone(), entry.key.generation, entry.kind)) {
         return Err(LedgerError::Corrupt(
             "two entries have the same job and kind",
+            None,
         ));
     }
     entries.push(entry);

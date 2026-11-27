@@ -33,7 +33,7 @@ fn forms_and_templates_round_trip() {
     decode_form(&bytes).unwrap_err();
     let mut longer = encode_form(&form).unwrap();
     longer.push(0);
-    assert_eq!(decode_form(&longer), Err(HmiError::Malformed));
+    assert_eq!(decode_form(&longer), Err(HmiError::Malformed(None)));
 }
 
 #[test]
@@ -111,7 +111,9 @@ fn the_bounds_of_item_1_are_enforced_both_ways() {
         decode_template(&bytes),
         Err(HmiError::TooLong(MAX_HMI_FORM_LEN + 1))
     );
-    assert_eq!(decode_template(&[0xFF]), Err(HmiError::Malformed));
+    let error = decode_template(&[0xFF]).unwrap_err();
+    assert!(matches!(error, HmiError::Malformed(Some(_))), "{error:?}");
+    assert!(std::error::Error::source(&error).is_some());
 }
 
 #[test]

@@ -1331,7 +1331,7 @@ impl Container {
 pub(crate) fn container(cell: &str) -> Parsed<Container> {
     let bad = || format!("{cell:?} is not a container");
     let parts: Vec<&str> = cell.split(':').collect();
-    let name = |s: &str| values::name(s).map_err(|_| bad());
+    let name = |s: &str| values::name(s).map_err(|e| format!("{}: {e}", bad()));
     match parts.as_slice() {
         ["request", n] => Ok(Container::Request(name(n)?)),
         ["response", n] => Ok(Container::Response(name(n)?)),

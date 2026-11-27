@@ -45,8 +45,9 @@ impl BearerAuth {
         now: SystemTime,
     ) -> Result<tonic::Request<T>, tonic::Status> {
         let (token, _exp) = token::mint(&self.key, &self.subject, now);
-        let mut value = MetadataValue::try_from(format!("Bearer {token}"))
-            .map_err(|_| tonic::Status::internal("bearer token is not a valid header value"))?;
+        let mut value = MetadataValue::try_from(format!("Bearer {token}")).map_err(|error| {
+            tonic::Status::internal(format!("bearer token is not a valid header value: {error}"))
+        })?;
         // Keeps the token out of Debug output and the HPACK dynamic table.
         value.set_sensitive(true);
         request.metadata_mut().insert("authorization", value);

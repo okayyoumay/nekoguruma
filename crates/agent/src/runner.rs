@@ -124,6 +124,8 @@ pub struct Job {
     vci: Option<VciFacts>,
     /// The VCI's margins a hardware profile gives, for the log (ADR-357).
     vci_margins: VciMargins,
+    /// Set from outside to cancel the run, as dropping its future does ([`Job::with_cancel`]).
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 impl Job {
@@ -137,6 +139,7 @@ impl Job {
             comm_log_dir: None,
             vci: None,
             vci_margins: VciMargins::default(),
+            cancel: None,
         })
     }
 
@@ -173,6 +176,15 @@ impl Job {
     /// records which.
     pub fn with_vci_margins(mut self, margins: VciMargins) -> Self {
         self.vci_margins = margins;
+        self
+    }
+
+    /// Gives the job a flag that cancels the run when it is set, as dropping the run's future
+    /// does, but with the future still awaited, so the caller gets the run's result: a run that
+    /// has ended `Ok` before the flag is seen stays `Ok`. The run takes the flag at its next
+    /// interruptible point (ADR-330).
+    pub fn with_cancel(mut self, cancel: Arc<AtomicBool>) -> Self {
+        self.cancel = Some(cancel);
         self
     }
 
@@ -230,6 +242,7 @@ impl From<Program> for Job {
             comm_log_dir: None,
             vci: None,
             vci_margins: VciMargins::default(),
+            cancel: None,
         }
     }
 }
@@ -1223,11 +1236,12 @@ async fn run_checked<C: WorkerApi>(
         comm_log_dir: _,
         vci: _,
         vci_margins: _,
+        cancel,
     } = job;
     let artifact = artifact.map(|(_, artifact)| artifact);
     let config = config.clone();
 
-    let cancel = CancelOnDrop(Arc::new(AtomicBool::new(false)));
+    let cancel = CancelOnDrop(cancel.unwrap_or_default());
     let cancelled = Arc::clone(&cancel.0);
     let run = on_job_thread(
         comm_log,
@@ -11499,6 +11513,7 @@ def main():
             comm_log_dir: None,
             vci: None,
             vci_margins: VciMargins::default(),
+            cancel: None,
         };
         check_job(&job(READ_DTC, document()), Permission::ReadOnly).unwrap();
         assert!(!job(READ_DTC, document()).writes());
@@ -11590,6 +11605,7 @@ def main():
                 comm_log_dir: None,
                 vci: None,
                 vci_margins: VciMargins::default(),
+                cancel: None,
             }
         };
         for (service, sid) in [(SESSION, 0x10), (RESET, 0x11)] {
@@ -11641,6 +11657,7 @@ def main():
             comm_log_dir: None,
             vci: None,
             vci_margins: VciMargins::default(),
+            cancel: None,
         };
         check_job(&job, Permission::ReadOnly).unwrap();
         // A field the document does not declare is refused before anything is sent, also
@@ -11658,6 +11675,7 @@ def main():
             comm_log_dir: None,
             vci: None,
             vci_margins: VciMargins::default(),
+            cancel: None,
         };
         assert!(
             matches!(
@@ -11718,6 +11736,7 @@ def main():
             comm_log_dir: None,
             vci: None,
             vci_margins: VciMargins::default(),
+            cancel: None,
         };
         let refused = check_job(&job, Permission::ReadOnly);
         assert!(
@@ -11749,6 +11768,7 @@ def main():
             comm_log_dir: None,
             vci: None,
             vci_margins: VciMargins::default(),
+            cancel: None,
         };
         let refused = check_job(&job, Permission::ReadOnly);
         assert!(

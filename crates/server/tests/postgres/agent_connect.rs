@@ -312,6 +312,28 @@ impl Fixture {
         }
     }
 
+    /// Waits until the agent's report of the job has been applied: the job carries its time.
+    async fn until_stamped(&self, id: &str) {
+        let deadline = Instant::now() + LIMIT;
+        loop {
+            let stamped: bool = sqlx::query_scalar(
+                "SELECT last_reported_at IS NOT NULL FROM jobs WHERE id = $1::uuid",
+            )
+            .bind(id)
+            .fetch_one(&self.world.pool)
+            .await
+            .unwrap();
+            if stamped {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no report of the job was applied"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     /// Waits until the job is delivered and ended as failed: the agent's intake refuses the job
     /// of these tests, which names no document, after its `received` event (ADR-511 item 3).
     async fn until_refused_by_the_intake(&self, id: &str) {
@@ -382,6 +404,48 @@ impl Fixture {
                 );
             }
             other => panic!("the received event {seq} expected, got {other:?}"),
+        }
+    }
+
+    /// How many records the agent's outcome record holds: an `ended` and a `reported` for each job
+    /// it has ended and appended. The file is the header's frame and one frame per record after
+    /// the magic and the version; `0` while there is no file.
+    fn outcome_records(&self) -> usize {
+        let path = self
+            .env
+            .state
+            .path()
+            .join("registration")
+            .join(format!("{}.outcomes.v1", self.agent_id));
+        let Ok(bytes) = std::fs::read(path) else {
+            return 0;
+        };
+        let mut offset = 12;
+        let mut frames: usize = 0;
+        while let Some(head) = bytes.get(offset..offset + 8) {
+            let len = u32::from_le_bytes(head[..4].try_into().unwrap()) as usize;
+            if bytes.len() < offset + 8 + len {
+                break;
+            }
+            offset += 8 + len;
+            frames += 1;
+        }
+        frames.saturating_sub(1)
+    }
+
+    /// Waits until the agent's outcome record holds the `ended` and the `reported` of `jobs`
+    /// jobs: their end is in the outbox and recorded as such, so a kill now leaves nothing owed
+    /// for the restart to append again.
+    async fn until_reported(&self, jobs: usize) {
+        let deadline = Instant::now() + LIMIT;
+        while self.outcome_records() != 2 * jobs {
+            assert!(
+                Instant::now() < deadline,
+                "the outcome record holds {} records, not {}",
+                self.outcome_records(),
+                2 * jobs
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 
@@ -747,6 +811,9 @@ async fn a_job_created_through_the_route_is_accepted_and_acknowledged_by_the_age
         .unwrap()
         .to_owned();
     f.until_delivered(&id).await;
+    // The agent's `received` report has been applied (it stamps the job) before the audit rows
+    // are counted, so a report that arrives late cannot be missed.
+    f.until_stamped(&id).await;
     assert!(f.is_connected(), "{}", agent.log_text());
     // A12: the creation wrote one audit row, and the agent's `received` report added none.
     assert_eq!(
@@ -834,7 +901,9 @@ async fn events_seen_while_the_cursor_is_held_are_stored_once_across_a_kill_and_
     until_count(&f.counts.seen, 6, "the events seen", &agent).await;
     assert_eq!(f.counts.stored.load(Ordering::Relaxed), 0);
     assert_eq!(f.stored_events().await, (vec![], 0));
-    // The agent dies with its three events unacknowledged, and the lock is released.
+    // The agent dies with its events unacknowledged, and the lock is released. Its intake has
+    // recorded every end as reported by then, so the restart appends nothing it has not.
+    f.until_reported(3).await;
     agent.kill();
     f.wait_connected(None, false).await;
     held.commit().await.unwrap();
@@ -936,6 +1005,7 @@ async fn the_agents_received_event_stamps_its_job_once_and_a_resend_changes_noth
     f.until_delivered(JOB_ID).await;
     until_count(&f.counts.seen, 2, "the events seen", &agent).await;
     assert_eq!(f.counts.applied.load(Ordering::Relaxed), 0);
+    f.until_reported(1).await;
     agent.kill();
     f.wait_connected(None, false).await;
     held.commit().await.unwrap();

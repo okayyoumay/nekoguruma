@@ -452,11 +452,13 @@ async fn run_opened(
     // The task also ends without a stop when it panics (release builds unwind): the locks are
     // then free and no session is left, so the process must not stay up.
     let mut uploader_ended = false;
+    let mut session_ended = false;
     let outcome = loop {
         tokio::select! {
             biased;
             () = stop.as_mut() => break Ok(()),
             () = handle.stopped() => {
+                session_ended = true;
                 break Err(match handle.ended() {
                     Some(control::Ended::OutboxUnusable) => {
                         outbox_error(&OutboxError::Corrupt("reopen", None))
@@ -470,6 +472,20 @@ async fn run_opened(
                     ),
                 });
             }
+            // The intake ended on its own: the session would acknowledge jobs nothing runs, and
+            // their redeliveries would be duplicates, so the command ends (exit 1).
+            () = async {
+                match &intake {
+                    Some(intake) => intake.stopped().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                tracing::error!("the job intake ended; the agent ends with it");
+                break Err(fail(
+                    Exit::CannotConnect,
+                    "the job intake ended unexpectedly",
+                ));
+            }
             // Neither channel ends the other: the session goes on without uploads.
             () = uploader.stopped(), if !uploader_ended => {
                 uploader_ended = true;
@@ -480,7 +496,8 @@ async fn run_opened(
             }
         }
     };
-    if outcome.is_ok() {
+    // The session is stopped on every path but its own end: a stop, or the intake's end.
+    if !session_ended {
         handle.stop();
         handle.stopped().await;
         tracing::info!("control channel session stopped");

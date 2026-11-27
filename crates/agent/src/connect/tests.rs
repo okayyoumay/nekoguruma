@@ -342,6 +342,34 @@ async fn a_stop_during_the_key_retry_is_ok_and_frees_the_locks() {
     dirs.open().expect("the locks are free");
 }
 
+/// A job intake that ends without a stop ends the command (exit 1): a session that went on would
+/// acknowledge jobs nothing runs.
+#[tokio::test(start_paused = true)]
+async fn an_intake_that_ends_on_its_own_is_exit_1() {
+    let key = existing_key();
+    let dirs = Dirs::new(&key);
+    let opened = dirs.open().unwrap();
+    let slot = Arc::new(Mutex::new(Some(key)));
+    let result = run_opened(
+        opened,
+        move || Ok(slot.lock().unwrap().take().unwrap()),
+        |record, key| uploader::start(record, key, uploads_in(dirs.dir.path())),
+        |opened, key| {
+            start_session(opened, key, dirs.dir.path()).map(|started| Started {
+                intake: Some(intake::Handle::ended_for_test()),
+                ..started
+            })
+        },
+        STOP_BOUND,
+        std::future::pending::<()>(),
+    )
+    .await;
+    let error = result.unwrap_err();
+    assert_eq!(error.exit_code(), 1);
+    assert_eq!(error.to_string(), "the job intake ended unexpectedly");
+    dirs.open().expect("the locks are free");
+}
+
 /// A session task that ends without a stop (a panic) is exit 1, not a process that stays up.
 #[tokio::test(start_paused = true)]
 async fn a_session_that_ends_on_its_own_is_exit_1() {

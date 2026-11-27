@@ -4486,6 +4486,10 @@ async fn outbox_c13_a_failed_append_withholds_the_ack_and_closes_with_1011() {
     );
     assert_eq!(env.log.warns("outbox-write"), 1);
     assert!(!env.log.contains("commandId"));
+    assert!(
+        env.intake.received.lock().unwrap().is_empty(),
+        "the intake is not told of a job whose `received` was not appended"
+    );
 }
 
 /// A write failure on the `received` append ends the connection; the next one reopens the
@@ -4671,6 +4675,10 @@ async fn outbox_c13_a_full_outbox_withholds_the_ack() {
     // stands, and the redelivery of the first is a duplicate, acknowledged though the outbox is
     // still full, with no event (the admission bound delays the ack, it no longer refuses a job).
     assert_eq!(env.intake.calls(), 2);
+    assert!(
+        env.intake.received.lock().unwrap().is_empty(),
+        "a refused `received` append is not told to the intake"
+    );
     send(&mut ws, &verified(&env, "a-again")).await;
     assert_eq!(answer(&mut ws).await.1["type"], "commandAck");
     assert_eq!(env.counts(), (1, 0));

@@ -41,7 +41,7 @@
 //! the path [`crate::comm_log::comm_log_path`] gives under the journal directory; the intake does
 //! not enqueue it. At its start the intake appends the ends the record holds unreported.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -76,7 +76,7 @@ use crate::outbox::Kind as EventKind;
 use crate::outcome_record::{OutcomeRecord, RecordError};
 use crate::policy;
 use crate::result_json::{ResultJsonError, vm_state_json};
-use crate::runner::{Job, JobError, JobLimits, JobRun, check_job, run_program_journaled};
+use crate::runner::{Job, JobLimits, JobRun, check_job, run_program_journaled};
 use crate::uploader::SharedLedger;
 use crate::vci_shell::{ShellRun, VciLookup, VciShell, VciShellError, WorkerEnd, run_on_vci};
 
@@ -88,6 +88,9 @@ const FETCH_ATTEMPTS: u32 = 3;
 pub const UNAVAILABLE_WAIT: Duration = Duration::from_secs(60);
 /// How often a waiting job looks at its start deadline.
 const DEADLINE_POLL: Duration = Duration::from_secs(1);
+/// How long a stop waits for a cancelled run to end, as its worker stops and its locks are
+/// released, before the run is dropped.
+const RUN_STOP_BOUND: Duration = Duration::from_secs(8);
 /// How often an end that could not be appended is tried again while the intake is idle.
 const OWED_RETRY: Duration = Duration::from_secs(60);
 
@@ -250,6 +253,17 @@ impl std::fmt::Debug for Handle {
     }
 }
 
+#[cfg(test)]
+impl Handle {
+    /// A handle of a task that has ended, for a test of what the caller does about that.
+    pub(crate) fn ended_for_test() -> Handle {
+        Handle {
+            stop: watch::channel(false).0,
+            done: watch::channel(true).1,
+        }
+    }
+}
+
 /// The stop signal as the task sees it. A handle that is gone is a stop too.
 #[derive(Clone)]
 struct Stop(watch::Receiver<bool>);
@@ -287,6 +301,9 @@ pub fn start(parts: Parts) -> (Arc<JobIntake>, Handle) {
         parts,
         queue: Arc::clone(&queue),
         stop: Stop(stop_rx),
+        appended: Mutex::default(),
+        warned: Mutex::default(),
+        in_memory: Mutex::default(),
     };
     let ended = Ended {
         queue: Arc::clone(&queue),
@@ -378,9 +395,12 @@ fn fetch_class(error: &FetchError) -> FetchClass {
 }
 
 /// What watches a run that has not yet begun: the flag that cancels the wait for its locks, the
-/// channel its first step reports on, and the start deadline.
+/// flag that cancels the job, the channel its first step reports on, and the start deadline.
 struct Watched {
-    cancel: Arc<AtomicBool>,
+    /// Ends the shell's wait for the locks and its launch: the start deadline and the stop set it.
+    lock_cancel: Arc<AtomicBool>,
+    /// Cancels the job itself: only a stop sets it.
+    job_cancel: Arc<AtomicBool>,
     started: mpsc::UnboundedReceiver<()>,
     deadline: u64,
 }
@@ -404,11 +424,22 @@ struct Worker {
     parts: Parts,
     queue: Arc<Queue>,
     stop: Stop,
+    /// Ends the record holds unreported that were appended in this start: appended once per start,
+    /// whatever becomes of their `reported` record.
+    appended: Mutex<HashSet<(String, u64)>>,
+    /// Ends whose failure was logged at `warn`: the repeats are `debug`.
+    warned: Mutex<HashSet<(String, u64)>>,
+    /// Ends neither recorded nor appended (both writes failed): kept here, tried again, and lost
+    /// only if the agent ends first.
+    in_memory: Mutex<Vec<(JobKey, JobState)>>,
 }
 
 impl Worker {
     async fn run(self) {
         loop {
+            if self.stop.is_set() {
+                break;
+            }
             // The ends that could not be appended before are tried again whenever the task comes
             // here: at its start, and between two jobs.
             self.recover().await;
@@ -439,20 +470,52 @@ impl Worker {
         }
     }
 
-    /// Appends the ends the outcome record holds unreported (ADR-511 item 7).
+    /// Appends the ends the outcome record holds unreported (ADR-511 item 7), each once per start,
+    /// and the ends kept in memory because neither write of them worked.
     async fn recover(&self) {
+        let in_memory =
+            std::mem::take(&mut *self.in_memory.lock().unwrap_or_else(|e| e.into_inner()));
+        for (key, state) in in_memory {
+            let span = crate::logging::job_span(&key, "");
+            let recorded = self.record_end(&key, &state).instrument(span.clone()).await;
+            if !self.announce(&key, &state).instrument(span).await && !recorded {
+                self.keep_in_memory(key, state);
+            }
+        }
         for (key, state) in self.parts.outcomes.owed() {
             let span = crate::logging::job_span(&key, "");
-            self.announce(&key, &state).instrument(span).await;
+            let id = (key.job_id.0.clone(), key.generation);
+            let appended = self
+                .appended
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&id);
+            if appended {
+                // In the outbox already: only the record of it is missing.
+                self.record_reported(&key).instrument(span).await;
+            } else {
+                self.announce(&key, &state).instrument(span).await;
+            }
         }
     }
 
+    fn keep_in_memory(&self, key: JobKey, state: JobState) {
+        tracing::error!(
+            "the job's end is neither recorded nor appended; it is kept in memory and tried again, and is lost if the agent ends first"
+        );
+        self.in_memory
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((key, state));
+    }
+
     async fn serve(&self, instruction: VerifiedInstruction, key: &JobKey) {
+        let instruction = Arc::new(instruction);
         let ending = self.handle(&instruction, key).await;
         self.finish(key, ending).await;
     }
 
-    async fn handle(&self, instruction: &VerifiedInstruction, key: &JobKey) -> Ending {
+    async fn handle(&self, instruction: &Arc<VerifiedInstruction>, key: &JobKey) -> Ending {
         let named = instruction.instruction();
         let deadline = named.start_deadline;
         if self.stop.is_set() {
@@ -469,7 +532,10 @@ impl Worker {
             Ok(fetched) => fetched,
             Err(ending) => return ending,
         };
-        let (documents, raw) = match self.read_documents(instruction, plan_bytes.is_some()).await {
+        let (documents, raw) = match self
+            .read_documents(instruction, plan_bytes.is_some(), deadline)
+            .await
+        {
             Ok(held) => held,
             Err(ending) => return ending,
         };
@@ -477,9 +543,19 @@ impl Worker {
             Ok(artifact) => artifact,
             Err(ending) => return ending,
         };
-        let prepared = match prepare(instruction, documents, plan_bytes, &raw, artifact) {
-            Ok(prepared) => prepared,
-            Err(ending) => return ending,
+        // The checks load the documents and the plan, which is work for a blocking thread.
+        let checked = {
+            let instruction = Arc::clone(instruction);
+            let span = tracing::Span::current();
+            tokio::task::spawn_blocking(move || {
+                span.in_scope(|| prepare(&instruction, documents, plan_bytes, &raw, artifact))
+            })
+            .await
+        };
+        let prepared = match checked {
+            Ok(Ok(prepared)) => prepared,
+            Ok(Err(ending)) => return ending,
+            Err(_) => return Ending::panicked(),
         };
         self.run_job(instruction, key, prepared, deadline).await
     }
@@ -536,56 +612,88 @@ impl Worker {
                     );
                 }
             }
-            tokio::select! {
-                biased;
-                () = self.stop.requested() => return Err(Ending::Open),
-                () = self.deadline_passed(deadline) => return Err(Ending::expired()),
-                () = tokio::time::sleep(UNAVAILABLE_WAIT) => {}
-            }
+            self.wait_unavailable(deadline).await?;
+        }
+    }
+
+    /// The wait between two rounds with a server that did not answer (ADR-504 item 7); the stop
+    /// and the start deadline end it.
+    async fn wait_unavailable(&self, deadline: u64) -> Result<(), Ending> {
+        tokio::select! {
+            biased;
+            () = self.stop.requested() => Err(Ending::Open),
+            () = self.deadline_passed(deadline) => Err(Ending::expired()),
+            () = tokio::time::sleep(UNAVAILABLE_WAIT) => Ok(()),
         }
     }
 
     /// The documents the instruction names, read through the object source and nowhere else, and
     /// checked to be exactly the named set. `keep_bytes` keeps the bytes of each, which a plan is
-    /// loaded from.
+    /// loaded from. A read the server did not answer is waited for as a fetch is.
     async fn read_documents(
         &self,
         instruction: &VerifiedInstruction,
         keep_bytes: bool,
+        deadline: u64,
     ) -> Result<(Vec<JobDocument>, Vec<([u8; 32], Vec<u8>)>), Ending> {
         let named = &instruction.instruction().document_hashes;
         let mut documents = Vec::with_capacity(named.len());
         let mut raw = Vec::new();
         for digest in named {
-            let read = self
-                .parts
-                .objects
-                .read_document(instruction, digest, FETCH_ATTEMPTS);
-            let bytes = tokio::select! {
-                biased;
-                () = self.stop.requested() => return Err(Ending::Open),
-                bytes = read => bytes,
-            };
-            let bytes = match bytes {
-                Ok(bytes) => bytes,
-                Err(error) if fetch_class(&error) == FetchClass::Refused => {
-                    tracing::warn!(external = external(&error), "a document was refused");
-                    return Err(Ending::rejected("the server refused a document"));
-                }
-                Err(error) => {
-                    return Err(Ending::precondition(
-                        FailureCode::Internal,
-                        "a document cannot be read",
-                        &error,
-                    ));
+            let bytes = loop {
+                let read = self
+                    .parts
+                    .objects
+                    .read_document(instruction, digest, FETCH_ATTEMPTS);
+                let error = tokio::select! {
+                    biased;
+                    () = self.stop.requested() => return Err(Ending::Open),
+                    () = self.deadline_passed(deadline) => return Err(Ending::expired()),
+                    bytes = read => match bytes {
+                        Ok(bytes) => break bytes,
+                        Err(error) => error,
+                    },
+                };
+                match fetch_class(&error) {
+                    FetchClass::Refused => {
+                        tracing::warn!(external = external(&error), "a document was refused");
+                        return Err(Ending::rejected("the server refused a document"));
+                    }
+                    FetchClass::Local => {
+                        return Err(Ending::precondition(
+                            FailureCode::Internal,
+                            "a document cannot be read",
+                            &error,
+                        ));
+                    }
+                    FetchClass::Unavailable => {
+                        tracing::warn!(
+                            class = error.class(),
+                            "the server did not give a document; trying again"
+                        );
+                        self.wait_unavailable(deadline).await?;
+                    }
                 }
             };
             // A plan is loaded from the bytes, so they are kept beside the document that is
-            // built from them: at most one more copy of a document (16 MiB at most) per job.
-            let kept = keep_bytes.then(|| bytes.clone());
-            let document = JobDocument::new(bytes).map_err(|error| {
-                Ending::precondition(FailureCode::JobRefused, "a document does not load", &error)
-            })?;
+            // built from them: at most one more copy of a document (16 MiB at most) per job. The
+            // load checks the whole document, so it runs on a blocking thread.
+            let built = tokio::task::spawn_blocking(move || {
+                let kept = keep_bytes.then(|| bytes.clone());
+                JobDocument::new(bytes).map(|document| (document, kept))
+            })
+            .await;
+            let (document, kept) = match built {
+                Ok(Ok(built)) => built,
+                Ok(Err(error)) => {
+                    return Err(Ending::precondition(
+                        FailureCode::JobRefused,
+                        "a document does not load",
+                        &error,
+                    ));
+                }
+                Err(_) => return Err(Ending::panicked()),
+            };
             if let Some(bytes) = kept {
                 raw.push((*digest, bytes));
             }
@@ -629,8 +737,9 @@ impl Worker {
         };
         match artifact {
             Ok(Ok(artifact)) => Ok(Some((hash, artifact))),
+            // The agent's own cache: a read that fails is its fault, not the job's data.
             Ok(Err(error)) => Err(Ending::precondition(
-                FailureCode::JobRefused,
+                FailureCode::Internal,
                 "the artifact cannot be read",
                 &error,
             )),
@@ -651,31 +760,61 @@ impl Worker {
         deadline: u64,
     ) -> Ending {
         let named = instruction.instruction();
-        let route = match self.parts.vcis.find(&named.vci.0) {
-            Ok(route) => route,
-            Err(error) => return shell_ending(&error),
-        };
-        let dir = match (self.parts.journal_dir)() {
-            Ok(dir) => dir,
-            Err(error) => {
-                return Ending::precondition(
-                    FailureCode::Internal,
-                    "the journal directory is unusable",
-                    &error,
-                );
-            }
+        // The lookup reads the registration definitions, the directory is probed and the log's
+        // directory is made: one blocking section.
+        let identifies = matches!(prepared, Prepared::Identification { .. });
+        let (vcis, journal_dir) = (
+            Arc::clone(&self.parts.vcis),
+            Arc::clone(&self.parts.journal_dir),
+        );
+        let (vci, log_key, span) = (named.vci.0.clone(), key.clone(), tracing::Span::current());
+        let found = tokio::task::spawn_blocking(move || {
+            span.in_scope(|| {
+                let route = vcis.find(&vci).map_err(|error| shell_ending(&error))?;
+                let dir = journal_dir().map_err(|error| {
+                    Ending::precondition(
+                        FailureCode::Internal,
+                        "the journal directory is unusable",
+                        &error,
+                    )
+                })?;
+                let comm_log = identifies
+                    .then(|| CommLogSetup::for_run_key(dir.clone(), log_key))
+                    .transpose()
+                    .map_err(|error| {
+                        Ending::precondition(
+                            FailureCode::Internal,
+                            "the communication log's directory is unusable",
+                            &error,
+                        )
+                    })?;
+                Ok((route, dir, comm_log))
+            })
+        })
+        .await;
+        let (route, dir, comm_log) = match found {
+            Ok(Ok(found)) => found,
+            Ok(Err(ending)) => return ending,
+            Err(_) => return Ending::panicked(),
         };
         let shell = VciShell {
             vci: named.vci.0.clone(),
             mode: self.parts.mode,
             route,
         };
-        let cancel = Arc::new(AtomicBool::new(false));
+        let lock_cancel = Arc::new(AtomicBool::new(false));
+        let job_cancel = Arc::new(AtomicBool::new(false));
         let (first_step, started) = mpsc::unbounded_channel::<()>();
         let first = Box::new(move || {
             // The job thread does not wait: a send on an unbounded channel does not block.
             let _ = first_step.send(());
         });
+        let watched = Watched {
+            lock_cancel: Arc::clone(&lock_cancel),
+            job_cancel: Arc::clone(&job_cancel),
+            started,
+            deadline,
+        };
         match prepared {
             Prepared::Program {
                 job,
@@ -690,77 +829,69 @@ impl Worker {
                     vin: named.vin.as_ref().map(|vin| Vin::new(vin.0.clone())),
                     intended_software_version: None,
                 };
-                let flag = Arc::clone(&cancel);
-                let run = run_on_vci(shell, writes, flag, move |source, vci, guards| async move {
-                    let job = job.with_vci(vci);
-                    let JobRun {
-                        result,
-                        guards,
-                        comm_log,
-                    } = run_program_journaled(
-                        source,
-                        &link,
-                        job,
-                        JobLimits::default(),
-                        setup,
-                        guards,
-                        Some(first),
-                    )
-                    .await;
-                    (result, guards, comm_log)
-                });
+                let job = job.with_cancel(job_cancel);
+                let run = run_on_vci(
+                    shell,
+                    writes,
+                    lock_cancel,
+                    move |source, vci, guards| async move {
+                        let job = job.with_vci(vci);
+                        let JobRun {
+                            result,
+                            guards,
+                            comm_log,
+                        } = run_program_journaled(
+                            source,
+                            &link,
+                            job,
+                            JobLimits::default(),
+                            setup,
+                            guards,
+                            Some(first),
+                        )
+                        .await;
+                        (result, guards, comm_log)
+                    },
+                );
                 let standing_key = key.clone();
                 self.supervise(
                     key,
                     run,
-                    Watched {
-                        cancel,
-                        started,
-                        deadline,
-                    },
+                    watched,
                     move || JournalStanding::read(&dir, &standing_key, &program, true),
                     |state: &VmState| vm_state_json(state),
                 )
                 .await
             }
             Prepared::Identification { plan } => {
-                let comm_log = match CommLogSetup::for_run_key(dir, key.clone()) {
-                    Ok(setup) => setup,
-                    Err(error) => {
-                        return Ending::precondition(
-                            FailureCode::Internal,
-                            "the communication log's directory is unusable",
-                            &error,
-                        );
-                    }
-                };
-                let flag = Arc::clone(&cancel);
-                let job_cancel = Arc::clone(&cancel);
-                let run = run_on_vci(shell, false, flag, move |source, vci, guards| async move {
-                    let run = run_identification(
-                        source,
-                        *plan,
-                        JobLimits::default(),
-                        guards,
-                        Some(comm_log),
-                        Some(vci),
-                        // No VCI profile gives the agent margins.
-                        VciMargins::default(),
-                        job_cancel,
-                        Some(first),
-                    )
-                    .await;
-                    (run.result, run.guards, run.comm_log)
-                });
+                let comm_log =
+                    comm_log.expect("the section above made the log of an identification");
+                let run = run_on_vci(
+                    shell,
+                    false,
+                    lock_cancel,
+                    move |source, vci, guards| async move {
+                        let run = run_identification(
+                            source,
+                            *plan,
+                            JobLimits::default(),
+                            guards,
+                            Some(comm_log),
+                            Some(vci),
+                            // No VCI profile gives the agent margins.
+                            VciMargins::default(),
+                            job_cancel,
+                            Some(first),
+                        )
+                        .await;
+                        (run.result, run.guards, run.comm_log)
+                    },
+                );
                 // An identification run keeps no journal.
                 self.supervise(
                     key,
                     run,
-                    Watched {
-                        cancel,
-                        started,
-                        deadline,
-                    },
+                    watched,
                     || JournalStanding::Clean,
                     |report: &IdentificationReport| {
                         serde_json::to_string(report).map_err(ResultJsonError::Encode)
@@ -772,18 +903,22 @@ impl Worker {
     }
 
     /// Runs `run` as a task of its own and watches it: `running` once its first step begins, the
-    /// start deadline while it has not, the stop at any time. A stop drops the run (which cancels
-    /// the job at its next interruptible point) and leaves the job open.
+    /// start deadline while it has not (it cancels the wait for the locks and the launch only, so
+    /// a job past them is not ended by it), the stop at any time. A stop cancels the job and the
+    /// shell, and the run is awaited for [`RUN_STOP_BOUND`] so that its worker stops, its locks are
+    /// released and a run that ended `Ok` is reported; only a run that does not end in time is
+    /// dropped, and its job stays open.
     async fn supervise<T: Send + 'static>(
         &self,
         key: &JobKey,
         run: impl Future<Output = Result<ShellRun<T>, VciShellError>> + Send + 'static,
         watched: Watched,
-        standing: impl FnOnce() -> JournalStanding,
+        standing: impl FnOnce() -> JournalStanding + Send + 'static,
         to_json: impl FnOnce(&T) -> Result<String, ResultJsonError>,
     ) -> Ending {
         let Watched {
-            cancel,
+            lock_cancel,
+            job_cancel,
             mut started,
             deadline,
         } = watched;
@@ -792,8 +927,11 @@ impl Worker {
         let mut watching = true;
         let mut cut = false;
         let mut stopping = false;
+        let mut dropped = false;
         let deadline_watch = self.deadline_passed(deadline);
         tokio::pin!(deadline_watch);
+        let stop_bound = tokio::time::sleep(RUN_STOP_BOUND);
+        tokio::pin!(stop_bound);
         let joined = loop {
             tokio::select! {
                 biased;
@@ -807,11 +945,17 @@ impl Worker {
                 }
                 () = &mut deadline_watch, if !announced && !cut => {
                     cut = true;
-                    cancel.store(true, Ordering::Relaxed);
+                    lock_cancel.store(true, Ordering::Relaxed);
                 }
                 () = self.stop.requested(), if !stopping => {
                     stopping = true;
-                    cancel.store(true, Ordering::Relaxed);
+                    lock_cancel.store(true, Ordering::Relaxed);
+                    job_cancel.store(true, Ordering::Relaxed);
+                    stop_bound.as_mut().reset(tokio::time::Instant::now() + RUN_STOP_BOUND);
+                }
+                () = &mut stop_bound, if stopping && !dropped => {
+                    dropped = true;
+                    tracing::warn!("the run did not end within the bound of a stop; it is dropped and the job stays open");
                     run.abort();
                 }
             }
@@ -823,7 +967,7 @@ impl Worker {
         }
         match joined {
             Err(error) if error.is_cancelled() => Ending::Open,
-            Err(error) => Ending::panicked(&error),
+            Err(_) => Ending::panicked(),
             Ok(Err(VciShellError::Cancelled)) => {
                 if cut && !stopping {
                     Ending::expired()
@@ -839,11 +983,14 @@ impl Worker {
                     worker_end,
                 } = run;
                 log_run_end(&comm_log, &worker_end);
-                // A cancel the start deadline raised before the first step is the deadline's end.
-                if cut && !stopping && matches!(result, Err(JobError::Cancelled)) {
-                    return Ending::expired();
-                }
-                match job_report::outcome(&result, true, &standing()) {
+                // The journal is read on a blocking thread.
+                let span = tracing::Span::current();
+                let standing =
+                    match tokio::task::spawn_blocking(move || span.in_scope(standing)).await {
+                        Ok(standing) => standing,
+                        Err(_) => return Ending::panicked(),
+                    };
+                match job_report::outcome(&result, true, &standing) {
                     JobOutcome::Terminal(JobState::Completed) => {
                         let value = result.as_ref().ok();
                         let bytes = value.map(to_json).and_then(|json| match json {
@@ -885,6 +1032,7 @@ impl Worker {
 
     /// The end of a job: the result (for `Ok`), the record's `ended`, the outbox append, the
     /// record's `reported`. While the agent stops nothing terminal is reported, except `completed`.
+    /// An end that is neither recorded nor appended is kept in memory and tried again.
     async fn finish(&self, key: &JobKey, ending: Ending) {
         let Ending::Ended { state, result } = ending else {
             return;
@@ -900,22 +1048,60 @@ impl Worker {
                 "the job's result was not enqueued; its state is reported all the same"
             );
         }
+        let recorded = self.record_end(key, &state).await;
+        if !self.announce(key, &state).await && !recorded {
+            self.keep_in_memory(key.clone(), state);
+        }
+    }
+
+    /// Makes the end durable in the outcome record; false when that failed.
+    async fn record_end(&self, key: &JobKey, state: &JobState) -> bool {
         let (ended_key, ended_state) = (key.clone(), state.clone());
-        if let Err(error) = self
+        match self
             .record(move |record| record.ended(&ended_key, &ended_state))
             .await
         {
-            tracing::warn!(
-                error = &error as &dyn std::error::Error,
-                "the job's end was not recorded; it is reported all the same"
-            );
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(
+                    error = &error as &dyn std::error::Error,
+                    "the job's end was not recorded; it is reported all the same"
+                );
+                false
+            }
         }
-        self.announce(key, &state).await;
     }
 
-    /// Appends the terminal `state` to the outbox and records that it is there. An append that
-    /// fails leaves the end owed: it is tried again.
-    async fn announce(&self, key: &JobKey, state: &JobState) {
+    /// Records that the end of `key` is in the outbox. A failure is logged once and the end is not
+    /// appended again in this start.
+    async fn record_reported(&self, key: &JobKey) {
+        let reported = key.clone();
+        if let Err(error) = self.record(move |record| record.reported(&reported)).await {
+            self.log_failure(
+                key,
+                &error,
+                "the job's report was not recorded; it is appended again at the next start",
+            );
+        }
+    }
+
+    /// Logs a failure at `warn` the first time for a job in this start and at `debug` after.
+    fn log_failure(&self, key: &JobKey, error: &(dyn std::error::Error + 'static), text: &str) {
+        let first = self
+            .warned
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((key.job_id.0.clone(), key.generation));
+        if first {
+            tracing::warn!(error, "{text}");
+        } else {
+            tracing::debug!(error, "{text}");
+        }
+    }
+
+    /// Appends the terminal `state` to the outbox and records that it is there; true when the
+    /// append worked. An append that fails leaves the end owed (in the record, or in memory).
+    async fn announce(&self, key: &JobKey, state: &JobState) -> bool {
         match self
             .parts
             .outbox
@@ -923,18 +1109,21 @@ impl Worker {
             .await
         {
             Ok(_) => {
-                let reported = key.clone();
-                if let Err(error) = self.record(move |record| record.reported(&reported)).await {
-                    tracing::warn!(
-                        error = &error as &dyn std::error::Error,
-                        "the job's report was not recorded; it is appended again at the next start"
-                    );
-                }
+                self.appended
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert((key.job_id.0.clone(), key.generation));
+                self.record_reported(key).await;
+                true
             }
-            Err(error) => tracing::warn!(
-                error = &error as &dyn std::error::Error,
-                "the job's end was not appended; it is tried again"
-            ),
+            Err(error) => {
+                self.log_failure(
+                    key,
+                    &error,
+                    "the job's end was not appended; it is tried again",
+                );
+                false
+            }
         }
     }
 
@@ -1137,11 +1326,9 @@ fn log_run_end(comm_log: &CommLogStatus, worker_end: &WorkerEnd) {
 
 impl Ending {
     /// A run task that panicked.
-    fn panicked(error: &tokio::task::JoinError) -> Self {
-        tracing::error!(
-            error = error as &dyn std::error::Error,
-            "the job's run task failed"
-        );
+    fn panicked() -> Self {
+        // The panic's own message is not logged: it may carry text of the job's data.
+        tracing::error!("the job's run task panicked");
         Ending::state(JobState::Failed {
             code: FailureCode::Internal,
             detail: "the run task failed".to_owned(),

@@ -8,6 +8,7 @@
 //! its seams.
 
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -19,13 +20,15 @@ use shared_proto::{AgentId, INSTRUCTION_VERSION, JobInstruction, VciId};
 use tokio::time::Instant;
 
 use super::*;
+use crate::comm_log::CommLogStatus;
 use crate::document::tests::{empty_program, vin_document};
 use crate::identification::{NoPlans, PlanSourceError};
 use crate::instruction;
 use crate::launch::Api;
 use crate::outbox::Outbox;
+use crate::runner::JobError;
 use crate::upload_ledger::UploadLedger;
-use crate::vci_shell::VciRoute;
+use crate::vci_shell::{VciRoute, WorkerEnd};
 
 const AGENT_ID: &str = "0194f0a2-7c3e-7d11-8a52-3f6f9b1c2d4e";
 /// The device clock at the start of a test.
@@ -312,9 +315,14 @@ struct Rig {
     objects: Arc<FakeObjects>,
     vcis: Arc<FakeVcis>,
     outbox: SharedOutbox,
+    uploads: SharedLedger,
+    marks: IssueMark,
+    clock: Arc<dyn Clock>,
     outcomes: OutcomeRecord,
     intake: Arc<JobIntake>,
     handle: Handle,
+    /// How many ends the outcome record held unreported at each write the outbox made.
+    owed_at_append: Arc<StdMutex<Vec<usize>>>,
 }
 
 impl Rig {
@@ -339,16 +347,27 @@ impl Rig {
 
     fn with(plans: Arc<dyn PlanSource + Send + Sync>, clock: Arc<dyn Clock>) -> Rig {
         let dir = tempfile::tempdir().unwrap();
+        let registration = dir.path().join("registration");
+        std::fs::create_dir_all(&registration).unwrap();
+        let outcomes = OutcomeRecord::open_in(&registration, AGENT_ID).unwrap();
         let outbox_dir = dir.path().join("outbox");
         std::fs::create_dir_all(&outbox_dir).unwrap();
-        let outbox = SharedOutbox::new(Outbox::open_in(&outbox_dir, AGENT_ID).unwrap());
+        // The outbox looks at the record each time it is about to write an event.
+        let owed_at_append = Arc::new(StdMutex::new(Vec::new()));
+        let probe: crate::outbox::Probe = {
+            let (outcomes, seen) = (outcomes.clone(), owed_at_append.clone());
+            Box::new(move |step| {
+                if step == crate::outbox::Step::BeforeWrite {
+                    seen.lock().unwrap().push(outcomes.owed().len());
+                }
+                Ok(())
+            })
+        };
+        let outbox = SharedOutbox::new(Outbox::open_with(&outbox_dir, AGENT_ID, probe).unwrap());
         let uploads_dir = dir.path().join("uploads");
         std::fs::create_dir_all(&uploads_dir).unwrap();
         let uploads = SharedLedger::new(UploadLedger::open_in(&uploads_dir, AGENT_ID).unwrap());
-        let registration = dir.path().join("registration");
-        std::fs::create_dir_all(&registration).unwrap();
         let marks = IssueMark::open_in(&registration, AGENT_ID).unwrap();
-        let outcomes = OutcomeRecord::open_in(&registration, AGENT_ID).unwrap();
         let objects = Arc::new(FakeObjects::new());
         let vcis = Arc::new(FakeVcis {
             dir: dir.path().to_owned(),
@@ -362,9 +381,9 @@ impl Rig {
             mode: OperatingMode::User,
             journal_dir: Arc::new(move || Ok(journal.clone())),
             outbox: outbox.clone(),
-            uploads,
-            marks,
-            clock,
+            uploads: uploads.clone(),
+            marks: marks.clone(),
+            clock: clock.clone(),
             outcomes: outcomes.clone(),
         });
         Rig {
@@ -372,10 +391,39 @@ impl Rig {
             objects,
             vcis,
             outbox,
+            uploads,
+            marks,
+            clock,
             outcomes,
             intake,
             handle,
+            owed_at_append,
         }
+    }
+
+    /// A worker over the rig's stores, which the test drives itself, and its stop.
+    fn worker(&self) -> (Worker, watch::Sender<bool>) {
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let worker = Worker {
+            parts: Parts {
+                objects: self.objects.clone(),
+                plans: Arc::new(NoPlans),
+                vcis: self.vcis.clone(),
+                mode: OperatingMode::User,
+                journal_dir: Arc::new(|| Ok(PathBuf::from("journal"))),
+                outbox: self.outbox.clone(),
+                uploads: self.uploads.clone(),
+                marks: self.marks.clone(),
+                clock: self.clock.clone(),
+                outcomes: self.outcomes.clone(),
+            },
+            queue: Arc::new(Queue::default()),
+            stop: Stop(stop_rx),
+            appended: StdMutex::default(),
+            warned: StdMutex::default(),
+            in_memory: StdMutex::default(),
+        };
+        (worker, stop_tx)
     }
 
     /// What the channel does for a job: the intake takes it, then hears that `received` is in.
@@ -926,4 +974,277 @@ async fn an_end_that_was_recorded_and_not_reported_is_appended_at_the_next_start
         // Let the stores release their locks before the next start.
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
+}
+
+// ---------------------------------------------------------------- the run's end, watched
+
+/// What a fake run ends with: an `Ok` result of a run that completed.
+fn finished() -> Result<ShellRun<()>, VciShellError> {
+    Ok(ShellRun {
+        result: Ok(()),
+        comm_log: CommLogStatus::None,
+        worker_end: WorkerEnd::Exited,
+    })
+}
+
+/// What a test hands `supervise` besides the run: its flags, its first-step channel and the
+/// deadline `in_secs` from the start of the test.
+fn watch_of(
+    rig: &Rig,
+    in_secs: u64,
+) -> (
+    Watched,
+    Arc<AtomicBool>,
+    Arc<AtomicBool>,
+    mpsc::UnboundedSender<()>,
+) {
+    let (lock_cancel, job_cancel) = (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let (first_step, started) = mpsc::unbounded_channel();
+    (
+        Watched {
+            lock_cancel: lock_cancel.clone(),
+            job_cancel: job_cancel.clone(),
+            started,
+            deadline: rig.clock.now_unix() + in_secs,
+        },
+        lock_cancel,
+        job_cancel,
+        first_step,
+    )
+}
+
+async fn supervise_unit(
+    worker: &Worker,
+    key: &JobKey,
+    watched: Watched,
+    run: impl Future<Output = Result<ShellRun<()>, VciShellError>> + Send + 'static,
+) -> Ending {
+    worker
+        .supervise(
+            key,
+            run,
+            watched,
+            || JournalStanding::Clean,
+            |(): &()| Ok("{\"final\":true}".to_owned()),
+        )
+        .await
+}
+
+/// `running` is appended when the run's first step begins and the terminal event after it, in that
+/// order; the result is enqueued before the end.
+#[tokio::test(start_paused = true)]
+async fn running_is_reported_before_the_terminal_event() {
+    let rig = Rig::new();
+    let (worker, _stop) = rig.worker();
+    let key = JobKey {
+        job_id: JobId(job_id(1)),
+        generation: 1,
+    };
+    let (watched, _lock, _job, first_step) = watch_of(&rig, 600);
+    let run = async move {
+        first_step.send(()).unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        finished()
+    };
+    let ending = supervise_unit(&worker, &key, watched, run).await;
+    assert_eq!(rig.events(1).await, vec![state("running", None)]);
+    worker.finish(&key, ending).await;
+    assert_eq!(
+        rig.events(1).await,
+        vec![state("running", None), state("completed", None)]
+    );
+    let entries = rig.uploads.entries_for_test().await;
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| (entry.key.clone(), entry.kind))
+            .collect::<Vec<_>>(),
+        vec![(key, crate::upload_ledger::Kind::Result)]
+    );
+}
+
+/// A stop does not drop the run: it cancels the job and the run is awaited, so a run that ends
+/// `Ok` after the stop was requested (while its worker stops) is reported `completed`, recorded,
+/// and its result enqueued; a run that ends any other way is reported as nothing terminal.
+#[tokio::test(start_paused = true)]
+async fn a_run_that_ends_ok_after_a_stop_is_completed_recorded_and_its_result_enqueued() {
+    let rig = Rig::new();
+    let (worker, stop) = rig.worker();
+    let key = JobKey {
+        job_id: JobId(job_id(1)),
+        generation: 1,
+    };
+    let (watched, _lock, job_cancel, first_step) = watch_of(&rig, 600);
+    let seen = job_cancel.clone();
+    let run = async move {
+        first_step.send(()).unwrap();
+        while !seen.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // The worker stops, which takes a moment, and the run ends `Ok` all the same.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        finished()
+    };
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        stop.send_replace(true);
+    });
+    let ending = supervise_unit(&worker, &key, watched, run).await;
+    assert!(
+        job_cancel.load(Ordering::SeqCst),
+        "the stop cancelled the job"
+    );
+    assert!(matches!(
+        ending,
+        Ending::Ended {
+            state: JobState::Completed,
+            result: Some(_)
+        }
+    ));
+    worker.finish(&key, ending).await;
+    assert_eq!(
+        rig.events(1).await,
+        vec![state("running", None), state("completed", None)]
+    );
+    assert_eq!(
+        rig.outcomes.standing(&key),
+        Some((JobState::Completed, true))
+    );
+    assert_eq!(rig.uploads.entries_for_test().await.len(), 1);
+}
+
+/// A run that ends in an error after the stop reports nothing terminal, and one that does not
+/// end within the bound is dropped and left open.
+#[tokio::test(start_paused = true)]
+async fn a_stop_leaves_a_run_that_fails_or_does_not_end_open() {
+    let rig = Rig::new();
+    let (worker, stop) = rig.worker();
+    let key = JobKey {
+        job_id: JobId(job_id(1)),
+        generation: 1,
+    };
+    stop.send_replace(true);
+    let (watched, ..) = watch_of(&rig, 600);
+    let run = async {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        Ok(ShellRun {
+            result: Err(JobError::Cancelled),
+            comm_log: CommLogStatus::None,
+            worker_end: WorkerEnd::Exited,
+        })
+    };
+    let ending = supervise_unit(&worker, &key, watched, run).await;
+    worker.finish(&key, ending).await;
+    assert!(rig.events(1).await.is_empty());
+
+    let begun = Instant::now();
+    let (watched, ..) = watch_of(&rig, 600);
+    let ending = supervise_unit(&worker, &key, watched, std::future::pending()).await;
+    assert!(matches!(ending, Ending::Open));
+    assert!(begun.elapsed() <= RUN_STOP_BOUND + Duration::from_secs(1));
+    worker.finish(&key, ending).await;
+    assert!(rig.events(1).await.is_empty());
+    assert!(rig.outcomes.owed().is_empty());
+}
+
+/// The start deadline ends a job that still waits for its locks, by cancelling the shell, and
+/// only that: a job whose first step has begun runs on past the deadline, and neither flag the
+/// run sees is set by it (an identification run takes the job's cancel as its own).
+#[tokio::test(start_paused = true)]
+async fn the_deadline_ends_only_a_job_that_has_not_begun() {
+    let rig = Rig::new();
+    let (worker, _stop) = rig.worker();
+    let key = JobKey {
+        job_id: JobId(job_id(1)),
+        generation: 1,
+    };
+    // Not begun: the lock wait is cancelled at the deadline and the job is expired.
+    let (watched, lock_cancel, job_cancel, _first_step) = watch_of(&rig, 5);
+    let seen = lock_cancel.clone();
+    let run = async move {
+        while !seen.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Err(VciShellError::Cancelled)
+    };
+    let ending = supervise_unit(&worker, &key, watched, run).await;
+    assert!(matches!(
+        ending,
+        Ending::Ended {
+            state: JobState::Expired,
+            ..
+        }
+    ));
+    assert!(
+        !job_cancel.load(Ordering::SeqCst),
+        "the job's own cancel is not the deadline's"
+    );
+
+    // Begun: the job goes on past the deadline and ends as the run ends.
+    let (watched, lock_cancel, job_cancel, first_step) = watch_of(&rig, 3);
+    let (lock_seen, job_seen) = (lock_cancel.clone(), job_cancel.clone());
+    let run = async move {
+        first_step.send(()).unwrap();
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert!(!lock_seen.load(Ordering::SeqCst) && !job_seen.load(Ordering::SeqCst));
+        finished()
+    };
+    let ending = supervise_unit(&worker, &key, watched, run).await;
+    assert!(matches!(
+        ending,
+        Ending::Ended {
+            state: JobState::Completed,
+            ..
+        }
+    ));
+}
+
+/// The end is synced in the outcome record before its event is appended to the outbox: the
+/// outbox's write hook finds it recorded and not yet reported.
+#[tokio::test(start_paused = true)]
+async fn an_end_is_recorded_before_the_outbox_takes_it() {
+    let rig = Rig::new();
+    let reading = reading_document();
+    rig.objects.then(Answer::Refused);
+    rig.deliver(&Spec::new(1, JobKind::Acquire, &[&reading]))
+        .await;
+    rig.ended(1).await;
+    assert_eq!(*rig.owed_at_append.lock().unwrap(), vec![1]);
+}
+
+/// An end the intake appended in this start is not appended again when its `reported` record
+/// failed: the record is only tried once more.
+#[tokio::test(start_paused = true)]
+async fn an_owed_end_is_appended_once_per_start() {
+    let rig = Rig::new();
+    rig.handle.stop();
+    rig.handle.stopped().await;
+    let (worker, _stop) = rig.worker();
+    let key = JobKey {
+        job_id: JobId(job_id(1)),
+        generation: 1,
+    };
+    rig.outcomes.ended(&key, &JobState::Expired).unwrap();
+    // This start appended it already (its `reported` write is what failed).
+    worker
+        .appended
+        .lock()
+        .unwrap()
+        .insert((key.job_id.0.clone(), 1));
+    worker.recover().await;
+    assert!(rig.events(1).await.is_empty(), "not appended again");
+    assert!(rig.outcomes.owed().is_empty(), "the record is made good");
+    // Another job's owed end, not appended in this start, is appended once however often it is
+    // looked at.
+    let other = JobKey {
+        job_id: JobId(job_id(2)),
+        generation: 1,
+    };
+    rig.outcomes.ended(&other, &JobState::Expired).unwrap();
+    worker.recover().await;
+    worker.recover().await;
+    assert_eq!(rig.events(2).await.len(), 1);
 }

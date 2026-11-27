@@ -11,7 +11,13 @@ const REGENERATE: &str = "NGR_REGENERATE_PROTO";
 fn main() {
     println!("cargo:rerun-if-env-changed={REGENERATE}");
     if std::env::var_os(REGENERATE).is_some_and(|value| value == "1") {
-        build_protobuf();
+        if cfg!(feature = "protoc") {
+            build_protobuf();
+        } else {
+            println!(
+                "cargo:warning={REGENERATE}=1 has no effect without the 'protoc' or 'vendored-protoc' feature"
+            );
+        }
     }
 }
 #[cfg(not(feature = "protoc"))]

@@ -64,6 +64,10 @@ fn run_bindgen() {
         generate_bindings();
         return;
     }
+    #[cfg(not(feature = "bindgen"))]
+    if std::env::var_os(REGENERATE).is_some_and(|value| value == "1") {
+        println!("cargo:warning={REGENERATE}=1 has no effect without the 'bindgen' feature");
+    }
     use_committed_bindings();
 }
 

@@ -33,5 +33,5 @@ paths:
   regenerate: ask whether to regenerate now or defer. Never commit a header
   edit with stale bindings silently; record a deferral as an open item in
   `work/`.
-- Without `--features bindgen` and the variable, the build expects the committed `{target}.rs`
+- Unless both `--features bindgen` and `NGR_REGENERATE_FFI=1` are given, the build uses the committed `{target}.rs`
   and fails if it is missing, so adding a target means generating its file.

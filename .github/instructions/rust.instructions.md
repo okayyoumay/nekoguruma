@@ -16,9 +16,12 @@ Flag as P1:
   test-control symbols, and in narrow operating-system API calls (for example the Windows Shell
   or Event Log); there, flag only unsound code.
 - **Generated code out of step with its source**, in either direction:
-  - Proto: a change to `crates/vci-service-interface/src/bindings/vci.service.rs` without the
-    matching `service.proto` change (hand edit), or a `service.proto` change without the
-    regenerated bindings in the same PR. Proto regeneration is never deferred.
+  - Proto: content in `crates/vci-service-interface/src/bindings/vci.service.rs` that the locked
+    generator (`prost-build` and `tonic-prost-build` at their `Cargo.lock` versions) would not
+    produce from `service.proto` (a hand edit), or a `service.proto` change without the
+    regenerated bindings in the same PR. A regeneration with no `service.proto` change is fine
+    when it only brings the file to what the locked generator produces. Proto regeneration is
+    never deferred.
   - FFI hand edit: a change to `crates/*-sys/src/bindings/*.rs` without a header change. No
     exception.
   - IR FlatBuffers: content in `crates/diag-ir/src/generated/ir_generated.rs` that `flatc` (the

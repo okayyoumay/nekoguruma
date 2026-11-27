@@ -15,7 +15,9 @@ paths:
   (the feature alone builds the generator and writes nothing, so a `--all-features` run
   leaves the bindings as they are) and commit
   the result with the proto change. Update `docs/rpc-api-guide.md` in the same
-  PR.
+  PR. The committed file is what the generator at its `Cargo.lock` versions produces: a
+  generator update that changes the output is committed with the regenerated file, even
+  with no proto change.
 - **IR FlatBuffers bindings** (`crates/diag-ir`): `schema/ir.fbs` is the
   source of truth; `src/generated/ir_generated.rs` is regenerated with
   `cargo build -p diag-ir --features download-flatc`, which fetches the pinned

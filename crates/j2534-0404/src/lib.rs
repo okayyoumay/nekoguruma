@@ -684,12 +684,21 @@ pub struct MessageFilterId(pub u32);
 /// # Native calls
 ///
 /// Every `unsafe` block in this crate that calls a `PassThru*` function relies
-/// on the invariants below, so the safety comment on each block states only what is
-/// specific to its arguments.
+/// on the invariants below, so the safety comment on each block states only
+/// what is specific to its arguments.
 ///
 /// - The function table in `api` was resolved by [`from_path`] from a library
 ///   that the table itself keeps loaded, and `api` lives as long as `self`, so
-///   each function pointer is valid for any call made through `&self`.
+///   each function pointer is valid for a call made through `&self`.
+/// - The `unsigned long` width the bindings were generated for
+///   (`NGR_J2534_LONG_SIZE` for the worker) matches the loaded library. It
+///   comes from trusted configuration, and safe code cannot check it before
+///   the first calls: a wrong width makes the library read and write past the
+///   buffers passed here, possibly before the version self-check runs.
+/// - Calls into one library are made one at a time (J2534-1 clause 6.2 allows
+///   one thread in the DLL at a time). The type is `Send` and `Sync`, so the
+///   caller serialises calls, as the worker does by holding the handle in an
+///   `Arc<Mutex<_>>`.
 /// - Pointer arguments point at values owned by the calling frame (or the
 ///   caller's borrow) that are initialised, correctly aligned, sized as the
 ///   J2534 v04.04 signature of that function requires, and exclusively
@@ -713,12 +722,17 @@ impl J2534Api0404 {
     // ── Construction ──────────────────────────────────────────────────────────
 
     /// Loads a vendor J2534 shared library from the given filesystem path.
+    ///
+    /// The library must match the `unsigned long` width the bindings were
+    /// built for; see "Native calls" on the type.
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self, Error> {
         let path = path.as_ref();
         info!(path = %path.display(), "loading J2534 library");
         // SAFETY: `path` is a vendor J2534 library the caller chose to load; loading runs its
-        // initialisers, which is the trust the caller extends by naming it. `new` keeps the library
-        // handle inside the returned table, which `self.api` keeps alive.
+        // initialisers, which is the trust the caller extends by naming it. Its `unsigned long`
+        // width is assumed to match the bindings (Native calls on `J2534Api0404`), which nothing
+        // here can check. `new` keeps the library handle inside the returned table, which
+        // `self.api` keeps alive.
         let api = unsafe { SysJ2534Api0404::new(path.as_os_str()) }.map_err(Error::LibraryLoad)?;
         debug!(path = %path.display(), "J2534 library loaded");
         Ok(Self { api })
@@ -754,14 +768,17 @@ impl J2534Api0404 {
     /// `PassThruOpen`'s `pName` argument instead — an out-of-spec
     /// vendor-extension some J2534 DLLs use to select a connection target
     /// among multiple physical devices (ADR-106). The `&CStr` borrow ensures
-    /// the caller's owned `CString` outlives this call; no pointer is
-    /// retained past `PassThruOpen`'s return.
+    /// the caller's owned `CString` outlives this call. That the vendor
+    /// library keeps no pointer past `PassThruOpen`'s return is an assumption
+    /// about the library, not something the spec guarantees for a vendor
+    /// extension.
     pub fn open(&self, name: Option<&CStr>) -> Result<DeviceId, Error> {
         let p_name = name.map_or(std::ptr::null_mut(), |n| n.as_ptr() as *mut c_void);
         let mut device_id = 0_u32;
         // SAFETY: `p_name` is null or points into the caller's NUL-terminated `name`, which
-        // outlives this call and is not retained; `device_id` is a live `u32` the callee writes
-        // (Native calls on `J2534Api0404`).
+        // outlives this call; `device_id` is a live `u32` the callee writes (Native calls on
+        // `J2534Api0404`). A non-null name is a vendor extension (ADR-106); that the library
+        // does not keep the pointer is assumed of it, not guaranteed by J2534-1.
         self.check(unsafe { self.api.PassThruOpen(p_name, &mut device_id) })?;
         info!(device_id, "PassThruOpen");
         Ok(DeviceId(device_id))
@@ -977,10 +994,10 @@ impl J2534Api0404 {
         };
         let mut filter_id = 0_u32;
         // SAFETY: `mask` and `pattern` are exclusively borrowed messages with checked payload
-        // lengths; `flow_control_ptr` is null or the same kind of pointer, which
-        // `PassThruStartMsgFilter` accepts for the filter types that need none. The callee copies
-        // the messages and keeps none of the pointers. `filter_id` is a live `u32` the callee
-        // writes.
+        // lengths; `flow_control_ptr` is null or the same kind of pointer. The spec requires a
+        // flow-control message for FLOW_CONTROL_FILTER, so a null there relies on the library
+        // refusing it (ERR_NULL_PARAMETER) instead of reading it. `filter_id` is a live `u32` the
+        // callee writes.
         self.check(unsafe {
             self.api.PassThruStartMsgFilter(
                 channel_id.0,
@@ -1057,10 +1074,12 @@ impl J2534Api0404 {
         channel_id: ChannelId,
         setup: &mut RepeatMsgSetup,
     ) -> Result<u32, Error> {
+        setup.validate()?;
         let mut msg_id = 0_u32;
         // SAFETY: `START_REPEAT_MESSAGE` takes the repeat-message setup struct as input and a `u32`
         // message id as output. `setup` is an exclusively borrowed `RepeatMsgSetup` whose raw
-        // struct is what the call expects, and `msg_id` is a live `u32`.
+        // struct is what the call expects, with all three payload lengths checked above, and
+        // `msg_id` is a live `u32`.
         self.check(unsafe {
             self.api.PassThruIoctl(
                 channel_id.0,
@@ -1498,13 +1517,16 @@ impl J2534Api0404 {
         // const raw pointer to *mut so the FFI signature is satisfied without
         // requiring a mutable borrow from the caller.
         let input_ptr = match input {
-            Some(msg) => std::ptr::addr_of!(msg.0) as *mut bindings::PASSTHRU_MSG,
+            Some(msg) => {
+                let _ = msg.data_size()?;
+                std::ptr::addr_of!(msg.0) as *mut bindings::PASSTHRU_MSG
+            }
             None => std::ptr::null_mut(),
         };
         let mut output = PassThruMessage::zeroed();
         // SAFETY: `input_ptr` is null or points at the caller's `PASSTHRU_MSG`, which `FAST_INIT`
-        // only reads (the `*mut` is for the `void*` signature) and which the borrow keeps alive for
-        // the call. `output` is a zeroed `PASSTHRU_MSG` owned by this frame, which the callee
+        // only reads (the `*mut` is for the `void*` signature), whose payload length was checked
+        // above and which the borrow keeps alive for the call. `output` is a zeroed `PASSTHRU_MSG` owned by this frame, which the callee
         // fills.
         self.check(unsafe {
             self.api.PassThruIoctl(
@@ -1658,7 +1680,8 @@ impl J2534Api0404 {
     pub unsafe fn ioctl<C: IoCtlCommand>(&self, handle: u32, command: &mut C) -> Result<(), Error> {
         // SAFETY: the caller of this `unsafe fn` upholds the `IoCtlCommand` contract: the pointers
         // `command` returns are null or valid for the layout `ioctl_id` expects, for the duration
-        // of this call. Obtaining them borrows `command` for the whole call.
+        // of this call, and (also part of that contract) the pointer `output_ptr` returns does not
+        // invalidate the one `input_ptr` returned, although each method borrows `command` in turn.
         self.check(unsafe {
             self.api.PassThruIoctl(
                 handle,

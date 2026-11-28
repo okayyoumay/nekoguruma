@@ -177,8 +177,10 @@ pub struct RepeatMsgSetup(pub(crate) REPEAT_MSG_SETUP);
 impl RepeatMsgSetup {
     /// Builds a new `REPEAT_MSG_SETUP` from `time_interval` (ms),
     /// `condition` (the raw native `Condition` value), the repeat message
-    /// itself, and its stop-condition mask/pattern pair. Each `PassThruMessage`
-    /// is already validated by its own `PassThruMessage::new` construction.
+    /// itself, and its stop-condition mask/pattern pair. The payload lengths are
+    /// not checked here: `PassThruMessage`'s native field is public, so
+    /// [`crate::J2534Api0404::start_repeat_message`] checks all three before the
+    /// native call.
     pub fn new(
         time_interval: u32,
         condition: u32,
@@ -191,6 +193,15 @@ impl RepeatMsgSetup {
             Condition: condition,
             RepeatMsgData: [message.0, mask.0, pattern.0],
         })
+    }
+
+    /// Fails with `MessageTooLarge` when any of the three messages claims a
+    /// payload longer than the native `Data` array.
+    pub(crate) fn validate(&self) -> Result<(), Error> {
+        for message in &self.0.RepeatMsgData {
+            validate_data_size(message.DataSize as usize)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn as_raw_mut_ptr(&mut self) -> *mut REPEAT_MSG_SETUP {

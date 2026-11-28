@@ -13,6 +13,9 @@
 /// - [`output_ptr`] returns either `null_mut()` or a pointer to memory that is
 ///   valid, correctly aligned, and writable by the adapter DLL for the entire
 ///   duration of the call.
+/// - Calling [`output_ptr`] does not invalidate the pointer [`input_ptr`]
+///   returned: [`J2534Api0404::ioctl`] obtains both through separate `&mut self`
+///   borrows and uses them together in one native call.
 /// - The in-memory layout at each pointer matches what the adapter DLL expects
 ///   for the given [`ioctl_id`].
 ///

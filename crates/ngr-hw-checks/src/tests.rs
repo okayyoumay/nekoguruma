@@ -846,13 +846,13 @@ fn the_t0_loopback_check_is_listed_for_t0_and_refused_elsewhere() {
     );
 }
 
-/// The read check: listed for T2 and T3 profiles, refused on T0 and T1, and it fails without a
+/// The read check: listed for T1, T2 and T3 profiles, refused on T0, and it fails without a
 /// profile.
 #[test]
-fn the_t2_t3_read_check_is_listed_for_t2_and_t3_and_refused_elsewhere() {
+fn the_t2_t3_read_check_is_listed_for_t1_to_t3_and_refused_on_t0() {
     assert!(CHECKS.contains(&T2_T3_READ_CHECK));
     assert_eq!(T2_T3_READ_CHECK.name, "hw_t2_t3_read");
-    for class in ["T2", "T3"] {
+    for class in ["T1", "T2", "T3"] {
         let profile = parse(&profile(class, "")).unwrap();
         assert_eq!(
             listing(&profile, &[T2_T3_READ_CHECK]),
@@ -861,21 +861,14 @@ fn the_t2_t3_read_check_is_listed_for_t2_and_t3_and_refused_elsewhere() {
         assert_eq!(start(&T2_T3_READ_CHECK, Ok(profile.clone())), Ok(profile));
     }
     let t0 = parse(T0_PROFILE).unwrap();
-    let t1 = parse(&t1("")).unwrap();
-    for profile in [t0, t1] {
-        let class = profile.class;
-        assert_eq!(
-            listing(&profile, &[T2_T3_READ_CHECK]),
-            format!(
-                "hw_t2_t3_read: refused: the check runs on [T2, T3], not on the profile's \
-                 {class:?}\n"
-            )
-        );
-        assert!(matches!(
-            start(&T2_T3_READ_CHECK, Ok(profile)),
-            Err(StartError::Refused { .. })
-        ));
-    }
+    assert_eq!(
+        listing(&t0, &[T2_T3_READ_CHECK]),
+        "hw_t2_t3_read: refused: the check runs on [T1, T2, T3], not on the profile's T0\n"
+    );
+    assert!(matches!(
+        start(&T2_T3_READ_CHECK, Ok(t0)),
+        Err(StartError::Refused { .. })
+    ));
     assert_eq!(
         start(&T2_T3_READ_CHECK, Err(ProfileError::NotSet)),
         Err(StartError::Profile(ProfileError::NotSet))

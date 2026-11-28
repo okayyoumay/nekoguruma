@@ -505,10 +505,15 @@ carrying its own address byte.
 
 ## The T2/T3 read check
 
-`hw_t2_t3_read` (`ngr_hw_checks::T2_T3_READ_CHECK`, declared for T2 and T3, no operation beyond
-reads) runs a CSV + Starlark definition's reads on a bench ECU or a vehicle through the agent's job
-runner. The harness lists it for a T2 or T3 profile and refuses it on T0 and T1, and the test
-fails without `NGR_HW_PROFILE`. It has a test beside each worker, under the same name:
+`hw_t2_t3_read` (`ngr_hw_checks::T2_T3_READ_CHECK`, declared for T1, T2 and T3, no operation
+beyond reads) runs a CSV + Starlark definition's reads on the stand-in ECU, a bench ECU or a vehicle
+through the agent's job runner. The harness lists it for a T1, T2 or T3 profile and refuses it on
+T0, and the test fails without `NGR_HW_PROFILE`. On T1 it is the local end-to-end read of a real
+J2534 VCI against the stand-in ECU: the operator starts `ngr-stand-in-ecu` as described under "The
+profile", with the identifiers and width of the profile's `[link]` and a `--config` whose ECU the
+profile's `[read]` definition identifies (without `--config` the stand-in serves `sim-ecu`'s default
+configuration), and the check sends reads only, as on the other classes; it does not start or stop
+the stand-in ECU. It has a test beside each worker, under the same name:
 `crates/j2534-0404-service/tests/hw_t2_t3_read.rs` for a J2534 VCI and
 `crates/iso22900-service/tests/hw_t2_t3_read.rs` for a D-PDU API VCI. Both run the body
 `checks::t2_t3_read::run` over the guarded client (`guard::GuardedClient`, ADR-334), so CI runs

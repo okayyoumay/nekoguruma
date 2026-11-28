@@ -1,4 +1,4 @@
-//! `hw_t2_t3_read` (design 13.5, ADR-275): on a bench ECU or a vehicle, the read parts of a CSV +
+//! `hw_t2_t3_read` (design 13.5, ADR-275): on the stand-in ECU, a bench ECU or a vehicle, the read parts of a CSV +
 //! Starlark definition run through the agent's job runner, on the harness's guarded client
 //! (ADR-334). The profile names the definition (`[read]`): its tables, and the Starlark file of
 //! a read procedure. The check identifies the ECU's variant as a server does before it sends a

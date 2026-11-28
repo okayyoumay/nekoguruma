@@ -89,6 +89,8 @@ impl PassThruMessage {
     }
 
     pub(crate) fn zeroed() -> Self {
+        // SAFETY: `PASSTHRU_MSG` is a plain C struct of integers and an integer array, for which
+        // the all-zero bit pattern is a valid value.
         Self(unsafe { MaybeUninit::<PASSTHRU_MSG>::zeroed().assume_init() })
     }
 
@@ -98,6 +100,8 @@ impl PassThruMessage {
 
     /// Returns a borrowed view over this message.
     pub fn borrowed(&self) -> &BorrowedPassThruMessage {
+        // SAFETY: both types are `#[repr(transparent)]` over `PASSTHRU_MSG`, so they have the same
+        // layout and alignment; the result borrows `self` for the same lifetime.
         unsafe { &*(self as *const PassThruMessage as *const BorrowedPassThruMessage) }
     }
 
@@ -209,6 +213,8 @@ pub struct NdisAdapterInfo(pub NDIS_ADAPTER_INFORMATION);
 
 impl NdisAdapterInfo {
     pub(crate) fn zeroed() -> Self {
+        // SAFETY: `NDIS_ADAPTER_INFORMATION` is a plain C struct of integers and integer arrays,
+        // for which the all-zero bit pattern is a valid value.
         Self(unsafe { MaybeUninit::<NDIS_ADAPTER_INFORMATION>::zeroed().assume_init() })
     }
 

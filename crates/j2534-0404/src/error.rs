@@ -163,6 +163,10 @@ pub(crate) fn check(status: ::std::os::raw::c_long) -> Result<(), Error> {
 }
 
 pub(crate) fn c_buf_to_string(buffer: &[c_char]) -> Result<String, Error> {
+    // SAFETY: `buffer` is a live slice, so the pointer is readable; the callers pass buffers the
+    // library filled with a NUL-terminated string within the buffer's length, as
+    // `PassThruReadVersion` and `PassThruGetLastError` require. `cstr` is used only inside this
+    // function.
     let cstr = unsafe { CStr::from_ptr(buffer.as_ptr()) };
     cstr.to_str()
         .map(|s| s.to_string())

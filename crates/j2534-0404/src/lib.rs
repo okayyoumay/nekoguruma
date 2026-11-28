@@ -1,7 +1,3 @@
-#![expect(
-    clippy::undocumented_unsafe_blocks,
-    reason = "staged adoption, ADR-502"
-)]
 #![allow(
     unsafe_code,
     reason = "wraps the J2534 v04.04 API of a loaded vendor library; every call crosses the C ABI (ADR-502)"
@@ -684,6 +680,25 @@ pub struct MessageFilterId(pub u32);
 // ── API wrapper ───────────────────────────────────────────────────────────────
 
 /// Loaded J2534 v04.04 API handle.
+///
+/// # Native calls
+///
+/// Every `unsafe` block in this crate that calls a `PassThru*` function relies
+/// on the invariants below, so the safety comment on each block states only what is
+/// specific to its arguments.
+///
+/// - The function table in `api` was resolved by [`from_path`] from a library
+///   that the table itself keeps loaded, and `api` lives as long as `self`, so
+///   each function pointer is valid for any call made through `&self`.
+/// - Pointer arguments point at values owned by the calling frame (or the
+///   caller's borrow) that are initialised, correctly aligned, sized as the
+///   J2534 v04.04 signature of that function requires, and exclusively
+///   accessed until the call returns. The library neither retains them after
+///   returning nor frees them.
+/// - Output parameters are written only by the callee, into those frame-owned
+///   values, and are read back only after the status check succeeded.
+///
+/// [`from_path`]: Self::from_path
 pub struct J2534Api0404 {
     api: SysJ2534Api0404,
 }
@@ -701,6 +716,9 @@ impl J2534Api0404 {
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self, Error> {
         let path = path.as_ref();
         info!(path = %path.display(), "loading J2534 library");
+        // SAFETY: `path` is a vendor J2534 library the caller chose to load; loading runs its
+        // initialisers, which is the trust the caller extends by naming it. `new` keeps the library
+        // handle inside the returned table, which `self.api` keeps alive.
         let api = unsafe { SysJ2534Api0404::new(path.as_os_str()) }.map_err(Error::LibraryLoad)?;
         debug!(path = %path.display(), "J2534 library loaded");
         Ok(Self { api })
@@ -741,6 +759,9 @@ impl J2534Api0404 {
     pub fn open(&self, name: Option<&CStr>) -> Result<DeviceId, Error> {
         let p_name = name.map_or(std::ptr::null_mut(), |n| n.as_ptr() as *mut c_void);
         let mut device_id = 0_u32;
+        // SAFETY: `p_name` is null or points into the caller's NUL-terminated `name`, which
+        // outlives this call and is not retained; `device_id` is a live `u32` the callee writes
+        // (Native calls on `J2534Api0404`).
         self.check(unsafe { self.api.PassThruOpen(p_name, &mut device_id) })?;
         info!(device_id, "PassThruOpen");
         Ok(DeviceId(device_id))
@@ -749,6 +770,7 @@ impl J2534Api0404 {
     /// Closes a previously opened device context.
     pub fn close(&self, device_id: DeviceId) -> Result<(), Error> {
         info!(device_id = device_id.0, "PassThruClose");
+        // SAFETY: only a by-value device handle is passed; no pointers.
         self.check(unsafe { self.api.PassThruClose(device_id.0) })
     }
 
@@ -761,6 +783,7 @@ impl J2534Api0404 {
         baud_rate: u32,
     ) -> Result<ChannelId, Error> {
         let mut channel_id = 0_u32;
+        // SAFETY: the arguments are by value, and `channel_id` is a live `u32` the callee writes.
         self.check(unsafe {
             self.api
                 .PassThruConnect(device_id.0, protocol_id, flags, baud_rate, &mut channel_id)
@@ -775,6 +798,7 @@ impl J2534Api0404 {
     /// Disconnects an open channel.
     pub fn disconnect(&self, channel_id: ChannelId) -> Result<(), Error> {
         info!(channel_id = channel_id.0, "PassThruDisconnect");
+        // SAFETY: only a by-value channel handle is passed; no pointers.
         self.check(unsafe { self.api.PassThruDisconnect(channel_id.0) })
     }
 
@@ -783,6 +807,9 @@ impl J2534Api0404 {
         let mut firmware = [0; LAST_ERROR_BUFFER_SIZE];
         let mut dll = [0; LAST_ERROR_BUFFER_SIZE];
         let mut api_ver = [0; LAST_ERROR_BUFFER_SIZE];
+        // SAFETY: `firmware`, `dll` and `api_ver` are distinct, live, zero-initialised buffers of
+        // `LAST_ERROR_BUFFER_SIZE` (80) chars, the size `PassThruReadVersion` requires for each
+        // string; the callee writes them within the call.
         self.check(unsafe {
             self.api.PassThruReadVersion(
                 device_id.0,
@@ -805,6 +832,7 @@ impl J2534Api0404 {
         pin_number: u32,
         voltage: u32,
     ) -> Result<(), Error> {
+        // SAFETY: only by-value arguments are passed; no pointers.
         self.check(unsafe {
             self.api
                 .PassThruSetProgrammingVoltage(device_id.0, pin_number, voltage)
@@ -814,6 +842,8 @@ impl J2534Api0404 {
     /// Returns the implementation-defined last error text.
     pub fn last_error_text(&self) -> Result<String, Error> {
         let mut message = [0; LAST_ERROR_BUFFER_SIZE];
+        // SAFETY: `message` is a live, zero-initialised buffer of `LAST_ERROR_BUFFER_SIZE` (80)
+        // chars, the size `PassThruGetLastError` requires for its text.
         error::check(unsafe { self.api.PassThruGetLastError(message.as_mut_ptr()) })?;
         error::c_buf_to_string(&message)
     }
@@ -831,6 +861,10 @@ impl J2534Api0404 {
             let _ = message.data_size()?;
         }
         let mut num_messages = messages.len() as u32;
+        // SAFETY: `messages` is an exclusively borrowed slice of `#[repr(transparent)]`
+        // `PASSTHRU_MSG` values, so the cast pointer addresses `num_messages` (the slice length)
+        // initialised messages; every payload length was checked above. `num_messages` is a live
+        // `u32` the callee updates. Nothing is retained after the call.
         self.check(unsafe {
             self.api.PassThruWriteMsgs(
                 channel_id.0,
@@ -855,6 +889,10 @@ impl J2534Api0404 {
         }
         let mut raw_messages = vec![PassThruMessage::zeroed(); max_messages];
         let mut num_messages = max_messages as u32;
+        // SAFETY: `raw_messages` holds `max_messages` zeroed `PASSTHRU_MSG` values
+        // (`PassThruMessage` is `#[repr(transparent)]` over it), and `num_messages` starts at that
+        // count, so the callee writes at most that many into the buffer; the result is truncated to
+        // the count it reports.
         self.check(unsafe {
             self.api.PassThruReadMsgs(
                 channel_id.0,
@@ -884,6 +922,9 @@ impl J2534Api0404 {
     ) -> Result<PeriodicMessageId, Error> {
         let _ = message.data_size()?;
         let mut message_id = 0_u32;
+        // SAFETY: `message` is an exclusively borrowed, initialised message with a checked payload
+        // length. `PassThruStartPeriodicMsg` copies it before returning, so the pointer is not
+        // kept. `message_id` is a live `u32` the callee writes.
         self.check(unsafe {
             self.api.PassThruStartPeriodicMsg(
                 channel_id.0,
@@ -910,6 +951,7 @@ impl J2534Api0404 {
             message_id = id.0,
             "PassThruStopPeriodicMsg"
         );
+        // SAFETY: only by-value arguments are passed; no pointers.
         self.check(unsafe { self.api.PassThruStopPeriodicMsg(channel_id.0, id.0) })
     }
 
@@ -934,6 +976,11 @@ impl J2534Api0404 {
             None => std::ptr::null_mut(),
         };
         let mut filter_id = 0_u32;
+        // SAFETY: `mask` and `pattern` are exclusively borrowed messages with checked payload
+        // lengths; `flow_control_ptr` is null or the same kind of pointer, which
+        // `PassThruStartMsgFilter` accepts for the filter types that need none. The callee copies
+        // the messages and keeps none of the pointers. `filter_id` is a live `u32` the callee
+        // writes.
         self.check(unsafe {
             self.api.PassThruStartMsgFilter(
                 channel_id.0,
@@ -953,6 +1000,7 @@ impl J2534Api0404 {
         channel_id: ChannelId,
         id: MessageFilterId,
     ) -> Result<(), Error> {
+        // SAFETY: only by-value arguments are passed; no pointers.
         self.check(unsafe { self.api.PassThruStopMsgFilter(channel_id.0, id.0) })
     }
 
@@ -1010,6 +1058,9 @@ impl J2534Api0404 {
         setup: &mut RepeatMsgSetup,
     ) -> Result<u32, Error> {
         let mut msg_id = 0_u32;
+        // SAFETY: `START_REPEAT_MESSAGE` takes the repeat-message setup struct as input and a `u32`
+        // message id as output. `setup` is an exclusively borrowed `RepeatMsgSetup` whose raw
+        // struct is what the call expects, and `msg_id` is a live `u32`.
         self.check(unsafe {
             self.api.PassThruIoctl(
                 channel_id.0,
@@ -1031,6 +1082,8 @@ impl J2534Api0404 {
     pub fn query_repeat_message(&self, channel_id: ChannelId, msg_id: u32) -> Result<u32, Error> {
         let mut msg_id = msg_id;
         let mut status = 0_u32;
+        // SAFETY: `QUERY_REPEAT_MESSAGE` reads a `u32` message id and writes a `u32` status;
+        // `msg_id` and `status` are live, aligned `u32` locals.
         self.check(unsafe {
             self.api.PassThruIoctl(
                 channel_id.0,
@@ -1046,6 +1099,8 @@ impl J2534Api0404 {
     /// `msg_id` is the value [`Self::start_repeat_message`] returned.
     pub fn stop_repeat_message(&self, channel_id: ChannelId, msg_id: u32) -> Result<(), Error> {
         let mut msg_id = msg_id;
+        // SAFETY: `STOP_REPEAT_MESSAGE` reads a `u32` message id and has no output; `msg_id` is a
+        // live `u32` local and the output pointer is null.
         self.check(unsafe {
             self.api.PassThruIoctl(
                 channel_id.0,
@@ -1228,6 +1283,9 @@ impl J2534Api0404 {
     /// ever meaningful post-`PassThruConnect`).
     pub fn get_ndis_adapter_info(&self, channel_id: ChannelId) -> Result<NdisAdapterInfo, Error> {
         let mut info = NdisAdapterInfo::zeroed();
+        // SAFETY: `GET_NDIS_ADAPTER_INFO` takes no input (null) and writes one
+        // `NDIS_ADAPTER_INFORMATION`; `info` is a zero-initialised value of that type
+        // (`NdisAdapterInfo` is `#[repr(transparent)]` over it) owned by this frame.
         self.check(unsafe {
             self.api.PassThruIoctl(
                 channel_id.0,
@@ -1289,6 +1347,10 @@ impl J2534Api0404 {
             NumOfParams: configs.len() as u32,
             ConfigPtr: configs.as_mut_ptr(),
         };
+        // SAFETY: `GET_CONFIG` reads an `SCONFIG_LIST` input and writes each entry's `Value`.
+        // `config_list` is a live list whose `ConfigPtr` points at `configs`, a vector of exactly
+        // `NumOfParams` initialised entries that is neither moved nor touched until the call
+        // returns. There is no output pointer.
         self.check(unsafe {
             self.api.PassThruIoctl(
                 channel_id.0,
@@ -1320,6 +1382,9 @@ impl J2534Api0404 {
             NumOfParams: sconfigs.len() as u32,
             ConfigPtr: sconfigs.as_mut_ptr(),
         };
+        // SAFETY: `SET_CONFIG` reads an `SCONFIG_LIST`. `config_list` is a live list whose
+        // `ConfigPtr` points at `sconfigs`, a vector of exactly `NumOfParams` initialised entries
+        // that is neither moved nor touched until the call returns. There is no output pointer.
         self.check(unsafe {
             self.api.PassThruIoctl(
                 channel_id.0,
@@ -1363,6 +1428,10 @@ impl J2534Api0404 {
             NumOfParams: configs.len() as u32,
             ConfigPtr: configs.as_mut_ptr(),
         };
+        // SAFETY: `GET_DEVICE_CONFIG` takes an `SCONFIG_LIST` like `GET_CONFIG`;
+        // `config_list.ConfigPtr` points at `configs`, which holds exactly `NumOfParams`
+        // initialised entries and stays untouched until the call returns. `device_id` is the
+        // device-scoped handle this IOCTL requires. There is no output pointer.
         self.check(unsafe {
             self.api.PassThruIoctl(
                 device_id.0,
@@ -1397,6 +1466,10 @@ impl J2534Api0404 {
             NumOfParams: sconfigs.len() as u32,
             ConfigPtr: sconfigs.as_mut_ptr(),
         };
+        // SAFETY: `SET_DEVICE_CONFIG` takes an `SCONFIG_LIST` like `SET_CONFIG`;
+        // `config_list.ConfigPtr` points at `sconfigs`, which holds exactly `NumOfParams`
+        // initialised entries and stays untouched until the call returns. `device_id` is the
+        // device-scoped handle this IOCTL requires. There is no output pointer.
         self.check(unsafe {
             self.api.PassThruIoctl(
                 device_id.0,
@@ -1429,6 +1502,10 @@ impl J2534Api0404 {
             None => std::ptr::null_mut(),
         };
         let mut output = PassThruMessage::zeroed();
+        // SAFETY: `input_ptr` is null or points at the caller's `PASSTHRU_MSG`, which `FAST_INIT`
+        // only reads (the `*mut` is for the `void*` signature) and which the borrow keeps alive for
+        // the call. `output` is a zeroed `PASSTHRU_MSG` owned by this frame, which the callee
+        // fills.
         self.check(unsafe {
             self.api.PassThruIoctl(
                 channel_id.0,
@@ -1460,6 +1537,9 @@ impl J2534Api0404 {
             NumOfBytes: 2,
             BytePtr: keywords.as_mut_ptr(),
         };
+        // SAFETY: `FIVE_BAUD_INIT` reads an `SBYTE_ARRAY` input and fills an `SBYTE_ARRAY` output.
+        // `input` has one byte at `addr_byte` (`NumOfBytes` 1), and `output` has the two keyword
+        // bytes at `keywords` (`NumOfBytes` 2); all four locals outlive the call.
         self.check(unsafe {
             self.api.PassThruIoctl(
                 channel_id.0,
@@ -1541,6 +1621,10 @@ impl J2534Api0404 {
             NumOfParams: sparams.len() as u32,
             ParamPtr: sparams.as_mut_ptr(),
         };
+        // SAFETY: `param_list.ParamPtr` points at `sparams`, which holds exactly `NumOfParams`
+        // initialised entries and stays untouched until the call returns, and the callee fills
+        // `Supported` in place. `input_ptr` is the caller's own argument; every caller passes null
+        // or a pointer to a live value of the type `ioctl_id` expects.
         self.check(unsafe {
             self.api.PassThruIoctl(
                 handle,
@@ -1572,6 +1656,9 @@ impl J2534Api0404 {
     /// All safety requirements documented on [`IoCtlCommand`] must be upheld by
     /// the `command` value passed to this function.
     pub unsafe fn ioctl<C: IoCtlCommand>(&self, handle: u32, command: &mut C) -> Result<(), Error> {
+        // SAFETY: the caller of this `unsafe fn` upholds the `IoCtlCommand` contract: the pointers
+        // `command` returns are null or valid for the layout `ioctl_id` expects, for the duration
+        // of this call. Obtaining them borrows `command` for the whole call.
         self.check(unsafe {
             self.api.PassThruIoctl(
                 handle,
@@ -1586,6 +1673,8 @@ impl J2534Api0404 {
 
     /// `PassThruIoctl` with no input or output data.
     fn ioctl_no_data(&self, channel_id: ChannelId, ioctl_id: u32) -> Result<(), Error> {
+        // SAFETY: both data pointers are null, the form `PassThruIoctl` takes for commands with no
+        // input or output.
         self.check(unsafe {
             self.api.PassThruIoctl(
                 channel_id.0,
@@ -1599,6 +1688,8 @@ impl J2534Api0404 {
     /// `PassThruIoctl` with a `u32` output and no input.
     fn ioctl_read_u32(&self, handle: u32, ioctl_id: u32) -> Result<u32, Error> {
         let mut value: u32 = 0;
+        // SAFETY: the input is null; `value` is a live, aligned `u32` local, the output type of the
+        // callers' `ioctl_id`.
         self.check(unsafe {
             self.api.PassThruIoctl(
                 handle,
@@ -1618,6 +1709,8 @@ impl J2534Api0404 {
         mut input: u32,
     ) -> Result<u32, Error> {
         let mut value: u32 = 0;
+        // SAFETY: `input` and `value` are live, aligned `u32` locals, the input and output types of
+        // the callers' `ioctl_id`.
         self.check(unsafe {
             self.api.PassThruIoctl(
                 handle,
@@ -1641,6 +1734,9 @@ impl J2534Api0404 {
             NumOfBytes: bytes.len() as u32,
             BytePtr: bytes.as_mut_ptr(),
         };
+        // SAFETY: `input` is a live `SBYTE_ARRAY` whose `BytePtr` points at `bytes`, which holds
+        // `NumOfBytes` initialised bytes and stays untouched until the call returns. The output is
+        // null.
         self.check(unsafe {
             self.api.PassThruIoctl(
                 channel_id.0,

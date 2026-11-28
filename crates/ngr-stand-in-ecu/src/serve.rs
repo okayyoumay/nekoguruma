@@ -9,8 +9,7 @@ use std::time::{Duration, Instant};
 use sim_ecu::persist::{default_ecu_config, load_ecu_state, read_ecu_config, save_ecu_state};
 use sim_ecu::{Addressing, SimEcu};
 
-/// How long a wait for a request, or for a response's delay to pass, runs before it looks at the
-/// stop flag again.
+/// How long a wait for a request runs at most before the loop looks at the stop flag again.
 pub const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Whole UDS messages to and from the client: the part of the stand-in ECU that depends on the
@@ -102,65 +101,55 @@ impl Station {
     }
 
     /// Answers requests from `transport` until `stop` is set, then writes the state file once
-    /// more (the ECU's timers are kept as the time left in them). A request whose effect cannot
-    /// be written to the state file ends the run with its response unsent, as `sim-vci` fails the
-    /// request: the next process must not miss a change that was answered.
+    /// more (the ECU's timers are kept as the time left in them). Each message the ECU sends goes
+    /// out once its delay from its request has passed; requests keep being received meanwhile,
+    /// so a delayed response, a response pending chain or a repeated response holds up no other
+    /// request. A stop drops the messages still waiting, as a power loss would. A request whose
+    /// effect cannot be written to the state file ends the run with its response unsent, as
+    /// `sim-vci` fails the request: the next process must not miss a change that was answered.
     pub fn run<T: Transport>(
         &mut self,
         transport: &mut T,
         stop: &AtomicBool,
     ) -> Result<(), ServeError> {
+        // Ordered by when each message is due; messages due at the same time keep their order.
+        let mut waiting: Vec<(Instant, Vec<u8>)> = Vec::new();
         while !stop.load(Ordering::Relaxed) {
+            let now = Instant::now();
+            let due = waiting.partition_point(|(at, _)| *at <= now);
+            for (_, message) in waiting.drain(..due) {
+                transport.send(&message).map_err(ServeError::Send)?;
+            }
+            let timeout = waiting.first().map_or(POLL_INTERVAL, |(at, _)| {
+                at.saturating_duration_since(now).min(POLL_INTERVAL)
+            });
             let Some((addressing, request)) =
-                transport.recv(POLL_INTERVAL).map_err(ServeError::Receive)?
+                transport.recv(timeout).map_err(ServeError::Receive)?
             else {
                 continue;
             };
-            self.answer(transport, stop, addressing, &request)?;
+            self.answer(addressing, &request, &mut waiting)?;
         }
         self.save_or_fail()
     }
 
-    /// One exchange: the ECU handles `request`, its state is written, and each message it sends
-    /// goes out once its delay from the request has passed. A stop during the wait drops the
-    /// messages still waiting, as a power loss would.
-    fn answer<T: Transport>(
+    /// One exchange: the ECU handles `request`, its state is written, and the messages it sends
+    /// join `waiting`, each due its delay after the request was received.
+    fn answer(
         &mut self,
-        transport: &mut T,
-        stop: &AtomicBool,
         addressing: Addressing,
         request: &[u8],
+        waiting: &mut Vec<(Instant, Vec<u8>)>,
     ) -> Result<(), ServeError> {
         let received = Instant::now();
-        let mut sends: Vec<(u32, Vec<u8>)> = self
-            .ecu
-            .exchange(addressing, request)
-            .into_sends()
-            .collect();
+        let sends = self.ecu.exchange(addressing, request).into_sends();
         self.save_or_fail()?;
-        // Stable, so messages with the same delay keep their order.
-        sends.sort_by_key(|(delay_ms, _)| *delay_ms);
         for (delay_ms, message) in sends {
-            if !wait_until(received + Duration::from_millis(delay_ms.into()), stop) {
-                return Ok(());
-            }
-            transport.send(&message).map_err(ServeError::Send)?;
+            let at = received + Duration::from_millis(delay_ms.into());
+            let index = waiting.partition_point(|(due, _)| *due <= at);
+            waiting.insert(index, (at, message));
         }
         Ok(())
-    }
-}
-
-/// Waits until `deadline`; `false` if `stop` was set first.
-fn wait_until(deadline: Instant, stop: &AtomicBool) -> bool {
-    loop {
-        if stop.load(Ordering::Relaxed) {
-            return false;
-        }
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return true;
-        }
-        std::thread::sleep(left.min(POLL_INTERVAL));
     }
 }
 

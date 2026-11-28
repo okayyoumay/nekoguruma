@@ -5,12 +5,16 @@ use sim_ecu::{EcuConfig, Session};
 
 use super::*;
 
-/// Requests the station is given in order; when they run out the transport sets the stop flag.
-/// `sent` holds what the station sent, and `saved_at_send` the session the state file held
-/// when each message went out.
+/// Requests the station is given in order; once they have run out and `linger` has passed since
+/// the last one, the transport sets the stop flag (until then it waits out each timeout).
+/// `sent` holds what the station sent, `events` the order of requests taken and messages sent,
+/// and `saved_at_send` the session the state file held when each message went out.
 struct Fake<'a> {
     requests: VecDeque<(Addressing, Vec<u8>)>,
+    linger: Duration,
+    last_request: Instant,
     sent: Vec<Vec<u8>>,
+    events: Vec<&'static str>,
     saved_at_send: Vec<Option<Session>>,
     state: Option<PathBuf>,
     stop: &'a AtomicBool,
@@ -20,7 +24,10 @@ impl<'a> Fake<'a> {
     fn new(stop: &'a AtomicBool, state: Option<&Path>, requests: &[(Addressing, &[u8])]) -> Self {
         Self {
             requests: requests.iter().map(|(a, r)| (*a, r.to_vec())).collect(),
+            linger: Duration::ZERO,
+            last_request: Instant::now(),
             sent: Vec::new(),
+            events: Vec::new(),
             saved_at_send: Vec::new(),
             state: state.map(Path::to_path_buf),
             stop,
@@ -29,16 +36,23 @@ impl<'a> Fake<'a> {
 }
 
 impl Transport for Fake<'_> {
-    fn recv(&mut self, _timeout: Duration) -> io::Result<Option<(Addressing, Vec<u8>)>> {
-        let next = self.requests.pop_front();
-        if next.is_none() {
+    fn recv(&mut self, timeout: Duration) -> io::Result<Option<(Addressing, Vec<u8>)>> {
+        if let Some(next) = self.requests.pop_front() {
+            self.events.push("request");
+            self.last_request = Instant::now();
+            return Ok(Some(next));
+        }
+        if self.last_request.elapsed() < self.linger {
+            std::thread::sleep(timeout);
+        } else {
             self.stop.store(true, Ordering::Relaxed);
         }
-        Ok(next)
+        Ok(None)
     }
 
     fn send(&mut self, message: &[u8]) -> io::Result<()> {
         self.sent.push(message.to_vec());
+        self.events.push("send");
         let session = self
             .state
             .as_deref()
@@ -54,11 +68,23 @@ fn serve(
     state: Option<&Path>,
     requests: &[(Addressing, &[u8])],
 ) -> Vec<Vec<u8>> {
+    serve_lingering(config, state, requests, Duration::ZERO).0
+}
+
+/// As [`serve`], but the run goes on for `linger` after the last request, so that delayed
+/// messages go out; also returns the order of requests taken and messages sent.
+fn serve_lingering(
+    config: Option<&Path>,
+    state: Option<&Path>,
+    requests: &[(Addressing, &[u8])],
+    linger: Duration,
+) -> (Vec<Vec<u8>>, Vec<&'static str>) {
     let stop = AtomicBool::new(false);
     let mut station = Station::start(config, state).expect("the station should start");
     let mut fake = Fake::new(&stop, state, requests);
+    fake.linger = linger;
     station.run(&mut fake, &stop).expect("the run should end");
-    fake.sent
+    (fake.sent, fake.events)
 }
 
 fn write_config(dir: &Path, config: &EcuConfig) -> PathBuf {
@@ -120,9 +146,35 @@ fn a_response_waits_for_the_delay_the_ecu_gives() {
         },
     );
     let started = Instant::now();
-    let sent = serve(Some(&config), None, &[(PHYSICAL, &READ_VIN)]);
+    let (sent, _) = serve_lingering(
+        Some(&config),
+        None,
+        &[(PHYSICAL, &READ_VIN)],
+        Duration::from_millis(400),
+    );
     assert_eq!(sent.len(), 1);
     assert!(started.elapsed() >= Duration::from_millis(120));
+}
+
+#[test]
+fn a_request_is_taken_while_an_earlier_response_waits_for_its_delay() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(
+        dir.path(),
+        &EcuConfig {
+            response_delay_ms: 120,
+            ..default_ecu_config()
+        },
+    );
+    let (sent, events) = serve_lingering(
+        Some(&config),
+        None,
+        &[(PHYSICAL, &READ_VIN), (PHYSICAL, &[0x3E, 0x00])],
+        Duration::from_millis(400),
+    );
+    // Both requests are taken before the first response's delay has passed.
+    assert_eq!(events, ["request", "request", "send", "send"]);
+    assert_eq!(sent[1], [0x7E, 0x00]);
 }
 
 #[test]

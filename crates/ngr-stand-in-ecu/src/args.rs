@@ -8,8 +8,8 @@ const CAN_EFF_FLAG: u32 = 0x8000_0000;
 const MAX_STANDARD_ID: u32 = 0x7FF;
 const MAX_EXTENDED_ID: u32 = 0x1FFF_FFFF;
 
-/// Physical request ID of the first ECU on a legacy OBD bus (ISO 15765-4 identifiers, which
-/// `sim-vci` uses too), the ID its responses come from, and the functional request ID.
+/// Default physical request ID, response ID and functional request ID: the 11-bit IDs `sim-vci`
+/// also uses for its simulated ECU.
 const DEFAULT_REQUEST_ID: u32 = 0x7E0;
 const DEFAULT_RESPONSE_ID: u32 = 0x7E8;
 const DEFAULT_FUNCTIONAL_ID: u32 = 0x7DF;

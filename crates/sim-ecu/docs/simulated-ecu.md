@@ -304,7 +304,8 @@ A request goes to `SimEcu::exchange` with its addressing; the messages the excha
 (response pending messages, the response, repeated responses) all go out on the physical socket,
 each once its delay from its request has passed, and a response that is `NoResponse` is not sent.
 Requests keep being taken while messages wait, so a delayed response, a response pending chain or
-a repeated response holds up no other request. Responses use the physical
+a repeated response holds up no other request. A request that power cycles the ECU (an ECUReset,
+a power loss fault) drops the messages still waiting from before it, as `sim-vci` does. Responses use the physical
 socket for both addressings because functional addressing is single-frame only (ISO 15765-2
 (2024) 8.3.2.4): a segmented response is a physical transfer, and the tester sends its flow
 control to the request ID. The kernel cannot restrict the functional socket to single frames, so

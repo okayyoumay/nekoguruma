@@ -178,6 +178,27 @@ fn a_request_is_taken_while_an_earlier_response_waits_for_its_delay() {
 }
 
 #[test]
+fn a_reset_drops_the_responses_still_waiting_from_before_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(
+        dir.path(),
+        &EcuConfig {
+            response_delay_ms: 200,
+            ..default_ecu_config()
+        },
+    );
+    // ECUReset hardReset with the suppress bit, before the VIN read's response is due.
+    let (sent, events) = serve_lingering(
+        Some(&config),
+        None,
+        &[(PHYSICAL, &READ_VIN), (PHYSICAL, &[0x11, 0x81])],
+        Duration::from_millis(500),
+    );
+    assert_eq!(events, ["request", "request"]);
+    assert!(sent.is_empty(), "{sent:?}");
+}
+
+#[test]
 fn the_state_is_written_before_the_response_goes_out() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("ecu.state");

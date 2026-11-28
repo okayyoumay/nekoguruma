@@ -134,7 +134,9 @@ impl Station {
     }
 
     /// One exchange: the ECU handles `request`, its state is written, and the messages it sends
-    /// join `waiting`, each due its delay after the request was received.
+    /// join `waiting`, each due its delay after the request was received. A request that power
+    /// cycles the ECU (an ECUReset, a power loss fault) first drops the messages still waiting
+    /// from before, as `sim-vci` does: an ECU that restarted sends nothing it owed before.
     fn answer(
         &mut self,
         addressing: Addressing,
@@ -142,7 +144,11 @@ impl Station {
         waiting: &mut Vec<(Instant, Vec<u8>)>,
     ) -> Result<(), ServeError> {
         let received = Instant::now();
+        let power_cycles = self.ecu.power_cycles();
         let sends = self.ecu.exchange(addressing, request).into_sends();
+        if self.ecu.power_cycles() != power_cycles {
+            waiting.retain(|(at, _)| *at <= received);
+        }
         self.save_or_fail()?;
         for (delay_ms, message) in sends {
             let at = received + Duration::from_millis(delay_ms.into());

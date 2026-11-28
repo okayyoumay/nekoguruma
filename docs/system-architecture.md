@@ -163,7 +163,7 @@ Each device's operating mode is fixed to exactly one of "user mode" or "device m
 - Implemented in coarse-grained operation units (acquire / write / read-back verification)
 - Many J2534 DLLs are not thread-safe, which matches the per-VCI thread design. L0 / L1 (transport and protocol) also reside in the worker
 - Implementation: the worker binaries are the gRPC services `j2534-0404-service` (J2534 v04.04 libraries) and `iso22900-service` (D-PDU API libraries); their crates are described in `worker-crates.md`. Both expose the D-PDU API, so the agent drives either kind of library through one interface. One build per ABI (7.3)
-- On Linux a third worker, `ngr-socketcan-service`, drives a CAN adapter through SocketCAN with no vendor library: one process per configured VCI (it loads no library), the same D-PDU API interface as the other two, raw CAN and ISO 15765 links, and ISO-TP either in user space or in the kernel's ISO-TP sockets as its configuration selects (7.1.3, ADR-512). One build per host architecture (x86_64 or aarch64, ADR-232), since it loads no library
+- On Linux a third worker, `ngr-socketcan-service`, drives a CAN adapter through SocketCAN with no vendor library: one process per configured VCI (it loads no library), the same D-PDU API interface as the other two, raw CAN and ISO 15765-2 (2024) links (clauses 9 and 10), and ISO-TP either in user space or in the kernel's ISO-TP sockets as its configuration selects (7.1.3, ADR-512). One build per host architecture (x86_64 or aarch64, ADR-232), since it loads no library
 
 ---
 

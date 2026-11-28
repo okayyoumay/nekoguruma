@@ -44,8 +44,10 @@ supported hosts.
    battery voltage reading) the worker reports as absent through the interface, as the other
    workers report what their API cannot give.
 2. **Scope first: raw CAN and ISO 15765 on classical CAN.** The worker's ComLogicalLinks are
-   raw CAN links and ISO 15765-2 (2024) links with 11-bit and 29-bit identifiers and normal or
-   extended addressing. CAN FD comes later, as an extension of the same worker.
+   raw CAN links and ISO 15765-2 (2024) links: the transport layer protocol of clause 9 and the
+   network layer protocol of clause 10, with 11-bit and 29-bit identifiers and the normal and
+   extended addressing formats of 10.3.2 and 10.3.4. CAN FD (the larger data lengths of 9.5)
+   comes later, as an extension of the same worker.
 3. **Registration definitions at a fixed location.** A SocketCAN VCI is described by an
    administrator-written TOML file, one per VCI, in `/etc/nekoguruma/socketcan/` (design
    7.1.3). It names the VCI, the network interface and the bitrate the administrator configured

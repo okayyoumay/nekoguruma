@@ -34,7 +34,7 @@ use sim_ecu::SimResponse;
 use sim_ecu::persist::load_ecu_state;
 
 use crate::agent_connect::Agent;
-use crate::agent_register::ngr_agent_binary::cargo_artifact::{Artifact, build_artifact};
+use crate::agent_register::ngr_agent_binary::cargo_artifact::{Artifact, build_artifact_isolated};
 use crate::agent_register::{AgentEnv, fingerprint, run, text};
 use crate::documents::{name_of, put_document};
 use crate::jobs::{add_user, login, password, post_to};
@@ -66,14 +66,16 @@ struct Sim {
 }
 
 impl Sim {
-    /// Builds what the agent needs (Cargo is asked for the service and the simulator, as the
-    /// other tests of the workspace do) and lays it out.
+    /// Builds what the agent needs and lays it out. Cargo is asked for the agent as the other tests
+    /// of the workspace do. The service and the simulator are built in a target directory of their
+    /// own: the nested build resolves their features without the workspace's, so in the main one
+    /// it could replace the service binary that the service's own tests are starting.
     async fn new() -> Sim {
         let (agent, service, sim_vci) = tokio::task::spawn_blocking(|| {
             (
                 crate::agent_register::ngr_agent_binary::ngr_agent_path(),
-                build_artifact("j2534-0404-service", Artifact::Bin("j2534-0404-service")),
-                build_artifact("sim-vci", Artifact::Cdylib),
+                build_artifact_isolated("j2534-0404-service", Artifact::Bin("j2534-0404-service")),
+                build_artifact_isolated("sim-vci", Artifact::Cdylib),
             )
         })
         .await
@@ -290,21 +292,37 @@ impl Lab {
 
     /// Waits until the job has ended as completed and its vehicle's lock is freed, which is when
     /// the server has applied the agent's end report (ADR-480, ADR-481); a job that ended in
-    /// another state fails the test at once.
+    /// another state fails the test at once, with what the row and the agent say.
     async fn until_completed(&self, job: &str, agent: &mut Agent) {
+        // `until` holds the agent mutably, so the message reads the log by its path.
+        let log = agent.log.clone();
         self.until(&format!("job {job} to complete"), agent, || async {
-            let (state, code): (String, Option<String>) =
-                sqlx::query_as("SELECT state, failure_code FROM jobs WHERE id = $1::uuid")
-                    .bind(job)
-                    .fetch_one(&self.world.pool)
-                    .await
-                    .unwrap();
-            if matches!(
-                state.as_str(),
-                "failed" | "preconditionFailed" | "cancelled" | "expired"
-            ) {
-                panic!("job {job} ended as {state} ({code:?})");
-            }
+            let (state, code, detail, procedure): (
+                String,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            ) = sqlx::query_as(
+                "SELECT state, failure_code, failure_detail, procedure_code FROM jobs \
+                 WHERE id = $1::uuid",
+            )
+            .bind(job)
+            .fetch_one(&self.world.pool)
+            .await
+            .unwrap();
+            assert!(
+                !matches!(
+                    state.as_str(),
+                    "failed"
+                        | "preconditionFailed"
+                        | "needsOnSiteRecovery"
+                        | "cancelled"
+                        | "expired"
+                ),
+                "job {job} ended as {state}: failure code {code:?}, detail {detail:?}, procedure \
+                 code {procedure:?}; the agent says:\n{}",
+                std::fs::read_to_string(&log).unwrap_or_default()
+            );
             state == "completed" && self.locks(VIN).await == 0
         })
         .await;
@@ -441,9 +459,10 @@ async fn an_acquisition_job_and_a_write_job_created_through_the_web_api_run_on_t
     );
     let mut vin = vec![0x62, 0xF1, 0x90];
     vin.extend_from_slice(VIN.as_bytes());
+    let acquired = lab.result(&first, &mut agent).await;
     assert_eq!(
-        lab.result(&first, &mut agent).await.stack,
-        [Value::Bytes(vin), Value::Bytes(vec![0x7F, 0x22, 0x31]),]
+        acquired.stack,
+        [Value::Bytes(vin), Value::Bytes(vec![0x7F, 0x22, 0x31])]
     );
     assert_eq!(lab.created_rows(&first).await, "1");
     assert_eq!(
@@ -474,23 +493,36 @@ async fn an_acquisition_job_and_a_write_job_created_through_the_web_api_run_on_t
         lab.event_states(&second).await,
         ["received", "running", "completed"]
     );
-    lab.result(&second, &mut agent).await;
+    // The result is the write procedure's own final state, not the acquisition's: it ran longer,
+    // left nothing on the stack, and its first local holds the coding it saved before writing.
+    let written = lab.result(&second, &mut agent).await;
+    assert!(
+        written.steps > acquired.steps,
+        "{} steps, after the acquisition's {}",
+        written.steps,
+        acquired.steps
+    );
+    assert!(written.stack.is_empty(), "{:?}", written.stack);
+    assert_eq!(
+        written.locals.first(),
+        Some(&Some(Value::Bytes(CODING_BEFORE.to_vec())))
+    );
     assert_eq!(lab.created_rows(&second).await, "1");
     assert_eq!(lab.created_rows(&first).await, "1");
 
-    // The procedure opened the extended session, took the seed and sent the key, wrote the coding
-    // and read it back.
-    let requests = sim.requests().split_off(before_write);
-    let steps = [
-        "uds 10 03",
-        "uds 27",
-        "uds 27",
-        "uds 2E 0120",
-        "uds 22 0120",
-    ];
-    assert!(
-        requests.windows(steps.len()).any(|window| window == steps),
-        "the write job sent {requests:?}"
+    // The worker that ran the write job, the only one that sent anything since the acquisition's
+    // was reaped, read the coding, opened the extended session, took the seed, sent the key,
+    // wrote the coding and read it back; the agent sent nothing else.
+    assert_eq!(
+        sim.requests().split_off(before_write),
+        [
+            "uds 22 0120",
+            "uds 10 03",
+            "uds 27",
+            "uds 27",
+            "uds 2E 0120",
+            "uds 22 0120"
+        ]
     );
     assert_eq!(sim.coding(), CODING_AFTER);
 

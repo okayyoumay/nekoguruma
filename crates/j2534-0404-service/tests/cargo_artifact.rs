@@ -68,7 +68,14 @@ fn a_failed_or_unfinished_build_gives_no_path() {
 #[test]
 fn the_nested_build_names_the_package_target_and_configuration() {
     let manifest = Path::new("/w/Cargo.toml");
-    let args = cargo_args("agent", Artifact::Bin("ngr-agent"), false, None, manifest);
+    let args = cargo_args(
+        "agent",
+        Artifact::Bin("ngr-agent"),
+        false,
+        None,
+        None,
+        manifest,
+    );
     assert_eq!(
         args,
         [
@@ -88,6 +95,7 @@ fn the_nested_build_names_the_package_target_and_configuration() {
         Artifact::Cdylib,
         true,
         Some("aarch64-unknown-linux-gnu"),
+        Some(Path::new("/w/target/nested-artifacts")),
         manifest,
     );
     assert_eq!(
@@ -98,7 +106,9 @@ fn the_nested_build_names_the_package_target_and_configuration() {
             "--lib",
             "--release",
             "--target",
-            "aarch64-unknown-linux-gnu"
+            "aarch64-unknown-linux-gnu",
+            "--target-dir",
+            "/w/target/nested-artifacts"
         ]
     );
 }

@@ -78,6 +78,17 @@ the maintainer to delete the remote branch. List there any backlog edit the stop
 push, such as the `Blocked on:` clause for a PR closed unmerged. Every later step starts from
 this fresh branch.
 
+Then free disk space if the session is short of it: a run's builds keep every stale build unit
+in `target/debug/build/<crate>/<hash>` and fill the disk. When less than 10 GB is free, delete
+the hash directories there that have not been modified for a day (from the repository root; a
+deleted unit that is still current is only rebuilt):
+
+```sh
+if [ "$(df --output=avail -B1G . | tail -1)" -lt 10 ]; then
+  find target/debug/build -mindepth 2 -maxdepth 2 -type d -mtime +0 -exec rm -rf {} +
+fi
+```
+
 Then stop the run and go to "Final report" if any of these holds:
 
 - no items are left;

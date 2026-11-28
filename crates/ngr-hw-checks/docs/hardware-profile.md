@@ -509,15 +509,17 @@ carrying its own address byte.
 beyond reads) runs a CSV + Starlark definition's reads on the stand-in ECU, a bench ECU or a vehicle
 through the agent's job runner. The harness lists it for a T1, T2 or T3 profile and refuses it on
 T0, and the test fails without `NGR_HW_PROFILE`. On T1 it is the local end-to-end read of a real
-J2534 VCI against the stand-in ECU: the operator starts `ngr-stand-in-ecu` as described under "The
-profile", with the identifiers and width of the profile's `[link]` and a `--config` whose ECU the
-profile's `[read]` definition identifies (without `--config` the stand-in serves `sim-ecu`'s default
-configuration), and the check sends reads only, as on the other classes; it does not start or stop
-the stand-in ECU. It has a test beside each worker, under the same name:
+VCI (J2534 or D-PDU API) against the stand-in ECU: the operator starts `ngr-stand-in-ecu` as
+described under "The profile", with the identifiers and width of the profile's `[link]` and
+`--config crates/diag-frontend/examples/end-to-end/ecu.json`, the ECU configuration CI's read check
+serves (`tests/t2_t3_read_check.rs`), with no `--state` file or a fresh one (a state file that
+exists replaces the configuration). The profile's `[read]` is the `example-ecu` tables with
+`end-to-end/read.star` as the procedure, whose last step needs the DTCs that configuration holds. The
+check sends reads only, as on the other classes: it refuses a writing procedure on T1 as well; it does not start or stop the stand-in ECU. It has a test beside each worker, under the same name:
 `crates/j2534-0404-service/tests/hw_t2_t3_read.rs` for a J2534 VCI and
 `crates/iso22900-service/tests/hw_t2_t3_read.rs` for a D-PDU API VCI. Both run the body
 `checks::t2_t3_read::run` over the guarded client (`guard::GuardedClient`, ADR-334), so CI runs
-it on the example ECU's definition through each worker (`tests/t2_t3_read_check.rs` in both
+it on the example ECU's definition, for a T1 and a T3 profile, through each worker (`tests/t2_t3_read_check.rs` in both
 crates): against `sim-vci` behind `j2534-0404-service`, and against the simulated ECU
 `iso22900-mock` answers from (ADR-299) behind `iso22900-service`. Each test refuses a profile
 whose VCI belongs to the other worker, and a set debug-only override of the library lookup
@@ -533,8 +535,8 @@ whose VCI belongs to the other worker, and a set debug-only override of the libr
 - **What it does.** Each candidate variant's identification services are sent to the ECU as one
   job (`diag_ir::identify`, as a server identifies before it sends a job, design 8.9.1), and the
   variant whose patterns the answers match is selected; then that variant's read procedure runs as
-  a job, and it checks the values it decodes. A job whose program writes is refused before it
-  starts. The jobs take the VCI's slot in a lock directory of the run's own, and their
+  a job, and it checks the values it decodes. A read procedure that writes is refused before any job is
+  sent. The jobs take the VCI's slot in a lock directory of the run's own, and their
   communication logs go to the run's temporary directory.
 - **What the guard does.** Every request goes through it, so on T2 and T3 a write, routine, reset
   or security access is refused before it reaches the worker, and the job fails with the refusal.

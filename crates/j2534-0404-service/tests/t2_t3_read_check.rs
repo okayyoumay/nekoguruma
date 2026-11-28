@@ -3,7 +3,7 @@
 #![cfg(debug_assertions)]
 //! The part of `hw_t2_t3_read` that needs no hardware (design 13.5, ADR-275): the check's body
 //! (`ngr_hw_checks::checks::t2_t3_read`) identifies the example ECU's variant and runs its read
-//! procedure through the agent's job runner, on the harness's guarded client for a T3 profile,
+//! procedure through the agent's job runner, on the harness's guarded client for a T1 and a T3 profile,
 //! against the simulated ECU behind `sim-vci` in `j2534-0404-service`. The profile's definition
 //! is the example ECU's tables with the end-to-end read procedure beside them
 //! (`crates/diag-frontend/examples`). Every request the jobs make goes through the guard, and
@@ -15,7 +15,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use ngr_hw_checks::checks::t2_t3_read::{convert, run};
+use ngr_hw_checks::checks::t2_t3_read::{CheckError, convert, run};
 use ngr_hw_checks::guard::{GuardedClient, HandleOptions};
 use ngr_hw_checks::profile::{ReadDefinition, Setup, parse};
 use ngr_hw_checks::report::RunGuard;
@@ -43,12 +43,12 @@ fn long_size() -> u8 {
     }
 }
 
-/// A T3 profile on `sim-vci` with the example ECU's link (`protocols.csv`, `comparams.csv`),
+/// A profile of `class` on `sim-vci` with the example ECU's link (`protocols.csv`, `comparams.csv`),
 /// reading the definition in `definition`.
-fn profile_text(definition: &Path) -> String {
+fn profile_text(definition: &Path, class: &str) -> String {
     format!(
         r#"
-class = "T3"
+class = "{class}"
 
 [vci]
 api = "j2534-0404"
@@ -89,6 +89,12 @@ fn definition_dir(dir: &Path) {
         dir.join("read.star"),
     )
     .expect("the procedure should copy");
+    // A procedure that writes, which the check must refuse when a profile names it.
+    std::fs::copy(
+        examples().join("end-to-end/routine.star"),
+        dir.join("routine.star"),
+    )
+    .expect("the writing procedure should copy");
 }
 
 #[test]
@@ -116,100 +122,115 @@ fn the_read_check_identifies_the_variant_and_runs_its_read_procedure_through_the
     }
     let definition = root.join("ecu-definition");
     definition_dir(&definition);
-    let profile = parse(&profile_text(&definition)).expect("the profile is valid");
-    let read: ReadDefinition = profile
-        .read
-        .clone()
-        .expect("the profile names its definition");
+    for class in ["T1", "T3"] {
+        let profile = parse(&profile_text(&definition, class)).expect("the profile is valid");
+        let read: ReadDefinition = profile
+            .read
+            .clone()
+            .expect("the profile names its definition");
 
-    // The jobs' VMs run on blocking threads that block on the runtime for every primitive.
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("runtime");
-    runtime
-        .block_on(async {
-            tokio::time::timeout(Duration::from_secs(120), async {
-                let worker = WorkerProcess::launch(
-                    Path::new(env!("CARGO_BIN_EXE_j2534-0404-service")),
-                    ServiceKind::J2534V0404,
-                    LIBRARY_NAME,
-                    OperatingMode::User,
-                    &LaunchOptions {
-                        startup_timeout: Duration::from_secs(20),
-                        request_timeout: Duration::from_secs(5),
-                        long_size: Some(long_size()),
-                        ..LaunchOptions::default()
-                    },
-                )
-                .await
-                .expect("worker should launch");
-                let mut client = worker
-                    .connect(&ConnectOptions::default())
+        // The jobs' VMs run on blocking threads that block on the runtime for every primitive.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(120), async {
+                    let worker = WorkerProcess::launch(
+                        Path::new(env!("CARGO_BIN_EXE_j2534-0404-service")),
+                        ServiceKind::J2534V0404,
+                        LIBRARY_NAME,
+                        OperatingMode::User,
+                        &LaunchOptions {
+                            startup_timeout: Duration::from_secs(20),
+                            request_timeout: Duration::from_secs(5),
+                            long_size: Some(long_size()),
+                            ..LaunchOptions::default()
+                        },
+                    )
                     .await
-                    .expect("client should connect");
-                // The harness holds the module, as `open_device` leaves it for a hardware run.
-                let module = client
-                    .get_module_ids(GetModuleIdsRequest {})
-                    .await
-                    .expect("the worker lists its module")
-                    .into_inner()
-                    .module_id_list
-                    .and_then(|list| list.module_data.into_iter().next())
-                    .and_then(|module| module.module_handle)
-                    .expect("one module");
-                client
-                    .module_connect(ModuleConnectRequest {
-                        module_handle: Some(module),
-                    })
-                    .await
-                    .expect("the module connects");
+                    .expect("worker should launch");
+                    let mut client = worker
+                        .connect(&ConnectOptions::default())
+                        .await
+                        .expect("client should connect");
+                    // The harness holds the module, as `open_device` leaves it for a hardware run.
+                    let module = client
+                        .get_module_ids(GetModuleIdsRequest {})
+                        .await
+                        .expect("the worker lists its module")
+                        .into_inner()
+                        .module_id_list
+                        .and_then(|list| list.module_data.into_iter().next())
+                        .and_then(|module| module.module_handle)
+                        .expect("one module");
+                    client
+                        .module_connect(ModuleConnectRequest {
+                            module_handle: Some(module),
+                        })
+                        .await
+                        .expect("the module connects");
 
-                let Setup::Link { vci, .. } = &profile.setup else {
-                    unreachable!("a T3 profile has one link")
-                };
-                let mut guard = RunGuard::start_in(&profile, "hw_t2_t3_read", root.join("reports"));
-                let guarded = GuardedClient::attach(
-                    &profile,
-                    vci,
-                    client,
-                    module,
-                    HandleOptions::default(),
-                    &guard,
-                )
-                .await
-                .expect("the guarded client holds the module");
-                let documents = convert(&read).expect("the definition converts");
-                let outcome = match run(&guarded, &documents, &root.join("work")).await {
-                    Ok(outcome) => outcome,
-                    Err(error) => panic!(
-                        "the check passes: {error}; the guard decided {:#?}",
-                        guarded.trace().lock().unwrap()
-                    ),
-                };
-                // The simulated ECU reports software version 1.0.0, the first generation's.
-                assert_eq!(outcome.variant, "exampleEcuV1");
-                assert!(outcome.state.call_stack.is_empty(), "{:?}", outcome.state);
-                // Every request the jobs made passed the guard.
-                let trace = guarded.trace();
-                let refused: Vec<_> = trace
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .filter(|(_, decision)| decision.is_err())
-                    .map(|(rpc, decision)| format!("{rpc}: {decision:?}"))
-                    .collect();
-                assert!(refused.is_empty(), "{refused:#?}");
-                drop(guarded);
-                guard.pass();
-                assert!(guard.run_teardown().is_empty(), "the module disconnects");
-                drop(guard);
-                worker
-                    .stop(Duration::from_secs(5))
+                    let Setup::Link { vci, .. } = &profile.setup else {
+                        unreachable!("a T1 or T3 profile has one link")
+                    };
+                    let mut guard =
+                        RunGuard::start_in(&profile, "hw_t2_t3_read", root.join("reports"));
+                    let guarded = GuardedClient::attach(
+                        &profile,
+                        vci,
+                        client,
+                        module,
+                        HandleOptions::default(),
+                        &guard,
+                    )
                     .await
-                    .expect("the worker stops");
+                    .expect("the guarded client holds the module");
+                    let documents = convert(&read).expect("the definition converts");
+                    let outcome = match run(&guarded, &documents, &root.join("work")).await {
+                        Ok(outcome) => outcome,
+                        Err(error) => panic!(
+                            "the check passes: {error}; the guard decided {:#?}",
+                            guarded.trace().lock().unwrap()
+                        ),
+                    };
+                    // The simulated ECU reports software version 1.0.0, the first generation's.
+                    assert_eq!(outcome.variant, "exampleEcuV1");
+                    assert!(outcome.state.call_stack.is_empty(), "{:?}", outcome.state);
+                    // Every request the jobs made passed the guard.
+                    let trace = guarded.trace();
+                    let refused: Vec<_> = trace
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|(_, decision)| decision.is_err())
+                        .map(|(rpc, decision)| format!("{rpc}: {decision:?}"))
+                        .collect();
+                    assert!(refused.is_empty(), "{refused:#?}");
+                    // A procedure that writes is refused before any request of its jobs is sent.
+                    let sent = trace.lock().unwrap().len();
+                    let writing = ReadDefinition {
+                        procedure: "routine.star".to_owned(),
+                        ..read.clone()
+                    };
+                    let documents = convert(&writing).expect("the writing definition converts");
+                    let error = run(&guarded, &documents, &root.join("work"))
+                        .await
+                        .expect_err("a procedure that writes is refused");
+                    assert!(matches!(error, CheckError::Refused(_)), "{error}");
+                    assert_eq!(trace.lock().unwrap().len(), sent, "nothing was sent");
+                    drop(guarded);
+                    guard.pass();
+                    assert!(guard.run_teardown().is_empty(), "the module disconnects");
+                    drop(guard);
+                    worker
+                        .stop(Duration::from_secs(5))
+                        .await
+                        .expect("the worker stops");
+                })
+                .await
             })
-            .await
-        })
-        .expect("the check should finish in time");
+            .expect("the check should finish in time");
+    }
 }

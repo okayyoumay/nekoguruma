@@ -3990,9 +3990,12 @@ async fn a_status_answer_is_proved() {
     fx.finish().await;
 }
 
+/// The answers the store's outcome decides. The fixture keeps the default wait, which no
+/// completion here outlasts, so each answer is the outcome's and not the wait's, however slowly
+/// the test runs.
 #[tokio::test]
 async fn a_completion_answer_is_proved() {
-    let fx = Fx::waiting(With::Fake, Duration::from_millis(300)).await;
+    let fx = Fx::new(With::Fake).await;
     let open = || async {
         fx.row(&fx.job().await, 1, "result", 10, "open", PART_BYTES as i64)
             .await
@@ -4009,8 +4012,17 @@ async fn a_completion_answer_is_proved() {
         assert_eq!(json(&r)["state"], state);
     }
     Wrap::set(&fx.wrap.complete_fail, None);
-    // 202: the task is still at the store when the wait ends.
-    let id = open().await;
+    fx.finish().await;
+}
+
+/// The 202 a completion answers while its task is still at the store is proved: the store holds
+/// the task until the short wait has ended.
+#[tokio::test]
+async fn a_completing_answer_is_proved() {
+    let fx = Fx::waiting(With::Fake, Duration::from_millis(300)).await;
+    let id = fx
+        .row(&fx.job().await, 1, "result", 10, "open", PART_BYTES as i64)
+        .await;
     let hold = Hold::new();
     *fx.wrap.complete_hold.lock().unwrap() = Some(Arc::clone(&hold));
     let r = fx.proved(&call_of("complete", "", &id), 202).await;

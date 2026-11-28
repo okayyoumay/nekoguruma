@@ -10,8 +10,7 @@
 //! assumed, and the file is current: Cargo rebuilds it when its sources changed and does nothing
 //! when they did not.
 //!
-//! The nested build is kept on the test's own configuration so that it reuses the test's build
-//! instead of making a second one:
+//! The nested build uses the test's own configuration:
 //!
 //! - Profile: `--release` when the test was built without debug assertions (the dev profile has
 //!   them, the release profile does not). A custom profile (`cargo test --profile <name>`) is not
@@ -20,14 +19,26 @@
 //!   the target directory (`<target dir>/<triple>/<profile>/...`). The target directory's root is
 //!   the parent of `CARGO_TARGET_TMPDIR`, which every layout keeps at the root, and the triple is
 //!   the first directory below it with three or more `-`-separated parts (a profile name is not).
-//! - Features: none are passed. `sim-vci`'s dev-dependency entry in
-//!   `crates/j2534-0404-service/Cargo.toml` asks for none and the other packages are built with
-//!   their default features, which is what the workspace build uses; a dev-dependency that asks
-//!   for features needs the same `--features` here.
+//! - Features: none are passed. The nested Cargo resolves the features of the one package it
+//!   builds (`-p <package>`), not of the workspace, so it reuses the test's own build only when
+//!   that resolution gives the package the features the workspace build gave it. It does for
+//!   `ngr-agent` and for `sim-vci`, whose dev-dependency entry in
+//!   `crates/j2534-0404-service/Cargo.toml` asks for none; a dependency entry that asks for
+//!   features needs the same `--features` here. Where the resolution differs, the nested build
+//!   compiles the package and its dependencies again and replaces (removes, then links) the
+//!   files in `<target dir>/<profile>`, which tests that run in parallel may be starting.
+//!
+//! [`build_artifact`] builds in the test's own target directory and so shares its build lock
+//! and its output files with the other tests. [`build_artifact_isolated`] builds in
+//! `<target dir>/nested-artifacts` instead (`--target-dir`): it compiles the package there once
+//! and does nothing afterwards, never replaces a file another test runs or loads, and does not
+//! wait for the lock of the main build. Use it for an artifact that other tests of the
+//! workspace run through `CARGO_BIN_EXE_*` or load, when the including package does not itself
+//! build it with the features the nested build resolves.
 //!
 //! The nested Cargo inherits the test's environment unchanged: `RUSTFLAGS` (so a
-//! `-D warnings` run builds with the same flags and the same fingerprints), `CARGO_TARGET_DIR`
-//! (so it is the same target directory), `RUSTUP_TOOLCHAIN` (so a `cargo +<toolchain>` run builds
+//! `-D warnings` run builds with the same flags), `CARGO_TARGET_DIR` (so the shared build goes
+//! to the same target directory), `RUSTUP_TOOLCHAIN` (so a `cargo +<toolchain>` run builds
 //! with that toolchain), nextest's variables and the rest. Its working directory is the
 //! workspace root, where the outer Cargo was started. A test process that starts while another
 //! holds the build directory waits on Cargo's lock; it neither fails nor races.
@@ -66,8 +77,23 @@ pub fn workspace_root() -> PathBuf {
 /// The path of `artifact` of `package`, built by Cargo now or found up to date. Panics with the
 /// command and Cargo's stderr when the build fails or reports no such artifact.
 pub fn build_artifact(package: &str, artifact: Artifact) -> PathBuf {
+    build(package, artifact, false)
+}
+
+/// As [`build_artifact`], in the target directory `nested-artifacts` below the test's own, so the
+/// build neither contends for the main build lock nor replaces a file in the main directory.
+// Not `expect`: only some of the including test packages build an isolated artifact.
+#[allow(
+    dead_code,
+    reason = "only some of the including test packages build an isolated artifact"
+)]
+pub fn build_artifact_isolated(package: &str, artifact: Artifact) -> PathBuf {
+    build(package, artifact, true)
+}
+
+fn build(package: &str, artifact: Artifact, isolated: bool) -> PathBuf {
     static CACHE: Mutex<BTreeMap<String, PathBuf>> = Mutex::new(BTreeMap::new());
-    let key = format!("{package} {artifact:?}");
+    let key = format!("{package} {artifact:?} {isolated}");
     // The lock is held across the build: a second caller for the same artifact waits for it.
     let mut cache = CACHE
         .lock()
@@ -76,15 +102,18 @@ pub fn build_artifact(package: &str, artifact: Artifact) -> PathBuf {
         return path.clone();
     }
     let exe = std::env::current_exe().expect("test executable path");
-    let target = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .parent()
-        .and_then(|root| cargo_target(&exe, root));
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).parent();
+    let target = root.and_then(|root| cargo_target(&exe, root));
+    let target_dir = root
+        .filter(|_| isolated)
+        .map(|root| root.join(ISOLATED_DIR));
     let manifest = workspace_root().join("Cargo.toml");
     let args = cargo_args(
         package,
         artifact,
         !cfg!(debug_assertions),
         target.as_deref(),
+        target_dir.as_deref(),
         &manifest,
     );
     let cargo = env!("CARGO");
@@ -105,12 +134,16 @@ pub fn build_artifact(package: &str, artifact: Artifact) -> PathBuf {
     path
 }
 
-/// The arguments of the nested Cargo.
+/// The directory below the target directory's root that holds [`build_artifact_isolated`]'s builds.
+const ISOLATED_DIR: &str = "nested-artifacts";
+
+/// The arguments of the nested Cargo; `target_dir` is its own `--target-dir`, when it has one.
 pub fn cargo_args(
     package: &str,
     artifact: Artifact,
     release: bool,
     target: Option<&str>,
+    target_dir: Option<&Path>,
     manifest: &Path,
 ) -> Vec<String> {
     let mut args: Vec<String> = [
@@ -132,6 +165,9 @@ pub fn cargo_args(
     }
     if let Some(target) = target {
         args.extend(["--target".to_owned(), target.to_owned()]);
+    }
+    if let Some(dir) = target_dir {
+        args.extend(["--target-dir".to_owned(), dir.display().to_string()]);
     }
     args
 }

@@ -34,9 +34,6 @@ use agent::{
     Job, JobDocument, JobError, JobLimits, JobRun, JournalSetup, LinkConfig, VciFacts, run_program,
     run_program_journaled,
 };
-use diag_frontend::convert::{lower_procedures, to_ir};
-use diag_frontend::tables::{read_files, resolve};
-use diag_ir::declaration::load_ecu_document;
 use diag_ir::{IR_SCHEMA_VERSION, Op, Program, Value};
 use worker_host::client::{ConnectOptions, WorkerClient};
 use worker_host::service::{LaunchOptions, OperatingMode, ServiceKind, WorkerProcess};
@@ -47,6 +44,11 @@ const LIBRARY_NAME: &str = "sim-vci";
 mod artifacts;
 
 use artifacts::sim_vci_path;
+
+#[path = "common/fictional_ecm.rs"]
+mod fictional_ecm;
+
+use fictional_ecm::{coding_document, send, vehicle};
 
 /// Width of J2534 `unsigned long` in `sim-vci` on this platform.
 fn long_size() -> u8 {
@@ -66,53 +68,6 @@ impl Drop for TempDir {
     }
 }
 
-fn vehicle() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../diag-frontend/examples/fictional-vehicle")
-}
-
-/// A text file with its line endings made `\n`, so a Windows checkout reads the same bytes.
-fn read_text(path: &Path) -> Vec<u8> {
-    std::fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
-        .replace("\r\n", "\n")
-        .into_bytes()
-}
-
-/// The ECM definition's document for variant `ecmV1` (the simulated ECU's software version
-/// 1.0.1), with the coding procedure as its procedure.
-fn coding_document() -> Vec<u8> {
-    let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(vehicle().join("ecm"))
-        .expect("the ECM directory")
-        .map(|entry| {
-            let entry = entry.expect("entry");
-            let name = entry.file_name().into_string().expect("UTF-8 name");
-            (name, read_text(&entry.path()))
-        })
-        .collect();
-    files.push((
-        "write-coding.star".to_owned(),
-        read_text(&vehicle().join("write-coding.star")),
-    ));
-    files.sort();
-    let tables = read_files(files).unwrap_or_else(|e| panic!("does not read: {e:?}"));
-    let definition = resolve(tables).unwrap_or_else(|e| panic!("does not resolve: {e:?}"));
-    let procedures =
-        lower_procedures(&definition).unwrap_or_else(|e| panic!("does not lower: {e:?}"));
-    to_ir(&definition, &procedures)
-        .documents
-        .into_iter()
-        .find(|document| {
-            load_ecu_document(&document.bytes)
-                .expect("the document loads")
-                .variant()
-                .expect("a variant")
-                .short_name()
-                == Some("ecmV1")
-        })
-        .expect("the ecmV1 document")
-        .bytes
-}
-
 /// Reads the coding DID: the response, starting with its SID, is left on the stack.
 fn read_coding() -> Program {
     Program {
@@ -126,15 +81,6 @@ fn read_coding() -> Program {
         flash: Vec::new(),
         targets: Vec::new(),
     }
-}
-
-/// Writes `command` as the control file `name`, under a temporary name first so `sim-vci`
-/// never reads it half-written. It takes effect at the next J2534 call.
-fn send(control_dir: &Path, name: &str, command: &str) {
-    let tmp = control_dir.join(format!("{name}.tmp"));
-    std::fs::write(&tmp, command).expect("control file should be writable");
-    std::fs::rename(&tmp, control_dir.join(format!("{name}.json")))
-        .expect("control file should be renamed");
 }
 
 /// Guards for one job, in a lock directory of this call's own. `writes` takes the reprogramming

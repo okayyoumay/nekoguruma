@@ -453,9 +453,9 @@ components:
                   intake refuses an instruction it has acknowledged (ADR-511 item 3); it does not send
                   instructionKeyRetired. operatorNotAllowed is the agent's: it
                   refused a verified job because its operator is not one the agent allows, with no detail
-                  (5.3, 6.6, ADR-483). instructionNoLongerVerifies is the agent's too: its resume of a job it
-                  holds found that the recorded instruction no longer verifies (for example after a
-                  re-registration under a new key), with no detail (5.3, ADR-513). Only internal asserts a fault of the diagnostic system
+                  (5.3, 6.6, ADR-483). instructionNoLongerVerifies is an agent's code, for a job the agent holds whose
+                  recorded instruction no longer verifies, with no detail (ADR-513); the server keeps it as
+                  it keeps the agent's other codes. Only internal asserts a fault of the diagnostic system
                   (the agent's, or the server's when it ends a job whose instruction is too large to send);
                   exchangeFailed asserts neither a fault of the vehicle nor of the system, which the
                   communication log tells apart (8.11).

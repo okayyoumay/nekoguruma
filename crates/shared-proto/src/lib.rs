@@ -108,6 +108,7 @@ pub enum EventBody {
 /// Corresponds to the state transitions in 5.6.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobState {
+    // The variants' order is part of the agent's outcome record (postcard); add new ones at the end.
     Received,
     Precheck,
     Ready,
@@ -235,6 +236,7 @@ impl JobState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FailureCode {
+    // The variants' order is part of the agent's outcome record (postcard); add new ones at the end.
     DeviceLocked,
     VehicleLocked,
     VinMismatch,
@@ -274,11 +276,15 @@ pub enum FailureCode {
     /// `personal` and `personalRemote` presets, any operator but the registered owner (5.3, 6.6,
     /// ADR-483). The job state carries no detail.
     OperatorNotAllowed,
-    /// The agent's resume of a held job found that the recorded instruction no longer verifies,
-    /// as after a re-registration under a new instruction key (5.3, 5.6, ADR-513). The job state
-    /// carries no detail; the reason goes to the agent's log only.
-    InstructionNoLongerVerifies,
     Other,
+    /// The agent's resume of a held job found that the recorded instruction no longer verifies:
+    /// a newer agent build refuses it (an unsupported version or a stricter body check), or the
+    /// recorded envelope is damaged or was replaced (5.3, 5.6, ADR-513). The job state carries
+    /// no detail; the reason goes to the agent's log only.
+    ///
+    /// Declared after `Other`: the agent's outcome record stores a `JobState` with its code in
+    /// postcard, which encodes a variant by its position, so a new variant goes at the end.
+    InstructionNoLongerVerifies,
 }
 
 impl FailureCode {
@@ -518,8 +524,8 @@ mod wire_name_tests {
             InstructionRejected,
             InstructionKeyRetired,
             OperatorNotAllowed,
-            InstructionNoLongerVerifies,
             Other,
+            InstructionNoLongerVerifies,
         ];
         // A new variant fails to compile here until it is in the list above.
         for code in &codes {
@@ -545,8 +551,8 @@ mod wire_name_tests {
                 | InstructionRejected
                 | InstructionKeyRetired
                 | OperatorNotAllowed
-                | InstructionNoLongerVerifies
-                | Other => {}
+                | Other
+                | InstructionNoLongerVerifies => {}
             }
             assert_eq!(
                 FailureCode::from_wire_name(code.wire_name()).as_ref(),
@@ -564,5 +570,81 @@ mod wire_name_tests {
         );
         assert!(FailureCode::from_wire_name("Procedure").is_none());
         assert!(FailureCode::from_wire_name("").is_none());
+    }
+
+    /// The agent's outcome record keeps a `JobState` in postcard, which encodes a variant by its
+    /// position: an old record must read back as the state it was written as.
+    #[test]
+    fn the_encoded_variant_positions_of_the_job_state_and_its_codes_are_fixed() {
+        use FailureCode::*;
+        // In the order of the declaration; a new code is appended, never inserted.
+        let codes = [
+            DeviceLocked,
+            VehicleLocked,
+            VinMismatch,
+            VariantMismatch,
+            PowerCondition,
+            SignatureInvalid,
+            LibraryLoadFailed,
+            UnsupportedAbi,
+            Runtime32BitMissing,
+            CpuOrKernelNo32Bit,
+            GatewayAuthExpired,
+            TicketExpired,
+            Procedure,
+            ProcedureError,
+            JobRefused,
+            LinkNotOpened,
+            ExchangeFailed,
+            Internal,
+            InstructionRejected,
+            InstructionKeyRetired,
+            OperatorNotAllowed,
+            Other,
+            InstructionNoLongerVerifies,
+        ];
+        for (index, code) in codes.iter().enumerate() {
+            let bytes = postcard::to_allocvec(code).expect("encode");
+            assert_eq!(bytes, [index as u8], "{}", code.wire_name());
+            assert_eq!(&postcard::from_bytes::<FailureCode>(&bytes).unwrap(), code);
+        }
+        let failed = |code| JobState::Failed {
+            code,
+            detail: String::new(),
+            procedure_code: None,
+        };
+        let states = [
+            (JobState::Received, 0),
+            (JobState::Precheck, 1),
+            (JobState::Ready, 2),
+            (JobState::Running, 3),
+            (JobState::Verifying, 4),
+            (JobState::AwaitingHmi, 5),
+            (JobState::CancelRequested, 6),
+            (JobState::Completed, 7),
+            (failed(Other), 8),
+            (JobState::Cancelled, 9),
+            (JobState::Expired, 10),
+            (
+                JobState::PreconditionFailed {
+                    code: Other,
+                    detail: String::new(),
+                },
+                11,
+            ),
+            (
+                JobState::NeedsOnSiteRecovery {
+                    detail: String::new(),
+                },
+                12,
+            ),
+        ];
+        for (state, index) in states {
+            let bytes = postcard::to_allocvec(&state).expect("encode");
+            assert_eq!(bytes[0], index, "{}", state.wire_name());
+        }
+        // The failed state with the newest code: the state's index, the code's index, no detail.
+        let bytes = postcard::to_allocvec(&failed(InstructionNoLongerVerifies)).unwrap();
+        assert_eq!(bytes[..2], [8, 22]);
     }
 }

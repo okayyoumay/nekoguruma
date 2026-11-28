@@ -601,3 +601,37 @@ fn an_absent_file_holds_no_jobs_and_a_wrong_agent_id_is_refused() {
         Err(LedgerError::BadAgentId)
     ));
 }
+
+#[test]
+fn a_higher_generation_recorded_first_stays_at_its_own_position() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let ledger = open(dir.path()).unwrap();
+        ledger.record(&job(1), 9, &envelope(1, 100)).unwrap();
+        ledger.record(&job(2), 1, &envelope(2, 100)).unwrap();
+        ledger.record(&job(1), 7, &envelope(3, 100)).unwrap();
+    }
+    let (_, held) = ReceivedJobs::open_held_in(dir.path(), ID, |_, _| false).unwrap();
+    let got: Vec<_> = held
+        .iter()
+        .map(|h| (h.job_id.clone(), h.generation))
+        .collect();
+    assert_eq!(got, vec![(job(1), 9), (job(2), 1)]);
+    assert_eq!(held[0].envelope, envelope(1, 100));
+}
+
+#[test]
+fn opening_for_the_held_jobs_fails_where_open_in_fails() {
+    let corrupt = crafted(ID, &[entry(0, "not-a-uuid", 1, envelope(1, 50))]);
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(file_of(dir.path()), &corrupt).unwrap();
+    let error = ReceivedJobs::open_held_in(dir.path(), ID, |_, _| false).expect_err("corrupt");
+    assert!(matches!(error, LedgerError::Corrupt(..)), "{error}");
+    assert_eq!(fs::read(file_of(dir.path())).unwrap(), corrupt, "untouched");
+
+    let dir = tempfile::tempdir().unwrap();
+    let first = open(dir.path()).unwrap();
+    let error = ReceivedJobs::open_held_in(dir.path(), ID, |_, _| false).expect_err("in use");
+    assert!(matches!(error, LedgerError::InUse), "{error}");
+    drop(first);
+}

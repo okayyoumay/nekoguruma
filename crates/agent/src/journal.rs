@@ -535,8 +535,7 @@ pub struct JournalState {
     /// decision, and when a torn tail cut the record off. Kept apart from `facts`, so the
     /// summary sent for handover carries no hash.
     pub job_content: Option<JobContent>,
-    /// The journal holds a run start: the first run committed its start, which the hook that
-    /// said Go precedes (ADR-513). A journal that was only created has none.
+    /// The journal holds a run start, which the hook that said Go precedes (ADR-513).
     run_started: bool,
 }
 
@@ -1160,10 +1159,17 @@ impl JournalState {
             .sum()
     }
 
-    /// Whether the journal holds a run start, that is, the job's run began: a journal that was
-    /// only created reads as not begun (ADR-513).
+    /// Whether the job's run began (ADR-513): the journal holds a run start, or recorded progress
+    /// that only a run makes (a completed step, an intent, a transfer or a first request), which
+    /// a journal written before run starts existed (ADR-272) holds without one. A journal that
+    /// was only created, or holds a resume and nothing else, reads as not begun.
     pub fn begun(&self) -> bool {
+        let facts = &self.facts;
         self.run_started
+            || facts.last_step.is_some()
+            || facts.last_intent.is_some()
+            || facts.transfer.is_some()
+            || facts.first_request.is_some()
     }
 
     /// Whether `record` keeps the checkpoints in order: a checkpoint is not behind the latest
@@ -3355,6 +3361,61 @@ mod tests {
             assert!(Journal::read(&dir.0, &key()).expect("read").begun());
             assert!(Journal::open(&dir.0, &key()).expect("open").state().begun());
         }
+    }
+
+    /// A journal written before run starts existed (ADR-272) holds progress and no run start.
+    #[test]
+    fn a_journal_with_recorded_progress_and_no_run_start_is_begun() {
+        let progress = [
+            Record::Step {
+                at: at(1, 1),
+                vm_state: None,
+            },
+            Record::Intent { at: at(2, 2) },
+            Record::Request { at: at(2, 2) },
+            Record::TransferStart {
+                stage: STAGE,
+                at: at(3, 3),
+            },
+        ];
+        for record in progress {
+            let dir = TempDir::new();
+            legacy_journal(&dir, vec![record]);
+            assert!(Journal::read(&dir.0, &key()).expect("read").begun());
+        }
+        let dir = TempDir::new();
+        legacy_journal(&dir, Vec::new());
+        assert!(!Journal::read(&dir.0, &key()).expect("read").begun());
+    }
+
+    /// A crash while the run start was being written leaves a torn frame, which is cut off.
+    #[test]
+    fn a_torn_run_start_reads_as_not_begun() {
+        let dir = TempDir::new();
+        drop(
+            Journal::create(&dir.0, &key(), None, Some(VERSION), None, &content()).expect("create"),
+        );
+        let before = fs::read(path(&dir)).expect("read");
+        let mut j = Journal::open(&dir.0, &key()).expect("open");
+        j.commit_run_start(at(0, 0), b"initial").expect("run start");
+        drop(j);
+        let whole = fs::read(path(&dir)).expect("read");
+        assert!(whole.len() > before.len() + 1);
+        fs::write(path(&dir), &whole[..whole.len() - 1]).expect("tear");
+        assert!(!Journal::read(&dir.0, &key()).expect("read").begun());
+    }
+
+    /// A resume counted before the run start was committed is not a begun run.
+    #[test]
+    fn a_resume_and_a_crash_before_the_run_start_read_as_not_begun_with_the_resume_counted() {
+        let dir = TempDir::new();
+        let mut j =
+            Journal::create(&dir.0, &key(), None, Some(VERSION), None, &content()).expect("create");
+        j.commit_resume(STAGE, None).expect("resume");
+        drop(j);
+        let state = Journal::read(&dir.0, &key()).expect("read");
+        assert!(!state.begun());
+        assert_eq!(state.resume_total(), 1);
     }
 
     #[test]

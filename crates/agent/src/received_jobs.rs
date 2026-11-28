@@ -183,23 +183,20 @@ impl ReceivedJobs {
         ended: impl Fn(&str, u64) -> bool,
     ) -> Result<(ReceivedJobs, Vec<HeldJob>), LedgerError> {
         let (ledger, entries) = Self::open_inner(dir, agent_id, Box::new(|_| Ok(())), true)?;
-        let highest = ledger.index();
-        let mut seen = std::collections::HashSet::new();
-        // Walk from the end so a job's last record of its highest generation is the one kept.
-        let mut held: Vec<HeldJob> = entries
-            .into_iter()
-            .rev()
-            .filter(|entry| highest.get(&entry.job_id) == Some(&entry.generation))
-            .filter(|entry| seen.insert(entry.job_id.clone()))
+        let mut held: Vec<Entry> = entries
+            .into_values()
             .filter(|entry| !ended(&entry.job_id, entry.generation))
+            .collect();
+        // The record numbers are the file order.
+        held.sort_unstable_by_key(|entry| entry.seq);
+        let held = held
+            .into_iter()
             .map(|entry| HeldJob {
                 job_id: entry.job_id,
                 generation: entry.generation,
                 envelope: entry.envelope,
             })
             .collect();
-        held.reverse();
-        drop(highest);
         Ok((ledger, held))
     }
 
@@ -209,14 +206,14 @@ impl ReceivedJobs {
         agent_id: &str,
         probe: Probe,
         keep: bool,
-    ) -> Result<(ReceivedJobs, Vec<Entry>), LedgerError> {
+    ) -> Result<(ReceivedJobs, HashMap<String, Entry>), LedgerError> {
         if !shared_proto::is_canonical_uuid(agent_id) {
             return Err(LedgerError::BadAgentId);
         }
         let mut file = FrameFile::new(dir, agent_id, LAYOUT, probe);
         let mut reader = Reader {
             index: HashMap::new(),
-            entries: keep.then(Vec::new),
+            entries: keep.then(HashMap::new),
         };
         file.open_state(&mut |seq, payload| reader.read(seq, payload), &seq_of)?;
         let ledger = ReceivedJobs {
@@ -314,7 +311,9 @@ fn seq_of(payload: &[u8]) -> Option<u64> {
 /// held jobs.
 struct Reader {
     index: HashMap<String, u64>,
-    entries: Option<Vec<Entry>>,
+    /// The newest record of each job's highest generation so far, when the held jobs are wanted:
+    /// one envelope per job, whatever the file holds.
+    entries: Option<HashMap<String, Entry>>,
 }
 
 impl Reader {
@@ -332,12 +331,16 @@ impl Reader {
         if entry.envelope.is_empty() || entry.envelope.len() > MAX_ENVELOPE {
             return Err(corrupt("an envelope has a length no record holds"));
         }
+        let newest = self
+            .index
+            .get(&entry.job_id)
+            .is_none_or(|highest| entry.generation >= *highest);
         self.index
             .entry(entry.job_id.clone())
             .and_modify(|highest| *highest = (*highest).max(entry.generation))
             .or_insert(entry.generation);
-        if let Some(entries) = &mut self.entries {
-            entries.push(entry);
+        if newest && let Some(entries) = &mut self.entries {
+            entries.insert(entry.job_id.clone(), entry);
         }
         Ok(())
     }

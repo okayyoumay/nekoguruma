@@ -1,8 +1,8 @@
 # ADR-275: Real-Hardware Checks Are Optional, Opt-In Tests Bounded by a Target Class
 
 **Date:** 2026-10-11
-**Status:** Accepted
-**Affects:** design 13.5 (new), design 13.4, design 17 ("Items to Confirm Early"), VCI profile (9.3), `sim-ecu` (SocketCAN front end), the agent job runner (guarded worker client), test layout and `.config/nextest.toml` when the checks are implemented
+**Status:** Accepted (Decision item 5 refined: the front end is the `ngr-stand-in-ecu` binary on the kernel's ISO-TP sockets)
+**Affects:** design 13.5 (new), design 13.4, design 17 ("Items to Confirm Early"), VCI profile (9.3), `sim-ecu` and `ngr-stand-in-ecu` (SocketCAN front end), the agent job runner (guarded worker client), test layout and `.config/nextest.toml` when the checks are implemented
 
 ## Context
 
@@ -64,7 +64,22 @@ also need a limit that does not depend on each check's author being careful.
 5. **A stand-in ECU on a real bus.** `sim-ecu` gets a second front end that talks over a
    SocketCAN interface, so writes, reprogramming and fault injection (including physical ones:
    unplugging the VCI, cutting power through a host-controlled switch) can be checked with a real
-   VCI and library without risking an ECU.
+   VCI and library without risking an ECU. The front end is the `ngr-stand-in-ecu` binary
+   (`crates/ngr-stand-in-ecu`, a library and a binary); `sim-ecu` stays a pure simulator. It uses
+   the kernel's ISO-TP sockets (`CAN_ISOTP`), one per address pair (physical: receive on the
+   request ID, send on the response ID; functional: receive on the functional ID only), so the
+   kernel does the segmentation and flow control and the process handles whole UDS messages.
+   Every response goes out on the physical socket: functional addressing is single-frame only
+   (ISO 15765-2 (2024) 8.3.2.4), so a segmented response to a functional request is a physical
+   transfer and the tester sends its flow control to the physical request ID. The kernel cannot
+   restrict the functional socket to single frames, so a segmented functional request is
+   accepted. A transfer the kernel reports as failed does not end the process: it is logged and
+   dropped. The CAN identifiers and their width come from command-line flags, the
+   faults only from the `EcuConfig` JSON read at start, and the persistent state from the state
+   file `sim-vci` uses (shared code in `sim-ecu`'s `persist` module); it has no runtime control
+   channel. A start that loads a state file is the ECU's power-up: the session and security
+   state start from their defaults and the power-cycle count rises by one. The `vcan` test of the front end runs in CI in a step that loads the `vcan` and
+   `can-isotp` modules (decided 2026-11-27).
 6. **Cleanup on every exit.** The harness registers a teardown step as it acquires each
    resource (power, device, link) and runs the registered steps in reverse order, each at most
    once, on pass, failure and panic (default session where an ECU was addressed, channel and

@@ -46,7 +46,6 @@ M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 20
 
 **Hardware checks to implement (design 13.5; running them on hardware is optional).**
 
-- The stand-in ECU for T1: `sim-ecu` served over a Linux SocketCAN interface, testable without hardware on a virtual CAN interface (`vcan`).
 - T1 (carried over from M1 and M2): the local end-to-end read of M1 with a real J2534 VCI against the stand-in ECU, and M2's session timing measured the same way, to separate the VCI's own delays from the ECU's.
 - T1: an acquisition created through the Web API runs on a real VCI on the local profile.
 - Writes through a real VCI wait for M6: the agent lets only the simulated VCIs, `sim-vci` and `iso22900-mock`, receive state-changing requests until the authorization layer replaces that rule (ADR-247, ADR-331).

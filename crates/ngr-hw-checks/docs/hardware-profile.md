@@ -54,6 +54,13 @@ The operations a class allows by itself, beyond reads:
 An `allow` entry outside the class's operations is refused, and so is every addition the class
 does not take. A T3 profile can add nothing.
 
+On T1 the ECU is the stand-in ECU, which the operator starts before the run and the harness does
+not launch: `ngr-stand-in-ecu --interface <the CAN interface the VCI is wired to> --request-id
+<physical> --response-id <response> --functional-id <functional> [--extended] [--config <file>]
+[--state <file>]`, with the identifiers and width of the profile's `[link]`, and stopped with
+SIGTERM afterwards (design 13.5; flags and files in `crates/sim-ecu/docs/simulated-ecu.md`). The
+stand-in ECU uses normal addressing without padding, so a T1 link is set up the same way.
+
 `[vci]`:
 
 | Key | Meaning |

@@ -216,6 +216,11 @@ and then fail, rather than skip, without a session bus or a Secret Service. `cor
 after the main nextest run, in a step that installs gnome-keyring and starts it unlocked inside
 `dbus-run-session`; run them locally the same way (the step in `ci.yml`), never against the
 keyring of your own desktop session.
+The stand-in ECU's tests on a virtual CAN interface (`crates/ngr-stand-in-ecu/tests/vcan.rs`, ADR-275
+item 5) run only with `NGR_TEST_VCAN=1` and then fail, rather than skip, without `vcan0` or the
+`can-isotp` kernel module; `core-linux` runs them after the main nextest run, in a step that loads
+`vcan` and `can-isotp` and creates `vcan0`, and locally they need the same (`sudo modprobe vcan
+can-isotp`, `sudo ip link add dev vcan0 type vcan`, `sudo ip link set up vcan0`).
 The agent's Windows key store (ADR-507) has real-DPAPI tests that run in `core-windows` with no
 variable (a debug agent selects it with `NGR_AGENT_KEY_STORE=dpapi`), and one gated test,
 `crates/agent/tests/windows_service_account.rs`, that runs only with

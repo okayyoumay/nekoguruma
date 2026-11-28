@@ -20,7 +20,9 @@ Flag as P1:
   main runs them on Windows too. Running them on Windows on pull requests again is a finding. So
   is the `core-windows` step that runs the agent's `windows_service_account` test on pull
   requests (ADR-507: it is the only test of the key store under the virtual service account);
-  widening it beyond that one test is a finding. So
+  widening it beyond that one test is a finding. So is the `core-linux` step that loads `vcan` and
+  `can-isotp` and runs the stand-in ECU's `vcan` test (ADR-275 item 5); widening it beyond that
+  test binary is a finding. So
   is `fuzz`, the cargo-fuzz targets of
   `fuzz/` for 60 seconds each on main only (design 12.1 asks for fuzzing against malformed IR in
   CI); running it on pull requests is a finding.

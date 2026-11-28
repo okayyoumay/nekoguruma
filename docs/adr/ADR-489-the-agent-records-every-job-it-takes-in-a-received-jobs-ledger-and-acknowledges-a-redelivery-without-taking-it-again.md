@@ -1,7 +1,7 @@
 # ADR-489: The Agent Records Every Job It Takes in a Received-Jobs Ledger and Acknowledges a Redelivery Without Taking It Again
 
 **Date:** 2026-11-17
-**Status:** Accepted
+**Status:** Accepted (the Consequences on the missing `received` and on the unrun recorded job amended by ADR-513)
 **Affects:** design 5.3, 6.7; `docs/glossary.md`, `api/asyncapi.yaml` (`receiveJob`); `crates/agent` (`received_jobs`, `control::channel`, `control::gate`, `control`, `connect`), `crates/agent/docs/ngr-agent.md`, `crates/agent/docs/operational-log.md`; details ADR-229 and ADR-461 item 9; annotates ADR-473 item 4, ADR-478 item 5 and ADR-486
 
 ## Context

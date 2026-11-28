@@ -444,7 +444,8 @@ components:
                   deviceLocked, vehicleLocked, vinMismatch, variantMismatch, powerCondition, signatureInvalid,
                   libraryLoadFailed, unsupportedAbi, runtime32BitMissing, cpuOrKernelNo32Bit,
                   gatewayAuthExpired, ticketExpired, procedure, procedureError, jobRefused, linkNotOpened,
-                  exchangeFailed, internal, instructionRejected, instructionKeyRetired, operatorNotAllowed and other.
+                  exchangeFailed, internal, instructionRejected, instructionKeyRetired, operatorNotAllowed,
+                  instructionNoLongerVerifies and other.
                   instructionRejected and instructionKeyRetired are the server's, for a job it ends before
                   the agent runs it: the first when the agent refused the delivered command (the detail is the
                   agent's coarse reason), the second when the job's instruction was signed by a key that is
@@ -452,7 +453,9 @@ components:
                   intake refuses an instruction it has acknowledged (ADR-511 item 3); it does not send
                   instructionKeyRetired. operatorNotAllowed is the agent's: it
                   refused a verified job because its operator is not one the agent allows, with no detail
-                  (5.3, 6.6, ADR-483). Only internal asserts a fault of the diagnostic system
+                  (5.3, 6.6, ADR-483). instructionNoLongerVerifies is the agent's too: its resume of a job it
+                  holds found that the recorded instruction no longer verifies (for example after a
+                  re-registration under a new key), with no detail (5.3, ADR-513). Only internal asserts a fault of the diagnostic system
                   (the agent's, or the server's when it ends a job whose instruction is too large to send);
                   exchangeFailed asserts neither a fault of the vehicle nor of the system, which the
                   communication log tells apart (8.11).

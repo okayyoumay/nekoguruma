@@ -484,3 +484,120 @@ fn d9_many_records_read_back_in_one_pass_and_memory_keeps_the_index() {
     record(&ledger, 7, 99_999);
     assert_eq!(ledger.highest(&job(7)), Some(99_999));
 }
+
+// ADR-513: the held jobs
+#[test]
+fn held_jobs_are_each_jobs_highest_generation_record_in_file_order() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let ledger = open(dir.path()).unwrap();
+        ledger.record(&job(1), 7, &envelope(1, 100)).unwrap();
+        ledger.record(&job(2), 1, &envelope(2, 110)).unwrap();
+        ledger.record(&job(1), 9, &envelope(3, 120)).unwrap();
+        ledger.record(&job(3), 4, &envelope(4, 130)).unwrap();
+    }
+    let (ledger, held) = ReceivedJobs::open_held_in(dir.path(), ID, |_, _| false).unwrap();
+    // Job 1 sits where its generation 9 record lies, after job 2.
+    assert_eq!(
+        held,
+        vec![
+            HeldJob {
+                job_id: job(2),
+                generation: 1,
+                envelope: envelope(2, 110)
+            },
+            HeldJob {
+                job_id: job(1),
+                generation: 9,
+                envelope: envelope(3, 120)
+            },
+            HeldJob {
+                job_id: job(3),
+                generation: 4,
+                envelope: envelope(4, 130)
+            },
+        ]
+    );
+    assert_eq!(ledger.highest(&job(1)), Some(9));
+}
+
+#[test]
+fn ended_jobs_are_left_out_of_the_held_jobs_but_stay_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let ledger = open(dir.path()).unwrap();
+        record(&ledger, 1, 1);
+        record(&ledger, 2, 1);
+        record(&ledger, 2, 2);
+        record(&ledger, 3, 1);
+    }
+    let asked = Mutex::new(Vec::new());
+    let (ledger, held) = ReceivedJobs::open_held_in(dir.path(), ID, |job_id, generation| {
+        asked.lock().unwrap().push((job_id.to_owned(), generation));
+        job_id == job(1) || (job_id == job(2) && generation == 2)
+    })
+    .unwrap();
+    let ids: Vec<_> = held.iter().map(|h| h.job_id.clone()).collect();
+    assert_eq!(ids, vec![job(3)]);
+    // The predicate is asked about the highest generation only.
+    assert!(!asked.lock().unwrap().contains(&(job(2), 1)));
+    assert_eq!(
+        ledger.highest(&job(1)),
+        Some(1),
+        "an ended job is a duplicate"
+    );
+    assert_eq!(ledger.highest(&job(2)), Some(2));
+    assert_eq!(ledger.jobs(), 3);
+}
+
+#[test]
+fn a_torn_tail_is_cut_before_the_held_jobs_are_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let lengths = lengths_after(dir.path(), 3);
+    let whole = fs::read(file_of(dir.path())).unwrap();
+    let cut = lengths[1] as usize + 9;
+    fs::write(file_of(dir.path()), &whole[..cut]).unwrap();
+    let (ledger, held) = ReceivedJobs::open_held_in(dir.path(), ID, |_, _| false).unwrap();
+    let ids: Vec<_> = held.into_iter().map(|h| h.job_id).collect();
+    assert_eq!(ids, vec![job(1), job(2)]);
+    assert_eq!(ledger.highest(&job(3)), None);
+    assert_eq!(fs::metadata(file_of(dir.path())).unwrap().len(), lengths[1]);
+}
+
+#[test]
+fn opening_for_the_held_jobs_leaves_highest_and_the_file_as_open_gives_them() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let ledger = open(dir.path()).unwrap();
+        record(&ledger, 1, 3);
+        record(&ledger, 2, 1);
+        record(&ledger, 1, 5);
+    }
+    let before = fs::read(file_of(dir.path())).unwrap();
+    let plain = open(dir.path()).unwrap();
+    let plain_view = (plain.highest(&job(1)), plain.highest(&job(2)), plain.jobs());
+    drop(plain);
+    let (held_ledger, _) = ReceivedJobs::open_held_in(dir.path(), ID, |_, _| true).unwrap();
+    assert_eq!(
+        plain_view,
+        (
+            held_ledger.highest(&job(1)),
+            held_ledger.highest(&job(2)),
+            held_ledger.jobs()
+        )
+    );
+    drop(held_ledger);
+    assert_eq!(fs::read(file_of(dir.path())).unwrap(), before);
+}
+
+#[test]
+fn an_absent_file_holds_no_jobs_and_a_wrong_agent_id_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, held) = ReceivedJobs::open_held_in(dir.path(), ID, |_, _| false).unwrap();
+    assert!(held.is_empty());
+    assert!(!file_of(dir.path()).exists());
+    assert!(matches!(
+        ReceivedJobs::open_held_in(dir.path(), "x", |_, _| false),
+        Err(LedgerError::BadAgentId)
+    ));
+}

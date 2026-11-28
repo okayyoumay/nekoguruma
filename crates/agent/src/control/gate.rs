@@ -35,10 +35,10 @@ use std::pin::Pin;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use shared_crypto::PublicKey;
-use shared_crypto::registration::Preset;
 use shared_proto::{FailureCode, InstructionRejectReason};
 
 use crate::instruction::{self, Refusal, VerifiedInstruction};
+use crate::operator_policy::OperatorPolicy;
 
 /// Why an [`Intake`] could not take an instruction. It carries nothing: the cause is the intake's
 /// own to log, and the channel's entry names no job.
@@ -87,27 +87,6 @@ impl Intake for LogIntake {
             "a verified job instruction was dropped: no job runner is connected"
         );
         Box::pin(std::future::ready(Ok(())))
-    }
-}
-
-/// What the gate does with a verified instruction's operator ID, decided once per session from the
-/// record's preset (design 6.6, ADR-483).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum OperatorPolicy {
-    /// The operator must be the registered owner.
-    OwnerOnly,
-    /// No agent-side check: the server's own permission test stands alone.
-    Anyone,
-}
-
-impl OperatorPolicy {
-    /// The policy of the record's preset. A name that is not a preset (the record's reader
-    /// refuses one, so this is not reached) is owner-only: the stricter choice.
-    fn of_preset(preset: &str) -> OperatorPolicy {
-        match Preset::parse(preset) {
-            Some(Preset::Personal | Preset::PersonalRemote) | None => OperatorPolicy::OwnerOnly,
-            Some(Preset::Shared) => OperatorPolicy::Anyone,
-        }
     }
 }
 
@@ -230,11 +209,10 @@ impl<'a> Gate<'a> {
     /// The operator check (ADR-483): the operator ID against the owner ID as exact bytes, with
     /// no case folding or trimming.
     fn accept(&mut self, verified: VerifiedInstruction) -> Admitted {
-        let allowed = match self.policy {
-            OperatorPolicy::OwnerOnly => verified.instruction().operator_id == self.owner_id,
-            OperatorPolicy::Anyone => true,
-        };
-        if allowed {
+        if self
+            .policy
+            .allows(&verified.instruction().operator_id, self.owner_id)
+        {
             return Admitted::Accepted(Box::new(verified));
         }
         self.refused.operator_not_allowed += 1;

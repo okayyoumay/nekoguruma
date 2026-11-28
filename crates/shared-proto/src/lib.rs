@@ -274,6 +274,10 @@ pub enum FailureCode {
     /// `personal` and `personalRemote` presets, any operator but the registered owner (5.3, 6.6,
     /// ADR-483). The job state carries no detail.
     OperatorNotAllowed,
+    /// The agent's resume of a held job found that the recorded instruction no longer verifies,
+    /// as after a re-registration under a new instruction key (5.3, 5.6, ADR-513). The job state
+    /// carries no detail; the reason goes to the agent's log only.
+    InstructionNoLongerVerifies,
     Other,
 }
 
@@ -302,6 +306,7 @@ impl FailureCode {
             FailureCode::InstructionRejected => "instructionRejected",
             FailureCode::InstructionKeyRetired => "instructionKeyRetired",
             FailureCode::OperatorNotAllowed => "operatorNotAllowed",
+            FailureCode::InstructionNoLongerVerifies => "instructionNoLongerVerifies",
             FailureCode::Other => "other",
         }
     }
@@ -331,6 +336,7 @@ impl FailureCode {
             "instructionRejected" => FailureCode::InstructionRejected,
             "instructionKeyRetired" => FailureCode::InstructionKeyRetired,
             "operatorNotAllowed" => FailureCode::OperatorNotAllowed,
+            "instructionNoLongerVerifies" => FailureCode::InstructionNoLongerVerifies,
             "other" => FailureCode::Other,
             _ => return None,
         })
@@ -512,6 +518,7 @@ mod wire_name_tests {
             InstructionRejected,
             InstructionKeyRetired,
             OperatorNotAllowed,
+            InstructionNoLongerVerifies,
             Other,
         ];
         // A new variant fails to compile here until it is in the list above.
@@ -538,6 +545,7 @@ mod wire_name_tests {
                 | InstructionRejected
                 | InstructionKeyRetired
                 | OperatorNotAllowed
+                | InstructionNoLongerVerifies
                 | Other => {}
             }
             assert_eq!(
@@ -549,6 +557,10 @@ mod wire_name_tests {
         assert_eq!(
             FailureCode::OperatorNotAllowed.wire_name(),
             "operatorNotAllowed"
+        );
+        assert_eq!(
+            FailureCode::InstructionNoLongerVerifies.wire_name(),
+            "instructionNoLongerVerifies"
         );
         assert!(FailureCode::from_wire_name("Procedure").is_none());
         assert!(FailureCode::from_wire_name("").is_none());

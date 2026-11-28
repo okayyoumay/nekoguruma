@@ -1,7 +1,7 @@
 # ADR-475: A Run's End Is Mapped to the Job's Reported State by Its Error and Its Journal's Standing
 
 **Date:** 2026-11-14
-**Status:** Accepted (the consequence that the intake reports `running` only once the first step begins done by ADR-511 item 6; the resume of open jobs remains)
+**Status:** Accepted (the consequence that the intake reports `running` only once the first step begins done by ADR-511 item 6; item 2's definition of a first run amended and the resume of open jobs decided by ADR-513)
 **Affects:** design 5.6, `api/asyncapi.yaml`, `crates/agent` (`src/job_report.rs`, `docs/ngr-agent.md`), `crates/shared-proto`; annotates ADR-280, ADR-288; relies on ADR-255, ADR-325 item 12, ADR-335, ADR-344, ADR-348 items 6 and 8, ADR-375, ADR-392
 
 ## Context

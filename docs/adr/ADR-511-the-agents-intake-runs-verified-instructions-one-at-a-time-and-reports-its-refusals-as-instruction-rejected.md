@@ -1,7 +1,7 @@
 # ADR-511: The Agent's Intake Runs Verified Instructions One at a Time and Reports Its Refusals as Instruction Rejected
 
 **Date:** 2026-11-27
-**Status:** Accepted
+**Status:** Accepted (items 4, 5, 6 and 11 and the last Consequence amended by ADR-513)
 **Affects:** `crates/agent` (the intake, `runner`, the VCI shell shared with `ngr-agent run` and `ngr-agent identify`, `connect`), `crates/server/src/job_state.rs`, `api/asyncapi.yaml`, `docs/system-architecture.md` 5.3, 5.6 and 8.2.6, `crates/agent/docs/ngr-agent.md`
 
 ## Context

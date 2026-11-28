@@ -535,6 +535,9 @@ pub struct JournalState {
     /// decision, and when a torn tail cut the record off. Kept apart from `facts`, so the
     /// summary sent for handover carries no hash.
     pub job_content: Option<JobContent>,
+    /// The journal holds a run start: the first run committed its start, which the hook that
+    /// said Go precedes (ADR-513). A journal that was only created has none.
+    run_started: bool,
 }
 
 /// What a job was created with, as the journal binds it (ADR-485): the SHA-256 of the job
@@ -850,6 +853,7 @@ impl Journal<FileStore> {
                 latest_checkpoint: None,
                 records,
                 job_content: Some(*content),
+                run_started: false,
             },
             poisoned: false,
         })
@@ -933,6 +937,7 @@ impl<S: Store> Journal<S> {
                 latest_checkpoint: None,
                 records: 0,
                 job_content: None,
+                run_started: false,
             },
             poisoned: false,
         }
@@ -1146,6 +1151,21 @@ impl<S: Store> Journal<S> {
 }
 
 impl JournalState {
+    /// The resumes made in all stages together.
+    pub fn resume_total(&self) -> u64 {
+        self.facts
+            .resume_counts
+            .iter()
+            .map(|(_, count)| u64::from(*count))
+            .sum()
+    }
+
+    /// Whether the journal holds a run start, that is, the job's run began: a journal that was
+    /// only created reads as not begun (ADR-513).
+    pub fn begun(&self) -> bool {
+        self.run_started
+    }
+
     /// Whether `record` keeps the checkpoints in order: a checkpoint is not behind the latest
     /// state record (a run start, a step with a state, or a checkpoint). A checkpoint and the
     /// run start or checkpoint before it can share a step count, so the relation is not strict.
@@ -1163,6 +1183,9 @@ impl JournalState {
     /// flash-plan restart reads them, ADR-335 item 2); it and the others fold into
     /// `latest_checkpoint`.
     fn fold_vm_state(&mut self, record: Record) {
+        if matches!(record, Record::RunStart { .. }) {
+            self.run_started = true;
+        }
         match record {
             Record::Step {
                 at,
@@ -1567,6 +1590,7 @@ fn load(bytes: &[u8], key: &JobKey) -> Result<Loaded, JournalError> {
         latest_checkpoint: None,
         records: 0,
         job_content: None,
+        run_started: false,
     };
     let entry_seq = |payload: &[u8]| postcard::from_bytes::<Entry>(payload).ok().map(|e| e.seq);
     let mut offset = next;
@@ -2111,6 +2135,7 @@ mod tests {
                 latest_checkpoint: None,
                 records: 0,
                 job_content: None,
+                run_started: false,
             };
             if let Some(vin) = target_vin {
                 let FrameRead::Ok { next: vin_end, .. } = read_frame(&bytes, header_end) else {
@@ -2866,6 +2891,7 @@ mod tests {
                 latest_checkpoint: None,
                 records: 0,
                 job_content: None,
+                run_started: false,
             },
             poisoned: false,
         };
@@ -3309,6 +3335,49 @@ mod tests {
     }
 
     #[test]
+    fn a_journal_is_begun_only_once_it_holds_a_run_start() {
+        for target_vin in [Some(Vin::new("WDB12345678901234".to_owned())), None] {
+            let dir = TempDir::new();
+            let mut j = Journal::create(
+                &dir.0,
+                &key(),
+                target_vin.as_ref(),
+                Some(VERSION),
+                None,
+                &content(),
+            )
+            .expect("create");
+            assert!(!j.state().begun());
+            assert!(!Journal::read(&dir.0, &key()).expect("read").begun());
+            j.commit_run_start(at(0, 0), b"initial").expect("run start");
+            assert!(j.state().begun());
+            drop(j);
+            assert!(Journal::read(&dir.0, &key()).expect("read").begun());
+            assert!(Journal::open(&dir.0, &key()).expect("open").state().begun());
+        }
+    }
+
+    #[test]
+    fn the_resume_total_sums_the_resumes_of_every_stage() {
+        let dir = TempDir::new();
+        let mut j =
+            Journal::create(&dir.0, &key(), None, Some(VERSION), None, &content()).expect("create");
+        assert_eq!(j.state().resume_total(), 0);
+        j.commit_run_start(at(0, 0), b"initial").expect("run start");
+        assert_eq!(j.state().resume_total(), 0);
+        j.commit_resume(STAGE, None).expect("first");
+        j.commit_resume(STAGE, None).expect("second");
+        j.commit_resume(StageId(STAGE.0 + 1), None)
+            .expect("other stage");
+        assert_eq!(j.state().resume_total(), 3);
+        drop(j);
+        assert_eq!(
+            Journal::read(&dir.0, &key()).expect("read").resume_total(),
+            3
+        );
+    }
+
+    #[test]
     fn a_run_start_must_come_after_the_last_step() {
         let mut j = memory();
         j.commit_step(at(2, 5), None).expect("step");
@@ -3664,6 +3733,7 @@ mod tests {
                 latest_checkpoint: None,
                 records: 0,
                 job_content: None,
+                run_started: false,
             },
             poisoned: false,
         }

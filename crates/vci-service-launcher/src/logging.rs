@@ -172,6 +172,8 @@ mod eventlog {
     // `ReportEventW` may be called on it from any thread, concurrently.
     #[cfg(windows)]
     unsafe impl Send for EventLogLayer {}
+    // SAFETY: `&self` never changes the handle, and `ReportEventW` may be called on one handle
+    // from several threads at once, so shared references are safe to use across threads.
     #[cfg(windows)]
     unsafe impl Sync for EventLogLayer {}
 
@@ -179,6 +181,8 @@ mod eventlog {
     impl EventLogLayer {
         fn new(source: &str) -> Result<Self, std::io::Error> {
             let source_wide: Vec<u16> = source.encode_utf16().chain(Some(0)).collect();
+            // SAFETY: `source_wide` is NUL-terminated and outlives the call; a null server name
+            // selects the local machine.
             let handle = unsafe {
                 windows_sys::Win32::System::EventLog::RegisterEventSourceW(
                     std::ptr::null(),
@@ -195,6 +199,8 @@ mod eventlog {
     #[cfg(windows)]
     impl Drop for EventLogLayer {
         fn drop(&mut self) {
+            // SAFETY: `self.handle` came from a successful `RegisterEventSourceW` (`new` returns
+            // an error for a null one) and is deregistered only here, once.
             unsafe {
                 windows_sys::Win32::System::EventLog::DeregisterEventSource(self.handle);
             }
@@ -225,6 +231,9 @@ mod eventlog {
             let msg_wide: Vec<u16> = msg.encode_utf16().chain(Some(0)).collect();
             let strings: [*const u16; 1] = [msg_wide.as_ptr()];
 
+            // SAFETY: `self.handle` is a live event source handle; `strings` holds one pointer, as
+            // the string count passed says, to `msg_wide`, which is NUL-terminated and alive across
+            // the call; the SID and the binary data are null with a size of 0.
             unsafe {
                 ReportEventW(
                     self.handle,

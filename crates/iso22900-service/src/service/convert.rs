@@ -1055,6 +1055,13 @@ mod tests {
         E_PDU_IT, E_PDU_PC, E_PDU_PT, PDU_PARAM_ITEM, PDU_PARAM_STRUCTFIELD_DATA,
     };
 
+    /// Marks a native struct that has no padding bytes, so viewing it as bytes reads only
+    /// initialised memory. The bindings assert a size of 6 for both implementors on every
+    /// target, which is the sum of their fields. Do not implement it for a struct with padding.
+    trait PaddingFree: Copy {}
+    impl PaddingFree for PDU_PARAM_STRUCT_SESS_TIMING {}
+    impl PaddingFree for PDU_PARAM_STRUCT_ACCESS_TIMING {}
+
     /// Returns the raw native-layout bytes of `value`, mirroring what a real
     /// `PDUGetComParam`/`PDUSetComParam` call would read/write for a standard
     /// struct type -- used so tests never have to hand-compute field offsets
@@ -1063,9 +1070,10 @@ mod tests {
         unsafe_code,
         reason = "views a plain-data D-PDU API struct as its native bytes for the wire (ADR-502)"
     )]
-    fn native_bytes<T: Copy>(value: &T) -> Vec<u8> {
+    fn native_bytes<T: PaddingFree>(value: &T) -> Vec<u8> {
         // SAFETY: `value` is a live `&T`, so it is readable for `size_of::<T>()` bytes, and the
-        // bytes are copied out before the borrow ends. Tests pass only plain-data C structs.
+        // bytes are copied out before the borrow ends. `PaddingFree` is implemented only for
+        // structs without padding, so every byte read is initialised.
         unsafe { std::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) }
             .to_vec()
     }

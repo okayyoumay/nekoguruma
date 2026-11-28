@@ -72,8 +72,11 @@ impl TestServer {
             .expect("root description file should be writable");
         let config_path = dir.join("config.toml");
         std::fs::write(&config_path, extra_config_toml).expect("config file should be writable");
-        // SAFETY: every test of this file is `#[serial]`, so no other thread reads or writes the
-        // environment while the service starts.
+        // SAFETY: every test of this file is `#[serial]`, so no other test runs now. An
+        // earlier test's service or mock delivery thread may linger but reads no environment
+        // variable after its start-up. `Iso22900Service::new` reads
+        // these variables (library resolution, the config file, `PDUConstruct`) before it
+        // returns, on this task, and nothing reads the environment afterwards.
         unsafe {
             std::env::set_var("NGR_PDU_API_ROOT_FILE", &root_file);
             std::env::set_var("VCI_CONFIG_PATH", &config_path);
@@ -1947,10 +1950,13 @@ async fn a_started_link_keeps_the_session_alive_and_reports_a_missing_answer() {
         {"attach":{"config":{"s3_server_ms":1500}}},
         {"inject_fault":{"fault":"drop_response","service":62}}
     ]"#;
-    // SAFETY: the tests of this file are `#[serial]`, so none reads the environment meanwhile.
+    // SAFETY: the tests of this file are `#[serial]`, so no other test runs. The mock reads
+    // this variable only in `PDUConstruct`, which `TestServer::start` calls on this task, so
+    // no thread of an earlier service or of the mock's delivery reads the environment.
     unsafe { std::env::set_var("NGR_SIM_ECU_COMMANDS", commands) };
     let server = TestServer::start().await;
-    // SAFETY: as above.
+    // SAFETY: as above; the service and the mock's delivery thread now running read the
+    // environment no more after start-up.
     unsafe { std::env::remove_var("NGR_SIM_ECU_COMMANDS") };
     let lib_path = iso22900_mock::mock_library_path().expect("mock cdylib should be discoverable");
     let backdoor = MockBackdoor::open(&lib_path);

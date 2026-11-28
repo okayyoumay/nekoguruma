@@ -100,6 +100,10 @@ const HSRF_PRE_BRACKET_HARDWARE_BROADCAST_INTERVAL: u32 = 33;
     reason = "loads the mock library and looks up its `__mock_*` test-control symbol; libloading's `Library::new` and `get` are unsafe (ADR-502)"
 )]
 fn config_value(lib_path: &std::path::Path, channel_id: u32, param_id: u32) -> u32 {
+    // SAFETY: the mock cdylib exports `__mock_get_config_value` with the signature the `Symbol` type
+    // below declares, and `lib` stays loaded until the block ends, so the symbol is
+    // valid for every call in it.
+    // The `*mut u32` out-parameter points at a local `u32` that outlives the call.
     unsafe {
         let lib = j2534_0404_sys::libloading::Library::new(lib_path)
             .expect("mock library should be loadable");
@@ -126,6 +130,10 @@ fn config_value(lib_path: &std::path::Path, channel_id: u32, param_id: u32) -> u
     reason = "loads the mock library and looks up its `__mock_*` test-control symbol; libloading's `Library::new` and `get` are unsafe (ADR-502)"
 )]
 fn set_config_param_log(lib_path: &std::path::Path, channel_id: u32) -> Vec<u32> {
+    // SAFETY: the mock cdylib exports `__mock_get_set_config_param_log_count` and `__mock_get_set_config_param_log_entry` with the signature the `Symbol` type
+    // below declares, and `lib` stays loaded until the block ends, so the symbol is
+    // valid for every call in it.
+    // The `*mut u32` out-parameter points at a local `u32` that outlives the call.
     unsafe {
         let lib = j2534_0404_sys::libloading::Library::new(lib_path)
             .expect("mock library should be loadable");
@@ -163,6 +171,9 @@ fn set_config_param_log(lib_path: &std::path::Path, channel_id: u32) -> Vec<u32>
     reason = "loads the mock library and looks up its `__mock_*` test-control symbol; libloading's `Library::new` and `get` are unsafe (ADR-502)"
 )]
 fn written_count(lib_path: &std::path::Path, channel_id: u32) -> usize {
+    // SAFETY: the mock cdylib exports `__mock_get_written_msg_count` with the signature the `Symbol` type
+    // below declares, and `lib` stays loaded until the block ends, so the symbol is
+    // valid for every call in it.
     unsafe {
         let lib = j2534_0404_sys::libloading::Library::new(lib_path)
             .expect("mock library should be loadable");

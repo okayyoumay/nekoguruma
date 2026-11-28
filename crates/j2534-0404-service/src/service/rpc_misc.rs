@@ -1885,7 +1885,11 @@ impl VendorIoCtl {
     }
 }
 
-// Safety: `input_ptr`/`output_ptr` each return either `null_mut()` or a
+#[expect(
+    unsafe_code,
+    reason = "implements the J2534 IOCTL command trait, which is unsafe because the buffer layout must match the vendor call (ADR-502)"
+)]
+// SAFETY: `input_ptr`/`output_ptr` each return either `null_mut()` or a
 // pointer into one of this enum's own owned buffers -- raw mode's
 // `AlignedByteBuf` (its own `Vec<Align16Chunk>`-backed allocation,
 // 16-byte-aligned; see its doc comment) directly, or (wrapped mode) a
@@ -1894,10 +1898,6 @@ impl VendorIoCtl {
 // buffer on each call -- valid and writable for the native call's entire
 // duration, since neither buffer is resized after construction and `self`
 // is never moved while `J2534Api0404::ioctl` holds its `&mut self` borrow.
-#[expect(
-    unsafe_code,
-    reason = "implements the J2534 IOCTL command trait, which is unsafe because the buffer layout must match the vendor call (ADR-502)"
-)]
 unsafe impl j2534_0404::IoCtlCommand for VendorIoCtl {
     fn ioctl_id(&self) -> u32 {
         match self {
@@ -10714,6 +10714,9 @@ mod clear_periodic_msgs_epoch_gating_tests {
     )]
     fn clear_tx_buffer_count() -> usize {
         let lib_path = j2534_0404_mock::mock_library_path().expect("mock cdylib should be built");
+        // SAFETY: the mock cdylib exports `__mock_get_clear_tx_buffer_count_on_current_thread` with the signature the `Symbol` type
+        // below declares, and `lib` stays loaded until the block ends, so the symbol is
+        // valid for every call in it.
         unsafe {
             let lib = Library::new(&lib_path).expect("mock library should be loadable");
             let f: Symbol<unsafe extern "system" fn() -> usize> = lib
@@ -10908,6 +10911,9 @@ mod terminate_tp20_broadcast_periodic_for_suspension_tests {
     )]
     fn set_stop_periodic_message_error(code: Option<c_long>) {
         let lib_path = j2534_0404_mock::mock_library_path().expect("mock cdylib should be built");
+        // SAFETY: the mock cdylib exports `__mock_set_stop_periodic_message_error` with the signature the `Symbol` type
+        // below declares, and `lib` stays loaded until the block ends, so the symbol is
+        // valid for every call in it.
         unsafe {
             let lib = Library::new(&lib_path).expect("mock library should be loadable");
             let f: Symbol<unsafe extern "system" fn(c_long) -> c_long> = lib

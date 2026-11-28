@@ -55,6 +55,7 @@ async fn the_agent_launches_iso22900_service_for_a_d_pdu_api_vci() {
     // The agent resolves in this process and the worker in its own, which inherits these.
     let root_file = iso22900_mock::write_root_file(root, LIBRARY_NAME, &library)
         .expect("root description file should be writable");
+    // SAFETY: the tests of this file are `#[serial]`, so none reads the environment meanwhile.
     unsafe {
         std::env::set_var("NGR_PDU_API_ROOT_FILE", &root_file);
         std::env::set_var("VCI_CONFIG_PATH", &config_path);

@@ -151,7 +151,10 @@
 //!   `TX_FLAG_ISO15765_ADDR_TYPE` made client-authoritative on base CAN/
 //!   hardware ISO15765, the RX header/footer split skipped, and the Phase 1
 //!   protocol-allowlist/malformed-flag rejections at `CreateComLogicalLink`
-
+#![expect(
+    clippy::undocumented_unsafe_blocks,
+    reason = "staged adoption, ADR-502"
+)]
 // Relies on the debug-only runtime VCI_CONFIG_PATH override; see ADR-073.
 #![cfg(debug_assertions)]
 

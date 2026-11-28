@@ -72,6 +72,8 @@ impl TestServer {
             .expect("root description file should be writable");
         let config_path = dir.join("config.toml");
         std::fs::write(&config_path, extra_config_toml).expect("config file should be writable");
+        // SAFETY: every test of this file is `#[serial]`, so no other thread reads or writes the
+        // environment while the service starts.
         unsafe {
             std::env::set_var("NGR_PDU_API_ROOT_FILE", &root_file);
             std::env::set_var("VCI_CONFIG_PATH", &config_path);
@@ -151,6 +153,8 @@ impl MockBackdoor {
         reason = "loads the mock library and looks up its `__mock_*` test-control symbol; libloading's `Library::new` and `get` are unsafe (ADR-502)"
     )]
     fn open(path: &Path) -> Self {
+        // SAFETY: loading the mock cdylib only runs its initializers, which touch no state of this
+        // process; the library is kept in `self` for as long as symbols are taken from it.
         let lib = unsafe { Library::new(path) }.expect("mock library should be loadable");
         Self { lib }
     }
@@ -174,6 +178,8 @@ impl MockBackdoor {
         reason = "loads the mock library and looks up its `__mock_*` test-control symbol; libloading's `Library::new` and `get` are unsafe (ADR-502)"
     )]
     fn reset(&self) {
+        // SAFETY: the mock exports `__mock_reset` with the signature declared below, and `self.lib`
+        // keeps the library loaded for the call.
         unsafe {
             let f: Symbol<unsafe extern "system" fn() -> T_PDU_ERROR> = self
                 .lib
@@ -192,6 +198,8 @@ impl MockBackdoor {
         reason = "loads the mock library and looks up its `__mock_*` test-control symbol; libloading's `Library::new` and `get` are unsafe (ADR-502)"
     )]
     fn set_lock_resource_error(&self, code: T_PDU_ERROR) {
+        // SAFETY: the mock exports `__mock_set_lock_resource_error` with the signature declared
+        // below, and `self.lib` keeps the library loaded for the call.
         unsafe {
             let f: Symbol<unsafe extern "system" fn(T_PDU_ERROR) -> T_PDU_ERROR> = self
                 .lib
@@ -215,6 +223,8 @@ impl MockBackdoor {
         timestamp: UNUM32,
         extra_error_info: UNUM32,
     ) {
+        // SAFETY: the mock exports `__mock_set_last_error` with the signature declared below, and
+        // `self.lib` keeps the library loaded for the call.
         unsafe {
             let f: Symbol<
                 unsafe extern "system" fn(T_PDU_ERR_EVT, UNUM32, UNUM32, UNUM32) -> T_PDU_ERROR,
@@ -1357,6 +1367,9 @@ async fn set_com_param_rejects_mismatched_vendor_structfield_size_at_the_rpc_bou
 )]
 fn sim_ecu_control(backdoor: &MockBackdoor, command: &str) {
     let command = std::ffi::CString::new(command).expect("no NUL in the command");
+    // SAFETY: the mock exports `__mock_sim_ecu_control` with the signature declared below;
+    // `command` is a NUL-terminated string that outlives the call, and `backdoor.lib` keeps the
+    // library loaded.
     let status = unsafe {
         let f: Symbol<unsafe extern "system" fn(*const std::os::raw::c_char) -> UNUM32> = backdoor
             .lib
@@ -1934,8 +1947,10 @@ async fn a_started_link_keeps_the_session_alive_and_reports_a_missing_answer() {
         {"attach":{"config":{"s3_server_ms":1500}}},
         {"inject_fault":{"fault":"drop_response","service":62}}
     ]"#;
+    // SAFETY: the tests of this file are `#[serial]`, so none reads the environment meanwhile.
     unsafe { std::env::set_var("NGR_SIM_ECU_COMMANDS", commands) };
     let server = TestServer::start().await;
+    // SAFETY: as above.
     unsafe { std::env::remove_var("NGR_SIM_ECU_COMMANDS") };
     let lib_path = iso22900_mock::mock_library_path().expect("mock cdylib should be discoverable");
     let backdoor = MockBackdoor::open(&lib_path);

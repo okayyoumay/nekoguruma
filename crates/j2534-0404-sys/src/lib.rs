@@ -1,3 +1,7 @@
+#![expect(
+    clippy::undocumented_unsafe_blocks,
+    reason = "staged adoption, ADR-502"
+)]
 #![allow(
     unsafe_code,
     reason = "raw FFI bindings to the J2534 v04.04 API and the run-time loader over a vendor library (ADR-502)"

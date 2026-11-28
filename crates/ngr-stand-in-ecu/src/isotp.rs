@@ -62,8 +62,9 @@ impl IsoTpSocket {
             return Err(io::Error::last_os_error());
         }
         // SAFETY: `fd` is a socket this function just created and owns.
+        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
         let socket = Self {
-            fd: unsafe { OwnedFd::from_raw_fd(fd) },
+            fd: owned,
             rx_id,
             tx_id,
         };

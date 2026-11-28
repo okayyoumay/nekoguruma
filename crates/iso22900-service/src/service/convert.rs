@@ -1064,6 +1064,8 @@ mod tests {
         reason = "views a plain-data D-PDU API struct as its native bytes for the wire (ADR-502)"
     )]
     fn native_bytes<T: Copy>(value: &T) -> Vec<u8> {
+        // SAFETY: `value` is a live `&T`, so it is readable for `size_of::<T>()` bytes, and the
+        // bytes are copied out before the borrow ends. Tests pass only plain-data C structs.
         unsafe { std::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) }
             .to_vec()
     }

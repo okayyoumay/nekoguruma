@@ -36,6 +36,8 @@ fn the_runtime_override_replaces_the_registry() {
     }
     let native = j2534_0404::resolve(NAME);
     let all = j2534_0404::resolve_on_registry(NAME, RegistryViewMode::All);
+    // SAFETY: this test binary runs only this test, so nothing reads the environment
+    // concurrently.
     unsafe {
         std::env::remove_var("NGR_J2534_DEFINITION_DIR");
     }

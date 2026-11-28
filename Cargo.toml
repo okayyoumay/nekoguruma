@@ -65,6 +65,7 @@ redundant_type_annotations = "warn"
 renamed_function_params = "warn"
 unnecessary_safety_comment = "warn"
 unnecessary_safety_doc = "warn"
+undocumented_unsafe_blocks = "warn"
 unused_result_ok = "warn"
 
 [workspace.dependencies]

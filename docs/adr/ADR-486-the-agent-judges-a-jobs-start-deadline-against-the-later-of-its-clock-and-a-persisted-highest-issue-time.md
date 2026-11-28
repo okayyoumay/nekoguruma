@@ -1,7 +1,7 @@
 # ADR-486: The Agent Judges a Job's Start Deadline Against the Later of Its Clock and a Persisted Highest Issue Time
 
 **Date:** 2026-11-17
-**Status:** Accepted (the first Consequence, that the duplicate check must come before the deadline check, done by ADR-489)
+**Status:** Accepted (the first Consequence, that the duplicate check must come before the deadline check, done by ADR-489; the resume Consequence fulfilled by ADR-513)
 **Affects:** design 5.3, 6.7; `docs/glossary.md`, `api/asyncapi.yaml` (`jobState`, `ackCommand`); `crates/agent` (`deadline`, `control::channel`, `control::gate`, `connect`), `crates/agent/docs/ngr-agent.md`, `crates/agent/docs/operational-log.md`; details ADR-461 item 6, reuses ADR-483's path
 
 ## Context

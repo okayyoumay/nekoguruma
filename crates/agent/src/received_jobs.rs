@@ -19,6 +19,11 @@
 //! failed write the ledger refuses records until it is opened again
 //! ([`ReceivedJobs::reopen_if_poisoned`]). [`ReceivedJobs::highest`] reads memory only, so a
 //! poisoned ledger still recognises its duplicates.
+//!
+//! The jobs the agent holds are the ledger's jobs whose end is open (ADR-513).
+//! [`ReceivedJobs::open_held_in`] opens the ledger as [`ReceivedJobs::open_in`] does and also
+//! returns each job's highest-generation record with its envelope, in the order those records lie
+//! in the file, leaving out the jobs a caller-given predicate calls ended.
 
 use std::collections::HashMap;
 use std::io;
@@ -116,6 +121,16 @@ struct Entry {
     envelope: Vec<u8>,
 }
 
+/// A job the ledger holds: its highest-generation record, as [`ReceivedJobs::open_held_in`]
+/// returns it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldJob {
+    pub job_id: String,
+    pub generation: u64,
+    /// The signed envelope as it was delivered and recorded.
+    pub envelope: Vec<u8>,
+}
+
 /// The open ledger, the only writer of its agent ID's file. Cloning is cheap.
 #[derive(Clone)]
 pub struct ReceivedJobs {
@@ -155,17 +170,59 @@ impl ReceivedJobs {
         agent_id: &str,
         probe: Probe,
     ) -> Result<ReceivedJobs, LedgerError> {
+        Self::open_inner(dir, agent_id, probe, false).map(|(ledger, _)| ledger)
+    }
+
+    /// [`ReceivedJobs::open_in`] that also returns the held jobs: for each job ID, the record of
+    /// its highest generation, in the order those records lie in the file, unless `ended` says the
+    /// job's end is recorded. `ended` gets the job ID and that generation. [`ReceivedJobs::highest`]
+    /// and the duplicate check are the same as after `open_in`: an ended job still has its record.
+    pub fn open_held_in(
+        dir: &Path,
+        agent_id: &str,
+        ended: impl Fn(&str, u64) -> bool,
+    ) -> Result<(ReceivedJobs, Vec<HeldJob>), LedgerError> {
+        let (ledger, entries) = Self::open_inner(dir, agent_id, Box::new(|_| Ok(())), true)?;
+        let mut held: Vec<Entry> = entries
+            .into_values()
+            .filter(|entry| !ended(&entry.job_id, entry.generation))
+            .collect();
+        // The record numbers are the file order.
+        held.sort_unstable_by_key(|entry| entry.seq);
+        let held = held
+            .into_iter()
+            .map(|entry| HeldJob {
+                job_id: entry.job_id,
+                generation: entry.generation,
+                envelope: entry.envelope,
+            })
+            .collect();
+        Ok((ledger, held))
+    }
+
+    /// The open behind both public forms; the records are kept only when `keep` is set.
+    fn open_inner(
+        dir: &Path,
+        agent_id: &str,
+        probe: Probe,
+        keep: bool,
+    ) -> Result<(ReceivedJobs, HashMap<String, Entry>), LedgerError> {
         if !shared_proto::is_canonical_uuid(agent_id) {
             return Err(LedgerError::BadAgentId);
         }
         let mut file = FrameFile::new(dir, agent_id, LAYOUT, probe);
-        let index = read_index(&mut file)?;
-        Ok(ReceivedJobs {
+        let mut reader = Reader {
+            index: HashMap::new(),
+            entries: keep.then(HashMap::new),
+        };
+        file.open_state(&mut |seq, payload| reader.read(seq, payload), &seq_of)?;
+        let ledger = ReceivedJobs {
             inner: Arc::new(Inner {
-                index: Mutex::new(index),
+                index: Mutex::new(reader.index),
                 file: Mutex::new(file),
             }),
-        })
+        };
+        Ok((ledger, reader.entries.unwrap_or_default()))
     }
 
     /// The highest generation recorded for `job_id`, from memory.
@@ -235,24 +292,14 @@ impl ReceivedJobs {
         if !file.is_poisoned() {
             return Ok(false);
         }
-        let mut index = HashMap::new();
-        file.reopen_if_poisoned(
-            &mut |seq, payload| read_record(&mut index, seq, payload),
-            &seq_of,
-        )?;
-        *self.index() = index;
+        let mut reader = Reader {
+            index: HashMap::new(),
+            entries: None,
+        };
+        file.reopen_if_poisoned(&mut |seq, payload| reader.read(seq, payload), &seq_of)?;
+        *self.index() = reader.index;
         Ok(true)
     }
-}
-
-/// Opens `file` and builds the index from its records.
-fn read_index(file: &mut FrameFile) -> Result<HashMap<String, u64>, LedgerError> {
-    let mut index = HashMap::new();
-    file.open_state(
-        &mut |seq, payload| read_record(&mut index, seq, payload),
-        &seq_of,
-    )?;
-    Ok(index)
 }
 
 /// A record frame's number, `None` when the payload is not a record.
@@ -260,29 +307,43 @@ fn seq_of(payload: &[u8]) -> Option<u64> {
     postcard::from_bytes::<Entry>(payload).ok().map(|e| e.seq)
 }
 
-/// Checks the record number `seq`'s `payload` and counts it in `index`.
-fn read_record(
-    index: &mut HashMap<String, u64>,
-    seq: u64,
-    payload: &[u8],
-) -> Result<(), FileError> {
-    let corrupt = |reason| FileError::Corrupt(reason, None);
-    let entry: Entry = postcard::from_bytes(payload)
-        .map_err(|e| FileError::Corrupt("a record does not decode", Some(e)))?;
-    if entry.seq != seq {
-        return Err(corrupt("record numbers are not contiguous"));
+/// What reading the file builds: the index, and the records themselves when the caller wants the
+/// held jobs.
+struct Reader {
+    index: HashMap<String, u64>,
+    /// The newest record of each job's highest generation so far, when the held jobs are wanted:
+    /// one envelope per job, whatever the file holds.
+    entries: Option<HashMap<String, Entry>>,
+}
+
+impl Reader {
+    /// Checks the record number `seq`'s `payload` and counts it.
+    fn read(&mut self, seq: u64, payload: &[u8]) -> Result<(), FileError> {
+        let corrupt = |reason| FileError::Corrupt(reason, None);
+        let entry: Entry = postcard::from_bytes(payload)
+            .map_err(|e| FileError::Corrupt("a record does not decode", Some(e)))?;
+        if entry.seq != seq {
+            return Err(corrupt("record numbers are not contiguous"));
+        }
+        if !shared_proto::is_canonical_uuid(&entry.job_id) {
+            return Err(corrupt("a job ID is not a canonical UUID"));
+        }
+        if entry.envelope.is_empty() || entry.envelope.len() > MAX_ENVELOPE {
+            return Err(corrupt("an envelope has a length no record holds"));
+        }
+        let newest = self
+            .index
+            .get(&entry.job_id)
+            .is_none_or(|highest| entry.generation >= *highest);
+        self.index
+            .entry(entry.job_id.clone())
+            .and_modify(|highest| *highest = (*highest).max(entry.generation))
+            .or_insert(entry.generation);
+        if newest && let Some(entries) = &mut self.entries {
+            entries.insert(entry.job_id.clone(), entry);
+        }
+        Ok(())
     }
-    if !shared_proto::is_canonical_uuid(&entry.job_id) {
-        return Err(corrupt("a job ID is not a canonical UUID"));
-    }
-    if entry.envelope.is_empty() || entry.envelope.len() > MAX_ENVELOPE {
-        return Err(corrupt("an envelope has a length no record holds"));
-    }
-    index
-        .entry(entry.job_id)
-        .and_modify(|highest| *highest = (*highest).max(entry.generation))
-        .or_insert(entry.generation);
-    Ok(())
 }
 
 #[cfg(test)]

@@ -75,6 +75,7 @@ pub mod launch;
 pub mod link;
 pub mod log_upload;
 pub mod logging;
+mod operator_policy;
 mod oplog;
 pub mod outbox;
 pub mod outcome_record;

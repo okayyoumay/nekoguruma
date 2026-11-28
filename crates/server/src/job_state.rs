@@ -224,6 +224,15 @@ mod tests {
             code("failed", "instructionRejected"),
             Some("instructionRejected")
         );
+        // The agent's resume code for a recorded instruction that no longer verifies is kept.
+        assert_eq!(
+            code("preconditionFailed", "instructionNoLongerVerifies"),
+            Some("instructionNoLongerVerifies")
+        );
+        assert_eq!(
+            code("failed", "instructionNoLongerVerifies"),
+            Some("instructionNoLongerVerifies")
+        );
         // Unknown, wrongly cased and the server's own retired key are `other`.
         for odd in ["nope", "VinMismatch", "", "instructionKeyRetired"] {
             assert_eq!(code("failed", odd), Some("other"), "{odd:?}");

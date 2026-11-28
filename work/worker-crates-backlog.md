@@ -51,6 +51,14 @@ Most priorities here were set under the earlier scale these crates were develope
 - **P2**: `crates/iso22900` returns borrowed items (`Borrowed*` types in `crates/iso22900/src/item.rs`, returned from `crates/iso22900/src/lib.rs`) whose memory belongs to the native library until it is released with `PDUDestroyItem`, but its docs give only one-line type descriptions. Done when: the rustdoc of those types or `crates/iso22900/docs/implementation-notes.md` states which results are borrowed and which owned, when the native memory is released, and shows an example of copying data out before release.
 - **P2**: `crates/iso22900/tests/callback_lifecycle.rs`'s `unregistering_during_a_delivery_waits_for_the_callback_to_return` can only make it near-certain, not prove, that `DPduApi::unregister_event_callback` (`crates/iso22900/src/lib.rs`) is waiting on the callback registry's lock before the blocked callback returns: the test waits until the unregistering thread reports it is about to call it, then for a fixed window. Forcing the interleaving needs a test-only hook in the wrapper that fires just before the lock is taken (for example behind a test feature), which a new test file alone cannot add. Done when: the test synchronizes on such a hook and releases the callback only after it fired.
 
+## `j2534-0404`
+
+### Prioritized Backlog
+
+- **P2**: `J2534Api0404::from_path` in `crates/j2534-0404/src/lib.rs` loads a vendor library whose `unsigned long` width (`NGR_J2534_LONG_SIZE`) the bindings must match, and safe code cannot check that before the first calls; a wrong width overflows buffers before the `PassThruReadVersion` self-check. Needs a design decision: take the width explicitly, or make the constructor `unsafe`. Done when: the constructor either checks the width it is given against the bindings or states the requirement in its `unsafe` contract, and its callers (`j2534-0404-service`, the live tests) follow.
+- **P2**: `J2534Api0404` is `Send` and `Sync`, but J2534-1 clause 6.2 allows one thread in the library at a time; only `j2534-0404-service`'s `Arc<Mutex<_>>` enforces it. Needs a design decision (a `PhantomData<Cell<()>>` marker making it `!Sync`; whether calls need thread affinity). Done when: the type system or a runtime check rejects concurrent calls, and the service still compiles.
+- **P3**: `IoCtlCommand` in `crates/j2534-0404/src/ioctl.rs` has `input_ptr` and `output_ptr` as separate `&mut self` methods, so the second borrow may invalidate the first pointer (it is a trait contract only). Done when: one method returns both pointers and `J2534Api0404::ioctl` calls it once.
+
 ## `j2534-0404-service`
 
 ### Known Flaky Tests

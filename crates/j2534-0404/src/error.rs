@@ -1,4 +1,4 @@
-use std::{ffi::CStr, fmt, os::raw::c_char};
+use std::{fmt, os::raw::c_char};
 
 use j2534_0404_sys::bindings::{self, STATUS_NOERROR};
 use j2534_0404_sys::libloading;
@@ -94,6 +94,8 @@ pub enum Error {
     },
     /// C API returned invalid UTF-8 or malformed text; the source is the UTF-8 error.
     InvalidVersionString(std::str::Utf8Error),
+    /// A text buffer the C API filled holds no NUL terminator within its length.
+    UnterminatedText { len: usize },
     /// Operation is unavailable for this binding mode.
     OperationNotAvailable { operation: &'static str },
 }
@@ -122,6 +124,9 @@ impl fmt::Display for Error {
                 write!(f, "invalid argument {name}: {reason}")
             }
             Self::InvalidVersionString(_) => write!(f, "invalid version string returned by API"),
+            Self::UnterminatedText { len } => {
+                write!(f, "text returned by API has no NUL within {len} bytes")
+            }
             Self::OperationNotAvailable { operation } => {
                 write!(f, "operation requires open handle: {operation}")
             }
@@ -162,11 +167,18 @@ pub(crate) fn check(status: ::std::os::raw::c_long) -> Result<(), Error> {
     }
 }
 
+/// Converts a text buffer the C API filled into a `String`.
+///
+/// The text ends at the first NUL; a buffer without one is an error, since the
+/// API only requires the caller to supply the space, not the library to
+/// terminate the text.
 pub(crate) fn c_buf_to_string(buffer: &[c_char]) -> Result<String, Error> {
-    let cstr = unsafe { CStr::from_ptr(buffer.as_ptr()) };
-    cstr.to_str()
-        .map(|s| s.to_string())
-        .map_err(Error::InvalidVersionString)
+    let end = buffer
+        .iter()
+        .position(|&c| c == 0)
+        .ok_or(Error::UnterminatedText { len: buffer.len() })?;
+    let bytes: Vec<u8> = buffer[..end].iter().map(|&c| c as u8).collect();
+    String::from_utf8(bytes).map_err(|e| Error::InvalidVersionString(e.utf8_error()))
 }
 
 #[cfg(test)]
@@ -204,5 +216,22 @@ mod tests {
         assert!(matches!(err, Error::InvalidVersionString(_)), "{err:?}");
         assert!(std::error::Error::source(&err).is_some());
         assert_eq!(err.to_string(), "invalid version string returned by API");
+    }
+
+    #[test]
+    fn a_text_buffer_without_a_nul_is_an_error() {
+        let buffer: [c_char; 80] = [b'A' as c_char; 80];
+        let err = c_buf_to_string(&buffer).unwrap_err();
+        assert!(
+            matches!(err, Error::UnterminatedText { len: 80 }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_text_buffer_ends_at_the_first_nul() {
+        let mut buffer: [c_char; 80] = [b'A' as c_char; 80];
+        buffer[3] = 0;
+        assert_eq!(c_buf_to_string(&buffer).unwrap(), "AAA");
     }
 }

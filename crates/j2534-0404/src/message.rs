@@ -89,6 +89,8 @@ impl PassThruMessage {
     }
 
     pub(crate) fn zeroed() -> Self {
+        // SAFETY: `PASSTHRU_MSG` is a plain C struct of integers and an integer array, for which
+        // the all-zero bit pattern is a valid value.
         Self(unsafe { MaybeUninit::<PASSTHRU_MSG>::zeroed().assume_init() })
     }
 
@@ -98,6 +100,8 @@ impl PassThruMessage {
 
     /// Returns a borrowed view over this message.
     pub fn borrowed(&self) -> &BorrowedPassThruMessage {
+        // SAFETY: both types are `#[repr(transparent)]` over `PASSTHRU_MSG`, so they have the same
+        // layout and alignment; the result borrows `self` for the same lifetime.
         unsafe { &*(self as *const PassThruMessage as *const BorrowedPassThruMessage) }
     }
 
@@ -173,8 +177,10 @@ pub struct RepeatMsgSetup(pub(crate) REPEAT_MSG_SETUP);
 impl RepeatMsgSetup {
     /// Builds a new `REPEAT_MSG_SETUP` from `time_interval` (ms),
     /// `condition` (the raw native `Condition` value), the repeat message
-    /// itself, and its stop-condition mask/pattern pair. Each `PassThruMessage`
-    /// is already validated by its own `PassThruMessage::new` construction.
+    /// itself, and its stop-condition mask/pattern pair. The payload lengths are
+    /// not checked here: `PassThruMessage`'s native field is public, so
+    /// [`crate::J2534Api0404::start_repeat_message`] checks all three before the
+    /// native call.
     pub fn new(
         time_interval: u32,
         condition: u32,
@@ -187,6 +193,15 @@ impl RepeatMsgSetup {
             Condition: condition,
             RepeatMsgData: [message.0, mask.0, pattern.0],
         })
+    }
+
+    /// Fails with `MessageTooLarge` when any of the three messages claims a
+    /// payload longer than the native `Data` array.
+    pub(crate) fn validate(&self) -> Result<(), Error> {
+        for message in &self.0.RepeatMsgData {
+            validate_data_size(message.DataSize as usize)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn as_raw_mut_ptr(&mut self) -> *mut REPEAT_MSG_SETUP {
@@ -209,6 +224,8 @@ pub struct NdisAdapterInfo(pub NDIS_ADAPTER_INFORMATION);
 
 impl NdisAdapterInfo {
     pub(crate) fn zeroed() -> Self {
+        // SAFETY: `NDIS_ADAPTER_INFORMATION` is a plain C struct of integers and integer arrays,
+        // for which the all-zero bit pattern is a valid value.
         Self(unsafe { MaybeUninit::<NDIS_ADAPTER_INFORMATION>::zeroed().assume_init() })
     }
 

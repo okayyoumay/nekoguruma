@@ -746,13 +746,18 @@ async fn the_take_that_fills_the_pass_limit_still_includes_an_agents_only_newer_
 }
 
 /// The take is by rank, so more agents with backlogs than a pass holds do not keep another
-/// agent's only job out of the first pass. Every connection is open and every row is in before
-/// the first pass can see any (the jobs go in one transaction), and a pass's marks commit
-/// together, so the first state with a mark is the first pass's whole result.
+/// agent's only job out of the first pass. A pass takes the agents of the hub's snapshot it made
+/// when it began, so the rows go in (in one transaction) only once a pass has finished after the
+/// last connection opened: a pass that began before that registration may still be reading, and
+/// would see the rows without the agent. Every pass that sees a row began after every connection
+/// was registered, and a pass's marks commit together, so the first state with a mark is the
+/// whole result of a pass that had every agent.
 #[tokio::test]
 async fn every_agents_oldest_job_is_sent_in_the_first_pass_however_many_agents_are_connected() {
+    let passes = Arc::new(AtomicU64::new(0));
     let counted = Settings {
         period: Duration::from_millis(500),
+        passes: Some(passes.clone()),
         ..settings(LONG)
     };
     let u = Up::with_queue(2, Some(counted)).await;
@@ -764,6 +769,15 @@ async fn every_agents_oldest_job_is_sent_in_the_first_pass_however_many_agents_a
     let mut backlog = vec![u.id.clone()];
     backlog.extend(others.iter().take(4).map(|(id, _)| id.clone()));
     let single_agent = &others[4].0;
+    // A pass that finishes after every `open` above returned (a connection registers before its
+    // `hello`): the passes run one after another in one task, so every later pass takes its
+    // snapshot of the hub with all six agents in it.
+    let seen = passes.load(Ordering::Relaxed);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while passes.load(Ordering::Relaxed) == seen {
+        assert!(Instant::now() < deadline, "no pass finished");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     let mut tx = u.w.pool.begin().await.unwrap();
     for id in &backlog {
         add_old_jobs(&mut *tx, &u.w, id, 16, b"backlog").await;

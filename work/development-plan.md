@@ -15,7 +15,7 @@ Standards: `vehicle-comm-specs` holds SAE J2534-1 (v04.04), SAE J2534-2 (DEC2020
 | M3 Server and job control (local profile) | A job created through the Web API is executed by the agent over the control channel and its result is stored | `server`, `agent`, `shared-proto`, `shared-crypto`, `db/` | none (RFC/IT specs only) |
 | M4 Web UI and acquired data | Operators run jobs and view/edit acquired data in the browser; offline start works | UI framework, reference UI, `server` | none |
 | M6 Trust, approval and reprogramming | Signed packages and artifacts, approval levels, ECU reprogramming with preconditions | `shared-crypto`, `vendor-manifest`, `agent`, `server` | ISO 14229-1 clause 16 (held); SAE J3138 (not held) |
-| M5 Real-time monitoring | Monitoring at the 10 ms target, interval capture, multiple subscribers | `agent`, worker, `server`, UI | none |
+| M5 Real-time monitoring | Monitoring at the 10 ms target, interval capture, multiple subscribers; a SocketCAN worker on Linux | `agent`, worker, `ngr-socketcan-service`, `server`, UI | none |
 | M7 Standard formats and external API | ODX/PDX and OTX ingestion; SOVD / ExVe compatible endpoints; generic OBD package | `diag-frontend`, `server`; for generic OBD also `agent` (L2), worker L1 (functional requests), `diag-ir` and `sim-ecu` | ISO 22901-1 (ODX), ISO 17978 (SOVD) (held); ISO 13209 (OTX), ISO 20077/20078, SAE J1979 / J1979-2, ISO 15031-5, ISO 15765-4, ISO 27145 (not held) |
 | M8 Cloud deployment and field validation | Standard (cloud) deployment, scale measures for size S, validation with real VCIs | `server`, deployment, CI | UNECE R155/R156 as needed (free to obtain) |
 
@@ -107,9 +107,11 @@ M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 20
 2. A captured interval is stored as acquired data with its metadata (4.6).
 3. A second browser subscribes through the server path while the first uses the direct path (10.4).
 4. The hardware checks listed below are implemented: the harness lists each one for a profile of its class, a check run without `NGR_HW_PROFILE` fails, and their parts that need no hardware are tested in CI (design 13.5). Running them on hardware is optional.
+5. On Linux, the SocketCAN worker `ngr-socketcan-service` (design 3.4, 7.1.3, ADR-512) runs an acquisition and a monitoring session against `sim-ecu` served over a virtual CAN interface (`vcan`), once with the user-space ISO-TP engine and once with the kernel's ISO-TP sockets, and the monitoring session reports each backend's achievable interval; the agent drives it as it drives the other workers (added at the maintainer's request, 2026-11-28).
 
 **Hardware checks to implement (design 13.5; running them on hardware is optional).**
 
+- T0/T1: a loopback between the SocketCAN worker's adapter and a second CAN end, and a read against the stand-in ECU through that worker.
 - T0/T2: the achievable monitoring interval and p99 arrival interval of each VCI at hand, recorded as the VCI profile's minimum monitoring period (9.3).
 - T3: a monitoring session on a vehicle.
 

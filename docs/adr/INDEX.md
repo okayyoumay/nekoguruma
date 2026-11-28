@@ -501,6 +501,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-509](ADR-509-dependencies-are-audited-with-cargo-deny-against-a-licence-allow-list-and-the-advisory-database.md) | Dependencies Are Audited With cargo-deny Against a Licence Allow-List and the Advisory Database | Accepted | `deny.toml`, `.github/workflows/ci.yml`, `CLAUDE.md`; `Cargo.toml` `license` keys |
 | [ADR-510](ADR-510-a-mapped-error-keeps-its-cause.md) | A Mapped Error Keeps Its Cause | Accepted | `Cargo.toml` lints; error types across the workspace; `CLAUDE.md` |
 | [ADR-511](ADR-511-the-agents-intake-runs-verified-instructions-one-at-a-time-and-reports-its-refusals-as-instruction-rejected.md) | The Agent's Intake Runs Verified Instructions One at a Time and Reports Its Refusals as Instruction Rejected | Accepted | design 5.3, 5.6, 8.2.6, `api/asyncapi.yaml`, `crates/agent`, `crates/server`; details ADR-473, ADR-475, ADR-489, ADR-504; annotates ADR-398 item 6 and ADR-481 |
+| [ADR-512](ADR-512-a-socketcan-worker-drives-can-adapters-without-a-vendor-library.md) | A SocketCAN Worker Drives CAN Adapters Without a Vendor Library | Accepted | design 3.4 / 7.1 / 7.1.3 / 7.3, `ngr-socketcan-service`, `ngr-socketcan`, `ngr-isotp`, `j2534-0404-service` isotp, `ngr-hw-checks` SocketCAN end |
 
 ## Status Legend
 
@@ -827,6 +828,7 @@ the predecessor repository these ADRs came from.
 - ADR-500 (the consequence that job creation takes the digests it is given replaced by ADR-501)
 - ADR-505 (items 9 to 14 added with the verifier and the agent's dial; items 15 to 19 added with the switch's design, and item 8 split by item 19; items 20 to 22 added with the switch, which meet item 6)
 - ADR-506
+- ADR-512
 
 ### vci-service-manager Process Startup
 - ADR-073

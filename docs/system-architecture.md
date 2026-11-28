@@ -163,6 +163,7 @@ Each device's operating mode is fixed to exactly one of "user mode" or "device m
 - Implemented in coarse-grained operation units (acquire / write / read-back verification)
 - Many J2534 DLLs are not thread-safe, which matches the per-VCI thread design. L0 / L1 (transport and protocol) also reside in the worker
 - Implementation: the worker binaries are the gRPC services `j2534-0404-service` (J2534 v04.04 libraries) and `iso22900-service` (D-PDU API libraries); their crates are described in `worker-crates.md`. Both expose the D-PDU API, so the agent drives either kind of library through one interface. One build per ABI (7.3)
+- On Linux a third worker, `ngr-socketcan-service`, drives a CAN adapter through SocketCAN with no vendor library: one process per configured VCI, the same interface, raw CAN and ISO 15765 links, and ISO-TP either in user space or in the kernel's ISO-TP sockets as its configuration selects (7.1.3, ADR-512). One build per host architecture, since it loads no library
 
 ---
 
@@ -624,6 +625,7 @@ Confirmation level (6.3) and two-person approval. The server decides the require
 | J2534 / Windows | Per-VCI key under `HKLM\SOFTWARE\PassThruSupport.04.04` -> `FunctionLibrary` (absolute path of the DLL). `Name` / `Vendor` are used for display |
 | J2534 / Linux | Registration definition specific to this software (7.1.1) -> `FunctionLibrary` (absolute path of the .so) |
 | ISO 22900 (D-PDU API; ISO 22900-2:2022 clause 8.7 and Annex F, the same chain as 2009 clause 9.7) | Registry value `Root File` under `HKLM\SOFTWARE\D-PDU API` (Windows) / path fixed at build time, `/etc/pdu_api_root.xml` by default (Linux); in debug builds a runtime override replaces either, for tests (ADR-228, ADR-282) -> root description file (XML) -> the `MVCI_PDU_API` entry whose `SHORT_NAME` matches -> `LIBRARY_FILE` (`file:` URI, absolute local path of the API library). The entry's module and cable description files (MDF, CDF) are referenced alongside and verified under 7.2, not followed to find the library |
+| SocketCAN / Linux | Registration definition specific to this software (7.1.3) -> the network interface of the CAN adapter; no library is loaded |
 
 - Specify the registry view explicitly with `KEY_WOW64_32KEY` / `KEY_WOW64_64KEY`
 - Expand a `REG_EXPAND_SZ` value only from a fixed list of system folder names, taking each folder from the HKLM value of the same registry view (so the view's bitness decides it), never from the process environment; any other variable is refused, and the result must be an absolute local path (ADR-277)
@@ -686,6 +688,16 @@ Basis for the inference: AArch64's AAPCS64 matches x86_64's System V ABI in that
 - Structure layouts consist of `unsigned long`, pointers and fixed-length arrays, so they match if the widths are the same. However, armhf aligns 64bit integers to 8 bytes (i686 uses 4 bytes), so explicit packing specification is retained
 - `long_size` can be overridden in the registration definition (`LongSize`), and `long_size`, calling convention and alignment in the VCI profile (9.3), so that vendors for which the inference is wrong can be supported by adding an extension alone, without modifying the core
 
+#### 7.1.3 SocketCAN Registration Definition on Linux (Proprietary Specification)
+
+A CAN adapter whose driver is in the Linux kernel is reached through SocketCAN, without a vendor library, by `ngr-socketcan-service` (3.4, ADR-512). Registration follows 7.1.1's rules:
+
+- **Search path**: `/etc/nekoguruma/socketcan/` only, written by the administrator, in both operating modes, fixed at build time with a runtime override in debug builds only (ADR-228, ADR-282)
+- **Format**: one TOML file per VCI, holding its name (the name a caller resolves), the network interface (such as `can0`) and the bitrate the administrator configured on that interface
+- **Checks**: the definition and the worker's configuration file are checked with the 7.2 writability rules in the device's mode; there is no library, so the library and signer checks do not apply
+- **The interface is configured outside this software.** Setting the bitrate or bringing the interface up needs administrator rights, which the worker does not have. The worker reads the interface's state and bitrate and refuses to connect a link whose requested baud rate differs, naming both
+- **ISO-TP backend**: the worker's per-name setting `isotp_backend` in its configuration file selects the user-space engine (`user`), the kernel's ISO-TP sockets (`kernel`, Linux 5.10 or later) or the kernel when it offers them and the user-space engine otherwise (`auto`, the default). The backend in use is reported in `capabilities` (9.5). Only the user-space engine gives a timestamp per frame; the kernel delivers whole messages
+
 ### 7.2 Pre-load Verification
 
 - Verify that configuration files, libraries and their folders are not writable by regular users (blocking privilege-escalation paths). Only system principals may own or modify the library, its own folder and the files that named it; further ancestor folders may let regular users add entries but not replace or remove them (ADR-270). The worker's own configuration file is checked earlier, at startup (ADR-285)
@@ -741,6 +753,7 @@ flowchart TD
 - Launch-test failures are classified by the `exec` error code (`ENOEXEC`: CPU/kernel not supported, `ENOENT`: dynamic loader missing)
 - Results are reported in `capabilities` with reason codes
 - Emulation of a different architecture is out of scope (Linux)
+- `ngr-socketcan-service` loads no library, so it has no library header to match: the agent starts the build for the host's own architecture, and its VCIs carry no ABI interpretation category (7.1.3, ADR-512)
 - The launch test runs through the worker service itself, not through a separate probe binary: the agent launches the service for the detected ABI, connects the module and calls `GetVersion`, which the j2534-0404 service answers with `PassThruReadVersion`. The test therefore exercises the same binary, FFI layer and `long_size` that the job will use, and each ABI ships one worker binary per library kind
 
 **Implementation** (`crates/worker-host`): the agent starts a worker service with the VCI's library name and the device's operating mode (`<scheme>:<library name>?mode=<device|user>`; `ngr-agent run` and `identify` take the mode from the installation file, 6.7, and refuse a `--mode` that differs, ADR-494); the service resolves the path itself (7.1) and checks it (7.2). The worker refuses to start without a valid mode. Both `iso22900-service` and `j2534-0404-service` resolve their library through `ngr-library-resolver` and apply the mode to the 7.2 checks they run before loading. To choose the build, the agent resolves the name through `ngr-library-resolver` as each build would (the build's registry view on Windows, with both views read explicitly on 64-bit Windows; the registration definition on Linux) and takes the first build whose library header matches its own ABI (`agent::launch`, used by `ngr-agent run`). `abi::detect_file` reads the header and returns the ABI name of the 7.1.2 table. Worker binaries are installed as `<workers>/<ABI name>/<service binary>`, and `WorkerLayout::find` reports a missing build as `UNSUPPORTED_ABI`. The J2534 `long_size` (the definition file's `LongSize`, else the 7.1.2 default from `Abi::default_long_size`; `agent::launch` takes it from the definition it resolved for the chosen build, refuses an 8-byte width for an ABI whose `unsigned long` is 32 bits wide, ADR-284) is passed to the j2534-0404 service in the `NGR_J2534_LONG_SIZE` environment variable; its sys layer converts between 32-bit and 64-bit structures at the FFI boundary.

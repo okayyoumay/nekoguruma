@@ -1409,6 +1409,11 @@ a new migration file rebuilds the crate. How migrations are written and applied 
   the route, are in `agent_connect.rs`, which also follows three accepted jobs' `received` events
   through a held cursor row, a kill of the agent, a restart (every event a repeat, answered) and a
   fourth job's event stored and acknowledged, with nothing sent or closed after a further restart.
+  `job_end_to_end.rs` (Unix, debug builds) runs an `acquire` job and then a `writeSettings` job,
+  both created through the route, on the real agent, the real worker and the simulators with the
+  bundled object server: each job's stored events and result object, one `jobCreated` audit row
+  each, the second job created only after the first's lock is freed, and the coding the write job
+  changed in the simulated ECU.
   `agent_events.rs` (database; the pure rule, the strict device-time check and the event's
   derivation are unit tests in `src/agent_events.rs`, the queue's split, grouping, bound and
   failure in `src/job_queue.rs`, and the hub's slot and scoped close in `src/hub.rs`) covers the

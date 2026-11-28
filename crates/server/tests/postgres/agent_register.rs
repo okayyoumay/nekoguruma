@@ -92,7 +92,13 @@ impl AgentEnv {
     }
 
     pub(crate) fn command(&self, args: &[String]) -> Command {
-        let mut command = Command::new(ngr_agent_binary::ngr_agent_path());
+        self.command_with(&ngr_agent_binary::ngr_agent_path(), args)
+    }
+
+    /// As [`AgentEnv::command`], running the agent executable `exe` (a copy of the built binary,
+    /// for a test that needs files beside it).
+    pub(crate) fn command_with(&self, exe: &Path, args: &[String]) -> Command {
+        let mut command = Command::new(exe);
         command
             .args(args)
             .env("HOME", self.home.path())

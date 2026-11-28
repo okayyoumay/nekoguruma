@@ -98,6 +98,14 @@ futures-util = { version = "0.3", default-features = false, features = ["sink"] 
 # The package itself, with the fake object server and the test TLS server on, so that the tests
 # build the fake and their own TLS peers need no TLS crate of their own (ADR-505).
 server = { path = ".", features = ["fake-object-server"] }
+# tests/postgres/job_end_to_end.rs builds the job documents of the fictional vehicle and of a
+# read-only acquisition, installs the worker and the simulator's definition for the real agent it
+# starts, and reads the simulated ECU's state file afterwards.
+diag-frontend = { path = "../diag-frontend" }
+j2534-0404-mock = { workspace = true }
+postcard = { workspace = true }
+sim-ecu = { workspace = true }
+worker-host = { workspace = true }
 
 [lints]
 workspace = true

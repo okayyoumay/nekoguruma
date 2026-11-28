@@ -1,3 +1,8 @@
+#![expect(
+    clippy::undocumented_unsafe_blocks,
+    reason = "staged adoption, ADR-502"
+)]
+
 use std::ffi::CStr;
 use std::os::raw::c_char;
 

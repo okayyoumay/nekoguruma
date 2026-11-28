@@ -1267,6 +1267,9 @@ mod tests {
     )]
     fn set_stop_periodic_message_error(code: Option<std::os::raw::c_long>) {
         let lib_path = j2534_0404_mock::mock_library_path().expect("mock cdylib should be built");
+        // SAFETY: the mock cdylib exports `__mock_set_stop_periodic_message_error` with the signature the `Symbol` type
+        // below declares, and `lib` stays loaded until the block ends, so the symbol is
+        // valid for every call in it.
         unsafe {
             let lib = j2534_0404_sys::libloading::Library::new(&lib_path)
                 .expect("mock library should be loadable");
@@ -1299,6 +1302,9 @@ mod tests {
     )]
     fn stop_periodic_call_count() -> usize {
         let lib_path = j2534_0404_mock::mock_library_path().expect("mock cdylib should be built");
+        // SAFETY: the mock cdylib exports `__mock_get_stop_periodic_count_on_current_thread` with the signature the `Symbol` type
+        // below declares, and `lib` stays loaded until the block ends, so the symbol is
+        // valid for every call in it.
         unsafe {
             let lib = j2534_0404_sys::libloading::Library::new(&lib_path)
                 .expect("mock library should be loadable");

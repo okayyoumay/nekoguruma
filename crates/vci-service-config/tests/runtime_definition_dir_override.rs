@@ -25,11 +25,15 @@ fn runtime_env_var_overrides_build_time_definition_dir() {
     }
     let overridden = vci_service_config::j2534_definition_dir();
     let override_alone = vci_service_config::j2534_definition_dir_override();
+    // SAFETY: this test binary runs only this test, so nothing reads the environment
+    // concurrently.
     unsafe {
         std::env::set_var("NGR_J2534_DEFINITION_DIR", "test-defs");
     }
     let relative = vci_service_config::j2534_definition_dir_override();
     let relative_dir = vci_service_config::j2534_definition_dir();
+    // SAFETY: this test binary runs only this test, so nothing reads the environment
+    // concurrently.
     unsafe {
         std::env::remove_var("NGR_J2534_DEFINITION_DIR");
     }
@@ -46,11 +50,15 @@ fn runtime_env_var_overrides_build_time_definition_dir() {
     assert_eq!(unset, None);
 
     // An empty value counts as unset.
+    // SAFETY: this test binary runs only this test, so nothing reads the environment
+    // concurrently.
     unsafe {
         std::env::set_var("NGR_J2534_DEFINITION_DIR", "");
     }
     let empty = vci_service_config::j2534_definition_dir();
     let empty_override = vci_service_config::j2534_definition_dir_override();
+    // SAFETY: this test binary runs only this test, so nothing reads the environment
+    // concurrently.
     unsafe {
         std::env::remove_var("NGR_J2534_DEFINITION_DIR");
     }

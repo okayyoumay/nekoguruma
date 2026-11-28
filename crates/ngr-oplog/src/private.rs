@@ -280,6 +280,8 @@ mod windows {
             // SAFETY: the call filled `buffer` with a `TOKEN_USER` whose SID lies inside it;
             // `owner` is valid as above.
             let user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
+            // SAFETY: `owner` and `user.User.Sid` are valid SIDs that stay alive (the descriptor and
+            // `buffer` are not freed) for the call.
             Ok(unsafe { EqualSid(owner, user.User.Sid) } != 0)
         })();
         // SAFETY: `descriptor` was allocated by the call above and is freed once.

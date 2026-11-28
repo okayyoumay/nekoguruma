@@ -7,6 +7,10 @@
 //! the `iso22900_mock` rlib this test links, so the counters are read through
 //! the library's own `__mock_*` exports. The tests in this file share that
 //! state and take `SERIAL` first.
+#![expect(
+    clippy::undocumented_unsafe_blocks,
+    reason = "staged adoption, ADR-502"
+)]
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};

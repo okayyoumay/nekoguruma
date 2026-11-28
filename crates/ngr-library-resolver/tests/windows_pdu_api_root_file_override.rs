@@ -46,6 +46,8 @@ fn the_runtime_override_replaces_the_registry() {
     )
     .expect("write root file");
     let found = iso22900::resolve(NAME);
+    // SAFETY: this test binary runs only this test, so nothing reads the environment
+    // concurrently.
     unsafe {
         std::env::remove_var("NGR_PDU_API_ROOT_FILE");
     }

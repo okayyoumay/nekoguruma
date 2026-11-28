@@ -1,3 +1,7 @@
+#![expect(
+    clippy::undocumented_unsafe_blocks,
+    reason = "staged adoption, ADR-502"
+)]
 #![allow(
     unsafe_code,
     reason = "wraps the J2534 v04.04 API of a loaded vendor library; every call crosses the C ABI (ADR-502)"

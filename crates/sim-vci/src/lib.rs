@@ -7,6 +7,10 @@
 //! Build examples:
 //!   cargo build -p sim-vci --target i686-pc-windows-msvc    (win-x86)
 //!   cargo build -p sim-vci --target x86_64-unknown-linux-gnu (linux-x86_64)
+#![expect(
+    clippy::undocumented_unsafe_blocks,
+    reason = "staged adoption, ADR-502"
+)]
 #![allow(
     unsafe_code,
     reason = "a cdylib that exports the J2534 C ABI the workers load (ADR-502)"

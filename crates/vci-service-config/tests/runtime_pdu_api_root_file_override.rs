@@ -24,11 +24,15 @@ fn runtime_env_var_overrides_build_time_root_file() {
     }
     let overridden = vci_service_config::pdu_api_root_file();
     let override_alone = vci_service_config::pdu_api_root_file_override();
+    // SAFETY: this test binary runs only this test, so nothing reads the environment
+    // concurrently.
     unsafe {
         std::env::set_var("NGR_PDU_API_ROOT_FILE", "test-root.xml");
     }
     let relative = vci_service_config::pdu_api_root_file_override();
     let relative_file = vci_service_config::pdu_api_root_file();
+    // SAFETY: this test binary runs only this test, so nothing reads the environment
+    // concurrently.
     unsafe {
         std::env::remove_var("NGR_PDU_API_ROOT_FILE");
     }
@@ -49,11 +53,15 @@ fn runtime_env_var_overrides_build_time_root_file() {
     assert_eq!(unset, None);
 
     // An empty value counts as unset.
+    // SAFETY: this test binary runs only this test, so nothing reads the environment
+    // concurrently.
     unsafe {
         std::env::set_var("NGR_PDU_API_ROOT_FILE", "");
     }
     let empty = vci_service_config::pdu_api_root_file();
     let empty_override = vci_service_config::pdu_api_root_file_override();
+    // SAFETY: this test binary runs only this test, so nothing reads the environment
+    // concurrently.
     unsafe {
         std::env::remove_var("NGR_PDU_API_ROOT_FILE");
     }

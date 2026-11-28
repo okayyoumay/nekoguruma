@@ -24,11 +24,15 @@ fn runtime_env_var_overrides_build_time_installation_file() {
     }
     let overridden = vci_service_config::agent_installation_file();
     let override_alone = vci_service_config::agent_installation_file_override();
+    // SAFETY: this test binary runs only this test, so nothing reads the environment
+    // concurrently.
     unsafe {
         std::env::set_var("NGR_AGENT_INSTALLATION_FILE", "test-agent.toml");
     }
     let relative = vci_service_config::agent_installation_file_override();
     let relative_file = vci_service_config::agent_installation_file();
+    // SAFETY: this test binary runs only this test, so nothing reads the environment
+    // concurrently.
     unsafe {
         std::env::remove_var("NGR_AGENT_INSTALLATION_FILE");
     }
@@ -49,11 +53,15 @@ fn runtime_env_var_overrides_build_time_installation_file() {
     assert_eq!(unset, None);
 
     // An empty value counts as unset.
+    // SAFETY: this test binary runs only this test, so nothing reads the environment
+    // concurrently.
     unsafe {
         std::env::set_var("NGR_AGENT_INSTALLATION_FILE", "");
     }
     let empty = vci_service_config::agent_installation_file();
     let empty_override = vci_service_config::agent_installation_file_override();
+    // SAFETY: this test binary runs only this test, so nothing reads the environment
+    // concurrently.
     unsafe {
         std::env::remove_var("NGR_AGENT_INSTALLATION_FILE");
     }

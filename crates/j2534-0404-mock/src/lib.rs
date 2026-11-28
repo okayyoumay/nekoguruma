@@ -1,3 +1,7 @@
+#![expect(
+    clippy::undocumented_unsafe_blocks,
+    reason = "staged adoption, ADR-502"
+)]
 #![allow(
     clippy::too_many_arguments,
     reason = "the exported functions mirror the C signatures of the J2534 API"

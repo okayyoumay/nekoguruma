@@ -685,8 +685,12 @@ fn known_folder(rfid: &windows_sys::core::GUID) -> PathBuf {
         }
         n
     };
+    // SAFETY: `path_ptr` points at `len` initialised `u16`s (the string counted above), and the
+    // Shell allocation is not freed until after `wide` is copied into `root`.
     let wide = unsafe { std::slice::from_raw_parts(path_ptr, len) };
     let root = PathBuf::from(OsString::from_wide(wide));
+    // SAFETY: `path_ptr` was allocated by `SHGetKnownFolderPath`, which requires this release, and
+    // nothing reads it afterwards.
     unsafe { CoTaskMemFree(path_ptr as *const ::core::ffi::c_void) };
 
     root

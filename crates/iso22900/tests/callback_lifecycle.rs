@@ -10,6 +10,10 @@
 //! the counts exact. Its state is process-global and lives in the loaded
 //! cdylib, so it is reset through the library's own `__mock_reset` export, and
 //! the tests in this file take `SERIAL` first.
+#![expect(
+    clippy::undocumented_unsafe_blocks,
+    reason = "staged adoption, ADR-502"
+)]
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};

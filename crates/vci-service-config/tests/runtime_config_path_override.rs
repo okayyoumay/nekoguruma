@@ -36,10 +36,14 @@ fn runtime_env_var_overrides_build_time_config_path() {
     )
     .expect("write test config");
 
+    // SAFETY: this test binary runs only this test, so nothing reads the environment
+    // concurrently.
     unsafe {
         std::env::set_var("VCI_CONFIG_PATH", &config_file);
     }
     let cfg = vci_service_config::find_logging_config("iso22900", None, "somelib");
+    // SAFETY: this test binary runs only this test, so nothing reads the environment
+    // concurrently.
     unsafe {
         std::env::remove_var("VCI_CONFIG_PATH");
     }

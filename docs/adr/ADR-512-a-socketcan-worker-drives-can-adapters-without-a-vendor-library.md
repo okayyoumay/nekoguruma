@@ -2,7 +2,7 @@
 
 **Date:** 2026-11-28
 **Status:** Accepted
-**Affects:** design 3.4, 7.1, 7.1.3, 7.3; a new worker crate `ngr-socketcan-service`; new
+**Affects:** design 2 (Assumptions), 3.4, 7.1, 7.1.3, 7.3, 9.5, and with the worker 8.11 and 13.5; a new worker crate `ngr-socketcan-service`; new
 shared crates `ngr-socketcan` and `ngr-isotp`; `j2534-0404-service` (`src/service/isotp.rs`),
 `ngr-hw-checks` (`src/guard/socketcan.rs`), `ngr-library-resolver`, `worker-host`, the agent's
 discovery and `capabilities` (9.5)
@@ -62,14 +62,17 @@ supported hosts.
    transport trait with two implementations: a user-space engine on a raw CAN socket, and the
    kernel's `CAN_ISOTP` socket. The worker's per-name settings in its `config.toml` select one
    with `isotp_backend = "user" | "kernel" | "auto"`, keyed by the VCI's name as the other
-   workers key theirs (ADR-281). `auto` is the default: it opens a kernel ISO-TP socket and
-   uses the user-space engine when the kernel refuses the protocol. The backend in use is
+   workers key theirs by the library's name (ADR-281). `auto` is the default: it opens a kernel
+   ISO-TP socket and uses the user-space engine when the kernel refuses the protocol. It decides
+   by what the kernel offers, not by a link's ComParams. The backend in use is
    reported in `capabilities` (9.5). The user-space engine keeps the worker on every kernel
    ADR-232 supports and gives a timestamp for every frame; the kernel backend keeps the
    separation time and flow control timing under load, but needs Linux 5.10 or later and
    delivers only whole messages, so per-frame times are not available from it and the
    communication log (8.11) records the message's times only. A ComParam the kernel's socket
-   options cannot express is refused on that backend with its name, not ignored.
+   options cannot express is refused on that backend with its name, not ignored, under `auto`
+   as under `kernel`. Design 8.11 states the coarser times when the worker is built, and design
+   13.5 adds the worker as an API a hardware profile can name, with its checks.
 6. **Shared crates, not copies.**
    - `ngr-socketcan` holds the SocketCAN access: raw CAN sockets with filters and kernel
      timestamps, reading an interface's state and bitrate, and the kernel ISO-TP socket. The
@@ -85,7 +88,7 @@ supported hosts.
      the two are merged is decided once the new worker exists and the duplication can be
      measured.
 7. **Host builds only.** The worker loads no vendor library, so there is no library ABI to
-   match: one build per host architecture (x86_64 and aarch64, ADR-232) is bundled, and the
+   match: one build per supported host architecture (x86_64 and aarch64, ADR-232) is bundled, and the
    32-bit worker builds of 7.3 do not apply to it. Its VCIs are reported with no ABI
    interpretation category.
 8. **Milestone.** The worker is part of M5 (real-time monitoring), whose exit criteria measure

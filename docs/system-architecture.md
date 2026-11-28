@@ -18,7 +18,7 @@ Diagnostic software for vehicles. It connects to a VCI through vendor-supplied s
 | Vehicle | The target, identified by VIN. The unit of exclusive locking |
 | ECU | The target of writes and diagnostics. The unit of variant identification |
 | Agent | A resident process on the device that executes jobs |
-| Worker | A separate process that loads a vendor library (one per ABI) |
+| Worker | A separate process that loads a vendor library (one per ABI), or, for the SocketCAN worker, drives a kernel CAN interface (ADR-512) |
 
 "Device" is not used in this document in its generic hardware sense, being ambiguous; it always means the installed terminal (proper names such as the RFC 8628 Device Authorization Flow excepted).
 
@@ -53,7 +53,7 @@ D-PDU API and J2534 terms used by the worker crates are defined in `glossary.md`
 ### Assumptions
 
 - Target OS: Windows / Linux. Linux hosts are x86_64 and aarch64 (with i686 and armhf workers for 32-bit vendor libraries, 7.3), on glibc-based distributions with glibc 2.17 or later and kernel 3.2 or later (ADR-232). On Linux, J2534 reuses the Windows API definitions as-is; only registration information such as library locations uses a definition specific to this software (7.1.1)
-- Vendor library standards: J2534 (PassThru) and ISO 22900 (D-PDU API). Adapters are structured as two kinds, one per standard, plus absorption of vendor-specific quirks
+- Vendor library standards: J2534 (PassThru) and ISO 22900 (D-PDU API). Adapters are structured as two kinds, one per standard, plus absorption of vendor-specific quirks; on Linux a third worker reaches CAN adapters through SocketCAN without a vendor library (3.4, ADR-512)
 - Vendor libraries may be a mix of 32-bit and 64-bit (J2534 DLLs are mostly 32-bit, so an x86 worker is required). ARM may also be included
 - Whether and how vendor libraries communicate over the network is not our concern (outside the system's guarantees)
 - No assumption is made about how vendor libraries pass data (callback / polling / blocking read)
@@ -163,7 +163,7 @@ Each device's operating mode is fixed to exactly one of "user mode" or "device m
 - Implemented in coarse-grained operation units (acquire / write / read-back verification)
 - Many J2534 DLLs are not thread-safe, which matches the per-VCI thread design. L0 / L1 (transport and protocol) also reside in the worker
 - Implementation: the worker binaries are the gRPC services `j2534-0404-service` (J2534 v04.04 libraries) and `iso22900-service` (D-PDU API libraries); their crates are described in `worker-crates.md`. Both expose the D-PDU API, so the agent drives either kind of library through one interface. One build per ABI (7.3)
-- On Linux a third worker, `ngr-socketcan-service`, drives a CAN adapter through SocketCAN with no vendor library: one process per configured VCI, the same interface, raw CAN and ISO 15765 links, and ISO-TP either in user space or in the kernel's ISO-TP sockets as its configuration selects (7.1.3, ADR-512). One build per host architecture, since it loads no library
+- On Linux a third worker, `ngr-socketcan-service`, drives a CAN adapter through SocketCAN with no vendor library: one process per configured VCI (it loads no library), the same D-PDU API interface as the other two, raw CAN and ISO 15765 links, and ISO-TP either in user space or in the kernel's ISO-TP sockets as its configuration selects (7.1.3, ADR-512). One build per host architecture (x86_64 or aarch64, ADR-232), since it loads no library
 
 ---
 
@@ -696,7 +696,7 @@ A CAN adapter whose driver is in the Linux kernel is reached through SocketCAN, 
 - **Format**: one TOML file per VCI, holding its name (the name a caller resolves), the network interface (such as `can0`) and the bitrate the administrator configured on that interface
 - **Checks**: the definition and the worker's configuration file are checked with the 7.2 writability rules in the device's mode; there is no library, so the library and signer checks do not apply
 - **The interface is configured outside this software.** Setting the bitrate or bringing the interface up needs administrator rights, which the worker does not have. The worker reads the interface's state and bitrate and refuses to connect a link whose requested baud rate differs, naming both
-- **ISO-TP backend**: the worker's per-name setting `isotp_backend` in its configuration file selects the user-space engine (`user`), the kernel's ISO-TP sockets (`kernel`, Linux 5.10 or later) or the kernel when it offers them and the user-space engine otherwise (`auto`, the default). The backend in use is reported in `capabilities` (9.5). Only the user-space engine gives a timestamp per frame; the kernel delivers whole messages
+- **ISO-TP backend**: the worker's per-name setting `isotp_backend` in its configuration file selects the user-space engine (`user`), the kernel's ISO-TP sockets (`kernel`, Linux 5.10 or later) or the kernel's when the kernel offers ISO-TP sockets and the user-space engine when it does not (`auto`, the default). `auto` decides by what the kernel offers, not by a link's ComParams: a ComParam the kernel backend cannot express is refused on it with its name, under `auto` too. The backend in use is reported in `capabilities` (9.5). Only the user-space engine gives a timestamp per frame; the kernel delivers whole messages
 
 ### 7.2 Pre-load Verification
 
@@ -753,7 +753,7 @@ flowchart TD
 - Launch-test failures are classified by the `exec` error code (`ENOEXEC`: CPU/kernel not supported, `ENOENT`: dynamic loader missing)
 - Results are reported in `capabilities` with reason codes
 - Emulation of a different architecture is out of scope (Linux)
-- `ngr-socketcan-service` loads no library, so it has no library header to match: the agent starts the build for the host's own architecture, and its VCIs carry no ABI interpretation category (7.1.3, ADR-512)
+- `ngr-socketcan-service` loads no library, so it has no library header to match: the agent starts the build for the host's own architecture (x86_64 or aarch64, the only supported hosts, ADR-232), and its VCIs carry no ABI interpretation category (7.1.3, ADR-512)
 - The launch test runs through the worker service itself, not through a separate probe binary: the agent launches the service for the detected ABI, connects the module and calls `GetVersion`, which the j2534-0404 service answers with `PassThruReadVersion`. The test therefore exercises the same binary, FFI layer and `long_size` that the job will use, and each ABI ships one worker binary per library kind
 
 **Implementation** (`crates/worker-host`): the agent starts a worker service with the VCI's library name and the device's operating mode (`<scheme>:<library name>?mode=<device|user>`; `ngr-agent run` and `identify` take the mode from the installation file, 6.7, and refuse a `--mode` that differs, ADR-494); the service resolves the path itself (7.1) and checks it (7.2). The worker refuses to start without a valid mode. Both `iso22900-service` and `j2534-0404-service` resolve their library through `ngr-library-resolver` and apply the mode to the 7.2 checks they run before loading. To choose the build, the agent resolves the name through `ngr-library-resolver` as each build would (the build's registry view on Windows, with both views read explicitly on 64-bit Windows; the registration definition on Linux) and takes the first build whose library header matches its own ABI (`agent::launch`, used by `ngr-agent run`). `abi::detect_file` reads the header and returns the ABI name of the 7.1.2 table. Worker binaries are installed as `<workers>/<ABI name>/<service binary>`, and `WorkerLayout::find` reports a missing build as `UNSUPPORTED_ABI`. The J2534 `long_size` (the definition file's `LongSize`, else the 7.1.2 default from `Abi::default_long_size`; `agent::launch` takes it from the definition it resolved for the chosen build, refuses an 8-byte width for an ABI whose `unsigned long` is 32 bits wide, ADR-284) is passed to the j2534-0404 service in the `NGR_J2534_LONG_SIZE` environment variable; its sys layer converts between 32-bit and 64-bit structures at the FFI boundary.
@@ -1401,7 +1401,7 @@ The capability information reported by the agent is defined in one place. Based 
 |---|---|
 | Platform | OS, host architecture, whether under emulation (7.1.2), operating mode (user / device) |
 | Worker | Available ABIs, whether a 32-bit runtime is available and the reason code |
-| VCI | Detected VCIs, conformance, ABI interpretation category (standard-conformant / proprietary / inferred), loadability and reason, who performs signature verification |
+| VCI | Detected VCIs, conformance, ABI interpretation category (standard-conformant / proprietary / inferred; none for a SocketCAN VCI, which loads no library, 7.1.3), loadability and reason, who performs signature verification; for a SocketCAN VCI, the ISO-TP backend in use (7.1.3) |
 | Schema versions | IR schema version, extension package schema version, protocol version |
 | Features | Whether direct monitoring connection is possible, measured minimum update period, whether offline execution is possible |
 | State | Offline job packages held, versions of cached extensions |

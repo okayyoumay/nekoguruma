@@ -120,6 +120,14 @@ jobs:
       # dependency added here can leave fuzz/Cargo.lock stale. The fuzz job runs on main only, so
       # this resolves the fuzz workspace against its lock on every pull request; nothing is built.
       - run: cargo metadata --locked --format-version 1 --manifest-path fuzz/Cargo.toml > /dev/null
+      # The server's job end-to-end test builds the worker and sim-vci in a target directory of
+      # their own (`build_artifact_isolated` in crates/agent/tests/support/cargo_artifact.rs).
+      # Building them here, with the same commands, keeps that compile out of the test run, where
+      # it would load the runner while timing-sensitive tests run beside it.
+      - name: Build the isolated test artifacts
+        run: |
+          cargo build --locked -p j2534-0404-service --bin j2534-0404-service --target-dir target/nested-artifacts
+          cargo build --locked -p sim-vci --lib --target-dir target/nested-artifacts
       - run: cargo nextest run --workspace --locked --profile ci
       # The agent's Linux key store against a real Secret Service (ADR-459 Decision item 4): the
       # run above skips these tests, which need `NGR_TEST_SECRET_SERVICE=1`. gnome-keyring runs

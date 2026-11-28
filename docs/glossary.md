@@ -488,6 +488,9 @@ A single-wire, reduced-speed CAN physical layer (GM's GMLAN, per GM specificatio
 **State directory** (design 6.2, ADR-460)  
 Where the agent keeps its own state, one root per operating mode: the user's state directory in user mode, `/var/lib/nekoguruma` in Linux device mode (made by the installation), and the service account's own `%LOCALAPPDATA%\nekoguruma` in Windows device mode. Sub-directories hold the agent key's creation lock (`identity`) and, later, the write-job journal (`journal`). A debug build takes an absolute `NGR_AGENT_STATE_DIR` in place of the root. Resolved by `agent::state`. See **Named-secret store**.
 
+**SocketCAN worker** (design 3.4, 7.1.3, ADR-512)  
+`ngr-socketcan-service`, the worker that drives a CAN adapter on Linux through the kernel's SocketCAN interface instead of a vendor library. It serves the same worker interface as the J2534 and D-PDU API workers, is configured by a registration definition in `/etc/nekoguruma/socketcan/`, never changes the interface's bitrate, and runs ISO-TP either in its user-space engine or in the kernel's ISO-TP sockets, as its `isotp_backend` setting selects (`user`, `kernel`, or `auto`, which takes the kernel's when available).
+
 **Stand-in ECU**  
 `sim-ecu` run on a Linux host and attached to a real CAN bus through a SocketCAN interface, so a real VCI and its vendor library can be checked with writes, reprogramming and fault injection without risking a real ECU. The `ngr-stand-in-ecu` binary serves it over the kernel's ISO-TP sockets. Target class T1 of the **hardware checks** (design 13.5, ADR-275).
 

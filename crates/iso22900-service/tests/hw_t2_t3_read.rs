@@ -1,8 +1,10 @@
-//! `hw_t2_t3_read` (design 13.5, ADR-275) on a D-PDU API VCI: on the T2 or T3 profile
-//! `NGR_HW_PROFILE` names, a bench ECU or a vehicle on a D-PDU API VCI, the profile's definition
+//! `hw_t2_t3_read` (design 13.5, ADR-275) on a D-PDU API VCI: on the T1, T2 or T3 profile
+//! `NGR_HW_PROFILE` names, the stand-in ECU (the operator has started `ngr-stand-in-ecu` on the
+//! VCI's bus first), a bench ECU or a vehicle on a D-PDU API VCI, the profile's definition
 //! (`[read]`) identifies the ECU's variant and runs its read procedure through the agent's job
 //! runner on the harness's guarded client (ADR-334), through `iso22900-service` and the vendor's
-//! library. The guard refuses any write, routine, reset or security access, so the check sends
+//! library. The check refuses a read procedure that writes before it sends anything, and
+//! the guard refuses any write, routine, reset or security access on T2 and T3, so the check sends
 //! reads only. `crates/j2534-0404-service/tests/hw_t2_t3_read.rs` is the same check on a J2534 VCI.
 //!
 //! The test is ignored: it needs the attached hardware, a hardware profile and the vendor's

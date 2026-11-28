@@ -66,12 +66,13 @@ pub const T0_LOOPBACK_CHECK: CheckDecl = CheckDecl {
     operations: &[],
 };
 
-/// `hw_t2_t3_read`: on a bench ECU or a vehicle, the profile's definition (`[read]`) identifies
-/// the ECU's variant and runs its read procedure through the agent's job runner on the guarded
-/// client (`checks::t2_t3_read`). It needs a T2 or T3 profile and no operation beyond reads.
+/// `hw_t2_t3_read`: on the stand-in ECU, a bench ECU or a vehicle, the profile's definition
+/// (`[read]`) identifies the ECU's variant and runs its read procedure through the agent's job
+/// runner on the guarded client (`checks::t2_t3_read`). It needs a T1, T2 or T3 profile and no
+/// operation beyond reads. On T1 the operator has started `ngr-stand-in-ecu` before the run.
 pub const T2_T3_READ_CHECK: CheckDecl = CheckDecl {
     name: "hw_t2_t3_read",
-    classes: &[Class::T2, Class::T3],
+    classes: &[Class::T1, Class::T2, Class::T3],
     operations: &[],
 };
 

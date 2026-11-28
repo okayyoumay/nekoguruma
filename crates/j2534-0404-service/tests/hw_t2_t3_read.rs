@@ -1,8 +1,10 @@
-//! `hw_t2_t3_read` (design 13.5, ADR-275): on the T2 or T3 profile `NGR_HW_PROFILE` names, a bench
-//! ECU or a vehicle on a J2534 VCI, the profile's definition (`[read]`) identifies the ECU's
+//! `hw_t2_t3_read` (design 13.5, ADR-275): on the T1, T2 or T3 profile `NGR_HW_PROFILE` names, the
+//! stand-in ECU, a bench ECU or a vehicle on a J2534 VCI (on T1 the operator has started
+//! `ngr-stand-in-ecu` on the VCI's bus first), the profile's definition (`[read]`) identifies the ECU's
 //! variant and runs its read procedure through the agent's job runner on the harness's guarded
-//! client (ADR-334), through `j2534-0404-service` and the vendor's library. The guard refuses
-//! any write, routine, reset or security access, so the check sends reads only.
+//! client (ADR-334), through `j2534-0404-service` and the vendor's library. The check refuses a
+//! read procedure that writes before it sends anything, and the guard refuses any write, routine,
+//! reset or security access on T2 and T3, so the check sends reads only on every class.
 //!
 //! The test is ignored: it needs the attached hardware, a hardware profile and the vendor's
 //! registration (design 7.1.1), and CI never runs it. It does not use the debug-only

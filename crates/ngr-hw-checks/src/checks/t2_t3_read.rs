@@ -1,4 +1,4 @@
-//! `hw_t2_t3_read` (design 13.5, ADR-275): on a bench ECU or a vehicle, the read parts of a CSV +
+//! `hw_t2_t3_read` (design 13.5, ADR-275): on the stand-in ECU, a bench ECU or a vehicle, the read parts of a CSV +
 //! Starlark definition run through the agent's job runner, on the harness's guarded client
 //! (ADR-334). The profile names the definition (`[read]`): its tables, and the Starlark file of
 //! a read procedure. The check identifies the ECU's variant as a server does before it sends a
@@ -127,6 +127,17 @@ pub async fn run(
     documents: &[(String, Vec<u8>)],
     work: &Path,
 ) -> Result<ReadOutcome, CheckError> {
+    // Before any job is sent, so a definition whose procedure writes sends nothing.
+    for (name, document) in documents {
+        let job = JobDocument::new(document.clone())
+            .and_then(Job::from_document)
+            .map_err(|e| CheckError::Refused(format!("{name}'s document does not load: {e}")))?;
+        if job.writes() {
+            return Err(CheckError::Refused(format!(
+                "the {name} read procedure writes, and the check runs reads only"
+            )));
+        }
+    }
     let mut runs = Vec::new();
     for (name, document) in documents {
         let (identification, services) = identification_document(document).map_err(|e| {
@@ -172,11 +183,6 @@ async fn run_job(
         .map_err(|e| failed(e.to_string()))?
         .with_comm_log_dir(work.join("commlog"))
         .with_vci_margins(client.vci_margins());
-    if job.writes() {
-        return Err(CheckError::Refused(format!(
-            "the {job_name} job writes, and the check runs reads only"
-        )));
-    }
     let link = job.declared_link().map_err(|e| failed(e.to_string()))?;
     let guards = job_guards(&work.join("locks")).map_err(|e| failed(e.to_string()))?;
     let JobRun {
